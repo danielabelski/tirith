@@ -141,6 +141,23 @@ pub fn tier1_scan(input: &str, context: ScanContext) -> bool {
     }
 }
 
+/// Decode exactly one UTF-8 scalar from the start of `input`.
+///
+/// Decoding only the scalar's declared width prevents malformed bytes later in
+/// the buffer from hiding an otherwise-valid control character at the cursor.
+fn decode_utf8_scalar_prefix(input: &[u8]) -> Option<char> {
+    let width = match *input.first()? {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    std::str::from_utf8(input.get(..width)?)
+        .ok()?
+        .chars()
+        .next()
+}
+
 /// Scan raw bytes for control characters (paste-time, Tier 1 step 1).
 pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
     let mut result = ByteScanResult {
@@ -239,11 +256,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         // invisible/confusable class in one pass.
         if b >= 0xc0 {
             let remaining = &input[i..];
-            if let Some(ch) = std::str::from_utf8(remaining)
-                .ok()
-                .or_else(|| std::str::from_utf8(&remaining[..remaining.len().min(4)]).ok())
-                .and_then(|s| s.chars().next())
-            {
+            if let Some(ch) = decode_utf8_scalar_prefix(remaining) {
                 if is_bidi_control(ch) {
                     result.has_bidi_controls = true;
                     result.details.push(ByteFinding {
@@ -601,11 +614,7 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
         // Idle-mode zero-width tracking (multi-byte chars).
         if state.phase == OutputPhase::Idle && b >= 0xc0 {
             let remaining = &chunk[byte_idx..];
-            if let Some(ch) = std::str::from_utf8(remaining)
-                .ok()
-                .or_else(|| std::str::from_utf8(&remaining[..remaining.len().min(4)]).ok())
-                .and_then(|s| s.chars().next())
-            {
+            if let Some(ch) = decode_utf8_scalar_prefix(remaining) {
                 if is_zero_width(ch) || is_unicode_tag(ch) {
                     if zw_run_start.is_none() {
                         zw_run_start = Some(chunk_start_offset + byte_idx);
@@ -935,6 +944,28 @@ mod output_scan_tests {
         let result = scan_output_bytes(&input);
         assert_eq!(result.zero_width_runs.len(), 1);
         assert_eq!(result.zero_width_runs[0].count, 10);
+    }
+
+    #[test]
+    fn recovers_zero_width_run_immediately_before_invalid_utf8() {
+        let mut input = b"abc".to_vec();
+        for _ in 0..9 {
+            input.extend_from_slice("\u{200B}".as_bytes());
+        }
+        input.push(0xff);
+
+        let result = scan_output_bytes(&input);
+        assert_eq!(result.zero_width_runs.len(), 1);
+        assert_eq!(result.zero_width_runs[0].count, 9);
+    }
+
+    #[test]
+    fn valid_visible_scalar_before_invalid_utf8_is_not_zero_width() {
+        let mut input = "visible ☃".as_bytes().to_vec();
+        input.push(0xff);
+
+        let result = scan_output_bytes(&input);
+        assert!(result.zero_width_runs.is_empty());
     }
 
     #[test]
@@ -2287,6 +2318,39 @@ mod tests {
         let input = "hello\u{202E}dlrow".as_bytes();
         let result = scan_bytes(input);
         assert!(result.has_bidi_controls);
+    }
+
+    #[test]
+    fn test_byte_scan_recovers_bidi_immediately_before_invalid_utf8() {
+        // repo-0045: a valid three-byte RLO followed by an invalid octet must not
+        // make the scanner discard the valid control's leading byte.
+        let mut input = b"safe".to_vec();
+        let bidi_offset = input.len();
+        input.extend_from_slice("\u{202E}".as_bytes());
+        input.push(0xff);
+
+        let result = scan_bytes(&input);
+        assert!(
+            result.has_invalid_utf8,
+            "the malformed octet must be recorded"
+        );
+        assert!(
+            result.has_bidi_controls,
+            "a later malformed octet must not hide the preceding bidi control"
+        );
+        assert!(result.details.iter().any(|detail| {
+            detail.offset == bidi_offset && detail.codepoint == Some('\u{202E}' as u32)
+        }));
+    }
+
+    #[test]
+    fn test_byte_scan_invalid_utf8_does_not_invent_unicode_controls() {
+        // Legitimate control: malformed bytes alone still mark invalid UTF-8,
+        // but must not manufacture a bidi/zero-width finding.
+        let result = scan_bytes(b"plain\xfftext");
+        assert!(result.has_invalid_utf8);
+        assert!(!result.has_bidi_controls);
+        assert!(!result.has_zero_width);
     }
 
     #[test]
