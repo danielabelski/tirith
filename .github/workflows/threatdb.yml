@@ -45,6 +45,73 @@ jobs:
           # Need full history so we can rebase on top of any commits that
           # land on main while this build is running.
           fetch-depth: 0
+
+      # A rerun executes the workflow and compiler from its ORIGINAL GITHUB_SHA.
+      # Refuse stale source before building, fetching untrusted feeds, or exposing
+      # the signing key. The only tolerated descendants are this workflow's own
+      # direct manifest/index commits: those change publication state, not compiler
+      # code, and scheduled runs commonly start while one is at the tip.
+      - name: Refuse stale workflow reruns
+        run: |
+          set -euo pipefail
+
+          git fetch --quiet origin main
+          CURRENT_MAIN=$(git rev-parse origin/main)
+          if [ "$GITHUB_SHA" = "$CURRENT_MAIN" ]; then
+            echo "Workflow source is current at $GITHUB_SHA"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "$CURRENT_MAIN"; then
+            echo "::error::workflow source $GITHUB_SHA is not an ancestor of current main $CURRENT_MAIN; refusing stale publication"
+            exit 1
+          fi
+
+          if ! descendant_commits=$(git rev-list --reverse "$GITHUB_SHA..$CURRENT_MAIN"); then
+            echo "::error::failed to enumerate commits between workflow source and current main"
+            exit 1
+          fi
+          if [ -z "$descendant_commits" ]; then
+            echo "::error::main SHA differs but no descendant commits were found; refusing ambiguous stale publication"
+            exit 1
+          fi
+
+          while IFS= read -r commit; do
+            author_email=$(git show -s --format=%ae "$commit")
+            subject=$(git show -s --format=%s "$commit")
+            parent_count=$(git show -s --format=%P "$commit" | awk '{print NF}')
+            mapfile -t changed_paths < <(
+              git diff-tree --no-commit-id --name-only -r "$commit"
+            )
+
+            if [ "$author_email" != "41898282+github-actions[bot]@users.noreply.github.com" ] ||
+               [ "$parent_count" -ne 1 ] ||
+               [ "${#changed_paths[@]}" -ne 1 ]; then
+              echo "::error::main advanced to non-generated commit $commit; refusing stale publication"
+              exit 1
+            fi
+
+            case "${changed_paths[0]}" in
+              threatdb-manifest.json)
+                if [[ ! "$subject" =~ ^chore:\ update\ threatdb\ manifest\ to\ v[0-9]+$ ]]; then
+                  echo "::error::main advanced to unrecognized manifest commit $commit ($subject); refusing stale publication"
+                  exit 1
+                fi
+                ;;
+              threatdb-index-v2.json)
+                if [[ ! "$subject" =~ ^chore:\ update\ threatdb\ v2\ index\ to\ v[0-9]+$ ]]; then
+                  echo "::error::main advanced to unrecognized v2-index commit $commit ($subject); refusing stale publication"
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "::error::main advanced to unrecognized commit $commit (${changed_paths[0]}: $subject); refusing stale publication"
+                exit 1
+                ;;
+            esac
+          done <<< "$descendant_commits"
+
+          echo "Current main differs only by recognized threatdb publication commits; source remains current"
+
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: stable
@@ -547,20 +614,31 @@ jobs:
             exit 1
           fi
 
-          # Read back the discovery documents that clients will consume AFTER
-          # this run's uploads. Local worktree copies are insufficient: a failed
-          # upstream step can leave them newer than the actual rolling release.
+          # Read back BOTH discovery surfaces that clients can consume after this
+          # run: raw main (primary) and the rolling release (fallback). Local
+          # worktree copies are insufficient: a failed publish/push can leave
+          # either surface ahead of the other. Pruning protects the union.
           if ! jq -e '.assets | any(.name == "threatdb-manifest.json")' \
               "$ASSETS_JSON" >/dev/null; then
             echo "::error::prune: rolling release has no legacy manifest"
             exit 1
           fi
-          mkdir -p "$STATE_DIR/published"
+          mkdir -p "$STATE_DIR/published/release" "$STATE_DIR/published/main"
           if ! gh release download threatdb-latest \
               --repo "${{ github.repository }}" \
               --pattern threatdb-manifest.json \
-              --dir "$STATE_DIR/published" --clobber; then
+              --dir "$STATE_DIR/published/release" --clobber; then
             echo "::error::prune: failed to download the published legacy manifest"
+            exit 1
+          fi
+
+          if ! git fetch --quiet origin main; then
+            echo "::error::prune: failed to fetch the primary main discovery surface"
+            exit 1
+          fi
+          if ! git show origin/main:threatdb-manifest.json \
+              > "$STATE_DIR/published/main/threatdb-manifest.json"; then
+            echo "::error::prune: main has no readable legacy manifest"
             exit 1
           fi
 
@@ -579,40 +657,88 @@ jobs:
             PROTECTED_ASSETS["$asset"]=1
           }
 
-          if ! MANIFEST_URL=$(jq -er \
-              '.url | select(type == "string" and length > 0)' \
-              "$STATE_DIR/published/threatdb-manifest.json"); then
-            echo "::error::prune: published legacy manifest has no valid URL"
-            exit 1
-          fi
-          protect_asset "${MANIFEST_URL##*/}"
+          protect_manifest() {
+            local file="$1"
+            local label="$2"
+            local url asset
+            if ! url=$(jq -er \
+                'select(type == "object") | .url | select(type == "string" and length > 0)' \
+                "$file"); then
+              echo "::error::prune: $label has no valid asset URL"
+              exit 1
+            fi
+            asset="${url##*/}"
+            protect_asset "$asset"
+          }
 
-          # The v2 channel is optional under the rollback switch. When present,
-          # protect both each explicit filename and the basename of its URL; a
-          # malformed disagreement fails closed instead of risking either asset.
+          protect_index() {
+            local file="$1"
+            local label="$2"
+            local references
+            if ! jq -e '
+                (type == "object") and
+                (.assets | type == "array" and length > 0) and
+                all(.assets[];
+                  (.filename | type == "string" and length > 0) and
+                  (.url | type == "string" and length > 0))
+              ' "$file" >/dev/null; then
+              echo "::error::prune: $label has malformed asset references"
+              exit 1
+            fi
+            if ! references=$(jq -r '.assets[] | [.filename, .url] | @tsv' "$file"); then
+              echo "::error::prune: failed to extract $label asset references"
+              exit 1
+            fi
+            if [ -z "$references" ]; then
+              echo "::error::prune: $label yielded no asset references"
+              exit 1
+            fi
+            while IFS=$'\t' read -r filename url; do
+              local url_asset="${url##*/}"
+              if [ "$filename" != "$url_asset" ]; then
+                echo "::error::prune: $label filename/URL disagreement: $filename != $url_asset"
+                exit 1
+              fi
+              protect_asset "$filename"
+            done <<< "$references"
+          }
+
+          protect_manifest \
+            "$STATE_DIR/published/release/threatdb-manifest.json" \
+            "rolling-release legacy manifest"
+          protect_manifest \
+            "$STATE_DIR/published/main/threatdb-manifest.json" \
+            "main legacy manifest"
+
+          # The release v2 channel is optional under the rollback switch. When
+          # present, require each explicit filename to agree with its URL and
+          # protect the referenced asset; malformed disagreement fails closed.
           if jq -e '.assets | any(.name == "threatdb-index-v2.json")' \
               "$ASSETS_JSON" >/dev/null; then
             if ! gh release download threatdb-latest \
                 --repo "${{ github.repository }}" \
                 --pattern threatdb-index-v2.json \
-                --dir "$STATE_DIR/published" --clobber; then
+                --dir "$STATE_DIR/published/release" --clobber; then
               echo "::error::prune: failed to download the published v2 index"
               exit 1
             fi
-            if ! jq -e '
-                (.assets | type == "array" and length > 0) and
-                all(.assets[];
-                  (.filename | type == "string" and length > 0) and
-                  (.url | type == "string" and length > 0))
-              ' "$STATE_DIR/published/threatdb-index-v2.json" >/dev/null; then
-              echo "::error::prune: published v2 index has malformed asset references"
+            protect_index \
+              "$STATE_DIR/published/release/threatdb-index-v2.json" \
+              "rolling-release v2 index"
+          fi
+
+          # main's v2 index is optional while the rollback switch is in use, but
+          # when it exists every one of its references remains live and must be
+          # protected even if the rolling release has already advanced.
+          if git cat-file -e origin/main:threatdb-index-v2.json 2>/dev/null; then
+            if ! git show origin/main:threatdb-index-v2.json \
+                > "$STATE_DIR/published/main/threatdb-index-v2.json"; then
+              echo "::error::prune: failed to read main's existing v2 index"
               exit 1
             fi
-            while IFS=$'\t' read -r filename url; do
-              protect_asset "$filename"
-              protect_asset "${url##*/}"
-            done < <(jq -r '.assets[] | [.filename, .url] | @tsv' \
-              "$STATE_DIR/published/threatdb-index-v2.json")
+            protect_index \
+              "$STATE_DIR/published/main/threatdb-index-v2.json" \
+              "main v2 index"
           fi
 
           # v1 assets: tirith-threatdb-<run_id>-<attempt>.dat (no -v2- infix).
