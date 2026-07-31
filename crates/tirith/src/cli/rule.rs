@@ -829,6 +829,16 @@ mod tests {
         assert!(ordered_eval_contexts(&[]).is_empty());
     }
 
+    #[test]
+    fn lenient_policy_loader_rejects_explicit_invalid_schema_version() {
+        let err = parse_policy_lenient("schema_version: \"2\"\n")
+            .expect_err("validate's lenient loader must reject an explicit string version");
+        assert!(
+            err.contains("migration error") && err.contains("positive integer"),
+            "the lenient loader must surface the schema-version defect: {err}"
+        );
+    }
+
     /// Write `yaml` to a temp file and run `tirith rule validate` against it,
     /// returning the exit code (0 = all valid, 1 = at least one invalid).
     fn rule_validate_exit(yaml: &str) -> i32 {

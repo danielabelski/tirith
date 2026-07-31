@@ -106,10 +106,10 @@ fn migrate_v1_to_v2(value: &mut Value) {
 }
 
 /// Migrate a raw policy `Value` forward to [`CURRENT_SCHEMA_VERSION`]. No-op
-/// when already current; `Err(FutureVersion)` when the policy declares a higher
-/// version (so we never quietly drop fields a newer tirith added).
+/// when already current; rejects malformed explicit versions and versions newer
+/// than this binary (so neither can be silently treated as legacy v1).
 pub fn migrate_forward(value: &mut Value) -> Result<(), MigrationError> {
-    let mut current = detect_schema_version(value);
+    let mut current = detect_schema_version(value)?;
 
     if current > CURRENT_SCHEMA_VERSION {
         return Err(MigrationError::FutureVersion {
@@ -130,15 +130,23 @@ pub fn migrate_forward(value: &mut Value) -> Result<(), MigrationError> {
     Ok(())
 }
 
-/// Read the policy's declared `schema_version`, defaulting to `1` when absent
-/// (the pre-M5.5 convention).
-pub fn detect_schema_version(value: &Value) -> u32 {
-    value
-        .as_mapping()
-        .and_then(|m| m.get(Value::String("schema_version".to_string())))
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32)
-        .unwrap_or(1)
+/// Read the policy's declared `schema_version`, defaulting to `1` only when the
+/// field is absent (the pre-M5.5 convention). Explicit values must be positive
+/// integers representable as `u32`; malformed values are never treated as v1.
+pub fn detect_schema_version(value: &Value) -> Result<u32, MigrationError> {
+    let Some(map) = value.as_mapping() else {
+        return Ok(1);
+    };
+    let key = Value::String("schema_version".to_string());
+    let Some(declared) = map.get(&key) else {
+        return Ok(1);
+    };
+    let raw = declared.as_u64().ok_or(MigrationError::InvalidVersion)?;
+    let version = u32::try_from(raw).map_err(|_| MigrationError::InvalidVersion)?;
+    if version == 0 {
+        return Err(MigrationError::InvalidVersion);
+    }
+    Ok(version)
 }
 
 fn set_schema_version(value: &mut Value, version: u32) {
@@ -153,6 +161,9 @@ fn set_schema_version(value: &mut Value, version: u32) {
 /// Errors returned by [`migrate_forward`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationError {
+    /// An explicit schema version is not a positive integer representable as
+    /// `u32`. Absence alone has the legacy-v1 meaning.
+    InvalidVersion,
     /// The policy declares a version newer than this binary — upgrade tirith
     /// rather than silently drop unrecognised fields.
     FutureVersion {
@@ -167,6 +178,10 @@ pub enum MigrationError {
 impl std::fmt::Display for MigrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            MigrationError::InvalidVersion => write!(
+                f,
+                "policy `schema_version` must be a positive integer representable as u32"
+            ),
             MigrationError::FutureVersion {
                 policy_version,
                 supported_version,
@@ -174,7 +189,7 @@ impl std::fmt::Display for MigrationError {
                 f,
                 "policy schema v{policy_version} requires a newer tirith binary; \
                  this build supports schema v{supported_version}. Upgrade tirith \
-                 (or remove the `schema_version` field to load as v1)."
+                 before loading this policy."
             ),
             MigrationError::MissingMigration { from } => write!(
                 f,
@@ -239,13 +254,47 @@ mod tests {
     #[test]
     fn missing_field_defaults_to_v1() {
         let v = make_value(None);
-        assert_eq!(detect_schema_version(&v), 1);
+        assert_eq!(detect_schema_version(&v).unwrap(), 1);
     }
 
     #[test]
     fn explicit_v1_field_works() {
         let v = make_value(Some(1));
-        assert_eq!(detect_schema_version(&v), 1);
+        assert_eq!(detect_schema_version(&v).unwrap(), 1);
+    }
+
+    #[test]
+    fn invalid_explicit_schema_versions_are_rejected_instead_of_migrated_as_v1() {
+        // repo-0204: every explicit malformed value used to collapse to the same
+        // v1 default as an absent field, allowing migration to overwrite it.
+        for yaml in [
+            "schema_version: \"3\"\n",
+            "schema_version: -1\n",
+            "schema_version: 0\n",
+            "schema_version: 4294967296\n",
+            "schema_version: 1.5\n",
+            "schema_version: true\n",
+            "schema_version: null\n",
+        ] {
+            let mut value: Value = serde_yaml::from_str(yaml).expect("test YAML parses");
+            assert_eq!(
+                migrate_forward(&mut value),
+                Err(MigrationError::InvalidVersion),
+                "explicit invalid schema version must fail with InvalidVersion: {yaml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_and_supported_schema_versions_remain_valid() {
+        // Legitimate controls: absence keeps the documented legacy-v1 meaning,
+        // while explicit supported integer versions still parse exactly.
+        assert_eq!(detect_schema_version(&make_value(None)).unwrap(), 1);
+        assert_eq!(detect_schema_version(&make_value(Some(1))).unwrap(), 1);
+        assert_eq!(
+            detect_schema_version(&make_value(Some(CURRENT_SCHEMA_VERSION))).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -272,7 +321,7 @@ mod tests {
         let mut v = make_value(None);
         migrate_forward(&mut v).expect("v1 should migrate cleanly");
         if CURRENT_SCHEMA_VERSION > 1 {
-            assert_eq!(detect_schema_version(&v), CURRENT_SCHEMA_VERSION);
+            assert_eq!(detect_schema_version(&v).unwrap(), CURRENT_SCHEMA_VERSION);
         }
     }
 
@@ -317,7 +366,7 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["@my-co/*", "internal-tool"]);
-        assert_eq!(detect_schema_version(&v), CURRENT_SCHEMA_VERSION);
+        assert_eq!(detect_schema_version(&v).unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]

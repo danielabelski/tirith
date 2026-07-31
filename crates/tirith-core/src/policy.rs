@@ -2489,6 +2489,16 @@ mod tests {
     }
 
     #[test]
+    fn strict_policy_loader_rejects_explicit_invalid_schema_version() {
+        let err = Policy::try_parse_yaml("schema_version: \"2\"\n")
+            .expect_err("an explicit string schema version must not default to legacy v1");
+        assert!(
+            err.contains("migration error") && err.contains("positive integer"),
+            "the strict loader must surface the schema-version defect: {err}"
+        );
+    }
+
+    #[test]
     fn custom_rule_with_both_pattern_and_when_fails_to_load() {
         // CodeRabbit M13 finding R3: a custom rule carrying BOTH `pattern:` and
         // `when:` is a silent no-op and must make the whole policy fail to load.
