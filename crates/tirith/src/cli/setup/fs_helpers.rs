@@ -1,7 +1,7 @@
 //! Filesystem helpers for `tirith setup` — atomic writes, hook scripts,
 //! directory validation, CLI subprocess runner, and backup management.
 
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -228,6 +228,20 @@ fn read_existing_scoped(path: &Path, scope_root: &Path) -> Result<Option<(String
     Ok(Some((content, metadata.permissions().mode() & 0o7777)))
 }
 
+/// Read a setup-managed text file through the same root-confined, no-follow
+/// boundary used for writes. Missing files or parents return `None` without
+/// creating directories; unsafe components are errors even for dry runs and
+/// idempotent early returns.
+pub fn read_to_string_scoped(path: &Path, scope_root: &Path) -> Result<Option<String>, String> {
+    read_existing_scoped(path, scope_root).map(|existing| existing.map(|(content, _mode)| content))
+}
+
+/// Return whether a destination's complete parent chain currently exists and
+/// is safe beneath `scope_root`, without creating anything.
+pub fn parent_exists_scoped(path: &Path, scope_root: &Path) -> Result<bool, String> {
+    scoped_parent(path, scope_root, false).map(|parent| parent.is_some())
+}
+
 /// Write `content` to `path` atomically via temp+rename.
 ///
 /// Uses `O_EXCL` (`create_new`) to prevent clobbering stale temp files.
@@ -240,9 +254,24 @@ pub fn atomic_write(
     content: &str,
     mode: u32,
 ) -> Result<(), String> {
+    atomic_write_with_security(path, scope_root, content, mode, true)
+}
+
+fn atomic_write_with_security(
+    path: &Path,
+    scope_root: &Path,
+    content: &str,
+    mode: u32,
+    preserve_destination_mode: bool,
+) -> Result<(), String> {
     let parent = scoped_parent(path, scope_root, true)?
         .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
-    let effective_mode = existing_mode(&parent)?.unwrap_or(mode) & 0o7777;
+    let destination_mode = existing_mode(&parent)?;
+    let effective_mode = if preserve_destination_mode {
+        destination_mode.unwrap_or(mode)
+    } else {
+        mode
+    } & 0o7777;
 
     // PID + monotonic counter keeps temp file names unique across concurrent setups.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -548,46 +577,25 @@ fn run_cli_with(
 ///
 /// Format: `{path}.tirith-backup-{YYYYMMDD-HHMMSS}`
 /// Retention: keeps the 5 most recent backups, deletes older ones (best-effort).
-pub fn create_backup(path: &Path, force: bool) -> Result<(), String> {
-    if !force || !path.exists() {
+pub fn create_backup(path: &Path, scope_root: &Path, force: bool) -> Result<(), String> {
+    if !force {
         return Ok(());
     }
-
-    let now = chrono::Local::now();
-    let timestamp = now.format("%Y%m%d-%H%M%S");
-    let backup_name = format!(
-        "{}.tirith-backup-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        timestamp
-    );
-    let backup_path = path
-        .parent()
-        .ok_or_else(|| format!("no parent for {}", path.display()))?
-        .join(&backup_name);
-
-    fs::copy(path, &backup_path).map_err(|e| {
-        format!(
-            "backup {} -> {}: {e}",
-            path.display(),
-            backup_path.display()
-        )
-    })?;
-    eprintln!("tirith: backup at {}", backup_path.display());
-
-    cleanup_old_backups(path);
-
-    Ok(())
+    create_backup_impl(path, scope_root)
 }
 
 /// Create a timestamped backup unconditionally (not gated on `--force`).
 ///
 /// Used for high-value user files like VS Code settings.json where any
 /// modification (even first-time insertion) warrants a backup.
-pub fn create_backup_always(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
+pub fn create_backup_always(path: &Path, scope_root: &Path) -> Result<(), String> {
+    create_backup_impl(path, scope_root)
+}
 
+fn create_backup_impl(path: &Path, scope_root: &Path) -> Result<(), String> {
+    let Some((content, mode)) = read_existing_scoped(path, scope_root)? else {
+        return Ok(());
+    };
     let now = chrono::Local::now();
     let timestamp = now.format("%Y%m%d-%H%M%S");
     let backup_name = format!(
@@ -600,53 +608,89 @@ pub fn create_backup_always(path: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("no parent for {}", path.display()))?
         .join(&backup_name);
 
-    fs::copy(path, &backup_path).map_err(|e| {
-        format!(
-            "backup {} -> {}: {e}",
-            path.display(),
-            backup_path.display()
-        )
-    })?;
+    // A colliding attacker-created backup name must not donate a broader mode
+    // to sensitive copied content.
+    atomic_write_with_security(&backup_path, scope_root, &content, mode, false)?;
     eprintln!("tirith: backup at {}", backup_path.display());
 
-    cleanup_old_backups(path);
+    cleanup_old_backups(path, scope_root)?;
 
     Ok(())
 }
 
 /// Remove old backup files, keeping only the 5 most recent.
-fn cleanup_old_backups(path: &Path) {
-    let parent = match path.parent() {
-        Some(p) => p,
-        None => return,
+fn cleanup_old_backups(path: &Path, scope_root: &Path) -> Result<(), String> {
+    let Some(parent) = scoped_parent(path, scope_root, false)? else {
+        return Ok(());
     };
-    let stem = match path.file_name() {
-        Some(n) => n.to_string_lossy().to_string(),
-        None => return,
-    };
-    let prefix = format!("{stem}.tirith-backup-");
+    let stem = path
+        .file_name()
+        .ok_or_else(|| format!("no file name for {}", path.display()))?;
+    let prefix = [stem.as_bytes(), b".tirith-backup-"].concat();
 
-    let mut backups: Vec<PathBuf> = match fs::read_dir(parent) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-            .map(|e| e.path())
-            .collect(),
-        Err(_) => return,
-    };
+    // fdopendir takes ownership of its descriptor, so duplicate the held
+    // capability and keep `parent.dir` available for fstatat/unlinkat.
+    let duplicate = unsafe { libc::dup(parent.dir.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(format!(
+            "duplicate backup-directory handle: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(format!(
+            "enumerate backup directory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut backups = Vec::<CString>::new();
+    loop {
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name.starts_with(&prefix) {
+            if let Ok(name) = CString::new(name) {
+                backups.push(name);
+            }
+        }
+    }
+    unsafe { libc::closedir(directory) };
 
     if backups.len() <= 5 {
-        return;
+        return Ok(());
     }
 
     // Timestamps are embedded, so lexicographic order equals chronological.
-    backups.sort();
+    backups.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     let to_remove = backups.len() - 5;
     for old in &backups[..to_remove] {
-        if let Err(e) = fs::remove_file(old) {
-            eprintln!("tirith: could not clean old backup {}: {e}", old.display());
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let stat_rc = unsafe {
+            libc::fstatat(
+                parent.dir.as_raw_fd(),
+                old.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_rc < 0 || unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
+            continue;
+        }
+        if unsafe { libc::unlinkat(parent.dir.as_raw_fd(), old.as_ptr(), 0) } < 0 {
+            eprintln!(
+                "tirith: could not clean old backup {}: {}",
+                old.to_string_lossy(),
+                std::io::Error::last_os_error()
+            );
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -769,6 +813,28 @@ mod tests {
     }
 
     #[test]
+    fn write_hook_script_refuses_symlinked_parent_even_when_content_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("hook.sh"), "expected").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("hooks")).unwrap();
+
+        let result = write_hook_script(
+            &root.path().join("hooks/hook.sh"),
+            root.path(),
+            "expected",
+            false,
+            true,
+        );
+
+        assert!(result.is_err(), "up-to-date/dry-run must validate parents");
+        assert_eq!(
+            fs::read_to_string(outside.path().join("hook.sh")).unwrap(),
+            "expected"
+        );
+    }
+
+    #[test]
     fn atomic_write_refuses_symlinked_parent_and_leaves_outside_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -844,7 +910,7 @@ mod tests {
             fs::write(dir.path().join(&name), "backup").unwrap();
         }
 
-        cleanup_old_backups(&path);
+        cleanup_old_backups(&path, dir.path()).unwrap();
 
         let count = fs::read_dir(dir.path())
             .unwrap()
@@ -857,5 +923,70 @@ mod tests {
             })
             .count();
         assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn backup_preserves_content_and_restrictive_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, "secret-data").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        create_backup(&path, dir.path(), true).unwrap();
+
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("tirith-backup")
+            })
+            .expect("backup created")
+            .path();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "secret-data");
+        assert_eq!(
+            fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn backup_and_cleanup_refuse_symlinked_parent_without_outside_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked = root.path().join("configs");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        fs::write(outside.path().join("config.json"), "outside-secret").unwrap();
+        for i in 0..7 {
+            fs::write(
+                outside
+                    .path()
+                    .join(format!("config.json.tirith-backup-20260101-00000{i}")),
+                format!("backup-{i}"),
+            )
+            .unwrap();
+        }
+
+        let path = linked.join("config.json");
+        assert!(create_backup(&path, root.path(), true).is_err());
+        assert!(cleanup_old_backups(&path, root.path()).is_err());
+
+        assert_eq!(
+            fs::read_to_string(outside.path().join("config.json")).unwrap(),
+            "outside-secret"
+        );
+        let backups = fs::read_dir(outside.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("tirith-backup")
+            })
+            .count();
+        assert_eq!(backups, 7, "retention must not delete through the link");
     }
 }

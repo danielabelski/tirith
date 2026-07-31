@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -34,12 +33,12 @@ pub fn merge_mcp_json_with_key(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    let mut config: Value = if path.exists() {
-        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else {
-        json!({})
-    };
+    let mut config: Value =
+        if let Some(raw) = super::fs_helpers::read_to_string_scoped(path, scope_root)? {
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        } else {
+            json!({})
+        };
 
     let servers = config
         .as_object_mut()
@@ -74,7 +73,7 @@ pub fn merge_mcp_json_with_key(
         }
         // force: back up before overwriting user config (not in dry-run).
         if !dry_run {
-            super::fs_helpers::create_backup(path, true)?;
+            super::fs_helpers::create_backup(path, scope_root, true)?;
         }
     }
 
@@ -111,14 +110,14 @@ pub fn merge_hooks_json(
     dry_run: bool,
     require_version: bool,
 ) -> Result<(), String> {
-    let mut config: Value = if path.exists() {
-        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else if require_version {
-        json!({"version": 1, "hooks": {}})
-    } else {
-        json!({"hooks": {}})
-    };
+    let mut config: Value =
+        if let Some(raw) = super::fs_helpers::read_to_string_scoped(path, scope_root)? {
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        } else if require_version {
+            json!({"version": 1, "hooks": {}})
+        } else {
+            json!({"hooks": {}})
+        };
 
     let hooks = config
         .as_object_mut()
@@ -174,7 +173,7 @@ pub fn merge_hooks_json(
                 ));
             }
             if !dry_run {
-                super::fs_helpers::create_backup(path, true)?;
+                super::fs_helpers::create_backup(path, scope_root, true)?;
             }
             event_arr[idx] = hook_entry;
         }
@@ -193,7 +192,7 @@ pub fn merge_hooks_json(
                 ));
             }
             if !dry_run {
-                super::fs_helpers::create_backup(path, true)?;
+                super::fs_helpers::create_backup(path, scope_root, true)?;
             }
             // Reverse order so earlier indices stay valid while removing.
             for &idx in matching_indices.iter().rev() {
@@ -230,12 +229,12 @@ pub fn merge_claude_mcp_server(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    let mut config: Value = if path.exists() {
-        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else {
-        json!({})
-    };
+    let mut config: Value =
+        if let Some(raw) = super::fs_helpers::read_to_string_scoped(path, scope_root)? {
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        } else {
+            json!({})
+        };
 
     let servers = config
         .as_object_mut()
@@ -269,7 +268,7 @@ pub fn merge_claude_mcp_server(
             ));
         }
         if !dry_run {
-            super::fs_helpers::create_backup(path, true)?;
+            super::fs_helpers::create_backup(path, scope_root, true)?;
         }
     }
 
@@ -313,12 +312,12 @@ fn merge_hook_settings_inner(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    let mut config: Value = if path.exists() {
-        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else {
-        json!({})
-    };
+    let mut config: Value =
+        if let Some(raw) = super::fs_helpers::read_to_string_scoped(path, scope_root)? {
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        } else {
+            json!({})
+        };
 
     let root = config
         .as_object_mut()
@@ -400,7 +399,7 @@ fn merge_hook_settings_inner(
                         ));
                     }
                     if !dry_run {
-                        super::fs_helpers::create_backup(path, true)?;
+                        super::fs_helpers::create_backup(path, scope_root, true)?;
                     }
                     arr[idx]["hooks"][hi] = new_hook_entry;
                 }
@@ -435,7 +434,7 @@ fn merge_hook_settings_inner(
                 ));
             }
             if !dry_run {
-                super::fs_helpers::create_backup(path, true)?;
+                super::fs_helpers::create_backup(path, scope_root, true)?;
             }
 
             // Remove marker-matching hooks from all matchers; collect the
@@ -537,11 +536,9 @@ pub fn merge_vscode_settings(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    let raw = if path.exists() {
-        fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?
-    } else {
-        "{\n}\n".to_string()
-    };
+    let existing_raw = super::fs_helpers::read_to_string_scoped(path, scope_root)?;
+    let path_existed = existing_raw.is_some();
+    let raw = existing_raw.unwrap_or_else(|| "{\n}\n".to_string());
 
     let begin_marker = "// BEGIN tirith-hooks";
     let end_marker = "// END tirith-hooks";
@@ -556,7 +553,7 @@ pub fn merge_vscode_settings(
     let already_backed_up;
     let working_text = if has_begin && force {
         if !dry_run {
-            super::fs_helpers::create_backup(path, true)?;
+            super::fs_helpers::create_backup(path, scope_root, true)?;
             already_backed_up = true;
         } else {
             already_backed_up = false;
@@ -690,8 +687,8 @@ pub fn merge_vscode_settings(
 
     // High-value user content: always back up on first-time insertion (skip if
     // the force+remove path above already backed up this invocation).
-    if path.exists() && !already_backed_up {
-        super::fs_helpers::create_backup_always(path)?;
+    if path_existed && !already_backed_up {
+        super::fs_helpers::create_backup_always(path, scope_root)?;
     }
 
     super::fs_helpers::atomic_write(path, scope_root, &result, 0o644)?;
@@ -742,6 +739,7 @@ fn remove_managed_block(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     fn merge_mcp_json(
         path: &Path,
@@ -843,6 +841,83 @@ mod tests {
             force,
             dry_run,
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_up_to_date_and_dry_run_refuse_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked = root.path().join("nested");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let path = linked.join("mcp.json");
+        let expected = json!({"command": "tirith", "args": ["mcp"]});
+        fs::write(
+            outside.path().join("mcp.json"),
+            serde_json::to_string(&json!({"mcpServers": {"tirith": expected}})).unwrap(),
+        )
+        .unwrap();
+
+        for dry_run in [false, true] {
+            let result = super::merge_mcp_json(
+                &path,
+                root.path(),
+                "tirith",
+                expected.clone(),
+                false,
+                dry_run,
+            );
+            assert!(
+                result.is_err(),
+                "dry_run={dry_run} bypassed parent validation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_force_never_backs_up_or_cleans_through_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked = root.path().join("nested");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let path = linked.join("mcp.json");
+        fs::write(
+            outside.path().join("mcp.json"),
+            r#"{"mcpServers":{"tirith":{"command":"old"}}}"#,
+        )
+        .unwrap();
+        for i in 0..7 {
+            fs::write(
+                outside
+                    .path()
+                    .join(format!("mcp.json.tirith-backup-20260101-00000{i}")),
+                "outside-backup",
+            )
+            .unwrap();
+        }
+
+        let result = super::merge_mcp_json(
+            &path,
+            root.path(),
+            "tirith",
+            json!({"command": "new"}),
+            true,
+            false,
+        );
+
+        assert!(result.is_err());
+        let backups = fs::read_dir(outside.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("tirith-backup")
+            })
+            .count();
+        assert_eq!(backups, 7);
     }
 
     #[test]

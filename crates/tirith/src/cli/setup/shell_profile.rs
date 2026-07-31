@@ -4,7 +4,6 @@
 //! nushell/PowerShell) so the hook installs idempotently and updates/removes
 //! without corrupting user content.
 
-use std::fs;
 use std::path::PathBuf;
 
 const BEGIN_MARKER: &str = "# BEGIN tirith-hook v1";
@@ -57,19 +56,25 @@ pub(crate) fn shell_quote(path: &str, shell: &str) -> String {
 }
 
 /// Detect the user's default shell and return its profile file path.
-fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
-    let home = home::home_dir()?;
+fn detect_shell_profile() -> Result<Option<(&'static str, PathBuf)>, String> {
+    let Some(home) = home::home_dir() else {
+        return Ok(None);
+    };
     let shell = crate::cli::init::detect_shell();
 
+    Ok(profile_for_shell(shell, &home)?.map(|profile| (shell, profile)))
+}
+
+fn profile_for_shell(shell: &str, home: &std::path::Path) -> Result<Option<PathBuf>, String> {
     let profile = match shell {
         "zsh" => home.join(".zshrc"),
         "bash" => {
             // .bashrc preferred; fall back to .bash_profile, else create .bashrc.
             let bashrc = home.join(".bashrc");
             let bash_profile = home.join(".bash_profile");
-            if bashrc.exists() {
+            if super::fs_helpers::read_to_string_scoped(&bashrc, home)?.is_some() {
                 bashrc
-            } else if bash_profile.exists() {
+            } else if super::fs_helpers::read_to_string_scoped(&bash_profile, home)?.is_some() {
                 bash_profile
             } else {
                 bashrc
@@ -79,10 +84,12 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
         "nushell" => {
             let config = home.join(".config").join("nushell").join("config.nu");
             // Only offer if the user already has a nushell config directory.
-            if config.exists() || config.parent().map(|p| p.exists()).unwrap_or(false) {
+            if super::fs_helpers::read_to_string_scoped(&config, home)?.is_some()
+                || super::fs_helpers::parent_exists_scoped(&config, home)?
+            {
                 config
             } else {
-                return None;
+                return Ok(None);
             }
         }
         "powershell" => {
@@ -91,16 +98,18 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
                 .join(".config")
                 .join("powershell")
                 .join("Microsoft.PowerShell_profile.ps1");
-            if profile.exists() || profile.parent().map(|p| p.exists()).unwrap_or(false) {
+            if super::fs_helpers::read_to_string_scoped(&profile, home)?.is_some()
+                || super::fs_helpers::parent_exists_scoped(&profile, home)?
+            {
                 profile
             } else {
-                return None;
+                return Ok(None);
             }
         }
-        _ => return None,
+        _ => return Ok(None),
     };
 
-    Some((shell, profile))
+    Ok(Some(profile))
 }
 
 /// Detect a manually-added `tirith init` (uncommented executable line). Skips
@@ -188,7 +197,7 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
     // scoped to bash users without threading the shell name through the inner fn.
     #[cfg(unix)]
     if result.is_ok() && !dry_run {
-        if let Some(("bash", _)) = detect_shell_profile() {
+        if let Ok(Some(("bash", _))) = detect_shell_profile() {
             let _ = crate::cli::bash_capability::run_and_cache();
         }
     }
@@ -198,7 +207,7 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
 
 fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
-    let (shell, profile_path) = detect_shell_profile().ok_or_else(|| {
+    let (shell, profile_path) = detect_shell_profile()?.ok_or_else(|| {
         "could not detect shell — add eval \"$(tirith init)\" to your shell profile manually"
             .to_string()
     })?;
@@ -232,12 +241,8 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
 
     let managed_block = format!("{BEGIN_MARKER}\n{hook_line}\n{END_MARKER}\n");
 
-    let existing = if profile_path.exists() {
-        fs::read_to_string(&profile_path)
-            .map_err(|e| format!("read {}: {e}", profile_path.display()))?
-    } else {
-        String::new()
-    };
+    let existing =
+        super::fs_helpers::read_to_string_scoped(&profile_path, &home)?.unwrap_or_default();
 
     let begin_count = existing
         .lines()
@@ -384,6 +389,30 @@ fn remove_hook_blocks(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_discovery_refuses_symlinked_intermediate_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("nushell")).unwrap();
+        std::fs::write(outside.path().join("nushell/config.nu"), "# outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".config")).unwrap();
+
+        assert!(profile_for_shell("nushell", home.path()).is_err());
+    }
+
+    #[test]
+    fn bash_profile_discovery_preserves_existing_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let bash_profile = home.path().join(".bash_profile");
+        std::fs::write(&bash_profile, "# existing").unwrap();
+
+        assert_eq!(
+            profile_for_shell("bash", home.path()).unwrap(),
+            Some(bash_profile)
+        );
+    }
 
     #[test]
     fn quote_simple_name_unchanged() {

@@ -3,7 +3,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
@@ -29,12 +29,20 @@ use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
     MoveFileExW, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 
 struct OwnedHandle(HANDLE);
+
+impl OwnedHandle {
+    fn into_file(self) -> fs::File {
+        let raw = self.0 .0 as RawHandle;
+        std::mem::forget(self);
+        unsafe { fs::File::from_raw_handle(raw) }
+    }
+}
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
@@ -85,9 +93,9 @@ fn final_path(handle: HANDLE) -> Result<String, String> {
     }
 }
 
-fn open_directory(path: &Path) -> Result<OwnedHandle, String> {
+fn open_directory(path: &Path) -> Result<Option<OwnedHandle>, String> {
     let path_wide = wide(path);
-    let handle = unsafe {
+    let handle = match unsafe {
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
             (FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES).0,
@@ -97,8 +105,16 @@ fn open_directory(path: &Path) -> Result<OwnedHandle, String> {
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
-    }
-    .map_err(|e| format!("open directory handle {}: {e}", path.display()))?;
+    } {
+        Ok(handle) => handle,
+        Err(error)
+            if is_win32(&error, ERROR_FILE_NOT_FOUND.0)
+                || is_win32(&error, ERROR_PATH_NOT_FOUND.0) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(format!("open directory handle {}: {error}", path.display())),
+    };
     let owned = OwnedHandle(handle);
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(handle, &mut info) }
@@ -112,34 +128,40 @@ fn open_directory(path: &Path) -> Result<OwnedHandle, String> {
         }
         return Err(format!("{} is not a directory", path.display()));
     }
-    Ok(owned)
+    Ok(Some(owned))
 }
 
 fn open_or_create_directory(
     current: &mut PathBuf,
     component: &OsStr,
     handles: &mut Vec<OwnedHandle>,
-) -> Result<(), String> {
+    create: bool,
+) -> Result<bool, String> {
     current.push(component);
-    let component_handle = match open_directory(current) {
-        Ok(handle) => handle,
-        Err(open_error) if !current.exists() => {
+    let component_handle = match open_directory(current)? {
+        Some(handle) => handle,
+        None if !create => return Ok(false),
+        None => {
             let current_wide = wide(current);
-            unsafe { CreateDirectoryW(PCWSTR(current_wide.as_ptr()), None) }.map_err(|e| {
-                format!(
-                    "create directory {} after {open_error}: {e}",
-                    current.display()
-                )
-            })?;
-            open_directory(current)?
+            if let Err(error) = unsafe { CreateDirectoryW(PCWSTR(current_wide.as_ptr()), None) } {
+                if !is_win32(&error, ERROR_ALREADY_EXISTS.0) {
+                    return Err(format!("create directory {}: {error}", current.display()));
+                }
+            }
+            open_directory(current)?.ok_or_else(|| {
+                format!("{} disappeared after directory creation", current.display())
+            })?
         }
-        Err(error) => return Err(error),
     };
     handles.push(component_handle);
-    Ok(())
+    Ok(true)
 }
 
-fn validated_parent(path: &Path, scope_root: &Path) -> Result<ValidatedParent, String> {
+fn validated_parent(
+    path: &Path,
+    scope_root: &Path,
+    create: bool,
+) -> Result<Option<ValidatedParent>, String> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -191,13 +213,19 @@ fn validated_parent(path: &Path, scope_root: &Path) -> Result<ValidatedParent, S
             return Err(format!("cannot resolve {}", root.display()));
         }
     }
+    if !missing.is_empty() && !create {
+        return Ok(None);
+    }
     let mut current = anchor
         .canonicalize()
         .map_err(|e| format!("canonicalize trusted root {}: {e}", anchor.display()))?;
-    let mut handles = vec![open_directory(&current)?];
+    let mut handles = vec![open_directory(&current)?
+        .ok_or_else(|| format!("trusted root {} disappeared", current.display()))?];
 
     for component in missing.iter().rev() {
-        open_or_create_directory(&mut current, component, &mut handles)?;
+        if !open_or_create_directory(&mut current, component, &mut handles, create)? {
+            return Ok(None);
+        }
     }
     // Capture the final path of the requested scope root itself, rather than
     // its nearest pre-existing ancestor when the scope had to be created.
@@ -207,7 +235,9 @@ fn validated_parent(path: &Path, scope_root: &Path) -> Result<ValidatedParent, S
         std::path::Component::Normal(name) => Some(*name),
         _ => None,
     }) {
-        open_or_create_directory(&mut current, component, &mut handles)?;
+        if !open_or_create_directory(&mut current, component, &mut handles, create)? {
+            return Ok(None);
+        }
     }
 
     let parent_final = final_path(handles.last().expect("anchor handle exists").0)?;
@@ -217,11 +247,11 @@ fn validated_parent(path: &Path, scope_root: &Path) -> Result<ValidatedParent, S
             current.display()
         ));
     }
-    Ok(ValidatedParent {
+    Ok(Some(ValidatedParent {
         path: current,
         handles,
         root_final,
-    })
+    }))
 }
 
 fn open_existing(path: &Path) -> Result<Option<OwnedHandle>, String> {
@@ -229,7 +259,7 @@ fn open_existing(path: &Path) -> Result<Option<OwnedHandle>, String> {
     let handle = match unsafe {
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
-            (READ_CONTROL | FILE_READ_ATTRIBUTES).0,
+            (FILE_GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES).0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -262,6 +292,35 @@ fn open_existing(path: &Path) -> Result<Option<OwnedHandle>, String> {
     Ok(Some(owned))
 }
 
+/// Read through validated, retained no-reparse parent handles. Missing files or
+/// parents return `None` without creating directories, while unsafe components
+/// fail even when the caller would otherwise take an idempotent/dry-run return.
+pub fn read_to_string_scoped(path: &Path, scope_root: &Path) -> Result<Option<String>, String> {
+    let Some(parent) = validated_parent(path, scope_root, false)? else {
+        return Ok(None);
+    };
+    let destination = parent.path.join(
+        path.file_name()
+            .ok_or_else(|| format!("no file name for {}", path.display()))?,
+    );
+    let Some(handle) = open_existing(&destination)? else {
+        return Ok(None);
+    };
+    let mut file = handle.into_file();
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| format!("read {} through validated handle: {e}", path.display()))?;
+    // Keep the validated parent handles alive through the complete read.
+    drop(parent);
+    Ok(Some(content))
+}
+
+/// Return whether a destination's complete parent chain currently exists and
+/// is safe beneath `scope_root`, without creating anything.
+pub fn parent_exists_scoped(path: &Path, scope_root: &Path) -> Result<bool, String> {
+    validated_parent(path, scope_root, false).map(|parent| parent.is_some())
+}
+
 fn owner_only_descriptor() -> Result<LocalSecurityDescriptor, String> {
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
@@ -284,13 +343,23 @@ pub fn atomic_write(
     content: &str,
     _mode: u32,
 ) -> Result<(), String> {
-    let parent = validated_parent(path, scope_root)?;
+    atomic_write_with_security(path, scope_root, content, true)
+}
+
+fn atomic_write_with_security(
+    path: &Path,
+    scope_root: &Path,
+    content: &str,
+    preserve_destination_dacl: bool,
+) -> Result<(), String> {
+    let parent = validated_parent(path, scope_root, true)?
+        .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
     let destination = parent.path.join(
         path.file_name()
             .ok_or_else(|| format!("no file name for {}", path.display()))?,
     );
     let existing = open_existing(&destination)?;
-    let acl_source = path_rules::acl_source(existing.is_some());
+    let acl_source = path_rules::acl_source(existing.is_some(), preserve_destination_dacl);
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -429,18 +498,7 @@ pub fn write_hook_script(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "{} is a symlink — refusing to modify for safety",
-                path.display()
-            ));
-        }
-    }
-
-    if path.exists() {
-        let existing =
-            fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if let Some(existing) = read_to_string_scoped(path, scope_root)? {
         if existing == content {
             if !dry_run {
                 eprintln!("tirith: {} already configured, up to date", path.display());
@@ -603,22 +661,22 @@ fn run_cli_with(
 }
 
 /// Create a timestamped backup of `path` when `force` is true and the file exists.
-pub fn create_backup(path: &Path, force: bool) -> Result<(), String> {
-    if !force || !path.exists() {
+pub fn create_backup(path: &Path, scope_root: &Path, force: bool) -> Result<(), String> {
+    if !force {
         return Ok(());
     }
-    create_backup_impl(path)
+    create_backup_impl(path, scope_root)
 }
 
 /// Create a timestamped backup unconditionally.
-pub fn create_backup_always(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    create_backup_impl(path)
+pub fn create_backup_always(path: &Path, scope_root: &Path) -> Result<(), String> {
+    create_backup_impl(path, scope_root)
 }
 
-fn create_backup_impl(path: &Path) -> Result<(), String> {
+fn create_backup_impl(path: &Path, scope_root: &Path) -> Result<(), String> {
+    let Some(content) = read_to_string_scoped(path, scope_root)? else {
+        return Ok(());
+    };
     let now = chrono::Local::now();
     let timestamp = now.format("%Y%m%d-%H%M%S");
     let backup_name = format!(
@@ -631,49 +689,173 @@ fn create_backup_impl(path: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("no parent for {}", path.display()))?
         .join(&backup_name);
 
-    fs::copy(path, &backup_path).map_err(|e| {
-        format!(
-            "backup {} -> {}: {e}",
-            path.display(),
-            backup_path.display()
-        )
-    })?;
+    // Backups are always owner-only, even if an attacker pre-created the
+    // timestamped destination with a broader DACL.
+    atomic_write_with_security(&backup_path, scope_root, &content, false)?;
     eprintln!("tirith: backup at {}", backup_path.display());
 
-    cleanup_old_backups(path);
+    cleanup_old_backups(path, scope_root)?;
     Ok(())
 }
 
-fn cleanup_old_backups(path: &Path) {
-    let parent = match path.parent() {
-        Some(p) => p,
-        None => return,
+fn cleanup_old_backups(path: &Path, scope_root: &Path) -> Result<(), String> {
+    let Some(parent) = validated_parent(path, scope_root, false)? else {
+        return Ok(());
     };
-    let stem = match path.file_name() {
-        Some(n) => n.to_string_lossy().to_string(),
-        None => return,
-    };
+    let stem = path
+        .file_name()
+        .ok_or_else(|| format!("no file name for {}", path.display()))?
+        .to_string_lossy();
     let prefix = format!("{stem}.tirith-backup-");
 
-    let mut backups: Vec<PathBuf> = match fs::read_dir(parent) {
+    // The retained component handles omit FILE_SHARE_DELETE, so this path
+    // enumeration cannot be redirected by replacing a checked parent.
+    let mut backups: Vec<PathBuf> = match fs::read_dir(&parent.path) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
             .map(|e| e.path())
             .collect(),
-        Err(_) => return,
+        Err(error) => {
+            return Err(format!(
+                "enumerate backup directory {}: {error}",
+                parent.path.display()
+            ))
+        }
     };
 
     if backups.len() <= 5 {
-        return;
+        return Ok(());
     }
 
     backups.sort();
     let to_remove = backups.len() - 5;
     for old in &backups[..to_remove] {
-        if let Err(e) = fs::remove_file(old) {
-            eprintln!("tirith: could not clean old backup {}: {e}", old.display());
+        // Reject a reparse-point or non-file entry immediately before removal.
+        // Removing a checked name while all parent handles remain held keeps
+        // deletion inside the validated directory chain.
+        let checked = match open_existing(old) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!(
+                    "tirith: could not validate old backup {}: {error}",
+                    old.display()
+                );
+                continue;
+            }
+        };
+        drop(checked);
+        if let Err(error) = fs::remove_file(old) {
+            eprintln!(
+                "tirith: could not clean old backup {}: {error}",
+                old.display()
+            );
         }
+    }
+    drop(parent);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("skipping Windows symlink test: {error}");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn up_to_date_hook_refuses_reparse_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("hook.cmd"), "expected").unwrap();
+        if !link_directory(outside.path(), &root.path().join("hooks")) {
+            return;
+        }
+
+        let result = write_hook_script(
+            &root.path().join("hooks/hook.cmd"),
+            root.path(),
+            "expected",
+            false,
+            true,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(outside.path().join("hook.cmd")).unwrap(),
+            "expected"
+        );
+    }
+
+    #[test]
+    fn backup_and_retention_refuse_reparse_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("config.json"), "outside").unwrap();
+        for i in 0..7 {
+            fs::write(
+                outside
+                    .path()
+                    .join(format!("config.json.tirith-backup-20260101-00000{i}")),
+                "backup",
+            )
+            .unwrap();
+        }
+        if !link_directory(outside.path(), &root.path().join("configs")) {
+            return;
+        }
+        let path = root.path().join("configs/config.json");
+
+        assert!(create_backup(&path, root.path(), true).is_err());
+        assert!(cleanup_old_backups(&path, root.path()).is_err());
+        let backups = fs::read_dir(outside.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("tirith-backup")
+            })
+            .count();
+        assert_eq!(backups, 7);
+    }
+
+    #[test]
+    fn legitimate_backup_retention_keeps_five() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "data").unwrap();
+        for i in 0..7 {
+            fs::write(
+                root.path()
+                    .join(format!("config.json.tirith-backup-20260101-00000{i}")),
+                "backup",
+            )
+            .unwrap();
+        }
+
+        cleanup_old_backups(&path, root.path()).unwrap();
+
+        let backups = fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("tirith-backup")
+            })
+            .count();
+        assert_eq!(backups, 5);
     }
 }
 

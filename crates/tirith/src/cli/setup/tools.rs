@@ -870,9 +870,7 @@ fn write_owned_json(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    if path.exists() {
-        let existing =
-            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if let Some(existing) = fs_helpers::read_to_string_scoped(path, scope_root)? {
         if existing == content {
             eprintln!("tirith: {} already configured, up to date", path.display());
             return Ok(());
@@ -891,7 +889,7 @@ fn write_owned_json(
             ));
         }
         if !dry_run {
-            fs_helpers::create_backup(path, true)?;
+            fs_helpers::create_backup(path, scope_root, true)?;
         }
     }
     if dry_run {
@@ -911,6 +909,28 @@ fn write_owned_json(
 mod tests {
     use super::*;
     use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_json_up_to_date_and_dry_run_refuse_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("agents")).unwrap();
+        std::fs::write(outside.path().join("config.json"), "expected").unwrap();
+        let path = root.path().join("agents/config.json");
+
+        for dry_run in [false, true] {
+            let result = write_owned_json(&path, root.path(), "expected", false, dry_run);
+            assert!(
+                result.is_err(),
+                "dry_run={dry_run} bypassed parent validation"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("config.json")).unwrap(),
+            "expected"
+        );
+    }
 
     #[test]
     fn codex_mcp_get_reports_missing_accepts_known_cli_messages() {

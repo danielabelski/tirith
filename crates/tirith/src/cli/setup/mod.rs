@@ -393,14 +393,13 @@ mod run_impl {
     pub(crate) fn copy_gateway_config(force: bool, dry_run: bool) -> Result<PathBuf, String> {
         let base = etcetera::choose_base_strategy()
             .map_err(|e| format!("could not determine config directory: {e}"))?;
-        let config_dir = base.config_dir().join("tirith");
+        let config_root = base.config_dir();
+        let config_dir = config_root.join("tirith");
         let gateway_path = config_dir.join("gateway.yaml");
 
         let content = crate::assets::GATEWAY_YAML;
 
-        if gateway_path.exists() {
-            let existing = std::fs::read_to_string(&gateway_path)
-                .map_err(|e| format!("read {}: {e}", gateway_path.display()))?;
+        if let Some(existing) = fs_helpers::read_to_string_scoped(&gateway_path, &config_root)? {
             if existing == content {
                 eprintln!(
                     "tirith: {} already configured, up to date",
@@ -432,7 +431,7 @@ mod run_impl {
             return Ok(gateway_path);
         }
 
-        fs_helpers::atomic_write(&gateway_path, &config_dir, content, 0o644)?;
+        fs_helpers::atomic_write(&gateway_path, &config_root, content, 0o644)?;
         eprintln!("tirith: wrote {}", gateway_path.display());
         Ok(gateway_path)
     }
@@ -480,6 +479,33 @@ mod run_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[cfg(unix)]
+        #[test]
+        fn gateway_up_to_date_and_dry_run_refuse_symlinked_config_dir() {
+            use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+            with_fake_env(false, |home, _cwd| {
+                let config_root = home.join(".config");
+                std::fs::create_dir_all(&config_root).unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    outside.path().join("gateway.yaml"),
+                    crate::assets::GATEWAY_YAML,
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(outside.path(), config_root.join("tirith")).unwrap();
+                let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &config_root);
+
+                for dry_run in [false, true] {
+                    let result = copy_gateway_config(false, dry_run);
+                    assert!(
+                        result.is_err(),
+                        "dry_run={dry_run} bypassed parent validation"
+                    );
+                }
+            });
+        }
 
         #[cfg(unix)]
         fn write_executable(path: &Path, content: &str) {

@@ -1,4 +1,3 @@
-use std::fs;
 use std::process::Command;
 
 const BEGIN_MARKER: &str = "# BEGIN tirith-guard v1";
@@ -34,12 +33,8 @@ pub fn offer_zshenv_guard(
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let zshenv_path = home.join(".zshenv");
 
-    let existing = if zshenv_path.exists() {
-        fs::read_to_string(&zshenv_path)
-            .map_err(|e| format!("read {}: {e}", zshenv_path.display()))?
-    } else {
-        String::new()
-    };
+    let existing =
+        super::fs_helpers::read_to_string_scoped(&zshenv_path, &home)?.unwrap_or_default();
 
     let begin_count = existing
         .lines()
@@ -453,6 +448,23 @@ mod tests {
 
                 let zshenv = home.join(".zshenv");
                 assert!(!zshenv.exists(), "dry-run should not create file");
+            });
+        }
+
+        #[test]
+        fn up_to_date_and_dry_run_refuse_symlinked_zshenv() {
+            with_fake_home(|home| {
+                let outside = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(outside.path(), "outside-profile").unwrap();
+                std::os::unix::fs::symlink(outside.path(), home.join(".zshenv")).unwrap();
+
+                let result = offer_zshenv_guard(true, false, true, "tirith");
+
+                assert!(result.is_err());
+                assert_eq!(
+                    std::fs::read_to_string(outside.path()).unwrap(),
+                    "outside-profile"
+                );
             });
         }
 

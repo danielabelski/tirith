@@ -4,8 +4,8 @@ pub(crate) enum AclSource {
     OwnerOnly,
 }
 
-pub(crate) fn acl_source(destination_exists: bool) -> AclSource {
-    if destination_exists {
+pub(crate) fn acl_source(destination_exists: bool, preserve_destination_dacl: bool) -> AclSource {
+    if destination_exists && preserve_destination_dacl {
         AclSource::ExistingDestination
     } else {
         AclSource::OwnerOnly
@@ -65,8 +65,9 @@ mod tests {
 
     #[test]
     fn acl_policy_preserves_existing_and_hardens_new_files() {
-        assert_eq!(acl_source(true), AclSource::ExistingDestination);
-        assert_eq!(acl_source(false), AclSource::OwnerOnly);
+        assert_eq!(acl_source(true, true), AclSource::ExistingDestination);
+        assert_eq!(acl_source(false, true), AclSource::OwnerOnly);
+        assert_eq!(acl_source(true, false), AclSource::OwnerOnly);
     }
 
     #[test]
