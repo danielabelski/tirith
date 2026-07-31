@@ -745,17 +745,12 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
 /// fields it needs without re-reading the file. `Ok(None)` means there is no
 /// recent trigger on disk (missing file); `Err` is a real read/parse failure.
 fn load_last_trigger_value() -> Result<Option<serde_json::Value>, String> {
-    let data_dir = tirith_core::policy::data_dir()
-        .ok_or_else(|| "cannot determine data directory".to_string())?;
-    let path = data_dir.join("last_trigger.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content =
-        fs::read_to_string(&path).map_err(|e| format!("failed to read last trigger: {e}"))?;
-    let val: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("failed to parse last trigger: {e}"))?;
-    Ok(Some(val))
+    super::last_trigger::load_last_trigger_record()?
+        .map(|record| {
+            serde_json::to_value(record)
+                .map_err(|e| format!("failed to project structured last trigger: {e}"))
+        })
+        .transpose()
 }
 
 /// Extract `(target, rule_id)` PAIRS from a parsed `last_trigger.json`.
