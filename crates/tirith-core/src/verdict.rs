@@ -738,10 +738,10 @@ pub enum RuleId {
     /// silently widening the agent's blast radius. Only ADDED lines fire.
     AiConfigToolUseEscalation,
 
-    // Cross-event correlation rules (W7). Fire from `correlate_session` over a
-    // bounded per-session ring of typed events recorded AFTER each verdict is
-    // finalized (`crate::event_buffer`, `crate::session_warnings`), NOT from the
-    // `analyze` hot path. They reason about "A THEN B within a window" sequences,
+    // Cross-event correlation rules (W7). Fire over a bounded per-session ring of
+    // confirmed executed events plus a provisional current event
+    // (`crate::event_buffer`, `crate::session_warnings`), NOT from the `analyze`
+    // hot path. They reason about "A THEN B within a window" sequences,
     // so no single input ever triggers them; like the M11/M12/M13 rules above they
     // have NO PATTERN_TABLE entry and live in `EXTERNALLY_TRIGGERED_RULES`.
     // Unit-tested in `event_buffer.rs`.

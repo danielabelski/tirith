@@ -3,9 +3,9 @@
 //! This module is PURE: it performs no I/O, reads no clock of its own, and
 //! touches no global state. Callers (see [`crate::session_warnings`]) own the
 //! buffer's persistence and pass the current time in explicitly. That keeps the
-//! correlation logic trivially testable and keeps it OFF the hot path: events
-//! are recorded after a verdict is finalized, and correlation runs only when a
-//! session-level consumer asks for it, never during tier-1/2/3 analysis.
+//! correlation logic trivially testable and keeps it OFF the hot path: confirmed
+//! executions are persisted after caller completion, while pre-execution checks
+//! correlate a provisional current event without recording it.
 //!
 //! The correlations here are "A THEN B within a window" patterns: behaviours
 //! that are individually unremarkable but, in sequence and close in time, look

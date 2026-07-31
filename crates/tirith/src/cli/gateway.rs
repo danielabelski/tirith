@@ -18,7 +18,7 @@ use tirith_core::mcp::response_inspect::{self, InspectOutcome, ResponseKind};
 use tirith_core::mcp::types::{ContentItem, JsonRpcError, JsonRpcResponse, ToolCallResult};
 use tirith_core::policy::GatewayProfile;
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{Action, Finding};
+use tirith_core::verdict::{Action, Finding, Verdict};
 
 /// Per-run gateway options (CLI surface). M7 ch4: `filter_output` (opt-in,
 /// default `false`) routes every guarded-tool response's `result.content`
@@ -533,6 +533,31 @@ struct PendingPayload {
     /// the matching response can validate `result.structuredContent` against that
     /// tool's cached `outputSchema`. `None` for any non-`tools/call` request.
     tool_name: Option<String>,
+    /// W7: provisional command state to commit only when a matching upstream
+    /// response confirms that this guarded request completed. Passthrough
+    /// requests carry `None`; notifications have no response lifecycle and are
+    /// intentionally never recorded as confirmed executions.
+    execution: Option<PendingExecution>,
+}
+
+/// Everything needed to finalize typed session events after an upstream response.
+#[derive(Debug, Clone)]
+struct PendingExecution {
+    verdict: Verdict,
+    policy: tirith_core::policy::Policy,
+    command: String,
+    session_id: String,
+}
+
+impl PendingExecution {
+    fn record(&self) {
+        tirith_core::escalation::record_executed_verdict_events(
+            &self.verdict,
+            &self.policy,
+            &self.command,
+            &self.session_id,
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1729,7 +1754,6 @@ fn handle_guarded_call(
                     tirith_core::escalation::CallerContext::Gateway,
                 )
             };
-
             let should_deny = match effective.action {
                 Action::Block => true,
                 Action::Warn | Action::WarnAck => config.policy.warn_action == "deny",
@@ -1785,6 +1809,12 @@ fn handle_guarded_call(
                     // C2 — record the tool so the response can validate its
                     // `structuredContent` against the cached `outputSchema`.
                     tool_name: Some(tool_name.to_string()),
+                    execution: Some(PendingExecution {
+                        verdict: effective.clone(),
+                        policy: engine_policy.clone(),
+                        command: command.to_string(),
+                        session_id: session_id.clone(),
+                    }),
                 };
                 let outcome = match pending.lock() {
                     Ok(mut table) => table.register(direction, id.clone(), payload),
@@ -1993,6 +2023,9 @@ fn handle_guarded_notification(
                     tirith_core::escalation::CallerContext::Gateway,
                 )
             };
+            // A JSON-RPC notification has no response, so the gateway cannot
+            // confirm completion. Keep its W7 events provisional only; unlike the
+            // request path, there is no pending-response record to finalize.
 
             let should_deny = match effective.action {
                 Action::Block => true,
@@ -2451,6 +2484,7 @@ fn register_passthrough_request(
                 filter: false,
                 inspect_kind,
                 tool_name,
+                execution: None,
             },
         );
     }
@@ -2504,106 +2538,125 @@ fn handle_upstream_response(
     };
 
     match matched {
-        Some(m) => match m.disposition {
-            ResponseDisposition::Live => {
-                // C4 — a listing/reading response (tools/list, resources/list,
-                // resources/read, resources/templates/list, prompts/list,
-                // prompts/get): inspect + filter it through `response_inspect`
-                // (under `--filter-output`), mirroring the C2 tool-call path.
-                // A passthrough never carries warn findings, so this branch is
-                // self-contained.
-                if let (true, Some(kind)) = (filter_output, m.payload.inspect_kind) {
-                    let id = resp_id.clone();
-                    return Some(apply_response_inspection(
-                        parsed,
-                        line,
-                        &id,
-                        kind,
-                        fail_mode_closed,
-                        filter_ctx,
-                        descriptor_lock,
-                        schema_cache,
-                    ));
+        Some(m) => {
+            // A matching response carrying `result` is the gateway's first
+            // confirmation that the forwarded tool request was processed. A
+            // JSON-RPC `error` only proves protocol-level rejection and must not
+            // create executed history. Commit before response filtering (which can
+            // replace/drop presentation bytes but cannot undo upstream effects).
+            // Tool-level `isError` still arrives inside `result` and is committed:
+            // the tool ran and may have produced partial effects. Late result
+            // responses confirm processing too.
+            if parsed.get("result").is_some() {
+                if let Some(execution) = &m.payload.execution {
+                    execution.record();
                 }
+            }
+            match m.disposition {
+                ResponseDisposition::Live => {
+                    // C4 — a listing/reading response (tools/list, resources/list,
+                    // resources/read, resources/templates/list, prompts/list,
+                    // prompts/get): inspect + filter it through `response_inspect`
+                    // (under `--filter-output`), mirroring the C2 tool-call path.
+                    // A passthrough never carries warn findings, so this branch is
+                    // self-contained.
+                    if let (true, Some(kind)) = (filter_output, m.payload.inspect_kind) {
+                        let id = resp_id.clone();
+                        return Some(apply_response_inspection(
+                            parsed,
+                            line,
+                            &id,
+                            kind,
+                            fail_mode_closed,
+                            filter_ctx,
+                            descriptor_lock,
+                            schema_cache,
+                        ));
+                    }
 
-                // C2 — a `tools/call` response: validate `result.structuredContent`
-                // against the tool's cached `outputSchema` BEFORE the output filter.
-                // A structured output that violates a VALID outputSchema is blocked
-                // (a server returning off-contract structured data is a tampering /
-                // confused-deputy signal). Only under `--filter-output`, and only
-                // when the request recorded a tool name (a `tools/call`).
-                if filter_output {
-                    if let Some(tool_name) = m.payload.tool_name.as_deref() {
-                        if let Some(result) = parsed.get("result") {
-                            if let Some(why) =
-                                check_response_output_schema(schema_cache, tool_name, result)
-                            {
-                                eprintln!(
+                    // C2 — a `tools/call` response: validate `result.structuredContent`
+                    // against the tool's cached `outputSchema` BEFORE the output filter.
+                    // A structured output that violates a VALID outputSchema is blocked
+                    // (a server returning off-contract structured data is a tampering /
+                    // confused-deputy signal). Only under `--filter-output`, and only
+                    // when the request recorded a tool name (a `tools/call`).
+                    if filter_output {
+                        if let Some(tool_name) = m.payload.tool_name.as_deref() {
+                            if let Some(result) = parsed.get("result") {
+                                if let Some(why) =
+                                    check_response_output_schema(schema_cache, tool_name, result)
+                                {
+                                    eprintln!(
                                     "tirith gateway: tool {tool_name:?} structuredContent violates \
                                      outputSchema: {why}"
                                 );
-                                write_schema_audit(
-                                    "output_schema",
-                                    "block",
-                                    tool_name,
-                                    "structured_content_invalid",
-                                );
-                                return Some(
-                                    build_schema_block(
-                                        resp_id.clone(),
-                                        &format!(
+                                    write_schema_audit(
+                                        "output_schema",
+                                        "block",
+                                        tool_name,
+                                        "structured_content_invalid",
+                                    );
+                                    return Some(
+                                        build_schema_block(
+                                            resp_id.clone(),
+                                            &format!(
                                             "Tirith: tool {tool_name:?} structured output violates \
                                              its outputSchema"
                                         ),
-                                        "output_schema_invalid",
-                                    )
-                                    .into_bytes(),
-                                );
+                                            "output_schema_invalid",
+                                        )
+                                        .into_bytes(),
+                                    );
+                                }
                             }
                         }
                     }
-                }
 
-                // On-time response: filter the body (if requested), then augment
-                // residual content with any warn findings. A block from the filter
-                // short-circuits augmentation (the filtered bytes are returned).
-                let after_filter = if filter_output && m.payload.filter {
-                    apply_output_filter_to_response(parsed.clone(), fail_mode_closed, filter_ctx)
-                } else {
-                    None
-                };
-                match after_filter {
-                    Some(filtered) => {
-                        // Re-augment the filtered bytes (warn findings still apply
-                        // to whatever content survived the filter).
-                        Some(augment_response_bytes(filtered, &m.payload.findings))
-                    }
-                    None => Some(augment_response_bytes(line, &m.payload.findings)),
-                }
-            }
-            ResponseDisposition::Late => {
-                // Late response after a timeout/cancel tombstone. Per policy:
-                // fail-closed blocks (replace with a deny envelope keyed to the
-                // same id), fail-open drops. Either way the raw upstream bytes are
-                // never forwarded unfiltered — this is the anti-"delete-then-allow"
-                // guarantee.
-                write_pending_lifecycle_audit("late_response_after_timeout", 1);
-                if fail_mode_closed {
-                    Some(
-                        build_fail_mode_deny(
-                            resp_id.clone(),
-                            "response arrived after analysis deadline",
-                            0.0,
-                            true,
-                            true,
+                    // On-time response: filter the body (if requested), then augment
+                    // residual content with any warn findings. A block from the filter
+                    // short-circuits augmentation (the filtered bytes are returned).
+                    let after_filter = if filter_output && m.payload.filter {
+                        apply_output_filter_to_response(
+                            parsed.clone(),
+                            fail_mode_closed,
+                            filter_ctx,
                         )
-                        .into_bytes(),
-                    )
-                } else {
-                    None
+                    } else {
+                        None
+                    };
+                    match after_filter {
+                        Some(filtered) => {
+                            // Re-augment the filtered bytes (warn findings still apply
+                            // to whatever content survived the filter).
+                            Some(augment_response_bytes(filtered, &m.payload.findings))
+                        }
+                        None => Some(augment_response_bytes(line, &m.payload.findings)),
+                    }
+                }
+                ResponseDisposition::Late => {
+                    // Late response after a timeout/cancel tombstone. Per policy:
+                    // fail-closed blocks (replace with a deny envelope keyed to the
+                    // same id), fail-open drops. Either way the raw upstream bytes are
+                    // never forwarded unfiltered — this is the anti-"delete-then-allow"
+                    // guarantee.
+                    write_pending_lifecycle_audit("late_response_after_timeout", 1);
+                    if fail_mode_closed {
+                        Some(
+                            build_fail_mode_deny(
+                                resp_id.clone(),
+                                "response arrived after analysis deadline",
+                                0.0,
+                                true,
+                                true,
+                            )
+                            .into_bytes(),
+                        )
+                    } else {
+                        None
+                    }
                 }
             }
-        },
+        }
         None => {
             // Unknown id: no outstanding request matches this response. A fabricated
             // / unsolicited upstream response is the threat. Audit; strict-block
@@ -4700,6 +4753,7 @@ policy:
                 filter: false,
                 inspect_kind: None,
                 tool_name: None,
+                execution: None,
             },
         );
         assert_eq!(outcome, RegisterOutcome::Registered);
@@ -4715,6 +4769,7 @@ policy:
                 filter: true,
                 inspect_kind: None,
                 tool_name: None,
+                execution: None,
             },
         );
         assert_eq!(outcome, RegisterOutcome::Registered);
@@ -4730,6 +4785,7 @@ policy:
                 filter: false,
                 inspect_kind: Some(kind),
                 tool_name: None,
+                execution: None,
             },
         );
         assert_eq!(outcome, RegisterOutcome::Registered);
@@ -6052,6 +6108,7 @@ policy:
             filter: true,
             inspect_kind: None,
             tool_name: Some("calc".to_string()),
+            execution: None,
         };
         pending
             .lock()
@@ -6098,6 +6155,7 @@ policy:
             filter: true,
             inspect_kind: None,
             tool_name: Some("calc".to_string()),
+            execution: None,
         };
         pending
             .lock()
@@ -6172,6 +6230,7 @@ policy:
                     filter: false,
                     inspect_kind: None,
                     tool_name: None,
+                    execution: None,
                 }
             ),
             RegisterOutcome::Registered
@@ -6185,6 +6244,7 @@ policy:
                     filter: false,
                     inspect_kind: None,
                     tool_name: None,
+                    execution: None,
                 }
             ),
             RegisterOutcome::DuplicateActive
@@ -6248,6 +6308,7 @@ policy:
                 filter: true,
                 inspect_kind: None,
                 tool_name: None,
+                execution: None,
             },
         );
         // Deadline 0 -> the entry is immediately expired.
@@ -6367,6 +6428,7 @@ policy:
                 filter: false,
                 inspect_kind: None,
                 tool_name: None,
+                execution: None,
             },
         );
         table.register(
@@ -6377,6 +6439,7 @@ policy:
                 filter: false,
                 inspect_kind: None,
                 tool_name: None,
+                execution: None,
             },
         );
         assert_eq!(table.len(), 2, "distinct keys per direction");
@@ -6404,6 +6467,7 @@ policy:
                     filter: false,
                     inspect_kind: None,
                     tool_name: None,
+                    execution: None,
                 }
             ),
             RegisterOutcome::Registered
@@ -6422,6 +6486,7 @@ policy:
             filter: false,
             inspect_kind: None,
             tool_name: None,
+            execution: None,
         };
         // Two entries, both timed out into tombstones.
         table.register(Direction::ClientToUpstream, Value::from("t1"), payload());

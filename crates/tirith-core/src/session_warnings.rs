@@ -59,14 +59,16 @@ pub struct SessionWarnings {
     #[serde(default)]
     pub cooldowns: std::collections::BTreeMap<String, String>,
     /// W7: bounded ring of typed events for cross-event correlation. Recorded
-    /// AFTER each verdict is finalized (only for security-relevant signals), and
-    /// consumed by [`correlate_session`]. Off the hot path; capped to
-    /// [`MAX_TYPED_EVENTS`].
+    /// only after the caller confirms execution (and only for security-relevant
+    /// signals); pre-execution checks use a provisional, non-persisted event view.
+    /// Off the hot path; capped to [`MAX_TYPED_EVENTS`].
     #[serde(default)]
     pub typed_events: VecDeque<crate::event_buffer::TypedEvent>,
-    /// W7: signatures of correlation hits already surfaced this session, so a hit
-    /// whose A-then-B pair (or delete burst) is still inside its window on the next
-    /// command is surfaced exactly once. Expired in LOCKSTEP with the event window:
+    /// W7: signatures of correlation hits already added to session warning
+    /// presentation/accounting, so a hit whose A-then-B pair (or delete burst) is
+    /// still inside its window is counted there exactly once. Enforcement ignores
+    /// this de-dup set and evaluates every provisional attempt. Expired in LOCKSTEP
+    /// with the event window:
     /// a signature is retained while ANY of its source event timestamps remain among
     /// the live [`typed_events`](Self::typed_events), and dropped once they have all
     /// aged out (see [`correlate_session`]). [`MAX_SURFACED_CORRELATIONS`] is only a
@@ -445,16 +447,74 @@ pub fn record_escalation_event(session_id: &str, hits: &[crate::escalation::Esca
     });
 }
 
-/// W7: append a typed event to the session's correlation ring. Called AFTER a
-/// verdict is finalized, ONLY for security-relevant signals (never for a clean
-/// Allow with no findings). Best-effort and off the hot path; the ring is capped
-/// to [`MAX_TYPED_EVENTS`] (oldest dropped first).
+/// W7: append a typed event to the session's correlation ring. Production callers
+/// should prefer [`record_executed_typed_events`] so events are appended only after
+/// execution is confirmed. This single-event helper remains for focused recorders
+/// and compatibility. Best-effort and off the hot path; the ring is capped to
+/// [`MAX_TYPED_EVENTS`] (oldest dropped first).
 pub fn record_typed_event(session_id: &str, event: crate::event_buffer::TypedEvent) {
     with_session_locked(session_id, move |session| {
         session.typed_events.push_back(event);
         while session.typed_events.len() > MAX_TYPED_EVENTS {
             session.typed_events.pop_front();
         }
+    });
+}
+
+/// W7: correlate the persisted ring plus `provisional_events` without persisting
+/// those events or changing presentation de-duplication state.
+///
+/// This is the enforcement-time view used before a caller knows whether the
+/// current command will execute. Every matching hit is returned, including one
+/// whose signature was already surfaced: [`SessionWarnings::surfaced_correlations`]
+/// is a presentation/accounting de-duplication mechanism and must never suppress
+/// a blocking decision. The session lock keeps this read consistent with a
+/// concurrent confirmed-execution append.
+pub fn correlate_session_with_provisional(
+    session_id: &str,
+    provisional_events: &[crate::event_buffer::TypedEvent],
+) -> Vec<crate::event_buffer::CorrelationHit> {
+    if provisional_events.is_empty() {
+        return Vec::new();
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    with_session_locked_result(session_id, false, |session| {
+        let mut events: Vec<crate::event_buffer::TypedEvent> =
+            session.typed_events.iter().cloned().collect();
+        events.extend_from_slice(provisional_events);
+        crate::event_buffer::correlate(&events, &now)
+    })
+    .unwrap_or_default()
+}
+
+/// W7: commit typed events only after the caller has confirmed that the command
+/// executed. The append, correlation presentation marker, and corresponding
+/// warning event are one locked, crash-atomic session mutation.
+///
+/// Enforcement does not depend on the fresh-hit result here: it already ran via
+/// [`correlate_session_with_provisional`]. This mutation only records confirmed
+/// history and de-duplicates later presentation/accounting of the same sequence.
+pub fn record_executed_typed_events(
+    session_id: &str,
+    events: Vec<crate::event_buffer::TypedEvent>,
+    cmd: &str,
+    policy: &crate::policy::Policy,
+    dlp_patterns: &[String],
+) {
+    if events.is_empty() {
+        return;
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
+    let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
+    with_session_locked(session_id, move |session| {
+        session.typed_events.extend(events);
+        while session.typed_events.len() > MAX_TYPED_EVENTS {
+            session.typed_events.pop_front();
+        }
+        record_fresh_correlation_warnings(session, &now, &command_redacted, policy);
     });
 }
 
@@ -496,70 +556,72 @@ pub fn correlate_session(
     // (mirrors `record_outcome`); it is identical for every hit this call surfaces.
     let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
     let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
-    let mut fresh = Vec::new();
-    with_session_locked(session_id, |session| {
-        let events: Vec<crate::event_buffer::TypedEvent> =
-            session.typed_events.iter().cloned().collect();
-        let already: std::collections::HashSet<&str> = session
+    with_session_locked_result(session_id, true, |session| {
+        record_fresh_correlation_warnings(session, &now, &command_redacted, policy)
+    })
+    .unwrap_or_default()
+}
+
+/// Correlate the persisted ring and atomically record only fresh presentation /
+/// accounting entries. The complete hit set remains available to the provisional
+/// enforcement path above; this helper intentionally returns only fresh hits for
+/// the legacy `correlate_session` API.
+fn record_fresh_correlation_warnings(
+    session: &mut SessionWarnings,
+    now: &str,
+    command_redacted: &str,
+    policy: &crate::policy::Policy,
+) -> Vec<crate::event_buffer::CorrelationHit> {
+    let events: Vec<crate::event_buffer::TypedEvent> =
+        session.typed_events.iter().cloned().collect();
+    let already: std::collections::HashSet<&str> = session
+        .surfaced_correlations
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let hits = crate::event_buffer::correlate(&events, now);
+    let new_hits: Vec<crate::event_buffer::CorrelationHit> = hits
+        .into_iter()
+        .filter(|h| !already.contains(h.signature.as_str()))
+        .collect();
+    drop(already);
+
+    for hit in &new_hits {
+        session
             .surfaced_correlations
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let hits = crate::event_buffer::correlate(&events, &now);
-        // Collect fresh hits (signature not yet surfaced) without mutating the
-        // session while `already` still borrows it.
-        let new_hits: Vec<crate::event_buffer::CorrelationHit> = hits
-            .into_iter()
-            .filter(|h| !already.contains(h.signature.as_str()))
-            .collect();
-        drop(already);
-        for hit in new_hits {
-            // Mark the signature surfaced AND append the warning event in the same
-            // locked mutation, so the two can never diverge.
-            session
-                .surfaced_correlations
-                .push_back(hit.signature.clone());
-            // Persist the POST-override (effective) severity, matching the verdict.
-            let severity = policy
-                .severity_override(&hit.rule_id)
-                .unwrap_or(hit.severity);
-            session.events.push_back(WarningEvent {
-                timestamp: now.clone(),
-                rule_id: hit.rule_id.to_string(),
-                severity: severity.to_string(),
-                title: crate::util::truncate_bytes(&hit.title, 120),
-                command_redacted: command_redacted.clone(),
-                domains: Vec::new(),
-            });
-            session.total_warnings = session.total_warnings.saturating_add(1);
-            fresh.push(hit);
-        }
-        // Expire surfaced-correlation markers in LOCKSTEP with the event window
-        // rather than by an independent smaller cap. A correlation can only re-fire
-        // while the events that produced it are still in `typed_events`; its
-        // signature embeds exactly those source timestamps. So a marker is safe to
-        // drop only once NONE of its source timestamps remain among the live typed
-        // events: until then it must stay to keep the hit deduped. (A smaller
-        // independent cap evicted markers whose source events were still in-window,
-        // letting the same correlation re-emit and double-count.) `MAX_SURFACED_
-        // CORRELATIONS` remains as a generous pathological-growth backstop only.
-        let live_stamps: std::collections::HashSet<&str> = session
-            .typed_events
-            .iter()
-            .map(|e| e.timestamp.as_str())
-            .collect();
-        session.surfaced_correlations.retain(|sig| {
-            crate::event_buffer::signature_event_timestamps(sig).any(|ts| live_stamps.contains(ts))
+            .push_back(hit.signature.clone());
+        let severity = policy
+            .severity_override(&hit.rule_id)
+            .unwrap_or(hit.severity);
+        session.events.push_back(WarningEvent {
+            timestamp: now.to_string(),
+            rule_id: hit.rule_id.to_string(),
+            severity: severity.to_string(),
+            title: crate::util::truncate_bytes(&hit.title, 120),
+            command_redacted: command_redacted.to_string(),
+            domains: Vec::new(),
         });
-        drop(live_stamps);
-        while session.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS {
-            session.surfaced_correlations.pop_front();
-        }
-        while session.events.len() > MAX_EVENTS {
-            session.events.pop_front();
-        }
+        session.total_warnings = session.total_warnings.saturating_add(1);
+    }
+
+    // Expire presentation markers in lockstep with the persisted event window.
+    let live_stamps: std::collections::HashSet<&str> = session
+        .typed_events
+        .iter()
+        .map(|e| e.timestamp.as_str())
+        .collect();
+    session.surfaced_correlations.retain(|sig| {
+        crate::event_buffer::signature_event_timestamps(sig).any(|ts| live_stamps.contains(ts))
     });
-    fresh
+    drop(live_stamps);
+    while session.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS {
+        session.surfaced_correlations.pop_front();
+    }
+    while session.events.len() > MAX_EVENTS {
+        session.events.pop_front();
+    }
+
+    new_hits
 }
 
 /// Shared atomic lock-read-modify-write: take an exclusive cross-process lock on a
@@ -582,14 +644,19 @@ fn with_session_locked<F>(session_id: &str, mutate: F)
 where
     F: FnOnce(&mut SessionWarnings),
 {
-    let path = match session_state_path(session_id) {
-        Some(p) => p,
-        None => return,
-    };
-    let lock_path = match session_lock_path(session_id) {
-        Some(p) => p,
-        None => return,
-    };
+    let _ = with_session_locked_result(session_id, true, mutate);
+}
+
+/// Locked session access shared by mutations and the provisional read. When
+/// `persist` is false, the closure's view is protected by the same lock as writers
+/// but no session JSON is replaced; this prevents a check-only command from
+/// creating persisted execution history.
+fn with_session_locked_result<R, F>(session_id: &str, persist: bool, access: F) -> Option<R>
+where
+    F: FnOnce(&mut SessionWarnings) -> R,
+{
+    let path = session_state_path(session_id)?;
+    let lock_path = session_lock_path(session_id)?;
 
     if let Some(parent) = path.parent() {
         // Create sessions/ and, only if THIS call created it, fsync the grandparent
@@ -600,7 +667,7 @@ where
                 "tirith: session: cannot create state dir {}: {e}",
                 parent.display()
             ));
-            return;
+            return None;
         }
     }
 
@@ -615,7 +682,7 @@ where
                     "tirith: session: refusing to follow symlink at {}",
                     path.display()
                 ));
-                return;
+                return None;
             }
             _ => {}
         }
@@ -633,7 +700,7 @@ where
                     "tirith: session: refusing to follow symlink at lock {}",
                     lock_path.display()
                 ));
-                return;
+                return None;
             }
             _ => {}
         }
@@ -660,7 +727,7 @@ where
                 "tirith: session: cannot open lock {}; escalation may be impaired: {e}",
                 lock_path.display()
             ));
-            return;
+            return None;
         }
     };
     let locked = lock_file.lock_exclusive().is_ok() || lock_file.try_lock_exclusive().is_ok();
@@ -669,7 +736,7 @@ where
             "tirith: session: cannot lock {}; recording skipped",
             lock_path.display()
         ));
-        return;
+        return None;
     }
 
     // Read the existing session WHILE holding the lock, via the no-follow + regular-
@@ -687,7 +754,7 @@ where
                 "tirith: session: refusing non-regular, oversized, or unreadable {}; recording skipped",
                 path.display()
             ));
-            return;
+            return None;
         }
     };
     // Parse the bytes DIRECTLY (serde_json::from_slice), exactly as `load()` does, so
@@ -705,7 +772,12 @@ where
         })
     };
 
-    mutate(&mut session);
+    let result = access(&mut session);
+
+    if !persist {
+        let _ = fs2::FileExt::unlock(&lock_file);
+        return Some(result);
+    }
 
     let json = match serde_json::to_string(&session) {
         Ok(j) => j,
@@ -714,7 +786,11 @@ where
                 "tirith: session: failed to serialize warnings: {e}"
             ));
             let _ = fs2::FileExt::unlock(&lock_file);
-            return;
+            // The caller's computed result is still valid even though the
+            // best-effort presentation/accounting mutation could not persist.
+            // In particular, never turn an enforcement hit into an empty result
+            // merely because session serialization failed.
+            return Some(result);
         }
     };
 
@@ -728,6 +804,7 @@ where
     let _ = fs2::FileExt::unlock(&lock_file);
 
     opportunistic_gc();
+    Some(result)
 }
 
 /// Crash-atomically replace the session file at `path` with `bytes`: write to a temp

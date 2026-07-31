@@ -362,6 +362,9 @@ pub fn run(
         &session_id,
         CallerContext::Cli,
     );
+    // `tirith check` is a preflight/diagnostic boundary: a zero exit only permits
+    // the shell or caller to execute later, and this process never observes that
+    // outcome. Do not call `record_executed_verdict_events` here.
 
     let event_id = uuid::Uuid::new_v4().to_string();
     // Best-effort audit: a write failure must not change the exit code.

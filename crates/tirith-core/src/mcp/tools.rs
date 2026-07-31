@@ -241,6 +241,8 @@ fn call_check_command(args: &Value) -> ToolCallResult {
             &session_id,
             crate::escalation::CallerContext::McpServer,
         )
+        // This MCP tool reports a check result; it does not execute `command`, so
+        // it must not finalize typed execution events.
     };
 
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);

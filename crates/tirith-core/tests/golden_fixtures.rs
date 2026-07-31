@@ -1012,8 +1012,9 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "ai_config_tool_use_escalation",
     // W7: cross-event correlation rules fire only from `correlate_session` over a
     // bounded per-session typed-event ring (`crate::event_buffer`), which
-    // `post_process_verdict` consumes after each finalized verdict, never from
-    // the `analyze` hot path. They match "A THEN B within a window" sequences, so
+    // `post_process_verdict` reads with a provisional current event; confirmed
+    // callers persist executed events separately. It never runs from the
+    // `analyze` hot path. They match "A THEN B within a window" sequences, so
     // no single fixture input can trigger them. Covered by unit tests in
     // `event_buffer.rs` and the two-command integration test
     // `correlation_secret_write_then_network_reaches_verdict` in escalation.rs.
