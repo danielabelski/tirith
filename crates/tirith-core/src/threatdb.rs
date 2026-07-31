@@ -2512,25 +2512,27 @@ struct CanonicalPkgClaim<'a> {
 }
 
 /// Total, semantic ordering for evidence attached to claims of the same
-/// canonical package. Broader all-version scope wins first; within one scope,
-/// stronger confidence and then an actual reference win. Source, reference,
-/// and raw spelling are final deterministic tie-breakers and always move as one
-/// evidence unit.
+/// canonical package. Among claims that actually participate in the requested
+/// version assessment, stronger confidence wins before breadth of scope. This
+/// prevents a weaker all-version claim from downgrading an overlapping
+/// confirmed exact-version claim. An actual reference, source, reference value,
+/// and raw spelling are deterministic tie-breakers; all metadata always moves
+/// as one evidence unit.
 fn pkg_claim_metadata_cmp(
     left: &CanonicalPkgClaim<'_>,
     right: &CanonicalPkgClaim<'_>,
 ) -> std::cmp::Ordering {
     (
-        left.all_versions_malicious,
         left.confidence,
+        left.all_versions_malicious,
         left.reference_url.is_some(),
         left.source.as_str(),
         left.reference_url.unwrap_or(""),
         left.metadata_name,
     )
         .cmp(&(
-            right.all_versions_malicious,
             right.confidence,
+            right.all_versions_malicious,
             right.reference_url.is_some(),
             right.source.as_str(),
             right.reference_url.unwrap_or(""),
@@ -2540,16 +2542,16 @@ fn pkg_claim_metadata_cmp(
 
 fn threat_summary_cmp(left: &ThreatMatchSummary, right: &ThreatMatchSummary) -> std::cmp::Ordering {
     (
-        left.all_versions_malicious,
         left.confidence,
+        left.all_versions_malicious,
         left.reference_url.is_some(),
         left.source_id.as_str(),
         left.reference_url.as_deref().unwrap_or(""),
         left.name.as_str(),
     )
         .cmp(&(
-            right.all_versions_malicious,
             right.confidence,
+            right.all_versions_malicious,
             right.reference_url.is_some(),
             right.source_id.as_str(),
             right.reference_url.as_deref().unwrap_or(""),
@@ -4412,7 +4414,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_canonical_group_keeps_all_version_scope_metadata_in_both_orders() {
+    fn v1_canonical_group_ranks_confidence_before_breadth_in_both_orders() {
         let key = SigningKey::from_bytes(&[21u8; 32]);
         for all_versions_first in [false, true] {
             let mut writer = ThreatDbWriter::new(1_700_000_000, 47);
@@ -4424,7 +4426,7 @@ mod tests {
                     ThreatSource::OssfMalicious,
                     Confidence::Confirmed,
                     false,
-                    Some("https://example.invalid/specific"),
+                    Some("https://osv.dev/vulnerability/MAL-2026-0001"),
                 );
             };
             let add_all = |writer: &mut ThreatDbWriter| {
@@ -4453,6 +4455,37 @@ mod tests {
             )
             .expect("load v1");
 
+            // Both physical records participate for 1.0. The confirmed exact
+            // claim must win over the broader Medium claim without mixing any
+            // of their source/scope/reference metadata.
+            let matched = db
+                .check_package(Ecosystem::PyPI, "scope-pkg", Some("1.0"))
+                .expect("overlapping exact canonical match");
+            assert!(!matched.all_versions_malicious);
+            assert_eq!(matched.confidence, Confidence::Confirmed);
+            assert_eq!(matched.source, ThreatSource::OssfMalicious);
+            assert_eq!(
+                matched.reference_url.as_deref(),
+                Some("https://osv.dev/vulnerability/MAL-2026-0001")
+            );
+
+            let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
+                Ecosystem::PyPI,
+                "scope-pkg",
+                &VersionIntent::Exact("1.0".to_string()),
+            ) else {
+                panic!("expected overlapping exact assessment");
+            };
+            assert!(!summary.all_versions_malicious);
+            assert_eq!(summary.confidence, Confidence::Confirmed);
+            assert_eq!(summary.source_id, ThreatSource::OssfMalicious.as_str());
+            assert_eq!(
+                summary.reference_url.as_deref(),
+                Some("https://osv.dev/vulnerability/MAL-2026-0001")
+            );
+
+            // The exact claim does not participate for an unrelated version,
+            // so the all-version evidence remains the correct atomic result.
             let matched = db
                 .check_package(Ecosystem::PyPI, "scope-pkg", Some("99.0"))
                 .expect("all-version canonical match");
@@ -4461,6 +4494,21 @@ mod tests {
             assert_eq!(matched.source, ThreatSource::DatadogMalicious);
             assert_eq!(
                 matched.reference_url.as_deref(),
+                Some("https://example.invalid/all")
+            );
+
+            let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
+                Ecosystem::PyPI,
+                "scope-pkg",
+                &VersionIntent::Exact("99.0".to_string()),
+            ) else {
+                panic!("expected unrelated all-version assessment");
+            };
+            assert!(summary.all_versions_malicious);
+            assert_eq!(summary.confidence, Confidence::Medium);
+            assert_eq!(summary.source_id, ThreatSource::DatadogMalicious.as_str());
+            assert_eq!(
+                summary.reference_url.as_deref(),
                 Some("https://example.invalid/all")
             );
         }
