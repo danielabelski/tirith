@@ -1531,7 +1531,12 @@ pub fn parse_finding_id(id: &str) -> Option<(&str, usize)> {
 }
 
 fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
-    let dlp_redacted = crate::redact::redact_with_custom(cmd, custom_patterns);
+    // Redact assignment values across the COMPLETE command before retaining an
+    // audit prefix. Truncating first can preserve the beginning of a short,
+    // non-provider-shaped secret and prevents the canonical shell-assignment
+    // scrubber from seeing the full value boundary. The resulting string is the
+    // only command representation persisted locally or sent to the upload spool.
+    let dlp_redacted = crate::redact::redact_command_text(cmd, custom_patterns);
     let prefix = crate::util::truncate_bytes(&dlp_redacted, 80);
     if prefix.len() == dlp_redacted.len() {
         dlp_redacted
@@ -1562,6 +1567,37 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+    }
+
+    #[test]
+    fn audit_command_redaction_scrubs_assignment_values_before_truncation() {
+        const SECRETS: [&str; 3] = ["hunter2", "short-secret", "tiny-secret"];
+        let commands = [
+            "PASSWORD=hunter2 deploy".to_string(),
+            "env API_TOKEN=short-secret command".to_string(),
+            "$env:SERVICE_KEY = 'tiny-secret'; Invoke-Build".to_string(),
+        ];
+
+        for (command, secret) in commands.iter().zip(SECRETS) {
+            let redacted = redact_command(command, &[]);
+            assert!(
+                redacted.contains("[REDACTED]"),
+                "assignment marker must survive in audit output: {redacted}"
+            );
+            assert!(
+                !redacted.contains(secret),
+                "assignment value leaked into audit output: {redacted}"
+            );
+        }
+
+        // Keep the assignment inside the retained 80-byte prefix while placing
+        // its terminator beyond that boundary. Whole-command redaction must run
+        // first, so no prefix of the value reaches disk or the upload spool.
+        let secret = "boundary-secret-value";
+        let command = format!("{} PASSWORD={secret} deploy", "x".repeat(62));
+        let redacted = redact_command(&command, &[]);
+        assert!(!redacted.contains(secret));
+        assert!(!redacted.contains("boundary-secret"));
     }
 
     #[test]
