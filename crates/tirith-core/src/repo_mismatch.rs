@@ -57,8 +57,18 @@ pub fn verify(repository_url: &str, eco: Ecosystem, name: &str) -> RepoMismatchV
         }
     };
 
+    if let Err(reason) = crate::url_validate::validate_server_url(&raw_url) {
+        return RepoMismatchVerdict {
+            state: RepoMismatchState::Unverifiable,
+            reason: format!("refusing unsafe repo manifest URL: {reason}"),
+        };
+    }
+
     let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
+        .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .redirect(crate::ssrf_guard::server_redirect_policy())
         .build()
     {
         Ok(c) => c,
@@ -151,7 +161,7 @@ fn sanitize_repo_url(url: &str) -> String {
 
 /// A known git host the verifier can fetch a raw manifest from.
 struct KnownGitHost {
-    owner: String,
+    namespace: Vec<String>,
     repo: String,
     kind: HostKind,
 }
@@ -174,25 +184,38 @@ impl KnownGitHost {
 
     fn raw_manifest_url(&self, eco: Ecosystem) -> Option<String> {
         let manifest = manifest_filename(eco)?;
-        // Single candidate to keep network usage minimal; a 404 is treated as
-        // `Unverifiable`, not `Mismatch`.
-        match self.kind {
-            HostKind::GitHub => Some(format!(
-                "https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{manifest}",
-                owner = self.owner,
-                repo = self.repo,
-            )),
-            HostKind::GitLab => Some(format!(
-                "https://gitlab.com/{owner}/{repo}/-/raw/HEAD/{manifest}",
-                owner = self.owner,
-                repo = self.repo,
-            )),
-            HostKind::Bitbucket => Some(format!(
-                "https://bitbucket.org/{owner}/{repo}/raw/HEAD/{manifest}",
-                owner = self.owner,
-                repo = self.repo,
-            )),
+        let base = match self.kind {
+            HostKind::GitHub => "https://raw.githubusercontent.com/",
+            HostKind::GitLab => "https://gitlab.com/",
+            HostKind::Bitbucket => "https://bitbucket.org/",
+        };
+        let mut url = url::Url::parse(base).ok()?;
+        {
+            // `push` percent-encodes each already-validated component, so query
+            // delimiters and path separators can never change request identity.
+            let mut path = url.path_segments_mut().ok()?;
+            path.clear();
+            for segment in &self.namespace {
+                path.push(segment);
+            }
+            path.push(&self.repo);
+            match self.kind {
+                HostKind::GitHub => {
+                    path.push("HEAD");
+                }
+                HostKind::GitLab => {
+                    path.push("-");
+                    path.push("raw");
+                    path.push("HEAD");
+                }
+                HostKind::Bitbucket => {
+                    path.push("raw");
+                    path.push("HEAD");
+                }
+            }
+            path.push(manifest);
         }
+        Some(url.into())
     }
 }
 
@@ -235,24 +258,69 @@ fn manifest_names_package(manifest: &str, name: &str, eco: Ecosystem) -> bool {
 /// Parse `(owner, repo, kind)` from a sanitized URL. Returns `None` when the
 /// URL is not a github/gitlab/bitbucket project URL.
 fn parse_known_git_host(url: &str) -> Option<KnownGitHost> {
-    let (kind, after_host) = if let Some(rest) = url.strip_prefix("https://github.com/") {
-        (HostKind::GitHub, rest)
-    } else if let Some(rest) = url.strip_prefix("http://github.com/") {
-        (HostKind::GitHub, rest)
-    } else if let Some(rest) = url.strip_prefix("https://gitlab.com/") {
-        (HostKind::GitLab, rest)
-    } else if let Some(rest) = url.strip_prefix("http://gitlab.com/") {
-        (HostKind::GitLab, rest)
-    } else if let Some(rest) = url.strip_prefix("https://bitbucket.org/") {
-        (HostKind::Bitbucket, rest)
-    } else {
-        let rest = url.strip_prefix("http://bitbucket.org/")?;
-        (HostKind::Bitbucket, rest)
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let kind = match parsed
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "github.com" => HostKind::GitHub,
+        "gitlab.com" => HostKind::GitLab,
+        "bitbucket.org" => HostKind::Bitbucket,
+        _ => return None,
     };
-    let mut parts = after_host.split('/');
-    let owner = parts.next().filter(|p| !p.is_empty())?.to_string();
-    let repo = parts.next().filter(|p| !p.is_empty())?.to_string();
-    Some(KnownGitHost { owner, repo, kind })
+
+    let mut encoded: Vec<&str> = parsed.path_segments()?.collect();
+    if encoded.last().copied() == Some("") {
+        encoded.pop();
+    }
+    let mut components = Vec::with_capacity(encoded.len());
+    for segment in encoded {
+        if segment.is_empty() {
+            // A trailing empty component was removed above; any other empty
+            // segment changes path identity and is rejected.
+            return None;
+        }
+        let decoded = percent_encoding::percent_decode_str(segment)
+            .decode_utf8()
+            .ok()?;
+        if !valid_repository_component(&decoded) {
+            return None;
+        }
+        components.push(decoded.into_owned());
+    }
+    let repo = components.pop()?;
+    let repo = repo.strip_suffix(".git").unwrap_or(&repo).to_string();
+    if !valid_repository_component(&repo) || components.is_empty() {
+        return None;
+    }
+    if !matches!(kind, HostKind::GitLab) && components.len() != 1 {
+        return None;
+    }
+    Some(KnownGitHost {
+        namespace: components,
+        repo,
+        kind,
+    })
+}
+
+fn valid_repository_component(component: &str) -> bool {
+    !component.is_empty()
+        && component.len() <= 255
+        && !matches!(component, "." | "..")
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
@@ -287,9 +355,25 @@ mod tests {
     fn parse_known_git_host_github() {
         let h =
             parse_known_git_host("https://github.com/owner/repo").expect("github URL must parse");
-        assert_eq!(h.owner, "owner");
+        assert_eq!(h.namespace, ["owner"]);
         assert_eq!(h.repo, "repo");
         assert!(matches!(h.kind, HostKind::GitHub));
+        assert_eq!(
+            h.raw_manifest_url(Ecosystem::Npm).as_deref(),
+            Some("https://raw.githubusercontent.com/owner/repo/HEAD/package.json")
+        );
+    }
+
+    #[test]
+    fn parse_known_git_host_models_gitlab_subgroups() {
+        let h = parse_known_git_host("https://gitlab.com/group/subgroup/repo.git")
+            .expect("GitLab subgroup URL must parse");
+        assert_eq!(h.namespace, ["group", "subgroup"]);
+        assert_eq!(h.repo, "repo");
+        assert_eq!(
+            h.raw_manifest_url(Ecosystem::PyPI).as_deref(),
+            Some("https://gitlab.com/group/subgroup/repo/-/raw/HEAD/pyproject.toml")
+        );
     }
 
     #[test]
@@ -301,6 +385,25 @@ mod tests {
     fn parse_known_git_host_rejects_empty_segments() {
         assert!(parse_known_git_host("https://github.com//repo").is_none());
         assert!(parse_known_git_host("https://github.com/owner/").is_none());
+    }
+
+    #[test]
+    fn parse_known_git_host_rejects_ambiguous_or_unsafe_identity() {
+        for url in [
+            "http://github.com/owner/repo",
+            "https://user@github.com/owner/repo",
+            "https://github.com:444/owner/repo",
+            "https://github.com/owner/repo?raw=/other",
+            "https://github.com/owner/repo/extra",
+            "https://github.com/owner%2Frewrite/repo",
+            "https://github.com/owner/%2E%2E/repo",
+            "https://github.com.evil.invalid/owner/repo",
+        ] {
+            assert!(
+                parse_known_git_host(url).is_none(),
+                "unsafe repository identity must be rejected: {url}"
+            );
+        }
     }
 
     #[test]

@@ -216,6 +216,7 @@ fn download_bounded(
     let redirect_list_clone = redirect_list.clone();
 
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .dns_resolver(crate::ssrf_guard::fetch_resolver())
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if let Ok(mut list) = redirect_list_clone.lock() {

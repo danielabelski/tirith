@@ -61,6 +61,21 @@ const PHISHING_ARMY_URL: &str =
 const PHISHTANK_URL: &str = "https://data.phishtank.com/data/online-valid.csv";
 const TOR_EXIT_URL: &str = "https://check.torproject.org/torbulkexitlist";
 
+fn guarded_http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .dns_resolver(tirith_core::ssrf_guard::ssrf_guard_resolver())
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirect(tirith_core::ssrf_guard::server_redirect_policy())
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))
+}
+
+fn validate_remote_url(url: &str, purpose: &str) -> Result<(), String> {
+    tirith_core::url_validate::validate_server_url(url)
+        .map_err(|reason| format!("refusing unsafe {purpose} URL: {reason}"))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct Manifest {
     sha256: String,
@@ -540,12 +555,8 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
         return Ok(());
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS,
-        ))
-        .build()
-        .map_err(|e| format!("supplemental feed HTTP client error: {e}"))?;
+    let client = guarded_http_client(SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS)
+        .map_err(|e| format!("supplemental feed {e}"))?;
 
     let mut supplemental = SupplementalEntries::default();
     let mut attempted_feeds = 0usize;
@@ -692,6 +703,7 @@ fn fetch_text(client: &reqwest::blocking::Client, url: &str) -> Result<String, S
 
 fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
     let safe = redact_url(url);
+    validate_remote_url(url, "supplemental feed")?;
     let response = client
         .get(url)
         .header(
@@ -1176,10 +1188,16 @@ fn fetch_manifest_from_with_state(
     url: &str,
     state: Option<std::path::PathBuf>,
 ) -> Result<Manifest, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(MANIFEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    validate_remote_url(url, "threat DB manifest")?;
+    let client = guarded_http_client(MANIFEST_TIMEOUT_SECS)?;
+    fetch_manifest_from_with_state_and_client(url, state, &client)
+}
+
+fn fetch_manifest_from_with_state_and_client(
+    url: &str,
+    state: Option<std::path::PathBuf>,
+    client: &reqwest::blocking::Client,
+) -> Result<Manifest, String> {
     let cache_key = manifest_cache_key(url);
     let etag_path = state.as_ref().map(|d| d.join(format!("{cache_key}-etag")));
     let body_path = state.as_ref().map(|d| d.join(format!("{cache_key}-body")));
@@ -1353,10 +1371,8 @@ fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
         ));
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(DB_DOWNLOAD_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    validate_remote_url(url, "threat DB asset")?;
+    let client = guarded_http_client(DB_DOWNLOAD_TIMEOUT_SECS)?;
 
     let resp = client
         .get(url)
@@ -1422,10 +1438,8 @@ fn fetch_index_v2() -> Result<IndexV2, String> {
 /// Fetch and parse a v2 index from one URL (no ETag cache: the index is small
 /// and fetched at most once per update). Size-bounded to [`MAX_MANIFEST_SIZE`].
 fn fetch_index_v2_from(url: &str) -> Result<IndexV2, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(MANIFEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    validate_remote_url(url, "threat DB index")?;
+    let client = guarded_http_client(MANIFEST_TIMEOUT_SECS)?;
     let resp = client
         .get(url)
         .header(
@@ -3916,7 +3930,35 @@ mod tests {
 
     /// Fetch with an isolated state dir so parallel tests don't race on env vars.
     fn fetch_with_state(url: &str, state: &std::path::Path) -> Result<Manifest, String> {
-        super::fetch_manifest_from_with_state(url, Some(state.to_path_buf()))
+        // These tests exercise conditional-GET/cache transport against a private
+        // mock server. Production enters through `fetch_manifest_from_with_state`,
+        // which installs the strict URL/resolver/redirect boundary first.
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test HTTP client");
+        super::fetch_manifest_from_with_state_and_client(url, Some(state.to_path_buf()), &client)
+    }
+
+    #[test]
+    fn production_fetch_paths_reject_private_initial_destinations() {
+        let private = "https://127.0.0.1/threatdb";
+        for error in [
+            super::fetch_manifest_from_with_state(private, None).unwrap_err(),
+            super::download_url(private, 1).unwrap_err(),
+            super::fetch_index_v2_from(private).unwrap_err(),
+        ] {
+            assert!(
+                error.contains("refusing unsafe"),
+                "unexpected error: {error}"
+            );
+        }
+
+        let client = super::guarded_http_client(1).expect("guarded client builds");
+        let error = super::fetch_bytes(&client, private).unwrap_err();
+        assert!(error.contains("refusing unsafe supplemental feed URL"));
     }
 
     #[test]

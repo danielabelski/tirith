@@ -34,6 +34,7 @@ pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFet
     }
 
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))

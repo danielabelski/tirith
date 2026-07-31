@@ -108,6 +108,7 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
     }
 
     let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
         .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
         .timeout(std::time::Duration::from_secs(10))
         // F7: re-validate every redirect target and cap the hop count; the

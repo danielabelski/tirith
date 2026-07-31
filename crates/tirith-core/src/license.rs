@@ -500,6 +500,7 @@ pub fn refresh_from_server(server_url: &str, api_key: &str) -> Result<String, St
 
     let url = format!("{}/api/license/refresh", server_url.trim_end_matches('/'));
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
         .timeout(std::time::Duration::from_secs(30))
         // F7: re-validate every redirect target and cap the hop count; the

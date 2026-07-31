@@ -1165,7 +1165,10 @@ fn fetch_latest_version() -> Result<SemVer, DownloadError> {
 /// (GitHub requires a User-Agent on API requests).
 fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, reqwest::Error> {
     reqwest::blocking::Client::builder()
+        .no_proxy()
+        .dns_resolver(tirith_core::ssrf_guard::ssrf_guard_resolver())
         .timeout(Duration::from_secs(timeout_secs))
+        .redirect(tirith_core::ssrf_guard::server_redirect_policy())
         .build()
 }
 
@@ -1176,6 +1179,7 @@ fn fetch_bytes(
     url: &str,
     max: u64,
 ) -> Result<Vec<u8>, DownloadError> {
+    validate_download_url(url)?;
     let resp = client
         .get(url)
         .header(
@@ -1222,6 +1226,11 @@ fn fetch_bytes(
         )));
     }
     Ok(buf)
+}
+
+fn validate_download_url(url: &str) -> Result<(), DownloadError> {
+    tirith_core::url_validate::validate_server_url(url)
+        .map_err(|reason| DownloadError::Other(format!("refusing unsafe download URL: {reason}")))
 }
 
 /// Best-effort fetch of an optional release asset (the cosign sig / cert).
@@ -1742,6 +1751,29 @@ fn describe_status(status: &VerificationStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selfupdate_rejects_unsafe_initial_destinations() {
+        for url in [
+            "ftp://127.0.0.1/release",
+            "https://127.0.0.1/release",
+            "https://169.254.169.254/latest/meta-data/",
+            "not a URL",
+        ] {
+            let err = validate_download_url(url)
+                .expect_err("an unsafe self-update destination must be refused");
+            assert!(
+                matches!(err, DownloadError::Other(_)),
+                "validation failures are security/operational errors, not offline: {url}"
+            );
+            assert!(err.message().contains("refusing unsafe download URL"));
+        }
+    }
+
+    #[test]
+    fn selfupdate_guarded_http_client_builds() {
+        http_client(1).expect("the connect-time resolver and redirect policy must install");
+    }
 
     #[test]
     fn atomic_self_replace_swaps_and_keeps_backup() {

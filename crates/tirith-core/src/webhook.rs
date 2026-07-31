@@ -206,6 +206,7 @@ fn send_with_retry(
     max_attempts: u32,
 ) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
         .timeout(std::time::Duration::from_secs(10))
         // F7: re-validate every redirect target and cap the hop count; the
