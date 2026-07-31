@@ -389,6 +389,11 @@ fn validate_resolver_tool_provenance(
 }
 
 fn validate_resolver_tool_name(label: &str, path: &Path) -> Result<(), String> {
+    // Resolver paths are later carried through uv/pip string argv and PATH.
+    // Reject the whole canonical path, not merely its file name, when that
+    // round-trip would be lossy. Otherwise distinct non-UTF-8 parent paths can
+    // collapse to the same U+FFFD-containing child argument.
+    resolver_tool_unicode_path(path)?;
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Err("canonical executable has no UTF-8 file name".to_string());
     };
@@ -848,6 +853,21 @@ struct ResolverToolTrustStore {
     pins: BTreeMap<String, String>,
 }
 
+fn resolver_tool_unicode_path(path: &Path) -> Result<&str, String> {
+    path.to_str().ok_or_else(|| {
+        "canonical resolver executable path is not valid Unicode; non-Unicode resolver paths are refused because enrollment, argv, and PATH must preserve the exact path"
+            .to_string()
+    })
+}
+
+/// Versioned, injective JSON-map key for a canonical resolver path. Legacy
+/// display-string keys are intentionally not consulted: `Path::display` is
+/// lossy, so silently accepting those entries would preserve path collisions.
+fn resolver_tool_store_key(path: &Path) -> Result<String, String> {
+    let exact = resolver_tool_unicode_path(path)?;
+    Ok(format!("utf8-hex-v1:{}", hex::encode(exact.as_bytes())))
+}
+
 fn resolver_tool_trust_file() -> Result<PathBuf, String> {
     let base = crate::policy::config_dir()
         .ok_or_else(|| "cannot determine the operator config directory".to_string())?;
@@ -957,7 +977,7 @@ fn resolver_tool_pin_matches(path: &Path) -> Result<bool, String> {
         .map_err(|error| format!("cannot canonicalize resolver tool: {error}"))?;
     #[cfg(windows)]
     windows_trust_acl::validate_executable_hierarchy(&canonical)?;
-    let key = canonical.display().to_string();
+    let key = resolver_tool_store_key(&canonical)?;
     let Some(expected) = store.pins.get(&key) else {
         return Ok(false);
     };
@@ -990,6 +1010,11 @@ pub fn enroll_resolver_tool(path: &Path) -> Result<PathBuf, ResolverError> {
     let canonical = executable.path().to_path_buf();
     #[cfg(windows)]
     windows_trust_acl::validate_executable_hierarchy(&canonical).map_err(resolver_io_error)?;
+    let store_key =
+        resolver_tool_store_key(&canonical).map_err(|reason| ResolverError::ToolUntrusted {
+            tool: canonical.display().to_string(),
+            reason,
+        })?;
     let digest = resolver_tool_digest(&canonical).map_err(resolver_io_error)?;
     executable
         .revalidate()
@@ -1015,7 +1040,7 @@ pub fn enroll_resolver_tool(path: &Path) -> Result<PathBuf, ResolverError> {
     let mut store = read_resolver_tool_trust_store(&trust_file)
         .map_err(resolver_io_error)?
         .unwrap_or_default();
-    store.pins.insert(canonical.display().to_string(), digest);
+    store.pins.insert(store_key, digest);
     let body = serde_json::to_vec_pretty(&store).map_err(|error| {
         resolver_io_error(format!(
             "cannot serialize resolver-tool trust store: {error}"
@@ -3090,7 +3115,9 @@ certifi==2024.2.2 \\
         let trust_file = resolver_tool_trust_file().unwrap();
         std::fs::create_dir_all(trust_file.parent().unwrap()).unwrap();
         let mut store = ResolverToolTrustStore::default();
-        store.pins.insert(canonical.display().to_string(), digest);
+        store
+            .pins
+            .insert(resolver_tool_store_key(&canonical).unwrap(), digest);
         crate::util::write_file_atomic_0600(&trust_file, &serde_json::to_vec(&store).unwrap())
             .unwrap();
 
@@ -3104,6 +3131,31 @@ certifi==2024.2.2 \\
                 Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_tool_admission_rejects_colliding_non_unicode_parent_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        // Synthetic paths keep this regression portable to macOS filesystems
+        // that reject invalid byte sequences at create-time. Linux and other
+        // Unix filesystems can represent both paths exactly.
+        let first = PathBuf::from(OsString::from_vec(b"/opt/install-\x80/python3".to_vec()));
+        let second = PathBuf::from(OsString::from_vec(b"/opt/install-\x81/python3".to_vec()));
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first.display().to_string(),
+            second.display().to_string(),
+            "the regression requires two distinct paths that collide under Path::display"
+        );
+        for path in [&first, &second] {
+            assert!(resolver_tool_store_key(path).is_err());
+            let error = validate_resolver_tool_name("python", path).unwrap_err();
+            assert!(error.contains("not valid Unicode"), "{error}");
         }
     }
 
