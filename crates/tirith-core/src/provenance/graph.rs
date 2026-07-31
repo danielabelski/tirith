@@ -631,13 +631,28 @@ fn mcp_transport_endpoint(transport: &McpTransport) -> (Option<String>, String, 
 /// any embedded `"` and `\`. Keeps an id with a `!/` archive separator or a path
 /// with a backslash from breaking the digraph.
 fn dot_quote(s: &str) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
+            ch if ch.is_control()
+                || crate::extract::is_bidi_control(ch)
+                || crate::extract::is_zero_width(ch)
+                || crate::extract::is_unicode_tag(ch)
+                || crate::extract::is_variation_selector(ch)
+                || crate::extract::is_hangul_filler(ch)
+                || crate::extract::is_invisible_math_operator(ch)
+                || crate::extract::is_invisible_whitespace(ch) =>
+            {
+                // Two backslashes in DOT source make Graphviz render the
+                // following `u{...}` literally. Identity-distinguishing
+                // codepoints remain visible without becoming active controls.
+                let _ = write!(&mut out, "\\\\u{{{:04X}}}", ch as u32);
+            }
             _ => out.push(ch),
         }
     }
@@ -731,6 +746,33 @@ mod tests {
         }
         let dot2 = ProvenanceGraph::from_inspection(&insp).to_dot();
         assert!(dot2.contains("weird\\\"name"));
+    }
+
+    #[test]
+    fn dot_visibly_escapes_controls_without_changing_json_identity() {
+        let graph = ProvenanceGraph {
+            nodes: vec![ProvenanceNode {
+                id: "node\u{1b}]52;c;payload\u{7}".to_string(),
+                kind: NodeKind::File,
+                label: "label\u{202e}\u{200b}safe".to_string(),
+                ecosystem: None,
+                version: None,
+                location: None,
+            }],
+            edges: vec![],
+        };
+
+        let dot = graph.to_dot();
+        assert!(!dot.contains('\u{1b}'));
+        assert!(!dot.contains('\u{7}'));
+        assert!(!dot.contains('\u{202e}'));
+        assert!(!dot.contains('\u{200b}'));
+        assert!(dot.contains(r"\\u{001B}"));
+        assert!(dot.contains(r"\\u{202E}"));
+
+        let parsed: serde_json::Value = serde_json::from_str(&graph.to_json()).unwrap();
+        assert_eq!(parsed["nodes"][0]["id"], "node\u{1b}]52;c;payload\u{7}");
+        assert_eq!(parsed["nodes"][0]["label"], "label\u{202e}\u{200b}safe");
     }
 
     #[test]

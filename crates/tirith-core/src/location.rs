@@ -65,6 +65,13 @@ impl SubjectLocation {
             installed_path: Some(path.into()),
         }
     }
+
+    /// Render this location for a human terminal boundary without changing the
+    /// raw identity used by [`Display`](std::fmt::Display), JSON, SARIF, graph
+    /// node IDs, or matching.
+    pub fn terminal_safe(&self) -> String {
+        crate::mcp::output_filter::sanitize_for_display(&self.to_string())
+    }
 }
 
 impl std::fmt::Display for SubjectLocation {
@@ -130,5 +137,21 @@ mod tests {
         assert!(!json.contains("installed_path"));
         let back: SubjectLocation = serde_json::from_str(&json).unwrap();
         assert_eq!(back, loc);
+    }
+
+    #[test]
+    fn terminal_safe_projection_does_not_change_raw_identity() {
+        let loc = SubjectLocation::member("wheel\u{1b}[2J.whl", "pkg/\u{202e}file.py");
+        let raw = loc.to_string();
+        assert!(raw.contains('\u{1b}'));
+        assert!(raw.contains('\u{202e}'));
+        let safe = loc.terminal_safe();
+        assert!(!safe.contains('\u{1b}'));
+        assert!(!safe.contains('\u{202e}'));
+        assert_eq!(
+            loc.to_string(),
+            raw,
+            "safe display must not mutate identity"
+        );
     }
 }

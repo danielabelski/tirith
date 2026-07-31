@@ -39,6 +39,7 @@
 //! ownership-index construction over installed distributions have direct tests
 //! below.
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use tirith_core::artifact::inspect::inspect_artifact_set;
@@ -168,7 +169,10 @@ fn report_diff_error(err: &ReleaseDiffError, json: bool) {
         let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
         println!();
     } else {
-        eprintln!("tirith pkg diff: {err}");
+        eprintln!(
+            "tirith pkg diff: {}",
+            super::sanitize_for_human_output(&err.to_string(), false)
+        );
         eprintln!(
             "  both artifacts must be inspectable wheels; try: tirith pkg diff old.whl new.whl"
         );
@@ -183,16 +187,34 @@ fn render_diff_human(
     diff: &ReleaseDiff,
     verdict: &tirith_core::verdict::Verdict,
 ) {
-    eprintln!("tirith pkg diff: {} -> {}", old.display(), new.display());
-    eprintln!("  verdict:  {:?}", verdict.action);
+    let mut stderr = std::io::stderr().lock();
+    let _ = render_diff_human_to(&mut stderr, old, new, diff, verdict);
+}
+
+fn render_diff_human_to<W: Write>(
+    out: &mut W,
+    old: &Path,
+    new: &Path,
+    diff: &ReleaseDiff,
+    verdict: &tirith_core::verdict::Verdict,
+) -> io::Result<()> {
+    let old = super::sanitize_for_human_output(&old.display().to_string(), false);
+    let new = super::sanitize_for_human_output(&new.display().to_string(), false);
+    writeln!(out, "tirith pkg diff: {old} -> {new}")?;
+    writeln!(out, "  verdict:  {:?}", verdict.action)?;
     if diff.anomalies.is_empty() {
-        eprintln!("  no release anomaly: the two releases have the same execution shape");
-        return;
+        writeln!(
+            out,
+            "  no release anomaly: the two releases have the same execution shape"
+        )?;
+        return Ok(());
     }
-    eprintln!("  {} release anomaly(ies):", diff.anomalies.len());
+    writeln!(out, "  {} release anomaly(ies):", diff.anomalies.len())?;
     for anomaly in &diff.anomalies {
-        eprintln!("    [{}] {}", anomaly.kind.label(), anomaly.detail);
+        let detail = super::sanitize_for_human_output(&anomaly.detail, false);
+        writeln!(out, "    [{}] {detail}", anomaly.kind.label())?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -316,23 +338,30 @@ fn render(graph: &ProvenanceGraph, format: GraphFormat) {
 /// A short human summary: the counts, then each node and edge on one line. Kept
 /// terse so it reads in a terminal; `--json` / `--dot` carry the full structure.
 fn render_human(graph: &ProvenanceGraph) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = render_human_to(&mut stderr, graph);
+}
+
+fn render_human_to<W: Write>(out: &mut W, graph: &ProvenanceGraph) -> io::Result<()> {
     use tirith_core::provenance::graph::EdgeKind;
 
-    eprintln!(
+    writeln!(
+        out,
         "provenance graph: {} nodes, {} edges",
         graph.node_count(),
         graph.edge_count()
-    );
+    )?;
     if graph.has_execution_path() {
-        eprintln!("  carries an execution path (loader -> payload)");
+        writeln!(out, "  carries an execution path (loader -> payload)")?;
     }
     for node in &graph.nodes {
         let version = node
             .version
             .as_deref()
-            .map(|v| format!(" {v}"))
+            .map(|v| format!(" {}", super::sanitize_for_human_output(v, false)))
             .unwrap_or_default();
-        eprintln!("  [{:?}] {}{}", node.kind, node.label, version);
+        let label = super::sanitize_for_human_output(&node.label, false);
+        writeln!(out, "  [{:?}] {label}{version}", node.kind)?;
     }
     for edge in &graph.edges {
         let arrow = match edge.kind {
@@ -342,8 +371,12 @@ fn render_human(graph: &ProvenanceGraph) {
             EdgeKind::ExposesTool => "-tool->",
             EdgeKind::ServedBy => "-via->",
         };
-        eprintln!("  {} {} {} ({})", edge.from, arrow, edge.to, edge.detail);
+        let from = super::sanitize_for_human_output(&edge.from, false);
+        let to = super::sanitize_for_human_output(&edge.to, false);
+        let detail = super::sanitize_for_human_output(&edge.detail, false);
+        writeln!(out, "  {from} {arrow} {to} ({detail})")?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -357,6 +390,78 @@ mod tests {
         assert_eq!(GraphFormat::resolve(false, true), GraphFormat::Dot);
         // DOT wins if both arrive (clap normally makes them exclusive).
         assert_eq!(GraphFormat::resolve(true, true), GraphFormat::Dot);
+    }
+
+    #[test]
+    fn human_graph_renderer_neutralizes_dynamic_terminal_controls() {
+        use tirith_core::provenance::graph::{EdgeKind, NodeKind, ProvenanceEdge, ProvenanceNode};
+
+        let graph = ProvenanceGraph {
+            nodes: vec![ProvenanceNode {
+                id: "raw-id\u{1b}]52;c;payload\u{7}".to_string(),
+                kind: NodeKind::File,
+                label: "包\u{1b}[2J\nFORGED\u{202e}".to_string(),
+                ecosystem: None,
+                version: Some("1.0\u{200b}".to_string()),
+                location: Some("/tmp/raw".to_string()),
+            }],
+            edges: vec![ProvenanceEdge {
+                kind: EdgeKind::Owns,
+                from: "from\u{1b}[31m".to_string(),
+                to: "to\nROW".to_string(),
+                detail: "detail\u{7}\u{2066}".to_string(),
+                trigger: None,
+                confidence: None,
+            }],
+        };
+        let mut out = Vec::new();
+        render_human_to(&mut out, &graph).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        for forbidden in ['\u{1b}', '\u{7}', '\u{202e}', '\u{200b}', '\u{2066}'] {
+            assert!(
+                !text.contains(forbidden),
+                "unsafe character survived: {text:?}"
+            );
+        }
+        assert!(text.contains("包FORGED 1.0"));
+        assert!(
+            text.contains("toROW"),
+            "dynamic newlines must not forge rows"
+        );
+    }
+
+    #[test]
+    fn human_release_diff_renderer_is_safe_but_json_identity_stays_raw() {
+        use tirith_core::artifact::release_diff::{ReleaseAnomaly, ReleaseAnomalyKind};
+
+        let diff = ReleaseDiff {
+            anomalies: vec![ReleaseAnomaly {
+                kind: ReleaseAnomalyKind::StartupHookAdded,
+                detail: "member\u{1b}[2J\nFORGED\u{202e}".to_string(),
+            }],
+        };
+        let verdict = diff.evaluate(&Policy::default());
+        let mut out = Vec::new();
+        render_diff_human_to(
+            &mut out,
+            Path::new("old\u{1b}[31m.whl"),
+            Path::new("new\nROW.whl"),
+            &diff,
+            &verdict,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("newROW.whl"));
+        assert!(text.contains("memberFORGED"));
+
+        let raw = serde_json::to_value(&diff).unwrap();
+        assert_eq!(
+            raw["anomalies"][0]["detail"], "member\u{1b}[2J\nFORGED\u{202e}",
+            "machine identity must remain raw and structured"
+        );
     }
 
     #[test]
@@ -424,8 +529,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // pkg diff (F2)
     // -----------------------------------------------------------------------
-
-    use std::io::Write as _;
 
     /// Write a minimal `demo` wheel (version `ver`) carrying the EXTRA members
     /// beyond dist-info, with a correct RECORD, to `<dir>/<filename>`, and return
