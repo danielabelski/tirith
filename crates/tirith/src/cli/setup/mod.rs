@@ -9,6 +9,11 @@
 #[cfg_attr(not(unix), path = "fs_helpers_windows.rs")]
 mod fs_helpers;
 
+// Compile Windows containment/ACL policy tests on Unix CI as pure tests.
+#[cfg(all(test, unix))]
+#[path = "fs_helpers_windows_path.rs"]
+mod fs_helpers_windows_path;
+
 mod merge;
 mod shell_profile;
 mod tools;
@@ -427,9 +432,7 @@ mod run_impl {
             return Ok(gateway_path);
         }
 
-        std::fs::create_dir_all(&config_dir)
-            .map_err(|e| format!("create {}: {e}", config_dir.display()))?;
-        fs_helpers::atomic_write(&gateway_path, content, 0o644)?;
+        fs_helpers::atomic_write(&gateway_path, &config_dir, content, 0o644)?;
         eprintln!("tirith: wrote {}", gateway_path.display());
         Ok(gateway_path)
     }

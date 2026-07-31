@@ -1,10 +1,232 @@
 //! Filesystem helpers for `tirith setup` — atomic writes, hook scripts,
 //! directory validation, CLI subprocess runner, and backup management.
 
+use std::ffi::{CString, OsStr};
 use std::fs;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+struct ScopedParent {
+    dir: fs::File,
+    name: CString,
+}
+
+fn c_name(name: &OsStr) -> Result<CString, String> {
+    CString::new(name.as_bytes()).map_err(|_| "path component contains NUL".to_string())
+}
+
+fn absolute(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|e| format!("current_dir: {e}"))
+    }
+}
+
+fn relative_components<'a>(path: &'a Path, root: &Path) -> Result<Vec<&'a OsStr>, String> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        format!(
+            "{} is outside trusted setup root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name),
+            _ => Err(format!(
+                "{} contains a non-normal path component",
+                path.display()
+            )),
+        })
+        .collect()
+}
+
+fn open_dir(path: &Path) -> Result<fs::File, String> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("{} contains NUL", path.display()))?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "open trusted root {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+fn open_dir_at(parent: &fs::File, name: &CString) -> std::io::Result<fs::File> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+/// Open the destination parent beneath an explicitly trusted root. The root is
+/// canonicalized once (allowing normal platform aliases such as macOS `/var`),
+/// while every attacker-controlled descendant is traversed with `O_NOFOLLOW`.
+fn scoped_parent(
+    path: &Path,
+    scope_root: &Path,
+    create: bool,
+) -> Result<Option<ScopedParent>, String> {
+    let path = absolute(path)?;
+    let root = absolute(scope_root)?;
+    let components = relative_components(&path, &root)?;
+    let (name, parents) = components
+        .split_last()
+        .ok_or_else(|| format!("{} names the trusted root, not a file", path.display()))?;
+
+    let mut anchor = root.clone();
+    let mut missing_root = Vec::new();
+    while !anchor.exists() {
+        let component = anchor
+            .file_name()
+            .ok_or_else(|| format!("cannot resolve trusted root {}", root.display()))?;
+        missing_root.push(component.to_os_string());
+        if !anchor.pop() {
+            return Err(format!("cannot resolve trusted root {}", root.display()));
+        }
+    }
+    let canonical_root = anchor
+        .canonicalize()
+        .map_err(|e| format!("canonicalize trusted root {}: {e}", anchor.display()))?;
+    let mut dir = open_dir(&canonical_root)?;
+
+    for component in missing_root
+        .iter()
+        .rev()
+        .map(|part| part.as_os_str())
+        .chain(parents.iter().copied())
+    {
+        let component = c_name(component)?;
+        match open_dir_at(&dir, &component) {
+            Ok(next) => dir = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), component.as_ptr(), 0o755) };
+                if rc < 0 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(format!(
+                            "create directory component {} below {}: {mkdir_error}",
+                            component.to_string_lossy(),
+                            canonical_root.display()
+                        ));
+                    }
+                }
+                dir = open_dir_at(&dir, &component).map_err(|e| {
+                    format!(
+                        "open directory component {} below {} without following links: {e}",
+                        component.to_string_lossy(),
+                        canonical_root.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "open directory component {} below {} without following links: {error}",
+                    component.to_string_lossy(),
+                    canonical_root.display()
+                ));
+            }
+        }
+    }
+
+    Ok(Some(ScopedParent {
+        dir,
+        name: c_name(name)?,
+    }))
+}
+
+fn existing_mode(parent: &ScopedParent) -> Result<Option<u32>, String> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            parent.dir.as_raw_fd(),
+            parent.name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(format!("stat destination without following links: {error}"));
+    }
+    let stat = unsafe { stat.assume_init() };
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => Ok(Some(stat.st_mode as u32 & 0o7777)),
+        libc::S_IFLNK => Err("destination is a symlink — refusing to overwrite for safety".into()),
+        _ => Err("destination is not a regular file — refusing to overwrite for safety".into()),
+    }
+}
+
+fn read_existing_scoped(path: &Path, scope_root: &Path) -> Result<Option<(String, u32)>, String> {
+    let Some(parent) = scoped_parent(path, scope_root, false)? else {
+        return Ok(None);
+    };
+    let fd = unsafe {
+        libc::openat(
+            parent.dir.as_raw_fd(),
+            parent.name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(format!(
+                "{} is a symlink — refusing to modify for safety",
+                path.display()
+            ));
+        }
+        return Err(format!(
+            "open {} without following links: {error}",
+            path.display()
+        ));
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("stat {} through open handle: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{} is not a regular file — refusing for safety",
+            path.display()
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| format!("read {} through open handle: {e}", path.display()))?;
+    Ok(Some((content, metadata.permissions().mode() & 0o7777)))
+}
 
 /// Write `content` to `path` atomically via temp+rename.
 ///
@@ -12,80 +234,87 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// Retries up to 3 times on collision. If `path` already exists as a
 /// regular file, its permissions are preserved; otherwise `mode` is used.
 /// Refuses to overwrite a symlink target.
-pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("no parent directory for {}", path.display()))?;
-    fs::create_dir_all(parent).map_err(|e| format!("create dirs {}: {e}", parent.display()))?;
-
-    // Preserve existing file permissions; fall back to the caller's mode.
-    let effective_mode = match fs::metadata(path) {
-        Ok(meta) => meta.permissions().mode() & 0o7777,
-        Err(_) => mode,
-    };
+pub fn atomic_write(
+    path: &Path,
+    scope_root: &Path,
+    content: &str,
+    mode: u32,
+) -> Result<(), String> {
+    let parent = scoped_parent(path, scope_root, true)?
+        .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
+    let effective_mode = existing_mode(&parent)?.unwrap_or(mode) & 0o7777;
 
     // PID + monotonic counter keeps temp file names unique across concurrent setups.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    let tmp = {
-        let mut tmp_path;
-        let mut f_result;
-
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        tmp_path = parent.join(format!(".tirith-setup-{}-{}.tmp", std::process::id(), n));
-        f_result = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path);
-
-        // Collisions come from stale temps left by previous crashes; retry up to 3 times.
-        for _ in 0..3 {
-            if f_result.is_ok() {
-                break;
+    let (tmp_name, mut file) = (0..4)
+        .find_map(|_| {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name =
+                CString::new(format!(".tirith-setup-{}-{n}.tmp", std::process::id())).unwrap();
+            let fd = unsafe {
+                libc::openat(
+                    parent.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    effective_mode as libc::c_uint,
+                )
+            };
+            if fd >= 0 {
+                Some(Ok((name, unsafe { fs::File::from_raw_fd(fd) })))
+            } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+                None
+            } else {
+                Some(Err(std::io::Error::last_os_error()))
             }
-            let n2 = COUNTER.fetch_add(1, Ordering::Relaxed);
-            tmp_path = parent.join(format!(".tirith-setup-{}-{}.tmp", std::process::id(), n2));
-            f_result = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path);
-        }
+        })
+        .unwrap_or_else(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "temporary-name retries exhausted",
+            ))
+        })
+        .map_err(|e| format!("create temporary file below {}: {e}", scope_root.display()))?;
 
-        use std::io::Write;
-        let mut f = f_result.map_err(|e| format!("create tmp {}: {e}", tmp_path.display()))?;
-        f.write_all(content.as_bytes()).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            format!("write tmp: {e}")
-        })?;
-        tmp_path
+    let cleanup = || unsafe {
+        libc::unlinkat(parent.dir.as_raw_fd(), tmp_name.as_ptr(), 0);
     };
 
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(effective_mode)).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("chmod {}: {e}", tmp.display())
-    })?;
-
-    // symlink_metadata (not path.exists) so broken symlinks also error out.
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let _ = fs::remove_file(&tmp);
-            return Err(format!(
-                "{} is a symlink — refusing to overwrite for safety",
-                path.display()
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            return Err(format!("stat {}: {e}", path.display()));
-        }
+    // `openat` applies this mode at creation; `fchmod` makes the requested or
+    // preserved mode exact before any sensitive bytes are written.
+    if unsafe { libc::fchmod(file.as_raw_fd(), effective_mode as libc::mode_t) } < 0 {
+        let error = std::io::Error::last_os_error();
+        cleanup();
+        return Err(format!("set temporary-file permissions: {error}"));
+    }
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        cleanup();
+        return Err(format!("write temporary file: {error}"));
     }
 
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("rename {} -> {}: {e}", tmp.display(), path.display())
-    })?;
+    // Re-check the destination through the held parent descriptor immediately
+    // before publication, then rename relative to that same descriptor.
+    if let Err(error) = existing_mode(&parent) {
+        cleanup();
+        return Err(error);
+    }
+    let rc = unsafe {
+        libc::renameat(
+            parent.dir.as_raw_fd(),
+            tmp_name.as_ptr(),
+            parent.dir.as_raw_fd(),
+            parent.name.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        cleanup();
+        return Err(format!("publish {}: {error}", path.display()));
+    }
 
     Ok(())
 }
@@ -99,30 +328,18 @@ pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String>
 /// - Dry-run: print what would happen, write nothing.
 pub fn write_hook_script(
     path: &Path,
+    scope_root: &Path,
     content: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    // Symlink check runs even in dry-run — it's a safety violation, not an I/O op.
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "{} is a symlink — refusing to modify for safety",
-                path.display()
-            ));
-        }
-    }
-
-    if path.exists() {
-        let existing =
-            fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    // Resolve through held no-follow handles even in dry-run so a malicious
+    // parent link is never treated as an already-configured legitimate file.
+    if let Some((existing, existing_mode)) = read_existing_scoped(path, scope_root)? {
         if existing == content {
             if !dry_run {
-                let meta =
-                    fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-                if meta.permissions().mode() & 0o777 != 0o755 {
-                    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-                        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+                if existing_mode & 0o777 != 0o755 {
+                    set_mode_scoped(path, scope_root, 0o755)?;
                     eprintln!(
                         "tirith: {} already configured, fixed permissions",
                         path.display()
@@ -163,14 +380,42 @@ pub fn write_hook_script(
         return Ok(());
     }
 
-    atomic_write(path, content, 0o755)?;
+    atomic_write(path, scope_root, content, 0o755)?;
 
     // Always enforce 0o755; atomic_write preserves prior permissions which
     // may be stricter than we need for an executable hook.
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    set_mode_scoped(path, scope_root, 0o755)?;
 
     eprintln!("tirith: wrote {}", path.display());
+    Ok(())
+}
+
+fn set_mode_scoped(path: &Path, scope_root: &Path, mode: u32) -> Result<(), String> {
+    let parent = scoped_parent(path, scope_root, false)?
+        .ok_or_else(|| format!("{} disappeared before chmod", path.display()))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.dir.as_raw_fd(),
+            parent.name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "open {} for chmod: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } < 0 {
+        return Err(format!(
+            "chmod {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+
     Ok(())
 }
 
@@ -441,7 +686,7 @@ mod tests {
     fn atomic_write_creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
-        atomic_write(&path, "hello", 0o644).unwrap();
+        atomic_write(&path, dir.path(), "hello", 0o644).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
@@ -455,7 +700,7 @@ mod tests {
         let link = dir.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let result = atomic_write(&link, "evil", 0o644);
+        let result = atomic_write(&link, dir.path(), "evil", 0o644);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("symlink"));
         // Original untouched
@@ -469,7 +714,7 @@ mod tests {
         fs::write(&path, "old").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
-        atomic_write(&path, "new", 0o644).unwrap();
+        atomic_write(&path, dir.path(), "new", 0o644).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         // Preserved existing 0o600, not overwritten with mode arg 0o644.
@@ -483,7 +728,7 @@ mod tests {
         fs::write(&path, "#!/bin/bash\necho hi").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 
-        write_hook_script(&path, "#!/bin/bash\necho hi", false, false).unwrap();
+        write_hook_script(&path, dir.path(), "#!/bin/bash\necho hi", false, false).unwrap();
     }
 
     #[test]
@@ -492,7 +737,7 @@ mod tests {
         let path = dir.path().join("hook.sh");
         fs::write(&path, "old content").unwrap();
 
-        let result = write_hook_script(&path, "new content", false, false);
+        let result = write_hook_script(&path, dir.path(), "new content", false, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("content differs"));
     }
@@ -504,7 +749,7 @@ mod tests {
         fs::write(&path, "old content").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-        write_hook_script(&path, "new content", true, false).unwrap();
+        write_hook_script(&path, dir.path(), "new content", true, false).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
@@ -518,9 +763,53 @@ mod tests {
         let link = dir.path().join("link.sh");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let result = write_hook_script(&link, "evil", true, false);
+        let result = write_hook_script(&link, dir.path(), "evil", true, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("symlink"));
+    }
+
+    #[test]
+    fn atomic_write_refuses_symlinked_parent_and_leaves_outside_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked_parent = dir.path().join("hooks");
+        std::os::unix::fs::symlink(outside.path(), &linked_parent).unwrap();
+
+        let result = atomic_write(
+            &linked_parent.join("config.json"),
+            dir.path(),
+            "secret",
+            0o600,
+        );
+
+        assert!(result.is_err());
+        assert!(!outside.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn atomic_write_rejects_destination_outside_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("config.json");
+
+        let result = atomic_write(&path, dir.path(), "secret", 0o600);
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn atomic_write_creates_nested_components_without_following_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one").join("two").join("config.json");
+
+        atomic_write(&path, dir.path(), "secret", 0o600).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "secret");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

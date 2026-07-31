@@ -66,7 +66,7 @@ pub fn offer_zshenv_guard(
             }
             content.push_str(&managed_block);
 
-            super::fs_helpers::atomic_write(&zshenv_path, &content, 0o644)?;
+            super::fs_helpers::atomic_write(&zshenv_path, &home, &content, 0o644)?;
             eprintln!(
                 "tirith: appended tirith-guard block to {}",
                 zshenv_path.display()
@@ -96,7 +96,7 @@ pub fn offer_zshenv_guard(
             }
             content.push_str(&managed_block);
 
-            super::fs_helpers::atomic_write(&zshenv_path, &content, 0o644)?;
+            super::fs_helpers::atomic_write(&zshenv_path, &home, &content, 0o644)?;
             eprintln!(
                 "tirith: replaced tirith-guard block in {}",
                 zshenv_path.display()
@@ -125,7 +125,7 @@ pub fn offer_zshenv_guard(
             }
             content.push_str(&managed_block);
 
-            super::fs_helpers::atomic_write(&zshenv_path, &content, 0o644)?;
+            super::fs_helpers::atomic_write(&zshenv_path, &home, &content, 0o644)?;
             eprintln!(
                 "tirith: deduplicated tirith-guard blocks in {}",
                 zshenv_path.display()

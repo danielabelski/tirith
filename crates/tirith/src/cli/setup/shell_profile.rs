@@ -197,6 +197,7 @@ pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Resul
 }
 
 fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
+    let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let (shell, profile_path) = detect_shell_profile().ok_or_else(|| {
         "could not detect shell — add eval \"$(tirith init)\" to your shell profile manually"
             .to_string()
@@ -274,7 +275,7 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
             }
             content.push_str(&managed_block);
 
-            super::fs_helpers::atomic_write(&profile_path, &content, 0o644)?;
+            super::fs_helpers::atomic_write(&profile_path, &home, &content, 0o644)?;
             eprintln!("tirith: added shell hook to {}", profile_path.display());
         }
         1 => {
@@ -315,7 +316,7 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
             content.push('\n');
             content.push_str(&managed_block);
 
-            super::fs_helpers::atomic_write(&profile_path, &content, 0o644)?;
+            super::fs_helpers::atomic_write(&profile_path, &home, &content, 0o644)?;
             eprintln!("tirith: replaced shell hook in {}", profile_path.display());
         }
         _ => {
@@ -341,7 +342,7 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
             content.push('\n');
             content.push_str(&managed_block);
 
-            super::fs_helpers::atomic_write(&profile_path, &content, 0o644)?;
+            super::fs_helpers::atomic_write(&profile_path, &home, &content, 0o644)?;
             eprintln!(
                 "tirith: deduplicated tirith-hook blocks in {}",
                 profile_path.display()

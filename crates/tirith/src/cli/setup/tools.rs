@@ -49,21 +49,23 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
     };
 
     let scope_root = match opts.scope {
-        Scope::Project => Some(std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?),
-        Scope::User => Some(home.clone()),
+        Scope::Project => std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?,
+        Scope::User => home.clone(),
     };
-    fs_helpers::validate_target_dir(&target, scope_root.as_deref())?;
+    fs_helpers::validate_target_dir(&target, Some(&scope_root))?;
 
     let hooks_dir = target.join("hooks");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&hooks_dir)
-            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
-    }
 
     // The Python hook is used verbatim — no __TIRITH_BIN__ placeholder.
     let hook_path = hooks_dir.join("tirith-check.py");
     let hook_content = crate::assets::TIRITH_CHECK_PY;
-    fs_helpers::write_hook_script(&hook_path, hook_content, opts.force, opts.dry_run)?;
+    fs_helpers::write_hook_script(
+        &hook_path,
+        &scope_root,
+        hook_content,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     if opts.update_configs {
         eprintln!();
@@ -78,7 +80,13 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
         }
         Scope::User => r#"python3 "$HOME/.claude/hooks/tirith-check.py""#.to_string(),
     };
-    merge::merge_claude_settings(&settings_path, &hook_command, opts.force, opts.dry_run)?;
+    merge::merge_claude_settings(
+        &settings_path,
+        &scope_root,
+        &hook_command,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     if opts.with_mcp {
         match opts.scope {
@@ -87,6 +95,7 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
                 let mcp_path = cwd.join(".mcp.json");
                 merge::merge_mcp_json(
                     &mcp_path,
+                    &cwd,
                     "tirith",
                     json!({
                         "command": opts.tirith_bin,
@@ -101,6 +110,7 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
                 // `claude mcp add`, which deadlocks inside an active CC session.
                 merge::merge_claude_mcp_server(
                     &settings_path,
+                    &scope_root,
                     "tirith",
                     json!({
                         "command": opts.tirith_bin,
@@ -258,20 +268,22 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
     };
 
     let scope_root = match opts.scope {
-        Scope::Project => Some(std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?),
-        Scope::User => Some(home.clone()),
+        Scope::Project => std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?,
+        Scope::User => home.clone(),
     };
-    fs_helpers::validate_target_dir(&target, scope_root.as_deref())?;
+    fs_helpers::validate_target_dir(&target, Some(&scope_root))?;
 
     let hooks_dir = target.join("hooks");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&hooks_dir)
-            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
-    }
 
     let hook_path = hooks_dir.join("tirith-hook.sh");
     let hook_content = crate::assets::CURSOR_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
-    fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
+    fs_helpers::write_hook_script(
+        &hook_path,
+        &scope_root,
+        &hook_content,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     // Gateway config is refreshed in both full and --update-configs modes.
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
@@ -292,6 +304,7 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
     };
     merge::merge_hooks_json(
         &hooks_json_path,
+        &scope_root,
         "beforeShellExecution",
         json!({
             "command": hook_cmd,
@@ -308,6 +321,7 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
     let mcp_json_path = target.join("mcp.json");
     merge::merge_mcp_json(
         &mcp_json_path,
+        &scope_root,
         "tirith-gateway",
         json!({
             "command": opts.tirith_bin,
@@ -344,14 +358,10 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
     fs_helpers::validate_target_dir(&target, Some(&cwd))?;
 
     let hooks_dir = target.join("hooks");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&hooks_dir)
-            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
-    }
 
     let hook_path = hooks_dir.join("tirith-hook.sh");
     let hook_content = crate::assets::VSCODE_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
-    fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
+    fs_helpers::write_hook_script(&hook_path, &cwd, &hook_content, opts.force, opts.dry_run)?;
 
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
 
@@ -364,7 +374,7 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
     let settings_path = target.join("settings.json");
     // VS Code is project-only, so the hook command is a relative path.
     let hook_cmd = "hooks/tirith-hook.sh".to_string();
-    merge::merge_vscode_settings(&settings_path, &hook_cmd, opts.force, opts.dry_run)?;
+    merge::merge_vscode_settings(&settings_path, &cwd, &hook_cmd, opts.force, opts.dry_run)?;
 
     // VS Code uses "servers" as the top-level key (not "mcpServers") and
     // requires "type": "stdio" — see merge_mcp_json_with_key callsite.
@@ -372,6 +382,7 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
     let mcp_json_path = cwd.join(".vscode").join("mcp.json");
     merge::merge_mcp_json_with_key(
         &mcp_json_path,
+        &cwd,
         "tirith-gateway",
         json!({
             "type": "stdio",
@@ -406,32 +417,34 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
 pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
 
-    let (target, scope_root) = match opts.scope {
+    let (target, validation_root, write_root) = match opts.scope {
         Scope::Project => {
             let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
-            (cwd.join(".gemini"), Some(cwd))
+            (cwd.join(".gemini"), Some(cwd.clone()), cwd)
         }
         Scope::User => {
             if let Some(cli_home) = std::env::var_os("GEMINI_CLI_HOME") {
                 let base = std::path::PathBuf::from(cli_home);
-                (base.join(".gemini"), None)
+                (base.join(".gemini"), None, base)
             } else {
-                (home.join(".gemini"), Some(home.clone()))
+                (home.join(".gemini"), Some(home.clone()), home.clone())
             }
         }
     };
 
-    fs_helpers::validate_target_dir(&target, scope_root.as_deref())?;
+    fs_helpers::validate_target_dir(&target, validation_root.as_deref())?;
 
     let hooks_dir = target.join("hooks");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&hooks_dir)
-            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
-    }
 
     let hook_path = hooks_dir.join("tirith-security-guard-gemini.py");
     let hook_content = crate::assets::GEMINI_HOOK_PY;
-    fs_helpers::write_hook_script(&hook_path, hook_content, opts.force, opts.dry_run)?;
+    fs_helpers::write_hook_script(
+        &hook_path,
+        &write_root,
+        hook_content,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     if opts.update_configs {
         eprintln!();
@@ -453,11 +466,18 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
             )
         }
     };
-    merge::merge_gemini_settings(&settings_path, &hook_command, opts.force, opts.dry_run)?;
+    merge::merge_gemini_settings(
+        &settings_path,
+        &write_root,
+        &hook_command,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     if opts.with_mcp {
         merge::merge_mcp_json_with_key(
             &settings_path,
+            &write_root,
             "tirith",
             json!({
                 "command": opts.tirith_bin,
@@ -484,31 +504,38 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
 pub fn setup_pi_cli(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
 
-    let (target, scope_root) = match opts.scope {
+    let (target, validation_root, write_root) = match opts.scope {
         Scope::Project => {
             let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
-            (cwd.join(".pi"), Some(cwd))
+            (cwd.join(".pi"), Some(cwd.clone()), cwd)
         }
         Scope::User => {
             if let Some(agent_dir) = std::env::var_os("PI_CODING_AGENT_DIR") {
-                (std::path::PathBuf::from(agent_dir), None)
+                let target = std::path::PathBuf::from(agent_dir);
+                (target.clone(), None, target)
             } else {
-                (home.join(".pi").join("agent"), Some(home.clone()))
+                (
+                    home.join(".pi").join("agent"),
+                    Some(home.clone()),
+                    home.clone(),
+                )
             }
         }
     };
 
-    fs_helpers::validate_target_dir(&target, scope_root.as_deref())?;
+    fs_helpers::validate_target_dir(&target, validation_root.as_deref())?;
 
     let extensions_dir = target.join("extensions");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&extensions_dir)
-            .map_err(|e| format!("create {}: {e}", extensions_dir.display()))?;
-    }
 
     let guard_path = extensions_dir.join("tirith-guard.ts");
     let guard_content = crate::assets::TIRITH_GUARD_TS;
-    fs_helpers::write_hook_script(&guard_path, guard_content, opts.force, opts.dry_run)?;
+    fs_helpers::write_hook_script(
+        &guard_path,
+        &write_root,
+        guard_content,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     if opts.update_configs {
         eprintln!();
@@ -531,10 +558,10 @@ pub fn setup_pi_cli(opts: &SetupOpts) -> Result<(), String> {
 pub fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
 
-    let (target, scope_root) = match opts.scope {
+    let (target, validation_root, write_root) = match opts.scope {
         Scope::Project => {
             let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
-            (cwd.join(".openclaw"), Some(cwd))
+            (cwd.join(".openclaw"), Some(cwd.clone()), cwd)
         }
         Scope::User => {
             if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR")
@@ -553,24 +580,26 @@ pub fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
                         p = cwd.join(p);
                     }
                 }
-                (p, None)
+                (p.clone(), None, p)
             } else {
-                (home.join(".openclaw"), Some(home.clone()))
+                (home.join(".openclaw"), Some(home.clone()), home.clone())
             }
         }
     };
 
-    fs_helpers::validate_target_dir(&target, scope_root.as_deref())?;
+    fs_helpers::validate_target_dir(&target, validation_root.as_deref())?;
 
     let extensions_dir = target.join("extensions").join("tirith-security");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&extensions_dir)
-            .map_err(|e| format!("create {}: {e}", extensions_dir.display()))?;
-    }
 
     let guard_path = extensions_dir.join("index.ts");
     let guard_content = crate::assets::OPENCLAW_GUARD_TS;
-    fs_helpers::write_hook_script(&guard_path, guard_content, opts.force, opts.dry_run)?;
+    fs_helpers::write_hook_script(
+        &guard_path,
+        &write_root,
+        guard_content,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     if opts.update_configs {
         eprintln!();
@@ -598,14 +627,10 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
     fs_helpers::validate_target_dir(&target, Some(&home))?;
 
     let hooks_dir = target.join("hooks");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&hooks_dir)
-            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
-    }
 
     let hook_path = hooks_dir.join("tirith-hook.sh");
     let hook_content = crate::assets::WINDSURF_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
-    fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
+    fs_helpers::write_hook_script(&hook_path, &home, &hook_content, opts.force, opts.dry_run)?;
 
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
 
@@ -620,6 +645,7 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
     let hook_cmd = hooks_dir.join("tirith-hook.sh").display().to_string();
     merge::merge_hooks_json(
         &hooks_json_path,
+        &home,
         "pre_run_command",
         json!({
             "command": hook_cmd,
@@ -635,6 +661,7 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
     let mcp_json_path = target.join("mcp_config.json");
     merge::merge_mcp_json(
         &mcp_json_path,
+        &home,
         "tirith-gateway",
         json!({
             "command": opts.tirith_bin,
@@ -676,14 +703,11 @@ pub fn setup_copilot_cli(opts: &SetupOpts) -> Result<(), String> {
     fs_helpers::validate_target_dir(&repo_root, Some(&repo_root))?;
 
     let hooks_dir = repo_root.join(".github").join("hooks");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&hooks_dir)
-            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
-    }
 
     let hook_path = hooks_dir.join("copilot-cli-hook.py");
     fs_helpers::write_hook_script(
         &hook_path,
+        &repo_root,
         crate::assets::COPILOT_HOOK_PY,
         opts.force,
         opts.dry_run,
@@ -705,7 +729,13 @@ pub fn setup_copilot_cli(opts: &SetupOpts) -> Result<(), String> {
     });
     let config_str =
         serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
-    write_owned_json(&config_path, &config_str, opts.force, opts.dry_run)?;
+    write_owned_json(
+        &config_path,
+        &repo_root,
+        &config_str,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     if opts.update_configs {
         eprintln!();
@@ -751,16 +781,12 @@ pub fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
 
     let hooks_dir = kiro_root.join("hooks");
     let agents_dir = kiro_root.join("agents");
-    if !opts.dry_run {
-        std::fs::create_dir_all(&hooks_dir)
-            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
-        std::fs::create_dir_all(&agents_dir)
-            .map_err(|e| format!("create {}: {e}", agents_dir.display()))?;
-    }
+    let write_root = scope_root.as_deref().expect("all Kiro scopes have a root");
 
     let hook_path = hooks_dir.join("kiro-hook.py");
     fs_helpers::write_hook_script(
         &hook_path,
+        write_root,
         crate::assets::KIRO_HOOK_PY,
         opts.force,
         opts.dry_run,
@@ -786,7 +812,13 @@ pub fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
         }
     });
     let agent_str = serde_json::to_string_pretty(&agent).map_err(|e| format!("serialize: {e}"))?;
-    write_owned_json(&agent_path, &agent_str, opts.force, opts.dry_run)?;
+    write_owned_json(
+        &agent_path,
+        write_root,
+        &agent_str,
+        opts.force,
+        opts.dry_run,
+    )?;
 
     if opts.update_configs {
         eprintln!();
@@ -833,6 +865,7 @@ pub fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
 /// Used for files where tirith owns the entire file (no merge with user content).
 fn write_owned_json(
     path: &std::path::Path,
+    scope_root: &std::path::Path,
     content: &str,
     force: bool,
     dry_run: bool,
@@ -869,7 +902,7 @@ fn write_owned_json(
         );
         return Ok(());
     }
-    fs_helpers::atomic_write(path, content, 0o644)?;
+    fs_helpers::atomic_write(path, scope_root, content, 0o644)?;
     eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }

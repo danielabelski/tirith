@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 /// Skips identical config; errors on drift unless `force`.
 pub fn merge_mcp_json(
     path: &Path,
+    scope_root: &Path,
     server_name: &str,
     server_config: Value,
     force: bool,
@@ -14,6 +15,7 @@ pub fn merge_mcp_json(
 ) -> Result<(), String> {
     merge_mcp_json_with_key(
         path,
+        scope_root,
         server_name,
         server_config,
         "mcpServers",
@@ -25,6 +27,7 @@ pub fn merge_mcp_json(
 /// Like `merge_mcp_json` but with a custom top-level key (e.g. `"servers"` for VS Code).
 pub fn merge_mcp_json_with_key(
     path: &Path,
+    scope_root: &Path,
     server_name: &str,
     server_config: Value,
     server_key: &str,
@@ -88,15 +91,19 @@ pub fn merge_mcp_json_with_key(
         return Ok(());
     }
 
-    super::fs_helpers::atomic_write(path, &content, 0o644)?;
+    super::fs_helpers::atomic_write(path, scope_root, &content, 0o644)?;
     eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
 
 /// Merge a hook entry into a hooks.json file (Cursor/Windsurf format).
 /// Detects existing tirith hooks by the `marker` substring in each `command`.
+// The explicit scope root is a security boundary and must not be inferred from
+// the destination path, so retain it even though this makes eight parameters.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_hooks_json(
     path: &Path,
+    scope_root: &Path,
     event_name: &str,
     hook_entry: Value,
     marker: &str,
@@ -207,7 +214,7 @@ pub fn merge_hooks_json(
         return Ok(());
     }
 
-    super::fs_helpers::atomic_write(path, &content, 0o644)?;
+    super::fs_helpers::atomic_write(path, scope_root, &content, 0o644)?;
     eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
@@ -217,6 +224,7 @@ pub fn merge_hooks_json(
 /// inside an active Claude Code session. Same drift semantics as `merge_mcp_json`.
 pub fn merge_claude_mcp_server(
     path: &Path,
+    scope_root: &Path,
     server_name: &str,
     server_config: Value,
     force: bool,
@@ -278,7 +286,7 @@ pub fn merge_claude_mcp_server(
         return Ok(());
     }
 
-    super::fs_helpers::atomic_write(path, &content, 0o644)?;
+    super::fs_helpers::atomic_write(path, scope_root, &content, 0o644)?;
     eprintln!(
         "tirith: registered {server_name} MCP server in {}",
         path.display()
@@ -292,8 +300,12 @@ pub fn merge_claude_mcp_server(
 /// Operates at the individual hook-command level, preserving other hooks and
 /// matchers. `marker` is a tool-specific filename substring used to detect the
 /// existing tirith hook entry.
+// Keep the trusted root explicit at this internal boundary for the same reason
+// as merge_hooks_json.
+#[allow(clippy::too_many_arguments)]
 fn merge_hook_settings_inner(
     path: &Path,
+    scope_root: &Path,
     event_name: &str,
     matcher_name: &str,
     hook_command: &str,
@@ -470,7 +482,7 @@ fn merge_hook_settings_inner(
         return Ok(());
     }
 
-    super::fs_helpers::atomic_write(path, &content, 0o644)?;
+    super::fs_helpers::atomic_write(path, scope_root, &content, 0o644)?;
     eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
@@ -478,12 +490,14 @@ fn merge_hook_settings_inner(
 /// Merge a tirith PreToolUse hook into Claude Code's settings.json.
 pub fn merge_claude_settings(
     path: &Path,
+    scope_root: &Path,
     hook_command: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     merge_hook_settings_inner(
         path,
+        scope_root,
         "PreToolUse",
         "Bash",
         hook_command,
@@ -496,12 +510,14 @@ pub fn merge_claude_settings(
 /// Merge a tirith BeforeTool hook into Gemini CLI's settings.json.
 pub fn merge_gemini_settings(
     path: &Path,
+    scope_root: &Path,
     hook_command: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     merge_hook_settings_inner(
         path,
+        scope_root,
         "BeforeTool",
         "run_shell_command",
         hook_command,
@@ -516,6 +532,7 @@ pub fn merge_gemini_settings(
 /// instructions) if a `"hooks"` key already exists outside the block.
 pub fn merge_vscode_settings(
     path: &Path,
+    scope_root: &Path,
     hook_command: &str,
     force: bool,
     dry_run: bool,
@@ -677,7 +694,7 @@ pub fn merge_vscode_settings(
         super::fs_helpers::create_backup_always(path)?;
     }
 
-    super::fs_helpers::atomic_write(path, &result, 0o644)?;
+    super::fs_helpers::atomic_write(path, scope_root, &result, 0o644)?;
     eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
@@ -725,6 +742,108 @@ fn remove_managed_block(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn merge_mcp_json(
+        path: &Path,
+        server_name: &str,
+        server_config: Value,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_mcp_json(
+            path,
+            path.parent().expect("test path has parent"),
+            server_name,
+            server_config,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_mcp_json_with_key(
+        path: &Path,
+        server_name: &str,
+        server_config: Value,
+        server_key: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_mcp_json_with_key(
+            path,
+            path.parent().expect("test path has parent"),
+            server_name,
+            server_config,
+            server_key,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_hooks_json(
+        path: &Path,
+        event_name: &str,
+        hook_entry: Value,
+        marker: &str,
+        force: bool,
+        dry_run: bool,
+        require_version: bool,
+    ) -> Result<(), String> {
+        super::merge_hooks_json(
+            path,
+            path.parent().expect("test path has parent"),
+            event_name,
+            hook_entry,
+            marker,
+            force,
+            dry_run,
+            require_version,
+        )
+    }
+
+    fn merge_claude_settings(
+        path: &Path,
+        hook_command: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_claude_settings(
+            path,
+            path.parent().expect("test path has parent"),
+            hook_command,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_gemini_settings(
+        path: &Path,
+        hook_command: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_gemini_settings(
+            path,
+            path.parent().expect("test path has parent"),
+            hook_command,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_vscode_settings(
+        path: &Path,
+        hook_command: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_vscode_settings(
+            path,
+            path.parent().expect("test path has parent"),
+            hook_command,
+            force,
+            dry_run,
+        )
+    }
 
     #[test]
     fn mcp_json_creates_new_file() {

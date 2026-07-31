@@ -1,73 +1,421 @@
 //! Windows filesystem helpers for `tirith setup` — the same public API as
-//! `fs_helpers.rs` without the Unix permission handling (NTFS ACLs default to
-//! owner-only, so explicit chmod is unnecessary).
+//! `fs_helpers.rs` using held Windows handles and explicit DACL handling.
 
+use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Write `content` to `path` atomically via temp+rename. `mode` is accepted for
-/// API compatibility but ignored on Windows.
-pub fn atomic_write(path: &Path, content: &str, _mode: u32) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("no parent directory for {}", path.display()))?;
-    fs::create_dir_all(parent).map_err(|e| format!("create dirs {}: {e}", parent.display()))?;
+#[path = "fs_helpers_windows_path.rs"]
+mod path_rules;
 
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
+use windows::core::{BOOL, HRESULT, PCWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_PATH_NOT_FOUND, HANDLE, HLOCAL,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
+};
+use windows::Win32::Security::{
+    ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    MoveFileExW, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+};
 
-    let tmp = {
-        let mut tmp_path;
-        let mut f_result;
+struct OwnedHandle(HANDLE);
 
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        tmp_path = parent.join(format!(".tirith-setup-{}-{}.tmp", std::process::id(), n));
-        f_result = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path);
-
-        for _ in 0..3 {
-            if f_result.is_ok() {
-                break;
-            }
-            let n2 = COUNTER.fetch_add(1, Ordering::Relaxed);
-            tmp_path = parent.join(format!(".tirith-setup-{}-{}.tmp", std::process::id(), n2));
-            f_result = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path);
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
         }
+    }
+}
 
-        use std::io::Write;
-        let mut f = f_result.map_err(|e| format!("create tmp {}: {e}", tmp_path.display()))?;
-        f.write_all(content.as_bytes()).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            format!("write tmp: {e}")
-        })?;
-        tmp_path
-    };
+struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
 
-    // Refuse to overwrite a symlink target — matches Unix behavior.
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let _ = fs::remove_file(&tmp);
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+        }
+    }
+}
+
+struct ValidatedParent {
+    path: PathBuf,
+    handles: Vec<OwnedHandle>,
+    root_final: String,
+}
+
+fn wide(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+fn is_win32(error: &windows::core::Error, code: u32) -> bool {
+    error.code() == HRESULT::from_win32(code)
+}
+
+fn final_path(handle: HANDLE) -> Result<String, String> {
+    let mut buffer = vec![0u16; 512];
+    loop {
+        let length = unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, Default::default()) };
+        if length == 0 {
             return Err(format!(
-                "{} is a symlink — refusing to overwrite for safety",
+                "GetFinalPathNameByHandleW: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if (length as usize) < buffer.len() {
+            return Ok(String::from_utf16_lossy(&buffer[..length as usize]));
+        }
+        buffer.resize(length as usize + 1, 0);
+    }
+}
+
+fn open_directory(path: &Path) -> Result<OwnedHandle, String> {
+    let path_wide = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            (FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|e| format!("open directory handle {}: {e}", path.display()))?;
+    let owned = OwnedHandle(handle);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .map_err(|e| format!("inspect directory handle {}: {e}", path.display()))?;
+    if !path_rules::attributes_are_safe(info.dwFileAttributes, true) {
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(format!(
+                "{} is a reparse point — refusing for safety",
                 path.display()
             ));
         }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    Ok(owned)
+}
+
+fn open_or_create_directory(
+    current: &mut PathBuf,
+    component: &OsStr,
+    handles: &mut Vec<OwnedHandle>,
+) -> Result<(), String> {
+    current.push(component);
+    let component_handle = match open_directory(current) {
+        Ok(handle) => handle,
+        Err(open_error) if !current.exists() => {
+            let current_wide = wide(current);
+            unsafe { CreateDirectoryW(PCWSTR(current_wide.as_ptr()), None) }.map_err(|e| {
+                format!(
+                    "create directory {} after {open_error}: {e}",
+                    current.display()
+                )
+            })?;
+            open_directory(current)?
+        }
+        Err(error) => return Err(error),
+    };
+    handles.push(component_handle);
+    Ok(())
+}
+
+fn validated_parent(path: &Path, scope_root: &Path) -> Result<ValidatedParent, String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("current_dir: {e}"))?
+            .join(path)
+    };
+    let root = if scope_root.is_absolute() {
+        scope_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("current_dir: {e}"))?
+            .join(scope_root)
+    };
+    let relative = path.strip_prefix(&root).map_err(|_| {
+        format!(
+            "{} is outside trusted setup root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let mut relative_parts: Vec<_> = relative.components().collect();
+    if relative_parts.pop().is_none() {
+        return Err(format!(
+            "{} names the trusted root, not a file",
+            path.display()
+        ));
+    }
+    if relative_parts
+        .iter()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "{} contains a non-normal path component",
+            path.display()
+        ));
+    }
+
+    let mut anchor = root.clone();
+    let mut missing = Vec::new();
+    while !anchor.exists() {
+        missing.push(
+            anchor
+                .file_name()
+                .ok_or_else(|| format!("cannot resolve {}", root.display()))?
+                .to_os_string(),
+        );
+        if !anchor.pop() {
+            return Err(format!("cannot resolve {}", root.display()));
+        }
+    }
+    let mut current = anchor
+        .canonicalize()
+        .map_err(|e| format!("canonicalize trusted root {}: {e}", anchor.display()))?;
+    let mut handles = vec![open_directory(&current)?];
+
+    for component in missing.iter().rev() {
+        open_or_create_directory(&mut current, component, &mut handles)?;
+    }
+    // Capture the final path of the requested scope root itself, rather than
+    // its nearest pre-existing ancestor when the scope had to be created.
+    let root_final = final_path(handles.last().expect("root handle exists").0)?;
+
+    for component in relative_parts.iter().filter_map(|part| match part {
+        std::path::Component::Normal(name) => Some(*name),
+        _ => None,
+    }) {
+        open_or_create_directory(&mut current, component, &mut handles)?;
+    }
+
+    let parent_final = final_path(handles.last().expect("anchor handle exists").0)?;
+    if !path_rules::final_path_within(&root_final, &parent_final) {
+        return Err(format!(
+            "{} resolves outside trusted setup root",
+            current.display()
+        ));
+    }
+    Ok(ValidatedParent {
+        path: current,
+        handles,
+        root_final,
+    })
+}
+
+fn open_existing(path: &Path) -> Result<Option<OwnedHandle>, String> {
+    let path_wide = wide(path);
+    let handle = match unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            (READ_CONTROL | FILE_READ_ATTRIBUTES).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    } {
+        Ok(handle) => handle,
+        Err(error)
+            if is_win32(&error, ERROR_FILE_NOT_FOUND.0)
+                || is_win32(&error, ERROR_PATH_NOT_FOUND.0) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(format!("open destination {}: {error}", path.display())),
+    };
+    let owned = OwnedHandle(handle);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .map_err(|e| format!("inspect destination {}: {e}", path.display()))?;
+    if !path_rules::attributes_are_safe(info.dwFileAttributes, false) {
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(format!(
+                "{} is a reparse point — refusing for safety",
+                path.display()
+            ));
+        }
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    Ok(Some(owned))
+}
+
+fn owner_only_descriptor() -> Result<LocalSecurityDescriptor, String> {
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows::core::w!("D:P(A;;FA;;;OW)"),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|e| format!("build owner-only security descriptor: {e}"))?;
+    Ok(LocalSecurityDescriptor(descriptor))
+}
+
+/// Write through held, no-reparse directory handles. Existing destination
+/// DACLs are copied; new files are owner-only from the instant of creation.
+pub fn atomic_write(
+    path: &Path,
+    scope_root: &Path,
+    content: &str,
+    _mode: u32,
+) -> Result<(), String> {
+    let parent = validated_parent(path, scope_root)?;
+    let destination = parent.path.join(
+        path.file_name()
+            .ok_or_else(|| format!("no file name for {}", path.display()))?,
+    );
+    let existing = open_existing(&destination)?;
+    let acl_source = path_rules::acl_source(existing.is_some());
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let owner_only = owner_only_descriptor()?;
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: owner_only.0 .0,
+        bInheritHandle: BOOL(0),
+    };
+
+    let (tmp, handle) = (0..4)
+        .find_map(|_| {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp = parent
+                .path
+                .join(format!(".tirith-setup-{}-{n}.tmp", std::process::id()));
+            let tmp_wide = wide(&tmp);
+            match unsafe {
+                CreateFileW(
+                    PCWSTR(tmp_wide.as_ptr()),
+                    (FILE_GENERIC_WRITE | WRITE_DAC).0,
+                    FILE_SHARE_READ,
+                    Some(&security_attributes),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    None,
+                )
+            } {
+                Ok(handle) => Some(Ok((tmp, handle))),
+                Err(error)
+                    if is_win32(&error, ERROR_FILE_EXISTS.0)
+                        || is_win32(&error, ERROR_ALREADY_EXISTS.0) =>
+                {
+                    None
+                }
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()
+        .map_err(|e| format!("create owner-only temporary file: {e}"))?
+        .ok_or_else(|| "temporary-name retries exhausted".to_string())?;
+
+    if acl_source == path_rules::AclSource::ExistingDestination {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let status = unsafe {
+            GetSecurityInfo(
+                existing.as_ref().expect("existing ACL source").0,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                Some(&mut descriptor),
+            )
+        };
+        if status.0 != 0 {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
             let _ = fs::remove_file(&tmp);
-            return Err(format!("stat {}: {e}", path.display()));
+            return Err(format!(
+                "read existing destination DACL: error {}",
+                status.0
+            ));
+        }
+        let existing_descriptor = LocalSecurityDescriptor(descriptor);
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl),
+                None,
+            )
+        };
+        drop(existing_descriptor);
+        if status.0 != 0 {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            let _ = fs::remove_file(&tmp);
+            return Err(format!(
+                "apply existing destination DACL: error {}",
+                status.0
+            ));
         }
     }
 
-    fs::rename(&tmp, path).map_err(|e| {
+    let mut file = unsafe { fs::File::from_raw_handle(handle.0 as RawHandle) };
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        drop(file);
         let _ = fs::remove_file(&tmp);
-        format!("rename {} -> {}: {e}", tmp.display(), path.display())
+        return Err(format!("write temporary file: {error}"));
+    }
+    drop(file);
+
+    // Revalidate both the held parent containment and final destination type at
+    // publication time. Parent handles omit FILE_SHARE_DELETE, preventing a
+    // junction swap while this operation is in flight.
+    let parent_final = final_path(parent.handles.last().expect("parent handle exists").0)?;
+    if !path_rules::final_path_within(&parent.root_final, &parent_final) {
+        let _ = fs::remove_file(&tmp);
+        return Err("destination parent moved outside trusted setup root".into());
+    }
+    let final_destination = open_existing(&destination)?;
+    // These no-delete handles prevent swaps while validating/copying ACLs;
+    // release them only after the final check so MoveFileEx can replace the name.
+    drop(final_destination);
+    drop(existing);
+    let tmp_wide = wide(&tmp);
+    let destination_wide = wide(&destination);
+    unsafe {
+        MoveFileExW(
+            PCWSTR(tmp_wide.as_ptr()),
+            PCWSTR(destination_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("publish {}: {e}", destination.display())
     })?;
 
     Ok(())
@@ -76,6 +424,7 @@ pub fn atomic_write(path: &Path, content: &str, _mode: u32) -> Result<(), String
 /// Write a hook script. No executable bit needed on Windows.
 pub fn write_hook_script(
     path: &Path,
+    scope_root: &Path,
     content: &str,
     force: bool,
     dry_run: bool,
@@ -128,7 +477,7 @@ pub fn write_hook_script(
         return Ok(());
     }
 
-    atomic_write(path, content, 0)?;
+    atomic_write(path, scope_root, content, 0)?;
     eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
