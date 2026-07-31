@@ -12,17 +12,10 @@ keywords = ["security", "url", "analysis"]
 categories = ["development-tools"]
 
 [features]
-# Off-by-default seam for artifact / member SHA-256 known-malicious lookups
-# against the threat DB. The DB methods it calls (`check_artifact_sha256` /
-# `check_file_sha256`) shipped with DB-D, so this seam is now ACTIVE under the
-# feature: it decodes the inspected artifact's whole-file SHA-256 and each
-# member's SHA-256 and queries the v2 hash indices, emitting the Critical
-# `ArtifactKnownMalicious` RuleId on a positive match (see
-# `artifact::correlate::artifact_hash_indicator`). The feature stays OFF in the
-# default library build (the lookup is compiled out and the RuleId is
-# unreachable); the firewall / package-install surfaces flip it on. Building with
-# `--features artifact-hash-lookup` compiles and tests cleanly; with an empty or
-# v1 DB the lookup returns no match, so there is no false positive.
+# Compatibility-only feature name retained for downstream manifests. Artifact
+# and member SHA-256 lookups are a security control and are compiled
+# unconditionally; disabling default features must never remove known-malicious
+# blocking from the artifact firewall.
 default = []
 artifact-hash-lookup = []
 # native-yara (yara-x): DEFERRED by the PR-0 dependency spike, NOT wired here.

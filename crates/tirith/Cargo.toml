@@ -20,10 +20,9 @@ name = "tirith-threatdb-compile"
 path = "src/bin/tirith_threatdb_compile.rs"
 
 [features]
-# Pass-through to `tirith-core`'s off-by-default artifact / member hash
-# known-malicious lookup seam (DB-gated; see tirith-core's `[features]`). Keeping
-# the forwarding feature here means DB-D activation is one CLI flag, not a code
-# change. OFF by default; building `tirith` with this on compiles and tests today.
+# Compatibility-only pass-through retained for downstream build invocations.
+# The core lookup is unconditional so ordinary, no-default-feature, Nix, and
+# distribution builds all enforce the same known-malicious hash boundary.
 default = []
 artifact-hash-lookup = ["tirith-core/artifact-hash-lookup"]
 # sigstore-attestations (Stack F3 spike): the OFF-by-default gate for the PyPI

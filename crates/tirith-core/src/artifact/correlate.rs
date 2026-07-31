@@ -26,7 +26,7 @@
 //! * [`crate::verdict::RuleId::NativeImportExecutionChain`] (Critical) is produced
 //!   per native member by B7 triage and folded in directly.
 //! * [`crate::verdict::RuleId::ArtifactKnownMalicious`] (Critical) is the
-//!   DB-gated, feature-gated hash match (see [`artifact_hash_indicator`]).
+//!   DB-gated hash match (see [`artifact_hash_indicator`]).
 
 use std::collections::BTreeSet;
 
@@ -45,7 +45,8 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 /// the inspection's signal set, so the inspection populator passes them through).
 ///
 /// `threat_db` is threaded for the DB-gated [`RuleId::ArtifactKnownMalicious`]
-/// hash match; it is consulted only behind the `artifact-hash-lookup` feature.
+/// hash match. The lookup is unconditional when a database is supplied: build
+/// features must not compile a known-malicious security control out of releases.
 pub fn correlate_inspection_findings(
     inspection: &ArtifactInspection,
     extra_native_findings: &[Finding],
@@ -246,11 +247,9 @@ fn integrity_findings(signals: &[ArtifactSignal]) -> Vec<Finding> {
     }]
 }
 
-/// The DB-gated, FEATURE-GATED known-malicious hash correlation. Emits a Critical
+/// The DB-gated known-malicious hash correlation. Emits a Critical
 /// [`RuleId::ArtifactKnownMalicious`] when the artifact's whole-file hash or any
-/// member's hash matches a known-malicious record. The lookup is compiled in only
-/// under the `artifact-hash-lookup` feature (see [`artifact_hash_indicator`]); in
-/// the default library build it is a no-op and the RuleId is unreachable.
+/// member's hash matches a known-malicious record.
 fn known_malicious_findings(
     inspection: &ArtifactInspection,
     threat_db: Option<&ThreatDb>,
@@ -277,18 +276,17 @@ fn known_malicious_findings(
 
 /// The DB-gated known-malicious hash indicator for an inspection.
 ///
-/// B8g cross-track seam, ACTIVATED in PR-I now that DB-D shipped the v2 hash
+/// B8g cross-track seam, activated now that DB-D shipped the v2 hash
 /// indices and their readers (`ThreatDb::check_artifact_sha256` /
-/// `check_file_sha256`). Under the `artifact-hash-lookup` feature this decodes the
-/// inspected artifact's whole-file SHA-256 (the `subject`'s lowercase-hex hash,
-/// when the subject carries one) and each `inspection.files[].sha256`, queries the
-/// DB, and returns the matching record's wire string for the evidence. The
+/// `check_file_sha256`). This decodes the inspected artifact's whole-file SHA-256
+/// (the `subject`'s lowercase-hex hash, when the subject carries one) and each
+/// `inspection.files[].sha256`, queries the DB, and returns the matching record's
+/// wire string for the evidence. The
 /// whole-artifact hash is checked first (a positive there means the distributed
 /// artifact itself is known-malicious); then each member's content hash (a bundled
 /// known-malicious file). The first hit wins; an empty / v1 DB, an unparseable hex
 /// string, or a subject without bytes (an installed distribution) simply yields no
 /// match, so there is no false positive.
-#[cfg(feature = "artifact-hash-lookup")]
 fn artifact_hash_indicator(
     inspection: &ArtifactInspection,
     threat_db: Option<&ThreatDb>,
@@ -345,7 +343,6 @@ fn artifact_hash_indicator(
 /// that was hashed. An [`InspectionSubject::InstalledDistribution`] has none (its
 /// installed bytes are not the distributed-artifact bytes), so this returns `None`
 /// and the artifact-hash lookup is skipped for it.
-#[cfg(feature = "artifact-hash-lookup")]
 fn subject_artifact_sha256(subject: &crate::artifact::InspectionSubject) -> Option<&str> {
     use crate::artifact::InspectionSubject as S;
     match subject {
@@ -360,29 +357,16 @@ fn subject_artifact_sha256(subject: &crate::artifact::InspectionSubject) -> Opti
 /// indices take. Returns `None` for any string that is not exactly 32 decoded
 /// bytes (a short / malformed / non-hex value), so a bad hash never panics and
 /// never produces a false match.
-#[cfg(feature = "artifact-hash-lookup")]
 fn decode_sha256(hex_str: &str) -> Option<[u8; 32]> {
     hex::decode(hex_str).ok()?.try_into().ok()
 }
 
 /// Render the optional campaign label as an evidence suffix, or empty when absent.
-#[cfg(feature = "artifact-hash-lookup")]
 fn campaign_suffix(campaign: Option<&str>) -> String {
     match campaign {
         Some(c) => format!(", campaign: {c}"),
         None => String::new(),
     }
-}
-
-/// The DB-gated known-malicious hash indicator — DEFAULT build (feature off). The
-/// lookup is compiled out entirely, so the artifact path never consults the DB for
-/// a hash match and [`RuleId::ArtifactKnownMalicious`] is unreachable.
-#[cfg(not(feature = "artifact-hash-lookup"))]
-fn artifact_hash_indicator(
-    _inspection: &ArtifactInspection,
-    _threat_db: Option<&ThreatDb>,
-) -> Option<String> {
-    None
 }
 
 /// Whether a signal kind is a B6 startup-hook execution signal.
@@ -602,9 +586,7 @@ mod tests {
     #[test]
     fn known_malicious_not_emitted_without_db() {
         // With no DB threaded the seam cannot match: no ArtifactKnownMalicious
-        // finding is produced even from a populated inspection. (In the default
-        // library build the lookup is compiled out entirely, so this also holds
-        // there; under the feature it holds because `threat_db` is `None`.)
+        // finding is produced even from a populated inspection.
         let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
         inspection.files.push(crate::artifact::ArtifactFile {
             location: SubjectLocation::member("demo-1.0-py3-none-any.whl", "demo/__init__.py"),
@@ -618,12 +600,11 @@ mod tests {
             .all(|f| f.rule_id != RuleId::ArtifactKnownMalicious));
     }
 
-    // The activated hash-lookup seam: only compiled under the feature the firewall
-    // flips on. A throwaway in-memory v2 DB carries a known artifact hash and a
-    // known file hash; the seam must resolve an inspection's subject / member hash
-    // to a Critical ArtifactKnownMalicious finding, and must NOT false-positive on
-    // an unrelated hash or an empty / v1 DB.
-    #[cfg(feature = "artifact-hash-lookup")]
+    // The unconditional hash-lookup seam. A throwaway in-memory v2 DB carries a
+    // known artifact hash and a known file hash; every build configuration must
+    // resolve an inspection's subject / member hash to a Critical
+    // ArtifactKnownMalicious finding and must not false-positive on an unrelated
+    // hash or an empty / v1 DB.
     mod hash_lookup {
         use super::*;
         use crate::threatdb::Confidence;
