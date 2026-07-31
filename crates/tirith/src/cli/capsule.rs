@@ -7,10 +7,11 @@
 //! - **Linux**: re-exec `tirith __capsule-child <spec-json> -- <prog> <args>`;
 //!   the launcher ([`crate::cli::capsule_child`]) applies the full containment
 //!   sequence in a single-threaded child and `execve`s the target.
-//! - **macOS**: [`tirith_core::capsule::macos::sandbox_exec_argv`] builds a
-//!   `sandbox-exec -p <profile> -- <prog> <args>` argv; this wrapper additionally
-//!   scrubs the environment and applies the rlimits/handle closure the SBPL
-//!   profile alone does not.
+//! - **macOS**: re-exec `tirith __capsule-child <spec-json> -- <prog> <args>`;
+//!   the launcher closes inherited handles and applies rlimits before it `execve`s
+//!   the `sandbox-exec -p <profile> -- <prog> <args>` argv built by
+//!   [`tirith_core::capsule::macos::sandbox_exec_argv`]. The parent scrubs the
+//!   launcher's environment before the first exec.
 //! - **Windows**: [`crate::cli::capsule_windows::launch_contained`] creates the
 //!   AppContainer, ACLs the roots, and runs the child in a kill-on-close Job.
 //!
@@ -519,10 +520,11 @@ fn spawn_uncontained_piped(
 }
 
 /// Build the `Command` that launches `program` + `args` contained, for the Unix
-/// backends. Linux re-execs the `__capsule-child` launcher (which applies
-/// containment then `execve`s); macOS wraps in `sandbox-exec` and additionally
-/// scrubs the environment + applies rlimits/fd-closure that the SBPL profile alone
-/// does not.
+/// backends. Linux and macOS re-exec the `__capsule-child` launcher; Linux applies
+/// its full containment there, while macOS closes inherited descriptors, applies
+/// rlimits, and then `execve`s `sandbox-exec`. The extra macOS exec boundary is
+/// deliberate: Rust's private child-to-parent exec-error pipe must survive until
+/// the first exec, so descriptor closure cannot safely run in `Command::pre_exec`.
 ///
 /// The returned `Command` has had its environment/argv set up; the caller adds
 /// `cwd`/`extra_env`/stdio. NOT used on Windows (which has its own launcher).
@@ -561,43 +563,60 @@ fn linux_contained_command_os(
     Ok(cmd)
 }
 
+/// macOS: re-exec the internal capsule launcher, which closes inherited handles,
+/// applies rlimits, and then execs `sandbox-exec -p <profile> -- <program> <args>`.
+///
+/// Descriptor closure MUST NOT happen in `Command::pre_exec`: `Command::spawn`
+/// creates a private child-to-parent pipe after this command is built and uses it
+/// to report exec failures. The pipe is intentionally not part of the capsule
+/// handle allow-list, but closing it in `pre_exec` makes Rust abort before either
+/// `sandbox-exec` or the target can execute. Re-execing the trusted, single-threaded
+/// launcher first lets the pipe's own `FD_CLOEXEC` semantics complete normally;
+/// the launcher then closes every unrelated inherited descriptor before the
+/// second exec, preserving the handle-isolation boundary.
 #[cfg(target_os = "macos")]
-/// macOS: wrap the OS-native target argv in `sandbox-exec`, then apply the
-/// environment, resource, and handle controls that Seatbelt does not provide.
 fn macos_contained_command_os(
     spec: &CapsuleSpec,
     program: &OsStr,
     args: &[OsString],
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
-    use std::os::unix::process::CommandExt;
+    // Validate the final sandbox argv before spawning. The launcher reconstructs
+    // it after the first exec so a direct invocation of the hidden subcommand
+    // cannot substitute an uncontained program for sandbox-exec.
+    tirith_core::capsule::macos::sandbox_exec_argv_os(spec, program, args).map_err(|e| {
+        CapsuleRefused {
+            backend_id: sel.backend_id,
+            reason: format!("cannot build sandbox-exec invocation: {e}"),
+        }
+    })?;
 
-    let argv =
-        tirith_core::capsule::macos::sandbox_exec_argv_os(spec, program, args).map_err(|e| {
-            CapsuleRefused {
-                backend_id: sel.backend_id,
-                reason: format!("cannot build sandbox-exec invocation: {e}"),
-            }
-        })?;
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
+    let exe = std::env::current_exe().map_err(|e| CapsuleRefused {
+        backend_id: sel.backend_id,
+        reason: format!("cannot resolve current executable for capsule re-exec: {e}"),
+    })?;
+    let spec_json = serde_json::to_string(spec).map_err(|e| CapsuleRefused {
+        backend_id: sel.backend_id,
+        reason: format!("cannot serialize capsule spec: {e}"),
+    })?;
+    let mut cmd = Command::new(exe);
+    cmd.arg(crate::cli::capsule_child::SUBCOMMAND)
+        .arg(spec_json)
+        .arg("--")
+        .arg(program)
+        .args(args);
+
+    // Environment scrub: clear, then re-add the surviving names from the current
+    // environment, and (when temporary_home) point HOME/TMPDIR/XDG_* at a fresh
+    // temp dir. We do this on the parent `Command` (env_clear + env) so the child
+    // and the sandbox-exec wrapper both see the scrubbed set. Fails closed if the
+    // temporary HOME cannot be created for a `temporary_home` spec: skipping it
+    // would leave the real `$HOME` reachable (env_clear already ran, but
+    // `getpwuid()->pw_dir` still resolves it) while `env_isolated` claims true.
     apply_macos_env(&mut cmd, spec).map_err(|reason| CapsuleRefused {
         backend_id: sel.backend_id,
         reason,
     })?;
-
-    let resources = spec.resources.clone();
-    let handles = spec.handles.clone();
-    // SAFETY: the closure only invokes async-signal-safe libc functions
-    // (`getrlimit`, `close`, and `setrlimit`) on owned values. Descriptor closure
-    // runs before lowering RLIMIT_NOFILE so the scan sees the inherited ceiling.
-    unsafe {
-        cmd.pre_exec(move || {
-            close_extra_fds(&handles);
-            apply_macos_rlimits(&resources)?;
-            Ok(())
-        });
-    }
     Ok(cmd)
 }
 
@@ -676,11 +695,13 @@ where
 }
 
 /// Apply the rlimit dimensions of [`tirith_core::capsule::ResourceLimits`] via
-/// `setrlimit`, async-signal-safe for a `pre_exec` hook (macOS). Mirrors the Linux
-/// launcher's `apply_rlimits` but lives here because macOS containment is applied
-/// by this wrapper, not a re-exec launcher.
+/// `setrlimit` in the re-execed macOS capsule launcher. Mirrors the Linux
+/// launcher's `apply_rlimits` but lives here because the macOS launcher delegates
+/// the actual sandbox policy to `sandbox-exec`.
 #[cfg(target_os = "macos")]
-fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io::Result<()> {
+pub(crate) fn apply_macos_rlimits(
+    limits: &tirith_core::capsule::ResourceLimits,
+) -> std::io::Result<()> {
     fn set_one(resource: libc::c_int, value: u64) -> std::io::Result<()> {
         let rl = libc::rlimit {
             rlim_cur: value as libc::rlim_t,
@@ -716,9 +737,9 @@ fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io
 }
 
 /// Close every inherited file descriptor above stdio that is not in the handle
-/// allow-list (macOS, `pre_exec`). Best-effort and async-signal-safe: it walks the
-/// fd range up to the process `RLIMIT_NOFILE` ceiling and `close()`s anything not
-/// permitted. Stdio (0/1/2) and the explicit extras survive.
+/// allow-list in the re-execed macOS capsule launcher. It walks the fd range up to
+/// the process `RLIMIT_NOFILE` ceiling and `close()`s anything not permitted.
+/// Stdio (0/1/2) and the explicit extras survive.
 ///
 /// The upper bound is the current `RLIMIT_NOFILE` soft limit (an fd can never be
 /// numbered at or above it), so an inherited descriptor numbered above a hardcoded
@@ -726,9 +747,9 @@ fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io
 /// `RLIMIT_NOFILE`, so the ceiling reflects the inherited (higher) limit and a
 /// high-numbered inherited fd is still found. It is clamped to [`MAX_FD_SCAN`] so a
 /// process that raised `RLIMIT_NOFILE` to a huge value (or `RLIM_INFINITY`) does
-/// not make the `pre_exec` walk run unboundedly.
+/// not make the launcher walk run unboundedly.
 #[cfg(target_os = "macos")]
-fn close_extra_fds(handles: &tirith_core::capsule::HandlePolicy) {
+pub(crate) fn close_extra_fds(handles: &tirith_core::capsule::HandlePolicy) {
     let allowed = handles.allowed_unix_fds();
     let max_fd = fd_scan_ceiling();
     for fd in 3..max_fd {
@@ -743,8 +764,8 @@ fn close_extra_fds(handles: &tirith_core::capsule::HandlePolicy) {
 }
 
 /// A hard upper bound on the fd-closure walk so a pathological `RLIMIT_NOFILE`
-/// (e.g. `RLIM_INFINITY`) cannot make the async-signal-safe `pre_exec` loop run
-/// effectively forever. 1 MiB of fds is far more than any real inherited set.
+/// (e.g. `RLIM_INFINITY`) cannot make the launcher loop run effectively forever.
+/// 1 MiB of fds is far more than any real inherited set.
 #[cfg(target_os = "macos")]
 const MAX_FD_SCAN: i32 = 1 << 20;
 
@@ -773,7 +794,7 @@ fn fd_scan_ceiling() -> i32 {
 /// are unit-testable without `getrlimit`.
 ///
 /// - `RLIM_INFINITY`, or any value above [`MAX_FD_SCAN`], clamps DOWN to
-///   `MAX_FD_SCAN` so the async-signal-safe `pre_exec` loop is always bounded.
+///   `MAX_FD_SCAN` so the launcher loop is always bounded.
 /// - Anything below the historical hardcoded floor of 1024 is raised UP to 1024, so
 ///   the walk is never narrower than it used to be (a low `RLIMIT_NOFILE` must not
 ///   let a higher-numbered inherited fd survive the closure).
@@ -1172,6 +1193,31 @@ mod tests {
                 .as_deref(),
             Some(marker_val),
             "benign allow-listed marker should survive into the child: {child_env:?}"
+        );
+
+        // The first process is the trusted Tirith launcher, not sandbox-exec.
+        // This extra exec is what lets Rust's private exec-status pipe close via
+        // FD_CLOEXEC before the launcher performs descriptor isolation.
+        assert_eq!(
+            cmd.get_program(),
+            std::env::current_exe().expect("resolve current test executable")
+        );
+        let child_args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            child_args.first().map(String::as_str),
+            Some(crate::cli::capsule_child::SUBCOMMAND)
+        );
+        assert_eq!(
+            child_args.iter().position(|arg| arg == "--"),
+            Some(2),
+            "launcher argv must keep the spec and target separated: {child_args:?}"
+        );
+        assert_eq!(
+            child_args.get(3).map(String::as_str),
+            Some("/usr/bin/printenv")
         );
     }
 

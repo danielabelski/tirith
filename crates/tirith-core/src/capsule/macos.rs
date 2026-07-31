@@ -172,9 +172,10 @@ fn path_is_executable_file(path: &Path) -> bool {
 ///     domain enforcement (invariant 3). An allow-list spec is therefore degraded
 ///     on this flag and the enforcing surface fails closed.
 ///   - `resource_limits_enforced`: the SBPL profile alone imposes no rlimit, but
-///     the mandatory E5 launch wrapper applies CPU/memory/open-files rlimits in a
-///     `pre_exec` hook. The aggregate bit is true only when at least one limit was
-///     requested and **every** requested dimension is one of those three.
+///     the mandatory E5 re-exec launcher applies CPU/memory/open-files rlimits
+///     before it execs `sandbox-exec`. The aggregate bit is true only when at least
+///     one limit was requested and **every** requested dimension is one of those
+///     three.
 ///
 ///     **macOS gap (do NOT over-report): `max_processes` is not enforced.** Unlike
 ///     Linux (`RLIMIT_NPROC`) and Windows (Job Object `ActiveProcessLimit`), macOS
@@ -189,11 +190,12 @@ fn path_is_executable_file(path: &Path) -> bool {
 ///   - `env_isolated` / `handles_isolated`: likewise applied by the E5 wrapper,
 ///     not the SBPL profile. The wrapper `env_clear`s and re-adds only the
 ///     surviving (sensitive-stripped) variables, points HOME/TMPDIR/XDG_* at a
-///     fresh temp dir, and closes inherited fds above the handle allow-list in
-///     `pre_exec`. Because every macOS contained launch goes through that wrapper,
-///     the backend reports these `true` (matching what the launch delivers) rather
-///     than describing the bare profile — which would make a locked-down spec
-///     spuriously degraded and refuse every enforcing surface on macOS.
+///     fresh temp dir, and re-execs a trusted single-threaded launcher that closes
+///     inherited fds above the handle allow-list before execing `sandbox-exec`.
+///     Because every macOS contained launch goes through that wrapper, the backend
+///     reports these `true` (matching what the launch delivers) rather than
+///     describing the bare profile — which would make a locked-down spec spuriously
+///     degraded and refuse every enforcing surface on macOS.
 ///
 /// This honestly reflects the backend+wrapper as a unit, mirroring how the Linux
 /// backend reports `env_isolated`/`handles_isolated`/`resource_limits_enforced`

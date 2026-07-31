@@ -73,6 +73,87 @@ fn tirith() -> Command {
     cmd
 }
 
+/// Regression for the macOS capsule launcher's two-exec descriptor design. The
+/// test passes a deliberately inheritable high-numbered fd into the real Tirith
+/// binary, which must successfully exec native `sandbox-exec` and `/bin/sh` while
+/// ensuring the shell cannot observe that unrelated descriptor.
+///
+/// Before the two-exec launcher, production put the fd-closing walk in
+/// `Command::pre_exec`. That walk also closed Rust's private exec-status pipe, so
+/// the parent aborted before `sandbox-exec` ran. Invoking the hidden launcher here
+/// exercises the exact second-stage entry point that production now re-execs; its
+/// successful native sandbox execution plus the fd probe lock both properties.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_capsule_execs_and_does_not_inherit_unrelated_fd() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use tirith_core::capsule::{CapsuleSpec, ResourceLimits};
+
+    if !tirith_core::capsule::macos::probe_sandbox_exec().sandbox_exec_usable {
+        eprintln!("skipping: /usr/bin/sandbox-exec not usable on this host");
+        return;
+    }
+
+    let mut spec = CapsuleSpec::locked_down();
+    spec.resources = ResourceLimits {
+        cpu_seconds: Some(30),
+        max_open_files: Some(64),
+        ..ResourceLimits::default()
+    };
+    spec.environment.temporary_home = false;
+    spec.environment.allow = vec!["PATH".to_string()];
+    // This regression is about exec-status and handle inheritance, not filesystem
+    // policy. Permit reads so the native target remains stable across macOS dyld,
+    // locale, and runtime-path changes; writes and network remain deny-by-default,
+    // and the unrelated-handle boundary under test remains fully enforced.
+    spec.filesystem.read_roots.push(PathBuf::from("/"));
+    let spec_json = serde_json::to_string(&spec).expect("serialize capsule spec");
+
+    let source = fs::File::open("/dev/null").expect("open fd source");
+    // Duplicate above the launcher's eventual RLIMIT_NOFILE. This proves closure
+    // happens before the limit is lowered; merely shrinking the limit does not
+    // close an already-open high descriptor.
+    let inherited_fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, 200) };
+    assert!(inherited_fd >= 200, "duplicate a high-numbered fd");
+    let inherited_fd = unsafe { OwnedFd::from_raw_fd(inherited_fd) };
+    let rc = unsafe { libc::fcntl(inherited_fd.as_raw_fd(), libc::F_SETFD, 0) };
+    assert_eq!(rc, 0, "clear FD_CLOEXEC so the launcher must close the fd");
+
+    // If the fd survives, redirecting the shell no-op to it succeeds and exits
+    // 91. If handle isolation closed it, the redirection fails and the success
+    // marker is printed instead. Put stderr redirection first so the expected
+    // "bad fd" diagnostic is suppressed.
+    let fd_probe = format!(
+        "if : 2>/dev/null >&{}; then exit 91; else printf capsule-exec-ok; fi",
+        inherited_fd.as_raw_fd()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_tirith"))
+        .args([
+            "__capsule-child",
+            spec_json.as_str(),
+            "--",
+            "/bin/sh",
+            "-c",
+            fd_probe.as_str(),
+        ])
+        .output()
+        .expect("spawn macOS capsule launcher");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "native capsule command must exec successfully; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"capsule-exec-ok");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("fatal runtime error"),
+        "Rust's exec-status protocol must remain intact: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn base_command_isolates_user_state_and_credentials_per_invocation() {
     fn env_value(command: &Command, key: &str) -> Option<Option<std::ffi::OsString>> {
