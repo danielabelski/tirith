@@ -870,38 +870,40 @@ fn write_owned_json(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    if let Some(existing) = fs_helpers::read_to_string_scoped(path, scope_root)? {
-        if existing == content {
-            eprintln!("tirith: {} already configured, up to date", path.display());
-            return Ok(());
-        }
-        if !force {
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would error: {} exists with different content — use --force to update",
-                    path.display()
-                );
-                return Ok(());
+    let outcome = fs_helpers::transactional_update(path, scope_root, dry_run, |snapshot| {
+        let mut backup = false;
+        if let Some(existing) = snapshot.text(path)? {
+            if existing == content {
+                eprintln!("tirith: {} already configured, up to date", path.display());
+                return Ok(fs_helpers::FileUpdate::unchanged());
             }
-            return Err(format!(
-                "{} exists with different content — use --force to update",
-                path.display()
-            ));
+            if !force {
+                if dry_run {
+                    eprintln!(
+                        "[dry-run] would error: {} exists with different content — use --force to update",
+                        path.display()
+                    );
+                    return Ok(fs_helpers::FileUpdate::unchanged());
+                }
+                return Err(format!(
+                    "{} exists with different content — use --force to update",
+                    path.display()
+                ));
+            }
+            backup = true;
         }
-        if !dry_run {
-            fs_helpers::create_backup(path, scope_root, true)?;
+        if dry_run {
+            eprintln!(
+                "[dry-run] would write {} ({} bytes)",
+                path.display(),
+                content.len()
+            );
         }
+        Ok(fs_helpers::FileUpdate::write_text(content.to_string(), 0o644).with_backup(backup))
+    })?;
+    if outcome == fs_helpers::TransactionOutcome::Written {
+        eprintln!("tirith: wrote {}", path.display());
     }
-    if dry_run {
-        eprintln!(
-            "[dry-run] would write {} ({} bytes)",
-            path.display(),
-            content.len()
-        );
-        return Ok(());
-    }
-    fs_helpers::atomic_write(path, scope_root, content, 0o644)?;
-    eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
 

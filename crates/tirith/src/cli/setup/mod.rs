@@ -9,6 +9,8 @@
 #[cfg_attr(not(unix), path = "fs_helpers_windows.rs")]
 mod fs_helpers;
 
+mod fs_transaction;
+
 // Compile Windows containment/ACL policy tests on Unix CI as pure tests.
 #[cfg(all(test, unix))]
 #[path = "fs_helpers_windows_path.rs"]
@@ -399,40 +401,49 @@ mod run_impl {
 
         let content = crate::assets::GATEWAY_YAML;
 
-        if let Some(existing) = fs_helpers::read_to_string_scoped(&gateway_path, &config_root)? {
-            if existing == content {
-                eprintln!(
-                    "tirith: {} already configured, up to date",
-                    gateway_path.display()
-                );
-                return Ok(gateway_path);
-            }
-            if !force {
+        let outcome = fs_helpers::transactional_update(
+            &gateway_path,
+            &config_root,
+            dry_run,
+            |snapshot| {
+                if let Some(existing) = snapshot.text(&gateway_path)? {
+                    if existing == content {
+                        eprintln!(
+                            "tirith: {} already configured, up to date",
+                            gateway_path.display()
+                        );
+                        return Ok(fs_helpers::FileUpdate::unchanged());
+                    }
+                    if !force {
+                        if dry_run {
+                            eprintln!(
+                                "[dry-run] would error: {} exists but content differs — use --force to update",
+                                gateway_path.display()
+                            );
+                            return Ok(fs_helpers::FileUpdate::unchanged());
+                        }
+                        return Err(format!(
+                            "{} exists but content differs — use --force to update",
+                            gateway_path.display()
+                        ));
+                    }
+                }
                 if dry_run {
                     eprintln!(
-                        "[dry-run] would error: {} exists but content differs — use --force to update",
-                        gateway_path.display()
+                        "[dry-run] would write {} ({} bytes)",
+                        gateway_path.display(),
+                        content.len()
                     );
-                    return Ok(gateway_path);
                 }
-                return Err(format!(
-                    "{} exists but content differs — use --force to update",
-                    gateway_path.display()
-                ));
-            }
+                Ok(fs_helpers::FileUpdate::write_text(
+                    content.to_string(),
+                    0o644,
+                ))
+            },
+        )?;
+        if outcome == fs_helpers::TransactionOutcome::Written {
+            eprintln!("tirith: wrote {}", gateway_path.display());
         }
-
-        if dry_run {
-            eprintln!(
-                "[dry-run] would write {} ({} bytes)",
-                gateway_path.display(),
-                content.len()
-            );
-            return Ok(gateway_path);
-        }
-
-        fs_helpers::atomic_write(&gateway_path, &config_root, content, 0o644)?;
-        eprintln!("tirith: wrote {}", gateway_path.display());
         Ok(gateway_path)
     }
 

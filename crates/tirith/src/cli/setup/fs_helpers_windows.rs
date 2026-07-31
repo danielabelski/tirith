@@ -2,36 +2,44 @@
 //! `fs_helpers.rs` using held Windows handles and explicit DACL handling.
 
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{FromRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+
+use fs2::FileExt;
+use sha2::{Digest, Sha256};
+
+pub(crate) use super::fs_transaction::{
+    transactional_update, transactional_update_checked, FileUpdate, TransactionOutcome,
+};
 
 #[path = "fs_helpers_windows_path.rs"]
 mod path_rules;
 
 use windows::core::{BOOL, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
-    ERROR_PATH_NOT_FOUND, HANDLE, HLOCAL,
+    CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+    ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, HANDLE, HLOCAL,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
-    SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     SECURITY_ATTRIBUTES,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    MoveFileExW, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FlushFileBuffers,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    MoveFileExW, ReplaceFileW, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_WRITE_THROUGH,
+    OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL,
 };
 
 struct OwnedHandle(HANDLE);
@@ -93,6 +101,20 @@ fn final_path(handle: HANDLE) -> Result<String, String> {
     }
 }
 
+fn reparse_tag(handle: HANDLE) -> Result<u32, String> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    }
+    .map_err(|error| format!("inspect reparse tag: {error}"))?;
+    Ok(info.ReparseTag)
+}
+
 fn open_directory(path: &Path) -> Result<Option<OwnedHandle>, String> {
     let path_wide = wide(path);
     let handle = match unsafe {
@@ -121,9 +143,11 @@ fn open_directory(path: &Path) -> Result<Option<OwnedHandle>, String> {
         .map_err(|e| format!("inspect directory handle {}: {e}", path.display()))?;
     if !path_rules::attributes_are_safe(info.dwFileAttributes, true) {
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            let tag = reparse_tag(handle)?;
+            let redirects = path_rules::reparse_tag_redirects_name(tag);
             return Err(format!(
-                "{} is a reparse point — refusing for safety",
-                path.display()
+                "{} is a reparse point (tag 0x{tag:08x}, name_redirect={redirects}) — refusing for safety",
+                path.display(),
             ));
         }
         return Err(format!("{} is not a directory", path.display()));
@@ -282,9 +306,11 @@ fn open_existing(path: &Path) -> Result<Option<OwnedHandle>, String> {
         .map_err(|e| format!("inspect destination {}: {e}", path.display()))?;
     if !path_rules::attributes_are_safe(info.dwFileAttributes, false) {
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            let tag = reparse_tag(handle)?;
+            let redirects = path_rules::reparse_tag_redirects_name(tag);
             return Err(format!(
-                "{} is a reparse point — refusing for safety",
-                path.display()
+                "{} is a reparse point (tag 0x{tag:08x}, name_redirect={redirects}) — refusing for safety",
+                path.display(),
             ));
         }
         return Err(format!("{} is not a regular file", path.display()));
@@ -292,27 +318,183 @@ fn open_existing(path: &Path) -> Result<Option<OwnedHandle>, String> {
     Ok(Some(owned))
 }
 
-/// Read through validated, retained no-reparse parent handles. Missing files or
-/// parents return `None` without creating directories, while unsafe components
-/// fail even when the caller would otherwise take an idempotent/dry-run return.
-pub fn read_to_string_scoped(path: &Path, scope_root: &Path) -> Result<Option<String>, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileGeneration {
+    volume_serial: u32,
+    file_index: u64,
+    size: u64,
+    last_write: u64,
+}
+
+impl FileGeneration {
+    fn from_info(info: &BY_HANDLE_FILE_INFORMATION) -> Self {
+        Self {
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+            last_write: ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+                | info.ftLastWriteTime.dwLowDateTime as u64,
+        }
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.volume_serial == other.volume_serial && self.file_index == other.file_index
+    }
+}
+
+fn generation_at(path: &Path) -> Option<FileGeneration> {
+    let handle = open_existing(path).ok().flatten()?;
+    let info = handle_information(handle.0, path).ok()?;
+    Some(FileGeneration::from_info(&info))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SnapshotGeneration {
+    Absent,
+    Present(FileGeneration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlatformSnapshot {
+    pub(crate) bytes: Option<Vec<u8>>,
+    pub(crate) mode: Option<u32>,
+    generation: SnapshotGeneration,
+    security_descriptor: Option<Vec<u8>>,
+}
+
+impl PlatformSnapshot {
+    fn absent() -> Self {
+        Self {
+            bytes: None,
+            mode: None,
+            generation: SnapshotGeneration::Absent,
+            security_descriptor: None,
+        }
+    }
+}
+
+fn handle_information(handle: HANDLE, path: &Path) -> Result<BY_HANDLE_FILE_INFORMATION, String> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .map_err(|error| format!("inspect {} through open handle: {error}", path.display()))?;
+    Ok(info)
+}
+
+fn dacl_descriptor(handle: HANDLE, path: &Path) -> Result<Vec<u8>, String> {
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status.0 != 0 {
+        return Err(format!(
+            "read {} DACL security metadata: error {}",
+            path.display(),
+            status.0
+        ));
+    }
+    let descriptor = LocalSecurityDescriptor(descriptor);
+    let length = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+    if length == 0 {
+        return Err(format!("read {} empty security descriptor", path.display()));
+    }
+    let bytes =
+        unsafe { std::slice::from_raw_parts(descriptor.0 .0.cast::<u8>(), length).to_vec() };
+    Ok(bytes)
+}
+
+fn snapshot_destination(
+    destination: &Path,
+    display_path: &Path,
+) -> Result<PlatformSnapshot, String> {
+    for _ in 0..3 {
+        let Some(handle) = open_existing(destination)? else {
+            return Ok(PlatformSnapshot::absent());
+        };
+        let before = handle_information(handle.0, display_path)?;
+        let before_generation = FileGeneration::from_info(&before);
+        if before_generation.size > super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 {
+            return Err(format!(
+                "{} exceeds setup file limit of {} bytes",
+                display_path.display(),
+                super::fs_transaction::MAX_SETUP_FILE_BYTES
+            ));
+        }
+        let security_before = dacl_descriptor(handle.0, display_path)?;
+        let mut file = handle.into_file();
+        let raw_handle = HANDLE(file.as_raw_handle());
+        let mut bytes = Vec::with_capacity(before_generation.size as usize);
+        (&mut file)
+            .take(super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                format!(
+                    "read {} through validated handle: {error}",
+                    display_path.display()
+                )
+            })?;
+        if bytes.len() > super::fs_transaction::MAX_SETUP_FILE_BYTES {
+            return Err(format!(
+                "{} exceeds setup file limit of {} bytes",
+                display_path.display(),
+                super::fs_transaction::MAX_SETUP_FILE_BYTES
+            ));
+        }
+        let after = handle_information(raw_handle, display_path)?;
+        let after_generation = FileGeneration::from_info(&after);
+        let security_after = dacl_descriptor(raw_handle, display_path)?;
+        if before_generation == after_generation
+            && bytes.len() as u64 == after_generation.size
+            && security_before == security_after
+        {
+            return Ok(PlatformSnapshot {
+                bytes: Some(bytes),
+                mode: None,
+                generation: SnapshotGeneration::Present(after_generation),
+                security_descriptor: Some(security_after),
+            });
+        }
+    }
+    Err(format!(
+        "{} changed repeatedly while being read; retry setup",
+        display_path.display()
+    ))
+}
+
+pub(crate) fn read_snapshot_scoped(
+    path: &Path,
+    scope_root: &Path,
+) -> Result<PlatformSnapshot, String> {
     let Some(parent) = validated_parent(path, scope_root, false)? else {
-        return Ok(None);
+        return Ok(PlatformSnapshot::absent());
     };
     let destination = parent.path.join(
         path.file_name()
             .ok_or_else(|| format!("no file name for {}", path.display()))?,
     );
-    let Some(handle) = open_existing(&destination)? else {
-        return Ok(None);
-    };
-    let mut file = handle.into_file();
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .map_err(|e| format!("read {} through validated handle: {e}", path.display()))?;
-    // Keep the validated parent handles alive through the complete read.
+    let snapshot = snapshot_destination(&destination, path)?;
     drop(parent);
-    Ok(Some(content))
+    Ok(snapshot)
+}
+
+/// Read through validated, retained no-reparse parent handles with a strict
+/// cap. Missing files or parents return `None` without creating directories.
+pub fn read_to_string_scoped(path: &Path, scope_root: &Path) -> Result<Option<String>, String> {
+    read_snapshot_scoped(path, scope_root)?
+        .bytes
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| format!("{} is not valid UTF-8: {error}", path.display()))
+        })
+        .transpose()
 }
 
 /// Return whether a destination's complete parent chain currently exists and
@@ -335,159 +517,433 @@ fn owner_only_descriptor() -> Result<LocalSecurityDescriptor, String> {
     Ok(LocalSecurityDescriptor(descriptor))
 }
 
-/// Write through held, no-reparse directory handles. Existing destination
-/// DACLs are copied; new files are owner-only from the instant of creation.
-pub fn atomic_write(
-    path: &Path,
-    scope_root: &Path,
-    content: &str,
-    _mode: u32,
-) -> Result<(), String> {
-    atomic_write_with_security(path, scope_root, content, true)
+fn stable_lock_path(parent: &ValidatedParent, destination: &Path) -> Result<PathBuf, String> {
+    let name = destination
+        .file_name()
+        .ok_or_else(|| format!("no file name for {}", destination.display()))?;
+    let mut hasher = Sha256::new();
+    for unit in name.encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+    let mut lock_name = String::from(".tirith-setup-lock-");
+    for byte in hasher.finalize() {
+        let _ = write!(&mut lock_name, "{byte:02x}");
+    }
+    Ok(parent.path.join(lock_name))
 }
 
-fn atomic_write_with_security(
-    path: &Path,
-    scope_root: &Path,
-    content: &str,
-    preserve_destination_dacl: bool,
-) -> Result<(), String> {
-    let parent = validated_parent(path, scope_root, true)?
-        .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
-    let destination = parent.path.join(
-        path.file_name()
-            .ok_or_else(|| format!("no file name for {}", path.display()))?,
-    );
-    let existing = open_existing(&destination)?;
-    let acl_source = path_rules::acl_source(existing.is_some(), preserve_destination_dacl);
-
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
+fn open_lock(parent: &ValidatedParent, destination: &Path) -> Result<fs::File, String> {
+    let lock_path = stable_lock_path(parent, destination)?;
+    let lock_wide = wide(&lock_path);
     let owner_only = owner_only_descriptor()?;
     let security_attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: owner_only.0 .0,
         bInheritHandle: BOOL(0),
     };
-
-    let (tmp, handle) = (0..4)
-        .find_map(|_| {
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tmp = parent
-                .path
-                .join(format!(".tirith-setup-{}-{n}.tmp", std::process::id()));
-            let tmp_wide = wide(&tmp);
-            match unsafe {
-                CreateFileW(
-                    PCWSTR(tmp_wide.as_ptr()),
-                    (FILE_GENERIC_WRITE | WRITE_DAC).0,
-                    FILE_SHARE_READ,
-                    Some(&security_attributes),
-                    CREATE_NEW,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                    None,
-                )
-            } {
-                Ok(handle) => Some(Ok((tmp, handle))),
-                Err(error)
-                    if is_win32(&error, ERROR_FILE_EXISTS.0)
-                        || is_win32(&error, ERROR_ALREADY_EXISTS.0) =>
-                {
-                    None
-                }
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .transpose()
-        .map_err(|e| format!("create owner-only temporary file: {e}"))?
-        .ok_or_else(|| "temporary-name retries exhausted".to_string())?;
-
-    if acl_source == path_rules::AclSource::ExistingDestination {
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        let status = unsafe {
-            GetSecurityInfo(
-                existing.as_ref().expect("existing ACL source").0,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(&mut dacl),
-                None,
-                Some(&mut descriptor),
-            )
-        };
-        if status.0 != 0 {
-            unsafe {
-                let _ = CloseHandle(handle);
-            }
-            let _ = fs::remove_file(&tmp);
-            return Err(format!(
-                "read existing destination DACL: error {}",
-                status.0
-            ));
-        }
-        let existing_descriptor = LocalSecurityDescriptor(descriptor);
-        let status = unsafe {
-            SetSecurityInfo(
-                handle,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(dacl),
-                None,
-            )
-        };
-        drop(existing_descriptor);
-        if status.0 != 0 {
-            unsafe {
-                let _ = CloseHandle(handle);
-            }
-            let _ = fs::remove_file(&tmp);
-            return Err(format!(
-                "apply existing destination DACL: error {}",
-                status.0
-            ));
-        }
-    }
-
-    let mut file = unsafe { fs::File::from_raw_handle(handle.0 as RawHandle) };
-    if let Err(error) = file.write_all(content.as_bytes()) {
-        drop(file);
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("write temporary file: {error}"));
-    }
-    drop(file);
-
-    // Revalidate both the held parent containment and final destination type at
-    // publication time. Parent handles omit FILE_SHARE_DELETE, preventing a
-    // junction swap while this operation is in flight.
-    let parent_final = final_path(parent.handles.last().expect("parent handle exists").0)?;
-    if !path_rules::final_path_within(&parent.root_final, &parent_final) {
-        let _ = fs::remove_file(&tmp);
-        return Err("destination parent moved outside trusted setup root".into());
-    }
-    let final_destination = open_existing(&destination)?;
-    // These no-delete handles prevent swaps while validating/copying ACLs;
-    // release them only after the final check so MoveFileEx can replace the name.
-    drop(final_destination);
-    drop(existing);
-    let tmp_wide = wide(&tmp);
-    let destination_wide = wide(&destination);
-    unsafe {
-        MoveFileExW(
-            PCWSTR(tmp_wide.as_ptr()),
-            PCWSTR(destination_wide.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(lock_wide.as_ptr()),
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(&security_attributes),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
         )
     }
-    .map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("publish {}: {e}", destination.display())
-    })?;
+    .map_err(|error| format!("open stable setup lock {}: {error}", lock_path.display()))?;
+    let owned = OwnedHandle(handle);
+    let info = handle_information(handle, &lock_path)?;
+    if !path_rules::attributes_are_safe(info.dwFileAttributes, false) {
+        return Err(
+            "stable setup lock is a reparse point or non-file — refusing for safety".into(),
+        );
+    }
+    let file = owned.into_file();
+    file.lock_exclusive()
+        .map_err(|error| format!("lock setup destination: {error}"))?;
+    Ok(file)
+}
 
-    Ok(())
+pub(crate) struct PlatformTransaction {
+    parent: ValidatedParent,
+    destination: PathBuf,
+    display_path: PathBuf,
+    _lock: fs::File,
+}
+
+impl PlatformTransaction {
+    pub(crate) fn begin(path: &Path, scope_root: &Path) -> Result<Self, String> {
+        let parent = validated_parent(path, scope_root, true)?
+            .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
+        let destination = parent.path.join(
+            path.file_name()
+                .ok_or_else(|| format!("no file name for {}", path.display()))?,
+        );
+        let lock = open_lock(&parent, &destination)?;
+        Ok(Self {
+            parent,
+            destination,
+            display_path: path.to_path_buf(),
+            _lock: lock,
+        })
+    }
+
+    pub(crate) fn read_snapshot(&self) -> Result<PlatformSnapshot, String> {
+        snapshot_destination(&self.destination, &self.display_path)
+    }
+
+    pub(crate) fn validate_snapshot(&self, expected: &PlatformSnapshot) -> Result<(), String> {
+        let parent_final = final_path(
+            self.parent
+                .handles
+                .last()
+                .expect("validated parent has a handle")
+                .0,
+        )?;
+        if !path_rules::final_path_within(&self.parent.root_final, &parent_final) {
+            return Err("destination parent moved outside trusted setup root".into());
+        }
+        let live = self.read_snapshot()?;
+        if &live != expected {
+            return Err(format!(
+                "{} changed while setup was preparing the update; no changes were published",
+                self.display_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_temp<'a>(
+        &'a self,
+        bytes: &[u8],
+        _mode: u32,
+        _preserve_existing_mode: bool,
+        _snapshot: &PlatformSnapshot,
+    ) -> Result<TempGuard<'a>, String> {
+        let path = self.parent.path.join(format!(
+            ".tirith-setup-{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path_wide = wide(&path);
+        let owner_only = owner_only_descriptor()?;
+        let security_attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: owner_only.0 .0,
+            bInheritHandle: BOOL(0),
+        };
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ,
+                Some(&security_attributes),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|error| format!("create exclusive owner-only temporary file: {error}"))?;
+        let owned = OwnedHandle(handle);
+        let generation = FileGeneration::from_info(&handle_information(handle, &path)?);
+        let mut guard = TempGuard {
+            _transaction: self,
+            path,
+            file: Some(owned.into_file()),
+            generation,
+            armed: true,
+        };
+        let path_for_info = guard.path.clone();
+        let synced_generation = {
+            let file = guard.file.as_mut().expect("new temp owns file");
+            file.write_all(bytes)
+                .map_err(|error| format!("write temporary file: {error}"))?;
+            unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) }
+                .map_err(|error| format!("flush temporary file before publication: {error}"))?;
+            FileGeneration::from_info(&handle_information(
+                HANDLE(file.as_raw_handle()),
+                &path_for_info,
+            )?)
+        };
+        guard.generation = synced_generation;
+        Ok(guard)
+    }
+
+    pub(crate) fn publish(
+        &self,
+        mut temp: TempGuard<'_>,
+        expected: &PlatformSnapshot,
+    ) -> Result<(), String> {
+        let expected_exists = expected.bytes.is_some();
+        // ReplaceFileW documents two failure modes in which it may already
+        // have moved one or both names. Keep a private, flushed copy of the
+        // locked snapshot until the API has returned so those failures cannot
+        // erase both the original and the transaction artifacts.
+        let mut recovery = if expected_exists {
+            Some(self.create_backup_impl(expected, false)?)
+        } else {
+            None
+        };
+
+        // Keep the write handle non-share-delete while recovery is prepared,
+        // then close and verify that the UUID name still identifies the exact
+        // flushed file before handing the path to ReplaceFileW/MoveFileExW.
+        temp.file.take();
+        temp.validate_name()?;
+
+        // Creating the recovery copy can take time, so repeat the no-follow
+        // generation/content/DACL check immediately before publication.
+        self.validate_snapshot(expected)?;
+
+        let temp_wide = wide(&temp.path);
+        let destination_wide = wide(&self.destination);
+        match path_rules::publication_kind(expected_exists) {
+            path_rules::PublicationKind::ReplacePreservingMetadata => {
+                if let Err(error) = unsafe {
+                    ReplaceFileW(
+                        PCWSTR(destination_wide.as_ptr()),
+                        PCWSTR(temp_wide.as_ptr()),
+                        PCWSTR::null(),
+                        Default::default(),
+                        None,
+                        None,
+                    )
+                } {
+                    let names_may_have_changed =
+                        is_win32(&error, ERROR_UNABLE_TO_MOVE_REPLACEMENT.0)
+                            || is_win32(&error, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2.0);
+                    if names_may_have_changed {
+                        let recovery_path = recovery
+                            .as_ref()
+                            .expect("existing replacement has a recovery snapshot")
+                            .path
+                            .clone();
+                        recovery
+                            .as_mut()
+                            .expect("existing replacement has a recovery snapshot")
+                            .commit();
+                        temp.armed = false;
+                        return Err(format!(
+                            "replace {} entered a partial Windows failure state ({error}); retained original snapshot at {} and replacement at {} for recovery",
+                            self.destination.display(),
+                            recovery_path.display(),
+                            temp.path.display()
+                        ));
+                    }
+                    return Err(format!(
+                        "replace {} while preserving its DACL: {error}",
+                        self.destination.display()
+                    ));
+                }
+            }
+            path_rules::PublicationKind::MoveWithoutReplacement => {
+                // Omitting REPLACE_EXISTING gives expected-absent publication
+                // an atomic never-overwrite guarantee.
+                unsafe {
+                    MoveFileExW(
+                        PCWSTR(temp_wide.as_ptr()),
+                        PCWSTR(destination_wide.as_ptr()),
+                        MOVEFILE_WRITE_THROUGH,
+                    )
+                }
+                .map_err(|error| {
+                    format!(
+                        "publish new destination {} without replacement: {error}",
+                        self.destination.display()
+                    )
+                })?;
+            }
+        }
+        temp.armed = false;
+        Ok(())
+    }
+
+    pub(crate) fn sync_parent(&self) -> Result<(), String> {
+        // Windows has no portable directory-fsync equivalent. The temporary
+        // file is explicitly FlushFileBuffers'd before ReplaceFileW/MoveFileExW.
+        Ok(())
+    }
+
+    pub(crate) fn create_backup<'a>(
+        &'a self,
+        snapshot: &PlatformSnapshot,
+    ) -> Result<BackupGuard<'a>, String> {
+        self.create_backup_impl(snapshot, true)
+    }
+
+    fn create_backup_impl<'a>(
+        &'a self,
+        snapshot: &PlatformSnapshot,
+        announce: bool,
+    ) -> Result<BackupGuard<'a>, String> {
+        let bytes = snapshot
+            .bytes
+            .as_deref()
+            .ok_or_else(|| "cannot back up an absent destination".to_string())?;
+        let name = format!(
+            "{}.tirith-backup-{}-{}",
+            self.destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            uuid::Uuid::new_v4().simple()
+        );
+        let path = self.parent.path.join(name);
+        let path_wide = wide(&path);
+        let owner_only = owner_only_descriptor()?;
+        let security_attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: owner_only.0 .0,
+            bInheritHandle: BOOL(0),
+        };
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ,
+                Some(&security_attributes),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|error| format!("create exclusive owner-only backup: {error}"))?;
+        let owned = OwnedHandle(handle);
+        let generation = FileGeneration::from_info(&handle_information(handle, &path)?);
+        let mut guard = BackupGuard {
+            _transaction: self,
+            path,
+            file: Some(owned.into_file()),
+            generation,
+            armed: true,
+        };
+        let path_for_info = guard.path.clone();
+        let synced_generation = {
+            let file = guard.file.as_mut().expect("new backup owns file");
+            file.write_all(bytes)
+                .map_err(|error| format!("write backup from locked snapshot: {error}"))?;
+            unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) }
+                .map_err(|error| format!("flush backup before update: {error}"))?;
+            FileGeneration::from_info(&handle_information(
+                HANDLE(file.as_raw_handle()),
+                &path_for_info,
+            )?)
+        };
+        guard.generation = synced_generation;
+        if announce {
+            eprintln!("tirith: backup at {}", guard.path.display());
+        }
+        Ok(guard)
+    }
+
+    pub(crate) fn cleanup_old_backups(&self, keep: Option<&BackupGuard<'_>>) -> Result<(), String> {
+        let stem = self
+            .destination
+            .file_name()
+            .ok_or_else(|| format!("no file name for {}", self.destination.display()))?
+            .to_string_lossy();
+        let prefix = format!("{stem}.tirith-backup-");
+        let entries = fs::read_dir(&self.parent.path)
+            .map_err(|error| {
+                format!(
+                    "enumerate backup directory {}: {error}",
+                    self.parent.path.display()
+                )
+            })?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        let keep_present = keep.is_some_and(|guard| entries.iter().any(|path| path == &guard.path));
+        let mut backups = entries
+            .into_iter()
+            .filter(|path| keep.is_none_or(|guard| path != &guard.path))
+            .collect::<Vec<_>>();
+        backups.sort();
+        let keep_slots = usize::from(keep_present);
+        let remove_count = backups.len().saturating_sub(5 - keep_slots);
+        for old in &backups[..remove_count] {
+            match open_existing(old) {
+                Ok(Some(checked)) => drop(checked),
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "tirith: could not validate old backup {}: {error}",
+                        old.display()
+                    );
+                    continue;
+                }
+            }
+            if let Err(error) = fs::remove_file(old) {
+                eprintln!(
+                    "tirith: could not clean old backup {}: {error}",
+                    old.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct TempGuard<'a> {
+    _transaction: &'a PlatformTransaction,
+    path: PathBuf,
+    file: Option<fs::File>,
+    generation: FileGeneration,
+    armed: bool,
+}
+
+impl TempGuard<'_> {
+    fn validate_name(&self) -> Result<(), String> {
+        if generation_at(&self.path).as_ref() != Some(&self.generation) {
+            return Err(
+                "temporary setup file changed before publication; refusing for safety".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TempGuard<'_> {
+    fn drop(&mut self) {
+        self.file.take();
+        if self.armed
+            && generation_at(&self.path)
+                .as_ref()
+                .is_some_and(|live| live.same_identity(&self.generation))
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub(crate) struct BackupGuard<'a> {
+    _transaction: &'a PlatformTransaction,
+    path: PathBuf,
+    file: Option<fs::File>,
+    generation: FileGeneration,
+    armed: bool,
+}
+
+impl BackupGuard<'_> {
+    pub(crate) fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackupGuard<'_> {
+    fn drop(&mut self) {
+        self.file.take();
+        if self.armed
+            && generation_at(&self.path)
+                .as_ref()
+                .is_some_and(|live| live.same_identity(&self.generation))
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Write a hook script. No executable bit needed on Windows.
@@ -498,45 +954,45 @@ pub fn write_hook_script(
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
-    if let Some(existing) = read_to_string_scoped(path, scope_root)? {
-        if existing == content {
-            if !dry_run {
-                eprintln!("tirith: {} already configured, up to date", path.display());
-            } else {
-                eprintln!(
-                    "[dry-run] would skip {} (already up to date)",
-                    path.display()
-                );
+    let outcome = transactional_update(path, scope_root, dry_run, |snapshot| {
+        if let Some(existing) = snapshot.text(path)? {
+            if existing == content {
+                if dry_run {
+                    eprintln!(
+                        "[dry-run] would skip {} (already up to date)",
+                        path.display()
+                    );
+                } else {
+                    eprintln!("tirith: {} already configured, up to date", path.display());
+                }
+                return Ok(FileUpdate::unchanged());
             }
-            return Ok(());
-        }
-
-        if !force {
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would error: {} exists but content differs — use --force to update",
+            if !force {
+                if dry_run {
+                    eprintln!(
+                        "[dry-run] would error: {} exists but content differs — use --force to update",
+                        path.display()
+                    );
+                    return Ok(FileUpdate::unchanged());
+                }
+                return Err(format!(
+                    "{} exists but content differs — use --force to update",
                     path.display()
-                );
-                return Ok(());
+                ));
             }
-            return Err(format!(
-                "{} exists but content differs — use --force to update",
-                path.display()
-            ));
         }
+        if dry_run {
+            eprintln!(
+                "[dry-run] would write {} ({} bytes)",
+                path.display(),
+                content.len()
+            );
+        }
+        Ok(FileUpdate::write_text(content.to_string(), 0o644))
+    })?;
+    if outcome == TransactionOutcome::Written {
+        eprintln!("tirith: wrote {}", path.display());
     }
-
-    if dry_run {
-        eprintln!(
-            "[dry-run] would write {} ({} bytes)",
-            path.display(),
-            content.len()
-        );
-        return Ok(());
-    }
-
-    atomic_write(path, scope_root, content, 0)?;
-    eprintln!("tirith: wrote {}", path.display());
     Ok(())
 }
 
@@ -660,126 +1116,101 @@ fn run_cli_with(
     }
 }
 
-/// Create a timestamped backup of `path` when `force` is true and the file exists.
-pub fn create_backup(path: &Path, scope_root: &Path, force: bool) -> Result<(), String> {
-    if !force {
-        return Ok(());
-    }
-    create_backup_impl(path, scope_root)
-}
-
-/// Create a timestamped backup unconditionally.
-pub fn create_backup_always(path: &Path, scope_root: &Path) -> Result<(), String> {
-    create_backup_impl(path, scope_root)
-}
-
-fn create_backup_impl(path: &Path, scope_root: &Path) -> Result<(), String> {
-    let Some(content) = read_to_string_scoped(path, scope_root)? else {
-        return Ok(());
-    };
-    let now = chrono::Local::now();
-    let timestamp = now.format("%Y%m%d-%H%M%S");
-    let backup_name = format!(
-        "{}.tirith-backup-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        timestamp
-    );
-    let backup_path = path
-        .parent()
-        .ok_or_else(|| format!("no parent for {}", path.display()))?
-        .join(&backup_name);
-
-    // Backups are always owner-only, even if an attacker pre-created the
-    // timestamped destination with a broader DACL.
-    atomic_write_with_security(&backup_path, scope_root, &content, false)?;
-    eprintln!("tirith: backup at {}", backup_path.display());
-
-    cleanup_old_backups(path, scope_root)?;
-    Ok(())
-}
-
-fn cleanup_old_backups(path: &Path, scope_root: &Path) -> Result<(), String> {
-    let Some(parent) = validated_parent(path, scope_root, false)? else {
-        return Ok(());
-    };
-    let stem = path
-        .file_name()
-        .ok_or_else(|| format!("no file name for {}", path.display()))?
-        .to_string_lossy();
-    let prefix = format!("{stem}.tirith-backup-");
-
-    // The retained component handles omit FILE_SHARE_DELETE, so this path
-    // enumeration cannot be redirected by replacing a checked parent.
-    let mut backups: Vec<PathBuf> = match fs::read_dir(&parent.path) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-            .map(|e| e.path())
-            .collect(),
-        Err(error) => {
-            return Err(format!(
-                "enumerate backup directory {}: {error}",
-                parent.path.display()
-            ))
-        }
-    };
-
-    if backups.len() <= 5 {
-        return Ok(());
-    }
-
-    backups.sort();
-    let to_remove = backups.len() - 5;
-    for old in &backups[..to_remove] {
-        // Reject a reparse-point or non-file entry immediately before removal.
-        // Removing a checked name while all parent handles remain held keeps
-        // deletion inside the validated directory chain.
-        let checked = match open_existing(old) {
-            Ok(Some(handle)) => handle,
-            Ok(None) => continue,
-            Err(error) => {
-                eprintln!(
-                    "tirith: could not validate old backup {}: {error}",
-                    old.display()
-                );
-                continue;
-            }
-        };
-        drop(checked);
-        if let Err(error) = fs::remove_file(old) {
-            eprintln!(
-                "tirith: could not clean old backup {}: {error}",
-                old.display()
-            );
-        }
-    }
-    drop(parent);
-    Ok(())
-}
-
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
+    use super::super::fs_transaction::{transactional_update_with_hook, FileUpdate, TestStage};
     use super::*;
 
-    fn link_directory(target: &Path, link: &Path) -> bool {
+    fn symlink_directory_or_explicitly_skip(target: &Path, link: &Path) -> bool {
         match std::os::windows::fs::symlink_dir(target, link) {
             Ok(()) => true,
             Err(error) => {
-                eprintln!("skipping Windows symlink test: {error}");
+                eprintln!(
+                    "SKIP symlink reparse coverage: Windows denied symlink creation ({error})"
+                );
                 false
             }
         }
     }
 
+    fn symlink_file_or_explicitly_skip(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "SKIP backup reparse coverage: Windows denied symlink creation ({error})"
+                );
+                false
+            }
+        }
+    }
+
+    fn backup_paths(root: &Path) -> Vec<PathBuf> {
+        let mut paths = fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .contains("tirith-backup")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn update_with_backup(path: &Path, root: &Path, content: &str) -> Result<(), String> {
+        transactional_update(path, root, false, |_| {
+            Ok(FileUpdate::write_text(content.to_string(), 0o644).with_backup(true))
+        })?;
+        Ok(())
+    }
+
+    fn descriptor_control(descriptor: &mut [u8]) -> u16 {
+        use windows::Win32::Security::GetSecurityDescriptorControl;
+
+        let descriptor = PSECURITY_DESCRIPTOR(descriptor.as_mut_ptr().cast());
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.unwrap();
+        control
+    }
+
+    fn create_protected_owner_only_file(path: &Path, content: &[u8]) {
+        let path_wide = wide(path);
+        let owner_only = owner_only_descriptor().unwrap();
+        let security_attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: owner_only.0 .0,
+            bInheritHandle: BOOL(0),
+        };
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                Some(&security_attributes),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .unwrap();
+        let mut file = OwnedHandle(handle).into_file();
+        file.write_all(content).unwrap();
+        unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) }.unwrap();
+    }
+
     #[test]
-    fn up_to_date_hook_refuses_reparse_parent() {
+    fn up_to_date_hook_refuses_symlink_reparse_parent() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("hook.cmd"), "expected").unwrap();
-        if !link_directory(outside.path(), &root.path().join("hooks")) {
+        if !symlink_directory_or_explicitly_skip(outside.path(), &root.path().join("hooks")) {
             return;
         }
-
         let result = write_hook_script(
             &root.path().join("hooks/hook.cmd"),
             root.path(),
@@ -787,7 +1218,6 @@ mod tests {
             false,
             true,
         );
-
         assert!(result.is_err());
         assert_eq!(
             fs::read_to_string(outside.path().join("hook.cmd")).unwrap(),
@@ -796,72 +1226,312 @@ mod tests {
     }
 
     #[test]
-    fn backup_and_retention_refuse_reparse_parent() {
+    fn junction_parent_swap_is_rejected() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("config.json"), "outside").unwrap();
-        for i in 0..7 {
-            fs::write(
-                outside
-                    .path()
-                    .join(format!("config.json.tirith-backup-20260101-00000{i}")),
-                "backup",
-            )
-            .unwrap();
-        }
-        if !link_directory(outside.path(), &root.path().join("configs")) {
-            return;
-        }
-        let path = root.path().join("configs/config.json");
-
-        assert!(create_backup(&path, root.path(), true).is_err());
-        assert!(cleanup_old_backups(&path, root.path()).is_err());
-        let backups = fs::read_dir(outside.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("tirith-backup")
-            })
-            .count();
-        assert_eq!(backups, 7);
+        let junction = root.path().join("junction");
+        let command = format!(
+            "mklink /J \"{}\" \"{}\"",
+            junction.display(),
+            outside.path().display()
+        );
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/S", "/C", &command])
+            .output()
+            .expect("cmd.exe is available on Windows");
+        assert!(
+            output.status.success(),
+            "junction coverage setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let path = junction.join("config.json");
+        assert!(update_with_backup(&path, root.path(), "new").is_err());
+        assert!(!outside.path().join("config.json").exists());
     }
 
     #[test]
-    fn legitimate_backup_retention_keeps_five() {
+    fn held_parent_handles_block_concurrent_parent_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("configs");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.json");
+        fs::write(&path, "before").unwrap();
+        let moved = root.path().join("moved-configs");
+        let mut swap_was_blocked = false;
+        transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o644)),
+            |stage| {
+                if stage == TestStage::TempSynced {
+                    swap_was_blocked = fs::rename(&parent, &moved).is_err();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(swap_was_blocked);
+        assert_eq!(fs::read_to_string(path).unwrap(), "after");
+        assert!(!moved.exists());
+    }
+
+    #[test]
+    fn same_second_backups_are_unique_and_retention_keeps_five() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
-        fs::write(&path, "data").unwrap();
-        for i in 0..7 {
-            fs::write(
-                root.path()
-                    .join(format!("config.json.tirith-backup-20260101-00000{i}")),
-                "backup",
-            )
-            .unwrap();
+        fs::write(&path, "zero").unwrap();
+        update_with_backup(&path, root.path(), "one").unwrap();
+        update_with_backup(&path, root.path(), "two").unwrap();
+        assert_eq!(backup_paths(root.path()).len(), 2);
+        for index in 0..6 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
         }
+        let retained = backup_paths(root.path());
+        assert_eq!(retained.len(), 5);
+        assert!(retained
+            .iter()
+            .any(|backup| fs::read_to_string(backup).unwrap() == "value-4"));
+    }
 
-        cleanup_old_backups(&path, root.path()).unwrap();
+    #[test]
+    fn precreated_regular_and_reparse_backup_names_are_never_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "original").unwrap();
+        let regular = root
+            .path()
+            .join("config.json.tirith-backup-99999999-999999-attacker");
+        fs::write(&regular, "attacker-regular").unwrap();
+        let target = root.path().join("outside-secret");
+        fs::write(&target, "attacker-target").unwrap();
+        let link = root
+            .path()
+            .join("config.json.tirith-backup-99999999-999999-reparse");
+        if !symlink_file_or_explicitly_skip(&target, &link) {
+            return;
+        }
+        update_with_backup(&path, root.path(), "updated").unwrap();
+        assert_eq!(fs::read_to_string(regular).unwrap(), "attacker-regular");
+        assert_eq!(fs::read_to_string(target).unwrap(), "attacker-target");
+    }
 
-        let backups = fs::read_dir(root.path())
+    #[test]
+    fn non_cooperating_generation_change_is_rejected_and_temp_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        let result = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
+            |stage| {
+                if stage == TestStage::TempSynced {
+                    fs::write(&path, "editor-change").unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("changed while setup"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "editor-change");
+        assert!(!fs::read_dir(root.path())
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| {
+            .any(|entry| {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .contains("tirith-backup")
-            })
-            .count();
-        assert_eq!(backups, 5);
+                    .starts_with(".tirith-setup-")
+                    && entry.path() != path
+            }));
     }
-}
 
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
+    #[test]
+    fn prepared_temp_handle_blocks_name_swap_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        let mut deletion_was_blocked = false;
+        transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o644)),
+            |stage| {
+                if stage == TestStage::TempSynced {
+                    let temp = fs::read_dir(root.path())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .find(|entry| {
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            name.starts_with(".tirith-setup-") && name.ends_with(".tmp")
+                        })
+                        .unwrap()
+                        .path();
+                    deletion_was_blocked = fs::remove_file(temp).is_err();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(deletion_was_blocked);
+        assert_eq!(fs::read_to_string(path).unwrap(), "after");
+    }
+
+    #[test]
+    fn publication_failure_rolls_back_only_its_backup_and_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        let result = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("ours".into(), 0o644).with_backup(true)),
+            |stage| {
+                if stage == TestStage::SnapshotValidated {
+                    fs::remove_file(&path).unwrap();
+                    fs::create_dir(&path).unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(backup_paths(root.path()).is_empty());
+        assert!(!fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tirith-setup-")
+            }));
+    }
+
+    #[test]
+    fn cooperative_transactions_serialize_and_recompute() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.txt");
+        fs::write(&path, "base").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for suffix in ["-one", "-two"] {
+            let path = path.clone();
+            let root = root.path().to_path_buf();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                transactional_update(&path, &root, false, |snapshot| {
+                    let mut content = snapshot.text(&path)?.unwrap().to_string();
+                    content.push_str(suffix);
+                    Ok(FileUpdate::write_text(content, 0o644))
+                })
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let result = fs::read_to_string(path).unwrap();
+        assert!(result.contains("-one") && result.contains("-two"));
+    }
+
+    #[test]
+    fn oversized_snapshot_is_rejected_at_cap_plus_one() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("huge.json");
+        fs::write(
+            &path,
+            vec![b'x'; super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_to_string_scoped(&path, root.path()).is_err());
+    }
+
+    #[test]
+    fn replace_file_preserves_original_dacl_descriptor() {
+        use windows::Win32::Security::SE_DACL_PROTECTED;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        let before_handle = open_existing(&path).unwrap().unwrap();
+        let mut before = dacl_descriptor(before_handle.0, &path).unwrap();
+        assert_eq!(
+            descriptor_control(&mut before) & SE_DACL_PROTECTED.0,
+            0,
+            "fixture must exercise an inheriting DACL"
+        );
+        drop(before_handle);
+        transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text("after".into(), 0o644))
+        })
+        .unwrap();
+        let after_handle = open_existing(&path).unwrap().unwrap();
+        let after = dacl_descriptor(after_handle.0, &path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn replace_file_preserves_protected_dacl_descriptor() {
+        use windows::Win32::Security::SE_DACL_PROTECTED;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        create_protected_owner_only_file(&path, b"before");
+        let before_handle = open_existing(&path).unwrap().unwrap();
+        let mut before = dacl_descriptor(before_handle.0, &path).unwrap();
+        assert_ne!(
+            descriptor_control(&mut before) & SE_DACL_PROTECTED.0,
+            0,
+            "fixture must exercise a protected DACL"
+        );
+        drop(before_handle);
+        transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text("after".into(), 0o644))
+        })
+        .unwrap();
+        let after_handle = open_existing(&path).unwrap().unwrap();
+        let after = dacl_descriptor(after_handle.0, &path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn backup_dacl_is_protected_and_owner_only() {
+        use windows::Win32::Security::{
+            AclSizeInformation, GetAclInformation, GetSecurityDescriptorControl,
+            GetSecurityDescriptorDacl, ACL, ACL_SIZE_INFORMATION, SE_DACL_PROTECTED,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        update_with_backup(&path, root.path(), "after").unwrap();
+        let backup = backup_paths(root.path()).pop().unwrap();
+        let handle = open_existing(&backup).unwrap().unwrap();
+        let mut descriptor = dacl_descriptor(handle.0, &backup).unwrap();
+        let descriptor = PSECURITY_DESCRIPTOR(descriptor.as_mut_ptr().cast());
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.unwrap();
+        assert_ne!(control & SE_DACL_PROTECTED.0, 0);
+        let mut present = BOOL(0);
+        let mut defaulted = BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            .unwrap();
+        assert!(present.as_bool() && !dacl.is_null());
+        let mut size = ACL_SIZE_INFORMATION::default();
+        unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        }
+        .unwrap();
+        assert_eq!(size.AceCount, 1);
+    }
 
     fn cmd() -> tirith_core::trusted_child::TrustedExecutable {
         let root = std::env::var_os("SystemRoot").expect("SystemRoot");

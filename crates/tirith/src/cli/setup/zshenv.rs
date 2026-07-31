@@ -32,100 +32,82 @@ pub fn offer_zshenv_guard(
 
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let zshenv_path = home.join(".zshenv");
+    let mut completed_verb = "updated";
+    let outcome = super::fs_helpers::transactional_update(
+        &zshenv_path,
+        &home,
+        dry_run,
+        |snapshot| {
+            let existing = snapshot.text(&zshenv_path)?.unwrap_or_default();
+            let begin_count = existing
+                .lines()
+                .filter(|line| line.starts_with(BEGIN_PREFIX))
+                .count();
+            validate_marker_pairing(existing)?;
 
-    let existing =
-        super::fs_helpers::read_to_string_scoped(&zshenv_path, &home)?.unwrap_or_default();
-
-    let begin_count = existing
-        .lines()
-        .filter(|line| line.starts_with(BEGIN_PREFIX))
-        .count();
-
-    validate_marker_pairing(&existing)?;
-
-    match begin_count {
-        0 => {
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would append tirith-guard block to {}",
-                    zshenv_path.display()
-                );
-                return Ok(());
-            }
-            // Syntax validation only on the live path (dry-run returned above).
-            validate_zsh_syntax(&managed_block)?;
-
-            let mut content = existing;
+            let mut content = match begin_count {
+                0 => {
+                    completed_verb = "appended";
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would append tirith-guard block to {}",
+                            zshenv_path.display()
+                        );
+                    } else {
+                        validate_zsh_syntax(&managed_block)?;
+                    }
+                    existing.to_string()
+                }
+                1 if !force => {
+                    eprintln!(
+                        "tirith: tirith-guard already in {}, up to date",
+                        zshenv_path.display()
+                    );
+                    return Ok(super::fs_helpers::FileUpdate::unchanged());
+                }
+                1 => {
+                    completed_verb = "replaced";
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would replace tirith-guard block in {}",
+                            zshenv_path.display()
+                        );
+                    } else {
+                        validate_zsh_syntax(&managed_block)?;
+                    }
+                    remove_guard_blocks(existing)
+                }
+                _ if !force => {
+                    return Err(format!(
+                        "tirith: multiple tirith-guard blocks found in {} — use --force to deduplicate",
+                        zshenv_path.display()
+                    ));
+                }
+                _ => {
+                    completed_verb = "deduplicated";
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would deduplicate tirith-guard blocks in {}",
+                            zshenv_path.display()
+                        );
+                    } else {
+                        validate_zsh_syntax(&managed_block)?;
+                    }
+                    remove_guard_blocks(existing)
+                }
+            };
             if !content.is_empty() && !content.ends_with('\n') {
                 content.push('\n');
             }
             content.push_str(&managed_block);
-
-            super::fs_helpers::atomic_write(&zshenv_path, &home, &content, 0o644)?;
-            eprintln!(
-                "tirith: appended tirith-guard block to {}",
-                zshenv_path.display()
-            );
-        }
-        1 => {
-            if !force {
-                eprintln!(
-                    "tirith: tirith-guard already in {}, up to date",
-                    zshenv_path.display()
-                );
-                return Ok(());
-            }
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would replace tirith-guard block in {}",
-                    zshenv_path.display()
-                );
-                return Ok(());
-            }
-            validate_zsh_syntax(&managed_block)?;
-
-            let cleaned = remove_guard_blocks(&existing);
-            let mut content = cleaned;
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            content.push_str(&managed_block);
-
-            super::fs_helpers::atomic_write(&zshenv_path, &home, &content, 0o644)?;
-            eprintln!(
-                "tirith: replaced tirith-guard block in {}",
-                zshenv_path.display()
-            );
-        }
-        _ => {
-            if !force {
-                return Err(format!(
-                    "tirith: multiple tirith-guard blocks found in {} — use --force to deduplicate",
-                    zshenv_path.display()
-                ));
-            }
-            if dry_run {
-                eprintln!(
-                    "[dry-run] would deduplicate tirith-guard blocks in {}",
-                    zshenv_path.display()
-                );
-                return Ok(());
-            }
-            validate_zsh_syntax(&managed_block)?;
-
-            let cleaned = remove_guard_blocks(&existing);
-            let mut content = cleaned;
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            content.push_str(&managed_block);
-
-            super::fs_helpers::atomic_write(&zshenv_path, &home, &content, 0o644)?;
-            eprintln!(
-                "tirith: deduplicated tirith-guard blocks in {}",
-                zshenv_path.display()
-            );
-        }
+            Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644))
+        },
+    )?;
+    if outcome == super::fs_helpers::TransactionOutcome::Written {
+        eprintln!(
+            "tirith: {completed_verb} tirith-guard block in {}",
+            zshenv_path.display()
+        );
     }
 
     Ok(())
