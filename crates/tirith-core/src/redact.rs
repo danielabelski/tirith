@@ -314,6 +314,50 @@ pub fn detect_canaries(input: &str) -> Vec<crate::canary::CanaryHit> {
     crate::canary::detect(input)
 }
 
+/// Maximum UTF-8 byte length accepted for a policy-provided DLP regex.
+pub(crate) const MAX_CUSTOM_DLP_PATTERN_BYTES: usize = 1024;
+
+/// Why a policy-provided DLP regex cannot be used at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustomDlpPatternError {
+    TooLong {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    InvalidRegex,
+}
+
+impl std::fmt::Display for CustomDlpPatternError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong {
+                actual_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "pattern too long ({actual_bytes} bytes, max {max_bytes})"
+            ),
+            Self::InvalidRegex => write!(f, "invalid regex"),
+        }
+    }
+}
+
+/// Compile one policy-provided DLP regex using the runtime acceptance contract.
+pub(crate) fn compile_custom_dlp_pattern(pattern: &str) -> Result<Regex, CustomDlpPatternError> {
+    let actual_bytes = pattern.len();
+    if actual_bytes > MAX_CUSTOM_DLP_PATTERN_BYTES {
+        return Err(CustomDlpPatternError::TooLong {
+            actual_bytes,
+            max_bytes: MAX_CUSTOM_DLP_PATTERN_BYTES,
+        });
+    }
+    Regex::new(pattern).map_err(|_| CustomDlpPatternError::InvalidRegex)
+}
+
+fn warn_skipped_custom_dlp_pattern(pattern_kind: &str, index: usize, error: CustomDlpPatternError) {
+    eprintln!("tirith: warning: skipping {pattern_kind} pattern at index {index}: {error}");
+}
+
 /// Pre-compiled set of custom DLP patterns.
 pub struct CompiledCustomPatterns {
     patterns: Vec<Regex>,
@@ -324,13 +368,16 @@ impl CompiledCustomPatterns {
     pub fn new(raw_patterns: &[String]) -> Self {
         let patterns = raw_patterns
             .iter()
-            .filter_map(|pat_str| match Regex::new(pat_str) {
-                Ok(re) => Some(re),
-                Err(e) => {
-                    eprintln!("tirith: warning: invalid custom DLP pattern '{pat_str}': {e}");
-                    None
-                }
-            })
+            .enumerate()
+            .filter_map(
+                |(index, pat_str)| match compile_custom_dlp_pattern(pat_str) {
+                    Ok(re) => Some(re),
+                    Err(error) => {
+                        warn_skipped_custom_dlp_pattern("custom DLP", index, error);
+                        None
+                    }
+                },
+            )
             .collect();
         Self { patterns }
     }
@@ -339,20 +386,13 @@ impl CompiledCustomPatterns {
 /// Redact using both built-in and custom patterns from policy.
 pub fn redact_with_custom(input: &str, custom_patterns: &[String]) -> String {
     let mut result = redact(input);
-    for pat_str in custom_patterns {
-        if pat_str.len() > 1024 {
-            eprintln!(
-                "tirith: DLP pattern too long ({} chars), skipping",
-                pat_str.len()
-            );
-            continue;
-        }
-        match Regex::new(pat_str) {
+    for (index, pat_str) in custom_patterns.iter().enumerate() {
+        match compile_custom_dlp_pattern(pat_str) {
             Ok(re) => {
                 result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
             }
-            Err(e) => {
-                eprintln!("tirith: warning: invalid custom DLP pattern '{pat_str}': {e}");
+            Err(error) => {
+                warn_skipped_custom_dlp_pattern("custom DLP", index, error);
             }
         }
     }
@@ -449,15 +489,8 @@ pub fn redact_for_audience_with_custom(
     }
 
     // 3. Customer-ID patterns from policy (labeled `customer_id`, aggregated).
-    for pat_str in customer_id_patterns {
-        if pat_str.len() > 1024 {
-            eprintln!(
-                "tirith: customer_id pattern too long ({} chars), skipping",
-                pat_str.len()
-            );
-            continue;
-        }
-        match Regex::new(pat_str) {
+    for (index, pat_str) in customer_id_patterns.iter().enumerate() {
+        match compile_custom_dlp_pattern(pat_str) {
             Ok(re) => {
                 let matches = re.find_iter(&result).count();
                 if matches > 0 {
@@ -467,8 +500,8 @@ pub fn redact_for_audience_with_custom(
                     bump("customer_id", matches, &mut counts, &mut order);
                 }
             }
-            Err(e) => {
-                eprintln!("tirith: warning: invalid customer_id pattern '{pat_str}': {e}");
+            Err(error) => {
+                warn_skipped_custom_dlp_pattern("customer_id", index, error);
             }
         }
     }
@@ -860,6 +893,64 @@ mod tests {
         let redacted = redact_with_custom(input, &custom);
         assert!(!redacted.contains("PROJ-12345"));
         assert!(redacted.contains("[REDACTED:custom]"));
+    }
+
+    #[test]
+    fn custom_dlp_compiler_enforces_utf8_byte_boundary() {
+        let ascii_at_limit = "a".repeat(MAX_CUSTOM_DLP_PATTERN_BYTES);
+        let ascii_over_limit = "a".repeat(MAX_CUSTOM_DLP_PATTERN_BYTES + 1);
+        assert!(compile_custom_dlp_pattern(&ascii_at_limit).is_ok());
+        assert!(matches!(
+            compile_custom_dlp_pattern(&ascii_over_limit),
+            Err(CustomDlpPatternError::TooLong {
+                actual_bytes: 1025,
+                max_bytes: MAX_CUSTOM_DLP_PATTERN_BYTES,
+            })
+        ));
+
+        let multibyte_at_limit = "é".repeat(MAX_CUSTOM_DLP_PATTERN_BYTES / 2);
+        let multibyte_over_limit = format!("{multibyte_at_limit}a");
+        assert_eq!(multibyte_at_limit.len(), MAX_CUSTOM_DLP_PATTERN_BYTES);
+        assert_eq!(multibyte_over_limit.len(), MAX_CUSTOM_DLP_PATTERN_BYTES + 1);
+        assert!(compile_custom_dlp_pattern(&multibyte_at_limit).is_ok());
+        assert!(matches!(
+            compile_custom_dlp_pattern(&multibyte_over_limit),
+            Err(CustomDlpPatternError::TooLong { .. })
+        ));
+
+        assert!(matches!(
+            compile_custom_dlp_pattern("("),
+            Err(CustomDlpPatternError::InvalidRegex)
+        ));
+    }
+
+    #[test]
+    fn every_custom_dlp_runtime_path_uses_the_shared_compiler() {
+        let legitimate_pattern = r"PROJ-\d+".to_string();
+        let input = "internal ref: PROJ-12345";
+        assert!(
+            redact_with_custom(input, std::slice::from_ref(&legitimate_pattern))
+                .contains("[REDACTED:custom]")
+        );
+
+        let compiled = CompiledCustomPatterns::new(std::slice::from_ref(&legitimate_pattern));
+        assert!(redact_with_compiled(input, &compiled).contains("[REDACTED:custom]"));
+
+        let over_limit = "z".repeat(MAX_CUSTOM_DLP_PATTERN_BYTES + 1);
+        assert_eq!(
+            redact_with_custom(&over_limit, std::slice::from_ref(&over_limit)),
+            over_limit
+        );
+        let compiled = CompiledCustomPatterns::new(std::slice::from_ref(&over_limit));
+        assert_eq!(redact_with_compiled(&over_limit, &compiled), over_limit);
+
+        let report = redact_for_audience_with_custom(
+            &over_limit,
+            ShareAudience::Slack,
+            std::slice::from_ref(&over_limit),
+        );
+        assert_eq!(report.redacted_content, over_limit);
+        assert!(report.redactions.iter().all(|r| r.label != "customer_id"));
     }
 
     #[test]

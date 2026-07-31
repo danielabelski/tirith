@@ -525,13 +525,22 @@ fn validate_scan_config(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
         }
     }
 
-    // Validate DLP patterns compile
-    for (i, pattern) in policy.dlp_custom_patterns.iter().enumerate() {
-        if let Err(e) = regex::Regex::new(pattern) {
+    validate_custom_dlp_patterns("dlp_custom_patterns", &policy.dlp_custom_patterns, issues);
+    validate_custom_dlp_patterns(
+        "share.customer_id_patterns",
+        &policy.share.customer_id_patterns,
+        issues,
+    );
+}
+
+fn validate_custom_dlp_patterns(field: &str, patterns: &[String], issues: &mut Vec<PolicyIssue>) {
+    for (i, pattern) in patterns.iter().enumerate() {
+        if let Err(error) = crate::redact::compile_custom_dlp_pattern(pattern) {
+            let field = format!("{field}[{i}]");
             issues.push(PolicyIssue {
                 level: IssueLevel::Error,
-                message: format!("dlp_custom_patterns[{i}]: invalid regex '{pattern}': {e}"),
-                field: Some(format!("dlp_custom_patterns[{i}]")),
+                message: format!("{field}: {error}"),
+                field: Some(field),
             });
         }
     }
@@ -1186,6 +1195,44 @@ custom_rules:
 "#;
         let issues = validate(yaml);
         assert!(issues.iter().any(|i| i.message.contains("invalid regex")));
+    }
+
+    #[test]
+    fn custom_dlp_validation_matches_every_runtime_pattern_boundary() {
+        let cases = [
+            ("ascii-at-limit", "a".repeat(1024)),
+            ("ascii-over-limit", "a".repeat(1025)),
+            ("multibyte-at-limit", "é".repeat(512)),
+            ("multibyte-over-limit", format!("{}a", "é".repeat(512))),
+            ("invalid-regex", "(".to_string()),
+            ("legitimate", r"PROJ-\d+".to_string()),
+        ];
+
+        for (name, pattern) in cases {
+            let runtime_accepts = crate::redact::compile_custom_dlp_pattern(&pattern).is_ok();
+
+            let yaml = format!("dlp_custom_patterns:\n  - '{pattern}'\n");
+            let issues = validate(&yaml);
+            let validator_accepts = !issues.iter().any(|issue| {
+                issue.level == IssueLevel::Error
+                    && issue.field.as_deref() == Some("dlp_custom_patterns[0]")
+            });
+            assert_eq!(
+                validator_accepts, runtime_accepts,
+                "dlp_custom_patterns parity failed for {name}: {issues:?}"
+            );
+
+            let yaml = format!("share:\n  customer_id_patterns:\n    - '{pattern}'\n");
+            let issues = validate(&yaml);
+            let validator_accepts = !issues.iter().any(|issue| {
+                issue.level == IssueLevel::Error
+                    && issue.field.as_deref() == Some("share.customer_id_patterns[0]")
+            });
+            assert_eq!(
+                validator_accepts, runtime_accepts,
+                "share.customer_id_patterns parity failed for {name}: {issues:?}"
+            );
+        }
     }
 
     #[test]

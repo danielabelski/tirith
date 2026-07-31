@@ -167,6 +167,8 @@ pub struct Policy {
 
     /// Custom DLP redaction patterns (Team). Regex patterns applied alongside
     /// built-in patterns when redacting commands in audit logs and webhooks.
+    /// Patterns over 1024 UTF-8 bytes are rejected by policy validation and
+    /// skipped by best-effort runtime redaction for unvalidated policies.
     #[serde(default)]
     pub dlp_custom_patterns: Vec<String>,
 
@@ -363,7 +365,8 @@ pub struct Policy {
 pub struct ShareConfig {
     /// Repo-specific regex patterns matched against `tirith share`/`redact`
     /// content; each match becomes `[REDACTED:customer_id]`. Patterns over 1024
-    /// chars are skipped with a warning. No shipped default (e.g. `CUST-\d{4,6}`).
+    /// UTF-8 bytes are skipped with a warning. No shipped default (e.g.
+    /// `CUST-\d{4,6}`).
     pub customer_id_patterns: Vec<String>,
 }
 
