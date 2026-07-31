@@ -9926,32 +9926,176 @@ fn command_card_sign_json_fatal_error_is_parseable_nonzero() {
     );
 }
 
-/// Run `tirith <args>` (stdin nulled) and return its `Output`, FAILING the test rather than
-/// hanging if the process does not exit within `secs`. Used by the FIFO read-guard test below: a
-/// regression to a blocking `std::fs::read` of the card path would otherwise hang the whole
-/// suite, so we bound the wait on a helper thread and panic on timeout (the child is killed by
-/// `tempdir`/process teardown).
+#[cfg(unix)]
+fn isolate_test_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(unix)]
+fn terminate_test_process_group(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    // Only signal a negative process-group id after proving the child became the
+    // leader we requested. This avoids ever targeting the test runner's group if
+    // process-group setup failed unexpectedly.
+    if unsafe { libc::getpgid(pid) } == pid {
+        // SAFETY: `pid` is a live child-owned process-group id. ESRCH is benign:
+        // the group may have exited between the poll and this cleanup.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn wait_for_output_bounded(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+    context: &str,
+) -> std::process::Output {
+    use std::io::Read;
+
+    fn drain<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = reader.read_to_end(&mut bytes);
+            bytes
+        })
+    }
+
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // A descendant may still hold a captured pipe after the direct
+                // child exits. Tear down the remaining group before joining the
+                // drainers so the join itself cannot hang forever.
+                let pid = child.id() as libc::pid_t;
+                if unsafe { libc::getpgid(pid) } == pid {
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                break status;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                terminate_test_process_group(&mut child);
+                if let Some(handle) = stdout {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = stderr {
+                    let _ = handle.join();
+                }
+                panic!("{context} did not exit within {timeout:?}");
+            }
+            Err(error) => {
+                terminate_test_process_group(&mut child);
+                if let Some(handle) = stdout {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = stderr {
+                    let _ = handle.join();
+                }
+                panic!("could not poll {context}: {error}");
+            }
+        }
+    };
+
+    let stdout = stdout
+        .map(|handle| handle.join().expect("stdout drain thread panicked"))
+        .unwrap_or_default();
+    let stderr = stderr
+        .map(|handle| handle.join().expect("stderr drain thread panicked"))
+        .unwrap_or_default();
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_wait_kills_and_reaps_the_child_process_group() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let descendant_pid_path = temp.path().join("descendant.pid");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "sleep 30 & echo $! > \"$1\"; wait", "tirith-test"])
+        .arg(&descendant_pid_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    isolate_test_process_group(&mut command);
+    let child = command.spawn().expect("spawn process-tree fixture");
+    let direct_pid = child.id() as libc::pid_t;
+
+    let pid_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !descendant_pid_path.exists() && std::time::Instant::now() < pid_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let descendant_pid: libc::pid_t = fs::read_to_string(&descendant_pid_path)
+        .expect("fixture must publish descendant pid")
+        .trim()
+        .parse()
+        .expect("descendant pid must be numeric");
+
+    let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = wait_for_output_bounded(
+            child,
+            std::time::Duration::from_millis(50),
+            "process-tree fixture",
+        );
+    }));
+    assert!(
+        timed_out.is_err(),
+        "the fixture should exercise timeout cleanup"
+    );
+
+    fn process_exists(pid: libc::pid_t) -> bool {
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    assert!(!process_exists(direct_pid), "direct child must be reaped");
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while process_exists(descendant_pid) && std::time::Instant::now() < reap_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !process_exists(descendant_pid),
+        "descendant must not survive timeout cleanup"
+    );
+}
+
+/// Run `tirith <args>` (stdin nulled) and return its `Output`, failing the test rather than
+/// hanging if the process does not exit within `secs`. The parent retains the child handle and
+/// kills/reaps the full process group on timeout, so a read-guard regression cannot leak a
+/// detached process into the rest of the suite.
 #[cfg(unix)]
 fn run_tirith_bounded(args: &[&std::ffi::OsStr], secs: u64) -> std::process::Output {
-    use std::sync::mpsc;
-    let child = tirith()
+    let mut command = tirith();
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn tirith");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
-        Ok(result) => result.expect("wait_with_output"),
-        Err(_) => panic!(
-            "tirith {args:?} did not exit within {secs}s — a blocking read of a \
-             FIFO card path regressed the hardened capped reader"
+        .stderr(std::process::Stdio::piped());
+    isolate_test_process_group(&mut command);
+    let child = command.spawn().expect("spawn tirith");
+    wait_for_output_bounded(
+        child,
+        std::time::Duration::from_secs(secs),
+        &format!(
+            "tirith {args:?} — a blocking FIFO read may have regressed the hardened capped reader"
         ),
-    }
+    )
 }
 
 /// CodeRabbit R17 #1 (read-guard class): `command-card sign` and `verify` must read the card path
@@ -11510,7 +11654,6 @@ fn canary_list_and_status_json_fail_on_unreadable_store() {
 #[test]
 fn taint_list_warns_on_incomplete_store_read() {
     use std::ffi::CString;
-    use std::sync::mpsc;
 
     let state = tempfile::tempdir().expect("tempdir");
     // The taint store lives at `<XDG_STATE_HOME>/tirith/taint.jsonl`
@@ -11532,17 +11675,13 @@ fn taint_list_warns_on_incomplete_store_read() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    isolate_test_process_group(&mut cmd);
     let child = cmd.spawn().expect("spawn tirith taint list");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let out = match rx.recv_timeout(std::time::Duration::from_secs(20)) {
-        Ok(r) => r.expect("wait_with_output"),
-        Err(_) => {
-            panic!("tirith taint list hung on a FIFO store — incomplete-read read guard regressed")
-        }
-    };
+    let out = wait_for_output_bounded(
+        child,
+        std::time::Duration::from_secs(20),
+        "tirith taint list on a FIFO store — incomplete-read guard may have regressed",
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -12493,49 +12632,41 @@ fn paste_with_source_no_companion_file_is_graceful_noop() {
 #[cfg(unix)]
 #[test]
 fn clipboard_watch_exits_when_stdout_pipe_closed() {
-    use std::sync::mpsc;
-
     // Isolate state_dir() so `source_file_path()` resolves (otherwise watch exits
     // 1 before the watch_start write) without touching the real home.
     let state = tempfile::tempdir().expect("state tempdir");
 
-    let mut child = tirith()
+    let mut command = tirith();
+    command
         .args(["clipboard", "watch", "--json"])
         .env("XDG_STATE_HOME", state.path())
         .env("APPDATA", state.path())
         .env("LOCALAPPDATA", state.path())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn tirith clipboard watch");
+        .stderr(std::process::Stdio::piped());
+    isolate_test_process_group(&mut command);
+    let mut child = command.spawn().expect("spawn tirith clipboard watch");
 
     // Close the read end of stdout NOW: the child's first `watch_start` write then fails (broken
     // pipe), which must terminate it rather than spin the poll loop forever.
     drop(child.stdout.take());
 
     // Bound the wait so a regression (ignored write error → infinite poll) fails
-    // the test instead of hanging the suite.
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait());
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
-        Ok(status) => {
-            let status = status.expect("wait");
-            // Exactly two acceptable "it stopped" outcomes (CodeRabbit R4): a clean exit 0 via
-            // the broken-pipe `return 0` branch, or SIGPIPE-termination (no exit code).
-            assert!(
-                status.code() == Some(0) || status.code().is_none(),
-                "watch must stop cleanly (exit 0) or be signal-terminated on a \
-                 closed stdout pipe; status: {status:?}"
-            );
-        }
-        Err(_) => panic!(
-            "tirith clipboard watch did not exit within 20s after its stdout pipe \
-             was closed — a broken-pipe write must stop the watcher, not spin the poll loop"
-        ),
-    }
+    // after killing and reaping the process group instead of leaking it.
+    let out = wait_for_output_bounded(
+        child,
+        std::time::Duration::from_secs(20),
+        "tirith clipboard watch after its stdout pipe closed",
+    );
+    // Exactly two acceptable "it stopped" outcomes (CodeRabbit R4): a clean exit 0 via
+    // the broken-pipe `return 0` branch, or SIGPIPE-termination (no exit code).
+    assert!(
+        out.status.code() == Some(0) || out.status.code().is_none(),
+        "watch must stop cleanly (exit 0) or be signal-terminated on a \
+         closed stdout pipe; status: {:?}",
+        out.status
+    );
 }
 
 // M12 ch2/ch3 — visual-audit + browser (host + install-extension) Isolation mirrors the canary /
