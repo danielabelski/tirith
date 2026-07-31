@@ -650,7 +650,7 @@ fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
             out.push(PackageRef {
                 ecosystem: Ecosystem::Docker,
                 name,
-                version: VersionIntent::from_explicit_version(&version_token),
+                version: VersionIntent::from_docker_version(&version_token),
             });
         }
         i += 1;
@@ -727,7 +727,7 @@ fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
         out.push(PackageRef {
             ecosystem: Ecosystem::Go,
             name: name.to_string(),
-            version: VersionIntent::from_explicit_version(&version_token),
+            version: VersionIntent::from_go_version(&version_token),
         });
     }
     out

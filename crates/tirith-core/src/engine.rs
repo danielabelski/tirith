@@ -154,11 +154,10 @@ pub fn build_dsl_backing(
     if scan_context != ScanContext::FileScan {
         let segments = crate::tokenize::tokenize(analyzed_input, shell);
         for pkg in crate::rules::threatintel::extract_packages_for_shell(&segments, shell) {
-            // Lowercase before BOTH lookup and storage: case-insensitive
-            // ecosystems (PyPI, the threat-DB/popular indexes) would otherwise make
-            // `package.*` casing-dependent — matching `requests` but missing
-            // `Requests` (CodeRabbit M13 PR #132 R6-2).
-            let name = pkg.name.to_lowercase();
+            // Use the same registry identity as ThreatDb writer/lookups. A
+            // global lowercase would corrupt case-sensitive Go/Maven/npm keys,
+            // while raw spelling would miss PyPI/NuGet equivalents.
+            let name = crate::threatdb::canonical_package_name(pkg.ecosystem, &pkg.name);
             let reputation = package_reputation(
                 pkg.ecosystem,
                 &name,

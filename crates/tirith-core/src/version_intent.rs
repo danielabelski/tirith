@@ -1,4 +1,4 @@
-//! Package version intent: a lossless replacement for the old
+//! Package version intent: a semantics-preserving replacement for the old
 //! `version: Option<String>` carried on package references.
 //!
 //! A bare `Option<String>` could not distinguish "no version asked for" from
@@ -20,6 +20,35 @@
 //! PEP 440 solver is intentionally out of scope; the contract is "prove exclusion
 //! only when every part is understood, otherwise stay unresolved".
 
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+/// Bound parser work and canonical keys derived from attacker-controlled
+/// package specifications. Registry versions are tiny in practice; refusing an
+/// oversized spelling is safer than treating it as a concrete release.
+const MAX_EXACT_VERSION_BYTES: usize = 256;
+const MAX_VERSION_PARTS: usize = 16;
+
+/// The public and local components of a canonical PEP 440 version.
+///
+/// Keeping the public component separate is required for the deliberate
+/// local-to-base rule: a requested local build such as `1.0+ubuntu1` carries
+/// the code from public release `1.0`, so a malicious-base record must match it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalPep440Version {
+    pub(crate) public: String,
+    pub(crate) local: Option<String>,
+}
+
+impl CanonicalPep440Version {
+    pub(crate) fn full(&self) -> String {
+        match &self.local {
+            Some(local) => format!("{}+{local}", self.public),
+            None => self.public.clone(),
+        }
+    }
+}
+
 /// How a package's version was expressed at the point of reference.
 ///
 /// `Exact` and `Resolved` both name a single concrete version; they are kept
@@ -33,7 +62,8 @@ pub enum VersionIntent {
     /// pick any version, so a version-specific malicious record cannot be
     /// excluded.
     Unspecified,
-    /// An exact pin the user wrote (`==1.2.3`, `name@1.2.3`).
+    /// An exact pin (`==1.2.3`, `name@1.2.3`) in the registry-comparable
+    /// spelling when its ecosystem parser supports one.
     Exact(String),
     /// A range/constraint expression (`>=1.4.4`, `>=1.2,<2.0`, `^1.0`). `raw`
     /// preserves the original text exactly; `parsed` is `Some` only when the
@@ -64,11 +94,10 @@ impl VersionIntent {
         }
     }
 
-    /// The version text as originally written, regardless of kind: the concrete
-    /// version for `Exact`/`Resolved`, the raw constraint for `Constraint`, and
-    /// `None` for `Unspecified`. This reconstructs the lossy `Option<String>`
-    /// the field replaced, for consumers (e.g. OSV correlation) that just want
-    /// "the version string the user typed, if any".
+    /// The version text carried by the intent: the canonical concrete version
+    /// for `Exact`, resolver text for `Resolved`, raw constraint for
+    /// `Constraint`, and `None` for `Unspecified`. This reconstructs the old
+    /// lossy `Option<String>` shape for consumers that need one version field.
     pub fn as_version_str(&self) -> Option<&str> {
         match self {
             VersionIntent::Exact(v) | VersionIntent::Resolved(v) => Some(v.as_str()),
@@ -90,25 +119,14 @@ impl VersionIntent {
             return VersionIntent::Unspecified;
         }
 
-        // A single `==<ver>` (no wildcard, no extra clauses) is an exact pin,
-        // regardless of whether the version parses as a plain numeric release.
-        // The exact INTENT does not need a parseable version: the threat-DB
-        // match is a literal/numeric string compare, so a prerelease pin like
-        // `==1.0.0rc1` is still Exact (and would otherwise degrade to a
-        // Constraint and a mere Warn). This mirrors `from_explicit_version`,
-        // which already returns Exact for prerelease tails.
+        // A single `==<ver>` is exact only when the WHOLE version parses under
+        // PEP 440. This distinguishes concrete releases from wildcards,
+        // arbitrary equality, markers, and malformed values, and stores the
+        // registry-comparable spelling used by downstream advisory lookups.
         if let Some(rest) = trimmed.strip_prefix("==") {
             let ver = rest.trim();
-            // Only a clean exact-looking version is an Exact pin. `looks_like_plain_version`
-            // rejects environment markers (`;`), arbitrary equality (`===`, which leaves a
-            // leading `=`), epochs (`!`), wildcards (`*`), empty segments, and whitespace,
-            // so those fall through to a Constraint (and thus UNRESOLVED) instead of a bogus
-            // Exact. Prereleases (`1.0.0rc1`) AND PEP 440 local versions (`1.0+ubuntu1`) are
-            // kept Exact: `assess_package_self` matches an exact-local DB record literally
-            // and a malicious base record via its base, and `ReleaseVersion::parse` rejects
-            // locals so the numeric fallback never produces a false base match.
-            if looks_like_plain_version(ver) {
-                return VersionIntent::Exact(ver.to_string());
+            if let Some(canonical) = canonical_pep440_version(ver) {
+                return VersionIntent::Exact(canonical.full());
             }
         }
 
@@ -118,14 +136,13 @@ impl VersionIntent {
         }
     }
 
-    /// Build an intent from a single explicit version token of a non-PyPI
-    /// ecosystem (`name@1.2.3`, `name:^3.0`, `--version 1.2.3`).
+    /// Build an intent from a single SemVer-like explicit version token
+    /// (`name@1.2.3`, `name:^3.0`, `--version 1.2.3`).
     ///
-    /// A plain version-looking token (digits and dots, optionally with a build/
-    /// prerelease tail like `-beta.1`) is an [`Exact`](VersionIntent::Exact)
-    /// pin: the threat DB stores literal version strings, so this preserves the
-    /// pre-existing exact-string match behavior. Anything carrying a range
-    /// sigil, wildcard, dist-tag, or whitespace becomes an unparsed
+    /// Only a complete valid SemVer is an [`Exact`](VersionIntent::Exact) pin.
+    /// Anything carrying a range sigil, wildcard, dist-tag (including a tag
+    /// that begins with a digit), partial version, or whitespace becomes an
+    /// unparsed
     /// [`Constraint`](VersionIntent::Constraint) (the constraint syntax of these
     /// ecosystems is not modeled, so it stays unresolved rather than being
     /// mistaken for an exact pin).
@@ -134,11 +151,142 @@ impl VersionIntent {
         if t.is_empty() {
             return VersionIntent::Unspecified;
         }
-        if looks_like_plain_version(t) {
-            VersionIntent::Exact(t.to_string())
+        if let Some(canonical) = canonical_semver_concrete(t, SemverPrefix::OptionalV, false) {
+            VersionIntent::Exact(canonical)
         } else {
             // The constraint syntax of non-PyPI ecosystems is not parsed; keep
             // the raw text and leave it unresolved.
+            VersionIntent::Constraint {
+                parsed: None,
+                raw: t.to_string(),
+            }
+        }
+    }
+
+    /// Build an npm version intent. A complete SemVer (with npm's accepted
+    /// leading `v` spelling) is exact; dist-tags, git revisions, aliases,
+    /// partial versions, and ranges stay unresolved until a resolver supplies
+    /// the concrete version.
+    pub fn from_npm_version(token: &str) -> VersionIntent {
+        Self::from_explicit_version(token)
+    }
+
+    /// Build a Go module version-query intent. Only a complete canonical
+    /// `vMAJOR.MINOR.PATCH` semantic version is concrete. Branch names,
+    /// non-version tags, commit prefixes (including digit-leading ones),
+    /// `latest`, and partial version queries are resolver selectors and remain
+    /// unresolved.
+    pub fn from_go_version(token: &str) -> VersionIntent {
+        let t = token.trim();
+        if t.is_empty() {
+            return VersionIntent::Unspecified;
+        }
+        // The Go command rewrites arbitrary SemVer build metadata to a
+        // pseudo-version. Only `+incompatible` is part of a canonical module
+        // version and therefore proven to name the version written here.
+        let has_canonical_build = t
+            .split_once('+')
+            .is_none_or(|(_, build)| build == "incompatible");
+        match canonical_semver_concrete(t, SemverPrefix::RequiredV, true)
+            .filter(|_| has_canonical_build)
+        {
+            Some(canonical) => VersionIntent::Exact(canonical),
+            None => VersionIntent::Constraint {
+                parsed: None,
+                raw: t.to_string(),
+            },
+        }
+    }
+
+    /// Build a NuGet version intent. NuGet floating versions and ranges remain
+    /// unresolved; a concrete full 3-4 component version is normalized to
+    /// NuGet's case-insensitive, trailing-zero-equivalent identity. Shorter
+    /// PackageReference values remain ranges.
+    pub fn from_nuget_version(token: &str) -> VersionIntent {
+        let t = token.trim();
+        if t.is_empty() {
+            return VersionIntent::Unspecified;
+        }
+        // A bare one/two-component PackageReference value is a minimum range
+        // in NuGet dependency syntax. Require a full package version here even
+        // though the registry comparator below accepts shorter equivalent
+        // spellings from advisory data.
+        let public = t.split('+').next().unwrap_or(t);
+        let release = public.split('-').next().unwrap_or(public);
+        let release_parts = release.split('.').count();
+        match canonical_nuget_version(t).filter(|_| release_parts >= 3) {
+            Some(canonical) => VersionIntent::Exact(canonical),
+            None => VersionIntent::Constraint {
+                parsed: None,
+                raw: t.to_string(),
+            },
+        }
+    }
+
+    /// Build a Composer/Packagist version intent. Composer accepts branch and
+    /// stability selectors that can begin with digits; only a complete
+    /// concrete Composer version is proven concrete here.
+    pub fn from_composer_version(token: &str) -> VersionIntent {
+        let t = token.trim();
+        if t.is_empty() {
+            return VersionIntent::Unspecified;
+        }
+        match canonical_composer_version(t) {
+            Some(canonical) => VersionIntent::Exact(canonical),
+            None => VersionIntent::Constraint {
+                parsed: None,
+                raw: t.to_string(),
+            },
+        }
+    }
+
+    /// Build an intent for Maven's literal version coordinate. Maven ranges,
+    /// mutable `-SNAPSHOT` versions, and the dynamic `LATEST`/`RELEASE`
+    /// selectors stay unresolved; other coordinate values name that literal
+    /// version.
+    pub fn from_maven_version(token: &str) -> VersionIntent {
+        let t = token.trim();
+        if t.is_empty() {
+            return VersionIntent::Unspecified;
+        }
+        let uppercase = t.to_ascii_uppercase();
+        let dynamic = matches!(uppercase.as_str(), "LATEST" | "RELEASE")
+            || uppercase.ends_with("-SNAPSHOT")
+            || t.starts_with(['[', '('])
+            || t.contains(',')
+            || t.chars().any(char::is_whitespace);
+        if dynamic {
+            VersionIntent::Constraint {
+                parsed: None,
+                raw: t.to_string(),
+            }
+        } else {
+            VersionIntent::Exact(t.to_string())
+        }
+    }
+
+    /// Build a Docker reference intent. Immutable SHA-256 digests and literal
+    /// complete SemVer-shaped tags are concrete references. Free-form mutable
+    /// selectors remain unresolved so a version-specific malicious record
+    /// cannot be dismissed as a clean miss.
+    pub fn from_docker_version(token: &str) -> VersionIntent {
+        let t = token.trim();
+        if t.is_empty() {
+            return VersionIntent::Unspecified;
+        }
+        if let Some(hex) = t.strip_prefix("sha256:") {
+            if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return VersionIntent::Exact(format!("sha256:{}", hex.to_ascii_lowercase()));
+            }
+        }
+        if t.len() <= 128
+            && !t.contains('+')
+            && canonical_semver(t, SemverPrefix::OptionalV).is_some()
+        {
+            // Docker tag names are literal and case-sensitive. Validate the
+            // shape as SemVer, but do not erase a leading `v` or change case.
+            VersionIntent::Exact(t.to_string())
+        } else {
             VersionIntent::Constraint {
                 parsed: None,
                 raw: t.to_string(),
@@ -160,8 +308,10 @@ impl VersionIntent {
         // Cargo's `=` operator is the only exact pin: `=1.0.0` -> Exact("1.0.0").
         if let Some(pinned) = t.strip_prefix('=') {
             let pinned = pinned.trim();
-            if looks_like_plain_version(pinned) {
-                return VersionIntent::Exact(pinned.to_string());
+            if let Some(canonical) =
+                canonical_semver_concrete(pinned, SemverPrefix::Forbidden, false)
+            {
+                return VersionIntent::Exact(canonical);
             }
         }
         // A plain version (Cargo's caret default) or any other sigil/range is a Constraint.
@@ -178,31 +328,469 @@ impl VersionIntent {
     pub fn from_gem_version(token: &str) -> VersionIntent {
         let t = token.trim();
         let stripped = t.strip_prefix('=').map(str::trim).unwrap_or(t);
-        Self::from_explicit_version(stripped)
+        if stripped.is_empty() {
+            return VersionIntent::Unspecified;
+        }
+        if let Some(canonical) = canonical_rubygems_version(stripped) {
+            VersionIntent::Exact(canonical)
+        } else {
+            VersionIntent::Constraint {
+                parsed: None,
+                raw: t.to_string(),
+            }
+        }
     }
 }
 
-/// Whether a token looks like a plain, fully-specified version (an exact pin)
-/// rather than a range/tag. Accepts an optional single leading `v`/`V` (the Go
-/// module convention `v1.9.1`), then a digit, then digits, dots, and a `-`/`+`
-/// prerelease/build tail (`1.2.3`, `1.2.3-beta.1`, `1.2.3+build.5`). Rejects
-/// range sigils (`^ ~ > < = | *`), wildcards (`1.x`), whitespace, and dist-tags
-/// (`latest`).
-pub(crate) fn looks_like_plain_version(t: &str) -> bool {
-    // Allow a single leading `v`/`V` so Go's `v1.9.1` stays an exact pin.
-    let body = t.strip_prefix(['v', 'V']).unwrap_or(t);
-    match body.chars().next() {
-        Some(c) if c.is_ascii_digit() => {}
-        _ => return false,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemverPrefix {
+    Forbidden,
+    OptionalV,
+    RequiredV,
+}
+
+/// Return a canonical SemVer identity without build metadata.
+///
+/// SemVer build metadata does not participate in precedence/equality, while
+/// prerelease identifiers do (and are case-sensitive). Numeric identifiers are
+/// validated as strings so an attacker cannot force integer overflow with an
+/// otherwise syntactically valid, very large version component.
+pub(crate) fn canonical_semver(raw: &str, prefix: SemverPrefix) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > MAX_EXACT_VERSION_BYTES || !raw.is_ascii() {
+        return None;
     }
-    body.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
-        // Every segment must be non-empty and not a wildcard: this rejects an empty
-        // segment (`1.`, `1..2`, `1.+`, a malformed or Gradle-style dynamic selector)
-        // and a `x`/`X` wildcard (`1.x`), which are ranges, not exact pins.
-        && body
-            .split(['.', '-', '+'])
-            .all(|seg| !seg.is_empty() && seg != "x" && seg != "X")
+    let body = match prefix {
+        SemverPrefix::Forbidden => {
+            if raw.starts_with(['v', 'V']) {
+                return None;
+            }
+            raw
+        }
+        SemverPrefix::OptionalV => raw.strip_prefix(['v', 'V']).unwrap_or(raw),
+        SemverPrefix::RequiredV => raw.strip_prefix('v')?,
+    };
+
+    let mut plus = body.split('+');
+    let public = plus.next()?;
+    let build = plus.next();
+    if plus.next().is_some() {
+        return None;
+    }
+    if let Some(build) = build {
+        if !valid_semver_identifiers(build, false) {
+            return None;
+        }
+    }
+
+    let (release, prerelease) = match public.split_once('-') {
+        Some((release, prerelease)) => (release, Some(prerelease)),
+        None => (public, None),
+    };
+    let release_parts: Vec<&str> = release.split('.').collect();
+    if release_parts.len() != 3 || release_parts.iter().any(|part| !valid_semver_numeric(part)) {
+        return None;
+    }
+    if prerelease.is_some_and(|pre| !valid_semver_identifiers(pre, true)) {
+        return None;
+    }
+
+    let mut canonical = release_parts.join(".");
+    if let Some(pre) = prerelease {
+        canonical.push('-');
+        canonical.push_str(pre);
+    }
+    Some(canonical)
+}
+
+/// Return a concrete SemVer spelling suitable for resolver/API use while
+/// retaining valid build metadata. `canonical_semver` deliberately omits build
+/// metadata for equality; this wrapper keeps it on the source-side intent so a
+/// later exact artifact lookup does not silently request a different spelling.
+fn canonical_semver_concrete(
+    raw: &str,
+    prefix: SemverPrefix,
+    emit_lowercase_v: bool,
+) -> Option<String> {
+    let raw = raw.trim();
+    let public = canonical_semver(raw, prefix)?;
+    let build = raw.split_once('+').map(|(_, build)| build);
+    let mut concrete = String::with_capacity(raw.len());
+    if emit_lowercase_v {
+        concrete.push('v');
+    }
+    concrete.push_str(&public);
+    if let Some(build) = build {
+        concrete.push('+');
+        concrete.push_str(build);
+    }
+    Some(concrete)
+}
+
+fn valid_semver_numeric(part: &str) -> bool {
+    !part.is_empty()
+        && part.bytes().all(|b| b.is_ascii_digit())
+        && (part == "0" || !part.starts_with('0'))
+}
+
+fn valid_semver_identifiers(raw: &str, reject_numeric_leading_zero: bool) -> bool {
+    let mut count = 0usize;
+    for part in raw.split('.') {
+        count += 1;
+        if count > MAX_VERSION_PARTS
+            || part.is_empty()
+            || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || (reject_numeric_leading_zero
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && part.len() > 1
+                && part.starts_with('0'))
+        {
+            return false;
+        }
+    }
+    count > 0
+}
+
+/// Canonicalize a concrete NuGet version. NuGet compares prerelease labels
+/// case-insensitively, ignores build metadata, and treats missing/trailing zero
+/// release components as equivalent. Floating (`*`) and range syntax never
+/// reaches this function as a concrete identity.
+pub(crate) fn canonical_nuget_version(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > MAX_EXACT_VERSION_BYTES || !raw.is_ascii() {
+        return None;
+    }
+    let mut plus = raw.split('+');
+    let public = plus.next()?;
+    let build = plus.next();
+    if plus.next().is_some() || build.is_some_and(|value| !valid_semver_identifiers(value, false)) {
+        return None;
+    }
+    let (release, prerelease) = match public.split_once('-') {
+        Some((release, prerelease)) => (release, Some(prerelease)),
+        None => (public, None),
+    };
+    let parts: Vec<&str> = release.split('.').collect();
+    if parts.is_empty()
+        || parts.len() > 4
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    if prerelease.is_some_and(|pre| !valid_semver_identifiers(pre, false)) {
+        return None;
+    }
+
+    let mut normalized: Vec<String> = parts.iter().map(|part| normalize_decimal(part)).collect();
+    while normalized.len() < 3 {
+        normalized.push("0".to_string());
+    }
+    while normalized.len() > 3 && normalized.last().is_some_and(|part| part == "0") {
+        normalized.pop();
+    }
+    let mut canonical = normalized.join(".");
+    if let Some(pre) = prerelease {
+        canonical.push('-');
+        canonical.push_str(
+            &pre.split('.')
+                .map(|part| {
+                    if part.bytes().all(|b| b.is_ascii_digit()) {
+                        normalize_decimal(part)
+                    } else {
+                        part.to_ascii_lowercase()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("."),
+        );
+    }
+    Some(canonical)
+}
+
+static COMPOSER_VERSION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?xi)^
+        v?
+        (?P<release>[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)
+        (?:[-_.]?
+            (?P<stability>stable|dev|patch|p|alpha|a|beta|b|rc)
+            (?:[-_.]?(?P<stability_n>[0-9]+))?
+        )?
+        (?:\+(?P<build>[0-9a-z-]+(?:\.[0-9a-z-]+)*))?
+        $",
+    )
+    .expect("static Composer version regex")
+});
+
+static RUBYGEMS_VERSION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^[0-9]+(?:\.[0-9A-Za-z]+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
+        .expect("static RubyGems version regex")
+});
+
+/// Validate and canonicalize one concrete `Gem::Version` spelling. RubyGems
+/// treats letters as case-sensitive, rewrites hyphens to `.pre.`, splits
+/// alphanumeric segments, and ignores trailing numeric zero segments on both
+/// sides of the first alphabetic segment. Tokens outside its grammar
+/// (including digit-leading aliases such as `1stable`) are resolver/requirement
+/// expressions, not proven releases.
+pub(crate) fn canonical_rubygems_version(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.len() > MAX_EXACT_VERSION_BYTES
+        || !raw.is_ascii()
+        || !RUBYGEMS_VERSION_RE.is_match(raw)
+    {
+        return None;
+    }
+    #[derive(Clone)]
+    enum Segment {
+        Numeric(String),
+        Alpha(String),
+    }
+
+    let normalized = raw.replace('-', ".pre.");
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut current_is_numeric = None;
+    for byte in normalized.bytes() {
+        if byte == b'.' {
+            if !current.is_empty() {
+                segments.push(if current_is_numeric == Some(true) {
+                    Segment::Numeric(normalize_decimal(&current))
+                } else {
+                    Segment::Alpha(std::mem::take(&mut current))
+                });
+                current.clear();
+                current_is_numeric = None;
+            }
+            continue;
+        }
+        let is_numeric = byte.is_ascii_digit();
+        if current_is_numeric.is_some_and(|kind| kind != is_numeric) {
+            segments.push(if current_is_numeric == Some(true) {
+                Segment::Numeric(normalize_decimal(&current))
+            } else {
+                Segment::Alpha(std::mem::take(&mut current))
+            });
+            current.clear();
+        }
+        current_is_numeric = Some(is_numeric);
+        current.push(byte as char);
+    }
+    if !current.is_empty() {
+        segments.push(if current_is_numeric == Some(true) {
+            Segment::Numeric(normalize_decimal(&current))
+        } else {
+            Segment::Alpha(current)
+        });
+    }
+
+    let first_alpha = segments
+        .iter()
+        .position(|segment| matches!(segment, Segment::Alpha(_)))
+        .unwrap_or(segments.len());
+    let mut numeric = segments[..first_alpha].to_vec();
+    let mut prerelease = segments[first_alpha..].to_vec();
+    while matches!(numeric.last(), Some(Segment::Numeric(value)) if value == "0") {
+        numeric.pop();
+    }
+    while matches!(prerelease.last(), Some(Segment::Numeric(value)) if value == "0") {
+        prerelease.pop();
+    }
+    numeric.append(&mut prerelease);
+    if numeric.is_empty() || matches!(numeric.first(), Some(Segment::Alpha(_))) {
+        numeric.insert(0, Segment::Numeric("0".to_string()));
+    }
+    Some(
+        numeric
+            .into_iter()
+            .map(|segment| match segment {
+                Segment::Numeric(value) | Segment::Alpha(value) => value,
+            })
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
+/// Canonicalize a concrete Composer/Packagist version.
+///
+/// Composer normalizes a leading `v`, an optional fourth zero component, and
+/// case-insensitive stability aliases such as `RC`, `a`, and `p`. Branch names,
+/// wildcard versions, stability flags, and other solver expressions do not
+/// match this grammar and therefore stay unresolved.
+pub(crate) fn canonical_composer_version(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > MAX_EXACT_VERSION_BYTES || !raw.is_ascii() {
+        return None;
+    }
+    let captures = COMPOSER_VERSION_RE.captures(raw)?;
+    let mut release: Vec<String> = captures
+        .name("release")?
+        .as_str()
+        .split('.')
+        .map(normalize_decimal)
+        .collect();
+    if release.len() == 4 && release.last().is_some_and(|part| part == "0") {
+        release.pop();
+    }
+    let mut canonical = release.join(".");
+
+    if let Some(stability) = captures.name("stability") {
+        let stability = stability.as_str().to_ascii_lowercase();
+        let number = captures
+            .name("stability_n")
+            .map(|value| normalize_decimal(value.as_str()));
+        match stability.as_str() {
+            "stable" if number.is_none() => {}
+            "dev" if number.is_none() => canonical.push_str("-dev"),
+            "patch" | "p" => {
+                canonical.push_str("-patch");
+                canonical.push_str(number.as_deref().unwrap_or("0"));
+            }
+            "alpha" | "a" => {
+                canonical.push_str("-alpha");
+                canonical.push_str(number.as_deref().unwrap_or("0"));
+            }
+            "beta" | "b" => {
+                canonical.push_str("-beta");
+                canonical.push_str(number.as_deref().unwrap_or("0"));
+            }
+            "rc" => {
+                canonical.push_str("-rc");
+                canonical.push_str(number.as_deref().unwrap_or("0"));
+            }
+            _ => return None,
+        }
+    }
+    Some(canonical)
+}
+
+static PEP440_VERSION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?xi)^
+        v?
+        (?:(?P<epoch>[0-9]+)!)?
+        (?P<release>[0-9]+(?:\.[0-9]+)*)
+        (?:
+            [-_.]?
+            (?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)
+            [-_.]?
+            (?P<pre_n>[0-9]+)?
+        )?
+        (?:
+            (?P<post_n1>-[0-9]+)
+            |
+            (?:
+                [-_.]?
+                (?P<post_l>post|rev|r)
+                [-_.]?
+                (?P<post_n2>[0-9]+)?
+            )
+        )?
+        (?:
+            [-_.]?
+            (?P<dev_l>dev)
+            [-_.]?
+            (?P<dev_n>[0-9]+)?
+        )?
+        (?:\+(?P<local>[a-z0-9]+(?:[-_.][a-z0-9]+)*))?
+        $",
+    )
+    .expect("static PEP 440 version regex")
+});
+
+/// Parse and canonicalize the PEP 440 public/local identity used by PyPI.
+pub(crate) fn canonical_pep440_version(raw: &str) -> Option<CanonicalPep440Version> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > MAX_EXACT_VERSION_BYTES || !raw.is_ascii() {
+        return None;
+    }
+    let captures = PEP440_VERSION_RE.captures(raw)?;
+    let release = captures.name("release")?.as_str();
+    let mut release_parts: Vec<String> = release.split('.').map(normalize_decimal).collect();
+    if release_parts.len() > MAX_VERSION_PARTS {
+        return None;
+    }
+    while release_parts.len() > 1 && release_parts.last().is_some_and(|part| part == "0") {
+        release_parts.pop();
+    }
+
+    let epoch = captures
+        .name("epoch")
+        .map(|value| normalize_decimal(value.as_str()))
+        .unwrap_or_else(|| "0".to_string());
+    let mut public = String::new();
+    if epoch != "0" {
+        public.push_str(&epoch);
+        public.push('!');
+    }
+    public.push_str(&release_parts.join("."));
+
+    if let Some(label) = captures.name("pre_l") {
+        let label = match label.as_str().to_ascii_lowercase().as_str() {
+            "alpha" | "a" => "a",
+            "beta" | "b" => "b",
+            "preview" | "pre" | "c" | "rc" => "rc",
+            _ => return None,
+        };
+        let number = captures
+            .name("pre_n")
+            .map(|value| normalize_decimal(value.as_str()))
+            .unwrap_or_else(|| "0".to_string());
+        public.push_str(label);
+        public.push_str(&number);
+    }
+
+    let post_number = captures
+        .name("post_n1")
+        .map(|value| value.as_str().trim_start_matches('-'))
+        .or_else(|| captures.name("post_n2").map(|value| value.as_str()));
+    if captures.name("post_n1").is_some() || captures.name("post_l").is_some() {
+        public.push_str(".post");
+        public.push_str(&normalize_decimal(post_number.unwrap_or("0")));
+    }
+
+    if captures.name("dev_l").is_some() {
+        let number = captures
+            .name("dev_n")
+            .map(|value| normalize_decimal(value.as_str()))
+            .unwrap_or_else(|| "0".to_string());
+        public.push_str(".dev");
+        public.push_str(&number);
+    }
+
+    let local = captures.name("local").map(|value| {
+        value
+            .as_str()
+            .split(['-', '_', '.'])
+            .map(|part| {
+                if part.bytes().all(|b| b.is_ascii_digit()) {
+                    normalize_decimal(part)
+                } else {
+                    part.to_ascii_lowercase()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    });
+    if local
+        .as_deref()
+        .is_some_and(|value| value.split('.').count() > MAX_VERSION_PARTS)
+    {
+        return None;
+    }
+    Some(CanonicalPep440Version { public, local })
+}
+
+fn normalize_decimal(raw: &str) -> String {
+    let normalized = raw.trim_start_matches('0');
+    if normalized.is_empty() {
+        "0".to_string()
+    } else {
+        normalized.to_string()
+    }
 }
 
 /// A parsed PEP 440 version constraint: a conjunction (AND) of comparison
@@ -416,11 +1004,9 @@ mod tests {
 
     #[test]
     fn exact_pin_with_prerelease_is_exact() {
-        // A lone `==<prerelease>` is an exact INTENT even though the version is
-        // not a plain numeric release: the DB match is a literal string compare,
-        // so it must not degrade to an Unresolved Constraint (a mere Warn).
+        // A lone valid prerelease is exact and stored in canonical PEP 440 form.
         match VersionIntent::from_pep440_specifier("==1.0.0rc1") {
-            VersionIntent::Exact(v) => assert_eq!(v, "1.0.0rc1"),
+            VersionIntent::Exact(v) => assert_eq!(v, "1rc1"),
             other => panic!("expected Exact for `==1.0.0rc1`, got {other:?}"),
         }
     }
@@ -467,7 +1053,7 @@ mod tests {
         // it must not be downgraded to an unresolved Constraint.
         assert_eq!(
             VersionIntent::from_pep440_specifier("==1.0+ubuntu1"),
-            VersionIntent::Exact("1.0+ubuntu1".to_string())
+            VersionIntent::Exact("1+ubuntu1".to_string())
         );
         // A clean exact pin and a prerelease pin are still Exact.
         assert_eq!(
@@ -476,8 +1062,102 @@ mod tests {
         );
         assert_eq!(
             VersionIntent::from_pep440_specifier("==1.0.0rc1"),
-            VersionIntent::Exact("1.0.0rc1".to_string())
+            VersionIntent::Exact("1rc1".to_string())
         );
+    }
+
+    #[test]
+    fn pep440_exact_versions_use_registry_canonical_identity() {
+        for (raw, canonical) in [
+            ("==v1.0.0", "1"),
+            ("==1.0RC01", "1rc1"),
+            ("==01.002-post03", "1.2.post3"),
+            ("==1.0+Ubuntu_01", "1+ubuntu.1"),
+        ] {
+            assert_eq!(
+                VersionIntent::from_pep440_specifier(raw),
+                VersionIntent::Exact(canonical.to_string()),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn ecosystem_selectors_are_not_misclassified_as_exact() {
+        for intent in [
+            VersionIntent::from_npm_version("1stable"),
+            VersionIntent::from_npm_version("1.2"),
+            VersionIntent::from_go_version("123abc"),
+            VersionIntent::from_go_version("v1.2"),
+            VersionIntent::from_go_version("v1.2.3+metadata"),
+            VersionIntent::from_composer_version("1stable"),
+            VersionIntent::from_gem_version("1stable"),
+            VersionIntent::from_maven_version("1.2.3-SNAPSHOT"),
+            VersionIntent::from_nuget_version("v1.2.3"),
+            VersionIntent::from_nuget_version("1.2"),
+            VersionIntent::from_nuget_version("1.*"),
+        ] {
+            assert!(matches!(
+                intent,
+                VersionIntent::Constraint { parsed: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn ecosystem_concrete_version_controls_remain_exact() {
+        assert_eq!(
+            VersionIntent::from_npm_version("v1.2.3-beta.1+build.7"),
+            VersionIntent::Exact("1.2.3-beta.1+build.7".to_string())
+        );
+        assert_eq!(
+            VersionIntent::from_go_version("v0.0.0-20260101000000-abcdef123456"),
+            VersionIntent::Exact("v0.0.0-20260101000000-abcdef123456".to_string())
+        );
+        assert_eq!(
+            VersionIntent::from_go_version("v2.0.0+incompatible"),
+            VersionIntent::Exact("v2.0.0+incompatible".to_string())
+        );
+        assert_eq!(
+            VersionIntent::from_cargo_version("=1.2.3+vendor.7"),
+            VersionIntent::Exact("1.2.3+vendor.7".to_string())
+        );
+        assert_eq!(
+            VersionIntent::from_nuget_version("01.2.0.0-RC.01+BUILD"),
+            VersionIntent::Exact("1.2.0-rc.1".to_string())
+        );
+        assert_eq!(
+            VersionIntent::from_composer_version("v01.2.3.0-RC01+build.7"),
+            VersionIntent::Exact("1.2.3-rc1".to_string())
+        );
+        assert_eq!(
+            VersionIntent::from_gem_version("1.0-RC1"),
+            VersionIntent::Exact("1.pre.RC.1".to_string())
+        );
+        assert_eq!(
+            VersionIntent::from_docker_version("v1.2.3"),
+            VersionIntent::Exact("v1.2.3".to_string()),
+            "Docker tag identity is literal"
+        );
+        assert_eq!(
+            VersionIntent::from_maven_version("1stable"),
+            VersionIntent::Exact("1stable".to_string()),
+            "Maven coordinates are literal, not resolver dist-tags"
+        );
+    }
+
+    #[test]
+    fn rubygems_versions_follow_gem_version_canonical_segments() {
+        for (raw, canonical) in [
+            ("1.0.0", "1"),
+            ("1.0-RC1", "1.pre.RC.1"),
+            ("1.0.pre.RC1", "1.pre.RC.1"),
+            ("1.0.a.0", "1.a"),
+            ("0.0.a.0", "0.a"),
+            ("01.002", "1.2"),
+        ] {
+            assert_eq!(canonical_rubygems_version(raw).as_deref(), Some(canonical));
+        }
     }
 
     #[test]

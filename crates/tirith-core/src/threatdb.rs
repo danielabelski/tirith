@@ -520,6 +520,9 @@ pub enum UnresolvedReason {
     /// The constraint parsed, but at least one affected version in the record
     /// is not a plain release version we can compare against.
     AffectedVersionUnparsed,
+    /// An exact requested or affected version was outside the ecosystem parser
+    /// used for equivalence, so a non-literal mismatch cannot be called clean.
+    ExactVersionUnsupported,
 }
 
 /// Outcome of a constraint-aware package threat assessment.
@@ -785,6 +788,168 @@ fn pkg_key_hash(eco: Ecosystem, name: &[u8]) -> u32 {
     buf.push(eco as u8);
     buf.extend_from_slice(name);
     fnv1a_hash(&buf)
+}
+
+/// Canonical registry identity for a package name.
+///
+/// This is the single source of truth for package, typosquat, and popular-name
+/// indices. It deliberately does not apply one global lowercase rule: npm, Go,
+/// Maven, and RubyGems names retain case as part of the supplied identity,
+/// while PyPI has PEP 503 separator folding and NuGet/Packagist/Scoop use
+/// lowercase registry keys. crates.io additionally treats ASCII case and
+/// hyphen/underscore spelling differences as the same package identity.
+pub fn canonical_package_name(eco: Ecosystem, name: &str) -> String {
+    match eco {
+        Ecosystem::PyPI => {
+            let mut canonical = String::with_capacity(name.len());
+            let mut in_separator_run = false;
+            for ch in name.chars() {
+                if matches!(ch, '-' | '_' | '.') {
+                    if !in_separator_run {
+                        canonical.push('-');
+                        in_separator_run = true;
+                    }
+                } else {
+                    canonical.extend(ch.to_lowercase());
+                    in_separator_run = false;
+                }
+            }
+            canonical
+        }
+        Ecosystem::NuGet | Ecosystem::Packagist | Ecosystem::Scoop => name.to_lowercase(),
+        Ecosystem::Crates => name
+            .chars()
+            .map(|ch| match ch {
+                '_' => '-',
+                _ => ch.to_ascii_lowercase(),
+            })
+            .collect(),
+        Ecosystem::Apt
+        | Ecosystem::Brew
+        | Ecosystem::Dnf
+        | Ecosystem::Yum
+        | Ecosystem::Pacman
+        | Ecosystem::Docker => name.to_ascii_lowercase(),
+        Ecosystem::Npm | Ecosystem::RubyGems | Ecosystem::Go | Ecosystem::Maven => name.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionEquivalence {
+    Equal,
+    Different,
+    Unknown,
+}
+
+/// Compare a requested exact version to one affected-version record using the
+/// ecosystem's actual version identity. Literal equality is always sufficient;
+/// a non-literal comparison is `Unknown` when either side is outside the parser
+/// we can prove correct, never a clean `Different` miss.
+fn affected_version_equivalence(
+    eco: Ecosystem,
+    affected: &str,
+    requested: &str,
+) -> VersionEquivalence {
+    use crate::version_intent::{
+        canonical_composer_version, canonical_nuget_version, canonical_pep440_version,
+        canonical_rubygems_version, canonical_semver, SemverPrefix,
+    };
+
+    if affected == requested {
+        return VersionEquivalence::Equal;
+    }
+
+    match eco {
+        Ecosystem::PyPI => {
+            let (Some(affected), Some(requested)) = (
+                canonical_pep440_version(affected),
+                canonical_pep440_version(requested),
+            ) else {
+                return VersionEquivalence::Unknown;
+            };
+            if affected == requested
+                // A requested local build contains its public/base release's
+                // code. Do not invert this: a local-only malicious record does
+                // not make every build of the public release malicious.
+                || (affected.local.is_none()
+                    && requested.local.is_some()
+                    && affected.public == requested.public)
+            {
+                VersionEquivalence::Equal
+            } else {
+                VersionEquivalence::Different
+            }
+        }
+        Ecosystem::Npm | Ecosystem::Crates | Ecosystem::Go => {
+            let prefix = if eco == Ecosystem::Go {
+                SemverPrefix::RequiredV
+            } else {
+                SemverPrefix::OptionalV
+            };
+            match (
+                canonical_semver(affected, prefix),
+                canonical_semver(requested, prefix),
+            ) {
+                (Some(a), Some(b)) if a == b => VersionEquivalence::Equal,
+                (Some(_), Some(_)) => VersionEquivalence::Different,
+                _ => VersionEquivalence::Unknown,
+            }
+        }
+        Ecosystem::NuGet => match (
+            canonical_nuget_version(affected),
+            canonical_nuget_version(requested),
+        ) {
+            (Some(a), Some(b)) if a == b => VersionEquivalence::Equal,
+            (Some(_), Some(_)) => VersionEquivalence::Different,
+            _ => VersionEquivalence::Unknown,
+        },
+        Ecosystem::Packagist => match (
+            canonical_composer_version(affected),
+            canonical_composer_version(requested),
+        ) {
+            (Some(a), Some(b)) if a == b => VersionEquivalence::Equal,
+            (Some(_), Some(_)) => VersionEquivalence::Different,
+            _ => VersionEquivalence::Unknown,
+        },
+        Ecosystem::RubyGems => match (
+            canonical_rubygems_version(affected),
+            canonical_rubygems_version(requested),
+        ) {
+            (Some(a), Some(b)) if a == b => VersionEquivalence::Equal,
+            (Some(_), Some(_)) => VersionEquivalence::Different,
+            _ => VersionEquivalence::Unknown,
+        },
+        // Maven coordinates and Docker tags/digests are literal identities.
+        Ecosystem::Maven | Ecosystem::Docker => VersionEquivalence::Different,
+        // Tirith does not yet carry complete registry-native comparators for
+        // these version schemes. A non-literal mismatch must remain unresolved.
+        Ecosystem::Apt
+        | Ecosystem::Brew
+        | Ecosystem::Dnf
+        | Ecosystem::Yum
+        | Ecosystem::Pacman
+        | Ecosystem::Scoop => VersionEquivalence::Unknown,
+    }
+}
+
+fn canonical_version_for_storage(eco: Ecosystem, version: &str) -> String {
+    use crate::version_intent::{
+        canonical_composer_version, canonical_nuget_version, canonical_pep440_version,
+        canonical_rubygems_version, canonical_semver, SemverPrefix,
+    };
+
+    let canonical = match eco {
+        Ecosystem::PyPI => canonical_pep440_version(version).map(|value| value.full()),
+        Ecosystem::Npm | Ecosystem::Crates => canonical_semver(version, SemverPrefix::OptionalV),
+        Ecosystem::Go => {
+            canonical_semver(version, SemverPrefix::RequiredV).map(|value| format!("v{value}"))
+        }
+        Ecosystem::NuGet => canonical_nuget_version(version),
+        Ecosystem::Packagist => canonical_composer_version(version),
+        Ecosystem::RubyGems => canonical_rubygems_version(version),
+        _ => None,
+    };
+    canonical.unwrap_or_else(|| version.to_string())
 }
 
 fn read_u16_le(buf: &[u8], off: usize) -> Option<u16> {
@@ -1466,19 +1631,24 @@ impl ThreatDb {
         name: &str,
         version: Option<&str>,
     ) -> Option<ThreatMatch> {
+        let name = canonical_package_name(eco, name);
         let target_hash = pkg_key_hash(eco, name.as_bytes());
 
-        if let Some(idx) = self.binary_search_pkg_index(eco, name, target_hash) {
+        if let Some(idx) = self.binary_search_pkg_index(eco, &name, target_hash) {
             let (data_off, _) = self.pkg_index_entry(idx)?;
             let rec = self.parse_pkg_record(data_off as usize)?;
 
             match version {
                 Some(v) => {
-                    if !rec.all_versions_malicious && !rec.versions.iter().any(|rv| rv == &v) {
+                    if !rec.all_versions_malicious
+                        && !rec.versions.iter().any(|rv| {
+                            affected_version_equivalence(eco, rv, v) == VersionEquivalence::Equal
+                        })
+                    {
                         return self
                             .supplemental
                             .as_deref()
-                            .and_then(|db| db.check_package(eco, name, version));
+                            .and_then(|db| db.check_package(eco, &name, version));
                     }
                 }
                 None => {
@@ -1486,7 +1656,7 @@ impl ThreatDb {
                         return self
                             .supplemental
                             .as_deref()
-                            .and_then(|db| db.check_package(eco, name, version));
+                            .and_then(|db| db.check_package(eco, &name, version));
                     }
                 }
             }
@@ -1507,7 +1677,7 @@ impl ThreatDb {
 
         self.supplemental
             .as_deref()
-            .and_then(|db| db.check_package(eco, name, version))
+            .and_then(|db| db.check_package(eco, &name, version))
     }
 
     /// Constraint-aware, serializable package threat assessment.
@@ -1550,8 +1720,9 @@ impl ThreatDb {
     ) -> PackageThreatAssessment {
         use crate::version_intent::{ReleaseVersion, VersionIntent};
 
+        let name = canonical_package_name(eco, name);
         let target_hash = pkg_key_hash(eco, name.as_bytes());
-        let Some(idx) = self.binary_search_pkg_index(eco, name, target_hash) else {
+        let Some(idx) = self.binary_search_pkg_index(eco, &name, target_hash) else {
             return PackageThreatAssessment::NoRecord;
         };
         let Some((data_off, _)) = self.pkg_index_entry(idx) else {
@@ -1569,24 +1740,38 @@ impl ThreatDb {
             return PackageThreatAssessment::ExactMatch(summary);
         }
 
+        // A version-specific malicious record with no affected-version data
+        // cannot prove either a hit or an exclusion for any request.
+        if rec.versions.is_empty() {
+            return PackageThreatAssessment::Unresolved {
+                summary,
+                reason: UnresolvedReason::AffectedVersionUnparsed,
+                affected_versions: affected,
+            };
+        }
+
         match intent {
             VersionIntent::Exact(v) | VersionIntent::Resolved(v) => {
-                // Match on a literal string equal OR a numeric release equal, so
-                // a pin like `==1.4` still hits a record listing `1.4.0`. The
-                // numeric arm only fires when both sides parse as plain release
-                // versions; anything else (prereleases, locals) relies on the
-                // literal compare and falls through to NoRecord when it differs.
-                // Compare via `cmp` (not `==`): only `Ord` treats trailing-zero
-                // segments as equal, so `1.4` and `1.4.0` match here.
-                let matched = rec.versions.iter().any(|rv| {
-                    rv == v
-                        || matches!(
-                            (ReleaseVersion::parse(rv), ReleaseVersion::parse(v)),
-                            (Some(a), Some(b)) if a.cmp(&b) == std::cmp::Ordering::Equal
-                        )
-                });
+                let mut unknown = false;
+                let matched =
+                    rec.versions
+                        .iter()
+                        .any(|rv| match affected_version_equivalence(eco, rv, v) {
+                            VersionEquivalence::Equal => true,
+                            VersionEquivalence::Different => false,
+                            VersionEquivalence::Unknown => {
+                                unknown = true;
+                                false
+                            }
+                        });
                 if matched {
                     PackageThreatAssessment::ExactMatch(summary)
+                } else if unknown {
+                    PackageThreatAssessment::Unresolved {
+                        summary,
+                        reason: UnresolvedReason::ExactVersionUnsupported,
+                        affected_versions: affected,
+                    }
                 } else {
                     // This concrete version is not the malicious one; no record
                     // for the request in this layer.
@@ -1795,18 +1980,19 @@ impl ThreatDb {
 
     /// Check a package name against known typosquats.
     pub fn check_typosquat(&self, eco: Ecosystem, name: &str) -> Option<TyposquatMatch> {
+        let name = canonical_package_name(eco, name);
         if self.typosquat_index_count == 0 {
             return self
                 .supplemental
                 .as_deref()
-                .and_then(|db| db.check_typosquat(eco, name));
+                .and_then(|db| db.check_typosquat(eco, &name));
         }
         let target_hash = pkg_key_hash(eco, name.as_bytes());
-        let Some(idx) = self.binary_search_typosquat_index(eco, name, target_hash) else {
+        let Some(idx) = self.binary_search_typosquat_index(eco, &name, target_hash) else {
             return self
                 .supplemental
                 .as_deref()
-                .and_then(|db| db.check_typosquat(eco, name));
+                .and_then(|db| db.check_typosquat(eco, &name));
         };
         let base = self.typosquat_index_offset as usize + idx as usize * TYPOSQUAT_INDEX_ENTRY_SIZE;
         let data_off = read_u32_le(&self.data, base)? as usize;
@@ -2024,6 +2210,7 @@ impl ThreatDb {
     ///
     /// [`check_popular_distance`]: Self::check_popular_distance
     pub fn is_popular_package(&self, eco: Ecosystem, name: &str) -> bool {
+        let name = canonical_package_name(eco, name);
         // Linear scan: the popular index is sorted by (ecosystem, name), not by
         // hash, so a hash-keyed binary search would be unsound.
         for i in 0..self.popular_index_count {
@@ -2056,13 +2243,14 @@ impl ThreatDb {
         }
         self.supplemental
             .as_deref()
-            .map(|db| db.is_popular_package(eco, name))
+            .map(|db| db.is_popular_package(eco, &name))
             .unwrap_or(false)
     }
 
     /// Find the closest popular package name within Levenshtein distance.
     /// Returns `(popular_name, distance)` if distance <= 1.
     pub fn check_popular_distance(&self, eco: Ecosystem, name: &str) -> Option<(String, usize)> {
+        let name = canonical_package_name(eco, name);
         // Linear scan is fine for ~5k short names.
         let mut best: Option<(String, usize)> = None;
         let max_distance = 1;
@@ -2102,7 +2290,7 @@ impl ThreatDb {
                 continue;
             }
 
-            let dist = levenshtein(name, popular_name);
+            let dist = levenshtein(&name, popular_name);
             if dist <= max_distance {
                 match &best {
                     Some((_, d)) if dist < *d => {
@@ -2119,7 +2307,7 @@ impl ThreatDb {
         let overlay = self
             .supplemental
             .as_deref()
-            .and_then(|db| db.check_popular_distance(eco, name));
+            .and_then(|db| db.check_popular_distance(eco, &name));
 
         // Return whichever result has the smaller edit distance; prefer primary on tie.
         match (best, overlay) {
@@ -2668,14 +2856,21 @@ impl ThreatDbWriter {
         all_versions_malicious: bool,
         reference: Option<&str>,
     ) {
+        let name = canonical_package_name(eco, name);
+        let mut versions: Vec<String> = versions
+            .iter()
+            .map(|version| canonical_version_for_storage(eco, version))
+            .collect();
+        versions.sort();
+        versions.dedup();
         let ref_offset = match reference {
             Some(r) => self.string_table.intern(r),
             None => 0xFFFF_FFFF,
         };
         self.packages.push(WriterPkg {
             ecosystem: eco,
-            name: name.to_string(),
-            versions: versions.iter().map(|v| v.to_string()).collect(),
+            name,
+            versions,
             source,
             confidence,
             all_versions_malicious,
@@ -2700,15 +2895,15 @@ impl ThreatDbWriter {
     pub fn add_typosquat(&mut self, eco: Ecosystem, malicious_name: &str, target_name: &str) {
         self.typosquats.push(WriterTyposquat {
             ecosystem: eco,
-            malicious_name: malicious_name.to_string(),
-            target_name: target_name.to_string(),
+            malicious_name: canonical_package_name(eco, malicious_name),
+            target_name: canonical_package_name(eco, target_name),
         });
     }
 
     pub fn add_popular(&mut self, eco: Ecosystem, name: &str) {
         self.popular.push(WriterPopular {
             ecosystem: eco,
-            name: name.to_string(),
+            name: canonical_package_name(eco, name),
         });
     }
 
@@ -2757,8 +2952,50 @@ impl ThreatDbWriter {
         // Sort and deduplicate each section.
         self.packages
             .sort_by(|a, b| (a.ecosystem as u8, &a.name).cmp(&(b.ecosystem as u8, &b.name)));
-        self.packages
-            .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name);
+        // Canonical spellings can make previously distinct feed records share
+        // one registry key (for example PyPI `foo.bar` and `foo__bar`). Merge
+        // them after sorting so affected-version sets are preserved in O(n)
+        // time instead of silently dropping one record or doing an O(n^2)
+        // lookup on every insertion.
+        let mut merged_packages: Vec<WriterPkg> = Vec::with_capacity(self.packages.len());
+        for mut package in std::mem::take(&mut self.packages) {
+            if let Some(existing) = merged_packages.last_mut().filter(|existing| {
+                existing.ecosystem == package.ecosystem && existing.name == package.name
+            }) {
+                existing.versions.append(&mut package.versions);
+                // If one record is the reason the merged entry covers every
+                // version, its metadata must describe that broader claim. Do
+                // not accidentally promote a medium-confidence all-version
+                // signal to confirmed using an unrelated version-specific
+                // record for the same canonical package key.
+                let replace_metadata = match (
+                    existing.all_versions_malicious,
+                    package.all_versions_malicious,
+                ) {
+                    (false, true) => true,
+                    (true, false) => false,
+                    _ => {
+                        package.confidence > existing.confidence
+                            || (package.confidence == existing.confidence
+                                && existing.reference_offset == 0xFFFF_FFFF
+                                && package.reference_offset != 0xFFFF_FFFF)
+                    }
+                };
+                if replace_metadata {
+                    existing.source = package.source;
+                    existing.confidence = package.confidence;
+                    existing.reference_offset = package.reference_offset;
+                }
+                existing.all_versions_malicious |= package.all_versions_malicious;
+            } else {
+                merged_packages.push(package);
+            }
+        }
+        for package in &mut merged_packages {
+            package.versions.sort();
+            package.versions.dedup();
+        }
+        self.packages = merged_packages;
 
         self.hostnames.sort_by(|a, b| a.name.cmp(&b.name));
         self.hostnames.dedup_by(|a, b| a.name == b.name);
@@ -3437,6 +3674,139 @@ mod tests {
             .check_package(Ecosystem::Npm, "borderline-pkg", Some("2.0.0"))
             .expect("should match");
         assert_eq!(m.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn package_indices_share_registry_canonical_names() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 43);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "Malware.Pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        // The same PyPI identity must merge rather than silently losing either
+        // affected-version record during writer deduplication.
+        writer.add_package(
+            Ecosystem::PyPI,
+            "malware__pkg",
+            &["2.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::NuGet,
+            "Newtonsoft.JSON",
+            &["13.0.3"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Npm,
+            "CasePkg",
+            &["1.2.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::RubyGems,
+            "CaseGem",
+            &["1.2.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Crates,
+            "Serde_JSON",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_typosquat(Ecosystem::PyPI, "Reqeusts__Plus", "Requests");
+        writer.add_popular(Ecosystem::PyPI, "Friendly-._-Bard");
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        assert_eq!(db.stats().package_count, 5);
+        for version in ["1", "2.0"] {
+            assert!(db
+                .check_package(Ecosystem::PyPI, "MALWARE-._-PKG", Some(version))
+                .is_some());
+        }
+        assert!(db
+            .check_package(Ecosystem::NuGet, "newtonsoft.json", Some("13.0.3"))
+            .is_some());
+        let typo = db
+            .check_typosquat(Ecosystem::PyPI, "REQEUSTS-._-PLUS")
+            .expect("canonical typosquat key");
+        assert_eq!(typo.target_name, "requests");
+        assert!(db.is_popular_package(Ecosystem::PyPI, "friendly__bard"));
+
+        // Legitimate non-equivalent control: npm names are not globally folded.
+        assert!(db
+            .check_package(Ecosystem::Npm, "CasePkg", Some("1.2.3"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::Npm, "casepkg", Some("1.2.3"))
+            .is_none());
+        assert!(db
+            .check_package(Ecosystem::RubyGems, "CaseGem", Some("1.2.3"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::RubyGems, "casegem", Some("1.2.3"))
+            .is_none());
+        assert!(db
+            .check_package(Ecosystem::Crates, "serde-json", Some("1.0.0"))
+            .is_some());
+    }
+
+    #[test]
+    fn canonical_package_merge_does_not_overstate_all_version_confidence() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 44);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "Coverage.Pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.invalid/specific"),
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "coverage__pkg",
+            &[],
+            ThreatSource::DatadogMalicious,
+            Confidence::Medium,
+            true,
+            Some("https://example.invalid/all"),
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let matched = db
+            .check_package(Ecosystem::PyPI, "COVERAGE-._-PKG", Some("99.0"))
+            .expect("all-version canonical match");
+        assert!(matched.all_versions_malicious);
+        assert_eq!(matched.source, ThreatSource::DatadogMalicious);
+        assert_eq!(matched.confidence, Confidence::Medium);
+        assert_eq!(
+            matched.reference_url.as_deref(),
+            Some("https://example.invalid/all")
+        );
     }
 
     #[test]
@@ -4370,6 +4740,184 @@ mod tests {
             }
             other => panic!("expected ExactMatch for `==1.4` vs `1.4.0`, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn assess_pep440_equivalent_spelling_and_local_base_are_exact_matches() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 12);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "evil-pre",
+            &["1.0rc1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "evil-base",
+            &["1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "local-only",
+            &["1.0+vendor1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let prerelease = VersionIntent::from_pep440_specifier("==v1.0RC01");
+        assert!(matches!(
+            db.assess_package(Ecosystem::PyPI, "evil-pre", &prerelease),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+        let local = VersionIntent::from_pep440_specifier("==1.0+Ubuntu_01");
+        assert!(matches!(
+            db.assess_package(Ecosystem::PyPI, "evil-base", &local),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+
+        // The local-to-base rule is deliberately one-way: a malicious local
+        // rebuild does not mark the public upstream release itself malicious.
+        let base = VersionIntent::from_pep440_specifier("==1.0");
+        assert_eq!(
+            db.assess_package(Ecosystem::PyPI, "local-only", &base),
+            PackageThreatAssessment::NoRecord
+        );
+    }
+
+    #[test]
+    fn assess_ecosystem_version_identity_preserves_literal_and_resolver_semantics() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 14);
+        for (eco, name, version) in [
+            (Ecosystem::Packagist, "vendor/evil", "1.2.3-RC1"),
+            (Ecosystem::Go, "example.com/evil", "v2.0.0+incompatible"),
+            (Ecosystem::Crates, "evil-crate", "1.2.3+vendor.7"),
+            (Ecosystem::RubyGems, "evil-gem", "1.0-RC1"),
+            (Ecosystem::Docker, "library/evil", "v1.2.3"),
+        ] {
+            writer.add_package(
+                eco,
+                name,
+                &[version],
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+        }
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        for (eco, name, intent) in [
+            (
+                Ecosystem::Packagist,
+                "vendor/evil",
+                VersionIntent::from_composer_version("v1.2.3.0-rc01"),
+            ),
+            (
+                Ecosystem::Go,
+                "example.com/evil",
+                VersionIntent::from_go_version("v2.0.0+incompatible"),
+            ),
+            (
+                Ecosystem::Docker,
+                "library/evil",
+                VersionIntent::from_docker_version("v1.2.3"),
+            ),
+            (
+                Ecosystem::Crates,
+                "evil-crate",
+                VersionIntent::from_cargo_version("=1.2.3+vendor.7"),
+            ),
+            (
+                Ecosystem::RubyGems,
+                "evil-gem",
+                VersionIntent::from_gem_version("1.0.pre.RC1"),
+            ),
+        ] {
+            assert!(matches!(
+                db.assess_package(eco, name, &intent),
+                PackageThreatAssessment::ExactMatch(_)
+            ));
+        }
+
+        assert_eq!(
+            db.assess_package(
+                Ecosystem::RubyGems,
+                "evil-gem",
+                &VersionIntent::from_gem_version("2.0"),
+            ),
+            PackageThreatAssessment::NoRecord
+        );
+
+        // Docker tags are not SemVer aliases: these are different registry
+        // references even though one has only a leading `v` difference.
+        assert_eq!(
+            db.assess_package(
+                Ecosystem::Docker,
+                "library/evil",
+                &VersionIntent::from_docker_version("1.2.3"),
+            ),
+            PackageThreatAssessment::NoRecord
+        );
+    }
+
+    #[test]
+    fn unsupported_exact_equivalence_is_unresolved_not_clean() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 13);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "opaque-version",
+            &["not-a-pep440-version"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let intent = VersionIntent::Exact("another-opaque-version".to_string());
+        match db.assess_package(Ecosystem::PyPI, "opaque-version", &intent) {
+            PackageThreatAssessment::Unresolved { reason, .. } => {
+                assert_eq!(reason, UnresolvedReason::ExactVersionUnsupported);
+            }
+            other => panic!("expected fail-closed Unresolved, got {other:?}"),
+        }
+
+        // Identical opaque registry strings are still a proven exact hit.
+        let identical = VersionIntent::Exact("not-a-pep440-version".to_string());
+        assert!(matches!(
+            db.assess_package(Ecosystem::PyPI, "opaque-version", &identical),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+    }
+
+    #[test]
+    fn digit_leading_npm_selector_stays_unresolved_against_malicious_versions() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let intent = VersionIntent::from_npm_version("1stable");
+        assert!(matches!(
+            intent,
+            VersionIntent::Constraint { parsed: None, .. }
+        ));
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "evil-package", &intent),
+            PackageThreatAssessment::Unresolved {
+                reason: UnresolvedReason::ConstraintUnsupported,
+                ..
+            }
+        ));
     }
 
     #[test]

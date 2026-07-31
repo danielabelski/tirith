@@ -305,12 +305,10 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
 /// (`1` == `1.x.x`, `1.2` == `1.2.x`); explicit operators stay unresolved. This
 /// keeps a partial spec from being mistaken for a too-narrow exact match.
 pub(crate) fn npm_manifest_intent(spec: &str) -> VersionIntent {
-    match VersionIntent::from_explicit_version(spec) {
-        VersionIntent::Exact(v) => match npm_partial_xrange(&v) {
-            Some(range) => VersionIntent::from_pep440_specifier(&range),
-            None => VersionIntent::Exact(v),
-        },
-        other => other,
+    if let Some(range) = npm_partial_xrange(spec.trim()) {
+        VersionIntent::from_pep440_specifier(&range)
+    } else {
+        VersionIntent::from_npm_version(spec)
     }
 }
 
@@ -326,8 +324,8 @@ fn npm_partial_xrange(v: &str) -> Option<String> {
         .map(|s| s.parse::<u64>().ok())
         .collect::<Option<_>>()?;
     // `checked_add` so a pathological segment (`18446744073709551615`) returns None
-    // (treated as an exact pin) instead of overflowing: a panic in debug, or a bogus
-    // `>=MAX,<0` range in release that would never match.
+    // (and the strict npm parser leaves it unresolved) instead of overflowing: a
+    // panic in debug, or a bogus `>=MAX,<0` range in release that would never match.
     match nums.as_slice() {
         [major] => major
             .checked_add(1)
@@ -502,8 +500,8 @@ fn python_requirement_name(line: &str) -> Option<String> {
 fn python_requirement_spec(line: &str) -> String {
     // Drop any `[extras]` so its contents are not mistaken for a specifier. The
     // environment marker is KEPT: a marker-qualified requirement only applies under an
-    // unsupported condition, so keeping the `;` makes `from_pep440_specifier` reject it
-    // (its `looks_like_plain_version` rejects `;`) and degrade to unresolved.
+    // unsupported condition, so keeping the `;` makes the full PEP 440 exact-version
+    // parser reject it and degrade to unresolved.
     let mut buf = String::with_capacity(line.len());
     let mut depth = 0u32;
     for c in line.chars() {
@@ -759,7 +757,7 @@ fn go_mod_require_entry(entry: &str) -> Option<DeclaredDependency> {
         ecosystem: Ecosystem::Go,
         // go.mod pins a concrete module version (e.g. `v1.2.3`).
         version: version
-            .map(|v| VersionIntent::from_explicit_version(&v))
+            .map(|v| VersionIntent::from_go_version(&v))
             .unwrap_or(VersionIntent::Unspecified),
         dev: false,
     })
@@ -3747,11 +3745,12 @@ git+https://github.com/x/y.git
             npm_manifest_intent("1.2.3"),
             VersionIntent::Exact("1.2.3".to_string())
         );
-        // A pathological u64::MAX segment must not overflow: it stays an exact pin.
-        assert_eq!(
+        // A pathological u64::MAX segment must not overflow or become a bogus
+        // exact version; it remains an unresolved npm X-range.
+        assert!(matches!(
             npm_manifest_intent("18446744073709551615"),
-            VersionIntent::Exact("18446744073709551615".to_string())
-        );
+            VersionIntent::Constraint { parsed: None, .. }
+        ));
     }
 
     #[test]

@@ -13,7 +13,9 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 
-use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbFormat, ThreatDbWriter, ThreatSource};
+use tirith_core::threatdb::{
+    canonical_package_name, Confidence, Ecosystem, ThreatDbFormat, ThreatDbWriter, ThreatSource,
+};
 use tirith_core::threatdb_feeds::{
     parse_curated_file_hashes, parse_digitalside_csv, parse_domain_blocklist,
     parse_exfil_endpoint_list, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
@@ -201,20 +203,7 @@ struct KevCatalog {
 
 /// Normalize package name per ecosystem conventions.
 fn normalize_name(eco: Ecosystem, name: &str) -> String {
-    match eco {
-        Ecosystem::PyPI => {
-            // PEP 503: lowercase, normalize - and _ to -
-            name.to_lowercase().replace(['_', '.'], "-")
-        }
-        Ecosystem::Npm => {
-            // npm is case-sensitive, keep as-is
-            name.to_string()
-        }
-        _ => {
-            // Default: lowercase
-            name.to_lowercase()
-        }
-    }
+    canonical_package_name(eco, name)
 }
 
 /// OSV JSON schema (subset used for malicious-packages).
@@ -1573,6 +1562,10 @@ mod tests {
         assert_eq!(normalize_name(Ecosystem::PyPI, "My_Package"), "my-package");
         assert_eq!(normalize_name(Ecosystem::PyPI, "my.package"), "my-package");
         assert_eq!(normalize_name(Ecosystem::PyPI, "MY-PACKAGE"), "my-package");
+        assert_eq!(
+            normalize_name(Ecosystem::PyPI, "FrIeNdLy-._.-BaRd"),
+            "friendly-bard"
+        );
     }
 
     #[test]
@@ -1582,8 +1575,23 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_crates_lowercase() {
-        assert_eq!(normalize_name(Ecosystem::Crates, "Serde"), "serde");
+    fn test_normalize_crates_registry_identity() {
+        assert_eq!(
+            normalize_name(Ecosystem::Crates, "Serde_JSON"),
+            "serde-json"
+        );
+        assert_eq!(
+            normalize_name(Ecosystem::Crates, "serde-json"),
+            "serde-json"
+        );
+    }
+
+    #[test]
+    fn test_normalize_nuget_case_insensitive() {
+        assert_eq!(
+            normalize_name(Ecosystem::NuGet, "Newtonsoft.JSON"),
+            "newtonsoft.json"
+        );
     }
 
     #[test]

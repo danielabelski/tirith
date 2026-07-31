@@ -20,11 +20,15 @@ pub struct PackageRef {
 /// Split a `name<sep>version` string (e.g. `serde@1.0`) into a name and an
 /// explicit [`VersionIntent`]. The version part is interpreted as an explicit
 /// single token (exact pin if plain, unresolved constraint otherwise).
-fn split_name_version(s: &str, sep: char) -> (&str, VersionIntent) {
+fn split_name_version(
+    s: &str,
+    sep: char,
+    parse: fn(&str) -> VersionIntent,
+) -> (&str, VersionIntent) {
     if let Some(pos) = s.find(sep) {
         let name = &s[..pos];
         let ver = &s[pos + 1..];
-        (name, VersionIntent::from_explicit_version(ver))
+        (name, parse(ver))
     } else {
         (s, VersionIntent::Unspecified)
     }
@@ -43,9 +47,9 @@ fn split_name_version_cargo(s: &str, sep: char) -> (&str, VersionIntent) {
 
 /// Build a [`VersionIntent`] from an optional explicit version token; `None`
 /// (and empty) becomes [`Unspecified`](VersionIntent::Unspecified).
-fn intent_from_opt_token(token: Option<&str>) -> VersionIntent {
+fn maven_intent_from_opt_token(token: Option<&str>) -> VersionIntent {
     match token {
-        Some(v) => VersionIntent::from_explicit_version(v),
+        Some(v) => VersionIntent::from_maven_version(v),
         None => VersionIntent::Unspecified,
     }
 }
@@ -235,12 +239,10 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
     }
 }
 
-/// Normalize a PyPI package name: lowercase, replace `_` and `.` with `-`.
+/// Normalize a PyPI package name with the same registry identity used by all
+/// ThreatDb indices (PEP 503 separator-run folding included).
 fn normalize_pypi_name(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| if c == '_' || c == '.' { '-' } else { c })
-        .collect()
+    threatdb::canonical_package_name(Ecosystem::PyPI, name)
 }
 
 /// Flags for npm/yarn/pnpm that consume the next argument.
@@ -641,7 +643,7 @@ fn extract_gem_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                             if last.ecosystem == Ecosystem::RubyGems
                                 && matches!(last.version, VersionIntent::Unspecified)
                             {
-                                last.version = VersionIntent::from_explicit_version(ver);
+                                last.version = VersionIntent::from_gem_version(ver);
                             }
                         }
                     }
@@ -654,7 +656,7 @@ fn extract_gem_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         }
 
         // `gem install rails:7.0` form (also accepts bare name).
-        let (name, version) = split_name_version(arg, ':');
+        let (name, version) = split_name_version(arg, ':', VersionIntent::from_gem_version);
 
         if !name.is_empty() {
             packages.push(PackageRef {
@@ -683,7 +685,7 @@ fn extract_go_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         }
 
         // `go get github.com/user/pkg@v1.2.3` form.
-        let (name, version) = split_name_version(arg, '@');
+        let (name, version) = split_name_version(arg, '@', VersionIntent::from_go_version);
 
         if !name.is_empty() {
             packages.push(PackageRef {
@@ -711,7 +713,7 @@ fn extract_composer_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         }
 
         // `composer require vendor/package:^1.0` form.
-        let (name, version) = split_name_version(arg, ':');
+        let (name, version) = split_name_version(arg, ':', VersionIntent::from_composer_version);
 
         if !name.is_empty() {
             packages.push(PackageRef {
@@ -752,7 +754,7 @@ fn extract_dotnet_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                         if last.ecosystem == Ecosystem::NuGet
                             && matches!(last.version, VersionIntent::Unspecified)
                         {
-                            last.version = VersionIntent::from_explicit_version(ver);
+                            last.version = VersionIntent::from_nuget_version(ver);
                         }
                     }
                 }
@@ -783,7 +785,7 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             let parts: Vec<&str> = coord.splitn(4, ':').collect();
             if parts.len() >= 2 {
                 let name = format!("{}:{}", parts[0], parts[1]);
-                let version = intent_from_opt_token(parts.get(2).copied());
+                let version = maven_intent_from_opt_token(parts.get(2).copied());
                 packages.push(PackageRef {
                     ecosystem: Ecosystem::Maven,
                     name,
@@ -804,7 +806,7 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         if parts.len() >= 3 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[2].is_empty()
         {
             let name = format!("{}:{}", parts[0], parts[1]);
-            let version = intent_from_opt_token(parts.get(2).copied());
+            let version = maven_intent_from_opt_token(parts.get(2).copied());
             packages.push(PackageRef {
                 ecosystem: Ecosystem::Maven,
                 name,
@@ -1216,7 +1218,10 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::threatdb::{Confidence, ThreatDbWriter, ThreatSource};
     use crate::tokenize;
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
 
     fn tokenize_and_extract(input: &str) -> Vec<PackageRef> {
         tokenize_and_extract_for_shell(input, ShellType::Posix)
@@ -1241,7 +1246,7 @@ mod tests {
         let pkgs = tokenize_and_extract("pip install requests==2.31.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
-        assert_eq!(pkgs[0].version, VersionIntent::Exact("2.31.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("2.31".to_string()));
     }
 
     #[test]
@@ -1289,7 +1294,7 @@ mod tests {
         let pkgs = tokenize_and_extract("pip install requests[security]==2.31.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
-        assert_eq!(pkgs[0].version, VersionIntent::Exact("2.31.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("2.31".to_string()));
     }
 
     #[test]
@@ -1649,7 +1654,7 @@ mod tests {
         let pkgs = tokenize_and_extract("gem install rails --version 7.0.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "rails");
-        assert_eq!(pkgs[0].version, VersionIntent::Exact("7.0.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("7".to_string()));
     }
 
     #[test]
@@ -1657,7 +1662,7 @@ mod tests {
         let pkgs = tokenize_and_extract("gem install rails:7.0.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "rails");
-        assert_eq!(pkgs[0].version, VersionIntent::Exact("7.0.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("7".to_string()));
     }
 
     #[test]
@@ -1882,6 +1887,85 @@ mod tests {
     fn check_returns_empty_without_db() {
         let findings = check("pip install malicious-pkg", ShellType::Posix, &[], None);
         assert!(findings.is_empty(), "check() must be fail-open without DB");
+    }
+
+    #[test]
+    fn command_to_threatdb_uses_registry_package_and_version_identity() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 88);
+        for (eco, name, version) in [
+            (Ecosystem::PyPI, "malware-pkg", "1.0rc1"),
+            (Ecosystem::NuGet, "Newtonsoft.JSON", "13.0.3"),
+            (Ecosystem::Crates, "partial_sort", "0.1.0"),
+        ] {
+            writer.add_package(
+                eco,
+                name,
+                &[version],
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+        }
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        for command in [
+            "pip install Malware__Pkg==v1.0RC01",
+            "dotnet add package newtonsoft.json --version 13.0.3",
+            "cargo install Partial-Sort --version =0.1.0",
+        ] {
+            let findings = check(command, ShellType::Posix, &[], Some(&db));
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::ThreatMaliciousPackage
+                        && finding.severity == Severity::Critical
+                }),
+                "{command}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn digit_leading_resolver_selectors_emit_unresolved_warning() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 89);
+        for (eco, name) in [
+            (Ecosystem::Npm, "evil-npm"),
+            (Ecosystem::Go, "example.com/evil-go"),
+        ] {
+            writer.add_package(
+                eco,
+                name,
+                &[if eco == Ecosystem::Go {
+                    "v1.2.3"
+                } else {
+                    "1.2.3"
+                }],
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+        }
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        for command in [
+            "npm install evil-npm@1stable",
+            "go install example.com/evil-go@123abc",
+        ] {
+            let findings = check(command, ShellType::Posix, &[], Some(&db));
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::ThreatUnresolvedMaliciousPackage
+                        && finding.severity == Severity::Medium
+                }),
+                "{command}: {findings:?}"
+            );
+            assert!(!findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage));
+        }
     }
 
     #[test]
