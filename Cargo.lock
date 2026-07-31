@@ -3445,6 +3445,7 @@ dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -6,12 +6,15 @@
 //! 3. Inspect tokens (decode payload without signature verification)
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
+
+#[cfg(windows)]
+mod secure_file_windows;
 
 const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -26,7 +29,8 @@ struct Cli {
 enum Commands {
     /// Generate a new Ed25519 keypair.
     ///
-    /// Writes the 32-byte private seed to a file (mode 0600).
+    /// Writes the 32-byte private seed to a private file (mode 0600 or a
+    /// protected user-only ACL).
     /// Prints the public key as a Rust byte-array literal for KEYRING.
     Keygen {
         /// Output file for the private key seed (32 bytes, hex-encoded).
@@ -118,7 +122,7 @@ fn main() {
     }
 }
 
-fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
+fn cmd_keygen(output: &Path, kid: &str) -> Result<(), String> {
     use rand_core::OsRng;
 
     let sk = SigningKey::generate(&mut OsRng);
@@ -127,7 +131,9 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
 
     let hex_seed: String = bytes_to_hex(&seed);
 
-    // Unix: mode 0600; fall back to default permissions on other platforms.
+    // The private key is a signing trust root. Every supported platform must
+    // establish restrictive access at creation time; there is no permissive
+    // fallback and no post-creation window with inherited access.
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -149,27 +155,20 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
             })?;
         f.write_all(hex_seed.as_bytes())
             .map_err(|e| format!("write failed: {e}"))?;
+        f.sync_all().map_err(|e| format!("sync failed: {e}"))?;
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(output)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    format!(
-                        "{} already exists — refusing to overwrite private key",
-                        output.display()
-                    )
-                } else {
-                    format!("cannot create {}: {e}", output.display())
-                }
-            })?;
-        f.write_all(hex_seed.as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
+        secure_file_windows::write_private_file(output, hex_seed.as_bytes())?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        return Err(format!(
+            "secure private-key creation is not implemented on this platform; refusing to create {}",
+            output.display()
+        ));
     }
 
     eprintln!("Private key seed written to: {}", output.display());
@@ -200,7 +199,7 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_sign(
-    key_path: &PathBuf,
+    key_path: &Path,
     kid: &str,
     tier: &str,
     expires: &str,
