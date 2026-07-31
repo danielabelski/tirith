@@ -5,11 +5,122 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+fn fresh_command_environment() -> PathBuf {
+    static SUITE_ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static NEXT_COMMAND: AtomicU64 = AtomicU64::new(0);
+
+    let suite = SUITE_ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("tirith-cli-integration-")
+            .tempdir()
+            .expect("create hermetic CLI integration root")
+    });
+    let id = NEXT_COMMAND.fetch_add(1, Ordering::Relaxed);
+    let root = suite.path().join(format!("command-{id}"));
+    for relative in [
+        "config",
+        "data",
+        "state",
+        "cache",
+        "runtime",
+        "appdata",
+        "localappdata",
+    ] {
+        fs::create_dir_all(root.join(relative)).expect("create hermetic command directory");
+    }
+    root
+}
 
 fn tirith() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
-    cmd.env_remove("TIRITH");
+    let root = fresh_command_environment();
+    cmd.env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_RUNTIME_DIR", root.join("runtime"))
+        .env("APPDATA", root.join("appdata"))
+        .env("LOCALAPPDATA", root.join("localappdata"))
+        .env("TIRITH_LOG", "0");
+    for key in [
+        "TIRITH",
+        "TIRITH_API_KEY",
+        "TIRITH_SERVER_URL",
+        "TIRITH_LICENSE",
+        "TIRITH_POLICY_ROOT",
+        "TIRITH_THREATDB_PATH",
+        "TIRITH_THREATDB_SUPPLEMENTAL_PATH",
+        "TIRITH_AUDIT_DEBUG",
+        "TIRITH_DEFER",
+        "TIRITH_INTERACTIVE",
+        "TIRITH_OFFLINE",
+        "TIRITH_ALLOW_HTTP",
+        "TIRITH_ALLOW_PRIVATE_FETCH",
+        "TIRITH_CANARY_TOKEN",
+        "TIRITH_SESSION_ID",
+        "TIRITH_INTEGRATION",
+        "TIRITH_INTEGRATION_VERSION",
+    ] {
+        cmd.env_remove(key);
+    }
     cmd
+}
+
+#[test]
+fn base_command_isolates_user_state_and_credentials_per_invocation() {
+    fn env_value(command: &Command, key: &str) -> Option<Option<std::ffi::OsString>> {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+    }
+
+    let first = tirith();
+    let second = tirith();
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ] {
+        assert!(
+            matches!(env_value(&first, key), Some(Some(_))),
+            "base command must override {key} with a test-owned path"
+        );
+        assert_ne!(
+            env_value(&first, key),
+            env_value(&second, key),
+            "each command must receive independent {key} state"
+        );
+    }
+    for key in [
+        "TIRITH_API_KEY",
+        "TIRITH_SERVER_URL",
+        "TIRITH_LICENSE",
+        "TIRITH_POLICY_ROOT",
+        "TIRITH_THREATDB_PATH",
+        "TIRITH_THREATDB_SUPPLEMENTAL_PATH",
+    ] {
+        assert_eq!(
+            env_value(&first, key),
+            Some(None),
+            "base command must explicitly remove ambient {key}"
+        );
+    }
+    assert_eq!(
+        env_value(&first, "TIRITH_LOG"),
+        Some(Some(std::ffi::OsString::from("0"))),
+        "base command must disable persistent audit writes by default"
+    );
 }
 
 /// Scrub the ambient policy / threat-DB / TTY-override env vars that the test runner may
@@ -22,12 +133,10 @@ fn scrub_ambient_env(c: &mut Command) -> &mut Command {
         .env_remove("TIRITH_INTERACTIVE")
         .env_remove("TIRITH_THREATDB_PATH")
         .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
-        // TIRITH_LOG governs whether the audit log is written at all. An ambient
-        // `TIRITH_LOG=0` on the CI runner would silently stop the audit-verify
-        // seeding from producing a `log.jsonl`, making those tests environment-
-        // dependent. Scrub it here; tests that REQUIRE logging set TIRITH_LOG=1
-        // explicitly.
-        .env_remove("TIRITH_LOG")
+        // Persistent audit writes are disabled by default so ordinary tests can
+        // never mutate the developer's state. Tests that require a log opt in
+        // with TIRITH_LOG=1 and an explicit test-owned data directory.
+        .env("TIRITH_LOG", "0")
         // TIRITH_DEFER opts a non-critical `check` block into exit 4 (deferred,
         // pending review) instead of exit 1, and writes pending state. An ambient
         // `TIRITH_DEFER=1` would flip the exit code and persisted state of tests
