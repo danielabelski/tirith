@@ -23,6 +23,13 @@ const CARD_READ_CAP: u64 = 64 * 1024;
 /// [`read_regular_capped`] to bound the read and refuse FIFO/device paths.
 const SECRET_KEY_READ_CAP: u64 = 4096;
 
+/// One-line terminal-safe rendering for every card-derived or path-derived
+/// value in the human CLI. Structured JSON deliberately retains the raw value
+/// and relies on serde's JSON escaping instead.
+fn human_display_field(value: &str) -> String {
+    super::sanitize_for_human_output(value, false)
+}
+
 /// Render an [`OpenRegularError`] as a human message prefixed with `what` (e.g.
 /// `"read card.json"`), keeping the FIFO/device and oversized cases legible.
 fn describe_open_error(what: &str, path: &str, cap: u64, e: &OpenRegularError) -> String {
@@ -210,10 +217,10 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
             return 2;
         }
     } else {
-        println!(
-            "Signed {card_path} (key_id {}, algo {}).",
-            sig.key_id, sig.algo
-        );
+        let card_path = human_display_field(card_path);
+        let key_id = human_display_field(&sig.key_id);
+        let algo = human_display_field(&sig.algo.to_string());
+        println!("Signed {card_path} (key_id {}, algo {}).", key_id, algo);
     }
     0
 }
@@ -289,20 +296,25 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
         ) {
             return 2;
         }
-    } else if verified {
-        println!("VERIFIED: card is signed by a trusted key and has not expired.");
-        println!("  command: {}", card.command);
-        println!("  expires: {}", card.expires);
     } else {
-        println!(
-            "NOT VERIFIED: {}",
-            reason.unwrap_or_else(|| "unknown reason".to_string())
-        );
-        println!("  command: {}", card.command);
-        println!(
-            "  trusted-keys dir: {} (drop the signer's <key_id>.pub here to trust it)",
-            trusted_dir.display()
-        );
+        // Cards are untrusted even when verification succeeds: the signer may
+        // intentionally attest to a command containing terminal-control or
+        // deceptive Unicode. Never render card fields before sanitizing them.
+        let display_command = human_display_field(&card.command);
+        let display_expiry = human_display_field(&card.expires);
+        if verified {
+            println!("VERIFIED: card is signed by a trusted key and has not expired.");
+            println!("  command: {display_command}");
+            println!("  expires: {display_expiry}");
+        } else {
+            let display_reason = human_display_field(reason.as_deref().unwrap_or("unknown reason"));
+            let display_trusted_dir = human_display_field(&trusted_dir.display().to_string());
+            println!("NOT VERIFIED: {display_reason}");
+            println!("  command: {display_command}");
+            println!(
+                "  trusted-keys dir: {display_trusted_dir} (drop the signer's <key_id>.pub here to trust it)"
+            );
+        }
     }
 
     if verified {
@@ -452,16 +464,15 @@ pub fn fetch(url: &str, json: bool) -> i32 {
             return 2;
         }
     } else {
-        println!("{}", dest.display());
+        let display_dest = human_display_field(&dest.display().to_string());
+        let display_url = human_display_field(&dl.final_url);
+        println!("{display_dest}");
         eprintln!(
             "Cached card from {} (sha256 {}).",
-            dl.final_url,
+            display_url,
             tirith_core::receipt::short_hash(&sha)
         );
-        eprintln!(
-            "Use it: tirith check --card {} -- \"<command>\"",
-            dest.display()
-        );
+        eprintln!("Use it: tirith check --card {display_dest} -- \"<command>\"");
     }
     0
 }
@@ -567,14 +578,25 @@ fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
         let v = serde_json::json!({ "error": msg });
         super::write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"))
     } else {
-        eprintln!("{ctx}: {msg}");
+        eprintln!("{}: {}", human_display_field(ctx), human_display_field(msg));
         true
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{emit_error, write_card_atomic};
+    use super::{emit_error, human_display_field, write_card_atomic};
+
+    #[test]
+    fn card_human_fields_strip_terminal_and_line_injection() {
+        let hostile = "echo safe\x1b]52;c;YXR0YWNr\x07\x1b[2J\u{202e}\nFORGED";
+        let rendered = human_display_field(hostile);
+        assert_eq!(rendered, "echo safeFORGED");
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\n'));
+    }
 
     /// `emit_error` must propagate the JSON-write status so a `--json` caller can
     /// return a distinct write-failure exit (2). Human mode is best-effort and

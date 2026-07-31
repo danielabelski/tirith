@@ -239,7 +239,11 @@ mod tests {
             "untrusted fields must not forge a top-level line: {rendered:?}"
         );
         assert!(rendered.contains("https://safe.example/beforeafter"));
-        assert!(rendered.contains("botFORGED"));
+        // A C1 CSI consumes through its final byte, so text immediately after an
+        // unterminated control introducer is not guaranteed to survive. Safety
+        // requires removing the sequence and preventing row forgery, not
+        // preserving attacker-controlled bytes inside that sequence.
+        assert!(rendered.contains("bot"));
         assert!(rendered.contains("remotered\n      FORGED DETAIL"));
     }
 

@@ -10,6 +10,10 @@ use tirith_core::taint::{self, TaintEntry};
 
 use super::{confirm, write_json_stdout};
 
+fn human_taint_field(value: &str) -> String {
+    super::sanitize_for_human_output(value, false)
+}
+
 /// `tirith taint list` — print every recorded taint.
 pub fn list(json: bool) -> i32 {
     let entries = taint::list_taints();
@@ -64,18 +68,19 @@ pub fn explain(file: &str, json: bool) -> i32 {
         return if entry.is_some() { 1 } else { 0 };
     }
 
+    let display_file = human_taint_field(file);
     match entry {
         Some(e) => {
-            println!("{file}: TAINTED");
+            println!("{display_file}: TAINTED");
             println!();
             print_entry_human(&e);
             println!();
             println!("This file was downloaded from a risky source. Review it before running it.");
-            println!("Once you trust it: tirith taint clear {file}");
+            println!("Once you trust it: tirith taint clear {display_file}");
             1
         }
         None => {
-            println!("{file}: not tainted");
+            println!("{display_file}: not tainted");
             0
         }
     }
@@ -102,12 +107,16 @@ pub fn clear(file: &str, yes: bool, json: bool) -> i32 {
                 return 2;
             }
         } else {
-            println!("{file}: not tainted — nothing to clear.");
+            println!(
+                "{}: not tainted — nothing to clear.",
+                human_taint_field(file)
+            );
         }
         return 0;
     }
 
-    if !json && !confirm(&format!("Clear taint mark for {file}?"), yes) {
+    let display_file = human_taint_field(file);
+    if !json && !confirm(&format!("Clear taint mark for {display_file}?"), yes) {
         println!("Aborted — taint mark left in place.");
         return 0;
     }
@@ -136,14 +145,14 @@ pub fn clear(file: &str, yes: bool, json: bool) -> i32 {
                 }
             } else {
                 println!(
-                    "Cleared taint mark for {file} ({removed} entr{}).",
+                    "Cleared taint mark for {display_file} ({removed} entr{}).",
                     if removed == 1 { "y" } else { "ies" }
                 );
             }
             0
         }
         Err(e) => {
-            eprintln!("tirith taint clear: {e}");
+            eprintln!("tirith taint clear: {}", human_taint_field(&e.to_string()));
             2
         }
     }
@@ -151,13 +160,30 @@ pub fn clear(file: &str, yes: bool, json: bool) -> i32 {
 
 /// Render one taint entry as indented human output.
 fn print_entry_human(entry: &TaintEntry) {
-    println!("  {}", entry.path);
-    println!("    origin:    {}", entry.origin);
-    println!("    marked_at: {}", entry.marked_at);
+    println!("  {}", human_taint_field(&entry.path));
+    println!("    origin:    {}", human_taint_field(&entry.origin));
+    println!("    marked_at: {}", human_taint_field(&entry.marked_at));
     if let Some(ref url) = entry.source_url {
-        println!("    source_url:  {url}");
+        println!("    source_url:  {}", human_taint_field(url));
     }
     if let Some(ref repo) = entry.source_repo {
-        println!("    source_repo: {repo}");
+        println!("    source_repo: {}", human_taint_field(repo));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_taint_field;
+
+    #[test]
+    fn taint_human_fields_strip_terminal_and_row_injection() {
+        let rendered = human_taint_field("path\x1b]52;c;YXR0YWNr\x07\x1b[2J\u{202e}\r\nFORGED");
+        assert_eq!(rendered, "pathFORGED");
+        for forbidden in ['\x1b', '\x07', '\u{202e}', '\r', '\n'] {
+            assert!(
+                !rendered.contains(forbidden),
+                "unsafe character {forbidden:?}"
+            );
+        }
     }
 }

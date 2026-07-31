@@ -22,6 +22,17 @@ use tirith_core::verdict::Severity;
 
 use super::write_json_stdout;
 
+fn human_hook_field(value: &str) -> String {
+    super::sanitize_for_human_output(value, false)
+}
+
+/// A hook body can contain both credentials and active terminal sequences.
+/// Redact secrets first, then sanitize the complete multiline value so every
+/// continuation is re-indented before the presenter adds its body prefix.
+fn redacted_hook_body_for_human(body: &str) -> String {
+    super::sanitize_for_human_output(&redact(body), true)
+}
+
 /// `tirith hooks scan` — inventory + classify. Exit 1 if any High/Critical.
 pub fn scan(json: bool) -> i32 {
     let scan = repo_hooks::scan_for_cwd();
@@ -46,7 +57,7 @@ pub fn scan(json: bool) -> i32 {
 fn print_human_scan(scan: &RepoHookScan) {
     let (hooks_n, automation_n) = scan.category_counts();
     match &scan.repo_root {
-        Some(root) => eprintln!("tirith hooks: scanning {root}"),
+        Some(root) => eprintln!("tirith hooks: scanning {}", human_hook_field(root)),
         None => {
             eprintln!("tirith hooks: no repository / scan root found (no .git boundary).");
             return;
@@ -100,9 +111,9 @@ fn print_category(scan: &RepoHookScan, category: HookCategory, header: &str) {
         eprintln!(
             "  {:<10} {:<22} {:<8} {}",
             e.provider.as_str(),
-            super::sanitize_for_human_output(&e.name, false),
+            human_hook_field(&e.name),
             risk,
-            super::sanitize_for_human_output(&e.source_path.display().to_string(), false),
+            human_hook_field(&e.source_path.display().to_string()),
         );
     }
     eprintln!();
@@ -325,29 +336,29 @@ pub fn explain(name: &str, json: bool) -> i32 {
 }
 
 fn print_human_explain(name: &str, matches: &[RepoHookEntry]) {
+    let display_name = human_hook_field(name);
     if matches.is_empty() {
-        eprintln!("tirith hooks: no hook or automation surface named `{name}` found.");
+        eprintln!("tirith hooks: no hook or automation surface named `{display_name}` found.");
         eprintln!("  (run `tirith hooks scan` to list every surface in this repo.)");
         return;
     }
 
     eprintln!(
-        "tirith hooks explain `{name}`: {} surface(s).\n",
+        "tirith hooks explain `{display_name}`: {} surface(s).\n",
         matches.len()
     );
     for e in matches {
         eprintln!(
             "  {} ({}) — {}",
-            e.name,
+            human_hook_field(&e.name),
             e.provider.as_str(),
-            e.source_path.display(),
+            human_hook_field(&e.source_path.display().to_string()),
         );
         if e.body.trim().is_empty() {
             eprintln!("    body: (empty / not captured)");
         } else {
-            // Redact before display — a hook body may inline a secret.
-            let redacted = redact(&e.body);
-            for line in redacted.lines() {
+            let safe_body = redacted_hook_body_for_human(&e.body);
+            for line in safe_body.lines() {
                 eprintln!("    | {line}");
             }
         }
@@ -356,7 +367,7 @@ fn print_human_explain(name: &str, matches: &[RepoHookEntry]) {
 
     let findings: Vec<&RepoHookFinding> = matches.iter().flat_map(|e| e.findings.iter()).collect();
     if findings.is_empty() {
-        eprintln!("Analysis: no risk rules fired for `{name}`.");
+        eprintln!("Analysis: no risk rules fired for `{display_name}`.");
         return;
     }
     eprintln!("Analysis — {} finding(s):", findings.len());
@@ -372,10 +383,10 @@ fn print_one_finding(f: &RepoHookFinding) {
         "  [{}] {}\n      surface:  {} ({})\n      location: {}\n      detail:   {}\n",
         severity_label(f.severity),
         f.rule_id,
-        super::sanitize_for_human_output(&f.name, false),
+        human_hook_field(&f.name),
         f.provider.as_str(),
-        super::sanitize_for_human_output(&f.location, false),
-        super::sanitize_for_human_output(&f.detail, false),
+        human_hook_field(&f.location),
+        human_hook_field(&f.detail),
     );
 }
 
@@ -474,6 +485,19 @@ mod tests {
 
         let body2 = explain_json_body("nope", &[]);
         assert_eq!(body2["found"], false);
+    }
+
+    #[test]
+    fn human_hook_fields_and_bodies_neutralize_terminal_injection() {
+        let field = human_hook_field("pre\x1b]52;c;YXR0YWNr\x07\u{202e}\ncommit");
+        assert_eq!(field, "precommit");
+
+        let body =
+            redacted_hook_body_for_human("echo safe\x1b[2J\nFORGED\x1b]52;c;YXR0YWNr\x07\u{202e}");
+        assert_eq!(body, "echo safe\n  FORGED");
+        for forbidden in ['\x1b', '\x07', '\u{202e}'] {
+            assert!(!body.contains(forbidden), "unsafe character {forbidden:?}");
+        }
     }
 
     #[test]
