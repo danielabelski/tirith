@@ -51,7 +51,7 @@ fn trusted_lookup_preserves_a_legitimate_absolute_tool() {
 #[test]
 fn supervisor_preserves_short_legitimate_output_and_status() {
     let args = [OsStr::new("-c"), OsStr::new("printf legitimate")];
-    let spec = ChildSpec::new(&args, ChildLimits::new(Duration::from_secs(2), 64, 64));
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 64, 64));
 
     match run(&shell(), &spec) {
         ChildOutcome::Completed {
@@ -70,7 +70,7 @@ fn supervisor_preserves_short_legitimate_output_and_status() {
 #[test]
 fn supervisor_enforces_the_capture_cap_before_retaining_excess() {
     let args = [OsStr::new("-c"), OsStr::new("printf 12345")];
-    let spec = ChildSpec::new(&args, ChildLimits::new(Duration::from_secs(2), 4, 64));
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 4, 64));
 
     assert!(matches!(
         run(&shell(), &spec),
@@ -87,7 +87,7 @@ fn supervisor_deadline_is_not_defeated_by_a_descendant_holding_stdout() {
     let pid_file = temp.path().join("grandchild.pid");
     let body = format!("sleep 30 & printf '%s' $! > '{}'", pid_file.display());
     let args = [OsStr::new("-c"), OsStr::new(&body)];
-    let spec = ChildSpec::new(&args, ChildLimits::new(Duration::from_millis(300), 64, 64));
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_millis(300), 64, 64));
 
     let started = Instant::now();
     let outcome = run(&shell(), &spec);
