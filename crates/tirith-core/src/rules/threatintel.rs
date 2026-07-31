@@ -2057,110 +2057,110 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_v1_claims_enforce_strongest_participating_evidence_in_both_orders() {
+    fn overlapping_claims_enforce_strongest_evidence_in_both_formats_and_orders() {
         let key = SigningKey::from_bytes(&[23u8; 32]);
-        for all_versions_first in [false, true] {
-            let mut writer = ThreatDbWriter::new(1_700_000_000, 95);
-            let add_exact = |writer: &mut ThreatDbWriter| {
-                writer.add_package(
-                    Ecosystem::PyPI,
-                    "enforcement.pkg",
-                    &["1.0"],
-                    ThreatSource::OssfMalicious,
-                    Confidence::Confirmed,
-                    false,
-                    Some("https://osv.dev/vulnerability/MAL-2026-0001"),
-                );
-            };
-            let add_all_versions = |writer: &mut ThreatDbWriter| {
-                writer.add_package(
-                    Ecosystem::PyPI,
-                    "enforcement__pkg",
+        for format in [ThreatDbFormat::V1, ThreatDbFormat::V2] {
+            for all_versions_first in [false, true] {
+                let mut writer = ThreatDbWriter::new(1_700_000_000, 95);
+                let add_exact = |writer: &mut ThreatDbWriter| {
+                    writer.add_package(
+                        Ecosystem::PyPI,
+                        "enforcement.pkg",
+                        &["1.0"],
+                        ThreatSource::OssfMalicious,
+                        Confidence::Confirmed,
+                        false,
+                        Some("https://osv.dev/vulnerability/MAL-2026-0001"),
+                    );
+                };
+                let add_all_versions = |writer: &mut ThreatDbWriter| {
+                    writer.add_package(
+                        Ecosystem::PyPI,
+                        "enforcement__pkg",
+                        &[],
+                        ThreatSource::DatadogMalicious,
+                        Confidence::Medium,
+                        true,
+                        Some("https://example.invalid/all-versions"),
+                    );
+                };
+                if all_versions_first {
+                    add_all_versions(&mut writer);
+                    add_exact(&mut writer);
+                } else {
+                    add_exact(&mut writer);
+                    add_all_versions(&mut writer);
+                }
+                let db = ThreatDb::from_bytes(
+                    writer.build_format(format, &key).expect("build threat DB"),
+                    0,
+                )
+                .expect("load threat DB");
+
+                let exact_findings = check(
+                    "pip install enforcement-pkg==1.0",
+                    ShellType::Posix,
                     &[],
-                    ThreatSource::DatadogMalicious,
-                    Confidence::Medium,
-                    true,
-                    Some("https://example.invalid/all-versions"),
+                    Some(&db),
                 );
-            };
-            if all_versions_first {
-                add_all_versions(&mut writer);
-                add_exact(&mut writer);
-            } else {
-                add_exact(&mut writer);
-                add_all_versions(&mut writer);
+                let exact = exact_findings
+                    .iter()
+                    .find(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage)
+                    .expect("overlapping exact claim must produce a finding");
+                assert_eq!(exact.severity, Severity::Critical);
+                assert!(exact.description.contains("Specific version(s) affected."));
+                let Evidence::ThreatIntel {
+                    source,
+                    confidence,
+                    reference,
+                    ..
+                } = &exact.evidence[0]
+                else {
+                    panic!("expected threat-intel evidence");
+                };
+                assert_eq!(source, ThreatSource::OssfMalicious.label());
+                assert_eq!(*confidence, Confidence::Confirmed);
+                assert_eq!(
+                    reference.as_deref(),
+                    Some("https://osv.dev/vulnerability/MAL-2026-0001")
+                );
+                assert_eq!(
+                    crate::verdict::action_from_findings(&exact_findings),
+                    crate::verdict::Action::Block
+                );
+
+                let unrelated_findings = check(
+                    "pip install enforcement-pkg==99.0",
+                    ShellType::Posix,
+                    &[],
+                    Some(&db),
+                );
+                let unrelated = unrelated_findings
+                    .iter()
+                    .find(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage)
+                    .expect("all-version claim must cover an unrelated version");
+                assert_eq!(unrelated.severity, Severity::Medium);
+                assert!(unrelated.description.contains("All versions are affected."));
+                let Evidence::ThreatIntel {
+                    source,
+                    confidence,
+                    reference,
+                    ..
+                } = &unrelated.evidence[0]
+                else {
+                    panic!("expected threat-intel evidence");
+                };
+                assert_eq!(source, ThreatSource::DatadogMalicious.label());
+                assert_eq!(*confidence, Confidence::Medium);
+                assert_eq!(
+                    reference.as_deref(),
+                    Some("https://example.invalid/all-versions")
+                );
+                assert_eq!(
+                    crate::verdict::action_from_findings(&unrelated_findings),
+                    crate::verdict::Action::Warn
+                );
             }
-            let db = ThreatDb::from_bytes(
-                writer
-                    .build_format(ThreatDbFormat::V1, &key)
-                    .expect("build v1"),
-                0,
-            )
-            .expect("load v1");
-
-            let exact_findings = check(
-                "pip install enforcement-pkg==1.0",
-                ShellType::Posix,
-                &[],
-                Some(&db),
-            );
-            let exact = exact_findings
-                .iter()
-                .find(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage)
-                .expect("overlapping exact claim must produce a finding");
-            assert_eq!(exact.severity, Severity::Critical);
-            assert!(exact.description.contains("Specific version(s) affected."));
-            let Evidence::ThreatIntel {
-                source,
-                confidence,
-                reference,
-                ..
-            } = &exact.evidence[0]
-            else {
-                panic!("expected threat-intel evidence");
-            };
-            assert_eq!(source, ThreatSource::OssfMalicious.label());
-            assert_eq!(*confidence, Confidence::Confirmed);
-            assert_eq!(
-                reference.as_deref(),
-                Some("https://osv.dev/vulnerability/MAL-2026-0001")
-            );
-            assert_eq!(
-                crate::verdict::action_from_findings(&exact_findings),
-                crate::verdict::Action::Block
-            );
-
-            let unrelated_findings = check(
-                "pip install enforcement-pkg==99.0",
-                ShellType::Posix,
-                &[],
-                Some(&db),
-            );
-            let unrelated = unrelated_findings
-                .iter()
-                .find(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage)
-                .expect("all-version claim must cover an unrelated version");
-            assert_eq!(unrelated.severity, Severity::Medium);
-            assert!(unrelated.description.contains("All versions are affected."));
-            let Evidence::ThreatIntel {
-                source,
-                confidence,
-                reference,
-                ..
-            } = &unrelated.evidence[0]
-            else {
-                panic!("expected threat-intel evidence");
-            };
-            assert_eq!(source, ThreatSource::DatadogMalicious.label());
-            assert_eq!(*confidence, Confidence::Medium);
-            assert_eq!(
-                reference.as_deref(),
-                Some("https://example.invalid/all-versions")
-            );
-            assert_eq!(
-                crate::verdict::action_from_findings(&unrelated_findings),
-                crate::verdict::Action::Warn
-            );
         }
     }
 

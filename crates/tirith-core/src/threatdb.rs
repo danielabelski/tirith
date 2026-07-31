@@ -1602,18 +1602,50 @@ impl ThreatDb {
     }
 
     /// Locate every package record that has this registry identity. v2 stores
-    /// canonical keys and therefore uses the hash index directly. v1 records
-    /// must retain their historical spellings for old readers, so a new reader
-    /// performs a bounded linear fallback and canonicalizes each stored key at
-    /// comparison time. There can be more than one v1 spelling of one modern
-    /// identity (`foo.bar`, `foo__bar`), and all must participate in assessment.
+    /// canonical keys and therefore scans only the equal-hash index run. A
+    /// canonical v2 key may intentionally retain multiple evidence claims:
+    /// combining their versions, scope, and metadata into one physical record
+    /// would let an unrelated broad claim overwrite stronger exact evidence.
+    /// v1 records must retain their historical spellings for old readers, so a
+    /// new reader performs a bounded linear fallback and canonicalizes each
+    /// stored key at comparison time. There can be more than one v1 spelling of
+    /// one modern identity (`foo.bar`, `foo__bar`), and every physical claim in
+    /// either format must participate in assessment.
     fn package_record_indices(&self, eco: Ecosystem, canonical_name: &str) -> Vec<u32> {
         if self.format_version >= 2 {
             let target_hash = pkg_key_hash(eco, canonical_name.as_bytes());
-            return self
-                .binary_search_pkg_index(eco, canonical_name, target_hash)
-                .into_iter()
-                .collect();
+            let mut lo = 0;
+            let mut hi = self.pkg_index_count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let Some((_, hash)) = self.pkg_index_entry(mid) else {
+                    return Vec::new();
+                };
+                if hash < target_hash {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            let mut indices = Vec::new();
+            let mut idx = lo;
+            while idx < self.pkg_index_count {
+                let Some((data_off, hash)) = self.pkg_index_entry(idx) else {
+                    break;
+                };
+                if hash != target_hash {
+                    break;
+                }
+                if self
+                    .parse_pkg_record(data_off as usize)
+                    .is_some_and(|record| record.ecosystem == eco && record.name == canonical_name)
+                {
+                    indices.push(idx);
+                }
+                idx += 1;
+            }
+            return indices;
         }
 
         self.legacy_package_index
@@ -1973,6 +2005,7 @@ impl ThreatDb {
         }
     }
 
+    #[cfg(test)]
     fn binary_search_pkg_index(&self, eco: Ecosystem, name: &str, target_hash: u32) -> Option<u32> {
         if self.pkg_index_count == 0 {
             return None;
@@ -3322,44 +3355,44 @@ impl ThreatDbWriter {
         }
 
         // Sort and deduplicate each section.
-        self.packages
-            .sort_by(|a, b| (a.ecosystem as u8, &a.name).cmp(&(b.ecosystem as u8, &b.name)));
         // Canonical spellings can make previously distinct feed records share
         // one registry key (for example PyPI `foo.bar` and `foo__bar`). Merge
-        // them after sorting so affected-version sets are preserved in O(n)
-        // time instead of silently dropping one record or doing an O(n^2)
-        // lookup on every insertion.
+        // only claims whose complete evidence identity and scope agree. A
+        // version-specific Confirmed claim and an all-version Medium claim must
+        // remain separate physical records: OR-ing their scope and selecting
+        // one metadata tuple would necessarily corrupt one of the two results.
+        // Sorting by the full claim identity makes equal claims adjacent, so
+        // their affected versions can still be combined in O(n) time.
         if format == ThreatDbFormat::V2 {
+            self.packages.sort_by(|a, b| {
+                (
+                    a.ecosystem as u8,
+                    &a.name,
+                    a.source as u8,
+                    a.confidence as u8,
+                    a.all_versions_malicious,
+                    a.reference_offset,
+                )
+                    .cmp(&(
+                        b.ecosystem as u8,
+                        &b.name,
+                        b.source as u8,
+                        b.confidence as u8,
+                        b.all_versions_malicious,
+                        b.reference_offset,
+                    ))
+            });
             let mut merged_packages: Vec<WriterPkg> = Vec::with_capacity(self.packages.len());
             for mut package in std::mem::take(&mut self.packages) {
                 if let Some(existing) = merged_packages.last_mut().filter(|existing| {
-                    existing.ecosystem == package.ecosystem && existing.name == package.name
+                    existing.ecosystem == package.ecosystem
+                        && existing.name == package.name
+                        && existing.source == package.source
+                        && existing.confidence == package.confidence
+                        && existing.all_versions_malicious == package.all_versions_malicious
+                        && existing.reference_offset == package.reference_offset
                 }) {
                     existing.versions.append(&mut package.versions);
-                    // If one record is the reason the merged entry covers every
-                    // version, its metadata must describe that broader claim. Do
-                    // not accidentally promote a medium-confidence all-version
-                    // signal to confirmed using an unrelated version-specific
-                    // record for the same canonical package key.
-                    let replace_metadata = match (
-                        existing.all_versions_malicious,
-                        package.all_versions_malicious,
-                    ) {
-                        (false, true) => true,
-                        (true, false) => false,
-                        _ => {
-                            package.confidence > existing.confidence
-                                || (package.confidence == existing.confidence
-                                    && existing.reference_offset == 0xFFFF_FFFF
-                                    && package.reference_offset != 0xFFFF_FFFF)
-                        }
-                    };
-                    if replace_metadata {
-                        existing.source = package.source;
-                        existing.confidence = package.confidence;
-                        existing.reference_offset = package.reference_offset;
-                    }
-                    existing.all_versions_malicious |= package.all_versions_malicious;
                 } else {
                     merged_packages.push(package);
                 }
@@ -3373,6 +3406,8 @@ impl ThreatDbWriter {
             // This is the exact pre-v2 behavior: same-spelling duplicates keep
             // the first record. Do not silently change what a v1-only reader
             // observes under the legacy format stamp.
+            self.packages
+                .sort_by(|a, b| (a.ecosystem as u8, &a.name).cmp(&(b.ecosystem as u8, &b.name)));
             self.packages
                 .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name);
         }
@@ -4414,103 +4449,106 @@ mod tests {
     }
 
     #[test]
-    fn v1_canonical_group_ranks_confidence_before_breadth_in_both_orders() {
+    fn canonical_group_ranks_confidence_before_breadth_in_both_formats_and_orders() {
         let key = SigningKey::from_bytes(&[21u8; 32]);
-        for all_versions_first in [false, true] {
-            let mut writer = ThreatDbWriter::new(1_700_000_000, 47);
-            let add_specific = |writer: &mut ThreatDbWriter| {
-                writer.add_package(
-                    Ecosystem::PyPI,
-                    "scope.pkg",
-                    &["1.0"],
-                    ThreatSource::OssfMalicious,
-                    Confidence::Confirmed,
-                    false,
-                    Some("https://osv.dev/vulnerability/MAL-2026-0001"),
+        for (format, expected_version) in [(ThreatDbFormat::V1, 1), (ThreatDbFormat::V2, 2)] {
+            for all_versions_first in [false, true] {
+                let mut writer = ThreatDbWriter::new(1_700_000_000, 47);
+                let add_specific = |writer: &mut ThreatDbWriter| {
+                    writer.add_package(
+                        Ecosystem::PyPI,
+                        "scope.pkg",
+                        &["1.0"],
+                        ThreatSource::OssfMalicious,
+                        Confidence::Confirmed,
+                        false,
+                        Some("https://osv.dev/vulnerability/MAL-2026-0001"),
+                    );
+                };
+                let add_all = |writer: &mut ThreatDbWriter| {
+                    writer.add_package(
+                        Ecosystem::PyPI,
+                        "scope__pkg",
+                        &[],
+                        ThreatSource::DatadogMalicious,
+                        Confidence::Medium,
+                        true,
+                        Some("https://example.invalid/all"),
+                    );
+                };
+                if all_versions_first {
+                    add_all(&mut writer);
+                    add_specific(&mut writer);
+                } else {
+                    add_specific(&mut writer);
+                    add_all(&mut writer);
+                }
+                let db = ThreatDb::from_bytes(
+                    writer.build_format(format, &key).expect("build threat DB"),
+                    0,
+                )
+                .expect("load threat DB");
+
+                assert_eq!(db.format_version, expected_version);
+                assert_eq!(db.stats().package_count, 2);
+
+                // Both physical records participate for 1.0. The confirmed exact
+                // claim must win over the broader Medium claim without mixing any
+                // of their source/scope/reference metadata.
+                let matched = db
+                    .check_package(Ecosystem::PyPI, "scope-pkg", Some("1.0"))
+                    .expect("overlapping exact canonical match");
+                assert!(!matched.all_versions_malicious);
+                assert_eq!(matched.confidence, Confidence::Confirmed);
+                assert_eq!(matched.source, ThreatSource::OssfMalicious);
+                assert_eq!(
+                    matched.reference_url.as_deref(),
+                    Some("https://osv.dev/vulnerability/MAL-2026-0001")
                 );
-            };
-            let add_all = |writer: &mut ThreatDbWriter| {
-                writer.add_package(
+
+                let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
                     Ecosystem::PyPI,
-                    "scope__pkg",
-                    &[],
-                    ThreatSource::DatadogMalicious,
-                    Confidence::Medium,
-                    true,
-                    Some("https://example.invalid/all"),
+                    "scope-pkg",
+                    &VersionIntent::Exact("1.0".to_string()),
+                ) else {
+                    panic!("expected overlapping exact assessment");
+                };
+                assert!(!summary.all_versions_malicious);
+                assert_eq!(summary.confidence, Confidence::Confirmed);
+                assert_eq!(summary.source_id, ThreatSource::OssfMalicious.as_str());
+                assert_eq!(
+                    summary.reference_url.as_deref(),
+                    Some("https://osv.dev/vulnerability/MAL-2026-0001")
                 );
-            };
-            if all_versions_first {
-                add_all(&mut writer);
-                add_specific(&mut writer);
-            } else {
-                add_specific(&mut writer);
-                add_all(&mut writer);
+
+                // The exact claim does not participate for an unrelated version,
+                // so the all-version evidence remains the correct atomic result.
+                let matched = db
+                    .check_package(Ecosystem::PyPI, "scope-pkg", Some("99.0"))
+                    .expect("all-version canonical match");
+                assert!(matched.all_versions_malicious);
+                assert_eq!(matched.confidence, Confidence::Medium);
+                assert_eq!(matched.source, ThreatSource::DatadogMalicious);
+                assert_eq!(
+                    matched.reference_url.as_deref(),
+                    Some("https://example.invalid/all")
+                );
+
+                let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
+                    Ecosystem::PyPI,
+                    "scope-pkg",
+                    &VersionIntent::Exact("99.0".to_string()),
+                ) else {
+                    panic!("expected unrelated all-version assessment");
+                };
+                assert!(summary.all_versions_malicious);
+                assert_eq!(summary.confidence, Confidence::Medium);
+                assert_eq!(summary.source_id, ThreatSource::DatadogMalicious.as_str());
+                assert_eq!(
+                    summary.reference_url.as_deref(),
+                    Some("https://example.invalid/all")
+                );
             }
-            let db = ThreatDb::from_bytes(
-                writer
-                    .build_format(ThreatDbFormat::V1, &key)
-                    .expect("build v1"),
-                0,
-            )
-            .expect("load v1");
-
-            // Both physical records participate for 1.0. The confirmed exact
-            // claim must win over the broader Medium claim without mixing any
-            // of their source/scope/reference metadata.
-            let matched = db
-                .check_package(Ecosystem::PyPI, "scope-pkg", Some("1.0"))
-                .expect("overlapping exact canonical match");
-            assert!(!matched.all_versions_malicious);
-            assert_eq!(matched.confidence, Confidence::Confirmed);
-            assert_eq!(matched.source, ThreatSource::OssfMalicious);
-            assert_eq!(
-                matched.reference_url.as_deref(),
-                Some("https://osv.dev/vulnerability/MAL-2026-0001")
-            );
-
-            let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
-                Ecosystem::PyPI,
-                "scope-pkg",
-                &VersionIntent::Exact("1.0".to_string()),
-            ) else {
-                panic!("expected overlapping exact assessment");
-            };
-            assert!(!summary.all_versions_malicious);
-            assert_eq!(summary.confidence, Confidence::Confirmed);
-            assert_eq!(summary.source_id, ThreatSource::OssfMalicious.as_str());
-            assert_eq!(
-                summary.reference_url.as_deref(),
-                Some("https://osv.dev/vulnerability/MAL-2026-0001")
-            );
-
-            // The exact claim does not participate for an unrelated version,
-            // so the all-version evidence remains the correct atomic result.
-            let matched = db
-                .check_package(Ecosystem::PyPI, "scope-pkg", Some("99.0"))
-                .expect("all-version canonical match");
-            assert!(matched.all_versions_malicious);
-            assert_eq!(matched.confidence, Confidence::Medium);
-            assert_eq!(matched.source, ThreatSource::DatadogMalicious);
-            assert_eq!(
-                matched.reference_url.as_deref(),
-                Some("https://example.invalid/all")
-            );
-
-            let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
-                Ecosystem::PyPI,
-                "scope-pkg",
-                &VersionIntent::Exact("99.0".to_string()),
-            ) else {
-                panic!("expected unrelated all-version assessment");
-            };
-            assert!(summary.all_versions_malicious);
-            assert_eq!(summary.confidence, Confidence::Medium);
-            assert_eq!(summary.source_id, ThreatSource::DatadogMalicious.as_str());
-            assert_eq!(
-                summary.reference_url.as_deref(),
-                Some("https://example.invalid/all")
-            );
         }
     }
 
