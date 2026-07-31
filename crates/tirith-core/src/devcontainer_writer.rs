@@ -1,5 +1,6 @@
 //! Shared idempotent writer for `.devcontainer/devcontainer.json` (M8 ch5):
-//! adds a tirith `postCreateCommand` + `TIRITH_DEVCONTAINER=1` to `containerEnv`.
+//! adds an independent, structurally exact Tirith `postCreateCommand` plus
+//! `TIRITH_DEVCONTAINER=1` in `containerEnv`.
 //!
 //! JSONC support is best-effort, not complete (no single-quoted strings,
 //! unquoted keys, or Unicode-escape edge cases): we strip line/block comments
@@ -11,8 +12,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-/// Sentinel embedded in `postCreateCommand` so a re-run detects prior wiring.
+/// Human-readable marker retained for CLI output compatibility.
 pub const TIRITH_HOOK_MARKER: &str = "tirith init";
+/// Reserved lifecycle-command key owned by Tirith.
+pub const TIRITH_HOOK_KEY: &str = "tirith-init";
+
+const TIRITH_HOOK_ARGV: [&str; 4] = ["tirith", "init", "--shell", "auto"];
 
 /// Outcome of an inject / setup operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,9 +54,12 @@ pub fn default_devcontainer_json(cwd: &Path) -> PathBuf {
     cwd.join(".devcontainer").join("devcontainer.json")
 }
 
-/// Append the tirith `postCreateCommand` + `TIRITH_DEVCONTAINER=1` to an
-/// existing devcontainer.json, or (with `create_if_missing`) write a minimal
-/// one. Idempotent: a re-run with the marker present is a no-op.
+/// Add the Tirith lifecycle command plus `TIRITH_DEVCONTAINER=1` to an existing
+/// devcontainer.json, or (with `create_if_missing`) write a minimal one.
+///
+/// Existing string and argv lifecycle forms become a multi-command object so
+/// an untrusted setup command cannot prevent Tirith from being launched. A
+/// re-run is a no-op only when the reserved entry contains the exact argv.
 pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome {
     let content_str = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -62,7 +70,9 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
             // Minimal seed kept narrow — operators re-edit image/features/name.
             let value = json!({
                 "name": "tirith-protected devcontainer",
-                "postCreateCommand": format!("{TIRITH_HOOK_MARKER} --shell auto || true"),
+                "postCreateCommand": {
+                    TIRITH_HOOK_KEY: TIRITH_HOOK_ARGV,
+                },
                 "containerEnv": { "TIRITH_DEVCONTAINER": "1" },
             });
             match write_pretty(path, &value) {
@@ -87,7 +97,9 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
         return InjectOutcome::AlreadyInjected(path.to_path_buf());
     }
 
-    upsert_post_create(&mut value);
+    if let Err(message) = upsert_post_create(&mut value) {
+        return InjectOutcome::ParseError(path.to_path_buf(), message.to_string());
+    }
     upsert_container_env_flag(&mut value);
 
     match write_pretty(path, &value) {
@@ -118,15 +130,11 @@ pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
 }
 
 fn has_tirith_marker(value: &Value) -> bool {
-    match value.get("postCreateCommand") {
-        Some(Value::String(s)) => s.contains(TIRITH_HOOK_MARKER),
-        Some(Value::Array(items)) => items.iter().any(|v| {
-            v.as_str()
-                .map(|s| s.contains(TIRITH_HOOK_MARKER))
-                .unwrap_or(false)
-        }),
-        _ => false,
-    }
+    value
+        .get("postCreateCommand")
+        .and_then(Value::as_object)
+        .and_then(|commands| commands.get(TIRITH_HOOK_KEY))
+        == Some(&tirith_hook_value())
 }
 
 fn has_env_flag(value: &Value) -> bool {
@@ -139,42 +147,51 @@ fn has_env_flag(value: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn upsert_post_create(value: &mut Value) {
-    let obj = match value.as_object_mut() {
-        Some(o) => o,
-        None => return,
+fn tirith_hook_value() -> Value {
+    json!(TIRITH_HOOK_ARGV)
+}
+
+fn preserve_managed_key_collision(commands: &mut serde_json::Map<String, Value>) {
+    let Some(existing) = commands.remove(TIRITH_HOOK_KEY) else {
+        return;
     };
-    let existing = obj.remove("postCreateCommand");
-    let tirith_cmd = format!("{TIRITH_HOOK_MARKER} --shell auto || true");
-    match existing {
-        Some(Value::String(s)) => {
-            if s.contains(TIRITH_HOOK_MARKER) {
-                obj.insert("postCreateCommand".to_string(), Value::String(s));
-            } else {
-                // `&&` so the user's command still runs before the tirith hook.
-                let joined = format!("{s} && {tirith_cmd}");
-                obj.insert("postCreateCommand".to_string(), Value::String(joined));
-            }
+    let mut suffix = 0usize;
+    loop {
+        let candidate = if suffix == 0 {
+            format!("{TIRITH_HOOK_KEY}-existing")
+        } else {
+            format!("{TIRITH_HOOK_KEY}-existing-{suffix}")
+        };
+        if !commands.contains_key(&candidate) {
+            commands.insert(candidate, existing);
+            return;
         }
-        Some(Value::Array(mut items)) => {
-            let already = items.iter().any(|v| {
-                v.as_str()
-                    .map(|s| s.contains(TIRITH_HOOK_MARKER))
-                    .unwrap_or(false)
-            });
-            if !already {
-                items.push(Value::String(tirith_cmd));
-            }
-            obj.insert("postCreateCommand".to_string(), Value::Array(items));
-        }
-        Some(other) => {
-            // Unknown shape — preserve it rather than corrupt the file.
-            obj.insert("postCreateCommand".to_string(), other);
-        }
-        None => {
-            obj.insert("postCreateCommand".to_string(), Value::String(tirith_cmd));
-        }
+        suffix = suffix.saturating_add(1);
     }
+}
+
+fn upsert_post_create(value: &mut Value) -> Result<(), &'static str> {
+    let obj = value
+        .as_object_mut()
+        .ok_or("devcontainer.json root must be an object")?;
+    let existing = obj.remove("postCreateCommand");
+    let mut commands = match existing {
+        Some(Value::Object(commands)) => commands,
+        Some(existing @ (Value::String(_) | Value::Array(_))) => {
+            let mut commands = serde_json::Map::new();
+            commands.insert("existing".to_string(), existing);
+            commands
+        }
+        Some(Value::Null) | None => serde_json::Map::new(),
+        Some(_) => return Err("postCreateCommand must be a string, array, or object"),
+    };
+
+    if commands.get(TIRITH_HOOK_KEY) != Some(&tirith_hook_value()) {
+        preserve_managed_key_collision(&mut commands);
+        commands.insert(TIRITH_HOOK_KEY.to_string(), tirith_hook_value());
+    }
+    obj.insert("postCreateCommand".to_string(), Value::Object(commands));
+    Ok(())
 }
 
 fn upsert_container_env_flag(value: &mut Value) {
@@ -356,9 +373,9 @@ mod tests {
         let path = dir.path().join(".devcontainer/devcontainer.json");
         let outcome = inject_tirith_hook(&path, true);
         assert!(matches!(outcome, InjectOutcome::Created(_)));
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("tirith init"));
-        assert!(body.contains("TIRITH_DEVCONTAINER"));
+        let value = read_devcontainer(&path);
+        assert_exact_tirith_lifecycle_entry(&value);
+        assert_eq!(value["containerEnv"]["TIRITH_DEVCONTAINER"], "1");
     }
 
     #[test]
@@ -389,12 +406,9 @@ mod tests {
         .unwrap();
         let outcome = inject_tirith_hook(&path, false);
         assert!(matches!(outcome, InjectOutcome::Updated(_)));
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("npm ci"), "expected user's command preserved");
-        assert!(
-            body.contains("tirith init"),
-            "expected tirith hook appended"
-        );
+        let value = read_devcontainer(&path);
+        assert_eq!(value["postCreateCommand"]["existing"], "npm ci");
+        assert_exact_tirith_lifecycle_entry(&value);
     }
 
     #[test]
@@ -408,8 +422,114 @@ mod tests {
         .unwrap();
         let outcome = inject_tirith_hook(&path, false);
         assert!(matches!(outcome, InjectOutcome::Updated(_)));
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("tirith init"));
+        let value = read_devcontainer(&path);
+        assert_eq!(value["postCreateCommand"]["existing"], json!(["npm", "ci"]));
+        assert_exact_tirith_lifecycle_entry(&value);
+    }
+
+    fn read_devcontainer(path: &Path) -> Value {
+        let body = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&body).unwrap()
+    }
+
+    fn assert_exact_tirith_lifecycle_entry(value: &Value) {
+        let commands = value
+            .get("postCreateCommand")
+            .and_then(Value::as_object)
+            .expect("lifecycle command must be a multi-command object");
+        assert_eq!(
+            commands.get("tirith-init"),
+            Some(&json!(["tirith", "init", "--shell", "auto"])),
+            "the managed entry must be an exact argv invocation"
+        );
+    }
+
+    #[test]
+    fn inject_does_not_trust_a_tirith_substring() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("devcontainer.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "postCreateCommand": "echo 'tirith init --shell auto'",
+                "containerEnv": { "TIRITH_DEVCONTAINER": "1" }
+            }"#,
+        )
+        .unwrap();
+
+        let outcome = inject_tirith_hook(&path, false);
+        assert!(matches!(outcome, InjectOutcome::Updated(_)));
+        let value = read_devcontainer(&path);
+        assert_exact_tirith_lifecycle_entry(&value);
+        assert_eq!(
+            value["postCreateCommand"]["existing"], "echo 'tirith init --shell auto'",
+            "the original command must be preserved without being trusted as the hook"
+        );
+    }
+
+    #[test]
+    fn inject_converts_string_to_independent_lifecycle_commands() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("devcontainer.json");
+        std::fs::write(&path, r#"{ "postCreateCommand": "exit 1" }"#).unwrap();
+
+        assert!(matches!(
+            inject_tirith_hook(&path, false),
+            InjectOutcome::Updated(_)
+        ));
+        let value = read_devcontainer(&path);
+        assert_exact_tirith_lifecycle_entry(&value);
+        assert_eq!(value["postCreateCommand"]["existing"], "exit 1");
+    }
+
+    #[test]
+    fn inject_preserves_argv_array_as_one_independent_command() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("devcontainer.json");
+        std::fs::write(
+            &path,
+            r#"{ "postCreateCommand": ["npm", "ci", "--ignore-scripts"] }"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            inject_tirith_hook(&path, false),
+            InjectOutcome::Updated(_)
+        ));
+        let value = read_devcontainer(&path);
+        assert_exact_tirith_lifecycle_entry(&value);
+        assert_eq!(
+            value["postCreateCommand"]["existing"],
+            json!(["npm", "ci", "--ignore-scripts"])
+        );
+    }
+
+    #[test]
+    fn inject_preserves_existing_multi_command_object() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("devcontainer.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "postCreateCommand": {
+                    "dependencies": ["npm", "ci"],
+                    "notice": "echo ready"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            inject_tirith_hook(&path, false),
+            InjectOutcome::Updated(_)
+        ));
+        let value = read_devcontainer(&path);
+        assert_exact_tirith_lifecycle_entry(&value);
+        assert_eq!(
+            value["postCreateCommand"]["dependencies"],
+            json!(["npm", "ci"])
+        );
+        assert_eq!(value["postCreateCommand"]["notice"], "echo ready");
     }
 
     #[test]

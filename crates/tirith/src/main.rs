@@ -4028,14 +4028,15 @@ operational-context findings (cloud CLI, SSH, IaC, sudo, container).")]
     /// Inject the tirith hook into devcontainer.json (idempotent)
     #[command(after_help = "\
 What it writes:
-  Adds a `postCreateCommand` that runs `tirith init --shell auto || true`
+  Adds a dedicated `postCreateCommand` entry that runs
+  `[\"tirith\", \"init\", \"--shell\", \"auto\"]`
   AND sets `containerEnv.TIRITH_DEVCONTAINER=1` so commands inside the
   container know they are inside a tirith-wired devcontainer.
 
 Idempotency:
-  Re-running with the hook already in place is a no-op. The existing
-  `postCreateCommand` (if any) is preserved — tirith joins its command
-  with `&&` so the user's setup still runs.
+  Re-running with the exact managed hook already in place is a no-op. Existing
+  string, argv, and multi-command lifecycle entries are preserved and Tirith
+  runs as an independent lifecycle command.
 
 JSONC:
   devcontainer.json is JSONC: comments and trailing commas are accepted.
