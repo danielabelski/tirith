@@ -72,7 +72,10 @@ canary rule, because that key is not in your store.
 
 By default a canary is **local-only**: a hit raises the finding and writes to the
 local audit log; nothing leaves the machine. A canary MAY be created with
-`--callback-url <url>`, where `<url>` is an endpoint **you self-host**. On
+`--callback-url <url>`, where `<url>` is a publicly routable HTTPS endpoint
+**you self-host**. Private, loopback, link-local, credential-bearing, and cloud
+metadata destinations are rejected when the canary is created and again just
+before a callback is sent. On
 detection (and only on detection) tirith sends one best-effort POST of
 `{kind, detected_at, context}` — **never the token value** — to that URL. There
 is no tirith-operated endpoint. A callback failure is logged to the audit log

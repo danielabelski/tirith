@@ -214,6 +214,10 @@ struct StreamingLogRedactor<'a> {
     pending_cr: bool,
     dropping_line: bool,
     discard_remainder: bool,
+    /// A line ended immediately after `-----BEGIN`. The shared credential
+    /// grammar accepts a newline as its single whitespace separator, so hold
+    /// that prefix until the next logical line proves or disproves the label.
+    pending_multiline_begin: bool,
     block: Option<SecretBlock>,
     pending_record: StreamRecord,
     line_limit: usize,
@@ -250,6 +254,7 @@ impl<'a> StreamingLogRedactor<'a> {
             pending_cr: false,
             dropping_line: false,
             discard_remainder: false,
+            pending_multiline_begin: false,
             block: None,
             pending_record: StreamRecord::default(),
             line_limit,
@@ -291,9 +296,17 @@ impl<'a> StreamingLogRedactor<'a> {
         if self.pending_cr || !self.line.is_empty() || self.dropping_line {
             self.finish_line(&mut records);
         }
+        if self.pending_multiline_begin {
+            let mut record = std::mem::take(&mut self.pending_record);
+            self.append_safe(&mut record, "-----BEGIN");
+            self.pending_record = record;
+            self.pending_multiline_begin = false;
+        }
         if self.block.take().is_some() {
             self.pending_record
                 .append_marker(INCOMPLETE_REDACTION_MARKER, "redaction_incomplete");
+            records.push(std::mem::take(&mut self.pending_record));
+        } else if !self.pending_record.content.is_empty() {
             records.push(std::mem::take(&mut self.pending_record));
         }
         records
@@ -331,6 +344,29 @@ impl<'a> StreamingLogRedactor<'a> {
         let mut record = std::mem::take(&mut self.pending_record);
         record.escape_count += escape_count;
         let mut cursor = 0usize;
+
+        if self.pending_multiline_begin {
+            self.pending_multiline_begin = false;
+            if let Some(label) = parse_private_key_label(&line) {
+                self.block = Some(SecretBlock {
+                    end_marker: label.end_marker,
+                    redaction_label: label.redaction_label,
+                    // Count two bytes for the line boundary so CRLF cannot
+                    // gain a byte over the secret-block cap.
+                    bytes_seen: "-----BEGIN"
+                        .len()
+                        .saturating_add(2)
+                        .saturating_add(label.end),
+                    oversized: false,
+                });
+                cursor = label.end;
+            } else {
+                // The cross-line candidate was not a private-key header. Put
+                // it back as ordinary text and continue scanning this line so
+                // a later valid BEGIN marker cannot be hidden by the decoy.
+                self.append_safe(&mut record, "-----BEGIN\n");
+            }
+        }
 
         loop {
             if let Some(block) = self.block.as_mut() {
@@ -376,6 +412,25 @@ impl<'a> StreamingLogRedactor<'a> {
                 continue;
             }
 
+            if remaining.ends_with("-----BEGIN") {
+                let safe_end = remaining.len() - "-----BEGIN".len();
+                self.append_safe(&mut record, &remaining[..safe_end]);
+                // Repeated malformed cross-line candidates must not turn the
+                // one-line memory bound into an unbounded pending record. Once
+                // the aggregate proof buffer exceeds the same cap, discard the
+                // remainder and emit only the fail-closed marker.
+                if record.content.len() > self.line_limit {
+                    let mut incomplete = StreamRecord::default();
+                    incomplete.append_marker(INCOMPLETE_REDACTION_MARKER, "redaction_incomplete");
+                    self.pending_multiline_begin = false;
+                    self.discard_remainder = true;
+                    return Some(incomplete);
+                }
+                self.pending_multiline_begin = true;
+                self.pending_record = record;
+                return None;
+            }
+
             self.append_safe(&mut record, remaining);
             return Some(record);
         }
@@ -400,6 +455,34 @@ struct PrivateKeyBegin {
     redaction_label: &'static str,
 }
 
+struct PrivateKeyLabel {
+    end: usize,
+    end_marker: String,
+    redaction_label: &'static str,
+}
+
+fn parse_private_key_label(input: &str) -> Option<PrivateKeyLabel> {
+    let label_end = input.find("-----")?;
+    let label = &input[..label_end];
+    let is_pgp = label == "PGP PRIVATE KEY BLOCK";
+    let is_pem = label.ends_with("PRIVATE KEY")
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == ' ');
+    if !is_pgp && !is_pem {
+        return None;
+    }
+    Some(PrivateKeyLabel {
+        end: label_end + 5,
+        end_marker: format!("-----END {label}-----"),
+        redaction_label: if is_pgp {
+            "pgp_private_key"
+        } else {
+            "private_key"
+        },
+    })
+}
+
 fn find_private_key_begin(input: &str) -> Option<PrivateKeyBegin> {
     let mut search_from = 0usize;
     const PREFIX: &str = "-----BEGIN";
@@ -407,29 +490,17 @@ fn find_private_key_begin(input: &str) -> Option<PrivateKeyBegin> {
         let start = search_from + relative;
         let after_prefix = start + PREFIX.len();
         let first = input[after_prefix..].chars().next()?;
-        if !first.is_ascii_whitespace() || matches!(first, '\r' | '\n') {
+        if !first.is_whitespace() || matches!(first, '\r' | '\n') {
             search_from = after_prefix;
             continue;
         }
         let label_start = after_prefix + first.len_utf8();
-        let end_relative = input[label_start..].find("-----")?;
-        let label_end = label_start + end_relative;
-        let label = &input[label_start..label_end];
-        let is_pgp = label == "PGP PRIVATE KEY BLOCK";
-        let is_pem = label.ends_with("PRIVATE KEY")
-            && label
-                .chars()
-                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == ' ');
-        if is_pgp || is_pem {
+        if let Some(label) = parse_private_key_label(&input[label_start..]) {
             return Some(PrivateKeyBegin {
                 start,
-                end: label_end + 5,
-                end_marker: format!("-----END {label}-----"),
-                redaction_label: if is_pgp {
-                    "pgp_private_key"
-                } else {
-                    "private_key"
-                },
+                end: label_start + label.end,
+                end_marker: label.end_marker,
+                redaction_label: label.redaction_label,
             });
         }
         // A malformed BEGIN may use the dashes from a later valid BEGIN as its
@@ -993,6 +1064,16 @@ mod tests {
                 "PGP-SECRET-BODY",
                 "pgp_private_key",
             ),
+            (
+                "before\n-----BEGIN\nRSA PRIVATE KEY-----\nCROSS-LINE-SECRET\n-----END RSA PRIVATE KEY-----\nafter",
+                "CROSS-LINE-SECRET",
+                "private_key",
+            ),
+            (
+                "before\n-----BEGIN\u{a0}RSA PRIVATE KEY-----\nUNICODE-SPACE-SECRET\n-----END RSA PRIVATE KEY-----\nafter",
+                "UNICODE-SPACE-SECRET",
+                "private_key",
+            ),
         ] {
             let mut redactor = StreamingLogRedactor::new(ShareAudience::Llm, &[], false);
             let mut records = push_bytewise(&mut redactor, input.as_bytes());
@@ -1013,6 +1094,33 @@ mod tests {
                 Some(1)
             );
         }
+    }
+
+    #[test]
+    fn streaming_redactor_restores_incomplete_cross_line_begin_as_benign_text() {
+        let input = b"before -----BEGIN\nnot a private key label\nafter";
+        let mut redactor = StreamingLogRedactor::new(ShareAudience::Llm, &[], false);
+        let mut records = push_bytewise(&mut redactor, input);
+        records.extend(redactor.finish());
+        let output = records
+            .iter()
+            .map(|record| record.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(output, "before -----BEGIN\nnot a private key label\nafter");
+    }
+
+    #[test]
+    fn repeated_cross_line_begin_decoys_stay_memory_bounded() {
+        let input = b"-----BEGIN\nx-----BEGIN\nx-----BEGIN\nSECRET-AFTER-CAP";
+        let mut redactor =
+            StreamingLogRedactor::with_limits(ShareAudience::Llm, &[], false, 16, 128);
+        let mut records = push_bytewise(&mut redactor, input);
+        records.extend(redactor.finish());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, INCOMPLETE_REDACTION_MARKER);
+        assert!(!records[0].content.contains("SECRET-AFTER-CAP"));
+        assert_eq!(records[0].redactions[0].label, "redaction_incomplete");
     }
 
     #[test]

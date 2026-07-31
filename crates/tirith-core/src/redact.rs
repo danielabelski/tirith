@@ -278,9 +278,121 @@ pub fn looks_secret_shaped(s: &str) -> bool {
     false
 }
 
+#[derive(Default)]
+struct PrivateKeyRedactionCounts {
+    pem: usize,
+    pgp: usize,
+}
+
+/// Structurally redact every recognized PEM/PGP private-key block. Regex
+/// backreferences are unavailable, so a single expression cannot require an
+/// END label to equal its BEGIN label. Parse the label once and search for that
+/// exact footer; if it is absent, consume through end-of-input.
+fn redact_private_key_blocks(input: &str) -> (String, PrivateKeyRedactionCounts) {
+    let (spans, counts) = private_key_block_spans(input);
+    if spans.is_empty() {
+        return (input.to_string(), counts);
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut copied_through = 0usize;
+    for span in spans {
+        output.push_str(&input[copied_through..span.start]);
+        output.push_str("[REDACTED]");
+        copied_through = span.end;
+    }
+    output.push_str(&input[copied_through..]);
+    (output, counts)
+}
+
+/// Byte ranges occupied by structurally recognized private-key blocks. This is
+/// crate-visible so consumers that must preserve original line identity can
+/// use the exact same BEGIN/END grammar instead of leaking multiline bodies by
+/// redacting each line independently.
+pub(crate) fn private_key_redaction_spans(input: &str) -> Vec<std::ops::Range<usize>> {
+    private_key_block_spans(input).0
+}
+
+fn private_key_block_spans(
+    input: &str,
+) -> (Vec<std::ops::Range<usize>>, PrivateKeyRedactionCounts) {
+    const BEGIN: &str = "-----BEGIN";
+    let mut spans = Vec::new();
+    let mut counts = PrivateKeyRedactionCounts::default();
+    let mut search_from = 0usize;
+
+    while let Some(relative) = input[search_from..].find(BEGIN) {
+        let start = search_from + relative;
+        let after_begin = start + BEGIN.len();
+        let Some(separator) = input[after_begin..].chars().next() else {
+            break;
+        };
+        if !separator.is_whitespace() {
+            search_from = start + 1;
+            continue;
+        }
+        let label_start = after_begin + separator.len_utf8();
+        let Some(label_end_relative) = input[label_start..].find("-----") else {
+            break;
+        };
+        let label_end = label_start + label_end_relative;
+        let label = &input[label_start..label_end];
+        let is_pgp = label == "PGP PRIVATE KEY BLOCK";
+        let is_pem = label.ends_with("PRIVATE KEY")
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == ' ');
+        if !is_pgp && !is_pem {
+            // Do not let a malformed earlier BEGIN consume or hide a later
+            // valid marker.
+            search_from = start + 1;
+            continue;
+        }
+
+        let header_end = label_end + 5;
+        let block_end =
+            find_matching_private_key_footer(input, header_end, label).unwrap_or(input.len());
+        spans.push(start..block_end);
+        if is_pgp {
+            counts.pgp += 1;
+        } else {
+            counts.pem += 1;
+        }
+        search_from = block_end;
+    }
+
+    (spans, counts)
+}
+
+fn find_matching_private_key_footer(
+    input: &str,
+    from: usize,
+    expected_label: &str,
+) -> Option<usize> {
+    const END: &str = "-----END";
+    let mut search_from = from;
+    while let Some(relative) = input[search_from..].find(END) {
+        let start = search_from + relative;
+        let after_end = start + END.len();
+        let separator = input[after_end..].chars().next()?;
+        if !separator.is_whitespace() {
+            search_from = start + 1;
+            continue;
+        }
+        let label_start = after_end + separator.len_utf8();
+        let label_end_relative = input[label_start..].find("-----")?;
+        let label_end = label_start + label_end_relative;
+        if &input[label_start..label_end] == expected_label {
+            return Some(label_end + 5);
+        }
+        search_from = start + 1;
+    }
+    None
+}
+
 /// Redact sensitive content from a string using built-in and credential patterns.
 pub fn redact(input: &str) -> String {
-    let mut result = input.to_string();
+    let (mut result, _) = redact_private_key_blocks(input);
     // Built-ins first (labeled replacements like `[REDACTED:Foo]`).
     for (label, regex) in BUILTIN_PATTERNS.iter() {
         result = regex
@@ -593,8 +705,9 @@ pub fn try_redact_with_compiled(
     if let Some(error) = &compiled.incomplete {
         return Err(error.clone());
     }
+    let (private_safe, _) = redact_private_key_blocks(input);
     let (custom_redacted, _) =
-        apply_custom_patterns_once(input, &compiled.patterns, CUSTOM_REDACTION_MARKER)?;
+        apply_custom_patterns_once(&private_safe, &compiled.patterns, CUSTOM_REDACTION_MARKER)?;
     Ok(redact(&custom_redacted))
 }
 
@@ -678,14 +791,24 @@ pub fn try_redact_for_audience_with_custom(
             *counts.entry(label.to_string()).or_insert(0) += n;
         };
 
-    // 1. Policy-provided customer IDs are planned over the ORIGINAL input and
-    // rendered once. Later built-in/static replacements can never become input
-    // to an operator regex.
+    // 1. Private keys go first because an operator custom pattern must never be
+    // able to rewrite the BEGIN header and expose the remaining key body.
+    // Customer IDs are then planned once over that structurally safe input;
+    // later built-in/static replacements never become operator-regex input.
+    let (private_safe, private_counts) = redact_private_key_blocks(input);
     let (mut result, customer_id_matches) = apply_custom_patterns_once(
-        input,
+        &private_safe,
         &customer_id_patterns.patterns,
         CUSTOMER_ID_REDACTION_MARKER,
     )?;
+
+    bump("private_key", private_counts.pem, &mut counts, &mut order);
+    bump(
+        "pgp_private_key",
+        private_counts.pgp,
+        &mut counts,
+        &mut order,
+    );
 
     // 2. Credential patterns — ahead of built-ins so a built-in's labeled
     //    output doesn't shadow a credential match.
@@ -900,7 +1023,12 @@ pub fn redact_command_text(input: &str, custom_patterns: &[String]) -> String {
 }
 
 fn redact_command_text_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> String {
-    let scrubbed = redact_shell_assignments(input);
+    // Private-key structure must be removed before assignment scrubbing. An
+    // input such as `KEY=-----BEGIN RSA PRIVATE KEY-----\n...` otherwise has
+    // its BEGIN marker split by the assignment pass, leaving the key body for
+    // the later generic redactor to miss.
+    let (private_safe, _) = redact_private_key_blocks(input);
+    let scrubbed = redact_shell_assignments(&private_safe);
     redact_with_compiled(&scrubbed, compiled)
 }
 
@@ -1138,6 +1266,79 @@ mod tests {
         let redacted = redact(input);
         assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(redacted.contains("[REDACTED:AWS Access Key]"));
+    }
+
+    #[test]
+    fn test_redact_sendgrid_segmented_key() {
+        let key = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+        let redacted = redact(&format!("SENDGRID_API_KEY={key}"));
+        assert!(!redacted.contains(&key));
+        assert!(redacted.contains("SG.[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_private_keys_with_or_without_footer() {
+        let complete = concat!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+            "b3BlbnNzaC1rZXktdjEAAAAA\n",
+            "-----END OPENSSH PRIVATE KEY-----\n",
+            "after"
+        );
+        let complete_redacted = redact(complete);
+        assert!(!complete_redacted.contains("b3BlbnNzaC1rZXktdjEAAAAA"));
+        assert!(complete_redacted.ends_with("\nafter"));
+
+        for truncated in [
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEprivatebody",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGprivatebody",
+        ] {
+            let redacted = redact(truncated);
+            assert_eq!(redacted, "[REDACTED]");
+
+            let report = redact_for_audience(truncated, ShareAudience::PublicPaste);
+            assert_eq!(report.redacted_content, "[REDACTED]");
+            assert_eq!(report.total(), 1);
+        }
+
+        let decoy_footer = concat!(
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "FIRST-SECRET\n",
+            "-----END EC PRIVATE KEY-----\n",
+            "SECOND-SECRET\n",
+            "-----END RSA PRIVATE KEY-----\n",
+            "after"
+        );
+        let redacted = redact(decoy_footer);
+        assert!(!redacted.contains("FIRST-SECRET"));
+        assert!(!redacted.contains("SECOND-SECRET"));
+        assert!(redacted.ends_with("\nafter"));
+    }
+
+    #[test]
+    fn custom_patterns_cannot_hide_private_key_headers() {
+        let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEprivatebody";
+        let patterns = vec!["BEGIN RSA".to_string()];
+        let generic = redact_with_custom(key, &patterns);
+        assert_eq!(generic, "[REDACTED]");
+
+        let audience = redact_for_audience_with_custom(key, ShareAudience::PublicPaste, &patterns);
+        assert_eq!(audience.redacted_content, "[REDACTED]");
+        assert!(audience
+            .redactions
+            .iter()
+            .any(|row| row.label == "private_key" && row.count == 1));
+    }
+
+    #[test]
+    fn command_assignment_scrubbing_cannot_destroy_private_key_header() {
+        let input = "KEY=-----BEGIN RSA PRIVATE KEY-----\nMIIErecoverable-private-body";
+        let redacted = redact_command_text(input, &[]);
+        assert!(!redacted.contains("RSA PRIVATE KEY"), "got: {redacted}");
+        assert!(
+            !redacted.contains("MIIErecoverable-private-body"),
+            "got: {redacted}"
+        );
+        assert!(redacted.contains("[REDACTED]"), "got: {redacted}");
     }
 
     #[test]
@@ -1558,6 +1759,17 @@ mod tests {
         // AWS key must be redacted.
         assert!(!report.redacted_content.contains(aws_key));
         assert!(report.redactions.iter().any(|r| r.count > 0));
+    }
+
+    #[test]
+    fn audience_redaction_strips_sendgrid_key() {
+        let key = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+        let report = redact_for_audience(&key, ShareAudience::Llm);
+        assert!(!report.redacted_content.contains(&key));
+        assert!(report
+            .redactions
+            .iter()
+            .any(|row| row.label == "sendgrid_api_key" && row.count == 1));
     }
 
     #[test]

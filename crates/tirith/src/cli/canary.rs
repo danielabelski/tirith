@@ -45,25 +45,6 @@ pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
         return 2;
     };
 
-    // Reject a non-http(s) callback URL early (reachability is not checked — it's
-    // the user's self-hosted endpoint, contacted only on detection). Trim before
-    // persisting so CLI whitespace never lands in the store.
-    let callback_url = match callback_url {
-        Some(url) => {
-            let trimmed = url.trim();
-            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-                let _ = emit_error(
-                    json,
-                    "tirith canary create",
-                    &format!("--callback-url must be an http(s) URL (got '{url}')"),
-                );
-                return 2;
-            }
-            Some(trimmed.to_string())
-        }
-        None => None,
-    };
-
     match canary::create(kind, callback_url) {
         Ok(entry) => {
             if json {
@@ -81,7 +62,11 @@ pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
             if !emit_error(json, "tirith canary create", &e.to_string()) {
                 return 2;
             }
-            1
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                2
+            } else {
+                1
+            }
         }
     }
 }
@@ -356,7 +341,7 @@ fn print_entry_human(entry: &CanaryEntry, show_token: bool) {
     }
     println!("    created_at: {}", entry.created_at);
     match &entry.callback_url {
-        Some(url) => println!("    callback:   {url} (opt-in, user-self-hosted)"),
+        Some(url) => println!("    callback:   {url} (opt-in, public user-self-hosted HTTPS)"),
         None => println!("    callback:   none (local-only)"),
     }
 }

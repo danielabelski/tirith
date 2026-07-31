@@ -14,8 +14,9 @@
 //!   state-change rules (no PATTERN_TABLE entry; in `EXTERNALLY_TRIGGERED_RULES`).
 //! * `crontab -l` / login-items `osascript` run via [`crate::util::run_trusted_with_timeout`]
 //!   with a 1.5s budget; a non-zero exit ("no crontab") counts as empty, not an error.
-//! * The diff reports ADDED LINES ONLY (never removed/full content), each run
-//!   through [`crate::redact::redact`] so a new key/token never leaks into a finding.
+//! * The diff reports ADDED LINES ONLY (never removed/full content), while
+//!   private-key block state is derived from the complete current document and
+//!   every emitted line is credential-redacted so keys/tokens never leak.
 //! * The on-disk snapshot ([`PersistenceSnapshot`]) is `0600` and stores NO
 //!   cleartext — only `sha256` + `size` + per-line hashes. Added lines are
 //!   recomputed at diff time from the CURRENT file (legitimately in hand then).
@@ -575,19 +576,78 @@ fn describe_change(kind: PersistenceKind, prev_present: bool, now_present: bool)
 /// credential-redacted, order-preserving. Membership is by hash (the snapshot
 /// stores no cleartext) — the secret-at-rest contract.
 fn added_lines_redacted(prev_line_hashes: &[String], new_content: &str) -> Vec<String> {
+    added_lines_redacted_with_work(prev_line_hashes, new_content).0
+}
+
+fn added_lines_redacted_with_work(
+    prev_line_hashes: &[String],
+    new_content: &str,
+) -> (Vec<String>, usize) {
     use std::collections::HashSet;
     let prev: HashSet<&str> = prev_line_hashes.iter().map(String::as_str).collect();
+    // Discover blocks over the complete current document before selecting
+    // added lines. Per-line redaction leaks every body line after a PEM/PGP
+    // header, and selecting first would also lose the state established by an
+    // unchanged header whose body was added later.
+    let private_spans = crate::redact::private_key_redaction_spans(new_content);
     let mut out = Vec::new();
-    for line in new_content.lines() {
+    let mut source_offset = 0usize;
+    let mut next_span = 0usize;
+    let mut span_work = 0usize;
+    for segment in new_content.split_inclusive('\n') {
+        let without_lf = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+        let line_start = source_offset;
+        source_offset = source_offset.saturating_add(segment.len());
+        while next_span < private_spans.len() && private_spans[next_span].end <= line_start {
+            next_span += 1;
+            span_work = span_work.saturating_add(1);
+        }
         if line.trim().is_empty() {
             continue;
         }
         if prev.contains(line_hash(line).as_str()) {
             continue;
         }
-        out.push(crate::redact::redact(line));
+        let (redacted, line_work) =
+            redact_persistence_line(line, line_start, &private_spans[next_span..]);
+        span_work = span_work.saturating_add(line_work);
+        out.push(redacted);
     }
-    out
+    (out, span_work)
+}
+
+fn redact_persistence_line(
+    line: &str,
+    line_start: usize,
+    private_spans: &[std::ops::Range<usize>],
+) -> (String, usize) {
+    let line_end = line_start.saturating_add(line.len());
+    let mut cursor = line_start;
+    let mut redacted = String::with_capacity(line.len());
+    let mut span_work = 0usize;
+
+    for span in private_spans {
+        span_work = span_work.saturating_add(1);
+        if span.start >= line_end {
+            break;
+        }
+        if span.end <= line_start {
+            continue;
+        }
+        let overlap_start = span.start.max(line_start);
+        let overlap_end = span.end.min(line_end);
+        if overlap_start > cursor {
+            redacted.push_str(&line[cursor - line_start..overlap_start - line_start]);
+        }
+        redacted.push_str("[REDACTED]");
+        cursor = cursor.max(overlap_end);
+    }
+    if cursor < line_end {
+        redacted.push_str(&line[cursor - line_start..]);
+    }
+
+    (crate::redact::redact(&redacted), span_work)
 }
 
 /// `true` when `new_content` has an `Include` RAW line whose hash is absent from
@@ -948,6 +1008,69 @@ mod tests {
             added
         );
         assert!(added[0].contains("[REDACTED"));
+    }
+
+    #[test]
+    fn added_lines_redact_complete_and_truncated_private_key_bodies() {
+        for content in [
+            concat!(
+                "prefix\n",
+                "-----BEGIN RSA PRIVATE KEY-----\n",
+                "MIIE-COMPLETE-SECRET\n",
+                "-----END RSA PRIVATE KEY-----\n",
+                "suffix\n"
+            ),
+            concat!(
+                "prefix\n",
+                "-----BEGIN PGP PRIVATE KEY BLOCK-----\n",
+                "LQDG-TRUNCATED-SECRET"
+            ),
+        ] {
+            let added = added_lines_redacted(&[], content);
+            let rendered = added.join("\n");
+            assert!(!rendered.contains("COMPLETE-SECRET"), "got: {rendered}");
+            assert!(!rendered.contains("TRUNCATED-SECRET"), "got: {rendered}");
+            assert!(rendered.contains("[REDACTED]"), "got: {rendered}");
+        }
+    }
+
+    #[test]
+    fn unchanged_private_key_header_still_protects_new_body_lines() {
+        let header = "-----BEGIN RSA PRIVATE KEY-----";
+        let current = concat!(
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "MIIE-NEW-SECRET-BODY\n",
+            "-----END RSA PRIVATE KEY-----\n"
+        );
+        let added = added_lines_redacted(&[line_hash(header)], current);
+        let rendered = added.join("\n");
+        assert!(
+            !rendered.contains("MIIE-NEW-SECRET-BODY"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"), "got: {rendered}");
+    }
+
+    #[test]
+    fn many_private_key_blocks_use_linear_span_work() {
+        const BLOCKS: usize = 2_048;
+        let mut content = String::new();
+        for index in 0..BLOCKS {
+            use std::fmt::Write as _;
+            content.push_str("-----BEGIN RSA PRIVATE KEY-----\n");
+            writeln!(content, "MIIE-SECRET-{index}").unwrap();
+            content.push_str("-----END RSA PRIVATE KEY-----\n");
+        }
+
+        let line_count = content.lines().count();
+        let (added, span_work) = added_lines_redacted_with_work(&[], &content);
+        let rendered = added.join("\n");
+        assert!(!rendered.contains("MIIE-SECRET-"));
+        assert_eq!(added.len(), line_count);
+        assert!(
+            span_work <= line_count.saturating_mul(3).saturating_add(BLOCKS),
+            "span traversal must stay linear: {span_work} checks for {line_count} lines and {BLOCKS} blocks"
+        );
     }
 
     #[test]

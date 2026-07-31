@@ -303,6 +303,9 @@ pub struct HttpRegistryClient {
     npm_base: String,
     pypi_base: String,
     crates_base: String,
+    /// Production requests enforce Tirith's full destination boundary. The
+    /// only false value is the explicit local-mock integration-test factory.
+    enforce_destination_guard: bool,
 }
 
 impl Default for HttpRegistryClient {
@@ -313,6 +316,7 @@ impl Default for HttpRegistryClient {
             npm_base: NPM_BASE.to_string(),
             pypi_base: PYPI_BASE.to_string(),
             crates_base: CRATES_BASE.to_string(),
+            enforce_destination_guard: true,
         }
     }
 }
@@ -339,14 +343,27 @@ impl HttpRegistryClient {
             npm_base: base.to_string(),
             pypi_base: base.to_string(),
             crates_base: base.to_string(),
+            enforce_destination_guard: false,
             ..Self::default()
         }
     }
 
     /// GET `url` and return the body, capped at [`MAX_RESPONSE_BYTES`].
     fn get_json_bytes(&self, url: &str) -> Result<Vec<u8>, FetchError> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(self.timeout)
+        let builder = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(self.timeout);
+        let builder = if self.enforce_destination_guard {
+            crate::url_validate::validate_server_url(url).map_err(FetchError::Network)?;
+            builder
+                .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
+                .redirect(crate::ssrf_guard::server_redirect_policy())
+        } else {
+            // Local mock transport only. Refuse redirects so the explicit test
+            // seam cannot unexpectedly contact a second destination.
+            builder.redirect(reqwest::redirect::Policy::none())
+        };
+        let client = builder
             .build()
             .map_err(|e| FetchError::Network(e.to_string()))?;
 
@@ -1226,6 +1243,26 @@ mod tests {
         // And it surfaces as a graceful Unavailable, not a panic.
         let (sig, _existence) = gather_api_signals(&client, Ecosystem::Npm, "../../../etc/passwd");
         assert!(matches!(sig, ApiSignals::Unavailable { .. }));
+    }
+
+    #[test]
+    fn production_registry_transport_rejects_private_destination() {
+        let client = HttpRegistryClient::without_cache();
+        let error = client
+            .get_json_bytes("https://127.0.0.1/package")
+            .expect_err("production registry transport must reject private destinations");
+        assert!(matches!(error, FetchError::Network(_)));
+        assert!(error.reason().contains("non-public"));
+    }
+
+    #[test]
+    fn local_mock_factory_is_the_only_destination_guard_bypass() {
+        assert!(HttpRegistryClient::new().enforce_destination_guard);
+        assert!(HttpRegistryClient::without_cache().enforce_destination_guard);
+        assert!(
+            !HttpRegistryClient::with_base_url_for_test("http://127.0.0.1:9")
+                .enforce_destination_guard
+        );
     }
 
     #[test]

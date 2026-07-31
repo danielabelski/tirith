@@ -3232,7 +3232,7 @@ mistaken for a real credential (see docs/canary-formats.md).
 
 <kind> is one of: aws-like, github-like, gcp-like, env-line, private-key-shaped.
 
---callback-url is OPT-IN and must be a URL YOU self-host (http/https). On
+--callback-url is OPT-IN and must be a public HTTPS URL YOU self-host. On
 detection, a best-effort POST of {kind, detected_at, context} (NEVER the token
 value) is sent to it; failures are logged and never block. Omit it for the
 local-only default (no network ever).
@@ -3245,7 +3245,7 @@ Examples:
         /// The token kind: aws-like, github-like, gcp-like, env-line, or
         /// private-key-shaped.
         kind: String,
-        /// OPT-IN, user-self-hosted callback URL (http/https). On detection a
+        /// OPT-IN, public user-self-hosted callback URL (HTTPS by default). On detection a
         /// best-effort POST of {kind, detected_at, context} — never the token
         /// value — is sent here. Omit for local-only (the default).
         #[arg(long = "callback-url")]

@@ -481,17 +481,10 @@ pub fn create_at(
     kind: CanaryKind,
     callback_url: Option<String>,
 ) -> std::io::Result<CanaryEntry> {
-    // Normalize the callback URL HERE (single point for every caller): trim and
-    // collapse a blank-after-trim value to `None`, so the store can't claim a
-    // callback that `fire_callback` would trim away and no-op.
-    let callback_url = callback_url.and_then(|u| {
-        let t = u.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
-        }
-    });
+    // Normalize and validate HERE (single point for every caller), before the
+    // callback is persisted. Runtime validates again because old stores and a
+    // concurrent store editor cannot be trusted.
+    let callback_url = normalize_callback_url(callback_url)?;
     let entry = CanaryEntry {
         id: new_id(),
         token: generate_token(kind),
@@ -504,6 +497,29 @@ pub fn create_at(
     append_entry(store, &entry)?;
     invalidate_cache();
     Ok(entry)
+}
+
+fn normalize_callback_url(callback_url: Option<String>) -> std::io::Result<Option<String>> {
+    let Some(callback_url) = callback_url else {
+        return Ok(None);
+    };
+    let callback_url = callback_url.trim();
+    if callback_url.is_empty() {
+        return Ok(None);
+    }
+    crate::url_validate::validate_server_url(callback_url).map_err(|reason| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid callback URL: {reason}"),
+        )
+    })?;
+    // Persist the URL parser's canonical ASCII serialization, not the raw
+    // operator string. This prevents tolerated/encoded path characters from
+    // becoming terminal controls when the store is listed later.
+    let canonical = url::Url::parse(callback_url)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
+        .to_string();
+    Ok(Some(canonical))
 }
 
 /// Production entry point: create a canary in the default store.
@@ -783,9 +799,20 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
                 context,
             };
 
+            // Revalidate immediately before building/sending. This protects
+            // legacy or concurrently modified stores; the installed resolver
+            // then enforces the same policy on the address actually connected.
+            if crate::url_validate::validate_server_url(&url).is_err() {
+                log_callback_failure(&id, "callback URL rejected by destination policy");
+                return;
+            }
+
             let client = match reqwest::blocking::Client::builder()
+                .no_proxy()
+                .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
                 .connect_timeout(Duration::from_millis(1500))
                 .timeout(Duration::from_secs(3))
+                .redirect(crate::ssrf_guard::server_redirect_policy())
                 .build()
             {
                 Ok(c) => c,
@@ -1052,12 +1079,36 @@ mod tests {
         let entry2 = create_at(
             &store,
             CanaryKind::GithubLike,
-            Some("  https://example.com/cb  ".to_string()),
+            Some("  https://93.184.216.34/cb  ".to_string()),
         )
         .unwrap();
         assert_eq!(
             entry2.callback_url.as_deref(),
-            Some("https://example.com/cb")
+            Some("https://93.184.216.34/cb")
+        );
+    }
+
+    #[test]
+    fn create_rejects_unsafe_callback_before_persisting() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+
+        for url in [
+            "http://127.0.0.1/callback",
+            "https://127.0.0.1/callback",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://user:secret@example.com/callback",
+            "not a URL",
+        ] {
+            let error = create_at(&store, CanaryKind::GithubLike, Some(url.to_string()))
+                .expect_err("unsafe callback URL must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("invalid callback URL"));
+        }
+
+        assert!(
+            !store.exists(),
+            "URL validation must happen before creating or mutating the store"
         );
     }
 
@@ -1178,7 +1229,7 @@ mod tests {
     fn rotate_changes_token_keeps_id_and_callback() {
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
-        let cb = Some("https://my-self-hosted.example/hit".to_string());
+        let cb = Some("https://93.184.216.34/hit".to_string());
         let original = create_at(&store, CanaryKind::GithubLike, cb.clone()).unwrap();
 
         let rotated = rotate_at(&store, &original.id).unwrap().expect("known id");
@@ -1451,6 +1502,7 @@ mod tests {
         let unique_host = "canary-secret-endpoint.invalid";
         let url = format!("http://{unique_host}:9/callback");
         let client = reqwest::blocking::Client::builder()
+            .no_proxy()
             .connect_timeout(Duration::from_millis(200))
             .timeout(Duration::from_millis(400))
             .build()

@@ -1601,6 +1601,23 @@ mod tests {
     }
 
     #[test]
+    fn audit_command_redaction_scrubs_sendgrid_and_truncated_private_keys() {
+        let sendgrid = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+        let sendgrid_redacted = redact_command(&sendgrid, &[]);
+        assert!(!sendgrid_redacted.contains(&sendgrid));
+        assert!(sendgrid_redacted.contains("[REDACTED]"));
+
+        for key in [
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEprivatebody",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGprivatebody",
+        ] {
+            let redacted = redact_command(key, &[]);
+            assert!(!redacted.contains("privatebody"));
+            assert!(redacted.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
     fn test_tirith_log_disabled() {
         let _guard = crate::TEST_ENV_LOCK
             .lock()

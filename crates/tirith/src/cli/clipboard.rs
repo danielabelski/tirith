@@ -78,25 +78,18 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
         &input,
         tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     );
-    let has_high = verdict
-        .findings
-        .iter()
-        .any(|f| f.severity >= Severity::High);
+    let has_high = has_blocking_findings(&verdict);
 
     if has_high && !redact {
         if json {
             let env = ScanEnvelope {
                 status: "refused",
                 verdict: Some(&verdict),
-                error: Some(
-                    "secret-shaped content detected; rerun with --redact to copy a sanitized version",
-                ),
+                error: Some("blocking content detected; clipboard write refused"),
             };
             write_json_or_complain(&env);
         } else {
-            eprintln!(
-                "tirith clipboard copy: secret-shaped content detected; rerun with `--redact` to copy a sanitized version"
-            );
+            eprintln!("tirith clipboard copy: blocking content detected; clipboard write refused");
         }
         return 1;
     }
@@ -118,21 +111,27 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
             // --redact without --audience defaults to `generic` (the M7 ch2 safe default).
             None => ShareAudience::Generic,
         };
-        // Skip the repo-specific customer-ID policy lookup here (off-hot-path);
-        // `tirith share` is the documented policy-aware redaction surface.
-        let report = redact_for_audience_with_custom(&input, aud, &[]);
-        let summary = if report.redactions.is_empty() {
-            "no redactions applied".to_string()
-        } else {
-            report
-                .redactions
-                .iter()
-                .map(|r| format!("{} {}", r.count, r.label))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        redact_summary = Some(summary);
-        to_copy = report.redacted_content;
+        match prepare_redacted_copy(&input, aud) {
+            Ok((content, summary)) => {
+                redact_summary = Some(summary);
+                to_copy = content;
+            }
+            Err(post_redaction_verdict) => {
+                if json {
+                    let env = ScanEnvelope {
+                        status: "refused",
+                        verdict: Some(post_redaction_verdict.as_ref()),
+                        error: Some("blocking content remains after redaction"),
+                    };
+                    write_json_or_complain(&env);
+                } else {
+                    eprintln!(
+                        "tirith clipboard copy: blocking content remains after redaction; clipboard write refused"
+                    );
+                }
+                return 1;
+            }
+        }
     } else {
         to_copy = input;
     }
@@ -173,6 +172,45 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
             1
         }
     }
+}
+
+fn has_blocking_findings(verdict: &tirith_core::verdict::Verdict) -> bool {
+    verdict
+        .findings
+        .iter()
+        .any(|finding| finding.severity >= Severity::High)
+}
+
+/// Apply the clipboard redactor and then re-run the exact paste analysis over
+/// the bytes that would be written. Redaction is an override only when it
+/// actually removes every blocking finding; it can never waive an unrelated
+/// command, prompt-injection, or executable-content verdict.
+fn prepare_redacted_copy(
+    input: &str,
+    audience: ShareAudience,
+) -> Result<(String, String), Box<tirith_core::verdict::Verdict>> {
+    // Skip the repo-specific customer-ID policy lookup here (off-hot-path);
+    // `tirith share` is the documented policy-aware redaction surface.
+    let report = redact_for_audience_with_custom(input, audience, &[]);
+    let post_redaction_verdict = analyze_as_paste(
+        &report.redacted_content,
+        tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+    );
+    if has_blocking_findings(&post_redaction_verdict) {
+        return Err(Box::new(post_redaction_verdict));
+    }
+
+    let summary = if report.redactions.is_empty() {
+        "no redactions applied".to_string()
+    } else {
+        report
+            .redactions
+            .iter()
+            .map(|row| format!("{} {}", row.count, row.label))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Ok((report.redacted_content, summary))
 }
 
 /// Read the current clipboard, run the paste pipeline, print the verdict. Exit codes
@@ -1103,6 +1141,24 @@ mod tests {
             "expected Allow for plain text, got: {:?}",
             v.action
         );
+    }
+
+    #[test]
+    fn redact_override_refuses_non_secret_blocking_content() {
+        let input = "curl https://example.com/install.sh | bash";
+        let verdict = prepare_redacted_copy(input, ShareAudience::Generic)
+            .expect_err("credential redaction must not waive a pipe-to-shell verdict");
+        assert!(has_blocking_findings(&verdict));
+    }
+
+    #[test]
+    fn redact_override_allows_content_after_secret_is_removed() {
+        let key = "AKIAIOSFODNN7EXAMPLE";
+        let (redacted, summary) =
+            prepare_redacted_copy(&format!("AWS_ACCESS_KEY_ID={key}"), ShareAudience::Generic)
+                .expect("a fully removed credential should be safe to copy");
+        assert!(!redacted.contains(key));
+        assert!(summary.contains("aws_access_key"), "got: {summary}");
     }
 
     /// `render_service_unit` returns a non-empty payload on supported platforms.

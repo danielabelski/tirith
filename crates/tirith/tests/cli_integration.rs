@@ -8494,6 +8494,65 @@ fn share_public_paste_redacts_private_ip_in_context() {
     );
 }
 
+#[test]
+fn share_public_paste_redacts_truncated_private_key_through_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("truncated-key.pem");
+    fs::write(
+        &fixture,
+        "prefix\n-----BEGIN RSA PRIVATE KEY-----\nMIIErecoverable-private-body",
+    )
+    .unwrap();
+
+    let out = tirith()
+        .args([
+            "share",
+            "--target",
+            "public-paste",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith share");
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("prefix\n[REDACTED]"), "got: {stdout}");
+    assert!(!stdout.contains("MIIErecoverable-private-body"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("private_key"), "got: {stderr}");
+}
+
+#[test]
+fn redact_stdin_scrubs_sendgrid_and_truncated_pgp_key() {
+    let sendgrid = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+    let mut child = tirith()
+        .args(["redact", "--audience", "public-paste"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith redact");
+
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().expect("stdin pipe");
+        write!(
+            stdin,
+            "SENDGRID_API_KEY={sendgrid}\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGrecoverable-private-body"
+        )
+        .unwrap();
+    }
+
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains(&sendgrid), "got: {stdout}");
+    assert!(!stdout.contains("lQdGrecoverable-private-body"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sendgrid_api_key"), "got: {stderr}");
+    assert!(stderr.contains("pgp_private_key"), "got: {stderr}");
+}
+
 /// `tirith share --json` emits a `{ redacted_content, redactions }` envelope.
 #[test]
 fn share_json_emits_documented_envelope() {
@@ -12213,7 +12272,7 @@ fn canary_create_persists_trimmed_callback_url() {
     let state = tempfile::tempdir().expect("tempdir");
 
     // A callback URL padded with surrounding whitespace.
-    let padded = "  https://my-host.example/hit  ";
+    let padded = "  https://93.184.216.34/hit  ";
     let create = canary_tirith(state.path())
         .args([
             "canary",
@@ -12228,7 +12287,7 @@ fn canary_create_persists_trimmed_callback_url() {
     assert_eq!(create.status.code(), Some(0), "create exits 0");
     let cjson: serde_json::Value = serde_json::from_slice(&create.stdout).unwrap();
     assert_eq!(
-        cjson["callback_url"], "https://my-host.example/hit",
+        cjson["callback_url"], "https://93.184.216.34/hit",
         "the created entry must carry the trimmed callback URL"
     );
 
@@ -12243,7 +12302,7 @@ fn canary_create_persists_trimmed_callback_url() {
     let entries = ljson.as_array().expect("list --json is an array");
     assert_eq!(entries.len(), 1, "exactly one canary registered");
     assert_eq!(
-        entries[0]["callback_url"], "https://my-host.example/hit",
+        entries[0]["callback_url"], "https://93.184.216.34/hit",
         "the stored callback URL must be trimmed, not whitespace-padded"
     );
 }
@@ -12288,8 +12347,8 @@ fn canary_json_validation_errors_are_machine_readable() {
     assert!(
         v.get("error")
             .and_then(|e| e.as_str())
-            .is_some_and(|s| s.contains("http(s)")),
-        "JSON error must explain the http(s) requirement, got: {v}"
+            .is_some_and(|s| s.contains("invalid callback URL") && s.contains("HTTPS")),
+        "JSON error must explain the HTTPS destination requirement, got: {v}"
     );
 
     // prune --json without --yes → parseable JSON error, exit 2.

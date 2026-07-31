@@ -956,6 +956,30 @@ mod tests {
     }
 
     #[test]
+    fn test_sendgrid_segmented_key_detected() {
+        let key = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+        let findings = check(&key, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "valid segmented SendGrid key should be detected: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_sendgrid_invalid_unsegmented_shape_not_detected() {
+        let invalid = format!("SG.{}", "A".repeat(66));
+        let findings = check(&invalid, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.rule_id != RuleId::CredentialInText),
+            "unsegmented non-SendGrid shape must stay a negative control: {findings:?}"
+        );
+    }
+
+    #[test]
     fn test_private_key_detected() {
         let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/yGaV...\n-----END RSA PRIVATE KEY-----";
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
@@ -989,6 +1013,22 @@ mod tests {
                     && f.severity == Severity::Critical),
             "PGP private key block should be detected as Critical: {findings:?}"
         );
+    }
+
+    #[test]
+    fn test_truncated_private_key_headers_still_detected() {
+        for input in [
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEprivatebody",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGprivatebody",
+        ] {
+            let findings = check(input, ShellType::Posix, ScanContext::Paste);
+            assert!(
+                findings.iter().any(|f| {
+                    f.rule_id == RuleId::PrivateKeyExposed && f.severity == Severity::Critical
+                }),
+                "truncated private key must still be detected: {findings:?}"
+            );
+        }
     }
 
     #[test]
