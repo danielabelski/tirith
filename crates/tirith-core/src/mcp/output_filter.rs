@@ -812,7 +812,13 @@ pub fn sanitize_for_display(s: &str) -> String {
                 || crate::extract::is_variation_selector(ch)
                 || crate::extract::is_hangul_filler(ch)
                 || crate::extract::is_invisible_math_operator(ch)
-                || crate::extract::is_invisible_whitespace(ch))
+                || crate::extract::is_invisible_whitespace(ch)
+                // `sanitize_text_str` works byte-wise and already removes C0,
+                // but a valid UTF-8 string may carry the C1 control range as
+                // Unicode codepoints (for example U+009B, the 8-bit CSI form).
+                // Keep only the layout controls the documented display contract
+                // intentionally preserves for the CLI newline-policy wrapper.
+                || (ch.is_control() && !matches!(ch, '\t' | '\n' | '\r')))
         })
         .collect()
 }
@@ -962,6 +968,10 @@ mod tests {
         assert_eq!(sanitize_for_display("a\u{FE0F}b"), "ab");
         assert_eq!(sanitize_for_display("a\u{3164}b"), "ab");
         assert_eq!(sanitize_for_display("a\u{2061}b"), "ab");
+        // UTF-8 encoded C1 controls are still terminal controls. U+009B is the
+        // single-codepoint CSI form and must not survive merely because the
+        // input arrived as valid UTF-8 instead of a raw 0x9B byte.
+        assert_eq!(sanitize_for_display("a\u{009B}31mb"), "a31mb");
         // Plain ASCII plus \n / \t are preserved (newline policy is the CLI
         // wrapper's job, not the core display scrub's).
         assert_eq!(sanitize_for_display("hello\tworld\nok"), "hello\tworld\nok");

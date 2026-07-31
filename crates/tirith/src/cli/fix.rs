@@ -82,6 +82,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     let shell_type = match shell.parse::<ShellType>() {
         Ok(s) => s,
         Err(_) => {
+            let shell = human_single_line(shell);
             eprintln!("tirith fix: warning: unknown shell '{shell}', falling back to posix");
             ShellType::Posix
         }
@@ -145,14 +146,9 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     // No mechanical rewrite anywhere — print every remediation and exit 1.
     // Never invent a rewrite (Risk #2 in the spec).
     if with_rewrite.is_empty() {
-        eprintln!(
-            "tirith fix: no mechanical rewrite available — see guidance below ({} finding(s))",
-            verdict.findings.len()
-        );
-        for s in &guidance_only {
-            eprintln!("  rule={}", s.rule_id);
-            eprintln!("    rationale:   {}", s.rationale);
-            eprintln!("    remediation: {}", s.remediation);
+        let mut stderr = io::stderr().lock();
+        if write_guidance_only_to(&mut stderr, verdict.findings.len(), &guidance_only).is_err() {
+            return 2;
         }
         return 1;
     }
@@ -160,53 +156,33 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     // Interactive mode requires BOTH stdin and stderr to be TTYs (see
     // `is_tty_pair` for why stderr, not stdout).
     if !is_tty_pair() {
-        // Surface what the user would have seen, then refuse to apply. Exit 2 =
-        // "rewrite available but no accept signal", distinct from exit 1 above.
-        eprintln!(
-            "tirith fix: stdin/stdout is not a TTY — re-run with --non-interactive --json \
-             to capture suggestions, or attach a TTY to apply one."
-        );
-        for (i, s) in with_rewrite.iter().enumerate() {
-            eprintln!(
-                "  [{}] rule={} rewrite={} — {}",
-                i + 1,
-                s.rule_id,
-                s.safe_command.as_deref().unwrap_or(""),
-                s.rationale
-            );
+        let mut stderr = io::stderr().lock();
+        if write_non_tty_rewrites_to(&mut stderr, &with_rewrite).is_err() {
+            return 2;
         }
         return 2;
     }
 
     // Interactive presenter. Prompt + suggestion list go to stderr so stdout
     // stays clean for the chosen `safe_command` (the `$(tirith fix …)` contract).
-    eprintln!("tirith fix: {} finding(s) in:", verdict.findings.len());
-    eprintln!("  {cmd}");
-    eprintln!("verdict: {}", action_str(verdict.action));
-    eprintln!();
-    eprintln!("Suggestions:");
-    for (i, s) in with_rewrite.iter().enumerate() {
-        let sc = s.safe_command.as_deref().unwrap_or("");
-        eprintln!(
-            "  [{}] rule={} rewrite={} — {}",
-            i + 1,
-            s.rule_id,
-            sc,
-            s.rationale
-        );
-    }
-    // Surface guidance-only entries too (unnumbered — they can't be applied).
-    if !guidance_only.is_empty() {
-        eprintln!();
-        eprintln!("Guidance (no mechanical rewrite):");
-        for s in &guidance_only {
-            eprintln!("  rule={} — {}", s.rule_id, s.remediation);
-        }
+    let mut stderr = io::stderr().lock();
+    if write_interactive_intro_to(
+        &mut stderr,
+        verdict.findings.len(),
+        &cmd,
+        verdict.action,
+        &with_rewrite,
+        &guidance_only,
+    )
+    .is_err()
+    {
+        return 2;
     }
 
     let n = with_rewrite.len();
-    eprint!("\nApply (1-{n})? [n] ");
-    let _ = io::stderr().flush();
+    if write!(stderr, "\nApply (1-{n})? [n] ").is_err() || stderr.flush().is_err() {
+        return 2;
+    }
 
     let stdin = io::stdin();
     let mut handle = stdin.lock();
@@ -214,18 +190,18 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     match handle.read_line(&mut buf) {
         Ok(0) => {
             // EOF before input — treat as reject.
-            eprintln!("tirith fix: no input (EOF) — declining to apply");
+            let _ = writeln!(stderr, "tirith fix: no input (EOF) — declining to apply");
             2
         }
         Err(e) => {
-            eprintln!("tirith fix: stdin read failed: {e}");
+            let _ = writeln!(stderr, "tirith fix: stdin read failed: {e}");
             2
         }
         Ok(_) => {
             let trimmed = buf.trim();
             // `n`/`N`/`no`/empty → reject; any digit → try to apply.
             if trimmed.is_empty() || matches!(trimmed, "n" | "N" | "no" | "No") {
-                eprintln!("tirith fix: declined");
+                let _ = writeln!(stderr, "tirith fix: declined");
                 return 2;
             }
             match trimmed.parse::<usize>() {
@@ -234,17 +210,130 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
                         .safe_command
                         .as_deref()
                         .expect("partition guarantees safe_command is Some");
-                    // The chosen rewrite goes to stdout (the `$(tirith fix …)` contract).
-                    println!("{sc}");
-                    0
+                    // The chosen rewrite goes to stdout byte-for-byte unchanged
+                    // (the `$(tirith fix …)` contract). Terminal sanitization is
+                    // exclusively for the human preview written to stderr.
+                    let mut stdout = io::stdout().lock();
+                    if write_accepted_command_to(&mut stdout, sc).is_err() {
+                        let _ = writeln!(stderr, "tirith fix: failed to write accepted command");
+                        2
+                    } else {
+                        0
+                    }
                 }
                 _ => {
-                    eprintln!("tirith fix: invalid choice '{trimmed}' — declined");
+                    let _ = write_invalid_choice_to(&mut stderr, trimmed);
                     2
                 }
             }
         }
     }
+}
+
+fn human_single_line(value: &str) -> String {
+    super::sanitize_for_human_output(value, false)
+}
+
+/// Sanitize prose while retaining legitimate newlines. `outer_indent` is added
+/// before the CLI helper's own two-space continuation indent so a continuation
+/// remains nested beneath the formatted row that introduced it.
+fn human_multiline(value: &str, outer_indent: &str) -> String {
+    let value = super::sanitize_for_human_output(value, true);
+    if outer_indent.is_empty() {
+        value
+    } else {
+        value.replace('\n', &format!("\n{outer_indent}"))
+    }
+}
+
+fn write_rewrite_rows_to<W: Write>(out: &mut W, suggestions: &[&SafeSuggestion]) -> io::Result<()> {
+    for (i, s) in suggestions.iter().enumerate() {
+        let rule_id = human_single_line(&s.rule_id);
+        let rewrite = human_single_line(s.safe_command.as_deref().unwrap_or(""));
+        let rationale = human_multiline(&s.rationale, "  ");
+        writeln!(
+            out,
+            "  [{}] rule={} rewrite={} — {}",
+            i + 1,
+            rule_id,
+            rewrite,
+            rationale
+        )?;
+    }
+    Ok(())
+}
+
+fn write_guidance_only_to<W: Write>(
+    out: &mut W,
+    finding_count: usize,
+    guidance_only: &[&SafeSuggestion],
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "tirith fix: no mechanical rewrite available — see guidance below ({finding_count} finding(s))"
+    )?;
+    for s in guidance_only {
+        let rule_id = human_single_line(&s.rule_id);
+        let rationale = human_multiline(&s.rationale, "    ");
+        let remediation = human_multiline(&s.remediation, "    ");
+        writeln!(out, "  rule={rule_id}")?;
+        writeln!(out, "    rationale:   {rationale}")?;
+        writeln!(out, "    remediation: {remediation}")?;
+    }
+    Ok(())
+}
+
+fn write_non_tty_rewrites_to<W: Write>(
+    out: &mut W,
+    with_rewrite: &[&SafeSuggestion],
+) -> io::Result<()> {
+    // Surface what the user would have seen, then refuse to apply. Exit 2 =
+    // "rewrite available but no accept signal", distinct from exit 1.
+    writeln!(
+        out,
+        "tirith fix: stdin/stdout is not a TTY — re-run with --non-interactive --json \
+         to capture suggestions, or attach a TTY to apply one."
+    )?;
+    write_rewrite_rows_to(out, with_rewrite)
+}
+
+fn write_interactive_intro_to<W: Write>(
+    out: &mut W,
+    finding_count: usize,
+    cmd: &str,
+    action: Action,
+    with_rewrite: &[&SafeSuggestion],
+    guidance_only: &[&SafeSuggestion],
+) -> io::Result<()> {
+    let cmd = human_single_line(cmd);
+    writeln!(out, "tirith fix: {finding_count} finding(s) in:")?;
+    writeln!(out, "  {cmd}")?;
+    writeln!(out, "verdict: {}", action_str(action))?;
+    writeln!(out)?;
+    writeln!(out, "Suggestions:")?;
+    write_rewrite_rows_to(out, with_rewrite)?;
+
+    if !guidance_only.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "Guidance (no mechanical rewrite):")?;
+        for s in guidance_only {
+            let rule_id = human_single_line(&s.rule_id);
+            let remediation = human_multiline(&s.remediation, "  ");
+            writeln!(out, "  rule={rule_id} — {remediation}")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_invalid_choice_to<W: Write>(out: &mut W, choice: &str) -> io::Result<()> {
+    let choice = human_single_line(choice);
+    writeln!(out, "tirith fix: invalid choice '{choice}' — declined")
+}
+
+/// Preserve the stdout/eval contract: this is intentionally not a human
+/// terminal renderer and must not alter the selected executable command.
+fn write_accepted_command_to<W: Write>(out: &mut W, command: &str) -> io::Result<()> {
+    writeln!(out, "{command}")
 }
 
 /// Map `Verdict::action` to the lowercase JSON token used in our envelope.
@@ -299,6 +388,20 @@ fn emit_suggestions_array(suggestions: &[SafeSuggestion]) -> bool {
 mod tests {
     use super::*;
 
+    fn suggestion(
+        rule_id: &str,
+        safe_command: Option<&str>,
+        rationale: &str,
+        remediation: &str,
+    ) -> SafeSuggestion {
+        SafeSuggestion {
+            rule_id: rule_id.to_string(),
+            safe_command: safe_command.map(str::to_string),
+            rationale: rationale.to_string(),
+            remediation: remediation.to_string(),
+        }
+    }
+
     #[test]
     fn action_str_collapses_warn_ack() {
         assert_eq!(action_str(Action::Allow), "allow");
@@ -322,5 +425,98 @@ mod tests {
         assert_eq!(json["reason"], "no_findings");
         assert_eq!(json["verdict"], "allow");
         assert_eq!(json["command"], "ls");
+    }
+
+    #[test]
+    fn interactive_renderer_neutralizes_dynamic_fields() {
+        let rewrite = suggestion(
+            "rule\x1b[2J\u{009b}\nFORGED RULE",
+            Some("echo safe\x1b]52;c;aGVsbG8=\x07\nFORGED REWRITE"),
+            "why\x1b[31mred\x1b[0m\nFORGED RATIONALE",
+            "remedy\u{202e}\nFORGED REMEDIATION",
+        );
+        let guidance = suggestion(
+            "guide\u{200b}",
+            None,
+            "guidance rationale",
+            "manual\x1b[2J fix\nFORGED GUIDANCE",
+        );
+        let with_rewrite = vec![&rewrite];
+        let guidance_only = vec![&guidance];
+        let mut out = Vec::new();
+
+        write_interactive_intro_to(
+            &mut out,
+            2,
+            "curl https://例え.テスト/路径\x1b[2J\nFORGED COMMAND",
+            Action::Block,
+            &with_rewrite,
+            &guidance_only,
+        )
+        .expect("render interactive intro");
+
+        let rendered = String::from_utf8(out).expect("renderer emits UTF-8");
+        assert!(!rendered.contains('\x1b'), "ESC must not reach stderr");
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\u{200b}'));
+        assert!(!rendered.contains('\u{009b}'));
+        assert!(
+            !rendered.contains("\nFORGED"),
+            "dynamic values must not forge a top-level line: {rendered:?}"
+        );
+        assert!(rendered.contains("https://例え.テスト/路径FORGED COMMAND"));
+        assert!(rendered.contains("whyred\n    FORGED RATIONALE"));
+        assert!(rendered.contains("manual fix\n    FORGED GUIDANCE"));
+    }
+
+    #[test]
+    fn guidance_and_non_tty_renderers_are_terminal_safe() {
+        let rewrite = suggestion(
+            "rewrite-rule",
+            Some("echo ok\x1b[2J\nFORGED"),
+            "rationale\nFORGED",
+            "unused",
+        );
+        let guidance = suggestion("guide\x1b[31m-rule", None, "why\x1b[0m", "remedy\nFORGED");
+
+        let mut non_tty = Vec::new();
+        write_non_tty_rewrites_to(&mut non_tty, &[&rewrite]).expect("render non-TTY rewrites");
+        let non_tty = String::from_utf8(non_tty).unwrap();
+        assert!(!non_tty.contains('\x1b'));
+        assert!(!non_tty.contains("\nFORGED"));
+
+        let mut guidance_out = Vec::new();
+        write_guidance_only_to(&mut guidance_out, 1, &[&guidance]).expect("render guidance");
+        let guidance_out = String::from_utf8(guidance_out).unwrap();
+        assert!(!guidance_out.contains('\x1b'));
+        assert!(!guidance_out.contains("\nFORGED"));
+        assert!(guidance_out.contains("remedy\n      FORGED"));
+    }
+
+    #[test]
+    fn selection_diagnostic_is_safe_but_accepted_command_is_exact() {
+        let mut diagnostic = Vec::new();
+        write_invalid_choice_to(&mut diagnostic, "9\x1b[2J\u{202e}")
+            .expect("render invalid selection");
+        let diagnostic = String::from_utf8(diagnostic).unwrap();
+        assert!(!diagnostic.contains('\x1b'));
+        assert!(!diagnostic.contains('\u{202e}'));
+
+        let candidate = "printf '路径' && printf '\x1b[2J'";
+        let mut stdout = Vec::new();
+        write_accepted_command_to(&mut stdout, candidate).expect("write accepted command");
+        assert_eq!(stdout, format!("{candidate}\n").into_bytes());
+    }
+
+    #[test]
+    fn suggestion_json_keeps_raw_machine_values() {
+        let raw = "echo ok\x1b[2J路径";
+        let s = suggestion("test_rule", Some(raw), "why\u{202e}", "remedy\nnext");
+
+        let json = serde_json::to_value(&s).expect("serialize suggestion");
+
+        assert_eq!(json["safe_command"], raw);
+        assert_eq!(json["rationale"], "why\u{202e}");
+        assert_eq!(json["remediation"], "remedy\nnext");
     }
 }

@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::path::Path;
 
 use tirith_core::rules::cloaking;
@@ -98,8 +99,8 @@ pub fn run(url: &str, json: bool) -> i32 {
         Ok(result) => {
             if json {
                 print_json(&result);
-            } else {
-                print_human(&result);
+            } else if !print_human(&result) {
+                return 2;
             }
             if result.cloaking_detected {
                 1
@@ -125,9 +126,21 @@ fn print_json(result: &cloaking::CloakingResult) {
     );
 }
 
-fn print_human(result: &cloaking::CloakingResult) {
-    println!("Cloaking check: {}", result.url);
-    println!();
+fn print_human(result: &cloaking::CloakingResult) -> bool {
+    let mut stdout = io::stdout().lock();
+    if print_human_to(&mut stdout, result).is_err() {
+        eprintln!("tirith fetch: failed to write human output");
+        return false;
+    }
+    true
+}
+
+/// Render a cloaking result to a human terminal. Machine JSON deliberately
+/// bypasses this projection and remains raw structured data.
+fn print_human_to<W: Write>(out: &mut W, result: &cloaking::CloakingResult) -> io::Result<()> {
+    let url = super::sanitize_for_human_output(&result.url, false);
+    writeln!(out, "Cloaking check: {url}")?;
+    writeln!(out)?;
 
     for agent in &result.agent_responses {
         let status = if agent.status_code == 0 {
@@ -135,32 +148,128 @@ fn print_human(result: &cloaking::CloakingResult) {
         } else {
             agent.status_code.to_string()
         };
-        println!(
+        let agent_name = super::sanitize_for_human_output(&agent.agent_name, false);
+        writeln!(
+            out,
             "  {:<14} status={:<6} length={}",
-            agent.agent_name, status, agent.content_length
-        );
+            agent_name, status, agent.content_length
+        )?;
     }
 
-    println!();
+    writeln!(out)?;
 
     if result.cloaking_detected {
-        println!(
+        writeln!(
+            out,
             "{}",
             tirith_core::style::bold_red("Cloaking detected!", tirith_core::style::Stream::Stdout)
-        );
+        )?;
         for diff in &result.diff_pairs {
-            println!(
+            let agent_a = super::sanitize_for_human_output(&diff.agent_a, false);
+            let agent_b = super::sanitize_for_human_output(&diff.agent_b, false);
+            writeln!(
+                out,
                 "  {} vs {}: {} chars different",
-                diff.agent_a, diff.agent_b, diff.diff_chars
-            );
+                agent_a, agent_b, diff.diff_chars
+            )?;
             if let Some(ref text) = diff.diff_text {
-                println!("    {text}");
+                let text = super::sanitize_for_human_output(text, true).replace('\n', "\n    ");
+                writeln!(out, "    {text}")?;
             }
         }
     } else {
-        println!(
+        writeln!(
+            out,
             "{}",
             tirith_core::style::green("No cloaking detected.", tirith_core::style::Stream::Stdout)
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cloaking_result(url: &str, agent: &str, diff_text: &str) -> cloaking::CloakingResult {
+        cloaking::CloakingResult {
+            url: url.to_string(),
+            cloaking_detected: true,
+            findings: Vec::new(),
+            agent_responses: vec![cloaking::AgentResponse {
+                agent_name: agent.to_string(),
+                status_code: 200,
+                content_length: 42,
+            }],
+            diff_pairs: vec![cloaking::DiffPair {
+                agent_a: "chrome".to_string(),
+                agent_b: agent.to_string(),
+                diff_chars: 42,
+                diff_text: Some(diff_text.to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn human_renderer_neutralizes_untrusted_terminal_controls() {
+        let result = cloaking_result(
+            "https://safe.example/before\x1b]52;c;aGVsbG8=\x07after\u{202e}",
+            "bot\x1b[2J\u{009b}\nFORGED",
+            "remote\x1b[31mred\x1b[0m\nFORGED DETAIL",
         );
+        let mut out = Vec::new();
+
+        print_human_to(&mut out, &result).expect("render human output");
+
+        let rendered = String::from_utf8(out).expect("renderer emits UTF-8");
+        assert!(
+            !rendered.contains('\x1b'),
+            "ESC must not reach the terminal"
+        );
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "bidi controls must not reach the terminal"
+        );
+        assert!(
+            !rendered.contains('\u{009b}'),
+            "C1 CSI must not reach the terminal"
+        );
+        assert!(
+            !rendered.contains("\nFORGED"),
+            "untrusted fields must not forge a top-level line: {rendered:?}"
+        );
+        assert!(rendered.contains("https://safe.example/beforeafter"));
+        assert!(rendered.contains("botFORGED"));
+        assert!(rendered.contains("remotered\n      FORGED DETAIL"));
+    }
+
+    #[test]
+    fn human_renderer_preserves_legitimate_unicode() {
+        let result = cloaking_result(
+            "https://例え.テスト/路径",
+            "検査-bot",
+            "café résumé 東京 🚀",
+        );
+        let mut out = Vec::new();
+
+        print_human_to(&mut out, &result).expect("render human output");
+
+        let rendered = String::from_utf8(out).expect("renderer emits UTF-8");
+        assert!(rendered.contains("https://例え.テスト/路径"));
+        assert!(rendered.contains("検査-bot"));
+        assert!(rendered.contains("café résumé 東京 🚀"));
+    }
+
+    #[test]
+    fn json_projection_preserves_raw_structured_values() {
+        let raw_url = "https://safe.example/\x1b[2J路径";
+        let raw_diff = "before\x1b]52;c;aGVsbG8=\x07after";
+        let result = cloaking_result(raw_url, "検査-bot", raw_diff);
+
+        let json = result.to_json(true);
+
+        assert_eq!(json["url"], raw_url);
+        assert_eq!(json["agents"][0]["agent"], "検査-bot");
+        assert_eq!(json["diffs"][0]["diff_text"], raw_diff);
     }
 }
