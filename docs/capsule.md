@@ -55,7 +55,7 @@ produces a per-capability coverage ledger:
 | `exec_limited` | process spawn / exec is restricted (e.g. no-new-privs, seccomp) |
 | `network_raw_denied` | raw outbound sockets are blocked at the OS layer |
 | `domain_proxy_enforced` | domain egress is enforced through the loopback broker |
-| `resource_limits_enforced` | CPU / memory / process / open-files / output / wall-clock caps are applied |
+| `resource_limits_enforced` | at least one resource cap was requested and every requested CPU / memory / process / open-files / output / wall-clock dimension is applied |
 | `env_isolated` | the environment was scrubbed of sensitive variables and given an isolated HOME / TMPDIR |
 | `handles_isolated` | inherited handles were closed down to stdio plus the explicit allow-list |
 

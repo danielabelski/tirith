@@ -144,8 +144,9 @@ pub struct CapsuleCoverage {
     /// Domain egress is enforced *through the broker*. May be `true` ONLY when
     /// [`Self::network_raw_denied`] is also `true` (invariant 3).
     pub domain_proxy_enforced: bool,
-    /// CPU / memory / process-count / open-files / output-size / wall-clock
-    /// limits from [`ResourceLimits`] are applied.
+    /// At least one resource limit was requested, and **every populated** CPU /
+    /// memory / process-count / open-files / output-size / wall-clock dimension
+    /// from [`ResourceLimits`] is enforced by the selected backend and wrapper.
     pub resource_limits_enforced: bool,
     /// The child's environment was scrubbed of sensitive variables and given an
     /// isolated HOME/TMPDIR per [`EnvironmentPolicy`].
@@ -410,12 +411,14 @@ impl HandlePolicy {
     }
 }
 
-/// Resource ceilings applied on **every** backend (cross-cutting invariant 2:
-/// resource limits are a tracked coverage flag).
+/// Resource ceilings requested from a capsule backend (cross-cutting invariant
+/// 2: resource limits are a tracked coverage flag).
 ///
 /// `None` means "do not impose a tirith limit for this dimension" (the OS / cgroup
-/// default applies). A backend that successfully applies the populated limits
-/// sets [`CapsuleCoverage::resource_limits_enforced`].
+/// default applies). A backend sets
+/// [`CapsuleCoverage::resource_limits_enforced`] only when at least one limit was
+/// requested and it successfully applies **every** populated dimension. One
+/// supported dimension must never mask another unsupported dimension.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Max CPU time in seconds (rlimit `RLIMIT_CPU` on Unix; Job Object on Windows).
@@ -465,6 +468,36 @@ impl ResourceLimits {
             || self.max_output_bytes.is_some()
             || self.wall_clock_seconds.is_some()
     }
+
+    /// Whether at least one limit is requested and every requested dimension is
+    /// enforced by `support`.
+    ///
+    /// This is deliberately all-or-nothing because [`CapsuleCoverage`] exposes a
+    /// single aggregate resource bit. Treating "any supported limit" as full
+    /// coverage lets a supported CPU or memory limit hide an unsupported wall,
+    /// output, process-count, or open-file limit and defeats fail-closed checks.
+    pub(crate) fn all_requested_enforced_by(&self, support: ResourceLimitSupport) -> bool {
+        self.any_set()
+            && (self.cpu_seconds.is_none() || support.cpu_seconds)
+            && (self.memory_bytes.is_none() || support.memory_bytes)
+            && (self.max_processes.is_none() || support.max_processes)
+            && (self.max_open_files.is_none() || support.max_open_files)
+            && (self.max_output_bytes.is_none() || support.max_output_bytes)
+            && (self.wall_clock_seconds.is_none() || support.wall_clock_seconds)
+    }
+}
+
+/// Resource-limit dimensions a concrete backend + launch wrapper can enforce.
+/// Kept crate-private so every backend derives the aggregate coverage bit from
+/// the same all-requested invariant without expanding the serialized API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResourceLimitSupport {
+    pub(crate) cpu_seconds: bool,
+    pub(crate) memory_bytes: bool,
+    pub(crate) max_processes: bool,
+    pub(crate) max_open_files: bool,
+    pub(crate) max_output_bytes: bool,
+    pub(crate) wall_clock_seconds: bool,
 }
 
 /// Everything a backend needs to contain one child process. Constructed by the

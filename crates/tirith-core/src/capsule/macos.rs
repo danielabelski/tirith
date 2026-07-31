@@ -62,10 +62,21 @@ use std::path::Path;
 
 use super::{
     CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, FilesystemPolicy, NetworkPolicy,
+    ResourceLimitSupport,
 };
 
 /// The stable backend identifier reported in receipts and `tirith doctor`.
 pub const BACKEND_ID: &str = "seatbelt";
+
+/// Resource dimensions applied by the mandatory macOS launch wrapper.
+const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
+    cpu_seconds: true,
+    memory_bytes: true,
+    max_processes: false,
+    max_open_files: true,
+    max_output_bytes: false,
+    wall_clock_seconds: false,
+};
 
 /// The system Seatbelt wrapper the backend drives. An absolute path on purpose:
 /// the backend must not resolve `sandbox-exec` from a caller-controlled `PATH`
@@ -160,14 +171,9 @@ fn path_is_executable_file(path: &Path) -> bool {
 ///     domain enforcement (invariant 3). An allow-list spec is therefore degraded
 ///     on this flag and the enforcing surface fails closed.
 ///   - `resource_limits_enforced`: the SBPL profile alone imposes no rlimit, but
-///     on macOS the capsule is always launched through the E5 wrapper
-///     (`tirith::cli::capsule::macos_contained_command`), which applies the
-///     CPU/memory/open-files rlimits in a `pre_exec` hook before `sandbox-exec`
-///     execs the target. The backend + wrapper are inseparable on macOS (there is
-///     no Seatbelt launch that bypasses the wrapper), so this reports `true`
-///     whenever the spec sets a dimension the wrapper enforces. Honest: it
-///     describes what a contained macOS launch actually delivers, not the profile
-///     in isolation.
+///     the mandatory E5 launch wrapper applies CPU/memory/open-files rlimits in a
+///     `pre_exec` hook. The aggregate bit is true only when at least one limit was
+///     requested and **every** requested dimension is one of those three.
 ///
 ///     **macOS gap (do NOT over-report): `max_processes` is not enforced.** Unlike
 ///     Linux (`RLIMIT_NPROC`) and Windows (Job Object `ActiveProcessLimit`), macOS
@@ -175,17 +181,10 @@ fn path_is_executable_file(path: &Path) -> bool {
 ///     applying it would throttle the whole user (and could lock the user's own
 ///     shell out of forking) without bounding the contained child's subtree, a
 ///     false fork-bomb cap, not a real one. The wrapper therefore does NOT apply it
-///     (see `apply_macos_rlimits`), and `max_processes` is deliberately excluded
-///     from `rlimitable` below. Consequence, kept honest by construction: a spec
-///     whose ONLY resource limit is `max_processes` reports
-///     `resource_limits_enforced = false` here, so `required_coverage` (which
-///     demands the flag whenever any dimension is set) is degraded and an enforcing
-///     surface fails closed rather than running believing the fork-bomb cap holds.
-///     When other macOS-enforceable dimensions are ALSO set (the conservative
-///     locked-down spec sets CPU+memory), the flag is `true` for THOSE dimensions;
-///     it never promised a per-dimension fork-bomb guarantee (just as
-///     `wall_clock`/`max_output` are launcher-enforced, not setrlimit). The absence
-///     of a macOS process-tree cap is a documented limitation, not a silent `true`.
+///     (see `apply_macos_rlimits`). Wall-clock and output caps are likewise not
+///     applied by that wrapper. Any one of these unsupported dimensions keeps the
+///     aggregate bit false even when CPU or memory is also present, so an enforcing
+///     surface fails closed instead of accepting partial coverage.
 ///   - `env_isolated` / `handles_isolated`: likewise applied by the E5 wrapper,
 ///     not the SBPL profile. The wrapper `env_clear`s and re-adds only the
 ///     surviving (sensitive-stripped) variables, points HOME/TMPDIR/XDG_* at a
@@ -204,19 +203,9 @@ pub fn derive_coverage(spec: &CapsuleSpec, probe: &SeatbeltProbe) -> CapsuleCove
         // Degraded, never NoOp-success: nothing is enforced.
         return CapsuleCoverage::NONE;
     }
-    // The wrapper applies CPU/memory/open-files rlimits; report the flag when the
-    // spec sets any dimension it actually enforces. `wall_clock`/`max_output` are
-    // launcher-enforced (not setrlimit), so they do not raise this alone. CRUCIALLY,
-    // `max_processes` is EXCLUDED: macOS has no per-process process-count cap
-    // (RLIMIT_NPROC is per-UID; see the doc above and `apply_macos_rlimits`), so the
-    // fork-bomb dimension is enforced by nothing here. Excluding it keeps the flag
-    // honest: a `max_processes`-only spec then reports false and an enforcing
-    // surface degrades/fails closed instead of trusting an absent cap. (Linux's
-    // `rlimitable` includes max_processes because RLIMIT_NPROC there is per-process;
-    // macOS genuinely cannot, so the two backends legitimately differ on this one.)
-    let rlimitable = spec.resources.cpu_seconds.is_some()
-        || spec.resources.memory_bytes.is_some()
-        || spec.resources.max_open_files.is_some();
+    // Report the aggregate bit only when the wrapper enforces every requested
+    // dimension. A supported CPU limit cannot hide an unsupported process, output,
+    // or wall-clock limit.
     CapsuleCoverage {
         fs_read_enforced: true,
         fs_write_enforced: true,
@@ -228,7 +217,9 @@ pub fn derive_coverage(spec: &CapsuleSpec, probe: &SeatbeltProbe) -> CapsuleCove
         domain_proxy_enforced: false,
         // The E5 wrapper applies the rlimit / env / handle policy that the profile
         // alone does not; a macOS contained launch always goes through it.
-        resource_limits_enforced: rlimitable,
+        resource_limits_enforced: spec
+            .resources
+            .all_requested_enforced_by(RESOURCE_LIMIT_SUPPORT),
         env_isolated: true,
         handles_isolated: true,
     }
@@ -456,8 +447,9 @@ mod tests {
     fn derive_coverage_denyall_with_sandbox_exec() {
         // sandbox-exec usable + a locked-down deny-all spec -> FS enforced, raw-net
         // denied, exec limited, and NEVER egress. The E5 wrapper applies the
-        // rlimit/env/handle policy, so the backend+wrapper unit reports those true
-        // for a spec that sets them (the conservative locked-down spec does).
+        // env/handle policy. The aggregate resource bit remains false because the
+        // conservative locked-down spec also requests process, output, and wall
+        // limits the wrapper cannot enforce.
         let spec = CapsuleSpec::locked_down();
         let probe = SeatbeltProbe {
             sandbox_exec_usable: true,
@@ -469,9 +461,7 @@ mod tests {
         assert!(cov.network_raw_denied);
         // The single most important honesty property of E3's backend.
         assert!(!cov.domain_proxy_enforced);
-        // The wrapper applies these; locked_down() sets conservative rlimits + a
-        // sensitive-stripping env policy + a handle allow-list.
-        assert!(cov.resource_limits_enforced);
+        assert!(!cov.resource_limits_enforced);
         assert!(cov.env_isolated);
         assert!(cov.handles_isolated);
         // The ledger is internally coherent (no egress claim without raw-deny).
@@ -479,23 +469,18 @@ mod tests {
     }
 
     #[test]
-    fn derive_coverage_locked_down_is_not_degraded_with_sandbox_exec() {
-        // C4 regression guard: a locked-down deny-all spec must NOT be degraded on
-        // macOS when sandbox-exec is usable. Before the fix, env/handle/rlimit flags
-        // were hard-coded false, so the backend was degraded against its own
-        // required coverage and EVERY enforcing surface (pkg install, gateway
-        // --capsule, run --capsule) refused on macOS even though the wrapper
-        // delivers the policy.
+    fn derive_coverage_locked_down_is_degraded_on_unenforced_resource_dimensions() {
+        // The wrapper delivers filesystem, network, env, handle, and its supported
+        // rlimits, but locked_down also requests process/output/wall dimensions it
+        // cannot enforce. The aggregate resource bit must fail closed.
         let spec = CapsuleSpec::locked_down();
         let probe = SeatbeltProbe {
             sandbox_exec_usable: true,
         };
         let cov = derive_coverage(&spec, &probe);
-        // Deny-all does not require the proxy, and the wrapper supplies env/handle/
-        // rlimit coverage, so nothing required is missing -> not degraded.
         assert!(
-            !cov.is_degraded_against(&spec.required_coverage()),
-            "locked-down macOS coverage must satisfy its requirement: {cov:?}"
+            cov.is_degraded_against(&spec.required_coverage()),
+            "locked-down macOS coverage must expose unsupported resource dimensions: {cov:?}"
         );
     }
 
@@ -698,17 +683,54 @@ mod tests {
     }
 
     #[test]
-    fn conservative_limits_are_reported_enforced() {
-        // C4: the SBPL profile alone applies no rlimit, but the E5 wrapper (which
-        // every macOS contained launch goes through) applies CPU/mem/open-files via
-        // setrlimit in pre_exec. So a spec with conservative limits honestly reports
-        // resource_limits_enforced = true (the backend+wrapper unit delivers them).
+    fn mixed_cpu_and_max_processes_does_not_claim_all_resource_limits() {
+        let probe = SeatbeltProbe {
+            sandbox_exec_usable: true,
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            cpu_seconds: Some(30),
+            max_processes: Some(32),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(
+            !coverage.resource_limits_enforced,
+            "a supported CPU rlimit must not hide the unenforced process-count limit"
+        );
+        assert!(coverage.is_degraded_against(&spec.required_coverage()));
+    }
+
+    #[test]
+    fn macos_supported_only_resource_limits_are_reported_enforced() {
+        let probe = SeatbeltProbe {
+            sandbox_exec_usable: true,
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            cpu_seconds: Some(30),
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_open_files: Some(64),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(coverage.resource_limits_enforced);
+        assert!(!coverage.is_degraded_against(&spec.required_coverage()));
+    }
+
+    #[test]
+    fn conservative_limits_expose_unsupported_dimensions() {
+        // Conservative limits include process-count, output, and wall-clock caps
+        // the wrapper does not apply, so the aggregate bit must remain false.
         let mut spec = CapsuleSpec::locked_down();
         spec.resources = ResourceLimits::conservative();
         let probe = SeatbeltProbe {
             sandbox_exec_usable: true,
         };
         let cov = derive_coverage(&spec, &probe);
-        assert!(cov.resource_limits_enforced);
+        assert!(!cov.resource_limits_enforced);
+        assert!(cov.is_degraded_against(&spec.required_coverage()));
     }
 }

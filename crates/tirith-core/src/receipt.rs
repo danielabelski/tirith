@@ -733,6 +733,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capsule_resource_gap_survives_receipt_json_roundtrip() {
+        let mut capsule = sample_capsule();
+        capsule.coverage.resource_limits_enforced = false;
+
+        let json = serde_json::to_string(&capsule).expect("serialize capsule receipt");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse receipt JSON");
+        assert_eq!(
+            value["coverage"]["resource_limits_enforced"],
+            serde_json::Value::Bool(false)
+        );
+
+        let round_trip: CapsuleReceipt =
+            serde_json::from_str(&json).expect("deserialize capsule receipt");
+        assert!(!round_trip.coverage.resource_limits_enforced);
+    }
+
     /// A receipt assembled from already-redacted inputs.
     fn sample_receipt() -> ArtifactScanReceipt {
         ArtifactScanReceipt::new(

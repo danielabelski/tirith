@@ -60,11 +60,24 @@ use std::ffi::{CString, OsString};
 use std::path::{Path, PathBuf};
 
 use super::{
-    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, EnvironmentPolicy, ResourceLimits,
+    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, EnvironmentPolicy,
+    ResourceLimitSupport, ResourceLimits,
 };
 
 /// The stable backend identifier reported in receipts and `tirith doctor`.
 pub const BACKEND_ID: &str = "landlock-seccomp";
+
+/// Resource dimensions applied by `apply_rlimits`. Keep this single definition
+/// shared by the pure availability probe and the child-side apply receipt so
+/// they cannot disagree about aggregate coverage.
+const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
+    cpu_seconds: true,
+    memory_bytes: true,
+    max_processes: true,
+    max_open_files: true,
+    max_output_bytes: false,
+    wall_clock_seconds: false,
+};
 
 /// Whether this build can install a seccomp filter. `extrasafe`/`seccompiler`
 /// only support `linux-x86_64`; on any other Linux architecture the seccomp layer
@@ -155,14 +168,12 @@ fn best_effort_abi() -> Option<u8> {
 /// - `domain_proxy_enforced`: **always false in E2**. No verified
 ///   raw-socket-blocking egress backend exists yet, so an allow-list spec is
 ///   degraded (invariant 3).
-/// - `resource_limits_enforced`: true when the spec sets any rlimit-able dimension.
+/// - `resource_limits_enforced`: true only when every requested dimension is
+///   rlimit-able here. Wall-clock and output limits are not applied by this
+///   launcher, so either one keeps the aggregate bit false.
 /// - `env_isolated` / `handles_isolated`: true (the launcher always scrubs the
 ///   environment and closes inherited fds down to the policy set).
 pub fn derive_coverage(spec: &CapsuleSpec, fs: &LandlockProbe, seccomp: bool) -> CapsuleCoverage {
-    let rlimitable = spec.resources.cpu_seconds.is_some()
-        || spec.resources.memory_bytes.is_some()
-        || spec.resources.max_processes.is_some()
-        || spec.resources.max_open_files.is_some();
     CapsuleCoverage {
         fs_read_enforced: fs.usable,
         fs_write_enforced: fs.usable,
@@ -172,7 +183,9 @@ pub fn derive_coverage(spec: &CapsuleSpec, fs: &LandlockProbe, seccomp: bool) ->
         network_raw_denied: seccomp,
         // E2 ships no verified raw-socket-blocking egress path.
         domain_proxy_enforced: false,
-        resource_limits_enforced: rlimitable,
+        resource_limits_enforced: spec
+            .resources
+            .all_requested_enforced_by(RESOURCE_LIMIT_SUPPORT),
         env_isolated: true,
         handles_isolated: true,
     }
@@ -268,7 +281,9 @@ pub fn apply_containment(
         exec_limited: true,
         network_raw_denied: seccomp_applied,
         domain_proxy_enforced: false,
-        resource_limits_enforced: spec.resources.any_set(),
+        resource_limits_enforced: spec
+            .resources
+            .all_requested_enforced_by(RESOURCE_LIMIT_SUPPORT),
         env_isolated: true,
         handles_isolated: true,
     })
@@ -583,8 +598,10 @@ mod tests {
 
     #[test]
     fn derive_coverage_denyall_with_full_backend() {
-        // Landlock usable + seccomp supported + a deny-all spec with rlimits ->
-        // FS enforced, raw-net denied, NEVER egress, limits + env + handles set.
+        // Landlock usable + seccomp supported + a locked-down spec -> FS
+        // enforced, raw-net denied, NEVER egress, and env + handles set. The
+        // aggregate resource bit stays false because locked_down also requests
+        // output and wall-clock limits that this launcher does not enforce.
         let spec = CapsuleSpec::locked_down();
         let fs = LandlockProbe {
             usable: true,
@@ -597,11 +614,12 @@ mod tests {
         assert!(cov.network_raw_denied);
         // The single most important honesty property of E2's Linux backend.
         assert!(!cov.domain_proxy_enforced);
-        assert!(cov.resource_limits_enforced);
+        assert!(!cov.resource_limits_enforced);
         assert!(cov.env_isolated);
         assert!(cov.handles_isolated);
         // And the coverage is internally coherent (no egress claim w/o raw-deny).
         assert!(cov.egress_claim_is_coherent());
+        assert!(cov.is_degraded_against(&spec.required_coverage()));
     }
 
     #[test]
@@ -658,6 +676,47 @@ mod tests {
         };
         let cov3 = derive_coverage(&spec, &fs, true);
         assert!(cov3.resource_limits_enforced);
+    }
+
+    #[test]
+    fn mixed_cpu_and_wall_clock_does_not_claim_all_resource_limits() {
+        let fs = LandlockProbe {
+            usable: true,
+            abi: Some(4),
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            cpu_seconds: Some(30),
+            wall_clock_seconds: Some(60),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &fs, true);
+        assert!(
+            !coverage.resource_limits_enforced,
+            "a supported CPU rlimit must not hide the unenforced wall-clock limit"
+        );
+        assert!(coverage.is_degraded_against(&spec.required_coverage()));
+    }
+
+    #[test]
+    fn linux_supported_only_resource_limits_are_reported_enforced() {
+        let fs = LandlockProbe {
+            usable: true,
+            abi: Some(4),
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            cpu_seconds: Some(30),
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(32),
+            max_open_files: Some(64),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &fs, true);
+        assert!(coverage.resource_limits_enforced);
+        assert!(!coverage.is_degraded_against(&spec.required_coverage()));
     }
 
     #[test]

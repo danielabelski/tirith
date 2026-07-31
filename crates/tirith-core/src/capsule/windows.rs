@@ -72,11 +72,22 @@
 use std::path::Path;
 
 use super::{
-    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, FilesystemPolicy, ResourceLimits,
+    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, FilesystemPolicy, ResourceLimitSupport,
+    ResourceLimits,
 };
 
 /// The stable backend identifier reported in receipts and `tirith doctor`.
 pub const BACKEND_ID: &str = "appcontainer";
+
+/// Resource dimensions mapped into the Job Object by `job_object_limits`.
+const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
+    cpu_seconds: true,
+    memory_bytes: true,
+    max_processes: true,
+    max_open_files: false,
+    max_output_bytes: false,
+    wall_clock_seconds: false,
+};
 
 /// The display name handed to `CreateAppContainerProfile` for tirith's containers.
 /// Cosmetic (shown in some diagnostics); the security identity is the derived SID,
@@ -164,8 +175,10 @@ pub fn probe_appcontainer() -> WindowsProbe {
 ///     is routed by E5), so E4 cannot claim end-to-end domain enforcement
 ///     (invariant 3). An allow-list spec is therefore degraded on this flag and the
 ///     enforcing surface fails closed.
-///   - `resource_limits_enforced`: true when the spec sets any Job-Object-able
-///     dimension (CPU / memory / process count / open files); the Job applies them.
+///   - `resource_limits_enforced`: true only when at least one limit is requested
+///     and every requested dimension maps to the Job Object (CPU / memory /
+///     process count). Open-files, output, and wall-clock requests keep the
+///     aggregate bit false.
 ///   - `env_isolated` / `handles_isolated`: true — the executor builds the child's
 ///     environment from the surviving-vars policy (sensitive set stripped, isolated
 ///     HOME/TEMP) and calls `CreateProcessW` with `bInheritHandles = FALSE`.
@@ -182,20 +195,12 @@ pub fn derive_coverage(spec: &CapsuleSpec, probe: &WindowsProbe) -> CapsuleCover
         network_raw_denied: true,
         // E4 ships no verified broker-pinned egress path of its own.
         domain_proxy_enforced: false,
-        resource_limits_enforced: job_limitable(&spec.resources),
+        resource_limits_enforced: spec
+            .resources
+            .all_requested_enforced_by(RESOURCE_LIMIT_SUPPORT),
         env_isolated: true,
         handles_isolated: true,
     }
-}
-
-/// Whether `limits` populates any dimension a Job Object can enforce. Wall-clock
-/// and output-byte caps are NOT Job Object limits (the spawning wrapper enforces
-/// those), so they do not, on their own, set `resource_limits_enforced`.
-fn job_limitable(limits: &ResourceLimits) -> bool {
-    limits.cpu_seconds.is_some()
-        || limits.memory_bytes.is_some()
-        || limits.max_processes.is_some()
-        || limits.max_open_files.is_some()
 }
 
 /// An error from building (or, in the CLI executor, applying) a Windows capsule
@@ -404,10 +409,9 @@ pub struct JobObjectLimits {
 /// 100-ns ticks (the unit `PerJobUserTimeLimit` expects: `seconds * 10_000_000`),
 /// saturating so an absurd value cannot overflow. `max_open_files` has no direct
 /// per-Job equivalent on Windows (handle limits are per-process via other
-/// mechanisms), so it does not appear here; it still contributes to
-/// `resource_limits_enforced` via [`job_limitable`] only when one of the mapped
-/// dimensions is also set — see the note in [`derive_coverage`]. Wall-clock and
-/// output caps are the wrapper's job, not the Job Object's.
+/// mechanisms), so it does not appear here and prevents an aggregate resource
+/// coverage claim. Wall-clock and output caps are also not applied by this
+/// backend or its wrapper.
 pub fn job_object_limits(limits: &ResourceLimits) -> JobObjectLimits {
     JobObjectLimits {
         kill_on_close: true,
@@ -582,9 +586,10 @@ mod tests {
 
     #[test]
     fn derive_coverage_denyall_with_appcontainer() {
-        // AppContainer supported + a deny-all spec with rlimits -> FS enforced,
-        // raw-net denied (no networking capability), exec limited, limits + env +
-        // handles set, and NEVER egress.
+        // AppContainer supported + locked_down -> FS enforced, raw-net denied,
+        // exec limited, env + handles set, and NEVER egress. The resource bit
+        // stays false because locked_down requests open-files/output/wall limits
+        // the Job Object does not apply.
         let spec = CapsuleSpec::locked_down();
         let probe = WindowsProbe {
             appcontainer_supported: true,
@@ -596,11 +601,12 @@ mod tests {
         assert!(cov.network_raw_denied);
         // The single most important honesty property of E4's backend.
         assert!(!cov.domain_proxy_enforced);
-        assert!(cov.resource_limits_enforced);
+        assert!(!cov.resource_limits_enforced);
         assert!(cov.env_isolated);
         assert!(cov.handles_isolated);
         // The ledger is internally coherent (no egress claim without raw-deny).
         assert!(cov.egress_claim_is_coherent());
+        assert!(cov.is_degraded_against(&spec.required_coverage()));
     }
 
     #[test]
@@ -649,13 +655,50 @@ mod tests {
         };
         assert!(derive_coverage(&spec, &probe).resource_limits_enforced);
 
-        // open-files alone (no per-Job equivalent here) still counts as
-        // Job-limitable for the coverage flag (job_limitable includes it).
+        // Open-files alone has no per-Job equivalent -> not claimed.
         spec.resources = ResourceLimits {
             max_open_files: Some(64),
             ..ResourceLimits::default()
         };
-        assert!(derive_coverage(&spec, &probe).resource_limits_enforced);
+        assert!(!derive_coverage(&spec, &probe).resource_limits_enforced);
+    }
+
+    #[test]
+    fn mixed_memory_and_open_files_does_not_claim_all_resource_limits() {
+        let probe = WindowsProbe {
+            appcontainer_supported: true,
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_open_files: Some(64),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(
+            !coverage.resource_limits_enforced,
+            "a mapped Job memory limit must not hide the unmapped open-files limit"
+        );
+        assert!(coverage.is_degraded_against(&spec.required_coverage()));
+    }
+
+    #[test]
+    fn windows_supported_only_resource_limits_are_reported_enforced() {
+        let probe = WindowsProbe {
+            appcontainer_supported: true,
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            cpu_seconds: Some(30),
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(32),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(coverage.resource_limits_enforced);
+        assert!(!coverage.is_degraded_against(&spec.required_coverage()));
     }
 
     #[test]

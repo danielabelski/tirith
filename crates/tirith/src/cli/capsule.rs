@@ -697,11 +697,11 @@ fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io
     // `max_processes` is intentionally NOT applied: RLIMIT_NPROC is per real UID on
     // macOS, so it would cap the whole user (and could deny the user's own shell a
     // fork) without bounding the contained child's subtree, a false fork-bomb cap.
-    // The honesty contract handles this by EXCLUDING max_processes from the macOS
-    // `resource_limits_enforced` claim (see `tirith_core::capsule::macos::
-    // derive_coverage`), so a spec that relies on it degrades rather than trusting a
-    // cap that is not here. `wall_clock`/`max_output` are launcher-enforced, not
-    // rlimits.
+    // The honesty contract handles this by marking aggregate resource coverage
+    // false whenever max_processes is requested (see
+    // `tirith_core::capsule::macos::derive_coverage`), so a spec that relies on it
+    // degrades rather than trusting a cap that is not here. `wall_clock` and
+    // `max_output` are also not enforced by this wrapper and have the same effect.
     Ok(())
 }
 
@@ -965,17 +965,14 @@ mod tests {
         assert_degraded_run_is_permitted(DegradedPolicy::FailClosed);
     }
 
-    // ── C4: macOS contained launch honestly delivers env/handle/rlimit coverage ──
+    // ── macOS locked-down coverage fails closed on unsupported resource caps ──
 
-    /// On macOS with a usable `sandbox-exec`, a locked-down (deny-all) spec must NOT
-    /// be degraded: the Seatbelt backend + this wrapper together supply FS/exec/
-    /// raw-net-deny AND the env/handle/rlimit coverage the wrapper applies. Before
-    /// the C4 fix the backend hard-coded env/handle/rlimit to false, so every
-    /// enforcing surface (`pkg install`, `gateway --capsule`, `run --capsule`)
-    /// refused on macOS. This asserts the live coverage on the host.
+    /// Even with a usable `sandbox-exec`, locked_down requests process-count,
+    /// output, and wall-clock caps this wrapper does not apply. The live backend
+    /// selection must expose that aggregate resource gap and fail closed.
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_locked_down_is_not_degraded_when_sandbox_exec_present() {
+    fn macos_locked_down_is_degraded_on_unsupported_resource_limits() {
         // Only meaningful where sandbox-exec is actually usable (the macOS CI runner
         // and dev hosts). If it is somehow missing, the honest answer IS degraded;
         // skip rather than assert a false expectation.
@@ -987,16 +984,17 @@ mod tests {
         let sel = select_backend(&spec);
         assert_eq!(sel.backend_id, "seatbelt");
         assert!(
-            !sel.is_degraded(),
-            "locked-down macOS capsule must not be degraded with sandbox-exec present: \
+            sel.is_degraded(),
+            "locked-down macOS capsule must expose unsupported resource limits: \
              coverage={:?} required={:?}",
             sel.coverage,
             sel.required
         );
-        // The wrapper-supplied flags are honestly reported.
+        // Wrapper-supplied env/handle coverage remains true; the aggregate
+        // resource claim is false because only some requested limits are applied.
         assert!(sel.coverage.env_isolated);
         assert!(sel.coverage.handles_isolated);
-        assert!(sel.coverage.resource_limits_enforced);
+        assert!(!sel.coverage.resource_limits_enforced);
     }
 
     /// C4 env-scrub proof on macOS: the contained `Command` the wrapper builds has
@@ -1045,7 +1043,14 @@ mod tests {
                 temporary_home: false,
             },
             handles: HandlePolicy::default(),
-            resources: ResourceLimits::conservative(),
+            // Keep this env-focused spec fully enforceable on macOS: request only
+            // the dimensions `apply_macos_rlimits` actually applies.
+            resources: ResourceLimits {
+                cpu_seconds: Some(30),
+                memory_bytes: Some(512 * 1024 * 1024),
+                max_open_files: Some(64),
+                ..ResourceLimits::default()
+            },
         };
 
         let sel = select_backend(&spec);
@@ -1210,6 +1215,36 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_resource_gap_reaches_cli_summary_and_refusal() {
+        let spec = CapsuleSpec::locked_down();
+        let coverage = CapsuleCoverage {
+            fs_read_enforced: true,
+            fs_write_enforced: true,
+            exec_limited: true,
+            network_raw_denied: true,
+            domain_proxy_enforced: false,
+            resource_limits_enforced: false,
+            env_isolated: true,
+            handles_isolated: true,
+        };
+        let outcome = CapsuleOutcome {
+            exit_code: 0,
+            backend_id: "test",
+            coverage,
+            degraded: true,
+        };
+        assert!(outcome.coverage_summary().contains("rlimits=false"));
+
+        let selected = SelectedBackend {
+            backend_id: "test",
+            coverage,
+            required: spec.required_coverage(),
+        };
+        assert!(selected.is_degraded());
+        assert!(shortfall_reason(selected.backend_id, &selected).contains("resource_limits"));
+    }
+
+    #[test]
     fn not_degraded_when_coverage_meets_requirement() {
         let spec = CapsuleSpec::locked_down();
         let full = CapsuleCoverage {
@@ -1267,8 +1302,16 @@ mod tests {
             assert!(info.network_raw_denied);
         }
         // It serializes (doctor --format json).
-        let json = serde_json::to_string(&info).expect("serialize");
-        assert!(json.contains("backend_id"));
+        // Every current backend leaves at least one locked_down resource
+        // dimension unsupported, and doctor must carry that false aggregate bit
+        // through instead of recomputing it from ResourceLimits::any_set().
+        assert!(!info.resource_limits_enforced);
+        assert!(!info.deny_all_enforceable);
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(
+            json["resource_limits_enforced"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[test]
