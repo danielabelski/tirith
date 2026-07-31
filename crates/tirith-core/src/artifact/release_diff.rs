@@ -62,6 +62,7 @@ use crate::artifact::{
     ArtifactFileKind, ArtifactInspection, ArtifactSignalKind, InspectionSubject,
 };
 use crate::policy::Policy;
+use crate::scan::CoverageGap;
 use crate::verdict::{Evidence, Finding, RuleId, Severity, Timings, Verdict};
 
 /// The default JavaScript-volume threshold (bytes) above which a release that had
@@ -131,13 +132,18 @@ pub struct ReleaseAnomaly {
 }
 
 /// The result of differencing an OLD release against a NEW release: every flagged
-/// anomaly, in a stable order. Empty means the two releases have the same
-/// execution shape (no anomaly), which is the expected case for an honest point
-/// release.
+/// anomaly and every incomplete-analysis gap. A result is clean only when both
+/// collections are empty; no visible anomaly does not make an incomplete
+/// comparison trustworthy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseDiff {
     /// The flagged deltas, sorted by kind then detail for determinism.
     pub anomalies: Vec<ReleaseAnomaly>,
+    /// Incomplete analysis on either side of the comparison. Locations retain the
+    /// old/new outer artifact name, so the CLI can identify the incomplete side.
+    /// A diff carrying any gap is never eligible for an Allow verdict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_gaps: Vec<CoverageGap>,
 }
 
 impl ReleaseDiff {
@@ -205,11 +211,25 @@ impl ReleaseDiff {
     /// [`RuleId::ArtifactReleaseAnomaly`] finding through
     /// [`crate::escalation::finalize_static_verdict`] (cross-cutting invariant 5) so
     /// a per-rule severity / action override is honored at this verdict site. A
-    /// clean diff yields an Allow. This is the single verdict seam a CLI reuses, so
-    /// the finalize call is not duplicated at the call site.
+    /// complete, anomaly-free diff yields an Allow. This is the single verdict seam
+    /// a CLI reuses, so the finalize call is not duplicated at the call site.
     pub fn evaluate(&self, policy: &Policy) -> Verdict {
         // Tier-3 by construction (no tier-1 command gate); timings unmeasured here.
-        crate::escalation::finalize_static_verdict(self.findings(), policy, 3, Timings::default())
+        let mut findings = self.findings();
+        findings.extend(crate::artifact::artifact_analysis_incomplete_findings(
+            &self.coverage_gaps,
+            Some(policy),
+            true,
+        ));
+        let mut verdict =
+            crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default());
+        crate::artifact::enforce_artifact_coverage_floor(
+            &mut verdict,
+            &self.coverage_gaps,
+            Some(policy),
+            true,
+        );
+        verdict
     }
 }
 
@@ -222,6 +242,12 @@ pub enum ReleaseDiffError {
     Old(ArtifactInspectError),
     /// The NEW artifact could not be inspected.
     New(ArtifactInspectError),
+    /// The OLD archive had a hard structural violation. Its partial evidence must
+    /// not be used as a trusted baseline.
+    OldRejected(Vec<String>),
+    /// The NEW archive had a hard structural violation. It cannot be reported as a
+    /// clean release merely because the visible prefix has no anomaly.
+    NewRejected(Vec<String>),
 }
 
 impl std::fmt::Display for ReleaseDiffError {
@@ -229,6 +255,16 @@ impl std::fmt::Display for ReleaseDiffError {
         match self {
             ReleaseDiffError::Old(e) => write!(f, "old artifact could not be inspected: {e:?}"),
             ReleaseDiffError::New(e) => write!(f, "new artifact could not be inspected: {e:?}"),
+            ReleaseDiffError::OldRejected(details) => write!(
+                f,
+                "old artifact was structurally rejected: {}",
+                rejection_detail(details)
+            ),
+            ReleaseDiffError::NewRejected(details) => write!(
+                f,
+                "new artifact was structurally rejected: {}",
+                rejection_detail(details)
+            ),
         }
     }
 }
@@ -242,16 +278,25 @@ impl std::error::Error for ReleaseDiffError {}
 /// [`ReleaseDiff`], or a [`ReleaseDiffError`] naming the side that could not be
 /// inspected.
 ///
-/// A structurally REJECTED wheel (a hard archive violation) is still differenced:
-/// its best-effort partial inspection carries the files/signals scanned before
-/// rejection, which is the right input for "what shape does this side have". The
-/// rejection itself is a separate, stronger signal the inspect/firewall path
-/// already surfaces; the differential does not re-derive it.
+/// A structurally REJECTED wheel (a hard archive violation) is refused as an input:
+/// its best-effort partial inspection is evidence, not a trustworthy old baseline or
+/// new-release shape. Accepted-but-incomplete inspections are returned with their
+/// coverage gaps, and [`ReleaseDiff::evaluate`] blocks them fail-closed.
 ///
 /// [`read_wheel`]: crate::artifact::archive::read_wheel
 pub fn diff_artifact_files(old: &Path, new: &Path) -> Result<ReleaseDiff, ReleaseDiffError> {
     let old_inspected = inspect_artifact_file(old).map_err(ReleaseDiffError::Old)?;
+    if old_inspected.rejected {
+        return Err(ReleaseDiffError::OldRejected(
+            old_inspected.violation_details,
+        ));
+    }
     let new_inspected = inspect_artifact_file(new).map_err(ReleaseDiffError::New)?;
+    if new_inspected.rejected {
+        return Err(ReleaseDiffError::NewRejected(
+            new_inspected.violation_details,
+        ));
+    }
     Ok(diff_inspections(
         &old_inspected.inspection,
         &new_inspected.inspection,
@@ -265,6 +310,8 @@ pub fn diff_artifact_files(old: &Path, new: &Path) -> Result<ReleaseDiff, Releas
 /// stable rendering regardless of input order.
 pub fn diff_inspections(old: &ArtifactInspection, new: &ArtifactInspection) -> ReleaseDiff {
     let mut anomalies: Vec<ReleaseAnomaly> = Vec::new();
+    let mut coverage_gaps = old.effective_coverage_gaps();
+    coverage_gaps.extend(new.effective_coverage_gaps());
 
     // --- Identity: the two artifacts should be the same distribution. ----------
     if let (Some(old_name), Some(new_name)) = (
@@ -344,7 +391,10 @@ pub fn diff_inspections(old: &ArtifactInspection, new: &ArtifactInspection) -> R
 
     // Stable order: by kind (the enum's declared order), then detail.
     anomalies.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.detail.cmp(&b.detail)));
-    ReleaseDiff { anomalies }
+    ReleaseDiff {
+        anomalies,
+        coverage_gaps,
+    }
 }
 
 /// Difference two inspections and evaluate the result under a policy, routing the
@@ -358,6 +408,26 @@ pub fn evaluate_release_diff(
     policy: &Policy,
 ) -> Verdict {
     diff_inspections(old, new).evaluate(policy)
+}
+
+/// Render a bounded structural-rejection summary. Archive member names are
+/// attacker-controlled; the CLI applies its terminal sanitizer after this, while
+/// this helper prevents a many-violation archive from flooding one error value.
+fn rejection_detail(details: &[String]) -> String {
+    if details.is_empty() {
+        return "structural archive violation".to_string();
+    }
+    let shown = details
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if details.len() > 4 {
+        format!("{shown}; (+{} more)", details.len() - 4)
+    } else {
+        shown
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +905,44 @@ mod tests {
             .contains(&ReleaseAnomalyKind::NewExecutionCapability));
     }
 
+    #[test]
+    fn incomplete_release_side_cannot_finalize_allow() {
+        let old = wheel("demo", "1.0", vec![], vec![]);
+        let mut new = wheel("demo", "1.1", vec![], vec![]);
+        new.coverage = crate::artifact::InspectionCoverage {
+            members_total: 2,
+            members_enumerated: 1,
+            members_inspected: 1,
+            gaps: vec![CoverageGap {
+                location: SubjectLocation::member(
+                    "demo-1.1-py3-none-any.whl",
+                    "members after entry 10000",
+                ),
+                kind: crate::scan::CoverageGapKind::EntryCountCapped,
+                sha256: None,
+            }],
+        };
+
+        let diff = diff_inspections(&old, &new);
+        assert!(
+            diff.anomalies.is_empty(),
+            "the hidden suffix has no visible delta"
+        );
+        assert_eq!(diff.coverage_gaps.len(), 1);
+
+        // Even an operator override cannot turn an incomplete security comparison
+        // into Allow: the release diff is a fail-closed verdict boundary.
+        let mut policy = Policy::default();
+        policy
+            .severity_overrides
+            .insert("analysis_incomplete".to_string(), Severity::Info);
+        let verdict = diff.evaluate(&policy);
+        assert_eq!(verdict.action, Action::Block);
+        assert!(verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete && finding.severity >= Severity::High
+        }));
+    }
+
     /// Two artifacts claiming different distribution names flag `IdentityChanged`;
     /// the same name (differing only by PEP 503 separators/case) does not.
     #[test]
@@ -1058,15 +1166,38 @@ mod tests {
         path
     }
 
+    /// Build a validly named wheel whose executable suffix begins just beyond the
+    /// archive entry cap. This is the original partial-diff bypass shape: the visible
+    /// prefix is benign, but pip would still extract the later startup hook.
+    fn write_entry_capped_demo_wheel(dir: &Path, ver: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("demo-{ver}-py3-none-any.whl"));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zw = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zw.start_file(format!("demo-{ver}.dist-info/METADATA"), options)
+            .unwrap();
+        zw.write_all(format!("Name: demo\nVersion: {ver}\n").as_bytes())
+            .unwrap();
+        for index in 1..crate::artifact::archive::ArchiveLimits::default().max_entries {
+            zw.start_file(format!("demo/pad-{index}.txt"), options)
+                .unwrap();
+        }
+        zw.start_file("demo/hidden.pth", options).unwrap();
+        zw.write_all(b"import os; os.system('id')\n").unwrap();
+        zw.finish().unwrap();
+        path
+    }
+
     /// End to end: an OLD pure-Python wheel diffed against a NEW wheel that adds a
-    /// native `.so` flags `PureToNative` over the real on-disk I/O path (this is the
-    /// `tirith pkg diff old.whl new.whl` milestone repro's core).
+    /// malformed native `.so` flags `PureToNative` but BLOCKS on the accompanying
+    /// native coverage gap. A magic-only stand-in is not a fully parsed object and
+    /// must no longer inherit the heuristic anomaly's Warn-only outcome.
     #[test]
-    fn diff_artifact_files_flags_pure_to_native_end_to_end() {
+    fn diff_artifact_files_blocks_unparseable_pure_to_native_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         // OLD: pure Python (one .py member).
         let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
-        // NEW: same plus a (tiny, valid-ELF-magic) native member.
+        // NEW: same plus a tiny ELF-magic-only native member (not a valid object).
         let so_body: &[u8] = b"\x7fELF\x02\x01\x01\x00 a tiny stand-in native object body";
         let new = write_demo_wheel(
             dir.path(),
@@ -1083,13 +1214,18 @@ mod tests {
             "a pure->native release must flag PureToNative; got {:?}",
             diff.kinds()
         );
-        // The verdict warns under the default policy (Medium -> Warn).
+        // The visible pure->native anomaly remains, but the malformed native parser
+        // coverage is fail-closed and therefore dominates the final action.
         let verdict = diff.evaluate(&Policy::default());
-        assert_eq!(verdict.action, Action::Warn);
+        assert_eq!(verdict.action, Action::Block);
         assert!(verdict
             .findings
             .iter()
             .any(|f| f.rule_id == RuleId::ArtifactReleaseAnomaly));
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::AnalysisIncomplete));
     }
 
     /// Two byte-distinct but shape-identical pure wheels diff clean over the I/O
@@ -1104,6 +1240,63 @@ mod tests {
             !diff.has_anomaly(),
             "honest release must be clean: {:?}",
             diff.anomalies
+        );
+    }
+
+    #[test]
+    fn diff_artifact_files_blocks_entry_capped_new_release_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
+        let new = write_entry_capped_demo_wheel(dir.path(), "1.1");
+
+        let diff = diff_artifact_files(&old, &new).expect("coverage gaps are typed diff data");
+        assert!(
+            diff.anomalies.is_empty(),
+            "hidden hook must be beyond enumeration"
+        );
+        assert!(diff
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.kind == crate::scan::CoverageGapKind::EntryCountCapped));
+        let verdict = diff.evaluate(&Policy::default());
+        assert_eq!(verdict.action, Action::Block);
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn diff_artifact_files_refuses_structurally_rejected_new_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
+        let new = write_demo_wheel(
+            dir.path(),
+            "1.1",
+            &[("../sitecustomize.py", b"owned = 1\n")],
+        );
+
+        let error = diff_artifact_files(&old, &new).unwrap_err();
+        assert!(
+            matches!(error, ReleaseDiffError::NewRejected(_)),
+            "rejected partial evidence must not become a release diff: {error:?}"
+        );
+    }
+
+    #[test]
+    fn diff_artifact_files_refuses_structurally_rejected_old_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_demo_wheel(
+            dir.path(),
+            "1.0",
+            &[("../sitecustomize.py", b"owned = 1\n")],
+        );
+        let new = write_demo_wheel(dir.path(), "1.1", &[("demo/__init__.py", b"x = 1\n")]);
+
+        let error = diff_artifact_files(&old, &new).unwrap_err();
+        assert!(
+            matches!(error, ReleaseDiffError::OldRejected(_)),
+            "rejected partial evidence must not become a trusted baseline: {error:?}"
         );
     }
 

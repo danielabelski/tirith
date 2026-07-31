@@ -1021,6 +1021,15 @@ fn windows_component_is_ambiguous(component: &str) -> bool {
     {
         return true;
     }
+    // NTFS may assign a DOS 8.3 short-name alias to a long filename. A later
+    // archive member using that alias addresses the same file on volumes where
+    // 8.3 creation is enabled, even though literal-name classification and the
+    // collision key see a different component. The exact alias-generation
+    // algorithm is volume/order dependent, so do not try to predict it: reject
+    // every component shaped like a generated 8.3 alias on every host.
+    if looks_like_windows_short_name_alias(component) {
+        return true;
+    }
 
     // Win32 device names alias regardless of case and even when followed by an
     // extension (`NUL.txt`, `COM1.py`). Trailing dots/spaces were rejected above,
@@ -1038,6 +1047,32 @@ fn windows_component_is_ambiguous(component: &str) -> bool {
         "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
     ) || upper.strip_prefix("COM").is_some_and(reserved_port_suffix)
         || upper.strip_prefix("LPT").is_some_and(reserved_port_suffix)
+}
+
+/// Whether `component` has the portable shape of a generated DOS 8.3 alias:
+/// an at-most-eight-character stem ending in `~<digits>`, plus an optional
+/// at-most-three-character extension. This intentionally accepts a wider prefix
+/// alphabet than the generator: false negatives would preserve an overwrite
+/// primitive, while the conservative false-positive surface is limited to explicit
+/// short-alias-shaped wheel members such as `SITECU~1.PY`.
+fn looks_like_windows_short_name_alias(component: &str) -> bool {
+    let (stem, extension) = match component.split_once('.') {
+        Some((stem, extension)) if !extension.contains('.') => (stem, Some(extension)),
+        Some(_) => return false,
+        None => (component, None),
+    };
+    if stem.is_empty()
+        || stem.chars().count() > 8
+        || extension.is_some_and(|extension| extension.chars().count() > 3)
+    {
+        return false;
+    }
+    let Some((prefix, generation)) = stem.rsplit_once('~') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && !generation.is_empty()
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Collision key under the broad portable extraction semantics the reader
@@ -1826,6 +1861,9 @@ mod tests {
             "demo/evil.pth.",
             "demo/evil.pth ",
             "demo/evil.pth::$DATA",
+            "demo/SITECU~1.PY",
+            "demo/EVILP~42.PTH",
+            "demo/ÉVILP~1.PTH",
             "demo/NUL.py",
             "demo/com1.txt",
             "demo/COM¹.txt",
@@ -1842,6 +1880,26 @@ mod tests {
                 |v| matches!(v, ArchiveViolation::WindowsPathTraversal { member: found } if found == member),
             );
         }
+    }
+
+    #[test]
+    fn windows_short_name_alias_cannot_overwrite_a_startup_hook() {
+        // On an NTFS volume with 8.3-name creation enabled, creating the long name
+        // can assign `SITECU~1.PY` as its short alias. A later member using that
+        // spelling would address the same file while literal-name classification
+        // sees only an ordinary `.py` source. Reject the archive independently of
+        // the inspection host so extraction order can never turn this pair into an
+        // analyzed-benign then overwritten startup hook.
+        let bytes = ZipBuilder::new()
+            .stored("sitecustomize.py", b"# benign prefix inspected by Tirith\n")
+            .stored("SITECU~1.PY", b"import os; os.system('id')\n")
+            .build();
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        assert_rejected_with(
+            &outcome,
+            "DOS 8.3 overwrite alias",
+            |v| matches!(v, ArchiveViolation::WindowsPathTraversal { member } if member == "SITECU~1.PY"),
+        );
     }
 
     #[test]
@@ -2737,6 +2795,11 @@ mod tests {
         assert!(has_windows_path("//server/share"));
         assert!(!has_windows_path("a/b/c"));
         assert!(!has_windows_path("demo/__init__.py"));
+        // A literal tilde without a numeric generation and a long extension are
+        // not possible generated 8.3 aliases, so ordinary portable names remain
+        // accepted.
+        assert!(!has_windows_path("demo/module~beta.py"));
+        assert!(!has_windows_path("demo/module~1.long"));
     }
 
     #[test]

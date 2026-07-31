@@ -117,7 +117,8 @@ pub fn run(target: GraphTarget, format: GraphFormat) -> i32 {
 ///
 /// Returns a process exit code: the verdict's exit code (Allow `0`, Warn `2`,
 /// Block `1`) when both wheels inspected, or `2` on a usage / input error (a wheel
-/// that could not be inspected). A clean diff (no anomaly) is an Allow, exit `0`.
+/// that could not be inspected). A complete diff with no anomaly is an Allow,
+/// exit `0`; any coverage gap is fail-closed and exits `1`.
 pub fn run_diff(old: &Path, new: &Path, json: bool) -> i32 {
     let diff = match diff_artifact_files(old, new) {
         Ok(d) => d,
@@ -144,6 +145,9 @@ pub fn run_diff(old: &Path, new: &Path, json: bool) -> i32 {
             "action": format!("{:?}", verdict.action),
             "anomaly_count": diff.anomalies.len(),
             "anomalies": diff.anomalies,
+            "complete": diff.coverage_gaps.is_empty(),
+            "coverage_gap_count": diff.coverage_gaps.len(),
+            "coverage_gaps": diff.coverage_gaps,
             "rule_ids": verdict
                 .findings
                 .iter()
@@ -159,8 +163,8 @@ pub fn run_diff(old: &Path, new: &Path, json: bool) -> i32 {
     exit
 }
 
-/// Report a release-diff input error (a wheel that could not be inspected) in the
-/// requested format.
+/// Report a release-diff input error (a wheel that could not be inspected or was
+/// structurally rejected) in the requested format.
 fn report_diff_error(err: &ReleaseDiffError, json: bool) {
     if json {
         let out = serde_json::json!({
@@ -202,11 +206,29 @@ fn render_diff_human_to<W: Write>(
     let new = super::sanitize_for_human_output(&new.display().to_string(), false);
     writeln!(out, "tirith pkg diff: {old} -> {new}")?;
     writeln!(out, "  verdict:  {:?}", verdict.action)?;
-    if diff.anomalies.is_empty() {
+    if !diff.coverage_gaps.is_empty() {
         writeln!(
             out,
-            "  no release anomaly: the two releases have the same execution shape"
+            "  {} coverage gap(s); release comparison is incomplete:",
+            diff.coverage_gaps.len()
         )?;
+        for gap in &diff.coverage_gaps {
+            let location = super::sanitize_for_human_output(&gap.location.to_string(), false);
+            writeln!(out, "    [{}] {location}", gap.kind.as_str())?;
+        }
+    }
+    if diff.anomalies.is_empty() {
+        if diff.coverage_gaps.is_empty() {
+            writeln!(
+                out,
+                "  no release anomaly: the two releases have the same execution shape"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "  no visible release anomaly; incomplete analysis prevents a clean result"
+            )?;
+        }
         return Ok(());
     }
     writeln!(out, "  {} release anomaly(ies):", diff.anomalies.len())?;
@@ -440,6 +462,7 @@ mod tests {
                 kind: ReleaseAnomalyKind::StartupHookAdded,
                 detail: "member\u{1b}[2J\nFORGED\u{202e}".to_string(),
             }],
+            coverage_gaps: Vec::new(),
         };
         let verdict = diff.evaluate(&Policy::default());
         let mut out = Vec::new();
@@ -462,6 +485,38 @@ mod tests {
             raw["anomalies"][0]["detail"], "member\u{1b}[2J\nFORGED\u{202e}",
             "machine identity must remain raw and structured"
         );
+    }
+
+    #[test]
+    fn release_diff_renderer_surfaces_coverage_and_never_claims_clean() {
+        let diff = ReleaseDiff {
+            anomalies: Vec::new(),
+            coverage_gaps: vec![tirith_core::scan::CoverageGap {
+                location: tirith_core::location::SubjectLocation::member(
+                    "new.whl",
+                    "members after entry 10000",
+                ),
+                kind: tirith_core::scan::CoverageGapKind::EntryCountCapped,
+                sha256: None,
+            }],
+        };
+        let verdict = diff.evaluate(&Policy::default());
+        assert_eq!(verdict.action, tirith_core::verdict::Action::Block);
+
+        let mut out = Vec::new();
+        render_diff_human_to(
+            &mut out,
+            Path::new("old.whl"),
+            Path::new("new.whl"),
+            &diff,
+            &verdict,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("coverage gap"));
+        assert!(text.contains("entry_count_capped"));
+        assert!(text.contains("prevents a clean result"));
+        assert!(!text.contains("same execution shape"));
     }
 
     #[test]
@@ -586,10 +641,10 @@ mod tests {
         path
     }
 
-    /// `pkg diff` over a pure->native release returns the warn exit code (2): the
-    /// release anomaly is surfaced, not blocked, under the default operator policy.
+    /// `pkg diff` over a release adding an unparseable native member is fail-closed:
+    /// the pure->native anomaly stays visible, but incomplete native analysis blocks.
     #[test]
-    fn run_diff_pure_to_native_warns() {
+    fn run_diff_unparseable_pure_to_native_blocks() {
         let dir = tempfile::tempdir().unwrap();
         let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
         let so: &[u8] = b"\x7fELF\x02\x01\x01\x00 tiny native body";
@@ -600,7 +655,7 @@ mod tests {
         );
         // JSON form so nothing is written to stderr in the test output.
         let code = run_diff(&old, &new, true);
-        assert_eq!(code, 2, "a release anomaly warns (exit 2)");
+        assert_eq!(code, 1, "incomplete native analysis blocks (exit 1)");
     }
 
     /// `pkg diff` over an honest point release (same shape) returns 0.
