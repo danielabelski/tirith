@@ -1729,40 +1729,13 @@ fn check_pipe_to_interpreter(
                     };
 
                     let description = if is_url_fetch_command(&source_base) {
-                        let show_tirith_run = cfg!(unix)
-                            && supports_tirith_run_hint(&source_base)
-                            && matches!(shell, ShellType::Posix | ShellType::Fish);
-                        if let Some(url) = extract_urls_from_args(&source.args, shell)
-                            .into_iter()
-                            .next()
-                            .map(|u| sanitize_url_for_display(&u))
-                        {
-                            if let Some(url) = show_tirith_run
-                                .then(|| crate::safe_command::shell_single_quote(&url))
-                                .flatten()
-                            {
-                                format!(
-                                    "{base_desc}\n  Safer: tirith run --capsule {url}  \
-                                     \u{2014} or: vet {url}  (https://getvet.sh)"
-                                )
-                            } else {
-                                format!(
-                                    "{base_desc}\n  Safer: vet {url}  \
-                                     (https://getvet.sh)"
-                                )
-                            }
-                        } else if show_tirith_run {
-                            format!(
-                                "{base_desc}\n  Safer: use 'tirith run --capsule <url>' \
-                                 or 'vet <url>' (https://getvet.sh) to inspect \
-                                 before executing."
-                            )
-                        } else {
-                            format!(
-                                "{base_desc}\n  Safer: use 'vet <url>' \
-                                 (https://getvet.sh) to inspect before executing."
-                            )
-                        }
+                        format!(
+                            "{base_desc}\n  Safer: run `tirith check --suggest -- <command>`; \
+                             Tirith emits a typed capsule command only when it can prove the \
+                             URL, interpreter, argv, and stdin semantics. Otherwise download \
+                             into a private location (or use `vet <url>`, https://getvet.sh) \
+                             and review the exact bytes before execution."
+                        )
                     } else {
                         base_desc
                     };
@@ -2545,14 +2518,14 @@ fn is_private_ip(host: &str) -> bool {
     false
 }
 
-/// POSIX fetch commands — eligible for both `tirith run` and `vet` hints.
+/// POSIX URL-fetch commands.
 const POSIX_FETCH_COMMANDS: &[&str] = &["curl", "wget", "http", "https", "xh", "fetch"];
 
-/// PowerShell fetch commands — `vet` hints only (`tirith run` is POSIX-only).
+/// PowerShell URL-fetch commands.
 const POWERSHELL_FETCH_COMMANDS: &[&str] =
     &["iwr", "irm", "invoke-webrequest", "invoke-restmethod"];
 
-/// Source commands that are not URL-fetching (no vet/tirith-run hints).
+/// Source commands that are not URL-fetching.
 const NON_FETCH_SOURCE_COMMANDS: &[&str] = &["scp", "rsync"];
 
 fn is_source_command(cmd: &str) -> bool {
@@ -2566,22 +2539,11 @@ fn is_url_fetch_command(cmd: &str) -> bool {
     POSIX_FETCH_COMMANDS.contains(&cmd) || POWERSHELL_FETCH_COMMANDS.contains(&cmd)
 }
 
-/// Whether this fetch source supports `tirith run` hints (POSIX fetch only).
-fn supports_tirith_run_hint(cmd: &str) -> bool {
-    POSIX_FETCH_COMMANDS.contains(&cmd)
-}
-
 /// Check if string starts with http:// or https:// (case-insensitive scheme).
 fn starts_with_http_scheme(s: &str) -> bool {
     let b = s.as_bytes();
     (b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://"))
         || (b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"http://"))
-}
-
-/// Strip control characters from a URL so it cannot inject ANSI escapes /
-/// newlines into the finding description shown to the user.
-fn sanitize_url_for_display(url: &str) -> String {
-    url.chars().filter(|&c| !c.is_ascii_control()).collect()
 }
 
 /// Extract all URLs from command arguments.
@@ -5610,24 +5572,14 @@ mod tests {
         check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
         assert_eq!(findings.len(), 1);
         assert!(
-            findings[0]
-                .description
-                .contains("https://example.com/install.sh"),
-            "should include extracted URL in hint"
-        );
-        assert!(
             findings[0].description.contains("getvet.sh"),
             "should mention vet"
         );
-        if cfg!(unix) {
-            assert!(
-                findings[0]
-                    .description
-                    .contains("tirith run --capsule 'https://example.com/install.sh'"),
-                "Unix builds should suggest the quoted capsule runner: {}",
-                findings[0].description
-            );
-        }
+        assert!(
+            findings[0].description.contains("tirith check --suggest"),
+            "the finding should delegate executable rewrites to the verified suggestion path: {}",
+            findings[0].description
+        );
     }
 
     #[test]
@@ -5638,10 +5590,10 @@ mod tests {
         check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
         assert_eq!(findings.len(), 1);
         assert!(
-            findings[0]
-                .description
-                .contains("https://example.com/install.sh"),
-            "should extract URL from quoted arg"
+            findings[0].evidence.iter().any(
+                |e| matches!(e, Evidence::Url { raw } if raw == "https://example.com/install.sh")
+            ),
+            "quoted URL should remain available as structured evidence"
         );
     }
 
@@ -5653,10 +5605,10 @@ mod tests {
         check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
         assert_eq!(findings.len(), 1);
         assert!(
-            findings[0]
-                .description
-                .contains("https://example.com/install.sh"),
-            "should extract URL from --flag=value"
+            findings[0].evidence.iter().any(
+                |e| matches!(e, Evidence::Url { raw } if raw == "https://example.com/install.sh")
+            ),
+            "--flag=value URL should remain available as structured evidence"
         );
     }
 
@@ -5783,8 +5735,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_to_interpreter_hint_sanitizes_ansi_in_url() {
-        // \x1b[31m is an ANSI "red" escape — must be stripped from hint
+    fn test_pipe_to_interpreter_hint_does_not_reemit_ansi_url() {
         let input = "curl https://example.com/\x1b[31mred | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
@@ -5792,64 +5743,28 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(
             !findings[0].description.contains('\x1b'),
-            "ANSI escape must be stripped from hint URL: {}",
+            "ANSI escape must not reach the static hint: {}",
             findings[0].description
         );
         assert!(
-            findings[0]
-                .description
-                .contains("https://example.com/[31mred"),
-            "URL should be present minus the ESC byte: {}",
+            !findings[0].description.contains("example.com"),
+            "untrusted executable URL data must not be sanitized and re-emitted: {}",
             findings[0].description
         );
     }
 
     #[test]
-    fn test_pipe_to_interpreter_hint_sanitizes_newline_in_url() {
-        // Newline in URL arg could spoof extra output lines
+    fn test_pipe_to_interpreter_hint_does_not_reemit_newline_url() {
         let input = "curl \"https://example.com/\nFAKE: safe\" | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
         check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
         assert_eq!(findings.len(), 1);
-        // The \n must be stripped — "FAKE" collapses onto the URL, not a separate line
-        let hint_line = findings[0]
-            .description
-            .lines()
-            .find(|l| l.contains("Safer:"))
-            .expect("should have hint line");
         assert!(
-            hint_line.contains("example.com/FAKE"),
-            "newline stripped, FAKE should be part of the URL on the hint line: {hint_line}"
-        );
-        // Verify no line starts with "FAKE" (would indicate injection)
-        assert!(
-            !findings[0]
-                .description
-                .lines()
-                .any(|l| l.starts_with("FAKE")),
-            "newline injection must not create a spoofed output line: {}",
+            !findings[0].description.contains("FAKE")
+                && !findings[0].description.contains("example.com"),
+            "control-bearing URL data must not be sanitized and re-emitted: {}",
             findings[0].description
-        );
-    }
-
-    #[test]
-    fn test_sanitize_url_for_display() {
-        assert_eq!(
-            sanitize_url_for_display("https://ok.com/path"),
-            "https://ok.com/path"
-        );
-        assert_eq!(
-            sanitize_url_for_display("https://evil.com/\x1b[31mred\x1b[0m"),
-            "https://evil.com/[31mred[0m"
-        );
-        assert_eq!(
-            sanitize_url_for_display("https://evil.com/\n\rspoof"),
-            "https://evil.com/spoof"
-        );
-        assert_eq!(
-            sanitize_url_for_display("https://evil.com/\x07bell\x00null"),
-            "https://evil.com/bellnull"
         );
     }
 

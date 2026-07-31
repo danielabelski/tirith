@@ -149,24 +149,29 @@ exact command you ran:
 tirith check --suggest-safe-command -- 'curl https://example.com/install.sh | bash'
 # tirith: safer alternative
 #   curl_pipe_shell
-#     try: tirith run --capsule 'https://example.com/install.sh'
+#     try: tirith run --capsule --script-stdin --interpreter bash \
+#          'https://example.com/install.sh'
 ```
 
-The runner bounds and analyzes the downloaded bytes in memory, asks for
-confirmation, then executes a hash-verified private copy inside a fail-closed
-capsule. Suggestions also drop insecure-TLS flags and upgrade `http://` to
-`https://`. For findings with no safe mechanical rewrite it says so plainly
-instead of guessing. The flag is advisory — it never changes the verdict or
-exit code. Use `tirith explain --rule curl_pipe_shell --fix` to see a rule's
-remediation on its own.
+For this proven shape, the runner bounds and analyzes the downloaded bytes,
+asks for confirmation, then feeds a hash-verified private copy to the selected
+`bash` over stdin inside a fail-closed capsule. It ignores a conflicting remote
+shebang. Literal no-argument `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, and
+`ash` are supported, as is the narrow POSIX-shell `-s -- <literal operands...>`
+form. Dynamic or malformed URL tokens, controls, Cmd, `|&`, and unsupported
+downloader/interpreter arguments produce guidance rather than an executable
+rewrite. Suggestions also drop insecure-TLS flags and upgrade `http://` to
+`https://`. The flag is advisory — it never changes the verdict or exit code.
 
 ### Using tirith run (built-in, Unix only)
 
-`tirith run` downloads, inspects, and prompts before executing:
+`tirith run` downloads, analyzes, and prompts before executing a private copy.
+A manual invocation uses the fully analyzed remote shebang and file semantics;
+use the command emitted by `check --suggest` when preserving an original stdin
+pipeline matters:
 
 ```bash
-# Instead of: curl -fsSL https://example.com/install.sh | bash
-tirith run https://example.com/install.sh
+tirith run --capsule https://example.com/install.sh
 ```
 
 Download and inspect only (no execution):
@@ -180,6 +185,12 @@ Pin to a known hash:
 ```bash
 tirith run --sha256 abc123... https://example.com/install.sh
 ```
+
+There is no pager step in `tirith run`; use `--no-exec` to stop after analysis,
+or `tirith fetch <url> --save <path>` for explicit file review. `--capsule` refuses execution if
+the host backend cannot meet its required coverage. Download and DNS resolution
+happen before the interpreter capsule, so containment is not a separate claim
+about the pre-execution resolver path.
 
 ### Using tirith install (recorded install transaction)
 

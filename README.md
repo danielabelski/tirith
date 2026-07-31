@@ -673,12 +673,17 @@ where a transformation is genuinely safer and correct:
 
 ```bash
 tirith check --suggest -- 'curl https://example-cli.dev/i.sh | bash'
-# → try: tirith run --capsule 'https://example-cli.dev/i.sh'
+# → try: tirith run --capsule --script-stdin --interpreter bash \
+#          'https://example-cli.dev/i.sh'
 ```
 
-It routes pipe-to-shell through Tirith's bounded, reviewed, hash-verified,
-fail-closed capsule runner, drops insecure-TLS flags (`-k` / `--insecure` /
-`--no-check-certificate`), and switches plain `http://` to `https://`. For
+For command shapes whose URL, shell, arguments, and stdin behavior can be
+decoded exactly, it routes pipe-to-shell through Tirith's bounded, reviewed,
+hash-verified, fail-closed capsule runner while preserving the selected shell
+instead of trusting the remote shebang. Dynamic or malformed URL tokens,
+unsupported interpreter arguments, Cmd, and ambiguous pipelines remain
+guidance-only. Suggestions also drop insecure-TLS flags (`-k` / `--insecure` /
+`--no-check-certificate`) and switch plain `http://` to `https://`. For
 findings with no safe mechanical rewrite (homograph
 hostnames, archive-extract targets, …) it says so plainly and shows the
 remediation instead, it never emits a bogus suggestion. The flag is advisory:
@@ -707,7 +712,7 @@ The everyday commands:
 | `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds a safer rewrite) |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
 | `tirith scan [path]` | Scan files, directories, and configs (`--profile`, `--format sarif`, `--ci`) |
-| `tirith run --capsule <url>` | Safe `curl \| bash` replacement: download, analyze, review, then execute contained (Unix) |
+| `tirith run [--capsule] <url>` | Download, analyze, confirm, and optionally execute in a fail-closed capsule; `check --suggest` adds typed stdin/interpreter flags only for provable pipe rewrites (Unix) |
 | `tirith fix -- <cmd>` | Interactively rewrite a risky command into a safer form |
 | `tirith score <url>` / `diff <url>` | Break down a URL's trust signals, or show where suspicious characters hide |
 | `tirith explain --rule <id>` / `why` | Rule docs and remediation, or explain the last trigger |

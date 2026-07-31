@@ -309,6 +309,90 @@ pub fn run_to_completion(
     )
 }
 
+/// Run a contained process with exact caller-supplied bytes on stdin while
+/// forwarding its stdout and stderr to the current process. This is the
+/// pipe-preserving execution shape used by safe rewrites of
+/// `<fetch> | <interpreter>`.
+///
+/// The launch uses the same fail-closed backend selection as
+/// [`run_to_completion`]. Program and argv stay typed; no shell joins or
+/// reparses them.
+pub fn run_to_completion_with_stdin(
+    spec: &CapsuleSpec,
+    program: &str,
+    args: &[String],
+    input: &[u8],
+    extra_env: &[(String, String)],
+    degraded: DegradedPolicy,
+) -> Result<CapsuleOutcome, CapsuleRefused> {
+    use std::io::Write as _;
+
+    let (mut child, selected, ran_degraded) =
+        spawn_piped(spec, program, args, extra_env, degraded)?;
+    let mut child_stdout = child.stdout.take().ok_or_else(|| CapsuleRefused {
+        backend_id: selected.backend_id,
+        reason: "contained child stdout was not piped".to_string(),
+    })?;
+    let mut child_stderr = child.stderr.take().ok_or_else(|| CapsuleRefused {
+        backend_id: selected.backend_id,
+        reason: "contained child stderr was not piped".to_string(),
+    })?;
+    let stdout_thread = std::thread::spawn(move || {
+        let mut output = std::io::stdout().lock();
+        std::io::copy(&mut child_stdout, &mut output)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut output = std::io::stderr().lock();
+        std::io::copy(&mut child_stderr, &mut output)
+    });
+
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| CapsuleRefused {
+            backend_id: selected.backend_id,
+            reason: "contained child stdin was not piped".to_string(),
+        })?
+        .write_all(input);
+    let status = child.wait().map_err(|error| CapsuleRefused {
+        backend_id: selected.backend_id,
+        reason: format!("capsule wait failed: {error}"),
+    })?;
+
+    for (stream, thread) in [("stdout", stdout_thread), ("stderr", stderr_thread)] {
+        match thread.join() {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return Err(CapsuleRefused {
+                    backend_id: selected.backend_id,
+                    reason: format!("forward child {stream}: {error}"),
+                })
+            }
+            Err(_) => {
+                return Err(CapsuleRefused {
+                    backend_id: selected.backend_id,
+                    reason: format!("forward child {stream}: worker panicked"),
+                })
+            }
+        }
+    }
+    if let Err(error) = write_result {
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(CapsuleRefused {
+                backend_id: selected.backend_id,
+                reason: format!("write contained child stdin: {error}"),
+            });
+        }
+    }
+
+    Ok(CapsuleOutcome {
+        exit_code: status.code().unwrap_or(128),
+        backend_id: selected.backend_id,
+        coverage: selected.coverage,
+        degraded: ran_degraded,
+    })
+}
+
 /// OS-native variant of [`run_to_completion`]. This is the authoritative launch
 /// path for callers such as `temp-run` that must preserve argument boundaries and
 /// non-UTF8 Unix bytes exactly. No component is joined or reparsed by a shell.

@@ -759,7 +759,7 @@ mod tests {
             // Mirrors what `rewrite_pipe_to_shell` emits: the original URL is the
             // runner's quoted argument. Here it carries the custom-pattern token.
             safe_command: Some(format!(
-                "tirith run --capsule 'https://evil.example/{secret}'"
+                "tirith run --capsule --script-stdin --interpreter bash 'https://evil.example/{secret}'"
             )),
             // Also plant it in the rationale (env-scrub builds this at runtime).
             rationale: format!("downloads {secret} for review"),
@@ -1324,7 +1324,9 @@ mod tests {
         assert!(out.contains("safer alternative"), "{out}");
         assert!(out.contains("try:"), "{out}");
         assert!(
-            out.contains("tirith run --capsule 'https://example.com/x.sh'"),
+            out.contains(
+                "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/x.sh'"
+            ),
             "{out}"
         );
         assert!(out.contains("fix:"), "{out}");

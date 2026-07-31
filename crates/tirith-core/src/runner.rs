@@ -31,17 +31,125 @@ pub struct RunResult {
 /// inside the OS containment capsule without `tirith-core` depending on the
 /// capsule launcher (which is async/OS-API-bound and lives in the CLI crate).
 ///
-/// Given the resolved `interpreter` and the private, hash-verified execution-file
-/// `path`, it runs the script and returns its exit code. The content-addressed
-/// cache is never passed to an executor. When `None`, the runner uses its built-in
-/// uncontained `Command::new(interpreter).arg(path)` execution.
-pub type ScriptExecutor = Box<dyn Fn(&str, &std::path::Path) -> Result<i32, String>>;
+/// Given the typed invocation, private hash-verified execution file, and bytes
+/// read back from that still-open file, run the script and return its exit code.
+/// The content-addressed cache is never passed to an executor.
+pub type ScriptExecutor =
+    Box<dyn Fn(&ScriptInvocation, &std::path::Path, &[u8]) -> Result<i32, String>>;
+
+/// Shell interpreters that a safe-command rewrite may explicitly preserve.
+/// These names are closed and path-free so an attacker cannot turn a generated
+/// suggestion into an arbitrary program launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeInterpreter {
+    Sh,
+    Bash,
+    Zsh,
+    Dash,
+    Ksh,
+    Fish,
+    Ash,
+}
+
+impl PipeInterpreter {
+    /// Stable executable name passed directly to the process launcher.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sh => "sh",
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Dash => "dash",
+            Self::Ksh => "ksh",
+            Self::Fish => "fish",
+            Self::Ash => "ash",
+        }
+    }
+}
+
+impl std::fmt::Display for PipeInterpreter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for PipeInterpreter {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "sh" => Ok(Self::Sh),
+            "bash" => Ok(Self::Bash),
+            "zsh" => Ok(Self::Zsh),
+            "dash" => Ok(Self::Dash),
+            "ksh" => Ok(Self::Ksh),
+            "fish" => Ok(Self::Fish),
+            "ash" => Ok(Self::Ash),
+            _ => Err(format!(
+                "unsupported stdin interpreter {value:?}; expected sh, bash, zsh, dash, ksh, fish, or ash"
+            )),
+        }
+    }
+}
+
+/// How the reviewed bytes reach the selected interpreter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptInputMode {
+    /// Invoke the interpreter with the private file path (manual `tirith run`).
+    File,
+    /// Pipe the reviewed bytes to stdin (safe rewrite of `<fetch> | <shell>`).
+    Stdin,
+}
+
+/// Exact interpreter invocation selected before download. A forced stdin
+/// invocation deliberately overrides any shebang in the remote bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptInvocation {
+    /// Closed interpreter program name (never an arbitrary generated path).
+    pub interpreter: String,
+    /// Exact argument boundaries passed without a shell.
+    pub args: Vec<String>,
+    /// Whether bytes arrive by private path or stdin.
+    pub input_mode: ScriptInputMode,
+}
+
+/// Validate the narrow argv contract safe-command suggestions can preserve.
+/// Every supported shell may read stdin with no arguments. POSIX-family shells
+/// additionally support the explicit `-s -- <literal operands...>` form. Fish
+/// has no equivalent `-s` contract and therefore remains no-args only.
+pub fn pipe_interpreter_args_supported(interpreter: PipeInterpreter, args: &[String]) -> bool {
+    if args.is_empty() {
+        return true;
+    }
+    if interpreter == PipeInterpreter::Fish
+        || args.len() < 2
+        || args[0] != "-s"
+        || args[1] != "--"
+        || args.len() > 34
+    {
+        return false;
+    }
+    args[2..]
+        .iter()
+        .all(|arg| arg.len() <= 4096 && !arg.is_empty() && !arg.chars().any(char::is_control))
+}
+
+/// Caller request corresponding to a verified pipe-to-shell suggestion.
+#[derive(Debug, Clone)]
+pub struct RequestedPipeInvocation {
+    /// The selected shell from the original pipeline.
+    pub interpreter: PipeInterpreter,
+    /// Narrow, prevalidated literal argv from the original sink.
+    pub args: Vec<String>,
+}
 
 pub struct RunOptions {
     pub url: String,
     pub no_exec: bool,
     pub interactive: bool,
     pub expected_sha256: Option<String>,
+    /// A typed stdin invocation emitted by the safe-command rewriter. When set,
+    /// the chosen interpreter and argv override the downloaded shebang.
+    pub requested_pipe_invocation: Option<RequestedPipeInvocation>,
     /// Optional contained executor for the run step (E5). `None` keeps the
     /// built-in uncontained execution.
     pub exec_fn: Option<ScriptExecutor>,
@@ -85,11 +193,32 @@ impl ExecutionFile {
     fn path(&self) -> &Path {
         self.file.path()
     }
+
+    fn read_verified(&self, expected_len: usize, expected_sha256: &str) -> Result<Vec<u8>, String> {
+        let mut reader = self
+            .file
+            .as_file()
+            .try_clone()
+            .map_err(|e| format!("clone execution file handle: {e}"))?;
+        use std::io::{Read as _, Seek as _};
+        reader
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| format!("rewind execution file: {e}"))?;
+        let mut bytes = Vec::with_capacity(expected_len);
+        reader
+            .take(expected_len as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("read execution file: {e}"))?;
+        if bytes.len() != expected_len || sha256_hex(&bytes) != expected_sha256 {
+            return Err("execution file digest changed before spawn".to_string());
+        }
+        Ok(bytes)
+    }
 }
 
 /// Interpreters matched by exact name only.
 const ALLOWED_EXACT: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "fish", "deno", "bun", "nodejs",
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "deno", "bun", "nodejs",
 ];
 
 /// Interpreter families allowed with an optional `digits[.digits]*` version
@@ -289,7 +418,7 @@ fn interpreter_analysis(
     interpreter: &str,
 ) -> Option<(crate::tokenize::ShellType, bool, &'static str)> {
     let base = interpreter.rsplit('/').next().unwrap_or(interpreter);
-    if matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh") {
+    if matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash") {
         return Some((crate::tokenize::ShellType::Posix, true, "sh"));
     }
     if base == "fish" {
@@ -320,6 +449,7 @@ fn review_script_bytes(
     will_execute: bool,
     interactive: bool,
     cwd: Option<&Path>,
+    forced_interpreter: Option<&str>,
 ) -> Result<ScriptReview, String> {
     let content_str = match std::str::from_utf8(content) {
         Ok(text) => text.to_string(),
@@ -328,7 +458,9 @@ fn review_script_bytes(
         }
         Err(_) => {
             let lossy = String::from_utf8_lossy(content).into_owned();
-            let interpreter = script_analysis::detect_interpreter(&lossy).to_string();
+            let interpreter = forced_interpreter
+                .map(str::to_string)
+                .unwrap_or_else(|| script_analysis::detect_interpreter(&lossy).to_string());
             return Ok(ScriptReview {
                 legacy: script_analysis::analyze(&lossy, &interpreter),
                 interpreter,
@@ -340,7 +472,12 @@ fn review_script_bytes(
             });
         }
     };
-    let interpreter = script_analysis::detect_interpreter(&content_str).to_string();
+    // A safe rewrite of `<fetch> | <shell>` must preserve the selected shell,
+    // not trust a remote shebang to replace it with Python, Node, or anything
+    // else. Manual `tirith run` retains shebang detection.
+    let interpreter = forced_interpreter
+        .map(str::to_string)
+        .unwrap_or_else(|| script_analysis::detect_interpreter(&content_str).to_string());
     let Some((shell, command_semantics, extension)) = interpreter_analysis(&interpreter) else {
         if will_execute {
             return Err(format!(
@@ -562,6 +699,20 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     if !opts.no_exec && !opts.interactive {
         return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
     }
+    if let Some(requested) = opts.requested_pipe_invocation.as_ref() {
+        if opts.exec_fn.is_none() {
+            return Err(
+                "a forced stdin interpreter is accepted only with fail-closed capsule execution"
+                    .to_string(),
+            );
+        }
+        if !pipe_interpreter_args_supported(requested.interpreter, &requested.args) {
+            return Err(format!(
+                "unsupported argv for forced stdin interpreter '{}'",
+                requested.interpreter
+            ));
+        }
+    }
     let purpose = if opts.no_exec {
         DownloadPurpose::SaveOnly
     } else {
@@ -579,15 +730,37 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     persist_cache_entry(&cache_dir, &cached_path, &content)?;
 
     let cwd = std::env::current_dir().ok();
-    let mut review =
-        review_script_bytes(&content, !opts.no_exec, opts.interactive, cwd.as_deref())?;
+    let forced_interpreter = opts
+        .requested_pipe_invocation
+        .as_ref()
+        .map(|requested| requested.interpreter.as_str());
+    let mut review = review_script_bytes(
+        &content,
+        !opts.no_exec,
+        opts.interactive,
+        cwd.as_deref(),
+        forced_interpreter,
+    )?;
+    let invocation = if let Some(requested) = opts.requested_pipe_invocation.as_ref() {
+        ScriptInvocation {
+            interpreter: requested.interpreter.as_str().to_string(),
+            args: requested.args.clone(),
+            input_mode: ScriptInputMode::Stdin,
+        }
+    } else {
+        ScriptInvocation {
+            interpreter: review.interpreter.clone(),
+            args: Vec::new(),
+            input_mode: ScriptInputMode::File,
+        }
+    };
     // Keep the legacy allowlist as a second, explicit execution gate. The
     // analyzer table is intentionally no broader than this list, but both must
     // agree before an interpreter is invoked.
-    if !opts.no_exec && !is_allowed_interpreter(&review.interpreter) {
+    if !opts.no_exec && !is_allowed_interpreter(&invocation.interpreter) {
         return Err(format!(
             "interpreter '{}' is not in the allowed list",
-            review.interpreter
+            invocation.interpreter
         ));
     }
 
@@ -683,7 +856,13 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         content.len(),
         crate::receipt::short_hash(&sha256)
     );
-    eprintln!("tirith: interpreter: {}", review.interpreter);
+    eprintln!("tirith: interpreter: {}", invocation.interpreter);
+    if invocation.input_mode == ScriptInputMode::Stdin {
+        eprintln!("tirith: script input: stdin");
+    }
+    if !invocation.args.is_empty() {
+        eprintln!("tirith: interpreter argv: {:?}", invocation.args);
+    }
     if bypass_honored {
         eprintln!(
             "tirith: blocking body verdict explicitly bypassed via TIRITH=0 (audited with raw findings)"
@@ -726,13 +905,40 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     // handle alive across execution, and verify its digest before the executor
     // sees the path. A cache replacement therefore cannot change executed bytes.
     let execution = materialize_execution_file(&cache_dir, &content, &sha256)?;
+    let execution_bytes = execution.read_verified(content.len(), &sha256)?;
     let exit_code = if let Some(exec) = opts.exec_fn.as_ref() {
-        Some(exec(&review.interpreter, execution.path())?)
+        Some(exec(&invocation, execution.path(), &execution_bytes)?)
     } else {
-        let status = Command::new(&review.interpreter)
-            .arg(execution.path())
-            .status()
-            .map_err(|e| format!("execute: {e}"))?;
+        let mut command = Command::new(&invocation.interpreter);
+        match invocation.input_mode {
+            ScriptInputMode::File => {
+                command.args(&invocation.args).arg(execution.path());
+            }
+            ScriptInputMode::Stdin => {
+                // This branch is unreachable for caller-supplied forced stdin
+                // invocations (they require `exec_fn` above), but keeping the
+                // primitive correct makes the type's contract explicit.
+                command
+                    .args(&invocation.args)
+                    .stdin(std::process::Stdio::piped());
+            }
+        }
+        let mut child = command.spawn().map_err(|e| format!("execute: {e}"))?;
+        let write_result = if invocation.input_mode == ScriptInputMode::Stdin {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "execute: interpreter stdin was not piped".to_string())?;
+            stdin.write_all(&execution_bytes)
+        } else {
+            Ok(())
+        };
+        let status = child.wait().map_err(|e| format!("execute wait: {e}"))?;
+        if let Err(error) = write_result {
+            if error.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(format!("execute stdin: {error}"));
+            }
+        }
         status.code()
     };
 
@@ -896,6 +1102,7 @@ mod tests {
             true,
             false,
             Some(dir.path()),
+            None,
         )
         .expect("supported UTF-8 shell content must be analyzed");
         assert!(review.analysis_complete);
@@ -909,16 +1116,72 @@ mod tests {
     fn invalid_utf8_and_unsupported_interpreters_refuse_only_execution() {
         let dir = tempfile::tempdir().unwrap();
         let invalid = b"#!/bin/sh\n\xff\n";
-        assert!(review_script_bytes(invalid, true, false, Some(dir.path())).is_err());
-        let inspect = review_script_bytes(invalid, false, false, Some(dir.path()))
+        assert!(review_script_bytes(invalid, true, false, Some(dir.path()), None).is_err());
+        let inspect = review_script_bytes(invalid, false, false, Some(dir.path()), None)
             .expect("--no-exec must retain incomplete inspection");
         assert!(!inspect.analysis_complete);
 
         let unsupported = b"#!/usr/bin/awk -f\nBEGIN { print \"ok\" }\n";
-        assert!(review_script_bytes(unsupported, true, false, Some(dir.path())).is_err());
-        let inspect = review_script_bytes(unsupported, false, false, Some(dir.path()))
+        assert!(review_script_bytes(unsupported, true, false, Some(dir.path()), None).is_err());
+        let inspect = review_script_bytes(unsupported, false, false, Some(dir.path()), None)
             .expect("--no-exec must retain unsupported-interpreter inspection");
         assert!(!inspect.analysis_complete);
+    }
+
+    #[test]
+    fn forced_shell_review_ignores_remote_python_and_node_shebangs() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in [
+            b"#!/usr/bin/env python3\nprint('remote python')\n".as_slice(),
+            b"#!/usr/bin/env node\nconsole.log('remote node')\n".as_slice(),
+        ] {
+            let review = review_script_bytes(content, true, false, Some(dir.path()), Some("bash"))
+                .expect("forced bash has a complete shell analyzer");
+            assert_eq!(review.interpreter, "bash");
+            assert!(review.analysis_complete);
+        }
+    }
+
+    #[test]
+    fn pipe_interpreter_argv_contract_is_narrow() {
+        assert!(pipe_interpreter_args_supported(PipeInterpreter::Bash, &[]));
+        assert!(pipe_interpreter_args_supported(
+            PipeInterpreter::Bash,
+            &["-s".into(), "--".into(), "feature".into()]
+        ));
+        assert!(!pipe_interpreter_args_supported(
+            PipeInterpreter::Bash,
+            &["-e".into()]
+        ));
+        assert!(!pipe_interpreter_args_supported(
+            PipeInterpreter::Fish,
+            &["-s".into(), "--".into()]
+        ));
+        assert!(!pipe_interpreter_args_supported(
+            PipeInterpreter::Bash,
+            &["-s".into(), "--".into(), "bad\rarg".into()]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_s_double_dash_reads_reviewed_bytes_from_stdin() {
+        let content = b"#!/usr/bin/env node\nprintf '<%s>\\n' \"$1\"\n";
+        let mut child = Command::new("bash")
+            .args(["-s", "--", "feature"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn bash stdin contract");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(content)
+            .expect("write reviewed bytes");
+        let output = child.wait_with_output().expect("wait bash");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"<feature>\n");
     }
 
     #[test]
@@ -929,6 +1192,7 @@ mod tests {
             true,
             false,
             Some(dir.path()),
+            None,
         )
         .unwrap();
         let raw_count = review.raw_verdict.as_ref().unwrap().findings.len();
@@ -1028,7 +1292,7 @@ mod tests {
 
         // Exercise the real in-memory review before simulating an attacker who
         // swaps the stable content-addressed cache pathname after approval.
-        let review = review_script_bytes(content, true, false, Some(dir.path()))
+        let review = review_script_bytes(content, true, false, Some(dir.path()), None)
             .expect("review clean script bytes");
         assert!(review.analysis_complete);
         std::fs::remove_file(&cache_path).unwrap();

@@ -2669,6 +2669,7 @@ fn run_url(
         no_exec,
         interactive,
         expected_sha256: sha256,
+        requested_pipe_invocation: None,
         // `tirith install` keeps its historical uncontained execution; the
         // contained path is opt-in on `tirith run --capsule` (E5).
         exec_fn: None,

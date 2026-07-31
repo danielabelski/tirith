@@ -270,6 +270,7 @@ Examples:
     #[command(after_help = "\
 Examples:
   tirith run https://get.example-tool.sh
+  tirith run --capsule --script-stdin --interpreter bash https://example.com/install.sh
   tirith run --no-exec https://example.com/install.sh
   tirith run --sha256 abc123 https://example.com/install.sh")]
     Run {
@@ -280,12 +281,27 @@ Examples:
         #[arg(long)]
         no_exec: bool,
 
-        /// Execute the downloaded script inside the OS containment capsule
-        /// (deny-network, scrubbed env, resource limits, FS confined to the
-        /// script's cache dir). Enforcing: a host whose backend cannot enforce
-        /// the containment refuses to run rather than running uncontained.
+        /// Execute the reviewed script inside the OS containment capsule.
+        /// Enforcing: a host whose backend cannot provide the required coverage
+        /// refuses rather than running uncontained. Download/DNS happens first
+        /// under the fetch validator, outside interpreter containment.
         #[arg(long)]
         capsule: bool,
+
+        /// Preserve a pipe-to-shell interpreter selected by a verified safe
+        /// suggestion. Requires --capsule and --script-stdin.
+        #[arg(long, requires = "capsule", requires = "script_stdin")]
+        interpreter: Option<tirith_core::runner::PipeInterpreter>,
+
+        /// Feed the reviewed bytes to the selected interpreter over stdin,
+        /// preserving `<fetch> | <shell>` semantics.
+        #[arg(long, requires = "capsule", requires = "interpreter")]
+        script_stdin: bool,
+
+        /// Exact literal argument for the selected stdin interpreter. This
+        /// narrow surface accepts only the runner's supported argv contract.
+        #[arg(long, requires = "interpreter", allow_hyphen_values = true)]
+        interpreter_arg: Vec<String>,
 
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -6941,12 +6957,29 @@ fn run() {
             url,
             no_exec,
             capsule,
+            interpreter,
+            script_stdin,
+            interpreter_arg,
             format,
             json,
             sha256,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::run::run(&url, no_exec, json, capsule, sha256)
+            debug_assert_eq!(script_stdin, interpreter.is_some());
+            debug_assert!(interpreter.is_some() || interpreter_arg.is_empty());
+            let requested_pipe_invocation =
+                interpreter.map(|interpreter| tirith_core::runner::RequestedPipeInvocation {
+                    interpreter,
+                    args: interpreter_arg,
+                });
+            cli::run::run(
+                &url,
+                no_exec,
+                json,
+                capsule,
+                requested_pipe_invocation,
+                sha256,
+            )
         }
 
         Commands::Install {

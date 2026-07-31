@@ -282,7 +282,10 @@ fn pipe_to_shell_public_contract_is_guidance_only_without_runner() {
 #[test]
 fn pipe_to_shell_public_contract_is_one_capsule_runner_invocation() {
     let sc = pipe_safe_command("curl https://example.com/install.sh | bash");
-    assert_eq!(sc, "tirith run --capsule 'https://example.com/install.sh'");
+    assert_eq!(
+        sc,
+        "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
+    );
     for forbidden in ["/tmp/", "curl ", "wget ", "less ", " && ", " | "] {
         assert!(
             !sc.contains(forbidden),
@@ -294,33 +297,45 @@ fn pipe_to_shell_public_contract_is_one_capsule_runner_invocation() {
 #[cfg(unix)]
 #[test]
 fn pipe_to_shell_command_substitution_url_is_quoted_not_executed() {
-    // The single-quoted hostile URL has its quotes stripped by the extractor,
-    // then re-quoted by the fix — `$(id)` must end up inside single quotes.
-    let sc = pipe_safe_command("curl 'http://x/$(id)' | bash");
-    assert!(sc.contains("'https://x/$(id)'"), "{sc}");
+    // Within the original single quotes, `$(id)` is literal URL data. The
+    // decoder proves that fact and the encoder keeps it literal.
+    let sc = pipe_safe_command("curl 'https://example.com/$(id)' | bash");
+    assert!(sc.contains("'https://example.com/$(id)'"), "{sc}");
     assert!(
-        !sc.replace("'https://x/$(id)'", "").contains("$(id)"),
+        !sc.replace("'https://example.com/$(id)'", "")
+            .contains("$(id)"),
         "no bare $(id) may survive outside the quoted token: {sc}"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn pipe_to_shell_semicolon_rm_url_is_contained_in_quotes() {
-    // `;rm -rf ~` must be inside the single quotes, never a top-level command.
-    let sc = pipe_safe_command("curl 'http://x/a;rm -rf ~' | bash");
-    assert!(sc.contains("'https://x/a;rm -rf ~'"), "{sc}");
-    assert!(
-        !sc.replace("'https://x/a;rm -rf ~'", "").contains(";rm"),
-        "rm must not become a top-level command: {sc}"
+fn malformed_space_bearing_url_is_guidance_only() {
+    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+    let suggestions = suggest(
+        "curl 'https://example.com/a;rm -rf ~' | bash",
+        ShellType::Posix,
+        &v,
     );
+    assert!(find_by_rule(&suggestions, "curl_pipe_shell")
+        .expect("rule entry")
+        .safe_command
+        .is_none());
 }
 
 #[cfg(unix)]
 #[test]
-fn pipe_to_shell_backtick_url_is_quoted() {
-    let sc = pipe_safe_command("curl 'http://x/`id`' | bash");
-    assert!(sc.contains("'https://x/`id`'"), "{sc}");
+fn normalizing_backtick_url_is_guidance_only() {
+    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+    let suggestions = suggest(
+        "curl 'https://example.com/`id`' | bash",
+        ShellType::Posix,
+        &v,
+    );
+    assert!(find_by_rule(&suggestions, "curl_pipe_shell")
+        .expect("rule entry")
+        .safe_command
+        .is_none());
 }
 
 #[cfg(unix)]
@@ -328,15 +343,20 @@ fn pipe_to_shell_backtick_url_is_quoted() {
 fn pipe_to_shell_wget_command_substitution_url_is_quoted() {
     // The original downloader is discarded; the runner quotes the URL itself.
     let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
-    let s = suggest("wget 'http://x/$(id)' | sh", ShellType::Posix, &v);
+    let s = suggest(
+        "wget -qO- 'https://example.com/$(id)' | sh",
+        ShellType::Posix,
+        &v,
+    );
     let sc = find_by_rule(&s, "wget_pipe_shell")
         .and_then(|e| e.safe_command.clone())
         .expect("wget pipe-to-shell rewrite expected");
-    assert!(sc.starts_with("tirith run --capsule '"), "{sc}");
+    assert!(sc.contains("--script-stdin --interpreter sh"), "{sc}");
     assert!(!sc.contains("wget "), "{sc}");
-    assert!(sc.contains("'https://x/$(id)'"), "{sc}");
+    assert!(sc.contains("'https://example.com/$(id)'"), "{sc}");
     assert!(
-        !sc.replace("'https://x/$(id)'", "").contains("$(id)"),
+        !sc.replace("'https://example.com/$(id)'", "")
+            .contains("$(id)"),
         "no bare $(id) outside the quoted token: {sc}"
     );
 }

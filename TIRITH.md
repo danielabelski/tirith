@@ -457,73 +457,48 @@ Beyond URL analysis, detect dangerous command patterns using the source-sink mod
 
 ### 5. Pipe-to-shell safe mode (script pre-analyzer)
 
-When a source-to-sink connection is detected (even with a clean URL), offer to download-first-then-review:
+The command checker reports the finding first. With `--suggest`, it may also
+emit one executable alternative, but only after it has decoded the URL and sink
+as shell literals and proved that the interpreter argv and stdin behavior fit
+the typed runner contract:
 
-```
-  +-- PIPE-TO-SHELL INTERCEPTED ------------------------------------+
-  |                                                                 |
-  |  Source: https://get.example-tool.sh (TLS ok, cert age: 2yr)        |
-  |  Size:   4.2 KB (138 lines)                                    |
-  |  SHA256: a1b2c3d4e5...                                          |
-  |                                                                 |
-  |  Static analysis (best-effort, inferred from script content):   |
-  |  |- Downloads binary from: cdn.example-tool.sh                  |
-  |  |- Writes to: ~/.example-tool/bin/ (inferred)                  |
-  |  |- Modifies: ~/.bashrc (inferred, adds to PATH)               |
-  |  |- Network calls: 2 domains referenced                         |
-  |  |- Privilege: no sudo                                          |
-  |  |- Obfuscation: none detected                                  |
-  |  |- eval/base64/hex: none                                       |
-  |                                                                 |
-  |  Risk: URL trust 94/100 | Command risk HIGH (pipe-to-shell)    |
-  |                                                                 |
-  |  [r]un  [v]iew script  [a]bort                                  |
-  |                                                                 |
-  |  Safe alternative:                                              |
-  |    tirith run https://get.example-tool.sh                     |
-  +---------------------------------------------------------------- +
+```bash
+$ tirith check --suggest -- 'curl -fsSL https://get.example-tool.sh | bash'
+# try: tirith run --capsule --script-stdin --interpreter bash \
+#      'https://get.example-tool.sh'
 ```
 
-Static analysis extracts from the script text:
-- Referenced filesystem paths (where it likely writes)
-- Referenced domains and IPs (where it likely connects)
-- Whether it modifies shell config files
-- Whether it contains obfuscated code (`eval`, base64 decode, hex decode)
-- Whether it uses `sudo` or references system paths
-- Privilege level required
-
-**Important:** These fields are **best-effort inferences from script text**, not runtime observations. The script may do things not detectable by static analysis. For verified runtime behavior, use `tirith run` with tracing enabled (future: `--trace` flag using platform-specific syscall tracing).
+The generated command preserves `bash` and feeds the reviewed bytes over stdin;
+the remote script's shebang cannot replace the selected interpreter. Supported
+forms include no-argument `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, and `ash`,
+plus the narrow POSIX-shell `-s -- <literal operands...>` form. Dynamic or
+malformed URLs, decoded control characters, Cmd, `|&`, unsupported download
+options, unsupported interpreter arguments, and ambiguous pipelines stay
+guidance-only. Tirith never repairs those executable bytes by deleting
+characters.
 
 ### 6. `tirith run` — safe installer runner
 
-One-command replacement for `curl ... | bash` that becomes muscle memory:
+For a manually supplied URL, `tirith run` downloads bounded bytes, hashes and
+analyzes them, prints the resulting verdict, asks for an explicit `y` on
+`/dev/tty`, records a receipt, and executes a fresh private hash-verified copy:
 
 ```bash
 $ tirith run https://get.example-tool.sh
 ```
 
-This command:
-1. Downloads to a temp file (never pipes directly to shell)
-2. Prints SHA256 hash
-3. Runs static analysis (same as pipe-to-shell interceptor)
-4. Opens in `$PAGER` for review
-5. Runs only after explicit `y` confirmation
-6. Stores an install receipt (see below)
-7. Caches the downloaded script — second run is instant if hash matches
+`--no-exec` stops after analysis. `--capsule` makes interpreter launch an
+enforcing surface: if the selected host backend cannot provide the capsule's
+required coverage, execution is refused rather than silently falling back.
+The download and DNS resolution occur before interpreter containment and use
+the fetch validator; capsule execution should not be described as a separate
+network-resolution guarantee.
 
-```
-  Downloading https://get.example-tool.sh ...
-  SHA256: a1b2c3d4e5f6...
-  Size:   4.2 KB (138 lines)
-
-  Static analysis (inferred from script content):
-  |- Downloads binary from: cdn.example-tool.sh
-  |- Writes to: ~/.example-tool/bin/
-  |- Modifies: ~/.bashrc (adds to PATH)
-  |- Network calls: 2 domains referenced
-
-  Press [v] to view script, [y] to run, [n] to abort: _
-```
+There is no built-in `$PAGER` step or `[v]` prompt. Use `--no-exec` to stop after
+analysis, or `tirith fetch <url> --save <path>` for explicit file review. The
+`--script-stdin`, `--interpreter`, and `--interpreter-arg` flags are the typed
+contract used by verified `check --suggest` rewrites; manual runs otherwise use
+the completely analyzed shebang and private-file execution semantics.
 
 ### 7. Install receipts (signature feature)
 
@@ -600,15 +575,14 @@ $ tirith why
   Proof:
     Byte 12: expected 0x69 (Latin i), got 0xd1 0x96 (Cyrillic і)
 
-  Safe rewrite:
-    curl -sSL https://install.example-cli.dev | bash
-    or better:
-    tirith run --capsule 'https://install.example-cli.dev'
+  Next step:
+    tirith diff https://іnstall.example-clі.dev
+    Verify the intended hostname independently before downloading anything.
 ```
 
 Every warning comes with:
 1. Which rule triggered and the minimal proof
-2. A "safe rewrite" suggestion when possible (strip userinfo, resolve punycode, replace pipe-to-shell with quoted `tirith run --capsule`, resolve shortened URL)
+2. A verified executable rewrite only when exact semantics can be proved; otherwise static remediation guidance
 
 Developers forgive warnings when they come with a clean fix.
 
@@ -616,8 +590,9 @@ This remediation surface is now concrete: every finding carries a per-rule
 remediation (shown as a `Fix:` line and in `--format json`); `tirith explain
 --rule <id> --fix` prints a rule's remediation on its own; and `tirith check
 --suggest-safe-command` rewrites the actual command into a safer one wherever a
-transformation is genuinely correct (pipe-to-shell → hardened
-`tirith run --capsule`, insecure-TLS flag dropped, `http://` → `https://`).
+transformation is genuinely correct (supported pipe-to-shell → typed
+`tirith run --capsule --script-stdin --interpreter <shell>`, insecure-TLS flag
+dropped, `http://` → `https://`).
 Where there is no safe mechanical rewrite, tirith says so plainly rather than
 inventing one.
 
@@ -843,7 +818,7 @@ No naked warnings. Every trigger includes:
 
 ```
   WARN: Pipe-to-shell detected.
-  Safe alternative: tirith run --capsule 'https://get.example-tool.sh'
+  Next step: tirith check --suggest -- '<original command>'
 ```
 
 ### Consistent prompt UI

@@ -459,7 +459,7 @@ fn check_suggest_safe_command_routes_pipe_to_hardened_runner() {
         "expected safe-command block: {stderr}"
     );
     assert!(
-        stderr.contains("tirith run --capsule 'https://example.com/install.sh'"),
+        stderr.contains("tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"),
         "expected hardened runner rewrite: {stderr}"
     );
     assert!(!stderr.contains("/tmp/"), "{stderr}");
@@ -516,12 +516,62 @@ fn check_suggest_safe_command_json_embeds_suggestions() {
     assert_eq!(s["rule_id"], "curl_pipe_shell");
     assert_eq!(
         s["safe_command"],
-        "tirith run --capsule 'https://example.com/install.sh'"
+        "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
     );
     // Findings still carry per-rule remediation independently of the flag.
     assert!(v["findings"][0]["remediation"]
         .as_str()
         .is_some_and(|s| !s.is_empty()));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_accepts_generated_bash_s_typed_argv_before_url_validation() {
+    let out = tirith()
+        .args([
+            "run",
+            "--capsule",
+            "--script-stdin",
+            "--interpreter",
+            "bash",
+            "--interpreter-arg=-s",
+            "--interpreter-arg=--",
+            "--interpreter-arg=feature",
+            "--no-exec",
+            "not-a-url",
+        ])
+        .output()
+        .expect("run typed stdin argv");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid URL"),
+        "typed argv should reach core URL validation without a clap reinterpretation: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_rejects_unsupported_forced_argv_before_url_or_network() {
+    let out = tirith()
+        .args([
+            "run",
+            "--capsule",
+            "--script-stdin",
+            "--interpreter",
+            "bash",
+            "--interpreter-arg=-e",
+            "--no-exec",
+            "https://example.com/install.sh",
+        ])
+        .output()
+        .expect("run unsupported typed argv");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported argv for forced stdin interpreter 'bash'"),
+        "unsupported argv must fail before any fetch: {stderr}"
+    );
 }
 
 #[cfg(unix)]
@@ -2329,6 +2379,7 @@ fn run_check_with_audit_failure(debug: bool) -> std::process::Output {
     let mut cmd = tirith();
     cmd.env("XDG_DATA_HOME", &data_home)
         .env("APPDATA", tmpdir.path())
+        .env_remove("TIRITH_LOG")
         .args([
             "check",
             "--shell",
@@ -2351,6 +2402,7 @@ fn run_paste_with_audit_failure(debug: bool) -> std::process::Output {
     let mut cmd = tirith();
     cmd.env("XDG_DATA_HOME", &data_home)
         .env("APPDATA", tmpdir.path())
+        .env_remove("TIRITH_LOG")
         .args(["paste", "--shell", "posix", "--non-interactive"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -8122,7 +8174,10 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
     let sc = curl_pipe["safe_command"]
         .as_str()
         .expect("safe_command is a string for this transform");
-    assert_eq!(sc, "tirith run --capsule 'https://example.com/install.sh'");
+    assert_eq!(
+        sc,
+        "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
+    );
     for forbidden in ["/tmp/", "curl ", "wget ", "less ", " && ", " | "] {
         assert!(
             !sc.contains(forbidden),
@@ -8175,7 +8230,8 @@ fn fix_composes_multi_finding_rewrites_and_only_emits_an_allow_command() {
     );
     let command = executable[0];
     assert_eq!(
-        command, "tirith run --capsule 'https://attacker.invalid/script'",
+        command,
+        "tirith run --capsule --script-stdin --interpreter bash 'https://attacker.invalid/script'",
         "TLS, transport, and pipe remediation must compose into one runner invocation"
     );
 
@@ -8359,16 +8415,31 @@ fn fix_with_shell_flag_routes_through_powershell_tokenizer() {
         ])
         .output()
         .expect("failed to run tirith");
-    // We expect findings + at least one suggestion (so exit 2 under --non-interactive).
+    // `bash.exe` is not a supported Unix capsule interpreter. The PowerShell
+    // tokenizer must still surface the finding, but it must not invent an
+    // executable rewrite whose interpreter semantics Tirith cannot preserve.
     assert_eq!(
         out.status.code(),
-        Some(2),
+        Some(1),
         "powershell shell path must reach a finding: stdout={}",
         String::from_utf8_lossy(&out.stdout)
     );
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix --shell powershell valid JSON");
     assert!(v.is_array(), "findings-present must be array shape");
+    let suggestions = v.as_array().expect("suggestion array");
+    assert!(
+        suggestions
+            .iter()
+            .any(|item| item["rule_id"] == "curl_pipe_shell"),
+        "PowerShell pipeline finding must remain visible: {v}"
+    );
+    assert!(
+        suggestions
+            .iter()
+            .all(|item| item.get("safe_command").is_none()),
+        "unsupported bash.exe semantics must remain guidance-only: {v}"
+    );
 }
 
 #[test]
@@ -16955,7 +17026,7 @@ fn fix_on_non_tty_prints_rerun_hint() {
     // Item 14d (pre-existing): the non-interactive `tirith fix` path must surface
     // the rerun hint so a piped user knows how to capture suggestions.
     let out = tirith()
-        .args(["fix", "curl https://bit.ly/x | bash"])
+        .args(["fix", "curl https://example.com/install.sh | bash"])
         .output()
         .expect("run fix");
     let err = String::from_utf8_lossy(&out.stderr);

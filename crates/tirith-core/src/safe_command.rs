@@ -408,80 +408,407 @@ fn build_suggestion(
     }
 }
 
-/// Shell interpreters a download can be piped into.
-fn is_shell_interpreter(name: &str) -> bool {
-    matches!(
-        name,
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "ash"
-    )
+/// Shell interpreters whose stdin invocation contract is represented by
+/// [`crate::runner::PipeInterpreter`].
+fn pipe_interpreter(name: &str) -> Option<crate::runner::PipeInterpreter> {
+    name.parse().ok()
 }
 
 /// Rewrite `<fetch> URL | <shell>` into one hardened runner invocation.
 ///
-/// `None` unless the command is exactly a single pipe from a URL-fetch command
-/// into a shell interpreter with exactly one `http(s)` URL on the fetch side.
-/// On Unix, `tirith run --capsule` owns the bounded download, in-memory review,
-/// confirmation, private hash-verified execution copy, and fail-closed capsule.
-/// Other platforms do not expose `tirith run`, so they fall through to honest
-/// guidance instead of receiving a raw temporary path.
+/// `None` unless the command is exactly a single stdout pipe from a supported
+/// URL-fetch command into a supported shell stdin invocation. Every URL,
+/// command, and sink argument must be a statically-decodable literal in the
+/// caller's shell. Dynamic, malformed, or control-bearing words remain
+/// guidance-only.
+///
+/// On Unix, the emitted `tirith run` command carries the selected interpreter,
+/// argv, and stdin mode as typed arguments. The runner therefore ignores a
+/// hostile remote shebang and preserves `curl ... | bash`'s stdin semantics.
+/// Other platforms do not expose `tirith run`, so they remain guidance-only.
 fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Option<String> {
     if segments.len() != 2 {
         return None;
     }
     let source = &segments[0];
     let sink = &segments[1];
-    match sink.preceding_separator.as_deref() {
-        Some("|") | Some("|&") => {}
-        _ => return None,
+    // `|&` also forwards downloader stderr. The typed runner only forwards the
+    // response body, so claiming equivalence would be wrong.
+    if sink.preceding_separator.as_deref() != Some("|") {
+        return None;
+    }
+    if shell == ShellType::Cmd {
+        return None;
+    }
+    // Prefix assignments can alter downloader or interpreter behavior. The
+    // typed runner does not carry an arbitrary environment, so dropping them
+    // would not preserve the original invocation.
+    if !tokenize::leading_env_assignments(&source.raw).is_empty()
+        || !tokenize::leading_env_assignments(&sink.raw).is_empty()
+    {
+        return None;
     }
 
-    let source_cmd = base_command(source.command.as_deref()?, shell);
-    let sink_cmd = base_command(sink.command.as_deref()?, shell);
-
+    let source_cmd = decode_shell_literal(source.command.as_deref()?, shell)?;
     if !is_url_fetch_command(&source_cmd) {
         return None;
     }
-    if !is_shell_interpreter(&sink_cmd) {
+    let sink_cmd = decode_shell_literal(sink.command.as_deref()?, shell)?;
+    let interpreter = pipe_interpreter(&sink_cmd)?;
+
+    let source_args = decode_literal_words(&source.args, shell)?;
+    let url = supported_fetch_url(&source_cmd, &source_args)?;
+    let sink_args = decode_literal_words(&sink.args, shell)?;
+    if !crate::runner::pipe_interpreter_args_supported(interpreter, &sink_args) {
         return None;
     }
 
-    // Exactly one http(s) URL on the fetch side — ambiguity → no rewrite.
-    let urls = extract_http_urls(&source.args);
-    if urls.len() != 1 {
-        return None;
+    let encoded_url = encode_shell_literal(&url, shell)?;
+    let mut command = format!(
+        "tirith run --capsule --script-stdin --interpreter {}",
+        interpreter.as_str()
+    );
+    for arg in sink_args {
+        let option = format!("--interpreter-arg={arg}");
+        let encoded = encode_shell_literal(&option, shell)?;
+        command.push(' ');
+        command.push_str(&encoded);
     }
-    let url = sanitize_for_display(&urls[0]);
-    if url.is_empty() {
-        return None;
-    }
-    // Single-quote the untrusted URL using the caller shell's escaping rule so
-    // `$( )`, backtick, `;`, `|`, `&`, spaces, and embedded quotes cannot break
-    // out when the suggestion is run / eval'd. Cmd has no supported Unix runner
-    // contract, so it remains guidance-only.
-    let url = runner_url_quote(&url, shell)?;
+    command.push(' ');
+    command.push_str(&encoded_url);
 
     #[cfg(unix)]
     {
-        Some(format!("tirith run --capsule {url}"))
+        Some(command)
     }
     #[cfg(not(unix))]
     {
-        let _ = url;
+        let _ = command;
         None
     }
 }
 
-fn runner_url_quote(url: &str, shell: ShellType) -> Option<String> {
+/// Encode one already-decoded argument and prove the selected shell decoder
+/// recovers exactly the same UTF-8 bytes. This is intentionally an assertion in
+/// the construction path, not merely a quoting best-effort.
+fn encode_shell_literal(value: &str, shell: ShellType) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let encoded = match shell {
+        ShellType::Posix | ShellType::Fish => shell_single_quote(value)?,
+        ShellType::PowerShell => format!("'{}'", value.replace('\'', "''")),
+        ShellType::Cmd => return None,
+    };
+    (decode_shell_literal(&encoded, shell).as_deref() == Some(value)).then_some(encoded)
+}
+
+fn decode_literal_words(words: &[String], shell: ShellType) -> Option<Vec<String>> {
+    words
+        .iter()
+        .map(|word| decode_shell_literal(word, shell))
+        .collect()
+}
+
+/// Decode a single shell word only when its value is fully literal. Expansion,
+/// substitution, globbing, operators, malformed quotes, and decoded controls
+/// are rejected instead of being removed or normalized.
+fn decode_shell_literal(word: &str, shell: ShellType) -> Option<String> {
     match shell {
-        ShellType::Posix | ShellType::Fish => shell_single_quote(url),
-        ShellType::PowerShell => {
-            if url.bytes().any(|byte| byte == b'\n' || byte == b'\0') {
-                return None;
-            }
-            Some(format!("'{}'", url.replace('\'', "''")))
-        }
+        ShellType::Posix => decode_posix_literal(word),
+        ShellType::Fish => decode_fish_literal(word),
+        ShellType::PowerShell => decode_powershell_literal(word),
         ShellType::Cmd => None,
     }
+}
+
+fn push_literal(out: &mut String, ch: char) -> Option<()> {
+    if ch.is_control() {
+        return None;
+    }
+    out.push(ch);
+    Some(())
+}
+
+fn decode_posix_literal(word: &str) -> Option<String> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Bare,
+        Single,
+        Double,
+    }
+
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    let mut quote = Quote::Bare;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        match quote {
+            Quote::Bare => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => {
+                    i += 1;
+                    push_literal(&mut out, *chars.get(i)?)?;
+                }
+                // These have expansion, substitution, glob, grouping, or
+                // operator meaning when unquoted.
+                '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '<' | '>' | '|'
+                | '&' | ';' | '!' => return None,
+                '~' if out.is_empty() => return None,
+                c if c.is_whitespace() || c.is_control() => return None,
+                c => push_literal(&mut out, c)?,
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::Bare;
+                } else {
+                    push_literal(&mut out, ch)?;
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::Bare,
+                '$' | '`' => return None,
+                '\\' => {
+                    let next = *chars.get(i + 1)?;
+                    if matches!(next, '$' | '`' | '"' | '\\') {
+                        i += 1;
+                        push_literal(&mut out, next)?;
+                    } else if next == '\n' {
+                        return None;
+                    } else {
+                        // POSIX preserves a backslash before other characters
+                        // inside double quotes.
+                        push_literal(&mut out, '\\')?;
+                    }
+                }
+                c => push_literal(&mut out, c)?,
+            },
+        }
+        i += 1;
+    }
+    if !matches!(quote, Quote::Bare) || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+fn decode_fish_literal(word: &str) -> Option<String> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Bare,
+        Single,
+        Double,
+    }
+
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    let mut quote = Quote::Bare;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        match quote {
+            Quote::Bare => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => {
+                    i += 1;
+                    push_literal(&mut out, *chars.get(i)?)?;
+                }
+                '$' | '*' | '?' | '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '|' | '&'
+                | ';' => return None,
+                '~' if out.is_empty() => return None,
+                c if c.is_whitespace() || c.is_control() => return None,
+                c => push_literal(&mut out, c)?,
+            },
+            Quote::Single => match ch {
+                '\'' => quote = Quote::Bare,
+                '\\' if matches!(chars.get(i + 1), Some('\'' | '\\')) => {
+                    i += 1;
+                    push_literal(&mut out, chars[i])?;
+                }
+                c => push_literal(&mut out, c)?,
+            },
+            Quote::Double => match ch {
+                '"' => quote = Quote::Bare,
+                '$' | '(' | ')' => return None,
+                '\\' => {
+                    let next = *chars.get(i + 1)?;
+                    if matches!(next, '$' | '"' | '\\') {
+                        i += 1;
+                        push_literal(&mut out, next)?;
+                    } else if next == '\n' {
+                        return None;
+                    } else {
+                        push_literal(&mut out, '\\')?;
+                    }
+                }
+                c => push_literal(&mut out, c)?,
+            },
+        }
+        i += 1;
+    }
+    if !matches!(quote, Quote::Bare) || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+fn decode_powershell_literal(word: &str) -> Option<String> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Bare,
+        Single,
+        Double,
+    }
+
+    fn escaped(ch: char) -> char {
+        match ch {
+            '0' => '\0',
+            'a' => '\u{0007}',
+            'b' => '\u{0008}',
+            'e' => '\u{001b}',
+            'f' => '\u{000c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\u{000b}',
+            other => other,
+        }
+    }
+
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    let mut quote = Quote::Bare;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        // PowerShell treats curly quote characters as string delimiters too.
+        // The command tokenizer does not model those alternate delimiters, so
+        // refuse them instead of decoding them as ordinary URL bytes.
+        if matches!(ch, '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}') {
+            return None;
+        }
+        match quote {
+            Quote::Bare => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '`' => {
+                    i += 1;
+                    let next = *chars.get(i)?;
+                    // PowerShell 6+ consumes the full `u{...}` sequence as one
+                    // Unicode escape. This bounded decoder intentionally does
+                    // not implement that variable-length grammar.
+                    if next == 'u' && chars.get(i + 1) == Some(&'{') {
+                        return None;
+                    }
+                    push_literal(&mut out, escaped(next))?;
+                }
+                '$' | '@' | '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '<' | '>' | '|'
+                | '&' | ';' | ',' => return None,
+                c if c.is_whitespace() || c.is_control() => return None,
+                c => push_literal(&mut out, c)?,
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        i += 1;
+                        push_literal(&mut out, '\'')?;
+                    } else {
+                        quote = Quote::Bare;
+                    }
+                } else {
+                    push_literal(&mut out, ch)?;
+                }
+            }
+            Quote::Double => match ch {
+                '"' if chars.get(i + 1) == Some(&'"') => {
+                    i += 1;
+                    push_literal(&mut out, '"')?;
+                }
+                '"' => quote = Quote::Bare,
+                '$' => return None,
+                '`' => {
+                    i += 1;
+                    let next = *chars.get(i)?;
+                    if next == 'u' && chars.get(i + 1) == Some(&'{') {
+                        return None;
+                    }
+                    push_literal(&mut out, escaped(next))?;
+                }
+                c => push_literal(&mut out, c)?,
+            },
+        }
+        i += 1;
+    }
+    if !matches!(quote, Quote::Bare) || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Return the one exact HTTPS response-body URL represented by a supported
+/// downloader argv. Unsupported downloader behavior remains guidance-only.
+fn supported_fetch_url(command: &str, args: &[String]) -> Option<String> {
+    let mut urls = Vec::new();
+    match command {
+        "curl" => {
+            for arg in args {
+                if starts_with_http(arg) {
+                    urls.push(arg.clone());
+                } else if let Some(long) = arg.strip_prefix("--") {
+                    if !matches!(long, "fail" | "silent" | "show-error" | "location") {
+                        return None;
+                    }
+                } else {
+                    let short = arg.strip_prefix('-')?;
+                    if short.is_empty()
+                        || !short.chars().all(|ch| matches!(ch, 'f' | 's' | 'S' | 'L'))
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        "wget" => {
+            let mut stdout = false;
+            let mut index = 0usize;
+            while index < args.len() {
+                let arg = &args[index];
+                if starts_with_http(arg) {
+                    urls.push(arg.clone());
+                } else if matches!(arg.as_str(), "-q" | "--quiet") {
+                } else if matches!(arg.as_str(), "-qO-" | "-O-") {
+                    stdout = true;
+                } else if arg == "-O" && args.get(index + 1).is_some_and(|next| next == "-") {
+                    stdout = true;
+                    index += 1;
+                } else {
+                    return None;
+                }
+                index += 1;
+            }
+            if !stdout {
+                return None;
+            }
+        }
+        // HTTPie/xh/fetch output formatting and option semantics are not yet a
+        // proven byte-for-byte body stream contract.
+        _ => return None,
+    }
+    if urls.len() != 1 {
+        return None;
+    }
+    let url = urls.pop()?;
+    if url.chars().any(char::is_control) {
+        return None;
+    }
+    let parsed = url::Url::parse(&url).ok()?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() || parsed.as_str() != url {
+        return None;
+    }
+    Some(url)
 }
 
 /// Remove insecure TLS flags, preserving everything else verbatim.
@@ -1213,24 +1540,6 @@ fn base_command(cmd: &str, shell: ShellType) -> String {
     }
 }
 
-/// Extract `http(s)://` URLs from command arguments, including `--flag=URL`.
-fn extract_http_urls(args: &[String]) -> Vec<String> {
-    let mut urls = Vec::new();
-    for arg in args {
-        let token = strip_quotes(arg.trim());
-        if starts_with_http(&token) {
-            urls.push(token);
-            continue;
-        }
-        if let Some((_, val)) = token.split_once('=') {
-            if starts_with_http(val) {
-                urls.push(val.to_string());
-            }
-        }
-    }
-    urls
-}
-
 fn starts_with_http(s: &str) -> bool {
     let b = s.as_bytes();
     (b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://"))
@@ -1385,9 +1694,26 @@ mod tests {
         let s = suggest(cmd, ShellType::Posix, &v);
         assert_eq!(s.len(), 1);
         let sc = s[0].safe_command.as_deref().unwrap();
-        assert_eq!(sc, "tirith run --capsule 'https://example.com/install.sh'");
+        assert_eq!(
+            sc,
+            "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
+        );
         assert!(!sc.contains("/tmp/"), "{sc}");
         assert!(!sc.contains(" && "), "{sc}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn common_curl_body_flags_keep_the_typed_rewrite() {
+        let cmd = "curl -fsSL https://example.com/install.sh | bash";
+        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let s = suggest(cmd, ShellType::Posix, &v);
+        assert_eq!(
+            s[0].safe_command.as_deref(),
+            Some(
+                "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
+            )
+        );
     }
 
     #[cfg(unix)]
@@ -1407,7 +1733,7 @@ mod tests {
             .expect("verified runner command");
         assert_eq!(
             command,
-            "tirith run --capsule 'https://example.com/install.sh'"
+            "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
         );
 
         let candidate_ctx = context_with_input(&ctx, command.to_string());
@@ -1431,13 +1757,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn wget_pipe_sh_uses_same_hardened_runner() {
-        let cmd = "wget https://example.com/x.sh | sh";
+    fn wget_stdout_pipe_sh_uses_same_hardened_runner() {
+        let cmd = "wget -qO- https://example.com/x.sh | sh";
         let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         let sc = s[0].safe_command.as_deref().unwrap();
-        assert_eq!(sc, "tirith run --capsule 'https://example.com/x.sh'");
+        assert_eq!(
+            sc,
+            "tirith run --capsule --script-stdin --interpreter sh 'https://example.com/x.sh'"
+        );
         assert!(!sc.contains("wget "), "{sc}");
+    }
+
+    #[test]
+    fn wget_without_stdout_mode_is_guidance_only() {
+        let cmd = "wget https://example.com/x.sh | sh";
+        let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
+        let s = suggest(cmd, ShellType::Posix, &v);
+        assert!(s[0].safe_command.is_none());
     }
 
     #[test]
@@ -1551,33 +1888,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn powershell_exe_suffix_stripped_for_interpreter_match() {
-        // bash.exe piped under PowerShell must still be recognized.
+    fn powershell_exe_interpreter_is_guidance_only_on_unix_runner() {
         let cmd = "curl https://example.com/x.sh | bash.exe";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::PowerShell, &v);
-        assert_eq!(
-            s[0].safe_command.as_deref(),
-            Some("tirith run --capsule 'https://example.com/x.sh'")
-        );
+        assert!(s[0].safe_command.is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn powershell_runner_url_doubles_embedded_quote() {
-        let cmd = r#"curl "https://x/a'b;Write-Output pwned" | bash.exe"#;
+    fn powershell_literal_decode_and_reencode_doubles_embedded_quote() {
+        let cmd = "curl 'https://example.com/a''b' | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::PowerShell, &v);
         let command = s[0].safe_command.as_deref().expect("runner rewrite");
         assert_eq!(
             command,
-            "tirith run --capsule 'https://x/a''b;Write-Output pwned'"
+            "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/a''b'"
         );
-        assert!(
-            !command
-                .replace("'https://x/a''b;Write-Output pwned'", "")
-                .contains("Write-Output"),
-            "the PowerShell payload must remain inside the quoted URL: {command}"
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_doubled_double_quote_is_decoded_not_dropped() {
+        assert_eq!(
+            decode_powershell_literal(r#""https://example.com/a""b""#).as_deref(),
+            Some("https://example.com/a\"b")
+        );
+        // A literal quote is not an exact canonical URL byte sequence, so the
+        // executable suggestion must be withheld rather than silently changing
+        // `a"b` into `ab`.
+        assert!(pipe_suggestion(
+            r#"curl "https://example.com/a""b" | bash"#,
+            ShellType::PowerShell
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_backtick_literal_decodes_before_single_quote_reencoding() {
+        let cmd = r#"curl "https://example.com/a`'b" | bash"#;
+        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let s = suggest(cmd, ShellType::PowerShell, &v);
+        assert_eq!(
+            s[0].safe_command.as_deref(),
+            Some(
+                "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/a''b'"
+            )
         );
     }
 
@@ -1779,106 +2137,163 @@ mod tests {
 
     // ── rewrite_pipe_to_shell — one runner invocation, quoted URL ──────────
 
-    /// Drive a `<url> | bash` rewrite and return the emitted command.
     #[cfg(unix)]
-    fn pipe_rewrite(url_literal: &str) -> String {
-        let cmd = format!("curl {url_literal} | bash");
+    fn pipe_suggestion(cmd: &str, shell: ShellType) -> Option<String> {
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-        let s = suggest(&cmd, ShellType::Posix, &v);
-        s[0].safe_command
-            .clone()
-            .unwrap_or_else(|| panic!("expected a rewrite for {cmd:?}"))
+        suggest(cmd, shell, &v)[0].safe_command.clone()
     }
 
     #[cfg(unix)]
     #[test]
-    fn pipe_to_shell_quotes_command_substitution_url() {
-        // The classic PR124 case: a single-quoted URL with `$(id)`.
-        let sc = pipe_rewrite("'http://x/$(id)'");
+    fn single_quoted_dollar_syntax_is_literal_and_round_trips() {
+        let sc = pipe_suggestion("curl 'https://example.com/$(id)' | bash", ShellType::Posix)
+            .expect("single quotes make the URL bytes literal");
         assert!(
-            sc.contains("'http://x/$(id)'"),
+            sc.contains("'https://example.com/$(id)'"),
             "URL must stay single-quoted so $(id) cannot execute: {sc}"
         );
-        // The substitution must NOT appear bare (outside the quoted token).
         assert!(
-            !sc.replace("'http://x/$(id)'", "").contains("$(id)"),
+            !sc.replace("'https://example.com/$(id)'", "")
+                .contains("$(id)"),
             "no bare $(id) may survive outside the quoted token: {sc}"
         );
-        assert!(sc.starts_with("tirith run --capsule '"), "{sc}");
+        assert!(
+            sc.starts_with("tirith run --capsule --script-stdin --interpreter bash "),
+            "{sc}"
+        );
         assert!(!sc.contains("/tmp/"), "{sc}");
         assert!(!sc.contains(" && "), "{sc}");
-        assert!(!sc.contains("less "), "{sc}");
     }
 
     #[cfg(unix)]
     #[test]
-    fn pipe_to_shell_quotes_backtick_url() {
-        let sc = pipe_rewrite("'http://x/`id`'");
-        assert!(
-            sc.contains("'http://x/`id`'"),
-            "backtick URL must stay quoted: {sc}"
-        );
+    fn dynamic_unquoted_url_is_guidance_only() {
+        assert!(pipe_suggestion("curl $URL | bash", ShellType::Posix).is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn pipe_to_shell_quotes_semicolon_rm_url() {
-        // `;rm -rf ~` must end up inside the single quotes, not a top-level command.
-        let sc = pipe_rewrite("'http://x/a;rm -rf ~'");
-        assert!(
-            sc.contains("'http://x/a;rm -rf ~'"),
-            "the ;rm payload must be inside single quotes: {sc}"
-        );
-        // After removing the quoted token, no bare `;` separator remains — i.e.
-        // `rm` is not its own command.
-        let outside = sc.replace("'http://x/a;rm -rf ~'", "");
-        assert!(
-            !outside.contains(";rm"),
-            "rm must not become a top-level command: {sc}"
-        );
+    fn carriage_return_host_mutation_is_rejected_not_sanitized() {
+        let cmd = "curl 'https://exa\rmple.com/install.sh' | bash";
+        assert!(pipe_suggestion(cmd, ShellType::Posix).is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn pipe_to_shell_quotes_space_in_url() {
-        let sc = pipe_rewrite("'http://x/a b'");
-        assert!(
-            sc.contains("'http://x/a b'"),
-            "spaces must be contained by the quotes: {sc}"
-        );
+    fn posix_escaped_space_url_is_rejected_as_non_exact_url() {
+        let cmd = r"curl https://example.com/a\ b | bash";
+        assert!(pipe_suggestion(cmd, ShellType::Posix).is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn pipe_to_shell_wget_quotes_command_substitution_url() {
-        // The original downloader is discarded; the same runner and quoting
-        // contract applies to every recognized fetch command.
-        let cmd = "wget 'http://x/$(id)' | sh";
+    fn wget_requires_an_explicit_stdout_body_shape() {
+        let cmd = "wget -qO- 'https://example.com/$(id)' | sh";
         let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         let sc = s[0].safe_command.as_deref().unwrap();
-        assert!(sc.starts_with("tirith run --capsule '"), "{sc}");
+        assert!(sc.contains("--interpreter sh"), "{sc}");
         assert!(!sc.contains("wget "), "{sc}");
-        assert!(sc.contains("'http://x/$(id)'"), "{sc}");
+        assert!(sc.contains("'https://example.com/$(id)'"), "{sc}");
         assert!(
-            !sc.replace("'http://x/$(id)'", "").contains("$(id)"),
+            !sc.replace("'https://example.com/$(id)'", "")
+                .contains("$(id)"),
             "no bare $(id) outside the quoted token: {sc}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn pipe_to_shell_quotes_embedded_single_quote_url() {
-        // A double-quoted URL carrying a literal single quote: the rewrite must
-        // escape it as '\'' and keep one shell token.
-        let cmd = r#"curl "http://x/a'b" | bash"#;
-        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-        let s = suggest(cmd, ShellType::Posix, &v);
-        let sc = s[0].safe_command.as_deref().unwrap();
+    fn posix_embedded_single_quote_round_trips() {
+        let cmd = r#"curl "https://example.com/a'b" | bash"#;
+        let sc = pipe_suggestion(cmd, ShellType::Posix).expect("literal URL rewrite");
         assert!(
-            sc.contains(r"'http://x/a'\''b'"),
+            sc.contains(r"'https://example.com/a'\''b'"),
             "embedded single quote must be escaped as '\\'': {sc}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supported_shells_are_preserved_as_typed_stdin_interpreters() {
+        for (sink, shell) in [
+            ("bash", ShellType::Posix),
+            ("zsh", ShellType::Posix),
+            ("fish", ShellType::Fish),
+            ("ash", ShellType::Posix),
+        ] {
+            let cmd = format!("curl https://example.com/install.sh | {sink}");
+            let rewrite = pipe_suggestion(&cmd, shell).expect("supported stdin shell");
+            assert!(
+                rewrite.contains(&format!("--interpreter {sink}")),
+                "{sink}: {rewrite}"
+            );
+            assert!(rewrite.contains("--script-stdin"), "{sink}: {rewrite}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_s_double_dash_operands_are_preserved_as_typed_argv() {
+        let rewrite = pipe_suggestion(
+            "curl https://example.com/install.sh | bash -s -- feature",
+            ShellType::Posix,
+        )
+        .expect("supported bash stdin argv");
+        for token in [
+            "'--interpreter-arg=-s'",
+            "'--interpreter-arg=--'",
+            "'--interpreter-arg=feature'",
+        ] {
+            assert!(rewrite.contains(token), "missing {token}: {rewrite}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_interpreter_args_remain_guidance_only() {
+        assert!(pipe_suggestion(
+            "curl https://example.com/install.sh | bash -e",
+            ShellType::Posix
+        )
+        .is_none());
+        assert!(pipe_suggestion(
+            "curl https://example.com/install.sh | fish -c 'source'",
+            ShellType::Fish
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_or_sink_environment_prefix_is_guidance_only() {
+        assert!(pipe_suggestion(
+            "HTTPS_PROXY=https://proxy.example curl https://example.com/install.sh | bash",
+            ShellType::Posix
+        )
+        .is_none());
+        assert!(pipe_suggestion(
+            "curl https://example.com/install.sh | MODE=feature bash",
+            ShellType::Posix
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_control_backtick_and_dynamic_expansion_are_rejected() {
+        assert!(pipe_suggestion(
+            r#"curl "https://exa`rmple.com/install.sh" | bash"#,
+            ShellType::PowerShell
+        )
+        .is_none());
+        assert!(pipe_suggestion(
+            r#"curl "https://example.com/$env:PAYLOAD" | bash"#,
+            ShellType::PowerShell
+        )
+        .is_none());
+        assert!(decode_powershell_literal(r#""https://example.com/`u{61}""#).is_none());
+        assert!(decode_powershell_literal("\u{201c}https://example.com/\u{201d}").is_none());
     }
 
     // ── rewrite_archive_list_first — archive path is single-quoted (PR124) ──
