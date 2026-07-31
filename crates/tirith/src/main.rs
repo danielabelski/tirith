@@ -89,6 +89,11 @@ What this does:
   new / modified files → prompt to delete or keep (default keep + print the
   path when non-interactive).
 
+  Arguments after `--` are executed directly as program + argv. They are never
+  joined and reparsed by an implicit shell. To request shell syntax explicitly,
+  name the shell yourself: `/bin/sh -c '<command>'` on Unix or `cmd /C <command>`
+  on Windows.
+
   --copy-repo   Seed the temp dir with a copy of the current repo, EXCLUDING
                 .git/. Off by default (copying a large tree is slow); the
                 default is an empty temp dir. Pure walkdir + fs::copy — no
@@ -115,6 +120,7 @@ Examples:
   tirith temp-run --copy-repo -- make build
   tirith temp-run --strip-env -- ./untrusted-installer.sh
   tirith temp-run --capsule -- ./untrusted-installer.sh
+  tirith temp-run -- /bin/sh -c 'printf done > result.txt'
   tirith temp-run --json -- npm install left-pad";
 
 #[derive(Subcommand)]
@@ -2267,9 +2273,9 @@ Examples:
         #[arg(long)]
         json: bool,
 
-        /// The command to run in the temp dir (everything after `--`)
+        /// Program and exact argv to run in the temp dir (everything after `--`)
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
-        command: Vec<String>,
+        command: Vec<std::ffi::OsString>,
     },
 
     /// Hidden alias for `temp-run` (the spec's `sandbox-dir` word). The
@@ -2295,9 +2301,9 @@ Examples:
         #[arg(long)]
         json: bool,
 
-        /// The command to run in the temp dir (everything after `--`)
+        /// Program and exact argv to run in the temp dir (everything after `--`)
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
-        command: Vec<String>,
+        command: Vec<std::ffi::OsString>,
     },
 
     /// Track files downloaded from risky sources (tainted-content) (M10 ch3)
@@ -6793,7 +6799,7 @@ fn main() {
     // single-threaded main thread. `run_on_main_thread` never returns on success
     // (it `execve`s the contained target) and exits non-zero on failure; it never
     // falls through to running the target uncontained.
-    let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if cli::capsule_child::is_invocation(&raw_args) {
         cli::capsule_child::run_on_main_thread(&raw_args);
     }

@@ -58,6 +58,7 @@
 //! broker is verified (cross-cutting invariant 3). A `DenyAll` spec is satisfied
 //! natively.
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use super::{
@@ -412,6 +413,45 @@ pub fn sandbox_exec_argv(
     argv.push(profile);
     argv.push("--".to_string());
     argv.push(program.to_string());
+    argv.extend(program_args.iter().cloned());
+    Ok(argv)
+}
+
+/// OS-native counterpart to [`sandbox_exec_argv`]. The Seatbelt profile remains
+/// UTF-8 text, while the target program and every target argument retain their
+/// original [`OsString`] representation all the way into `Command`.
+pub fn sandbox_exec_argv_os(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    program_args: &[OsString],
+) -> Result<Vec<OsString>, SeatbeltError> {
+    if spec.capability_level() == CapabilityLevel::AllowListedDomains {
+        return Err(SeatbeltError::Unsupported(
+            "allow-listed-domains egress needs the loopback broker wired in E5; E3's Seatbelt \
+             backend enforces DenyAll only"
+                .to_string(),
+        ));
+    }
+    if program.as_encoded_bytes().contains(&0) {
+        return Err(SeatbeltError::NulInArgument(
+            "program path contains NUL".to_string(),
+        ));
+    }
+    for arg in program_args {
+        if arg.as_encoded_bytes().contains(&0) {
+            return Err(SeatbeltError::NulInArgument(
+                "argument contains NUL".to_string(),
+            ));
+        }
+    }
+
+    let profile = sandbox_profile(spec)?;
+    let mut argv = Vec::with_capacity(program_args.len() + 5);
+    argv.push(OsString::from(SANDBOX_EXEC_PATH));
+    argv.push(OsString::from("-p"));
+    argv.push(OsString::from(profile));
+    argv.push(OsString::from("--"));
+    argv.push(program.to_os_string());
     argv.extend(program_args.iter().cloned());
     Ok(argv)
 }

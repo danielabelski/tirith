@@ -42,6 +42,7 @@
 //! degraded run that policy permitted is flagged `degraded = true`; an enforcing
 //! caller that did not permit degradation never reaches a spawn at all.
 
+use std::ffi::{OsStr, OsString};
 use std::process::{Child, Command, Stdio};
 
 #[cfg_attr(
@@ -296,6 +297,28 @@ pub fn run_to_completion(
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
+    let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+    run_to_completion_os(
+        spec,
+        OsStr::new(program),
+        &args_os,
+        cwd,
+        extra_env,
+        degraded,
+    )
+}
+
+/// OS-native variant of [`run_to_completion`]. This is the authoritative launch
+/// path for callers such as `temp-run` that must preserve argument boundaries and
+/// non-UTF8 Unix bytes exactly. No component is joined or reparsed by a shell.
+pub fn run_to_completion_os(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+    degraded: DegradedPolicy,
+) -> Result<CapsuleOutcome, CapsuleRefused> {
     let sel = select_backend(spec);
     let is_degraded = sel.is_degraded();
 
@@ -310,12 +333,12 @@ pub fn run_to_completion(
     #[cfg(target_os = "windows")]
     {
         if !is_degraded {
-            return windows_run_to_completion(spec, program, args, &sel);
+            return windows_run_to_completion_os(spec, program, args, &sel);
         }
         // Degraded + AllowDegraded on Windows: run uncontained via a plain Command.
         // An enforcing surface would have failed closed above; assert it here.
         assert_degraded_run_is_permitted(degraded);
-        return uncontained_run(program, args, cwd, extra_env, &sel, true);
+        return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -324,9 +347,9 @@ pub fn run_to_completion(
             // AllowDegraded: run uncontained but honestly flagged. An enforcing
             // surface would have failed closed above; assert it here.
             assert_degraded_run_is_permitted(degraded);
-            return uncontained_run(program, args, cwd, extra_env, &sel, true);
+            return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
         }
-        let mut cmd = build_contained_command(spec, program, args, &sel)?;
+        let mut cmd = build_contained_command_os(spec, program, args, &sel)?;
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -346,12 +369,11 @@ pub fn run_to_completion(
     }
 }
 
-/// Run uncontained (degraded path) via a plain `Command`, inheriting stdio. Only
-/// reached under [`DegradedPolicy::AllowDegraded`]; the outcome is flagged
-/// `degraded`.
-fn uncontained_run(
-    program: &str,
-    args: &[String],
+/// OS-native degraded launch. It uses `Command` directly, so shell metacharacters
+/// remain ordinary argument data and Unix non-UTF8 bytes survive unchanged.
+fn uncontained_run_os(
+    program: &OsStr,
+    args: &[OsString],
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
     sel: &SelectedBackend,
@@ -375,6 +397,33 @@ fn uncontained_run(
         coverage: sel.coverage,
         degraded,
     })
+}
+
+/// OS-native counterpart to [`build_contained_command`], used when the original
+/// process argv must reach the contained child without UTF-8 conversion.
+#[cfg(not(target_os = "windows"))]
+fn build_contained_command_os(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    sel: &SelectedBackend,
+) -> Result<Command, CapsuleRefused> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_contained_command_os(spec, program, args, sel)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_contained_command_os(spec, program, args, sel)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (spec, program, args);
+        Err(CapsuleRefused {
+            backend_id: sel.backend_id,
+            reason: "no containment backend on this target".to_string(),
+        })
+    }
 }
 
 /// Spawn `program` + `args` inside a capsule with **piped** stdin/stdout/stderr and
@@ -484,36 +533,15 @@ fn build_contained_command(
     args: &[String],
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
-    #[cfg(target_os = "linux")]
-    {
-        linux_contained_command(spec, program, args, sel)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos_contained_command(spec, program, args, sel)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // No Unix backend on this target; the select_backend probe would have been
-        // NoOp and the degraded gate already handled it. Reaching here means the
-        // caller bypassed the gate, so fail closed.
-        let _ = (spec, program, args);
-        Err(CapsuleRefused {
-            backend_id: sel.backend_id,
-            reason: "no containment backend on this target".to_string(),
-        })
-    }
+    let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+    build_contained_command_os(spec, OsStr::new(program), &args_os, sel)
 }
 
-/// Linux: re-exec `tirith __capsule-child <spec-json> -- <program> <args>`. The
-/// launcher applies the full containment sequence in a single-threaded child and
-/// `execve`s the target, so the parent only has to spawn the current executable
-/// with the right argv. The spec travels as JSON.
 #[cfg(target_os = "linux")]
-fn linux_contained_command(
+fn linux_contained_command_os(
     spec: &CapsuleSpec,
-    program: &str,
-    args: &[String],
+    program: &OsStr,
+    args: &[OsString],
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
     let exe = std::env::current_exe().map_err(|e| CapsuleRefused {
@@ -533,54 +561,36 @@ fn linux_contained_command(
     Ok(cmd)
 }
 
-/// macOS: wrap in `sandbox-exec -p <profile> -- <program> <args>` (built by the E3
-/// backend) and, in a `pre_exec` hook, apply the environment scrub + handle-closure
-/// + rlimits that the SBPL profile alone does not — closing the env/resource/handle
-///   coverage the E5 probe only claims because this wrapper applies them.
 #[cfg(target_os = "macos")]
-fn macos_contained_command(
+/// macOS: wrap the OS-native target argv in `sandbox-exec`, then apply the
+/// environment, resource, and handle controls that Seatbelt does not provide.
+fn macos_contained_command_os(
     spec: &CapsuleSpec,
-    program: &str,
-    args: &[String],
+    program: &OsStr,
+    args: &[OsString],
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
     use std::os::unix::process::CommandExt;
 
     let argv =
-        tirith_core::capsule::macos::sandbox_exec_argv(spec, program, args).map_err(|e| {
+        tirith_core::capsule::macos::sandbox_exec_argv_os(spec, program, args).map_err(|e| {
             CapsuleRefused {
                 backend_id: sel.backend_id,
                 reason: format!("cannot build sandbox-exec invocation: {e}"),
             }
         })?;
-    // argv[0] is the sandbox-exec path; the rest are its args.
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-
-    // Environment scrub: clear, then re-add the surviving names from the current
-    // environment, and (when temporary_home) point HOME/TMPDIR/XDG_* at a fresh
-    // temp dir. We do this on the parent `Command` (env_clear + env) so the child
-    // and the sandbox-exec wrapper both see the scrubbed set. Fails closed if the
-    // temporary HOME cannot be created for a `temporary_home` spec: skipping it
-    // would leave the real `$HOME` reachable (env_clear already ran, but
-    // `getpwuid()->pw_dir` still resolves it) while `env_isolated` claims true.
     apply_macos_env(&mut cmd, spec).map_err(|reason| CapsuleRefused {
         backend_id: sel.backend_id,
         reason,
     })?;
 
-    // rlimits + fd closure run in the child just before exec (pre_exec), so they
-    // affect the sandbox-exec process and, by inheritance, the target.
     let resources = spec.resources.clone();
     let handles = spec.handles.clone();
-    // SAFETY: the closure only calls async-signal-safe libc functions (getrlimit,
-    // setrlimit, close) on values captured by move; it allocates nothing and
-    // touches no shared state of the parent.
-    //
-    // Order matters: close inherited fds FIRST, while `RLIMIT_NOFILE` still reflects
-    // the inherited (higher) ceiling, so a high-numbered inherited fd is found and
-    // closed. Lowering `RLIMIT_NOFILE` does not close already-open fds, so applying
-    // rlimits first would shrink the scan ceiling and let a high fd survive.
+    // SAFETY: the closure only invokes async-signal-safe libc functions
+    // (`getrlimit`, `close`, and `setrlimit`) on owned values. Descriptor closure
+    // runs before lowering RLIMIT_NOFILE so the scan sees the inherited ceiling.
     unsafe {
         cmd.pre_exec(move || {
             close_extra_fds(&handles);
@@ -779,14 +789,14 @@ fn clamp_fd_ceiling(rlim_cur: libc::rlim_t) -> i32 {
 /// Windows run-to-completion: apply the AppContainer + Job launcher and wait. Only
 /// reached on a non-degraded Windows backend (the degraded gate is checked first).
 #[cfg(target_os = "windows")]
-fn windows_run_to_completion(
+fn windows_run_to_completion_os(
     spec: &CapsuleSpec,
-    program: &str,
-    args: &[String],
+    program: &OsStr,
+    args: &[OsString],
     sel: &SelectedBackend,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     let mut child =
-        crate::cli::capsule_windows::launch_contained(spec, program, args).map_err(|e| {
+        crate::cli::capsule_windows::launch_contained_os(spec, program, args).map_err(|e| {
             CapsuleRefused {
                 backend_id: sel.backend_id,
                 reason: format!("contained launch failed: {e}"),
@@ -952,6 +962,71 @@ mod tests {
         // S6: the guard at the uncontained-degraded-run path accepts AllowDegraded
         // (the only policy that should ever reach it). It must not panic for it.
         assert_degraded_run_is_permitted(DegradedPolicy::AllowDegraded);
+    }
+
+    /// The uncontained AllowDegraded branch itself already uses `Command` argv.
+    /// Pin that property so widening the API for temp-run cannot regress the
+    /// fallback into a shell string.
+    #[cfg(unix)]
+    #[test]
+    fn degraded_uncontained_run_keeps_shell_metacharacters_as_data() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("degraded-shell-injection");
+        let script = format!("test \"$1\" = 'safe; touch {}'", marker.display());
+        let args = vec![
+            "-c".to_string(),
+            script,
+            "probe".to_string(),
+            format!("safe; touch {}", marker.display()),
+        ];
+        let selected = SelectedBackend {
+            backend_id: "noop",
+            coverage: CapsuleCoverage::NONE,
+            required: CapsuleCoverage::NONE,
+        };
+
+        let args_os: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+        let outcome = uncontained_run_os(
+            OsStr::new("/bin/sh"),
+            &args_os,
+            Some(temp.path()),
+            &[],
+            &selected,
+            true,
+        )
+        .expect("degraded direct run");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.degraded);
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_contained_command_os_preserves_argv() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let spec = CapsuleSpec::locked_down();
+        let selected = SelectedBackend {
+            backend_id: "seatbelt",
+            coverage: spec.required_coverage(),
+            required: spec.required_coverage(),
+        };
+        let raw = b"raw-\xff; $(touch marker) > *.txt".to_vec();
+        let argument = OsString::from_vec(raw.clone());
+        let command = macos_contained_command_os(
+            &spec,
+            OsStr::new("/usr/bin/printf"),
+            std::slice::from_ref(&argument),
+            &selected,
+        )
+        .expect("build native Seatbelt argv");
+        let argv: Vec<OsString> = command.get_args().map(OsStr::to_os_string).collect();
+        let separator = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("sandbox-exec separator");
+        assert_eq!(argv[separator + 1], OsString::from("/usr/bin/printf"));
+        assert_eq!(argv[separator + 2].as_encoded_bytes(), raw);
     }
 
     #[cfg(debug_assertions)]

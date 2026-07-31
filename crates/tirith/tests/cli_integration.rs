@@ -1,9 +1,11 @@
 //! Integration tests for the tirith CLI binary.
 
+#[cfg(unix)]
+use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(unix)]
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -9135,6 +9137,70 @@ fn intend_empty_command_is_usage_error() {
 
 // M10 ch6 — `tirith temp-run` (file isolation only; NOT a sandbox).
 
+#[cfg(unix)]
+fn write_temp_run_argv_probe(project: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = project.join("argv probe.sh");
+    fs::write(
+        &probe,
+        b"#!/bin/sh\n: > argv.bin\nfor arg in \"$@\"; do printf '%s\\0' \"$arg\" >> argv.bin; done\n",
+    )
+    .expect("write argv probe");
+    let mut permissions = fs::metadata(&probe).expect("probe metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&probe, permissions).expect("make argv probe executable");
+}
+
+#[cfg(unix)]
+fn parse_nul_argv(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut args: Vec<Vec<u8>> = bytes.split(|b| *b == 0).map(<[u8]>::to_vec).collect();
+    if bytes.last() == Some(&0) {
+        args.pop();
+    }
+    args
+}
+
+#[cfg(unix)]
+fn run_temp_run_argv_probe(
+    project: &Path,
+    args: &[OsString],
+    capsule: bool,
+) -> (
+    std::process::Output,
+    Option<serde_json::Value>,
+    Vec<Vec<u8>>,
+) {
+    write_temp_run_argv_probe(project);
+    fs::write(project.join("glob-target.txt"), b"glob fixture").expect("write glob fixture");
+
+    let mut command = tirith();
+    command.arg("temp-run").arg("--json").arg("--copy-repo");
+    if capsule {
+        command.arg("--capsule");
+    }
+    command
+        .arg("--")
+        .arg(OsStr::new("./argv probe.sh"))
+        .args(args)
+        .current_dir(project);
+
+    let output = command.output().expect("run temp-run argv probe");
+    let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+    let recorded = json
+        .as_ref()
+        .and_then(|value| value["temp_dir"].as_str())
+        .map(PathBuf::from)
+        .and_then(|kept| {
+            let bytes = fs::read(kept.join("argv.bin")).ok();
+            let _ = fs::remove_dir_all(kept);
+            bytes
+        })
+        .map(|bytes| parse_nul_argv(&bytes))
+        .unwrap_or_default();
+    (output, json, recorded)
+}
+
 /// Positive: a command that creates a file lands that file in the temp dir (reported as a
 /// `new_files` diff entry), NOT in the caller's cwd.
 #[cfg(unix)]
@@ -9145,11 +9211,8 @@ fn temp_run_creates_file_in_temp_dir_not_cwd() {
     fs::create_dir_all(&workdir).unwrap();
 
     let out = tirith()
-        .args(["temp-run", "--json", "--", "touch foo.txt"])
+        .args(["temp-run", "--json", "--", "touch", "foo.txt"])
         .current_dir(&workdir)
-        // Pin the child shell: `temp-run` runs the command through `$SHELL`, so a broken
-        // interactive `$SHELL` on the test host would make this non-hermetic.
-        .env("SHELL", "/bin/sh")
         .output()
         .expect("failed to run tirith");
 
@@ -9196,9 +9259,6 @@ fn temp_run_creates_file_in_temp_dir_not_cwd() {
 fn temp_run_smoke_true_emits_isolation_kind() {
     let out = tirith()
         .args(["temp-run", "--json", "--", "true"])
-        // Pin the child shell (see `temp_run_creates_file_in_temp_dir_not_cwd`):
-        // `temp-run` executes via `$SHELL`; `/bin/sh` keeps the test hermetic.
-        .env("SHELL", "/bin/sh")
         .output()
         .expect("failed to run tirith");
 
@@ -9219,6 +9279,158 @@ fn temp_run_smoke_true_emits_isolation_kind() {
     if let Some(p) = json["temp_dir"].as_str() {
         let _ = fs::remove_dir_all(PathBuf::from(p));
     }
+}
+
+/// repo-0179: arguments that are data must remain one argv element. None of the
+/// shell metacharacter classes below may be reinterpreted by an implicit shell.
+#[cfg(unix)]
+#[test]
+fn temp_run_preserves_malicious_and_legitimate_argument_boundaries() {
+    let cases = [
+        ("whitespace", OsString::from("two words"), false),
+        ("empty", OsString::new(), false),
+        ("separator", OsString::from("safe; touch MARKER"), true),
+        ("substitution", OsString::from("$(touch MARKER)"), true),
+        ("redirection", OsString::from("safe > MARKER"), true),
+        ("quotes", OsString::from("a'\"b"), false),
+        ("glob", OsString::from("*"), false),
+        ("legitimate", OsString::from("plain-value"), false),
+    ];
+
+    for (label, template, has_marker) in cases {
+        let project = tempfile::tempdir().expect("project");
+        let marker = project.path().join(format!("{label}-executed"));
+        let marker_text = marker.to_string_lossy();
+        let argument = OsString::from(template.to_string_lossy().replace("MARKER", &marker_text));
+        let (output, json, recorded) =
+            run_temp_run_argv_probe(project.path(), std::slice::from_ref(&argument), false);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{label}: argv probe should run successfully; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = json.unwrap_or_else(|| {
+            panic!(
+                "{label}: expected JSON; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        assert_eq!(
+            json["argv"].as_array().map(Vec::len),
+            Some(2),
+            "{label}: structured argv must include program plus one data argument"
+        );
+        assert_eq!(json["argv"][0], "./argv probe.sh", "{label}: argv[0]");
+        assert_eq!(
+            json["argv"][1],
+            argument.to_string_lossy().as_ref(),
+            "{label}: structured data argument"
+        );
+        assert_eq!(
+            recorded,
+            vec![argument.as_encoded_bytes().to_vec()],
+            "{label}: child must receive the exact original data argument"
+        );
+        if has_marker {
+            assert!(
+                !marker.exists(),
+                "{label}: implicit shell interpretation created {}",
+                marker.display()
+            );
+        }
+    }
+}
+
+/// Shell syntax remains available, but only when the caller explicitly names a
+/// shell and supplies its `-c` command as one argument.
+#[cfg(unix)]
+#[test]
+fn temp_run_explicit_shell_control_still_interprets_shell_syntax() {
+    let project = tempfile::tempdir().expect("project");
+    let out = tirith()
+        .args([
+            "temp-run",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf explicit-shell > explicit.txt",
+        ])
+        .current_dir(project.path())
+        .output()
+        .expect("run explicit shell control");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "explicit shell should succeed; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON output");
+    assert_eq!(json["argv"].as_array().map(Vec::len), Some(3));
+    let kept = PathBuf::from(json["temp_dir"].as_str().expect("kept temp dir"));
+    assert_eq!(
+        fs::read_to_string(kept.join("explicit.txt")).expect("explicit shell output"),
+        "explicit-shell"
+    );
+    let _ = fs::remove_dir_all(kept);
+}
+
+/// The capsule route must preserve the same argv contract whether the host uses a
+/// real backend or the honest AllowDegraded fallback.
+#[cfg(unix)]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "pre-existing macOS capsule pre_exec closes Rust's internal exec-error pipe"
+)]
+#[test]
+fn temp_run_capsule_path_preserves_argument_boundaries() {
+    let project = tempfile::tempdir().expect("project");
+    let marker = project.path().join("capsule-shell-injection");
+    let argument = OsString::from(format!("safe; touch {}", marker.display()));
+    let (output, json, recorded) =
+        run_temp_run_argv_probe(project.path(), std::slice::from_ref(&argument), true);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "capsule argv probe should succeed; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = json.expect("capsule JSON output");
+    assert_eq!(json["capsule_requested"], true);
+    assert!(json["capsule_contained"].is_boolean());
+    assert_eq!(recorded, vec![argument.as_encoded_bytes().to_vec()]);
+    assert!(
+        !marker.exists(),
+        "capsule path must not reparse the argument"
+    );
+}
+
+/// Unix argv is a byte sequence, not necessarily UTF-8. `temp-run` must carry a
+/// non-UTF8 data argument unchanged into the child rather than panic or replace it.
+#[cfg(unix)]
+#[test]
+fn temp_run_preserves_non_utf8_unix_argument() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let project = tempfile::tempdir().expect("project");
+    let raw = b"raw-\xff-argument".to_vec();
+    let argument = OsString::from_vec(raw.clone());
+    let (output, json, recorded) =
+        run_temp_run_argv_probe(project.path(), std::slice::from_ref(&argument), false);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "non-UTF8 argv should execute; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(json.is_some(), "non-UTF8 argv must still produce JSON");
+    assert_eq!(recorded, vec![raw]);
 }
 
 /// F1 + pr-test-analyzer #6: `tirith watch` ALWAYS runs the after-snapshot and diff once the

@@ -56,7 +56,8 @@
 //! enforcing surface fails closed (cross-cutting invariant 3).
 
 use std::collections::BTreeSet;
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -570,15 +571,15 @@ fn env_name_survives(name: &std::ffi::OsStr, survivors: &BTreeSet<String>) -> bo
 /// Build the argv for `execve`: `prog` followed by `args`, as NUL-terminated
 /// C strings. Returns an error if any component contains an interior NUL (which
 /// cannot be passed to `execve`). Pure, so it is unit-testable on any platform.
-pub fn exec_cstrings(prog: &str, args: &[String]) -> Result<Vec<CString>, ContainError> {
+pub fn exec_cstrings(prog: &OsStr, args: &[OsString]) -> Result<Vec<CString>, ContainError> {
     let mut out = Vec::with_capacity(args.len() + 1);
     out.push(
-        CString::new(prog)
+        CString::new(prog.as_bytes())
             .map_err(|_| ContainError::Unsupported("program path contains NUL".to_string()))?,
     );
     for a in args {
         out.push(
-            CString::new(a.as_str())
+            CString::new(a.as_bytes())
                 .map_err(|_| ContainError::Unsupported("argument contains NUL".to_string()))?,
         );
     }
@@ -812,7 +813,11 @@ mod tests {
 
     #[test]
     fn exec_cstrings_builds_argv() {
-        let v = exec_cstrings("/usr/bin/python3", &["-m".to_string(), "pip".to_string()]).unwrap();
+        let v = exec_cstrings(
+            OsStr::new("/usr/bin/python3"),
+            &[OsString::from("-m"), OsString::from("pip")],
+        )
+        .unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].to_str().unwrap(), "/usr/bin/python3");
         assert_eq!(v[2].to_str().unwrap(), "pip");
@@ -820,8 +825,19 @@ mod tests {
 
     #[test]
     fn exec_cstrings_rejects_interior_nul() {
-        let err = exec_cstrings("/bin/sh", &["a\0b".to_string()]).expect_err("NUL must error");
+        let err = exec_cstrings(OsStr::new("/bin/sh"), &[OsString::from("a\0b")])
+            .expect_err("NUL must error");
         assert!(matches!(err, ContainError::Unsupported(_)));
+    }
+
+    #[test]
+    fn exec_cstrings_preserves_non_utf8_argument_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = b"raw-\xff-argument".to_vec();
+        let v = exec_cstrings(OsStr::new("/bin/echo"), &[OsString::from_vec(raw.clone())])
+            .expect("non-UTF8 argv is valid on Unix");
+        assert_eq!(v[1].as_bytes(), raw);
     }
 
     #[test]

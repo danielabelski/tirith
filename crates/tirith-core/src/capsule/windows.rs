@@ -69,6 +69,7 @@
 //! `DenyAll` spec is satisfied natively (no networking capability granted == no raw
 //! egress).
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use super::{
@@ -434,10 +435,10 @@ pub struct WindowsLaunchPlan {
     /// The Job Object limits to apply.
     pub job_limits: JobObjectLimits,
     /// The target program (the executable path / `lpApplicationName`).
-    pub program: String,
+    pub program: OsString,
     /// The target program's arguments (appended after the program in the
     /// `lpCommandLine`).
-    pub program_args: Vec<String>,
+    pub program_args: Vec<OsString>,
     /// Whether `CreateProcessW` must inherit handles. **Always false** in E4 (the
     /// honest handle closure); the field is explicit so a future stdio-forwarding
     /// path cannot flip it implicitly.
@@ -462,6 +463,18 @@ pub fn windows_launch_plan(
     program: &str,
     program_args: &[String],
 ) -> Result<WindowsLaunchPlan, WindowsCapsuleError> {
+    let args_os: Vec<OsString> = program_args.iter().map(OsString::from).collect();
+    windows_launch_plan_os(spec, OsStr::new(program), &args_os)
+}
+
+/// OS-native counterpart to [`windows_launch_plan`]. Keeping the program and
+/// arguments as [`OsString`] preserves Windows' native UTF-16/WTF-16 values until
+/// the executor constructs the `CreateProcessW` buffers.
+pub fn windows_launch_plan_os(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    program_args: &[OsString],
+) -> Result<WindowsLaunchPlan, WindowsCapsuleError> {
     // Fail closed on a level we cannot honestly enforce, before building anything.
     if spec.capability_level() == CapabilityLevel::AllowListedDomains {
         return Err(WindowsCapsuleError::Unsupported(
@@ -470,14 +483,17 @@ pub fn windows_launch_plan(
                 .to_string(),
         ));
     }
-    if program.contains('\0') {
+    if os_contains_nul(program) {
         return Err(WindowsCapsuleError::NulInArgument(format!(
-            "program path: {program}"
+            "program path: {}",
+            program.to_string_lossy()
         )));
     }
     for a in program_args {
-        if a.contains('\0') {
-            return Err(WindowsCapsuleError::NulInArgument(a.clone()));
+        if os_contains_nul(a) {
+            return Err(WindowsCapsuleError::NulInArgument(
+                a.to_string_lossy().into_owned(),
+            ));
         }
     }
 
@@ -486,11 +502,23 @@ pub fn windows_launch_plan(
         profile: app_container_profile(spec)?,
         acl_grants: grants,
         job_limits: job_object_limits(&spec.resources),
-        program: program.to_string(),
+        program: program.to_os_string(),
         program_args: program_args.to_vec(),
         // Honest handle closure: never inherit parent handles.
         inherit_handles: false,
     })
+}
+
+fn os_contains_nul(value: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().any(|unit| unit == 0)
+    }
+    #[cfg(not(windows))]
+    {
+        value.as_encoded_bytes().contains(&0)
+    }
 }
 
 /// Quote one argument for a `CreateProcessW` `lpCommandLine` following the
@@ -506,7 +534,7 @@ pub fn windows_launch_plan(
 /// bypasses because it needs `STARTUPINFOEXW`) so the assembled command line cannot
 /// be mis-split by the child.
 pub fn quote_arg_for_command_line(arg: &str) -> String {
-    if !arg.is_empty() && !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
+    if !arg.is_empty() && !arg.chars().any(command_line_char_needs_quotes) {
         return arg.to_string();
     }
     let mut out = String::with_capacity(arg.len() + 2);
@@ -542,19 +570,80 @@ pub fn quote_arg_for_command_line(arg: &str) -> String {
     out
 }
 
-/// Assemble the full `lpCommandLine` string for the plan: the (quoted) program
-/// followed by each (quoted) argument, space-separated, exactly as
-/// `CreateProcessW` parses it. **Pure.** The executor passes the program path as
-/// `lpApplicationName` *and* as argv[0] here so the child sees a conventional
-/// command line; `CreateProcessW` resolves the executable from `lpApplicationName`,
-/// not from this string, which closes the search-path ambiguity.
+fn command_line_char_needs_quotes(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '"')
+}
+
+/// Assemble a UTF-8 display/test form of the plan's command line. The Windows
+/// executor uses [`command_line_wide_for`] so native values are never converted
+/// lossily. Both builders apply the same CRT quoting algorithm and include the
+/// program as argv[0]; `CreateProcessW` resolves the executable separately from
+/// `lpApplicationName`, closing the search-path ambiguity.
 pub fn command_line_for(plan: &WindowsLaunchPlan) -> String {
     let mut parts = Vec::with_capacity(plan.program_args.len() + 1);
-    parts.push(quote_arg_for_command_line(&plan.program));
+    parts.push(quote_arg_for_command_line(&plan.program.to_string_lossy()));
     for a in &plan.program_args {
-        parts.push(quote_arg_for_command_line(a));
+        parts.push(quote_arg_for_command_line(&a.to_string_lossy()));
     }
     parts.join(" ")
+}
+
+/// Assemble the exact native UTF-16 `lpCommandLine` buffer, excluding the final
+/// NUL terminator. Unlike [`command_line_for`], this never performs a lossy text
+/// conversion on Windows and therefore preserves unpaired surrogate code units.
+pub fn command_line_wide_for(plan: &WindowsLaunchPlan) -> Vec<u16> {
+    let mut out = Vec::new();
+    for (index, arg) in std::iter::once(&plan.program)
+        .chain(plan.program_args.iter())
+        .enumerate()
+    {
+        if index != 0 {
+            out.push(u16::from(b' '));
+        }
+        out.extend(quote_wide_arg(&os_wide(arg)));
+    }
+    out
+}
+
+fn os_wide(value: &OsStr) -> Vec<u16> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().collect()
+    }
+    #[cfg(not(windows))]
+    {
+        value.to_string_lossy().encode_utf16().collect()
+    }
+}
+
+fn quote_wide_arg(arg: &[u16]) -> Vec<u16> {
+    let needs_quotes = arg.is_empty() || arg.iter().any(|unit| matches!(*unit, 0x20 | 0x09 | 0x22));
+    if !needs_quotes {
+        return arg.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(arg.len() + 2);
+    out.push(u16::from(b'"'));
+    let mut backslashes = 0usize;
+    for unit in arg {
+        match *unit {
+            0x5c => backslashes += 1,
+            0x22 => {
+                out.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+                out.push(u16::from(b'"'));
+                backslashes = 0;
+            }
+            other => {
+                out.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+                backslashes = 0;
+                out.push(other);
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    out.push(u16::from(b'"'));
+    out
 }
 
 #[cfg(test)]
@@ -837,7 +926,10 @@ mod tests {
         let plan = windows_launch_plan(&spec, "C:/python/python.exe", &["-m".into(), "pip".into()])
             .expect("plan");
         assert_eq!(plan.program, "C:/python/python.exe");
-        assert_eq!(plan.program_args, vec!["-m".to_string(), "pip".to_string()]);
+        assert_eq!(
+            plan.program_args,
+            vec![OsString::from("-m"), OsString::from("pip")]
+        );
         // Honest handle closure.
         assert!(!plan.inherit_handles);
         // No network capability.
@@ -946,5 +1038,41 @@ mod tests {
         let cmd = command_line_for(&plan);
         // The program (with a space) is quoted; the plain args are not.
         assert_eq!(cmd, "\"C:/Program Files/Python/python.exe\" -m pip");
+    }
+
+    #[test]
+    fn windows_quoting_keeps_shell_metacharacter_classes_inside_arguments() {
+        for arg in [
+            "two words",
+            "safe; touch marker",
+            "$(touch marker)",
+            "safe > marker",
+            "a'\"b",
+            "*.txt",
+        ] {
+            let quoted = quote_arg_for_command_line(arg);
+            if arg.chars().any(command_line_char_needs_quotes) {
+                assert!(quoted.starts_with('"') && quoted.ends_with('"'), "{arg:?}");
+            } else {
+                assert_eq!(quoted, arg, "a single token needs no extra quoting");
+            }
+
+            let plan = windows_launch_plan(
+                &CapsuleSpec::locked_down(),
+                "C:/Program Files/probe.exe",
+                &[arg.to_string()],
+            )
+            .expect("plan");
+            let command_line = command_line_for(&plan);
+            assert!(
+                command_line.ends_with(&quoted),
+                "argument must remain one CRT-quoted element: {command_line:?}"
+            );
+            assert_eq!(
+                String::from_utf16(&command_line_wide_for(&plan)).expect("valid fixture UTF-16"),
+                command_line,
+                "the native CreateProcessW buffer must apply the same argv quoting"
+            );
+        }
     }
 }

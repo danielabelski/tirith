@@ -15,6 +15,7 @@
 //!     `env -i NAME …` (the bare-name form is non-portable across coreutils/BSD).
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -76,15 +77,28 @@ const MAX_FILES: usize = 100_000;
 /// backend + coverage. Because `temp-run` is explicitly not an enforcing surface, a
 /// host without a working backend runs the command degraded with an honest banner
 /// rather than failing closed.
-pub fn run(command: &[String], copy_repo: bool, strip_env: bool, capsule: bool, json: bool) -> i32 {
-    let command_str = command.join(" ");
-    if command_str.trim().is_empty() {
+pub fn run(
+    command: &[OsString],
+    copy_repo: bool,
+    strip_env: bool,
+    capsule: bool,
+    json: bool,
+) -> i32 {
+    let Some(program) = command.first() else {
+        eprintln!(
+            "tirith temp-run: no command given \
+             (usage: tirith temp-run -- ./script.sh)"
+        );
+        return 2;
+    };
+    if program.is_empty() || program.to_str().is_some_and(|s| s.trim().is_empty()) {
         eprintln!(
             "tirith temp-run: no command given \
              (usage: tirith temp-run -- ./script.sh)"
         );
         return 2;
     }
+    let command_display = command_display(command);
 
     // The TempDir handle stays alive for the whole function so its Drop never
     // fires mid-run or mid-diff; we delete only at the end, on confirmation.
@@ -117,7 +131,7 @@ pub fn run(command: &[String], copy_repo: bool, strip_env: bool, capsule: bool, 
 
     if !json {
         print_preamble(
-            &command_str,
+            &command_display,
             &temp_path,
             copy_repo,
             strip_env,
@@ -129,7 +143,7 @@ pub fn run(command: &[String], copy_repo: bool, strip_env: bool, capsule: bool, 
     // Baseline inventory AFTER seeding so `--copy-repo` files aren't "new".
     let before = inventory(&temp_path);
 
-    let run_outcome = run_in_dir(&command_str, &temp_path, strip_env, capsule);
+    let run_outcome = run_in_dir(command, &temp_path, strip_env, capsule);
     let (exit_code, capsule_report) = match run_outcome {
         Ok((code, report)) => (code, report),
         Err(e) => {
@@ -164,7 +178,8 @@ pub fn run(command: &[String], copy_repo: bool, strip_env: bool, capsule: bool, 
 
     if json {
         emit_json(
-            &command_str,
+            &command_display,
+            command,
             exit_code,
             copy_repo,
             strip_env,
@@ -261,7 +276,8 @@ fn print_list_section(label: &str, items: &[String]) {
 
 #[allow(clippy::too_many_arguments)]
 fn emit_json(
-    command_str: &str,
+    command_display: &str,
+    command: &[OsString],
     exit_code: i32,
     copy_repo: bool,
     strip_env: bool,
@@ -282,11 +298,20 @@ fn emit_json(
     } else {
         IsolationKind::FileOnlyNotASandbox
     };
+    let argv: Vec<String> = command
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     let json_val = serde_json::json!({
         "isolation_kind": isolation_kind,
         "not_a_sandbox": !contained,
         "disclaimer": NOT_A_SANDBOX_BANNER,
-        "command": command_str,
+        // Backward-compatible display field. It is never fed back into execution.
+        "command": command_display,
+        // The execution shape is explicit for callers that must reason about argv.
+        // Non-UTF8 Unix arguments use their standard lossy JSON display; execution
+        // retains the original OsString bytes end to end.
+        "argv": argv,
         "exit_code": exit_code,
         "copy_repo": copy_repo,
         "files_copied": copied,
@@ -303,6 +328,16 @@ fn emit_json(
     write_json_stdout(&json_val, "tirith temp-run: failed to write JSON output");
 }
 
+/// Build the legacy human/JSON command label from argv. Sanitization and quoting
+/// happen only for display; execution always uses the original [`OsString`]s.
+fn command_display(command: &[OsString]) -> String {
+    let display_parts: Vec<String> = command
+        .iter()
+        .map(|arg| super::sanitize_for_human_output(&arg.to_string_lossy(), false))
+        .collect();
+    super::shell_join(&display_parts)
+}
+
 /// The capsule outcome surfaced by `--capsule`: the real backend that ran the
 /// command and whether it ran degraded (uncontained because the host had no
 /// working backend). Emitted in both human and JSON output so the containment
@@ -315,7 +350,10 @@ pub struct CapsuleReport {
     pub contained: bool,
 }
 
-/// Run `command_str` through the platform shell with cwd set to `dir`. With
+/// Run `command` directly with cwd set to `dir`, preserving every argv boundary.
+/// Shell syntax is interpreted only when the caller explicitly supplies a shell
+/// program and its command flag (for example `/bin/sh -c <string>` or
+/// `cmd /C <string>`). With
 /// `strip_env`, the child env is cleared and rebuilt from the allowlist. With
 /// `capsule`, the command is routed through the OS containment capsule (E5)
 /// confined to `dir`; the returned [`CapsuleReport`] records the backend and
@@ -323,25 +361,20 @@ pub struct CapsuleReport {
 /// if signal-killed). Without `--capsule` this is NOT isolation — the command runs
 /// with the user's full privileges.
 fn run_in_dir(
-    command_str: &str,
+    command: &[OsString],
     dir: &Path,
     strip_env: bool,
     capsule: bool,
 ) -> std::io::Result<(i32, Option<CapsuleReport>)> {
     if capsule {
-        return run_in_dir_capsuled(command_str, dir, strip_env);
+        return run_in_dir_capsuled(command, dir, strip_env);
     }
 
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(command_str);
-        c
-    } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut c = Command::new(shell);
-        c.arg("-c").arg(command_str);
-        c
-    };
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty argv"))?;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
     cmd.current_dir(dir);
 
     if strip_env {
@@ -359,14 +392,14 @@ fn run_in_dir(
     Ok((status.code().unwrap_or(128), None))
 }
 
-/// `--capsule` path: build a temp-dir-confined [`CapsuleSpec`] and run the shell
-/// command through [`crate::cli::capsule::run_to_completion`] under
+/// `--capsule` path: build a temp-dir-confined [`CapsuleSpec`] and run the exact
+/// argv through [`crate::cli::capsule::run_to_completion_os`] under
 /// [`crate::cli::capsule::DegradedPolicy::AllowDegraded`] (temp-run is not an
 /// enforcing surface, so a degraded host runs uncontained-but-flagged rather than
-/// failing closed). The temp dir is the single read+write root; the shell binary's
-/// directory is also granted read so the interpreter can be found.
+/// failing closed). The temp dir is the single read+write root, alongside the
+/// system read roots needed to start ordinary executables and interpreters.
 fn run_in_dir_capsuled(
-    command_str: &str,
+    command: &[OsString],
     dir: &Path,
     strip_env: bool,
 ) -> std::io::Result<(i32, Option<CapsuleReport>)> {
@@ -376,7 +409,7 @@ fn run_in_dir_capsuled(
     // to start. We DenyAll network (a filesystem-impact preview needs none).
     let mut spec = CapsuleSpec::locked_down();
     spec.filesystem.write_roots.push(dir.to_path_buf());
-    // Grant read of the common system roots so the shell + coreutils resolve. This
+    // Grant read of the common system roots so executables and interpreters resolve. This
     // is a preview convenience, not a relaxation of the deny-default credential
     // subtrees (those stay denied via deny_roots).
     for root in [
@@ -403,20 +436,14 @@ fn run_in_dir_capsuled(
     };
     spec.environment.allow = allow.into_iter().map(|s| s.to_string()).collect();
 
-    let (program, args): (String, Vec<String>) = if cfg!(windows) {
-        (
-            "cmd".to_string(),
-            vec!["/C".to_string(), command_str.to_string()],
-        )
-    } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        (shell, vec!["-c".to_string(), command_str.to_string()])
-    };
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty argv"))?;
 
-    match crate::cli::capsule::run_to_completion(
+    match crate::cli::capsule::run_to_completion_os(
         &spec,
-        &program,
-        &args,
+        program.as_os_str(),
+        args,
         Some(dir),
         &[],
         crate::cli::capsule::DegradedPolicy::AllowDegraded,
@@ -587,6 +614,19 @@ mod tests {
         let serialized =
             serde_json::to_value(IsolationKind::FileOnlyNotASandbox).expect("serialize enum");
         assert_eq!(serialized, serde_json::Value::String(ISOLATION_KIND.into()));
+    }
+
+    #[test]
+    fn legacy_command_display_is_quoted_and_terminal_sanitized() {
+        let display = command_display(&[
+            OsString::from("probe"),
+            OsString::from("two words"),
+            OsString::from("\u{1b}[31mred\nnext"),
+        ]);
+        assert!(display.contains("'two words'"));
+        assert!(!display.contains('\u{1b}'));
+        assert!(!display.contains('\n'));
+        assert!(display.contains("rednext"));
     }
 
     #[test]

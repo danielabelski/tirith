@@ -45,7 +45,7 @@
 //! the only way to create a process *inside* an AppContainer with a
 //! `SECURITY_CAPABILITIES` blob. So the launch is hand-rolled with `CreateProcessW`;
 //! the command line is built by the pure
-//! [`tirith_core::capsule::windows::command_line_for`] (CRT-correct quoting) and the
+//! [`tirith_core::capsule::windows::command_line_wide_for`] (CRT-correct quoting) and the
 //! executable is resolved from `lpApplicationName`, closing the search-path
 //! ambiguity.
 //!
@@ -59,7 +59,7 @@
 // module's own tests; keep the not-yet-wired API from tripping `-D warnings`.
 #![allow(dead_code)]
 
-use std::ffi::{c_void, OsStr};
+use std::ffi::{c_void, OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
@@ -93,7 +93,9 @@ use windows::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
-use tirith_core::capsule::windows::{command_line_for, AclAccess, AclGrant, WindowsLaunchPlan};
+use tirith_core::capsule::windows::{
+    command_line_wide_for, AclAccess, AclGrant, WindowsLaunchPlan,
+};
 use tirith_core::capsule::{CapsuleSpec, EnvironmentPolicy};
 
 /// A failure while applying a Windows capsule launch. Carries a short context and
@@ -194,7 +196,19 @@ pub fn launch_contained(
     program: &str,
     args: &[String],
 ) -> Result<ContainedChild, WindowsLaunchError> {
-    let plan = tirith_core::capsule::windows::windows_launch_plan(spec, program, args)
+    let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+    launch_contained_os(spec, OsStr::new(program), &args_os)
+}
+
+/// OS-native launch entry point. This keeps Windows UTF-16 argument data intact
+/// until the exact `CreateProcessW` application-name and command-line buffers are
+/// assembled.
+pub fn launch_contained_os(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+) -> Result<ContainedChild, WindowsLaunchError> {
+    let plan = tirith_core::capsule::windows::windows_launch_plan_os(spec, program, args)
         .map_err(|e| WindowsLaunchError::Encoding(e.to_string()))?;
     apply_plan(&plan, &spec.environment)
 }
@@ -603,12 +617,17 @@ fn create_process(
     env: &EnvironmentPolicy,
     attr_list: &mut ProcThreadAttributeList,
 ) -> Result<Launched, WindowsLaunchError> {
-    let app = wide_nul(&plan.program)
+    let app = wide_nul_os(&plan.program)
         .map_err(|_| WindowsLaunchError::Encoding("program path has NUL".to_string()))?;
     // CreateProcessW may modify the command-line buffer in place, so it must be a
     // writable, owned wide buffer.
-    let mut cmdline = wide_nul(&command_line_for(plan))
-        .map_err(|_| WindowsLaunchError::Encoding("command line has NUL".to_string()))?;
+    let mut cmdline = command_line_wide_for(plan);
+    if cmdline.contains(&0) {
+        return Err(WindowsLaunchError::Encoding(
+            "command line has NUL".to_string(),
+        ));
+    }
+    cmdline.push(0);
 
     // Scrubbed environment block (double-NUL-terminated UTF-16).
     let mut env_block = build_environment_block(env);
@@ -899,6 +918,15 @@ fn wide_nul(s: &str) -> Result<Vec<u16>, ()> {
     let mut v: Vec<u16> = OsStr::new(s).encode_wide().collect();
     v.push(0);
     Ok(v)
+}
+
+fn wide_nul_os(s: &OsStr) -> Result<Vec<u16>, ()> {
+    let mut out: Vec<u16> = s.encode_wide().collect();
+    if out.contains(&0) {
+        return Err(());
+    }
+    out.push(0);
+    Ok(out)
 }
 
 // `SUB_CONTAINERS_AND_OBJECTS_INHERIT` lives in the WinNT security headers; the
