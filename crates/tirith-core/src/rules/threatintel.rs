@@ -511,6 +511,23 @@ fn parse_npx_package_spec(spec: &str) -> Option<PackageRef> {
 
 /// Parse an npm-style package spec: `@scope/name@version` or `name@version`.
 fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
+    // npm accepts the protocol form as the whole spec (`npm:lodash@4.17.21`),
+    // not only as the version half of an alias (`safe@npm:lodash@4.17.21`).
+    // Strip it before splitting the declared name; otherwise the parser would
+    // assess the fictitious package `npm:lodash` and miss `lodash` entirely.
+    if let Some(target_spec) = spec.strip_prefix("npm:") {
+        let (target_name, target_version) =
+            crate::ecosystem_scan::split_npm_name_version(target_spec)?;
+        return Some(PackageRef {
+            ecosystem: Ecosystem::Npm,
+            name: target_name.to_string(),
+            alias: None,
+            version: target_version
+                .map(crate::ecosystem_scan::npm_manifest_intent)
+                .unwrap_or(VersionIntent::Unspecified),
+        });
+    }
+
     let (declared_name, declared_version) = crate::ecosystem_scan::split_npm_name_version(spec)?;
     let (name, version, alias) = match declared_version.and_then(|v| v.strip_prefix("npm:")) {
         Some(target_spec) => {
@@ -1468,6 +1485,57 @@ mod tests {
 
         let clean = check(
             "npm install safe@npm:knownbad@2.0.0",
+            ShellType::Posix,
+            &[],
+            Some(&db),
+        );
+        assert!(!clean
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage));
+    }
+
+    #[test]
+    fn npm_bare_protocol_spec_cannot_bypass_target_threat_record() {
+        let parsed = tokenize_and_extract("npm install npm:lodash@4.17.21");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "lodash");
+        assert_eq!(parsed[0].alias, None);
+        assert_eq!(
+            parsed[0].version,
+            VersionIntent::Exact("4.17.21".to_string())
+        );
+        let scoped = tokenize_and_extract("npm install npm:@hostile/knownbad@1.2.3");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].name, "@hostile/knownbad");
+        assert_eq!(scoped[0].alias, None);
+        assert_eq!(scoped[0].version, VersionIntent::Exact("1.2.3".to_string()));
+
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 93);
+        writer.add_package(
+            Ecosystem::Npm,
+            "lodash",
+            &["4.17.21"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let findings = check(
+            "npm install npm:lodash@4.17.21",
+            ShellType::Posix,
+            &[],
+            Some(&db),
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::ThreatMaliciousPackage
+                && finding.severity == Severity::Critical
+        }));
+
+        let clean = check(
+            "npm install npm:lodash@4.17.22",
             ShellType::Posix,
             &[],
             Some(&db),

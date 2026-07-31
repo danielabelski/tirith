@@ -4176,6 +4176,46 @@ fn threatdb_explain_known_malicious_package() {
 }
 
 #[test]
+fn check_bare_npm_protocol_scores_target_identity_end_to_end() {
+    // npm accepts a registry alias protocol as the whole install spec. The
+    // real CLI must score the target (`evil-package`), not the fictitious
+    // protocol-prefixed name (`npm:evil-package`).
+    let out = tirith()
+        .env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .args([
+            "check",
+            "--json",
+            "--shell",
+            "posix",
+            "--",
+            "npm install npm:evil-package@1.0.0",
+        ])
+        .output()
+        .expect("run the real tirith check command");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the malicious npm target must block; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("check output is JSON");
+    assert_eq!(json["action"], "block");
+    assert!(
+        json["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|finding| finding["rule_id"] == "threat_malicious_package"),
+        "the block must come from target-package threat intelligence: {json}"
+    );
+}
+
+#[test]
 fn threatdb_explain_absent_indicator_says_so() {
     let state = tempfile::tempdir().unwrap();
     let (stdout, _err, code) =

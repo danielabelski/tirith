@@ -15,7 +15,7 @@
 //! Every function is pure and total except the filesystem walk and the
 //! opt-in registry fetch; given the same inputs the verdict is reproducible.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -397,12 +397,19 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
 
     // lockfile v2 / v3 — `packages` keyed by install path.
     if let Some(packages) = json.get("packages").and_then(|v| v.as_object()) {
+        // npm aliases are declared on the root/parent package. The installed
+        // leaf's `name` field is optional (npm ci accepts a generated lock with
+        // it absent), so derive alias identity from those declarations and the
+        // path Node would resolve for that parent. Contradictory metadata is a
+        // malformed lock, never a reason to fall back to the harmless alias.
+        let aliases = npm_lock_alias_claims(packages)?;
         for (path_key, meta) in packages {
             // The root package is keyed by the empty string — skip it.
             let Some(installed_name) = package_lock_name_from_path(path_key) else {
                 continue;
             };
-            let (name, alias, version) = npm_lock_identity(&installed_name, meta);
+            let (name, alias, version) =
+                npm_lock_v2_identity(path_key, &installed_name, meta, aliases.get(path_key))?;
             let dev = meta.get("dev").and_then(|v| v.as_bool()).unwrap_or(false);
             if seen.insert((name.clone(), version.clone())) {
                 out.push(DeclaredDependency {
@@ -423,6 +430,235 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     }
 
     Some(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NpmLockAliasClaim {
+    target_name: String,
+    selectors: BTreeSet<String>,
+}
+
+/// Build the authoritative alias identity for each installed path from the
+/// root/parent dependency maps. A parent resolves its dependency by looking in
+/// its own `node_modules` and then each ancestor, matching Node's lookup order.
+/// Required aliases with no installed leaf, or two parents resolving one leaf
+/// to different registry targets, make the lock internally contradictory.
+fn npm_lock_alias_claims(
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> Option<BTreeMap<String, NpmLockAliasClaim>> {
+    let mut claims = BTreeMap::<String, NpmLockAliasClaim>::new();
+
+    for (parent_path, meta) in packages {
+        for (field, required) in [
+            ("dependencies", true),
+            ("devDependencies", true),
+            ("optionalDependencies", false),
+            ("peerDependencies", false),
+        ] {
+            let Some(dependencies) = meta.get(field).and_then(|value| value.as_object()) else {
+                continue;
+            };
+            for (alias, value) in dependencies {
+                let spec = value.as_str()?;
+                let Some(target_spec) = spec.strip_prefix("npm:") else {
+                    continue;
+                };
+                let (target_name, selector) = split_npm_name_version(target_spec)?;
+                if !npm_registry_name_is_structurally_safe(alias)
+                    || !npm_registry_name_is_structurally_safe(target_name)
+                {
+                    return None;
+                }
+                let Some(installed_path) =
+                    npm_resolved_dependency_path(packages, parent_path, alias)
+                else {
+                    if required {
+                        return None;
+                    }
+                    continue;
+                };
+
+                match claims.get_mut(&installed_path) {
+                    Some(existing) if existing.target_name != target_name => return None,
+                    Some(existing) => {
+                        if let Some(selector) = selector {
+                            existing.selectors.insert(selector.to_string());
+                        }
+                    }
+                    None => {
+                        let mut selectors = BTreeSet::new();
+                        if let Some(selector) = selector {
+                            selectors.insert(selector.to_string());
+                        }
+                        claims.insert(
+                            installed_path,
+                            NpmLockAliasClaim {
+                                target_name: target_name.to_string(),
+                                selectors,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Some(claims)
+}
+
+fn npm_registry_name_is_structurally_safe(name: &str) -> bool {
+    if name.is_empty()
+        || name.len() > 214
+        || name.trim() != name
+        || name.contains('\\')
+        || name.chars().any(char::is_control)
+        || !is_plausible_package_name(name)
+        || name.split('/').any(|part| part == "..")
+    {
+        return false;
+    }
+    if let Some(scoped) = name.strip_prefix('@') {
+        let mut parts = scoped.split('/');
+        matches!(
+            (parts.next(), parts.next(), parts.next()),
+            (Some(scope), Some(package), None)
+                if !scope.is_empty()
+                    && scope != "."
+                    && !scope.contains('@')
+                    && !package.is_empty()
+                    && package != "."
+                    && !package.contains('@')
+        )
+    } else {
+        !name.contains('/') && !name.contains('@') && name != "."
+    }
+}
+
+/// Resolve one dependency name from a package path using Node's ancestor
+/// lookup order. This also handles workspace/link package paths (which do not
+/// themselves start with `node_modules/`) by falling back to the root.
+fn npm_resolved_dependency_path(
+    packages: &serde_json::Map<String, serde_json::Value>,
+    parent_path: &str,
+    dependency_name: &str,
+) -> Option<String> {
+    let mut base = parent_path.trim_end_matches('/');
+    loop {
+        let candidate = if base.is_empty() {
+            format!("node_modules/{dependency_name}")
+        } else {
+            format!("{base}/node_modules/{dependency_name}")
+        };
+        if packages.contains_key(&candidate) {
+            return Some(candidate);
+        }
+        if base.is_empty() {
+            return None;
+        }
+        base = match base.rfind("node_modules/") {
+            Some(position) => base[..position].trim_end_matches('/'),
+            None => "",
+        };
+    }
+}
+
+/// Resolve a v2/v3 installed package identity. Dependency-map alias claims are
+/// authoritative; the optional leaf `name` is only corroboration. Exact alias
+/// selectors must agree with the concrete resolved version, while ranges/tags
+/// remain resolver-owned and are accepted with the leaf's pinned version.
+fn npm_lock_v2_identity(
+    path_key: &str,
+    installed_name: &str,
+    meta: &serde_json::Value,
+    claim: Option<&NpmLockAliasClaim>,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let raw_version = match meta.get("version") {
+        Some(value) => Some(value.as_str()?.trim()),
+        None => None,
+    };
+    let leaf_name = match meta.get("name") {
+        Some(value) => Some(value.as_str()?.trim()),
+        None => None,
+    };
+
+    if let Some(claim) = claim {
+        if leaf_name.is_some_and(|name| name != claim.target_name) {
+            return None;
+        }
+        let resolved = raw_version.filter(|version| !version.is_empty())?;
+        if resolved.starts_with("npm:")
+            || crate::version_intent::canonical_semver(
+                resolved,
+                crate::version_intent::SemverPrefix::OptionalV,
+            )
+            .is_none()
+            || claim
+                .selectors
+                .iter()
+                .any(|selector| !npm_alias_selector_accepts_resolved(selector, resolved))
+        {
+            return None;
+        }
+        return Some((
+            claim.target_name.clone(),
+            Some(installed_name.to_string()),
+            Some(resolved.to_string()),
+        ));
+    }
+
+    // Some legacy lock producers carry `npm:target@version` directly in the
+    // leaf. It is self-describing, but any optional name must corroborate it.
+    if let Some((target_name, target_version)) = raw_version
+        .and_then(|version| version.strip_prefix("npm:"))
+        .and_then(split_npm_name_version)
+    {
+        if !npm_registry_name_is_structurally_safe(target_name)
+            || leaf_name.is_some_and(|name| name != target_name)
+        {
+            return None;
+        }
+        let target_version = target_version.filter(|version| !version.is_empty())?;
+        crate::version_intent::canonical_semver(
+            target_version,
+            crate::version_intent::SemverPrefix::OptionalV,
+        )?;
+        return Some((
+            target_name.to_string(),
+            Some(installed_name.to_string()),
+            Some(target_version.to_string()),
+        ));
+    }
+
+    // Within node_modules, a differing leaf name denotes an alias and therefore
+    // requires a matching parent/root declaration. Non-node_modules package
+    // entries are workspaces, where `name` legitimately differs from the path.
+    let is_installed_path = path_key == "node_modules" || path_key.contains("node_modules/");
+    if is_installed_path && leaf_name.is_some_and(|name| name != installed_name) {
+        return None;
+    }
+    let name = if is_installed_path {
+        installed_name
+    } else {
+        leaf_name
+            .filter(|name| !name.is_empty())
+            .unwrap_or(installed_name)
+    };
+    Some((name.to_string(), None, raw_version.map(str::to_string)))
+}
+
+fn npm_alias_selector_accepts_resolved(selector: &str, resolved: &str) -> bool {
+    use crate::version_intent::{canonical_semver, SemverPrefix};
+    let exact_candidate = selector
+        .trim()
+        .strip_prefix('=')
+        .map(str::trim)
+        .unwrap_or_else(|| selector.trim());
+    let Some(expected) = canonical_semver(exact_candidate, SemverPrefix::OptionalV) else {
+        // npm ranges, partials, and tags are resolver-owned. The leaf still
+        // must carry a concrete SemVer (validated by the caller).
+        return true;
+    };
+    canonical_semver(resolved, SemverPrefix::OptionalV).is_some_and(|actual| actual == expected)
 }
 
 /// Map a lockfile's resolved version string to a [`VersionIntent`]. A lockfile
@@ -3727,7 +3963,10 @@ mod tests {
         let v3 = r#"{
             "lockfileVersion": 3,
             "packages": {
-                "": { "name": "root" },
+                "": {
+                    "name": "root",
+                    "dependencies": { "safe": "npm:knownbad@1.2.3" }
+                },
                 "node_modules/safe": {
                     "name": "knownbad",
                     "version": "1.2.3"
@@ -3750,6 +3989,211 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "knownbad");
         assert_eq!(deps[0].alias.as_deref(), Some("safe"));
+        assert_eq!(deps[0].version, VersionIntent::Resolved("1.2.3".into()));
+    }
+
+    #[test]
+    fn npm10_package_lock_alias_without_leaf_name_uses_dependency_target() {
+        // npm 10 generated this shape for
+        // `"safe": "npm:lodash@4.17.21"`; the optional leaf `name` field was
+        // then removed. `npm ci` accepts the lock, so target recovery must use
+        // the root dependency declaration rather than that optional field.
+        let lock = r#"{
+          "name": "alias-fixture",
+          "version": "1.0.0",
+          "lockfileVersion": 3,
+          "requires": true,
+          "packages": {
+            "": {
+              "name": "alias-fixture",
+              "version": "1.0.0",
+              "dependencies": {
+                "safe": "npm:lodash@4.17.21"
+              }
+            },
+            "node_modules/safe": {
+              "version": "4.17.21",
+              "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"
+            }
+          }
+        }"#;
+        let deps = parse_package_lock(lock).expect("npm-ci-compatible alias lock parses");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "lodash");
+        assert_eq!(deps[0].alias.as_deref(), Some("safe"));
+        assert_eq!(deps[0].version, VersionIntent::Resolved("4.17.21".into()));
+    }
+
+    #[test]
+    fn package_lock_alias_resolution_handles_nested_and_scoped_names() {
+        let lock = r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "dependencies": {
+                "@friendly/safe": "npm:@hostile/knownbad@1.2.3",
+                "parent": "1.0.0"
+              }
+            },
+            "node_modules/@friendly/safe": { "version": "1.2.3" },
+            "node_modules/parent": {
+              "version": "1.0.0",
+              "dependencies": {
+                "@friendly/safe": "npm:@hostile/knownbad@2.3.4"
+              }
+            },
+            "node_modules/parent/node_modules/@friendly/safe": {
+              "version": "2.3.4"
+            }
+          }
+        }"#;
+        let deps = parse_package_lock(lock).expect("nested scoped aliases parse");
+        assert!(deps.iter().any(|dep| {
+            dep.name == "@hostile/knownbad"
+                && dep.alias.as_deref() == Some("@friendly/safe")
+                && dep.version == VersionIntent::Resolved("1.2.3".into())
+        }));
+        assert!(deps.iter().any(|dep| {
+            dep.name == "@hostile/knownbad"
+                && dep.alias.as_deref() == Some("@friendly/safe")
+                && dep.version == VersionIntent::Resolved("2.3.4".into())
+        }));
+    }
+
+    #[test]
+    fn package_lock_parent_alias_can_resolve_a_hoisted_leaf() {
+        // npm hoists a transitive alias when no ancestor needs an incompatible
+        // version. The declaring parent is not the installed leaf's path
+        // parent, so resolution must walk outward to root node_modules.
+        let lock = r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "dependencies": { "fixture-parent": "1.0.0" }
+            },
+            "node_modules/fixture-parent": {
+              "version": "1.0.0",
+              "dependencies": { "safe": "npm:lodash@4.17.21" }
+            },
+            "node_modules/safe": { "version": "4.17.21" }
+          }
+        }"#;
+        let deps = parse_package_lock(lock).expect("hoisted alias lock parses");
+        assert!(deps.iter().any(|dep| {
+            dep.name == "lodash"
+                && dep.alias.as_deref() == Some("safe")
+                && dep.version == VersionIntent::Resolved("4.17.21".into())
+        }));
+    }
+
+    #[test]
+    fn package_lock_alias_identity_contradictions_are_rejected() {
+        for contradictory_leaf in [
+            r#"{ "name": "not-lodash", "version": "4.17.21" }"#,
+            r#"{ "name": "lodash", "version": "4.17.20" }"#,
+            r#"{ "name": "lodash" }"#,
+        ] {
+            let lock = format!(
+                r#"{{
+                  "lockfileVersion": 3,
+                  "packages": {{
+                    "": {{
+                      "dependencies": {{ "safe": "npm:lodash@4.17.21" }}
+                    }},
+                    "node_modules/safe": {contradictory_leaf}
+                  }}
+                }}"#
+            );
+            assert!(
+                parse_package_lock(&lock).is_none(),
+                "contradictory alias leaf must fail closed: {contradictory_leaf}"
+            );
+        }
+
+        let missing_required_leaf = r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "dependencies": { "safe": "npm:lodash@4.17.21" }
+            }
+          }
+        }"#;
+        assert!(parse_package_lock(missing_required_leaf).is_none());
+
+        let conflicting_hoisted_targets = r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "dependencies": { "parent-a": "1.0.0", "parent-b": "1.0.0" }
+            },
+            "node_modules/parent-a": {
+              "version": "1.0.0",
+              "dependencies": { "safe": "npm:lodash@4.17.21" }
+            },
+            "node_modules/parent-b": {
+              "version": "1.0.0",
+              "dependencies": { "safe": "npm:underscore@1.13.7" }
+            },
+            "node_modules/safe": { "version": "4.17.21" }
+          }
+        }"#;
+        assert!(parse_package_lock(conflicting_hoisted_targets).is_none());
+
+        let equals_selector_mismatch = r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "dependencies": { "safe": "npm:lodash@=4.17.21" }
+            },
+            "node_modules/safe": { "version": "4.17.20" }
+          }
+        }"#;
+        assert!(parse_package_lock(equals_selector_mismatch).is_none());
+
+        let non_concrete_resolved_version = r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "dependencies": { "safe": "npm:lodash@latest" }
+            },
+            "node_modules/safe": { "version": "latest" }
+          }
+        }"#;
+        assert!(parse_package_lock(non_concrete_resolved_version).is_none());
+
+        let malformed_alias_declaration = r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "dependencies": { "safe": 42 }
+            },
+            "node_modules/safe": { "version": "4.17.21" }
+          }
+        }"#;
+        assert!(parse_package_lock(malformed_alias_declaration).is_none());
+    }
+
+    #[test]
+    fn package_lock_alias_hardening_preserves_optional_and_workspace_entries() {
+        let lock = r#"{
+          "lockfileVersion": 3,
+          "packages": {
+            "": {
+              "optionalDependencies": {
+                "platform-only": "npm:lodash@4.17.21"
+              }
+            },
+            "packages/workspace": {
+              "name": "@scope/workspace",
+              "version": "1.2.3"
+            }
+          }
+        }"#;
+        let deps = parse_package_lock(lock)
+            .expect("an absent optional alias and a regular workspace entry remain valid");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "@scope/workspace");
+        assert_eq!(deps[0].alias, None);
         assert_eq!(deps[0].version, VersionIntent::Resolved("1.2.3".into()));
     }
 
@@ -4841,6 +5285,65 @@ gem 'toplevelgem'
         let json = serde_json::to_value(&report.assessments[0].dependency).unwrap();
         assert_eq!(json["name"], "knownbad");
         assert_eq!(json["alias"], "safe");
+    }
+
+    #[test]
+    fn package_lock_npm_alias_without_leaf_name_is_assessed_end_to_end() {
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+              "name": "alias-fixture",
+              "version": "1.0.0",
+              "lockfileVersion": 3,
+              "packages": {
+                "": {
+                  "dependencies": { "safe": "npm:lodash@4.17.21" }
+                },
+                "node_modules/safe": {
+                  "version": "4.17.21"
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = crate::threatdb::ThreatDbWriter::new(1_700_000_000, 94);
+        writer.add_package(
+            Ecosystem::Npm,
+            "lodash",
+            &["4.17.21"],
+            crate::threatdb::ThreatSource::OssfMalicious,
+            crate::threatdb::Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let request = ScanRequest {
+            root: dir.path(),
+            db: Some(&db),
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Manifests,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
+        };
+        let report = scan(&request);
+        assert_eq!(report.verdict.action, Action::Block);
+        assert_eq!(report.assessments.len(), 1);
+        assert_eq!(report.assessments[0].dependency.name, "lodash");
+        assert_eq!(
+            report.assessments[0].dependency.alias.as_deref(),
+            Some("safe")
+        );
+        assert!(report.verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::ThreatMaliciousPackage
+                && finding.severity == Severity::Critical
+        }));
     }
 
     #[test]

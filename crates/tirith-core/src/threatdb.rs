@@ -1641,6 +1641,50 @@ impl ThreatDb {
             .unwrap_or_default()
     }
 
+    /// Group every physical record for one canonical registry identity before
+    /// matching it. Legacy v1 can contain several raw spellings that a new
+    /// reader treats as one package; choosing the first hash/index entry would
+    /// make severity depend on storage order. Each physical claim keeps its own
+    /// versions and evidence until the requested intent identifies which claims
+    /// actually participate.
+    fn package_record_group<'a>(
+        &'a self,
+        eco: Ecosystem,
+        canonical_name: &str,
+    ) -> Option<CanonicalPkgGroup<'a>> {
+        let mut claims = Vec::new();
+        for idx in self.package_record_indices(eco, canonical_name) {
+            let Some(record) = self
+                .pkg_index_entry(idx)
+                .and_then(|(data_off, _)| self.parse_pkg_record(data_off as usize))
+            else {
+                continue;
+            };
+            let mut versions = record.versions;
+            versions.sort_unstable();
+            versions.dedup();
+            claims.push(CanonicalPkgClaim {
+                metadata_name: record.name,
+                source: record.source,
+                confidence: record.confidence,
+                all_versions_malicious: record.all_versions_malicious,
+                versions,
+                reference_url: self.read_string_table_entry(record.reference_offset),
+            });
+        }
+        if claims.is_empty() {
+            return None;
+        }
+        claims.sort_by(|left, right| {
+            pkg_claim_metadata_cmp(left, right).then_with(|| left.versions.cmp(&right.versions))
+        });
+        Some(CanonicalPkgGroup {
+            ecosystem: eco,
+            name: canonical_name.to_string(),
+            claims,
+        })
+    }
+
     /// Parse a package record at an absolute offset.
     fn parse_pkg_record(&self, off: usize) -> Option<PkgRecord<'_>> {
         let eco = Ecosystem::from_u8(*self.data.get(off)?)?;
@@ -1702,39 +1746,31 @@ impl ThreatDb {
         version: Option<&str>,
     ) -> Option<ThreatMatch> {
         let name = canonical_package_name(eco, name);
-        for idx in self.package_record_indices(eco, &name) {
-            let Some((data_off, _)) = self.pkg_index_entry(idx) else {
-                continue;
-            };
-            let Some(rec) = self.parse_pkg_record(data_off as usize) else {
-                continue;
-            };
-
-            let matched = match version {
-                Some(v) => {
-                    rec.all_versions_malicious
-                        || rec.versions.iter().any(|rv| {
-                            affected_version_equivalence(eco, rv, v) == VersionEquivalence::Equal
-                        })
-                }
-                None => rec.all_versions_malicious,
-            };
-            if !matched {
-                continue;
+        if let Some(group) = self.package_record_group(eco, &name) {
+            let matched_claim = group
+                .claims
+                .iter()
+                .filter(|claim| match version {
+                    Some(v) => {
+                        claim.all_versions_malicious
+                            || claim.versions.iter().any(|rv| {
+                                affected_version_equivalence(eco, rv, v)
+                                    == VersionEquivalence::Equal
+                            })
+                    }
+                    None => claim.all_versions_malicious,
+                })
+                .max_by(|left, right| pkg_claim_metadata_cmp(left, right));
+            if let Some(claim) = matched_claim {
+                return Some(ThreatMatch {
+                    ecosystem: Some(group.ecosystem),
+                    name: group.name.clone(),
+                    source: claim.source,
+                    confidence: claim.confidence,
+                    reference_url: claim.reference_url.map(String::from),
+                    all_versions_malicious: claim.all_versions_malicious,
+                });
             }
-
-            let reference_url = self
-                .read_string_table_entry(rec.reference_offset)
-                .map(String::from);
-
-            return Some(ThreatMatch {
-                ecosystem: Some(rec.ecosystem),
-                name: rec.name.to_string(),
-                source: rec.source,
-                confidence: rec.confidence,
-                reference_url,
-                all_versions_malicious: rec.all_versions_malicious,
-            });
         }
 
         self.supplemental
@@ -1781,40 +1817,50 @@ impl ThreatDb {
         intent: &crate::version_intent::VersionIntent,
     ) -> PackageThreatAssessment {
         let name = canonical_package_name(eco, name);
-        let mut assessments = self
-            .package_record_indices(eco, &name)
-            .into_iter()
-            .filter_map(|idx| self.pkg_index_entry(idx))
-            .filter_map(|(data_off, _)| self.parse_pkg_record(data_off as usize))
-            .map(|rec| self.assess_package_record(eco, &rec, intent));
+        let Some(group) = self.package_record_group(eco, &name) else {
+            return PackageThreatAssessment::NoRecord;
+        };
+        self.assess_package_group(eco, &group, intent)
+    }
+
+    /// Assess one canonical package group after all legacy spellings and claim
+    /// metadata have been combined deterministically.
+    fn assess_package_group(
+        &self,
+        eco: Ecosystem,
+        group: &CanonicalPkgGroup<'_>,
+        intent: &crate::version_intent::VersionIntent,
+    ) -> PackageThreatAssessment {
+        let mut assessments = group
+            .claims
+            .iter()
+            .map(|claim| self.assess_package_claim(eco, group, claim, intent));
         let Some(first) = assessments.next() else {
             return PackageThreatAssessment::NoRecord;
         };
-        assessments.fold(first, merge_assessments)
+        assessments.fold(first, merge_canonical_group_assessments)
     }
 
-    /// Assess one physical package record. Kept separate so a v1 DB containing
-    /// several legacy spellings of one canonical registry identity can merge
-    /// every claim instead of whichever hash entry happened to be found first.
-    fn assess_package_record(
+    fn assess_package_claim(
         &self,
         eco: Ecosystem,
-        rec: &PkgRecord<'_>,
+        group: &CanonicalPkgGroup<'_>,
+        claim: &CanonicalPkgClaim<'_>,
         intent: &crate::version_intent::VersionIntent,
     ) -> PackageThreatAssessment {
         use crate::version_intent::{ReleaseVersion, VersionIntent};
 
-        let summary = self.summarize_record(rec);
-        let affected: Vec<String> = rec.versions.iter().map(|v| v.to_string()).collect();
+        let summary = self.summarize_claim(group, claim);
+        let affected: Vec<String> = claim.versions.iter().map(|v| v.to_string()).collect();
 
         // An all-versions-malicious record hard-matches regardless of intent.
-        if rec.all_versions_malicious {
+        if claim.all_versions_malicious {
             return PackageThreatAssessment::ExactMatch(summary);
         }
 
         // A version-specific malicious record with no affected-version data
         // cannot prove either a hit or an exclusion for any request.
-        if rec.versions.is_empty() {
+        if claim.versions.is_empty() {
             return PackageThreatAssessment::Unresolved {
                 summary,
                 reason: UnresolvedReason::AffectedVersionUnparsed,
@@ -1827,24 +1873,23 @@ impl ThreatDb {
                 let is_resolved = matches!(intent, VersionIntent::Resolved(_));
                 let mut unknown = false;
                 let mut local_overlap = false;
-                let matched =
-                    rec.versions
-                        .iter()
-                        .any(|rv| match affected_version_equivalence(eco, rv, v) {
-                            VersionEquivalence::Equal => true,
-                            VersionEquivalence::Different => {
-                                if !is_resolved
-                                    && pep440_exact_specifier_includes_affected_local(eco, rv, v)
-                                {
-                                    local_overlap = true;
-                                }
-                                false
+                let matched = claim.versions.iter().any(|rv| {
+                    match affected_version_equivalence(eco, rv, v) {
+                        VersionEquivalence::Equal => true,
+                        VersionEquivalence::Different => {
+                            if !is_resolved
+                                && pep440_exact_specifier_includes_affected_local(eco, rv, v)
+                            {
+                                local_overlap = true;
                             }
-                            VersionEquivalence::Unknown => {
-                                unknown = true;
-                                false
-                            }
-                        });
+                            false
+                        }
+                        VersionEquivalence::Unknown => {
+                            unknown = true;
+                            false
+                        }
+                    }
+                });
                 if matched {
                     PackageThreatAssessment::ExactMatch(summary)
                 } else if local_overlap {
@@ -1881,8 +1926,8 @@ impl ThreatDb {
                 // Every affected version must parse for a proven exclusion;
                 // otherwise we cannot claim the constraint excludes them.
                 let mut parsed_affected: Vec<(String, ReleaseVersion)> =
-                    Vec::with_capacity(rec.versions.len());
-                for v in &rec.versions {
+                    Vec::with_capacity(claim.versions.len());
+                for v in &claim.versions {
                     match ReleaseVersion::parse(v) {
                         Some(rv) => parsed_affected.push((v.to_string(), rv)),
                         None => {
@@ -1911,18 +1956,20 @@ impl ThreatDb {
         }
     }
 
-    /// Build a serializable summary from a parsed package record.
-    fn summarize_record(&self, rec: &PkgRecord<'_>) -> ThreatMatchSummary {
+    /// Build a serializable summary for one claim in a canonical package group.
+    fn summarize_claim(
+        &self,
+        group: &CanonicalPkgGroup<'_>,
+        claim: &CanonicalPkgClaim<'_>,
+    ) -> ThreatMatchSummary {
         ThreatMatchSummary {
-            ecosystem: rec.ecosystem.to_string(),
-            name: rec.name.to_string(),
-            source_id: rec.source.as_str().to_string(),
-            source_label: rec.source.label().to_string(),
-            confidence: rec.confidence,
-            reference_url: self
-                .read_string_table_entry(rec.reference_offset)
-                .map(String::from),
-            all_versions_malicious: rec.all_versions_malicious,
+            ecosystem: group.ecosystem.to_string(),
+            name: group.name.clone(),
+            source_id: claim.source.as_str().to_string(),
+            source_label: claim.source.label().to_string(),
+            confidence: claim.confidence,
+            reference_url: claim.reference_url.map(String::from),
+            all_versions_malicious: claim.all_versions_malicious,
         }
     }
 
@@ -2444,6 +2491,188 @@ struct PkgRecord<'a> {
     all_versions_malicious: bool,
     versions: Vec<&'a str>,
     reference_offset: u32,
+}
+
+/// One logical registry identity after canonical-equivalent physical records
+/// have been grouped. Each claim retains its own versions and evidence so a
+/// high-confidence claim for version A cannot promote an unrelated version B.
+struct CanonicalPkgGroup<'a> {
+    ecosystem: Ecosystem,
+    name: String,
+    claims: Vec<CanonicalPkgClaim<'a>>,
+}
+
+struct CanonicalPkgClaim<'a> {
+    metadata_name: &'a str,
+    source: ThreatSource,
+    confidence: Confidence,
+    all_versions_malicious: bool,
+    versions: Vec<&'a str>,
+    reference_url: Option<&'a str>,
+}
+
+/// Total, semantic ordering for evidence attached to claims of the same
+/// canonical package. Broader all-version scope wins first; within one scope,
+/// stronger confidence and then an actual reference win. Source, reference,
+/// and raw spelling are final deterministic tie-breakers and always move as one
+/// evidence unit.
+fn pkg_claim_metadata_cmp(
+    left: &CanonicalPkgClaim<'_>,
+    right: &CanonicalPkgClaim<'_>,
+) -> std::cmp::Ordering {
+    (
+        left.all_versions_malicious,
+        left.confidence,
+        left.reference_url.is_some(),
+        left.source.as_str(),
+        left.reference_url.unwrap_or(""),
+        left.metadata_name,
+    )
+        .cmp(&(
+            right.all_versions_malicious,
+            right.confidence,
+            right.reference_url.is_some(),
+            right.source.as_str(),
+            right.reference_url.unwrap_or(""),
+            right.metadata_name,
+        ))
+}
+
+fn threat_summary_cmp(left: &ThreatMatchSummary, right: &ThreatMatchSummary) -> std::cmp::Ordering {
+    (
+        left.all_versions_malicious,
+        left.confidence,
+        left.reference_url.is_some(),
+        left.source_id.as_str(),
+        left.reference_url.as_deref().unwrap_or(""),
+        left.name.as_str(),
+    )
+        .cmp(&(
+            right.all_versions_malicious,
+            right.confidence,
+            right.reference_url.is_some(),
+            right.source_id.as_str(),
+            right.reference_url.as_deref().unwrap_or(""),
+            right.name.as_str(),
+        ))
+}
+
+/// Merge two assessments from physical records in the same canonical v1
+/// group. Outcome precedence matches the cross-layer merge below, but evidence
+/// selection is semantic rather than "first record wins". Only claims that
+/// produced the winning outcome can provide its summary.
+fn merge_canonical_group_assessments(
+    left: PackageThreatAssessment,
+    right: PackageThreatAssessment,
+) -> PackageThreatAssessment {
+    use PackageThreatAssessment as P;
+
+    match (&left, &right) {
+        (P::ExactMatch(left_summary), P::ExactMatch(right_summary)) => {
+            return if threat_summary_cmp(right_summary, left_summary).is_gt() {
+                P::ExactMatch(right_summary.clone())
+            } else {
+                P::ExactMatch(left_summary.clone())
+            };
+        }
+        (P::ExactMatch(summary), _) => return P::ExactMatch(summary.clone()),
+        (_, P::ExactMatch(summary)) => return P::ExactMatch(summary.clone()),
+        _ => {}
+    }
+
+    let affected_from = |assessment: &PackageThreatAssessment| -> Vec<String> {
+        match assessment {
+            P::ConstraintIntersectsAffected {
+                affected_versions, ..
+            }
+            | P::Unresolved {
+                affected_versions, ..
+            } => affected_versions.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let merged_affected = || {
+        let mut affected = affected_from(&left);
+        affected.extend(affected_from(&right));
+        affected.sort();
+        affected.dedup();
+        affected
+    };
+
+    let unresolved = match (&left, &right) {
+        (
+            P::Unresolved {
+                summary: left_summary,
+                reason: left_reason,
+                ..
+            },
+            P::Unresolved {
+                summary: right_summary,
+                reason: right_reason,
+                ..
+            },
+        ) => {
+            if threat_summary_cmp(right_summary, left_summary).is_gt() {
+                Some((right_summary.clone(), *right_reason))
+            } else {
+                Some((left_summary.clone(), *left_reason))
+            }
+        }
+        (
+            P::Unresolved {
+                summary, reason, ..
+            },
+            _,
+        )
+        | (
+            _,
+            P::Unresolved {
+                summary, reason, ..
+            },
+        ) => Some((summary.clone(), *reason)),
+        _ => None,
+    };
+    if let Some((summary, reason)) = unresolved {
+        return P::Unresolved {
+            summary,
+            reason,
+            affected_versions: merged_affected(),
+        };
+    }
+
+    let intersecting_summary = match (&left, &right) {
+        (
+            P::ConstraintIntersectsAffected {
+                summary: left_summary,
+                ..
+            },
+            P::ConstraintIntersectsAffected {
+                summary: right_summary,
+                ..
+            },
+        ) => Some(if threat_summary_cmp(right_summary, left_summary).is_gt() {
+            right_summary.clone()
+        } else {
+            left_summary.clone()
+        }),
+        (P::ConstraintIntersectsAffected { summary, .. }, _)
+        | (_, P::ConstraintIntersectsAffected { summary, .. }) => Some(summary.clone()),
+        _ => None,
+    };
+    if let Some(summary) = intersecting_summary {
+        return P::ConstraintIntersectsAffected {
+            summary,
+            affected_versions: merged_affected(),
+        };
+    }
+
+    if matches!(left, P::ConstraintExcludesAffected)
+        || matches!(right, P::ConstraintExcludesAffected)
+    {
+        P::ConstraintExcludesAffected
+    } else {
+        P::NoRecord
+    }
 }
 
 /// Combine a primary-layer assessment with a supplemental-layer assessment.
@@ -4111,6 +4340,190 @@ mod tests {
             .check_package(Ecosystem::PyPI, "legacy__pkg", Some("1.0rc01"))
             .is_some());
         assert!(canonical.is_popular_package(Ecosystem::Crates, "serde-json"));
+    }
+
+    #[test]
+    fn v1_canonical_group_chooses_strongest_exact_claim_in_both_orders() {
+        let key = SigningKey::from_bytes(&[20u8; 32]);
+        for confirmed_first in [false, true] {
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 46);
+            let add_confirmed = |writer: &mut ThreatDbWriter| {
+                writer.add_package(
+                    Ecosystem::PyPI,
+                    "foo.bar",
+                    &["1.0"],
+                    ThreatSource::OssfMalicious,
+                    Confidence::Confirmed,
+                    false,
+                    Some("https://example.invalid/confirmed"),
+                );
+            };
+            let add_medium = |writer: &mut ThreatDbWriter| {
+                writer.add_package(
+                    Ecosystem::PyPI,
+                    "foo__bar",
+                    &["1.0"],
+                    ThreatSource::DatadogMalicious,
+                    Confidence::Medium,
+                    false,
+                    Some("https://example.invalid/medium"),
+                );
+            };
+            if confirmed_first {
+                add_confirmed(&mut writer);
+                add_medium(&mut writer);
+            } else {
+                add_medium(&mut writer);
+                add_confirmed(&mut writer);
+            }
+            let db = ThreatDb::from_bytes(
+                writer
+                    .build_format(ThreatDbFormat::V1, &key)
+                    .expect("build v1"),
+                0,
+            )
+            .expect("load v1");
+
+            let matched = db
+                .check_package(Ecosystem::PyPI, "foo-bar", Some("1.0"))
+                .expect("canonical exact match");
+            assert_eq!(matched.confidence, Confidence::Confirmed);
+            assert_eq!(matched.source, ThreatSource::OssfMalicious);
+            assert_eq!(
+                matched.reference_url.as_deref(),
+                Some("https://example.invalid/confirmed")
+            );
+
+            let assessed = db.assess_package(
+                Ecosystem::PyPI,
+                "foo-bar",
+                &VersionIntent::Exact("1.0".to_string()),
+            );
+            let PackageThreatAssessment::ExactMatch(summary) = assessed else {
+                panic!("expected exact assessment");
+            };
+            assert_eq!(summary.confidence, Confidence::Confirmed);
+            assert_eq!(summary.source_id, ThreatSource::OssfMalicious.as_str());
+            assert_eq!(
+                summary.reference_url.as_deref(),
+                Some("https://example.invalid/confirmed")
+            );
+        }
+    }
+
+    #[test]
+    fn v1_canonical_group_keeps_all_version_scope_metadata_in_both_orders() {
+        let key = SigningKey::from_bytes(&[21u8; 32]);
+        for all_versions_first in [false, true] {
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 47);
+            let add_specific = |writer: &mut ThreatDbWriter| {
+                writer.add_package(
+                    Ecosystem::PyPI,
+                    "scope.pkg",
+                    &["1.0"],
+                    ThreatSource::OssfMalicious,
+                    Confidence::Confirmed,
+                    false,
+                    Some("https://example.invalid/specific"),
+                );
+            };
+            let add_all = |writer: &mut ThreatDbWriter| {
+                writer.add_package(
+                    Ecosystem::PyPI,
+                    "scope__pkg",
+                    &[],
+                    ThreatSource::DatadogMalicious,
+                    Confidence::Medium,
+                    true,
+                    Some("https://example.invalid/all"),
+                );
+            };
+            if all_versions_first {
+                add_all(&mut writer);
+                add_specific(&mut writer);
+            } else {
+                add_specific(&mut writer);
+                add_all(&mut writer);
+            }
+            let db = ThreatDb::from_bytes(
+                writer
+                    .build_format(ThreatDbFormat::V1, &key)
+                    .expect("build v1"),
+                0,
+            )
+            .expect("load v1");
+
+            let matched = db
+                .check_package(Ecosystem::PyPI, "scope-pkg", Some("99.0"))
+                .expect("all-version canonical match");
+            assert!(matched.all_versions_malicious);
+            assert_eq!(matched.confidence, Confidence::Medium);
+            assert_eq!(matched.source, ThreatSource::DatadogMalicious);
+            assert_eq!(
+                matched.reference_url.as_deref(),
+                Some("https://example.invalid/all")
+            );
+        }
+    }
+
+    #[test]
+    fn v1_canonical_group_does_not_promote_evidence_across_versions() {
+        let key = SigningKey::from_bytes(&[22u8; 32]);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 48);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "version.pkg",
+            &["1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.invalid/confirmed-v1"),
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "version__pkg",
+            &["2.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Medium,
+            false,
+            Some("https://example.invalid/medium-v2"),
+        );
+        let db = ThreatDb::from_bytes(
+            writer
+                .build_format(ThreatDbFormat::V1, &key)
+                .expect("build v1"),
+            0,
+        )
+        .expect("load v1");
+
+        for (version, confidence, reference) in [
+            (
+                "1.0",
+                Confidence::Confirmed,
+                "https://example.invalid/confirmed-v1",
+            ),
+            (
+                "2.0",
+                Confidence::Medium,
+                "https://example.invalid/medium-v2",
+            ),
+        ] {
+            let matched = db
+                .check_package(Ecosystem::PyPI, "version-pkg", Some(version))
+                .expect("version-specific match");
+            assert_eq!(matched.confidence, confidence);
+            assert_eq!(matched.reference_url.as_deref(), Some(reference));
+
+            let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
+                Ecosystem::PyPI,
+                "version-pkg",
+                &VersionIntent::Exact(version.to_string()),
+            ) else {
+                panic!("expected exact assessment for {version}");
+            };
+            assert_eq!(summary.confidence, confidence);
+            assert_eq!(summary.reference_url.as_deref(), Some(reference));
+        }
     }
 
     #[test]
