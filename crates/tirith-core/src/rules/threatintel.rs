@@ -10,7 +10,11 @@ use crate::version_intent::VersionIntent;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRef {
     pub ecosystem: Ecosystem,
+    /// The canonical target package used for every security lookup.
     pub name: String,
+    /// User-facing npm alias, when the command addressed `name@npm:target`.
+    /// This must never participate in threat-DB or reputation decisions.
+    pub alias: Option<String>,
     /// How the version was expressed. An unpinned install is `Unspecified`; an
     /// unparsed range is a `Constraint` and is treated as unresolved, never
     /// silently as an exact pin.
@@ -234,6 +238,7 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         packages.push(PackageRef {
             ecosystem: Ecosystem::PyPI,
             name: normalized,
+            alias: None,
             version,
         });
     }
@@ -506,39 +511,20 @@ fn parse_npx_package_spec(spec: &str) -> Option<PackageRef> {
 
 /// Parse an npm-style package spec: `@scope/name@version` or `name@version`.
 fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
-    if spec.is_empty() {
-        return None;
-    }
-
-    let (name, version) = if spec.starts_with('@') {
-        // Scoped `@scope/name@version` — find the version `@` after the scope.
-        {
-            // No slash means an invalid scoped package, so `?` yields None.
-            let slash_pos = spec.find('/')?;
-            let after_scope = &spec[slash_pos + 1..];
-            if let Some(at_pos) = after_scope.find('@') {
-                let full_name = &spec[..slash_pos + 1 + at_pos];
-                let ver = &after_scope[at_pos + 1..];
-                (full_name, if ver.is_empty() { None } else { Some(ver) })
-            } else {
-                (spec, None)
-            }
+    let (declared_name, declared_version) = crate::ecosystem_scan::split_npm_name_version(spec)?;
+    let (name, version, alias) = match declared_version.and_then(|v| v.strip_prefix("npm:")) {
+        Some(target_spec) => {
+            let (target_name, target_version) =
+                crate::ecosystem_scan::split_npm_name_version(target_spec)?;
+            (target_name, target_version, Some(declared_name.to_string()))
         }
-    } else if let Some(at_pos) = spec.find('@') {
-        let name = &spec[..at_pos];
-        let ver = &spec[at_pos + 1..];
-        (name, if ver.is_empty() { None } else { Some(ver) })
-    } else {
-        (spec, None)
+        None => (declared_name, declared_version, None),
     };
-
-    if name.is_empty() {
-        return None;
-    }
 
     Some(PackageRef {
         ecosystem: Ecosystem::Npm,
         name: name.to_string(),
+        alias,
         // npm treats a bare PARTIAL version as an X-range (`lodash@4` == `4.x`), so
         // classify the CLI spec the same way the manifest path does instead of a bogus
         // `Exact("4")` that would miss a threat record for the resolved `4.17.21`.
@@ -612,6 +598,7 @@ fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             packages.push(PackageRef {
                 ecosystem: Ecosystem::Crates,
                 name: name.to_string(),
+                alias: None,
                 version,
             });
         }
@@ -662,6 +649,7 @@ fn extract_gem_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             packages.push(PackageRef {
                 ecosystem: Ecosystem::RubyGems,
                 name: name.to_string(),
+                alias: None,
                 version,
             });
         }
@@ -691,6 +679,7 @@ fn extract_go_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             packages.push(PackageRef {
                 ecosystem: Ecosystem::Go,
                 name: name.to_string(),
+                alias: None,
                 version,
             });
         }
@@ -719,6 +708,7 @@ fn extract_composer_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             packages.push(PackageRef {
                 ecosystem: Ecosystem::Packagist,
                 name: name.to_string(),
+                alias: None,
                 version,
             });
         }
@@ -769,6 +759,7 @@ fn extract_dotnet_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         packages.push(PackageRef {
             ecosystem: Ecosystem::NuGet,
             name: arg.to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         });
     }
@@ -789,6 +780,7 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                 packages.push(PackageRef {
                     ecosystem: Ecosystem::Maven,
                     name,
+                    alias: None,
                     version,
                 });
             }
@@ -810,6 +802,7 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             packages.push(PackageRef {
                 ecosystem: Ecosystem::Maven,
                 name,
+                alias: None,
                 version,
             });
         }
@@ -931,6 +924,13 @@ enum UnresolvedKind {
     ConstraintIntersects,
 }
 
+fn package_display_name(pkg: &PackageRef) -> String {
+    match &pkg.alias {
+        Some(alias) => format!("{alias} (npm alias for {})", pkg.name),
+        None => pkg.name.clone(),
+    }
+}
+
 /// Build the Medium/Warn finding for a malicious-package name whose installed
 /// version could not be resolved to a definite hit. Advises pinning to a known
 /// non-affected version (the install-path resolution note).
@@ -940,6 +940,7 @@ fn unresolved_package_finding(
     affected_versions: &[String],
     kind: UnresolvedKind,
 ) -> Finding {
+    let display_name = package_display_name(pkg);
     let affected_list = if affected_versions.is_empty() {
         "unknown".to_string()
     } else {
@@ -964,14 +965,14 @@ fn unresolved_package_finding(
         severity: Severity::Medium,
         title: format!(
             "Unresolved malicious {} package: {}",
-            pkg.ecosystem, pkg.name
+            pkg.ecosystem, display_name
         ),
         description: format!(
             "Package '{}' in {} is flagged as malicious by {} for specific versions \
              ({affected_list}). {request_desc}, so the resolver might install an affected \
              version. Pin an exact non-affected version (or choose a different package) to \
              clear this warning.",
-            pkg.name, pkg.ecosystem, summary.source_label,
+            display_name, pkg.ecosystem, summary.source_label,
         ),
         evidence: vec![Evidence::ThreatIntel {
             source: summary.source_label.clone(),
@@ -1006,16 +1007,20 @@ pub fn check(
 
     for pkg in &packages {
         let db_eco = pkg.ecosystem;
+        let display_name = package_display_name(pkg);
 
         match db.assess_package(db_eco, &pkg.name, &pkg.version) {
             PackageThreatAssessment::ExactMatch(summary) => {
                 findings.push(Finding {
                     rule_id: RuleId::ThreatMaliciousPackage,
                     severity: confidence_to_severity(summary.confidence),
-                    title: format!("Known malicious {} package: {}", pkg.ecosystem, pkg.name),
+                    title: format!(
+                        "Known malicious {} package: {}",
+                        pkg.ecosystem, display_name
+                    ),
                     description: format!(
                         "Package '{}' in {} is flagged as malicious by {}. {}",
-                        pkg.name,
+                        display_name,
                         pkg.ecosystem,
                         summary.source_label,
                         if summary.all_versions_malicious {
@@ -1075,11 +1080,11 @@ pub fn check(
             findings.push(Finding {
                 rule_id: RuleId::ThreatPackageTyposquat,
                 severity: Severity::High,
-                title: format!("Confirmed typosquat: {} → {}", pkg.name, t.target_name),
+                title: format!("Confirmed typosquat: {} → {}", display_name, t.target_name),
                 description: format!(
                     "Package '{}' in {} is a confirmed typosquat of '{}' \
                      (source: ecosyste.ms typosquatting dataset).",
-                    pkg.name, pkg.ecosystem, t.target_name
+                    display_name, pkg.ecosystem, t.target_name
                 ),
                 evidence: vec![Evidence::ThreatIntel {
                     source: "ecosyste.ms Typosquats".to_string(),
@@ -1100,12 +1105,12 @@ pub fn check(
                 severity: Severity::Medium,
                 title: format!(
                     "Package name similar to popular package: {} ≈ {}",
-                    pkg.name, popular_name
+                    display_name, popular_name
                 ),
                 description: format!(
                     "Package '{}' in {} is within edit distance {} of popular package '{}'. \
                      This could indicate a typosquatting attempt.",
-                    pkg.name, pkg.ecosystem, distance, popular_name
+                    display_name, pkg.ecosystem, distance, popular_name
                 ),
                 evidence: vec![Evidence::ThreatIntel {
                     source: "popular package names".to_string(),
@@ -1413,6 +1418,63 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "@angular/core");
         assert_eq!(pkgs[0].version, VersionIntent::Exact("16.0.0".to_string()));
+    }
+
+    #[test]
+    fn npm_alias_uses_target_identity_and_keeps_alias_as_presentation_only() {
+        for (command, target, alias) in [
+            ("npm install safe@npm:knownbad@1.2.3", "knownbad", "safe"),
+            (
+                "npm install @friendly/safe@npm:@hostile/knownbad@1.2.3",
+                "@hostile/knownbad",
+                "@friendly/safe",
+            ),
+        ] {
+            let pkgs = tokenize_and_extract(command);
+            assert_eq!(pkgs.len(), 1, "{command}");
+            assert_eq!(pkgs[0].name, target);
+            assert_eq!(pkgs[0].alias.as_deref(), Some(alias));
+            assert_eq!(pkgs[0].version, VersionIntent::Exact("1.2.3".to_string()));
+        }
+    }
+
+    #[test]
+    fn npm_alias_command_cannot_bypass_target_threat_record() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 90);
+        writer.add_package(
+            Ecosystem::Npm,
+            "knownbad",
+            &["1.2.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let findings = check(
+            "npm install safe@npm:knownbad@1.2.3",
+            ShellType::Posix,
+            &[],
+            Some(&db),
+        );
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage)
+            .expect("the target package must be assessed");
+        assert_eq!(finding.severity, Severity::Critical);
+        assert!(finding.title.contains("safe (npm alias for knownbad)"));
+
+        let clean = check(
+            "npm install safe@npm:knownbad@2.0.0",
+            ShellType::Posix,
+            &[],
+            Some(&db),
+        );
+        assert!(!clean
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage));
     }
 
     #[test]

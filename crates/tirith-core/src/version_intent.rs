@@ -53,9 +53,9 @@ impl CanonicalPep440Version {
 ///
 /// `Exact` and `Resolved` both name a single concrete version; they are kept
 /// distinct because `Exact` is what the user typed (an `==` pin or `name@ver`)
-/// while `Resolved` is what a resolver/lockfile pinned. Both are treated the
-/// same by the threat-DB assessment (a single version to test), but keeping the
-/// provenance lets later milestones reason about pin vs resolution.
+/// while `Resolved` is what a resolver/lockfile pinned. That provenance is
+/// security-relevant for PEP 440: public `==1.0` may select `1.0+vendor1`, while
+/// a lockfile reporting resolved identity `1.0` names that concrete artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionIntent {
     /// No version was given (e.g. `pip install foo`). The resolver is free to

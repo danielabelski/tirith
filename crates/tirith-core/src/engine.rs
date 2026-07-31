@@ -93,25 +93,32 @@ fn host_reputation(
 
 /// Classify a package against the LOCAL signed threat-DB as a real tri-state
 /// (CodeRabbit M13 finding C): no DB → `NoDb` (fail-open); malicious hit →
-/// `Malicious`; else known-popular → `Known`; else → `Unknown`. `check_package`
-/// `Some` means only a malicious hit (not "known"), so the popular index is
-/// consulted separately. Malicious wins over known.
+/// `Malicious`; an unresolved/intersecting malicious record → `Unknown`; else
+/// known-popular → `Known`; else → `Unknown`. The full version intent is kept so
+/// an unsupported comparator can never collapse into a clean popular-package
+/// result. Malicious wins over known.
 fn package_reputation(
     eco: crate::threatdb::Ecosystem,
     name: &str,
-    version: Option<&str>,
+    intent: &crate::version_intent::VersionIntent,
     threat_db: Option<&crate::threatdb::ThreatDb>,
 ) -> crate::custom_rule_dsl::PkgReputation {
     use crate::custom_rule_dsl::PkgReputation;
+    use crate::threatdb::PackageThreatAssessment;
     let Some(db) = threat_db else {
         return PkgReputation::NoDb;
     };
-    if db.check_package(eco, name, version).is_some() {
-        PkgReputation::Malicious
-    } else if db.is_popular_package(eco, name) {
-        PkgReputation::Known
-    } else {
-        PkgReputation::Unknown
+    match db.assess_package(eco, name, intent) {
+        PackageThreatAssessment::ExactMatch(_) => PkgReputation::Malicious,
+        PackageThreatAssessment::ConstraintIntersectsAffected { .. }
+        | PackageThreatAssessment::Unresolved { .. } => PkgReputation::Unknown,
+        PackageThreatAssessment::ConstraintExcludesAffected | PackageThreatAssessment::NoRecord => {
+            if db.is_popular_package(eco, name) {
+                PkgReputation::Known
+            } else {
+                PkgReputation::Unknown
+            }
+        }
     }
 }
 
@@ -158,12 +165,7 @@ pub fn build_dsl_backing(
             // global lowercase would corrupt case-sensitive Go/Maven/npm keys,
             // while raw spelling would miss PyPI/NuGet equivalents.
             let name = crate::threatdb::canonical_package_name(pkg.ecosystem, &pkg.name);
-            let reputation = package_reputation(
-                pkg.ecosystem,
-                &name,
-                pkg.version.as_version_str(),
-                threat_db,
-            );
+            let reputation = package_reputation(pkg.ecosystem, &name, &pkg.version, threat_db);
             packages.push((pkg.ecosystem.to_string(), name, reputation));
         }
     }
@@ -183,20 +185,25 @@ pub fn build_dsl_backing(
             // wins). Known/Unknown/NoDb are version-independent, so the primary probe
             // is authoritative for them.
             let primary = tag.as_deref().or(digest.as_deref());
+            let primary_intent = primary
+                .map(|version| crate::version_intent::VersionIntent::Resolved(version.to_string()))
+                .unwrap_or(crate::version_intent::VersionIntent::Unspecified);
             let mut reputation = package_reputation(
                 crate::threatdb::Ecosystem::Docker,
                 &image,
-                primary,
+                &primary_intent,
                 threat_db,
             );
             // Re-probe the digest only when a tag was primary and missed malicious
             // (never regress a tag hit, still find a digest-keyed record).
             if reputation != crate::custom_rule_dsl::PkgReputation::Malicious {
                 if let (Some(d), true) = (digest.as_deref(), tag.is_some()) {
+                    let digest_intent =
+                        crate::version_intent::VersionIntent::Resolved(d.to_string());
                     let by_digest = package_reputation(
                         crate::threatdb::Ecosystem::Docker,
                         &image,
-                        Some(d),
+                        &digest_intent,
                         threat_db,
                     );
                     if by_digest == crate::custom_rule_dsl::PkgReputation::Malicious {
@@ -2888,6 +2895,76 @@ mod tests {
             ),
             "no-DB: no package may be reported as malicious"
         );
+    }
+
+    #[test]
+    fn custom_dsl_package_reputation_keeps_unresolved_intent_unknown() {
+        use crate::custom_rule_dsl::{evaluate, PkgReputation, Reputation, WhenClause};
+        use crate::threatdb::{Confidence, Ecosystem, ThreatDb, ThreatDbWriter, ThreatSource};
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 92);
+        for (ecosystem, name, affected) in [
+            (Ecosystem::Npm, "digit-selector", "1.2.3"),
+            (Ecosystem::Npm, "opaque-selector", "1.2.3"),
+            (Ecosystem::PyPI, "local-only", "1.0+vendor1"),
+            (Ecosystem::Npm, "exact-hit", "1.2.3"),
+        ] {
+            writer.add_package(
+                ecosystem,
+                name,
+                &[affected],
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+            // Make a clean miss become Known. The three ambiguous cases must
+            // remain Unknown instead of falling through to this popular index.
+            writer.add_popular(ecosystem, name);
+        }
+        writer.add_popular(Ecosystem::Npm, "known-only");
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let command = "npm install digit-selector@1stable opaque-selector@github:owner/ref exact-hit@1.2.3 known-only && pip install local-only==1.0";
+        let extracted = extract::extract_urls(command, ShellType::Posix);
+        let backing = build_dsl_backing(
+            command,
+            ShellType::Posix,
+            ScanContext::Exec,
+            &extracted,
+            Some(&db),
+        );
+        let reputation = |name: &str| {
+            backing
+                .packages
+                .iter()
+                .find(|(_, package_name, _)| package_name == name)
+                .map(|(_, _, reputation)| *reputation)
+                .unwrap_or_else(|| panic!("missing package {name}: {:?}", backing.packages))
+        };
+
+        assert_eq!(reputation("digit-selector"), PkgReputation::Unknown);
+        assert_eq!(reputation("opaque-selector"), PkgReputation::Unknown);
+        assert_eq!(reputation("local-only"), PkgReputation::Unknown);
+        assert_eq!(reputation("exact-hit"), PkgReputation::Malicious);
+        assert_eq!(reputation("known-only"), PkgReputation::Known);
+
+        let ctx = backing.as_eval_context(None, None);
+        assert!(evaluate(
+            &WhenClause::PackageReputation(Reputation::Unknown),
+            &ctx
+        ));
+        assert!(evaluate(
+            &WhenClause::PackageReputation(Reputation::Malicious),
+            &ctx
+        ));
+        assert!(evaluate(
+            &WhenClause::PackageReputation(Reputation::Known),
+            &ctx
+        ));
     }
 
     /// CodeRabbit M13 PR #132 R6-2: `DslBacking` lowercases package names so

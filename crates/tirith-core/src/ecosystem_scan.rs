@@ -202,8 +202,13 @@ pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
 /// One dependency a manifest declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeclaredDependency {
-    /// The package name as written in the manifest.
+    /// The canonical security target. For an npm alias this is the package to
+    /// be resolved, never the harmless-looking alias key.
     pub name: String,
+    /// Presentation-only npm alias from the manifest, when present. Security
+    /// lookups, allowlists, risk scoring, and online resolution use `name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     /// The ecosystem the manifest is for.
     #[serde(serialize_with = "serialize_ecosystem")]
     pub ecosystem: Ecosystem,
@@ -276,20 +281,37 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
     ] {
         if let Some(map) = json.get(field).and_then(|v| v.as_object()) {
             for (name, ver) in map {
-                let name = name.trim();
-                if name.is_empty() {
+                let declared_name = name.trim();
+                if declared_name.is_empty() {
                     continue;
                 }
-                let version = match ver.as_str().filter(|s| !s.is_empty()) {
+                let raw_spec = ver.as_str().filter(|s| !s.is_empty());
+                let (security_name, alias, version) = match raw_spec
+                    .and_then(|spec| spec.strip_prefix("npm:"))
+                    .and_then(split_npm_name_version)
+                {
+                    Some((target_name, target_version)) => (
+                        target_name.to_string(),
+                        Some(declared_name.to_string()),
+                        target_version
+                            .map(npm_manifest_intent)
+                            .unwrap_or(VersionIntent::Unspecified),
+                    ),
                     // package.json declares a semver range/version (not fully
                     // parsed for npm). A full bare version (`1.2.3`) is an exact
                     // pin; a PARTIAL bare version (`1`, `1.2`) is an X-range, not
                     // a too-narrow exact; explicit ranges stay unresolved.
-                    Some(v) => npm_manifest_intent(v),
-                    None => VersionIntent::Unspecified,
+                    None => (
+                        declared_name.to_string(),
+                        None,
+                        raw_spec
+                            .map(npm_manifest_intent)
+                            .unwrap_or(VersionIntent::Unspecified),
+                    ),
                 };
                 out.push(DeclaredDependency {
-                    name: name.to_string(),
+                    name: security_name,
+                    alias,
                     ecosystem: Ecosystem::Npm,
                     version,
                     dev,
@@ -298,6 +320,34 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
         }
     }
     Some(out)
+}
+
+/// Split an npm package target into registry name and optional version. Scoped
+/// names consume the first `@` only after `@scope/`; unscoped names split on
+/// their first `@`. This is shared by command and manifest alias handling so
+/// `safe@npm:knownbad@1.2.3` and `"safe":"npm:knownbad@1.2.3"` resolve to the
+/// same security identity.
+pub(crate) fn split_npm_name_version(spec: &str) -> Option<(&str, Option<&str>)> {
+    if spec.is_empty() {
+        return None;
+    }
+    let (name, version) = if spec.starts_with('@') {
+        let slash_pos = spec.find('/')?;
+        let after_scope = &spec[slash_pos + 1..];
+        if let Some(at_pos) = after_scope.find('@') {
+            let name_end = slash_pos + 1 + at_pos;
+            let version = &after_scope[at_pos + 1..];
+            (&spec[..name_end], (!version.is_empty()).then_some(version))
+        } else {
+            (spec, None)
+        }
+    } else if let Some(at_pos) = spec.find('@') {
+        let version = &spec[at_pos + 1..];
+        (&spec[..at_pos], (!version.is_empty()).then_some(version))
+    } else {
+        (spec, None)
+    };
+    (!name.is_empty()).then_some((name, version))
 }
 
 /// Classify an npm `package.json` version requirement. node-semver treats a full
@@ -349,17 +399,15 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     if let Some(packages) = json.get("packages").and_then(|v| v.as_object()) {
         for (path_key, meta) in packages {
             // The root package is keyed by the empty string — skip it.
-            let Some(name) = package_lock_name_from_path(path_key) else {
+            let Some(installed_name) = package_lock_name_from_path(path_key) else {
                 continue;
             };
-            let version = meta
-                .get("version")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            let (name, alias, version) = npm_lock_identity(&installed_name, meta);
             let dev = meta.get("dev").and_then(|v| v.as_bool()).unwrap_or(false);
             if seen.insert((name.clone(), version.clone())) {
                 out.push(DeclaredDependency {
                     name,
+                    alias,
                     ecosystem: Ecosystem::Npm,
                     // A lockfile pins a concrete resolved version.
                     version: lock_version_intent(version),
@@ -411,18 +459,16 @@ fn collect_lock_v1_deps(
     out: &mut Vec<DeclaredDependency>,
 ) {
     for (name, meta) in deps {
-        let name = name.trim();
-        if name.is_empty() {
+        let declared_name = name.trim();
+        if declared_name.is_empty() {
             continue;
         }
-        let version = meta
-            .get("version")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let (name, alias, version) = npm_lock_identity(declared_name, meta);
         let dev = meta.get("dev").and_then(|v| v.as_bool()).unwrap_or(false);
-        if seen.insert((name.to_string(), version.clone())) {
+        if seen.insert((name.clone(), version.clone())) {
             out.push(DeclaredDependency {
-                name: name.to_string(),
+                name,
+                alias,
                 ecosystem: Ecosystem::Npm,
                 // A lockfile pins a concrete resolved version.
                 version: lock_version_intent(version),
@@ -433,6 +479,36 @@ fn collect_lock_v1_deps(
             collect_lock_v1_deps(nested, seen, out);
         }
     }
+}
+
+/// Resolve the target identity carried by an npm lockfile alias. Lockfile v2/3
+/// normally exposes the real package in `meta.name`; v1 can encode the target
+/// in a `version: "npm:target@version"` value. The install-path/dependency key
+/// remains presentation-only alias metadata.
+fn npm_lock_identity(
+    declared_name: &str,
+    meta: &serde_json::Value,
+) -> (String, Option<String>, Option<String>) {
+    let raw_version = meta.get("version").and_then(|value| value.as_str());
+    if let Some((target, target_version)) = raw_version
+        .and_then(|version| version.strip_prefix("npm:"))
+        .and_then(split_npm_name_version)
+    {
+        return (
+            target.to_string(),
+            Some(declared_name.to_string()),
+            target_version.map(str::to_string),
+        );
+    }
+
+    let target = meta
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(declared_name);
+    let alias = (target != declared_name).then(|| declared_name.to_string());
+    (target.to_string(), alias, raw_version.map(str::to_string))
 }
 
 /// Python `requirements.txt`: one PEP 508 specifier per line. Comments, blank
@@ -461,6 +537,7 @@ fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
         if let Some(name) = python_requirement_name(line) {
             out.push(DeclaredDependency {
                 name,
+                alias: None,
                 ecosystem: Ecosystem::PyPI,
                 // Capture the PEP 508 version specifier so a real pin (`==1.4.0`)
                 // is assessed (Exact/Constraint) instead of degrading to a
@@ -552,6 +629,7 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
             if seen.insert(name.to_lowercase()) {
                 out.push(DeclaredDependency {
                     name: name.to_string(),
+                    alias: None,
                     ecosystem: Ecosystem::PyPI,
                     version,
                     dev,
@@ -668,6 +746,7 @@ fn parse_cargo_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
                 if seen.insert(real_name.to_string()) {
                     out.push(DeclaredDependency {
                         name: real_name.to_string(),
+                        alias: None,
                         ecosystem: Ecosystem::Crates,
                         // A Cargo.toml requirement is a SemVer range: a plain `1.0.193` is
                         // a caret requirement (^1.0.193); only `=1.0.193` is an exact pin.
@@ -754,6 +833,7 @@ fn go_mod_require_entry(entry: &str) -> Option<DeclaredDependency> {
     let version = parts.next().map(str::to_string);
     Some(DeclaredDependency {
         name: module.to_string(),
+        alias: None,
         ecosystem: Ecosystem::Go,
         // go.mod pins a concrete module version (e.g. `v1.2.3`).
         version: version
@@ -799,6 +879,7 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
             if seen.insert(name.clone()) {
                 out.push(DeclaredDependency {
                     name,
+                    alias: None,
                     ecosystem: Ecosystem::RubyGems,
                     version,
                     dev: block_stack.iter().any(|&is_dev| is_dev),
@@ -2280,6 +2361,7 @@ fn read_node_package(
     declared.push((
         DeclaredDependency {
             name: name.to_string(),
+            alias: None,
             ecosystem: Ecosystem::Npm,
             // An installed package reports its own concrete version.
             version: lock_version_intent(version),
@@ -2376,6 +2458,7 @@ fn walk_site_packages(
         declared.push((
             DeclaredDependency {
                 name,
+                alias: None,
                 ecosystem: Ecosystem::PyPI,
                 // An installed distribution reports its own concrete version.
                 version: lock_version_intent(version),
@@ -3310,6 +3393,7 @@ fn walk_vendor_go(
             declared.push((
                 DeclaredDependency {
                     name: module.to_string(),
+                    alias: None,
                     ecosystem: Ecosystem::Go,
                     // `modules.txt` records the concrete resolved module version.
                     version: lock_version_intent(version),
@@ -3347,6 +3431,7 @@ fn walk_vendor_go(
                 declared.push((
                     DeclaredDependency {
                         name: rel,
+                        alias: None,
                         ecosystem: Ecosystem::Go,
                         // Vendored layout carries no version on disk.
                         version: VersionIntent::Unspecified,
@@ -3398,6 +3483,7 @@ fn parse_cargo_lock(text: &str) -> Vec<DeclaredDependency> {
         if seen.insert((name.to_string(), version.clone())) {
             out.push(DeclaredDependency {
                 name: name.to_string(),
+                alias: None,
                 ecosystem: Ecosystem::Crates,
                 // Cargo.lock pins a concrete resolved version.
                 version: lock_version_intent(version),
@@ -3562,6 +3648,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_package_json_npm_alias_uses_target_identity() {
+        let text = r#"{
+          "dependencies": {
+            "safe": "npm:knownbad@1.2.3",
+            "@friendly/safe": "npm:@hostile/knownbad@2.3.4"
+          }
+        }"#;
+        let deps = parse_package_json(text).expect("valid package.json");
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|dep| {
+            dep.name == "knownbad"
+                && dep.alias.as_deref() == Some("safe")
+                && dep.version == VersionIntent::Exact("1.2.3".to_string())
+        }));
+        assert!(deps.iter().any(|dep| {
+            dep.name == "@hostile/knownbad"
+                && dep.alias.as_deref() == Some("@friendly/safe")
+                && dep.version == VersionIntent::Exact("2.3.4".to_string())
+        }));
+    }
+
+    #[test]
     fn parse_package_json_handles_malformed() {
         // Malformed JSON → `None` (the manifest could not be parsed).
         assert!(parse_package_json("{not json").is_none());
@@ -3612,6 +3720,37 @@ mod tests {
             deps.iter().any(|d| d.name == "accepts"),
             "nested v1 deps must be collected"
         );
+    }
+
+    #[test]
+    fn parse_package_lock_aliases_use_target_identity() {
+        let v3 = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root" },
+                "node_modules/safe": {
+                    "name": "knownbad",
+                    "version": "1.2.3"
+                }
+            }
+        }"#;
+        let deps = parse_package_lock(v3).expect("valid v3 lockfile JSON parses");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "knownbad");
+        assert_eq!(deps[0].alias.as_deref(), Some("safe"));
+        assert_eq!(deps[0].version, VersionIntent::Resolved("1.2.3".into()));
+
+        let v1 = r#"{
+            "lockfileVersion": 1,
+            "dependencies": {
+                "safe": { "version": "npm:knownbad@1.2.3" }
+            }
+        }"#;
+        let deps = parse_package_lock(v1).expect("valid v1 lockfile JSON parses");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "knownbad");
+        assert_eq!(deps[0].alias.as_deref(), Some("safe"));
+        assert_eq!(deps[0].version, VersionIntent::Resolved("1.2.3".into()));
     }
 
     #[test]
@@ -4110,6 +4249,7 @@ gem 'toplevelgem'
         DependencyAssessment {
             dependency: DeclaredDependency {
                 name: name.to_string(),
+                alias: None,
                 ecosystem: Ecosystem::Npm,
                 version: VersionIntent::Unspecified,
                 dev: false,
@@ -4252,6 +4392,7 @@ gem 'toplevelgem'
         let assessment = DependencyAssessment {
             dependency: DeclaredDependency {
                 name: "totally-unknown-pkg".to_string(),
+                alias: None,
                 ecosystem: Ecosystem::Npm,
                 version: VersionIntent::Unspecified,
                 dev: false,
@@ -4313,6 +4454,7 @@ gem 'toplevelgem'
         let assessment = DependencyAssessment {
             dependency: DeclaredDependency {
                 name: "ordinary-pkg".to_string(),
+                alias: None,
                 ecosystem: Ecosystem::Npm,
                 version: VersionIntent::Unspecified,
                 dev: false,
@@ -4354,6 +4496,7 @@ gem 'toplevelgem'
         let assessment = DependencyAssessment {
             dependency: DeclaredDependency {
                 name: "reaqt".to_string(),
+                alias: None,
                 ecosystem: Ecosystem::Npm,
                 version: VersionIntent::Unspecified,
                 dev: false,
@@ -4646,6 +4789,58 @@ gem 'toplevelgem'
             !rules.contains(&RuleId::ThreatUnresolvedMaliciousPackage),
             "a resolved exact hit must NOT emit the unresolved warn"
         );
+    }
+
+    #[test]
+    fn package_json_npm_alias_target_is_assessed_end_to_end() {
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"safe":"npm:knownbad@1.2.3"}}"#,
+        )
+        .unwrap();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = crate::threatdb::ThreatDbWriter::new(1_700_000_000, 91);
+        writer.add_package(
+            Ecosystem::Npm,
+            "knownbad",
+            &["1.2.3"],
+            crate::threatdb::ThreatSource::OssfMalicious,
+            crate::threatdb::Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let request = ScanRequest {
+            root: dir.path(),
+            db: Some(&db),
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Manifests,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
+        };
+        let report = scan(&request);
+        assert_eq!(report.verdict.action, Action::Block);
+        assert_eq!(report.assessments.len(), 1);
+        assert_eq!(report.assessments[0].dependency.name, "knownbad");
+        assert_eq!(
+            report.assessments[0].dependency.alias.as_deref(),
+            Some("safe")
+        );
+        assert!(report.verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::ThreatMaliciousPackage
+                && finding.severity == Severity::Critical
+        }));
+
+        // Presentation metadata must not contaminate the security key in JSON.
+        let json = serde_json::to_value(&report.assessments[0].dependency).unwrap();
+        assert_eq!(json["name"], "knownbad");
+        assert_eq!(json["alias"], "safe");
     }
 
     #[test]

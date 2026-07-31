@@ -13,9 +13,7 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 
-use tirith_core::threatdb::{
-    canonical_package_name, Confidence, Ecosystem, ThreatDbFormat, ThreatDbWriter, ThreatSource,
-};
+use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbFormat, ThreatDbWriter, ThreatSource};
 use tirith_core::threatdb_feeds::{
     parse_curated_file_hashes, parse_digitalside_csv, parse_domain_blocklist,
     parse_exfil_endpoint_list, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
@@ -203,7 +201,15 @@ struct KevCatalog {
 
 /// Normalize package name per ecosystem conventions.
 fn normalize_name(eco: Ecosystem, name: &str) -> String {
-    canonical_package_name(eco, name)
+    // This function feeds the legacy v1 publication as well as v2. Keep the
+    // exact historical spellings here so v1-only readers continue to hash the
+    // same keys; ThreatDbWriter canonicalizes a private working copy only when
+    // it emits v2.
+    match eco {
+        Ecosystem::PyPI => name.to_lowercase().replace(['_', '.'], "-"),
+        Ecosystem::Npm => name.to_string(),
+        _ => name.to_lowercase(),
+    }
 }
 
 /// OSV JSON schema (subset used for malicious-packages).
@@ -1001,7 +1007,7 @@ struct PackageKey {
     name: String,
 }
 
-/// Merge duplicate package entries: keep highest confidence + richest reference.
+/// Merge duplicate package entries without separating evidence from claim scope.
 fn deduplicate_packages(entries: Vec<PackageEntry>) -> Vec<PackageEntry> {
     let mut by_key: BTreeMap<PackageKey, PackageEntry> = BTreeMap::new();
 
@@ -1014,10 +1020,27 @@ fn deduplicate_packages(entries: Vec<PackageEntry>) -> Vec<PackageEntry> {
         by_key
             .entry(key)
             .and_modify(|existing| {
-                // Keep highest confidence.
-                if entry.confidence > existing.confidence {
+                // Scope and evidence are one claim. In particular, a confirmed
+                // version-specific record must never promote an unrelated
+                // medium-confidence all-version record to confirmed merely
+                // because both normalize to one package key.
+                let replace_claim_metadata = match (
+                    existing.all_versions_malicious,
+                    entry.all_versions_malicious,
+                ) {
+                    (false, true) => true,
+                    (true, false) => false,
+                    _ => {
+                        entry.confidence > existing.confidence
+                            || (entry.confidence == existing.confidence
+                                && existing.reference.is_none()
+                                && entry.reference.is_some())
+                    }
+                };
+                if replace_claim_metadata {
                     existing.confidence = entry.confidence;
                     existing.source = entry.source;
+                    existing.reference = entry.reference.clone();
                 }
 
                 // Union the affected_versions.
@@ -1029,14 +1052,7 @@ fn deduplicate_packages(entries: Vec<PackageEntry>) -> Vec<PackageEntry> {
                     }
                 }
 
-                if entry.all_versions_malicious {
-                    existing.all_versions_malicious = true;
-                }
-
-                // Keep the richest reference (prefer non-None).
-                if existing.reference.is_none() && entry.reference.is_some() {
-                    existing.reference = entry.reference.clone();
-                }
+                existing.all_versions_malicious |= entry.all_versions_malicious;
             })
             .or_insert(entry);
     }
@@ -1558,13 +1574,13 @@ mod tests {
     use tirith_core::threatdb::BehaviorTag;
 
     #[test]
-    fn test_normalize_pypi() {
+    fn test_v1_normalize_pypi_preserves_legacy_separator_bytes() {
         assert_eq!(normalize_name(Ecosystem::PyPI, "My_Package"), "my-package");
         assert_eq!(normalize_name(Ecosystem::PyPI, "my.package"), "my-package");
         assert_eq!(normalize_name(Ecosystem::PyPI, "MY-PACKAGE"), "my-package");
         assert_eq!(
             normalize_name(Ecosystem::PyPI, "FrIeNdLy-._.-BaRd"),
-            "friendly-bard"
+            "friendly-----bard"
         );
     }
 
@@ -1575,10 +1591,10 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_crates_registry_identity() {
+    fn test_v1_normalize_crates_preserves_legacy_underscore_key() {
         assert_eq!(
             normalize_name(Ecosystem::Crates, "Serde_JSON"),
-            "serde-json"
+            "serde_json"
         );
         assert_eq!(
             normalize_name(Ecosystem::Crates, "serde-json"),
@@ -1659,6 +1675,44 @@ mod tests {
         let deduped = deduplicate_packages(entries);
         assert_eq!(deduped.len(), 1);
         assert!(deduped[0].all_versions_malicious);
+    }
+
+    #[test]
+    fn deduplication_keeps_all_version_scope_and_confidence_atomic_in_both_orders() {
+        let all_versions = PackageEntry {
+            ecosystem: Ecosystem::PyPI,
+            name: "collision-pkg".to_string(),
+            affected_versions: Vec::new(),
+            all_versions_malicious: true,
+            source: ThreatSource::DatadogMalicious,
+            confidence: Confidence::Medium,
+            reference: Some("https://example.invalid/all".to_string()),
+        };
+        let version_specific = PackageEntry {
+            ecosystem: Ecosystem::PyPI,
+            name: "collision-pkg".to_string(),
+            affected_versions: vec!["1.0".to_string()],
+            all_versions_malicious: false,
+            source: ThreatSource::OssfMalicious,
+            confidence: Confidence::Confirmed,
+            reference: Some("https://example.invalid/specific".to_string()),
+        };
+
+        for entries in [
+            vec![all_versions.clone(), version_specific.clone()],
+            vec![version_specific.clone(), all_versions.clone()],
+        ] {
+            let deduped = deduplicate_packages(entries);
+            assert_eq!(deduped.len(), 1);
+            let merged = &deduped[0];
+            assert!(merged.all_versions_malicious);
+            assert_eq!(merged.confidence, Confidence::Medium);
+            assert_eq!(merged.source, ThreatSource::DatadogMalicious);
+            assert_eq!(
+                merged.reference.as_deref(),
+                Some("https://example.invalid/all")
+            );
+        }
     }
 
     #[test]

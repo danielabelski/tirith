@@ -650,6 +650,7 @@ fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
             out.push(PackageRef {
                 ecosystem: Ecosystem::Docker,
                 name,
+                alias: None,
                 version: VersionIntent::from_docker_version(&version_token),
             });
         }
@@ -727,6 +728,7 @@ fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
         out.push(PackageRef {
             ecosystem: Ecosystem::Go,
             name: name.to_string(),
+            alias: None,
             version: VersionIntent::from_go_version(&version_token),
         });
     }
@@ -1506,6 +1508,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "raect".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         let existing = vec![Finding {
@@ -1550,6 +1553,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::PyPI,
             name: "reqeusts".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         use crate::package_risk::NameVsPopular;
@@ -1947,6 +1951,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "missing-pkg".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
@@ -1979,6 +1984,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "some-pkg".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
@@ -2008,6 +2014,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "fresh-pkg".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
@@ -2041,6 +2048,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::PyPI,
             name: "reqeusts".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
@@ -2074,6 +2082,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "unknown-pkg".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
@@ -2110,6 +2119,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::PyPI,
             name: "unfamiliar".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
@@ -2155,6 +2165,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "test-pkg".to_string(),
+            alias: None,
             version: VersionIntent::Unspecified,
         };
         let breakdown = breakdown_with_provenance(
