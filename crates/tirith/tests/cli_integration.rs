@@ -8746,6 +8746,107 @@ fn logs_redact_audience_public_paste_strips_home_path() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn logs_redact_closes_multiline_private_key_leaks_in_human_and_json_exports() {
+    use std::io::Write as _;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut f = tmp.reopen().unwrap();
+    f.write_all(
+        b"before\r\n-----BEGIN RSA PRIVATE KEY-----\nPEM-SECRET-BODY\r\n-----END RSA PRIVATE KEY-----\nafter\n-----BEGIN PGP PRIVATE KEY BLOCK-----\r\nPGP-SECRET-BODY\n-----END PGP PRIVATE KEY BLOCK-----\r\n",
+    )
+    .unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    let human = tirith_scrubbed()
+        .args([
+            "logs",
+            "redact",
+            "--audience",
+            "llm",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(human.status.code(), Some(0));
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert_eq!(human_stdout, "before\n[REDACTED]\nafter\n[REDACTED]\n");
+    assert!(!human_stdout.contains("SECRET-BODY"));
+
+    let json = tirith_scrubbed()
+        .args([
+            "logs",
+            "redact",
+            "--audience",
+            "llm",
+            "--json",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(json.status.code(), Some(0));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["total_redactions"], 2);
+    assert_eq!(
+        value["redacted_content"],
+        "before\n[REDACTED]\nafter\n[REDACTED]"
+    );
+    assert_eq!(value["lines"].as_array().unwrap().len(), 4);
+    assert!(!String::from_utf8_lossy(&json.stdout).contains("SECRET-BODY"));
+}
+
+#[cfg(unix)]
+#[test]
+fn logs_summarize_safe_closes_multiline_private_key_leaks_in_human_and_json() {
+    use std::io::Write as _;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut f = tmp.reopen().unwrap();
+    f.write_all(
+        b"build start\n-----BEGIN PRIVATE KEY-----\r\nSUMMARIZE-SECRET\n-----END PRIVATE KEY-----\rbuild done\n",
+    )
+    .unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    let human = tirith_scrubbed()
+        .args([
+            "logs",
+            "summarize",
+            "--safe-for-agent",
+            "--max-lines",
+            "20",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(human.status.code(), Some(0));
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert_eq!(human_stdout, "build start\n[REDACTED]\nbuild done\n");
+    assert!(!human_stdout.contains("SUMMARIZE-SECRET"));
+
+    let json = tirith_scrubbed()
+        .args([
+            "logs",
+            "summarize",
+            "--safe-for-agent",
+            "--max-lines",
+            "20",
+            "--json",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(json.status.code(), Some(0));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["safe_for_agent"], true);
+    assert_eq!(value["secrets_removed"], 1);
+    assert_eq!(value["lines"].as_array().unwrap().len(), 3);
+    assert!(!String::from_utf8_lossy(&json.stdout).contains("SUMMARIZE-SECRET"));
+}
+
 // ── M8 ch6: `tirith prompt-status` + opt-in PS1 hooks ────────────────────────
 
 /// Helper — point the prompt-status cache + sudo-session + state to a fresh temp dir for each

@@ -1633,8 +1633,9 @@ Honesty on prompt injection:
   agent output as untrusted regardless of whether the rule fired.
 
 Streaming:
-  `summarize` and `redact` stream line-by-line and have no input size
-  cap. `scan` reads up to 64 MiB (above that, use `summarize` first).
+  `summarize --safe-for-agent` and `redact` use fixed-size reads and
+  bounded cross-line private-key state. A logical line or private-key
+  block over 1 MiB fails closed. `scan` reads up to 64 MiB.
 
 Examples:
   tirith logs scan ./error.log
@@ -4735,8 +4736,8 @@ Examples:
 
     /// Compress a log file: dedup lines, optionally redact and strip ANSI
     #[command(after_help = "\
-Streams the file via `BufReader::lines()` so large logs (1 GiB+) do not
-balloon memory. Pipeline:
+Streams the file without loading the entire log. With `--safe-for-agent`,
+fixed-size reads feed a bounded cross-line private-key redactor. Pipeline:
 
   1. (when --safe-for-agent) redact secrets / internal hostnames /
      customer IDs via `redact_for_audience(input, llm)`.
@@ -4777,8 +4778,10 @@ Examples:
     /// Stream a log file through the audience-aware share-engine
     #[command(after_help = "\
 Identical audience semantics to `tirith share --target`. Streams the file
-line-by-line, applies `redact_for_audience_with_custom`, and writes the
-sanitized content to stdout. Per-label counts go to stderr.
+in fixed-size chunks, carries bounded private-key state across lines,
+applies `redact_for_audience_with_custom` to non-key content, and writes
+the sanitized content to stdout. Per-label counts go to stderr. A logical
+line or private-key block over 1 MiB fails closed.
 
 Examples:
   tirith logs redact --audience llm ./error.log

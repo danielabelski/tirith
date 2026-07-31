@@ -10,13 +10,13 @@
 //! Honest scope: `scan`'s prompt-injection rule catches only well-known seed
 //! phrases — NOT a complete defense. Treat all agent output as untrusted.
 //!
-//! `summarize` / `redact` MUST stream (a 1 GiB+ log would OOM): they
-//! `read_until(b'\n', …)` and lossy-decode per line so a corrupt byte doesn't
-//! abort the stream. `scan` uses a bounded read (see [`SCAN_MAX_BYTES`]) because
-//! the engine needs the whole input for cross-line patterns. `summarize`
-//! head+tail truncation keeps half the `--max-lines` budget each side with a
-//! `[... N lines collapsed ...]` marker; the stderr trailer reports per-action
-//! counts.
+//! Protected `summarize` / `redact` paths read fixed chunks and carry bounded
+//! private-key-block state across chunk and newline boundaries. Oversized or
+//! unterminated secret-bearing records fail closed. `scan` uses a bounded read
+//! (see [`SCAN_MAX_BYTES`]) because the engine needs the whole input for cross-
+//! line patterns. `summarize` head+tail truncation keeps half the `--max-lines`
+//! budget each side with a `[... N lines collapsed ...]` marker; the stderr
+//! trailer reports per-action counts.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -25,13 +25,24 @@ use std::path::Path;
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::policy::Policy;
-use tirith_core::redact::{redact_for_audience_with_custom, RedactionCount, ShareAudience};
+use tirith_core::redact::{
+    redact_for_audience_with_custom, RedactReport, RedactionCount, ShareAudience,
+};
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{Action, Finding};
 
 /// Hard cap for `scan` — matches the engine's `scan_single_file` ceiling.
-/// `summarize` and `redact` STREAM and have no cap.
+/// The protected streaming commands have separate per-record caps below.
 const SCAN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Streaming redaction never retains more than one bounded logical record or
+/// secret-block delimiter overlap. Inputs beyond either cap are discarded and
+/// represented by the same fail-closed marker used by the core DLP engine.
+const STREAM_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_SECRET_BLOCK_BYTES: usize = 1024 * 1024;
+const REDACTED_BLOCK_MARKER: &str = "[REDACTED]";
+const INCOMPLETE_REDACTION_MARKER: &str = "[REDACTED:incomplete]";
 
 // ─── scan ───────────────────────────────────────────────────────────────────
 
@@ -151,6 +162,313 @@ fn emit_scan_json(path: &Path, verdict: &tirith_core::verdict::Verdict) -> i32 {
     }
 }
 
+// ─── bounded streaming redaction ───────────────────────────────────────────
+
+#[derive(Default)]
+struct StreamRecord {
+    content: String,
+    redactions: Vec<RedactionCount>,
+    escape_count: usize,
+}
+
+impl StreamRecord {
+    fn total_redactions(&self) -> usize {
+        self.redactions.iter().map(|r| r.count).sum()
+    }
+
+    fn append_report(&mut self, report: RedactReport) {
+        self.content.push_str(&report.redacted_content);
+        for redaction in report.redactions {
+            merge_redaction_count(&mut self.redactions, &redaction);
+        }
+    }
+
+    fn append_marker(&mut self, marker: &str, label: &str) {
+        self.content.push_str(marker);
+        merge_redaction_count(
+            &mut self.redactions,
+            &RedactionCount {
+                label: label.to_string(),
+                count: 1,
+            },
+        );
+    }
+}
+
+struct SecretBlock {
+    end_marker: String,
+    redaction_label: &'static str,
+    bytes_seen: usize,
+    oversized: bool,
+}
+
+/// Incremental decoder/redactor shared by both protected log-output commands.
+/// It accepts arbitrary byte chunks, so delimiter and newline boundaries do not
+/// depend on `BufReader` chunking. Only one capped logical line is retained;
+/// while inside a private-key block, body lines are discarded immediately.
+struct StreamingLogRedactor<'a> {
+    audience: ShareAudience,
+    custom_patterns: &'a [String],
+    strip_terminal_controls: bool,
+    line: Vec<u8>,
+    pending_cr: bool,
+    dropping_line: bool,
+    discard_remainder: bool,
+    block: Option<SecretBlock>,
+    pending_record: StreamRecord,
+    line_limit: usize,
+    block_limit: usize,
+}
+
+impl<'a> StreamingLogRedactor<'a> {
+    fn new(
+        audience: ShareAudience,
+        custom_patterns: &'a [String],
+        strip_terminal_controls: bool,
+    ) -> Self {
+        Self::with_limits(
+            audience,
+            custom_patterns,
+            strip_terminal_controls,
+            MAX_STREAM_LINE_BYTES,
+            MAX_STREAM_SECRET_BLOCK_BYTES,
+        )
+    }
+
+    fn with_limits(
+        audience: ShareAudience,
+        custom_patterns: &'a [String],
+        strip_terminal_controls: bool,
+        line_limit: usize,
+        block_limit: usize,
+    ) -> Self {
+        Self {
+            audience,
+            custom_patterns,
+            strip_terminal_controls,
+            line: Vec::with_capacity(STREAM_CHUNK_BYTES.min(line_limit)),
+            pending_cr: false,
+            dropping_line: false,
+            discard_remainder: false,
+            block: None,
+            pending_record: StreamRecord::default(),
+            line_limit,
+            block_limit,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<StreamRecord> {
+        let mut records = Vec::new();
+        for &byte in chunk {
+            if self.discard_remainder {
+                break;
+            }
+            if self.pending_cr {
+                self.finish_line(&mut records);
+                self.pending_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+
+            match byte {
+                b'\r' => self.pending_cr = true,
+                b'\n' => self.finish_line(&mut records),
+                _ if !self.dropping_line && self.line.len() < self.line_limit => {
+                    self.line.push(byte);
+                }
+                _ => {
+                    self.line.clear();
+                    self.dropping_line = true;
+                }
+            }
+        }
+        records
+    }
+
+    fn finish(mut self) -> Vec<StreamRecord> {
+        let mut records = Vec::new();
+        if self.pending_cr || !self.line.is_empty() || self.dropping_line {
+            self.finish_line(&mut records);
+        }
+        if self.block.take().is_some() {
+            self.pending_record
+                .append_marker(INCOMPLETE_REDACTION_MARKER, "redaction_incomplete");
+            records.push(std::mem::take(&mut self.pending_record));
+        }
+        records
+    }
+
+    fn finish_line(&mut self, records: &mut Vec<StreamRecord>) {
+        if self.dropping_line {
+            if let Some(block) = self.block.as_mut() {
+                block.oversized = true;
+            } else {
+                let mut record = StreamRecord::default();
+                record.append_marker(INCOMPLETE_REDACTION_MARKER, "redaction_incomplete");
+                records.push(record);
+                // The discarded line could have contained a private-key BEGIN
+                // marker. Without proof that it did not, exposing later lines
+                // would turn the memory cap into a key-body bypass.
+                self.discard_remainder = true;
+            }
+        } else {
+            let raw = String::from_utf8_lossy(&self.line).into_owned();
+            if let Some(record) = self.process_line(&raw) {
+                records.push(record);
+            }
+        }
+        self.line.clear();
+        self.dropping_line = false;
+    }
+
+    fn process_line(&mut self, raw: &str) -> Option<StreamRecord> {
+        let (line, escape_count) = if self.strip_terminal_controls {
+            strip_ansi_and_zero_width(raw)
+        } else {
+            (raw.to_string(), 0)
+        };
+        let mut record = std::mem::take(&mut self.pending_record);
+        record.escape_count += escape_count;
+        let mut cursor = 0usize;
+
+        loop {
+            if let Some(block) = self.block.as_mut() {
+                if let Some(end_end) = find_end_marker(&line[cursor..], &block.end_marker) {
+                    block.bytes_seen = block.bytes_seen.saturating_add(end_end).saturating_add(1);
+                    block.oversized |= block.bytes_seen > self.block_limit;
+                    let label = if block.oversized {
+                        "redaction_incomplete"
+                    } else {
+                        block.redaction_label
+                    };
+                    let marker = if block.oversized {
+                        INCOMPLETE_REDACTION_MARKER
+                    } else {
+                        REDACTED_BLOCK_MARKER
+                    };
+                    record.append_marker(marker, label);
+                    cursor += end_end;
+                    self.block = None;
+
+                    continue;
+                }
+
+                block.bytes_seen = block
+                    .bytes_seen
+                    .saturating_add(line.len().saturating_sub(cursor))
+                    .saturating_add(1);
+                block.oversized |= block.bytes_seen > self.block_limit;
+                self.pending_record = record;
+                return None;
+            }
+
+            let remaining = &line[cursor..];
+            if let Some(begin) = find_private_key_begin(remaining) {
+                self.append_safe(&mut record, &remaining[..begin.start]);
+                self.block = Some(SecretBlock {
+                    end_marker: begin.end_marker,
+                    redaction_label: begin.redaction_label,
+                    bytes_seen: begin.end.saturating_sub(begin.start),
+                    oversized: false,
+                });
+                cursor += begin.end;
+                continue;
+            }
+
+            self.append_safe(&mut record, remaining);
+            return Some(record);
+        }
+    }
+
+    fn append_safe(&self, record: &mut StreamRecord, input: &str) {
+        if input.is_empty() {
+            return;
+        }
+        record.append_report(redact_for_audience_with_custom(
+            input,
+            self.audience,
+            self.custom_patterns,
+        ));
+    }
+}
+
+struct PrivateKeyBegin {
+    start: usize,
+    end: usize,
+    end_marker: String,
+    redaction_label: &'static str,
+}
+
+fn find_private_key_begin(input: &str) -> Option<PrivateKeyBegin> {
+    let mut search_from = 0usize;
+    const PREFIX: &str = "-----BEGIN";
+    while let Some(relative) = input[search_from..].find(PREFIX) {
+        let start = search_from + relative;
+        let after_prefix = start + PREFIX.len();
+        let first = input[after_prefix..].chars().next()?;
+        if !first.is_ascii_whitespace() || matches!(first, '\r' | '\n') {
+            search_from = after_prefix;
+            continue;
+        }
+        let label_start = after_prefix + first.len_utf8();
+        let end_relative = input[label_start..].find("-----")?;
+        let label_end = label_start + end_relative;
+        let label = &input[label_start..label_end];
+        let is_pgp = label == "PGP PRIVATE KEY BLOCK";
+        let is_pem = label.ends_with("PRIVATE KEY")
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == ' ');
+        if is_pgp || is_pem {
+            return Some(PrivateKeyBegin {
+                start,
+                end: label_end + 5,
+                end_marker: format!("-----END {label}-----"),
+                redaction_label: if is_pgp {
+                    "pgp_private_key"
+                } else {
+                    "private_key"
+                },
+            });
+        }
+        // A malformed BEGIN may use the dashes from a later valid BEGIN as its
+        // apparent terminator. Advance only one byte so that later marker is
+        // still considered rather than becoming an attacker-controlled skip.
+        search_from = start + 1;
+    }
+    None
+}
+
+fn find_end_marker(input: &str, marker: &str) -> Option<usize> {
+    input.find(marker).map(|start| start + marker.len())
+}
+
+fn read_redacted_records<R, F>(
+    reader: &mut R,
+    mut redactor: StreamingLogRedactor<'_>,
+    mut consume: F,
+) -> std::io::Result<()>
+where
+    R: Read,
+    F: FnMut(StreamRecord) -> std::io::Result<()>,
+{
+    let mut chunk = [0u8; STREAM_CHUNK_BYTES];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        for record in redactor.push(&chunk[..n]) {
+            consume(record)?;
+        }
+    }
+    for record in redactor.finish() {
+        consume(record)?;
+    }
+    Ok(())
+}
+
 // ─── summarize ──────────────────────────────────────────────────────────────
 
 /// `tirith logs summarize` — a compressed, optionally-sanitized view of a log.
@@ -199,44 +517,8 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
         }
     };
 
-    // Sev-5 silent-failure fix: `lines()` aborts the whole stream on the first
-    // non-UTF-8 byte. Read raw per line and lossy-decode (bad bytes → U+FFFD).
     let mut reader = reader;
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
-    loop {
-        buf.clear();
-        let n = match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("tirith logs summarize: read error: {e}");
-                return 1;
-            }
-        };
-        // Strip trailing \n (and \r) before decode to match `lines()` output.
-        let mut end = n;
-        if end > 0 && buf[end - 1] == b'\n' {
-            end -= 1;
-        }
-        if end > 0 && buf[end - 1] == b'\r' {
-            end -= 1;
-        }
-        let raw = String::from_utf8_lossy(&buf[..end]).into_owned();
-
-        let processed = if safe_for_agent {
-            let (stripped, n_esc) = strip_ansi_and_zero_width(&raw);
-            escape_count += n_esc;
-            let report =
-                redact_for_audience_with_custom(&stripped, ShareAudience::Llm, &customer_patterns);
-            secret_count += report.total();
-            for r in &report.redactions {
-                merge_redaction_count(&mut redaction_breakdown, r);
-            }
-            report.redacted_content
-        } else {
-            raw
-        };
-
+    let mut accept_processed = |processed: String| {
         if last_line.as_deref() == Some(processed.as_str()) {
             last_count += 1;
         } else {
@@ -248,6 +530,46 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
             }
             last_line = Some(processed);
             last_count = 1;
+        }
+    };
+
+    if safe_for_agent {
+        let redactor = StreamingLogRedactor::new(ShareAudience::Llm, &customer_patterns, true);
+        let result = read_redacted_records(&mut reader, redactor, |record| {
+            secret_count += record.total_redactions();
+            escape_count += record.escape_count;
+            for redaction in &record.redactions {
+                merge_redaction_count(&mut redaction_breakdown, redaction);
+            }
+            accept_processed(record.content);
+            Ok(())
+        });
+        if let Err(e) = result {
+            eprintln!("tirith logs summarize: read error: {e}");
+            return 1;
+        }
+    } else {
+        // Preserve the unredacted command's historical behavior. The protected
+        // path above uses fixed-size reads and a bounded logical-record cap.
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        loop {
+            buf.clear();
+            let n = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("tirith logs summarize: read error: {e}");
+                    return 1;
+                }
+            };
+            let mut end = n;
+            if end > 0 && buf[end - 1] == b'\n' {
+                end -= 1;
+            }
+            if end > 0 && buf[end - 1] == b'\r' {
+                end -= 1;
+            }
+            accept_processed(String::from_utf8_lossy(&buf[..end]).into_owned());
         }
     }
     if let Some(prev) = last_line.take() {
@@ -487,9 +809,10 @@ fn merge_redaction_count(into: &mut Vec<RedactionCount>, r: &RedactionCount) {
 // ─── redact ─────────────────────────────────────────────────────────────────
 
 /// `tirith logs redact` — streaming share-engine wrapper over
-/// [`redact_for_audience_with_custom`]. Each line is redacted independently
-/// (bounded memory); counts are aggregated at the end. The audience is parsed
-/// via [`tirith_core::redact::ShareAudience::parse_cli`], like `tirith share`.
+/// [`redact_for_audience_with_custom`]. A bounded state machine carries private-
+/// key block state across lines and input chunks; counts are aggregated at the
+/// end. The audience is parsed via [`tirith_core::redact::ShareAudience::parse_cli`],
+/// like `tirith share`.
 pub fn redact(path: &Path, audience_str: &str, json: bool) -> i32 {
     let audience = match ShareAudience::parse_cli(audience_str) {
         Some(a) => a,
@@ -518,38 +841,23 @@ pub fn redact(path: &Path, audience_str: &str, json: bool) -> i32 {
     let mut out_lines: Vec<String> = Vec::new();
     let mut stdout = std::io::stdout().lock();
 
-    // Sev-5 silent-failure fix: same `lines()` UTF-8 abort hazard as
-    // `summarize` — lossy-decode per line.
     let mut reader = reader;
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
-    loop {
-        buf.clear();
-        let n = match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("tirith logs redact: read error: {e}");
-                return 1;
-            }
-        };
-        let mut end = n;
-        if end > 0 && buf[end - 1] == b'\n' {
-            end -= 1;
-        }
-        if end > 0 && buf[end - 1] == b'\r' {
-            end -= 1;
-        }
-        let line = String::from_utf8_lossy(&buf[..end]).into_owned();
-        let report = redact_for_audience_with_custom(&line, audience, &customer_patterns);
-        total += report.total();
-        for r in &report.redactions {
-            merge_redaction_count(&mut breakdown, r);
+    let redactor = StreamingLogRedactor::new(audience, &customer_patterns, false);
+    let result = read_redacted_records(&mut reader, redactor, |record| {
+        total += record.total_redactions();
+        for redaction in &record.redactions {
+            merge_redaction_count(&mut breakdown, redaction);
         }
         if json {
-            out_lines.push(report.redacted_content);
-        } else if writeln!(stdout, "{}", report.redacted_content).is_err() {
-            return 1;
+            out_lines.push(record.content);
+            Ok(())
+        } else {
+            writeln!(stdout, "{}", record.content)
         }
+    });
+    if let Err(e) = result {
+        eprintln!("tirith logs redact: read/write error: {e}");
+        return 1;
     }
 
     if json {
@@ -662,6 +970,126 @@ mod tests {
         // Head present, tail present.
         assert!(out[0].contains("line 1") || out[0].contains("line 2"));
         assert!(out.last().unwrap().contains("line 19") || out.last().unwrap().contains("line 20"));
+    }
+
+    fn push_bytewise(redactor: &mut StreamingLogRedactor<'_>, input: &[u8]) -> Vec<StreamRecord> {
+        let mut records = Vec::new();
+        for byte in input {
+            records.extend(redactor.push(std::slice::from_ref(byte)));
+        }
+        records
+    }
+
+    #[test]
+    fn streaming_redactor_carries_pem_and_pgp_state_across_chunks_and_newlines() {
+        for (input, leaked, label) in [
+            (
+                "before\r\n-----BEGIN RSA PRIVATE KEY-----\nPEM-SECRET-BODY\r-----END RSA PRIVATE KEY-----\nafter",
+                "PEM-SECRET-BODY",
+                "private_key",
+            ),
+            (
+                "before\n-----BEGIN PGP PRIVATE KEY BLOCK-----\r\nPGP-SECRET-BODY\n-----END PGP PRIVATE KEY BLOCK-----\r\nafter",
+                "PGP-SECRET-BODY",
+                "pgp_private_key",
+            ),
+        ] {
+            let mut redactor = StreamingLogRedactor::new(ShareAudience::Llm, &[], false);
+            let mut records = push_bytewise(&mut redactor, input.as_bytes());
+            records.extend(redactor.finish());
+            let output = records
+                .iter()
+                .map(|record| record.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(output, "before\n[REDACTED]\nafter");
+            assert!(!output.contains(leaked));
+            assert_eq!(
+                records
+                    .iter()
+                    .flat_map(|record| &record.redactions)
+                    .find(|redaction| redaction.label == label)
+                    .map(|redaction| redaction.count),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_preserves_benign_multiline_and_applies_custom_dlp() {
+        let patterns = vec![r"CUSTOM-[0-9]+".to_string()];
+        let input = b"benign caf\xc3\xa9\r\nCUSTOM-42\rthird line\nfourth";
+        let mut redactor = StreamingLogRedactor::new(ShareAudience::Llm, &patterns, false);
+        let mut records = push_bytewise(&mut redactor, input);
+        records.extend(redactor.finish());
+        let output = records
+            .iter()
+            .map(|record| record.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            output,
+            "benign café\n[REDACTED:customer_id]\nthird line\nfourth"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .flat_map(|record| &record.redactions)
+                .find(|redaction| redaction.label == "customer_id")
+                .map(|redaction| redaction.count),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn malformed_begin_cannot_hide_a_later_private_key_marker() {
+        let input = b"noise -----BEGIN malformed -----BEGIN PRIVATE KEY-----\nHIDDEN-BODY\n-----END PRIVATE KEY-----";
+        let mut redactor = StreamingLogRedactor::new(ShareAudience::Llm, &[], false);
+        let mut records = push_bytewise(&mut redactor, input);
+        records.extend(redactor.finish());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "noise -----BEGIN malformed [REDACTED]");
+        assert!(!records[0].content.contains("HIDDEN-BODY"));
+    }
+
+    #[test]
+    fn streaming_redactor_fails_closed_on_unterminated_and_oversized_blocks() {
+        let unterminated = b"safe prefix -----BEGIN PRIVATE KEY-----\nTOP-SECRET\nstill secret";
+        let mut redactor =
+            StreamingLogRedactor::with_limits(ShareAudience::Llm, &[], false, 128, 48);
+        let mut records = push_bytewise(&mut redactor, unterminated);
+        records.extend(redactor.finish());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "safe prefix [REDACTED:incomplete]");
+        assert!(!records[0].content.contains("TOP-SECRET"));
+        assert_eq!(records[0].redactions[0].label, "redaction_incomplete");
+
+        let oversized = b"-----BEGIN PRIVATE KEY-----\n012345678901234567890123456789\n-----END PRIVATE KEY----- suffix";
+        let mut redactor =
+            StreamingLogRedactor::with_limits(ShareAudience::Llm, &[], false, 128, 48);
+        let mut records = push_bytewise(&mut redactor, oversized);
+        records.extend(redactor.finish());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "[REDACTED:incomplete] suffix");
+        assert!(!records[0].content.contains("0123456789"));
+        assert_eq!(records[0].redactions[0].label, "redaction_incomplete");
+    }
+
+    #[test]
+    fn streaming_redactor_fails_closed_on_oversized_logical_line() {
+        let mut at_limit =
+            StreamingLogRedactor::with_limits(ShareAudience::Llm, &[], false, 8, 128);
+        let mut at_limit_records = at_limit.push(b"12345678\n");
+        at_limit_records.extend(at_limit.finish());
+        assert_eq!(at_limit_records.len(), 1);
+        assert_eq!(at_limit_records[0].content, "12345678");
+
+        let mut redactor =
+            StreamingLogRedactor::with_limits(ShareAudience::Llm, &[], false, 8, 128);
+        let mut records = redactor.push(b"0123456789\nbenign\n");
+        records.extend(redactor.finish());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, INCOMPLETE_REDACTION_MARKER);
     }
 
     #[test]
