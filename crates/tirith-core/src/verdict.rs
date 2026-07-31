@@ -286,9 +286,9 @@ pub enum RuleId {
     /// M7 ch1 — screen-clear sequences (`\e[2J` / `\e[H`) mid-stream. Info —
     /// scrolls prior output off-screen so a fake banner can take its place.
     OutputClearScreen,
-    /// M7 ch1 — an OSC/CSI escape open at end-of-stream without a terminator.
-    /// Truncated `\e]52;<base64>` was silently dropped; emit Medium so a
-    /// fail-closed caller can DENY (Sev-5).
+    /// M7 ch1 — an OSC/CSI escape open at EOF, or an OSC payload exceeding
+    /// bounded analysis retention. Truncated/oversized `\e]52;<base64>` must
+    /// remain High and fail closed instead of being silently dropped.
     OutputTruncatedEscapeSequence,
 
     // Prompt-injection rules (M7 ch5) — fire from `rules::prompt_injection` when

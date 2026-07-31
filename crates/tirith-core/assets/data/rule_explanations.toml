@@ -1716,13 +1716,13 @@ remediation = "`tirith view` neutralizes the screen-clear in the displayed outpu
 
 [[rule]]
 id = "output_truncated_escape_sequence"
-title = "Escape sequence open at end-of-stream"
+title = "Incomplete or analysis-overflowing escape sequence"
 category = "output"
-severity_rationale = "Medium (High when OSC52) — an OSC or CSI sequence that has not yet been terminated when the input ends is a strong signal that downstream bytes could complete a dangerous sequence (clipboard write, hyperlink, title rewrite). Under fail-closed callers we treat the partial sequence as suspicious so the response can be denied without waiting for terminator bytes that may never arrive."
-description = "Output ended while the byte-scanner was still inside an OSC (`\\e]...`) or CSI (`\\e[...`) sequence. The previous implementation silently dropped this state; we now surface it so MCP gateway / `tirith view` callers can fail-closed."
-examples_bad = ["An MCP response that ends mid-`\\e]52;c;<base64>` (no BEL / no ST) — half of a clipboard-write sequence, completable by the next stream chunk."]
+severity_rationale = "Medium (High when OSC52) — an OSC or CSI sequence that is unterminated, or an OSC payload larger than bounded analysis retention, can still be interpreted by a downstream terminal. Under fail-closed callers we surface the incomplete analysis explicitly; an oversized OSC52 remains a High clipboard-write attempt."
+description = "Output either ended while the byte-scanner was still inside an OSC (`\\e]...`) / CSI (`\\e[...`) sequence, or an OSC exceeded the 16 KiB retention cap. Oversized OSC input stays in discard-until-terminator mode instead of falling back to clean copy-through."
+examples_bad = ["An MCP response that ends mid-`\\e]52;c;<base64>` (no BEL / no ST) — half of a clipboard-write sequence, completable by the next stream chunk.", "An OSC52 clipboard payload larger than 16 KiB that a terminal may accept even though Tirith intentionally stops retaining payload bytes."]
 examples_good = ["A normal log file that ends with a newline or any non-escape byte."]
-false_positive_guidance = "True-positive in practice: well-formed terminal output always terminates its OSC/CSI sequences. A truncated sequence usually means the producer was cut off or the content was tampered with."
+false_positive_guidance = "True-positive in practice: well-formed terminal output terminates its OSC/CSI sequences and keeps control payloads bounded. A truncated or oversized sequence usually means the producer was cut off, hostile, or tampered with."
 remediation = "Under fail-closed mode the wrapping response is replaced with a placeholder. Under fail-open the finding is surfaced as a warning; consult the audit log and re-fetch the source if possible."
 
 # M7 ch5 — prompt-injection seed phrases.

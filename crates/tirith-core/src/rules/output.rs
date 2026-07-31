@@ -41,6 +41,43 @@ pub fn check(scan: &OutputScanResult) -> Vec<Finding> {
         });
     }
 
+    for hit in &scan.osc_overflow {
+        let clipboard_write = hit.operation.as_deref() == Some("52");
+        let operation = hit.operation.as_deref().unwrap_or("unknown");
+        findings.push(Finding {
+            rule_id: RuleId::OutputTruncatedEscapeSequence,
+            severity: if clipboard_write {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
+            title: if clipboard_write {
+                "OSC 52 clipboard-write payload exceeded the analysis limit".to_string()
+            } else {
+                "OSC payload exceeded the bounded analysis limit".to_string()
+            },
+            description: format!(
+                "An OSC operation ({operation}) exceeded the {} byte retention cap. Tirith kept \
+                 parsing in discard-until-terminator mode instead of treating the tail as clean. \
+                 Oversized terminal control sequences are refused because a terminal may accept \
+                 more bytes than the analyzer retains.",
+                hit.retained_cap
+            ),
+            evidence: vec![Evidence::ByteSequence {
+                offset: hit.offset,
+                hex: "1B 5D".to_string(),
+                description: format!(
+                    "OSC operation={operation}; retained_payload_cap={}; overflow=true",
+                    hit.retained_cap
+                ),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
     for hit in &scan.title_set {
         findings.push(Finding {
             rule_id: RuleId::OutputTitleManipulation,
@@ -438,7 +475,8 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::extract::{
-        OutputHyperlinkHit, OutputOscHit, OutputScanResult, OutputSgrHit, OutputZeroWidthRun,
+        OutputHyperlinkHit, OutputOscHit, OutputOscOverflowHit, OutputScanResult, OutputSgrHit,
+        OutputZeroWidthRun,
     };
 
     fn scan() -> OutputScanResult {
@@ -456,6 +494,26 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::OutputOsc52ClipboardWrite);
         assert_eq!(findings[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn osc52_overflow_emits_explicit_high_finding() {
+        let mut s = scan();
+        s.osc_overflow.push(OutputOscOverflowHit {
+            offset: 17,
+            operation: Some("52".to_string()),
+            retained_cap: 16 * 1024,
+        });
+        let findings = check(&s);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::OutputTruncatedEscapeSequence);
+        assert_eq!(findings[0].severity, Severity::High);
+        assert!(findings[0].title.contains("exceeded"));
+        assert!(matches!(
+            &findings[0].evidence[0],
+            Evidence::ByteSequence { offset: 17, description, .. }
+                if description.contains("overflow=true")
+        ));
     }
 
     #[test]

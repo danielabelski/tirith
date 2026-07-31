@@ -887,6 +887,7 @@ pub fn analyze_output(input: &str, ctx: OutputContext) -> Verdict {
 /// translates only the NEW hits into findings.
 struct ScanSnapshot {
     osc52: usize,
+    osc_overflow: usize,
     title_set: usize,
     screen_clear: usize,
     hyperlinks: usize,
@@ -898,6 +899,7 @@ impl ScanSnapshot {
     fn take(r: &extract::OutputScanResult) -> Self {
         Self {
             osc52: r.osc52.len(),
+            osc_overflow: r.osc_overflow.len(),
             title_set: r.title_set.len(),
             screen_clear: r.screen_clear.len(),
             hyperlinks: r.hyperlinks.len(),
@@ -910,6 +912,9 @@ impl ScanSnapshot {
         // A fresh scan slice over only the newly-appended hits.
         let mut slice = extract::OutputScanResult::default();
         slice.osc52.extend_from_slice(&r.osc52[self.osc52..]);
+        slice
+            .osc_overflow
+            .extend_from_slice(&r.osc_overflow[self.osc_overflow..]);
         slice
             .title_set
             .extend_from_slice(&r.title_set[self.title_set..]);
@@ -5125,6 +5130,22 @@ mod tests {
             "set TIRITH=1 & curl evil.com",
             ShellType::Cmd
         ));
+    }
+
+    #[test]
+    fn analyze_output_blocks_oversized_osc52_instead_of_failing_open() {
+        let mut output = String::from("prefix\u{1b}]52;");
+        output.push_str(&"A".repeat(16 * 1024 + 1));
+        output.push('\u{7}');
+        output.push_str("benign tail");
+
+        let verdict = analyze_output(&output, OutputContext::default());
+        assert_eq!(verdict.action, crate::verdict::Action::Block);
+        assert!(verdict.findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::OutputTruncatedEscapeSequence
+                && finding.severity == crate::verdict::Severity::High
+                && finding.title.contains("exceeded")
+        }));
     }
 
     #[test]
