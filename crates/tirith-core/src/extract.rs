@@ -391,6 +391,9 @@ pub struct OutputScanState {
     /// Absolute byte offset of the *next* byte to be fed in, so emitted offsets
     /// are file-wide. The streaming driver bumps this by each chunk's length.
     pub byte_offset: usize,
+    /// A trailing UTF-8 `0xC2` lead byte held across chunks so a C1 scalar whose
+    /// two bytes straddle the transport boundary is interpreted atomically.
+    pending_c1_utf8_lead: bool,
     phase: OutputPhase,
     osc_buf: Vec<u8>,
     /// OSC introducer (`0`, `2`, `52`, `8`): accumulate digits, dispatch on `;`.
@@ -434,6 +437,9 @@ enum OutputPhase {
     InCsi,
     /// Inside `\e]…` (OSC): collecting the introducer + payload.
     InOsc,
+    /// Inside a DCS/APC control string. Its payload is opaque, but retaining
+    /// state through ST prevents split/truncated controls from becoming clean.
+    InStringControl,
     /// OSC 8 link open: collecting visible text between `\e]8;…<ST>` and
     /// the closing `\e]8;;<ST>`.
     InOsc8Visible,
@@ -526,11 +532,48 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
     // is well within a 64 KiB window), keeping the state machine compact.
     let mut zw_run_start: Option<usize> = None;
     let mut zw_run_count: usize = 0;
-    let chunk_start_offset = state.byte_offset;
+    let original_chunk_start = state.byte_offset;
+    let original_chunk_len = chunk.len();
+    let had_c1_lead = state.pending_c1_utf8_lead;
+    state.pending_c1_utf8_lead = false;
+    let mut joined = Vec::new();
+    let chunk = if had_c1_lead {
+        joined.reserve(chunk.len() + 1);
+        joined.push(0xC2);
+        joined.extend_from_slice(chunk);
+        joined.as_slice()
+    } else {
+        chunk
+    };
+    let chunk_start_offset = if had_c1_lead {
+        original_chunk_start.saturating_sub(1)
+    } else {
+        original_chunk_start
+    };
 
     let mut byte_idx = 0;
     while byte_idx < chunk.len() {
-        let b = chunk[byte_idx];
+        let raw_b = chunk[byte_idx];
+        if raw_b == 0xC2 && byte_idx + 1 == chunk.len() {
+            // Do not misclassify a UTF-8 C1 scalar just because its continuation
+            // byte arrives in the next transport chunk. The absolute byte offset
+            // still advances below; the next call temporarily prepends this byte.
+            state.pending_c1_utf8_lead = true;
+            break;
+        }
+        // Valid Rust strings encode ECMA-48 C1 controls as UTF-8 C2 80..9F.
+        // Normalize that pair to its control byte for the state machine while
+        // retaining its original width for absolute offsets. Accept raw C1 too
+        // because the lower-level scanner also serves arbitrary byte streams.
+        let (b, byte_width, is_c1) = if raw_b == 0xC2
+            && chunk
+                .get(byte_idx + 1)
+                .is_some_and(|next| (0x80..=0x9F).contains(next))
+        {
+            (chunk[byte_idx + 1], 2usize, true)
+        } else {
+            (raw_b, 1usize, (0x80..=0x9F).contains(&raw_b))
+        };
 
         // Handle phase transitions first.
         match state.phase {
@@ -538,11 +581,44 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                 if b == 0x1B {
                     state.phase = OutputPhase::AfterEsc;
                     state.saw_lone_esc = false;
-                    byte_idx += 1;
+                    byte_idx += byte_width;
+                    continue;
+                }
+                if b == 0x9B {
+                    // C1 CSI (U+009B), equivalent to ESC [.
+                    state.phase = OutputPhase::InCsi;
+                    state.sgr_buf.clear();
+                    byte_idx += byte_width;
+                    continue;
+                }
+                if b == 0x9D {
+                    // C1 OSC (U+009D), equivalent to ESC ].
+                    state.phase = OutputPhase::InOsc;
+                    state.osc_introducer.clear();
+                    state.osc_buf.clear();
+                    state.osc_operation = None;
+                    state.osc_discarding = false;
+                    state.osc_pending_st = false;
+                    state.osc_start_offset = chunk_start_offset + byte_idx;
+                    byte_idx += byte_width;
+                    continue;
+                }
+                if matches!(b, 0x90 | 0x9F) {
+                    // C1 DCS/APC: consume the opaque string through ST.
+                    state.phase = OutputPhase::InStringControl;
+                    state.osc_pending_st = false;
+                    byte_idx += byte_width;
+                    continue;
+                }
+                if is_c1 {
+                    // All other C1 codepoints are controls too. They carry no
+                    // output-rule payload, so consume rather than retain them as
+                    // visible OSC8 label bytes.
+                    byte_idx += byte_width;
                     continue;
                 }
                 if state.phase == OutputPhase::InOsc8Visible {
-                    state.osc8_visible_buf.push(b);
+                    state.osc8_visible_buf.push(raw_b);
                     if state.osc8_visible_buf.len() > OUTPUT_OSC_CAP {
                         // Bail — visible text is unreasonably large, abort the link.
                         state.phase = OutputPhase::Idle;
@@ -575,7 +651,7 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                         state.phase = OutputPhase::Idle;
                     }
                 }
-                byte_idx += 1;
+                byte_idx += byte_width;
                 continue;
             }
             OutputPhase::InCsi => {
@@ -616,7 +692,28 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                         state.sgr_buf.clear();
                     }
                 }
-                byte_idx += 1;
+                byte_idx += byte_width;
+                continue;
+            }
+            OutputPhase::InStringControl => {
+                if state.osc_pending_st {
+                    state.osc_pending_st = false;
+                    if b == b'\\' {
+                        state.phase = OutputPhase::Idle;
+                        byte_idx += byte_width;
+                        continue;
+                    }
+                }
+                if b == 0x9C {
+                    // C1 ST (U+009C).
+                    state.phase = OutputPhase::Idle;
+                    byte_idx += byte_width;
+                    continue;
+                }
+                if b == 0x1B {
+                    state.osc_pending_st = true;
+                }
+                byte_idx += byte_width;
                 continue;
             }
             OutputPhase::InOsc => {
@@ -631,7 +728,7 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                     state.osc_pending_st = false;
                     if b == b'\\' {
                         finalize_osc(state, result, chunk_start_offset, byte_idx);
-                        byte_idx += 1;
+                        byte_idx += byte_width;
                         continue;
                     }
                     // False alarm: that `\e` was a stray payload byte (an
@@ -640,20 +737,20 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
 
                 if is_bel || is_st_8bit {
                     finalize_osc(state, result, chunk_start_offset, byte_idx);
-                    byte_idx += 1;
+                    byte_idx += byte_width;
                     continue;
                 }
                 if is_st_start {
                     // Stay InOsc; flip the pending-ST flag and wait one byte.
                     state.osc_pending_st = true;
-                    byte_idx += 1;
+                    byte_idx += byte_width;
                     continue;
                 }
                 if state.osc_discarding {
                     // Retention overflowed, but remaining in InOsc is the
                     // security boundary: discard every byte until BEL/ST so the
                     // terminator and tail can never be reinterpreted as clean.
-                    byte_idx += 1;
+                    byte_idx += byte_width;
                     continue;
                 }
                 if state.osc_introducer.contains(&b';') {
@@ -671,7 +768,7 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                         record_osc_overflow(state, result);
                     }
                 }
-                byte_idx += 1;
+                byte_idx += byte_width;
                 continue;
             }
         }
@@ -703,7 +800,7 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
         zw_run_start = None;
         zw_run_count = 0;
 
-        byte_idx += 1;
+        byte_idx += byte_width;
     }
 
     // End-of-chunk ZW flush.
@@ -717,7 +814,7 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
     }
 
     // Advance global offset for next chunk.
-    state.byte_offset = chunk_start_offset + chunk.len();
+    state.byte_offset = original_chunk_start + original_chunk_len;
 }
 
 /// Whole-buffer wrapper for the streaming scanner (used by `engine::analyze_output`).
@@ -735,7 +832,8 @@ pub fn scan_output_bytes(input: &[u8]) -> OutputScanResult {
 /// flag an unterminated escape sequence — fail-closed callers must DENY then.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OutputScanFinalize {
-    /// `true` when an OSC / CSI / OSC8-visible sequence was in-flight at EOF.
+    /// `true` when an OSC / CSI / DCS / APC / OSC8-visible sequence was in-flight
+    /// at EOF.
     /// Worst case: a truncated `\e]52;…` (partial clipboard write) the original
     /// implementation silently dropped.
     pub truncated_escape: bool,
@@ -748,8 +846,8 @@ pub struct OutputScanFinalize {
 /// what (if anything) was in-flight. Called by `scan_output_bytes` and
 /// `engine::analyze_output_finalize`.
 ///
-/// Silent-failure fix (Sev-5): pre-fix the scanner ended in `InOsc` /
-/// `InOsc8Visible` silently on truncation and the output filter accepted it;
+/// Silent-failure fix (Sev-5): pre-fix the scanner ended in an OSC/CSI/string
+/// control state silently on truncation and the output filter accepted it;
 /// callers can now emit an `OutputTruncatedEscapeSequence` finding.
 pub fn finalize_scan_state(state: &mut OutputScanState) -> OutputScanFinalize {
     let mut out = OutputScanFinalize::default();
@@ -781,6 +879,7 @@ pub fn finalize_scan_state(state: &mut OutputScanState) -> OutputScanFinalize {
         state.osc8_active_uri = None;
         state.osc8_visible_buf.clear();
     }
+    state.pending_c1_utf8_lead = false;
     out
 }
 
@@ -918,6 +1017,78 @@ mod output_scan_tests {
             1,
             "should detect OSC 52 with ST terminator"
         );
+    }
+
+    #[test]
+    fn detects_utf8_c1_osc52_with_c1_st() {
+        let input = "hello\u{009D}52;c;aGVsbG8=\u{009C}world";
+        let result = scan_output_bytes(input.as_bytes());
+        assert_eq!(result.osc52.len(), 1, "C1 OSC 52 must be detected");
+        assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
+    }
+
+    #[test]
+    fn detects_utf8_c1_osc52_split_across_chunks() {
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk("hello\u{009D}52;c;".as_bytes(), &mut state, &mut result);
+        scan_output_chunk("aGVsbG8=\u{009C}world".as_bytes(), &mut state, &mut result);
+        assert_eq!(result.osc52.len(), 1, "split C1 OSC 52 must be detected");
+        assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
+    }
+
+    #[test]
+    fn detects_c1_osc52_when_utf8_scalar_is_split_across_chunks() {
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        let encoded = "\u{009D}52;c;aGVsbG8=\u{009C}".as_bytes();
+
+        // Split both two-byte UTF-8 C1 scalars between their C2 lead and control
+        // continuation byte. The byte-stream API must retain security semantics
+        // even when a transport chunk ends mid-scalar.
+        scan_output_chunk(&encoded[..1], &mut state, &mut result);
+        let st_lead = encoded
+            .windows(2)
+            .rposition(|pair| pair == [0xC2, 0x9C])
+            .expect("encoded C1 ST");
+        scan_output_chunk(&encoded[1..st_lead + 1], &mut state, &mut result);
+        scan_output_chunk(&encoded[st_lead + 1..], &mut state, &mut result);
+
+        assert_eq!(result.osc52.len(), 1, "split UTF-8 C1 OSC 52 detected");
+        assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
+        assert!(!finalize_scan_state(&mut state).truncated_escape);
+    }
+
+    #[test]
+    fn detects_utf8_c1_csi_screen_clear() {
+        let result = scan_output_bytes("before\u{009B}2Jafter".as_bytes());
+        assert_eq!(result.screen_clear.len(), 1);
+    }
+
+    #[test]
+    fn c1_dcs_and_apc_stream_until_st_and_report_truncation() {
+        let mut complete_state = OutputScanState::default();
+        let mut complete_result = OutputScanResult::default();
+        scan_output_chunk(
+            "\u{0090}opaque".as_bytes(),
+            &mut complete_state,
+            &mut complete_result,
+        );
+        scan_output_chunk(
+            " payload\u{009C}safe".as_bytes(),
+            &mut complete_state,
+            &mut complete_result,
+        );
+        assert!(!finalize_scan_state(&mut complete_state).truncated_escape);
+
+        let mut truncated_state = OutputScanState::default();
+        let mut truncated_result = OutputScanResult::default();
+        scan_output_chunk(
+            "\u{009F}unterminated".as_bytes(),
+            &mut truncated_state,
+            &mut truncated_result,
+        );
+        assert!(finalize_scan_state(&mut truncated_state).truncated_escape);
     }
 
     #[test]
