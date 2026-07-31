@@ -31,12 +31,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Hard per-call wall-clock cap for any shell-out; the child is killed past it.
 const SHELL_OUT_TIMEOUT: Duration = Duration::from_millis(1500);
+const SHELL_OUT_CAP: usize = 1024 * 1024;
 
 /// Per-process cache TTL — keeps the hot path responsive during a burst of
 /// cloud-CLI commands.
@@ -146,6 +146,9 @@ impl DetectionResult {
 
 /// Process-global cache (`OnceLock`-deferred init, fine-grained inner `Mutex`).
 static CACHE: OnceLock<Mutex<CacheEntry>> = OnceLock::new();
+type ProviderDetection = Result<ProviderContext, ContextDetectFailure>;
+type ProviderCache = BTreeMap<Provider, (Instant, ProviderDetection)>;
+static PROVIDER_CACHE: OnceLock<Mutex<ProviderCache>> = OnceLock::new();
 
 #[derive(Default)]
 struct CacheEntry {
@@ -155,6 +158,10 @@ struct CacheEntry {
 
 fn cache() -> &'static Mutex<CacheEntry> {
     CACHE.get_or_init(|| Mutex::new(CacheEntry::default()))
+}
+
+fn provider_cache() -> &'static Mutex<ProviderCache> {
+    PROVIDER_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Detect the active context for every configured provider, with a per-process
@@ -202,11 +209,41 @@ pub fn detect_single(provider: Provider) -> Result<ProviderContext, ContextDetec
     }
 }
 
+/// Detect only the command's provider and cache that result. This keeps the
+/// analysis hot path from executing unrelated provider CLIs.
+pub fn detect_provider(provider: Provider) -> Result<ProviderContext, ContextDetectFailure> {
+    if std::env::var("TIRITH_CONTEXT_DETECT_DISABLE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Err(ContextDetectFailure::NotConfigured);
+    }
+    let now = Instant::now();
+    let mut guard = match provider_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((captured_at, result)) = guard.get(&provider) {
+        if now.duration_since(*captured_at) < Duration::from_secs(CACHE_TTL_SECS) {
+            return result.clone();
+        }
+    }
+    let result = detect_single(provider);
+    guard.insert(provider, (now, result.clone()));
+    result
+}
+
 /// Clear the per-process cache. Tests call this between scenarios.
 pub fn clear_cache_for_tests() {
     if let Some(lock) = CACHE.get() {
         if let Ok(mut guard) = lock.lock() {
             *guard = CacheEntry::default();
+        }
+    }
+    if let Some(lock) = PROVIDER_CACHE.get() {
+        if let Ok(mut guard) = lock.lock() {
+            guard.clear();
         }
     }
 }
@@ -396,13 +433,29 @@ struct ShellOutOutput {
 /// outcome onto [`ContextDetectFailure`]. A missing binary (`spawn` `NotFound`)
 /// becomes `NotConfigured` ("no signal"), distinct from a real I/O error.
 fn run_with_timeout(program: &str, args: &[&str]) -> Result<ShellOutOutput, ContextDetectFailure> {
-    use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
-    let outcome = run_shell_with_timeout(
-        program,
+    use crate::trusted_child::TrustedExecutableError;
+    use crate::util::{run_trusted_with_timeout, ShellTimeoutOutcome};
+    let executable = match crate::trusted_child::resolve_ambient(program) {
+        Ok(executable) => executable,
+        Err(TrustedExecutableError::NotFound(_)) => {
+            return Err(ContextDetectFailure::NotConfigured)
+        }
+        Err(error) => return Err(ContextDetectFailure::Io(error.to_string())),
+    };
+    let outcome = run_trusted_with_timeout(
+        &executable,
         args,
         SHELL_OUT_TIMEOUT,
-        Duration::from_millis(25),
-        Stdio::null(),
+        SHELL_OUT_CAP,
+        &[
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+            "CLOUDSDK_CONFIG",
+            "AZURE_CONFIG_DIR",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ],
     );
     match outcome {
         ShellTimeoutOutcome::Completed { status, stdout } => {
@@ -419,6 +472,9 @@ fn run_with_timeout(program: &str, args: &[&str]) -> Result<ShellOutOutput, Cont
         ShellTimeoutOutcome::SpawnError(reason) => Err(ContextDetectFailure::Io(reason)),
         ShellTimeoutOutcome::WaitError(reason) => Err(ContextDetectFailure::Io(reason)),
         ShellTimeoutOutcome::Timeout => Err(ContextDetectFailure::Timeout),
+        ShellTimeoutOutcome::OutputLimitExceeded => Err(ContextDetectFailure::Io(
+            "context helper output exceeded the capture limit".to_string(),
+        )),
     }
 }
 

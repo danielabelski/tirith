@@ -793,34 +793,17 @@ pub fn tirith_path_lookup_command() -> &'static str {
     }
 }
 
-/// Resolve all `tirith` executables on PATH via the shell's own resolution —
-/// the paths the shell would actually execute, not just filesystem entries.
+/// Resolve all `tirith` executables on PATH without executing a PATH-selected
+/// shell or lookup utility.
 pub fn resolve_tirith_on_path() -> Vec<std::path::PathBuf> {
-    let output = {
-        #[cfg(unix)]
-        {
-            std::process::Command::new("sh")
-                .args(["-c", "which -a tirith 2>/dev/null"])
-                .output()
-        }
-        #[cfg(not(unix))]
-        {
-            std::process::Command::new("where.exe")
-                .arg("tirith")
-                .output()
-        }
+    let Some(path) = std::env::var_os("PATH") else {
+        return Vec::new();
     };
+    resolve_tirith_on_path_from(&path)
+}
 
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(std::path::PathBuf::from)
-        .collect()
+fn resolve_tirith_on_path_from(path: &std::ffi::OsStr) -> Vec<std::path::PathBuf> {
+    tirith_core::path_audit::which_all_os("tirith", path)
 }
 
 /// Find `tirith` executables on PATH that aren't the current binary, deduped by
@@ -977,12 +960,34 @@ pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_shim_target, quiet_from_env, resolve_shim_target, sanitize_for_human_output,
-        shell_join, should_warn_neutralized,
+        parse_shim_target, quiet_from_env, resolve_shim_target, resolve_tirith_on_path_from,
+        sanitize_for_human_output, shell_join, should_warn_neutralized,
     };
     use std::fs;
     use std::path::PathBuf;
     use tirith_core::policy::PolicyScope;
+
+    #[cfg(unix)]
+    #[test]
+    fn tirith_path_lookup_is_in_process_and_preserves_order() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for directory in [first.path(), second.path()] {
+            let executable = directory.join("tirith");
+            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut permissions = fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(executable, permissions).unwrap();
+        }
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        let hits = resolve_tirith_on_path_from(&path);
+        assert_eq!(
+            hits,
+            vec![first.path().join("tirith"), second.path().join("tirith")]
+        );
+    }
 
     #[test]
     fn shell_join_preserves_argv_boundaries() {

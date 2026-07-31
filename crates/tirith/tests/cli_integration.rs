@@ -1142,6 +1142,47 @@ fn init_bash_output() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn init_does_not_execute_path_shadowed_diagnostics_or_prompt_binary() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let fake_bin = home.path().join("repo-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let marker = home.path().join("executed-marker");
+    for name in ["sh", "ps", "tirith"] {
+        let path = fake_bin.join(name);
+        fs::write(
+            &path,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+
+    let out = tirith()
+        .args(["init", "--shell", "zsh", "--prompt-status"])
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists(), "PATH-shadowed helpers must not execute");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("prompt-status --short"));
+    assert!(!stdout.contains(" tirith prompt-status --short"));
+}
+
 #[test]
 fn init_unsupported_shell() {
     let out = tirith()
@@ -3449,6 +3490,48 @@ fn onboard_json_reports_planted_signals_and_recommends_template() {
         reported.canonicalize().ok(),
         root.canonicalize().ok(),
         "repo_root should resolve to the planted .git tree"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn onboard_json_does_not_execute_a_path_shadowed_ps() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir(repo.path().join(".git")).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let fake_bin = repo.path().join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let marker = home.path().join("fake-ps-executed");
+    let fake_ps = fake_bin.join("ps");
+    fs::write(
+        &fake_ps,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_ps).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fake_ps, permissions).unwrap();
+
+    let out = tirith()
+        .args(["onboard", "--json"])
+        .current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        !marker.exists(),
+        "onboarding must not execute PATH-selected ps"
     );
 }
 
@@ -8814,9 +8897,9 @@ fn init_prompt_status_emits_marker_wrapped_snippet_zsh() {
         "zsh snippet must set PROMPT_SUBST; got: {stdout}"
     );
     assert!(
-        stdout.contains("'$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '"),
-        "zsh snippet must single-quote the command substitution and forward the \
-         non-exported TIRITH_STATUS; got: {stdout}"
+        stdout.contains("prompt-status --short")
+            && !stdout.contains(" tirith prompt-status --short"),
+        "zsh snippet must bind prompt status to the running absolute executable; got: {stdout}"
     );
 }
 
@@ -8859,10 +8942,11 @@ fn init_prompt_status_is_idempotent_when_run_twice() {
     );
 
     // The PS1 / PROMPT wrap-line must also appear exactly once.
-    let prompt_line =
-        "PROMPT='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PROMPT\"";
     assert_eq!(
-        stdout_a.matches(prompt_line).count(),
+        stdout_a
+            .lines()
+            .filter(|line| line.trim_start().starts_with("PROMPT="))
+            .count(),
         1,
         "PROMPT wrap-line must appear exactly once per invocation; got: {stdout_a}"
     );
@@ -8885,10 +8969,7 @@ fn init_without_prompt_status_does_not_emit_snippet() {
 #[test]
 fn init_prompt_status_supports_bash_and_fish_and_powershell() {
     for (shell, must_contain) in [
-        (
-            "bash",
-            "PS1='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PS1\"",
-        ),
+        ("bash", "PS1="),
         ("fish", "function fish_right_prompt"),
         ("powershell", "function global:prompt"),
     ] {
@@ -8905,6 +8986,10 @@ fn init_prompt_status_supports_bash_and_fish_and_powershell() {
         assert!(
             stdout.contains(must_contain),
             "snippet for {shell} must contain {must_contain:?}; got: {stdout}"
+        );
+        assert!(
+            !stdout.contains(" tirith prompt-status --short"),
+            "snippet for {shell} must not re-resolve a bare tirith: {stdout}"
         );
     }
 }

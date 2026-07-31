@@ -1042,23 +1042,14 @@ const KNOWN_SHELL_TOOLS: &[(&str, &str)] = &[
 
 /// True when `binary` resolves on `PATH` via the shell's own lookup.
 fn tool_on_path(binary: &str) -> bool {
-    let lookup = {
-        #[cfg(unix)]
-        {
-            std::process::Command::new("sh")
-                .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
-                .status()
-        }
-        #[cfg(not(unix))]
-        {
-            std::process::Command::new("where.exe")
-                .arg(binary)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-        }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
     };
-    lookup.map(|s| s.success()).unwrap_or(false)
+    tool_on_path_from(binary, &path)
+}
+
+fn tool_on_path_from(binary: &str, path: &std::ffi::OsStr) -> bool {
+    !tirith_core::path_audit::which_all_os(binary, path).is_empty()
 }
 
 /// True when `tool` is mentioned in any existing profile file for `shell`.
@@ -1246,9 +1237,14 @@ fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
     let binary = detect_powershell_binary(detected_shell)?;
     // `Option<bool>` keeps three states: Some(true)/Some(false)/None (probe
     // failed). Collapsing None into Some(false) would falsely report "missing".
-    let psreadline_available = probe_psreadline_available(binary);
+    let psreadline_available = probe_psreadline_available(&binary);
     Some(PsCompatInfo {
-        binary: binary.to_string(),
+        binary: binary
+            .path()
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("powershell")
+            .to_string(),
         psreadline_available,
         // None until all hook files carry a `# tirith-hook-version:` tag.
         hook_version_match: None,
@@ -1260,14 +1256,17 @@ fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
 /// pwsh-first — otherwise PSReadLine health would be reported from a DIFFERENT
 /// runtime than the operator runs. Used for both the availability check and the
 /// PSReadLine probe so they agree on one interpreter.
-fn detect_powershell_binary(detected_shell: &str) -> Option<&'static str> {
+fn detect_powershell_binary(
+    detected_shell: &str,
+) -> Option<tirith_core::trusted_child::TrustedExecutable> {
     let candidates: [&'static str; 2] = match detected_shell {
         "powershell" => ["powershell", "pwsh"],
         _ => ["pwsh", "powershell"],
     };
     candidates
         .into_iter()
-        .find(|&candidate| probe_command_available(candidate))
+        .filter_map(|candidate| tirith_core::trusted_child::resolve_ambient(candidate).ok())
+        .find(probe_command_available)
 }
 
 /// Run a PowerShell command body with `-NoProfile -NonInteractive` and a 3s
@@ -1277,19 +1276,49 @@ fn detect_powershell_binary(detected_shell: &str) -> Option<&'static str> {
 /// loading, so a user profile could mutate `$env:PSModulePath` or error out and
 /// skew module detection. Args are PowerShell-specific (pwsh / powershell.exe
 /// only).
-fn run_powershell(binary: &str, body: &str) -> Option<std::process::Output> {
-    let mut cmd = std::process::Command::new(binary);
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", body]);
-    run_with_timeout(&mut cmd, std::time::Duration::from_secs(3))
+fn run_powershell(
+    binary: &tirith_core::trusted_child::TrustedExecutable,
+    body: &str,
+) -> Option<std::process::Output> {
+    use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec};
+
+    let mut spec = ChildSpec::new(
+        ["-NoProfile", "-NonInteractive", "-Command", body],
+        ChildLimits::new(std::time::Duration::from_secs(3), 1024 * 1024, 1024 * 1024),
+    )
+    .inherit_env(&[
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SystemRoot",
+        "WINDIR",
+        "PSModulePath",
+    ]);
+    if let Some(path) = tirith_core::trusted_child::sanitized_ambient_path() {
+        spec = spec.env("PATH", path);
+    }
+    match tirith_core::trusted_child::run(binary, &spec) {
+        ChildOutcome::Completed {
+            status,
+            stdout,
+            stderr,
+        } => Some(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        _ => None,
+    }
 }
 
 /// Probe whether a PowerShell binary is on PATH via a no-op command. NOT
 /// `--version`: Windows PowerShell 5.1 rejects it (only `pwsh` accepts it);
 /// `-Command "exit 0"` works on both.
-fn probe_command_available(name: &str) -> bool {
+fn probe_command_available(binary: &tirith_core::trusted_child::TrustedExecutable) -> bool {
     // Spawn failure / timeout collapse to `None` → `false`; a non-zero exit is
     // also "not available" (only `status.success()` counts).
-    run_powershell(name, "exit 0")
+    run_powershell(binary, "exit 0")
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -1299,50 +1328,15 @@ fn probe_command_available(name: &str) -> bool {
 /// a literal `yes`/`no` rather than trusting the exit code, so a probe error is
 /// distinguishable from a clean negative. `Option<bool>`: `Some(true)` = "yes",
 /// `Some(false)` = anything else, `None` = probe failed/timed out.
-fn probe_psreadline_available(binary: &str) -> Option<bool> {
+fn probe_psreadline_available(
+    binary: &tirith_core::trusted_child::TrustedExecutable,
+) -> Option<bool> {
     let output = run_powershell(
         binary,
         "if (Get-Module -ListAvailable PSReadLine) { 'yes' } else { 'no' }",
     )?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     Some(stdout.trim().eq_ignore_ascii_case("yes"))
-}
-
-/// Spawn `cmd`, wait up to `timeout`, kill on timeout. `None` on spawn/wait
-/// failure or timeout.
-///
-/// Polls `try_wait` (50ms) so the owned `Child` stays in scope and we call
-/// `child.kill()` directly on timeout — safe even if the child already exited
-/// (NotFound is ignored). Avoids the PID-reuse race of `libc::kill(pid, …)`.
-fn run_with_timeout(
-    cmd: &mut std::process::Command,
-    timeout: std::time::Duration,
-) -> Option<std::process::Output> {
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            // Exited within budget — collect output.
-            Ok(Some(_status)) => return child.wait_with_output().ok(),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill(); // NotFound on an already-exited child is ignored
-                    let _ = child.wait(); // reap to avoid a zombie
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            // Wait failed (rare) — best-effort kill.
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
 }
 
 /// `tirith doctor --compat`: print a focused shell/terminal compatibility
@@ -2955,6 +2949,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert!(!tool_in_profile("starship", Some(&missing)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_path_detection_is_pure_and_preserves_a_legitimate_hit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("starship");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+
+        assert!(tool_on_path_from("starship", &path));
+        assert!(!tool_on_path_from("missing", &path));
     }
 
     #[test]

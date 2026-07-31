@@ -18,7 +18,6 @@
 //! `plan_hash_recorded` directly with the plan file's bytes.
 
 use std::path::Path;
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -415,7 +414,7 @@ fn unix_now() -> u64 {
 /// Hot-path warning: MUST NOT be called from `engine::analyze` — the only
 /// caller is the interactive `tirith iac check-plan`.
 pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, String> {
-    use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
+    use crate::util::{run_trusted_with_timeout, ShellTimeoutOutcome};
 
     let program = match tool {
         PlanTool::Terraform => "terraform",
@@ -429,14 +428,23 @@ pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u
     };
 
     let plan_path_string = plan_path.to_string_lossy().into_owned();
-    // Stderr is discarded, not piped — piping without draining could deadlock
-    // the child on ≥64KiB of stderr (PR-127 CodeRabbit).
-    let outcome = run_shell_with_timeout(
-        program,
+    // The supervisor drains and caps stderr independently from the plan JSON.
+    let executable =
+        crate::trusted_child::resolve_ambient(program).map_err(|error| error.to_string())?;
+    let outcome = run_trusted_with_timeout(
+        &executable,
         &["show", "-json", plan_path_string.as_str()],
         TERRAFORM_SHOW_TIMEOUT,
-        Duration::from_millis(50),
-        Stdio::null(),
+        MAX_PLAN_SIZE_BYTES as usize,
+        &[
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+            "TF_CLI_CONFIG_FILE",
+            "TF_PLUGIN_CACHE_DIR",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ],
     );
     match outcome {
         ShellTimeoutOutcome::Completed { status, stdout } => {
@@ -463,6 +471,10 @@ pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u
         ShellTimeoutOutcome::Timeout => Err(format!(
             "{program} show -json exceeded {}s timeout",
             TERRAFORM_SHOW_TIMEOUT.as_secs()
+        )),
+        ShellTimeoutOutcome::OutputLimitExceeded => Err(format!(
+            "{program} show -json exceeded the {} byte output cap",
+            MAX_PLAN_SIZE_BYTES
         )),
     }
 }

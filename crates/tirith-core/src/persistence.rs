@@ -12,7 +12,7 @@
 //!   mutate `HOME`/env (libc data race, PR #125).
 //! * The 6 rules fire on DIFF, not scan — `scan` emits no RuleId. They are
 //!   state-change rules (no PATTERN_TABLE entry; in `EXTERNALLY_TRIGGERED_RULES`).
-//! * `crontab -l` / login-items `osascript` run via [`crate::util::run_shell_with_timeout`]
+//! * `crontab -l` / login-items `osascript` run via [`crate::util::run_trusted_with_timeout`]
 //!   with a 1.5s budget; a non-zero exit ("no crontab") counts as empty, not an error.
 //! * The diff reports ADDED LINES ONLY (never removed/full content), each run
 //!   through [`crate::redact::redact`] so a new key/token never leaks into a finding.
@@ -26,11 +26,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
+use crate::util::{run_trusted_with_timeout, ShellTimeoutOutcome};
 use crate::verdict::{RuleId, Severity};
 
 /// Budget for each persistence shell-out (`crontab -l`, login-items `osascript`).
 const SHELL_OUT_TIMEOUT: Duration = Duration::from_millis(1500);
+const SHELL_OUT_CAP: usize = 4 * 1024 * 1024;
 
 /// The class of persistence surface; determines which [`RuleId`] a change fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,17 +298,22 @@ fn file_entry(key: &str, kind: PersistenceKind, path: &Path) -> PersistenceEntry
 /// Inventory the user crontab via `crontab -l`; a non-zero exit ("no crontab")
 /// counts as an EMPTY crontab, not an error.
 fn crontab_entry() -> PersistenceEntry {
-    let content = match run_shell_with_timeout(
-        "crontab",
-        &["-l"],
-        SHELL_OUT_TIMEOUT,
-        Duration::from_millis(25),
-        std::process::Stdio::null(),
-    ) {
-        ShellTimeoutOutcome::Completed { status, stdout } if status.success() => {
+    let program = crate::trusted_child::TrustedExecutable::from_system_candidates(&[
+        Path::new("/usr/bin/crontab"),
+        Path::new("/bin/crontab"),
+    ]);
+    let content = match program.map(|program| {
+        run_trusted_with_timeout(
+            &program,
+            &["-l"],
+            SHELL_OUT_TIMEOUT,
+            SHELL_OUT_CAP,
+            &["HOME", "USER", "LOGNAME"],
+        )
+    }) {
+        Ok(ShellTimeoutOutcome::Completed { status, stdout }) if status.success() => {
             String::from_utf8_lossy(&stdout).into_owned()
         }
-        // Non-zero exit / NotFound / timeout / spawn error → empty crontab.
         _ => String::new(),
     };
     let present = !content.trim().is_empty();
@@ -363,17 +369,22 @@ fn launch_agent_dir(dir: &Path, ext: &str) -> Vec<PersistenceEntry> {
 /// Inventory macOS login items via `osascript`; an absent entry on non-macOS
 /// (or when `osascript` is absent / errors / times out).
 fn login_items_entry() -> PersistenceEntry {
-    let content = match run_shell_with_timeout(
-        "osascript",
-        &[
-            "-e",
-            "tell application \"System Events\" to get the name of every login item",
-        ],
-        SHELL_OUT_TIMEOUT,
-        Duration::from_millis(25),
-        std::process::Stdio::null(),
-    ) {
-        ShellTimeoutOutcome::Completed { status, stdout } if status.success() => {
+    let program = crate::trusted_child::TrustedExecutable::from_system_candidates(&[Path::new(
+        "/usr/bin/osascript",
+    )]);
+    let content = match program.map(|program| {
+        run_trusted_with_timeout(
+            &program,
+            &[
+                "-e",
+                "tell application \"System Events\" to get the name of every login item",
+            ],
+            SHELL_OUT_TIMEOUT,
+            SHELL_OUT_CAP,
+            &["HOME", "USER"],
+        )
+    }) {
+        Ok(ShellTimeoutOutcome::Completed { status, stdout }) if status.success() => {
             String::from_utf8_lossy(&stdout).into_owned()
         }
         _ => String::new(),

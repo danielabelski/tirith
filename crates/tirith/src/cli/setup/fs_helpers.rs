@@ -231,98 +231,61 @@ pub fn validate_target_dir(dir: &Path, scope_root: Option<&Path>) -> Result<(), 
     Ok(())
 }
 
-/// Run a CLI subprocess with 30s timeout and sanitized env.
-///
-/// Spawns the command, drains stdout/stderr in background threads to prevent
-/// pipe-buffer deadlock, and polls with `try_wait()` against a 30s deadline.
-/// On timeout or error: `kill()` + `wait()` to fully reap (no zombie).
+/// Run a CLI subprocess through the shared trusted, bounded supervisor.
 pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
+    let executable = tirith_core::trusted_child::resolve_ambient(cmd)
+        .map_err(|error| format!("{cmd} not found or untrusted: {error}"))?;
+    run_cli_with(
+        &executable,
+        args,
+        tirith_core::trusted_child::ChildLimits::new(
+            std::time::Duration::from_secs(30),
+            4 * 1024 * 1024,
+            4 * 1024 * 1024,
+        ),
+    )
+}
 
-    let mut child = Command::new(cmd)
-        .args(args)
-        .env_remove("TERM")
-        .env_remove("COLORTERM")
-        .env_remove("GPG_TTY")
-        .env_remove("EDITOR")
-        .env_remove("VISUAL")
-        .env_remove("PAGER")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{cmd} not found or failed to start: {e}"))?;
+fn run_cli_with(
+    executable: &tirith_core::trusted_child::TrustedExecutable,
+    args: &[&str],
+    limits: tirith_core::trusted_child::ChildLimits,
+) -> Result<std::process::Output, String> {
+    use tirith_core::trusted_child::{ChildOutcome, ChildSpec};
 
-    // Draining pipes in background threads prevents pipe-buffer deadlock
-    // when the child writes more than pipe capacity before exiting.
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-
-    let mut stdout_thread = Some(std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut h) = stdout_handle {
-            let _ = h.read_to_end(&mut buf);
+    let mut spec = ChildSpec::new(args, limits).inherit_env(&[
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "USERPROFILE",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "CODEX_HOME",
+        "SystemRoot",
+        "WINDIR",
+    ]);
+    if let Some(path) = tirith_core::trusted_child::sanitized_ambient_path() {
+        spec = spec.env("PATH", path);
+    }
+    match tirith_core::trusted_child::run(executable, &spec) {
+        ChildOutcome::Completed {
+            status,
+            stdout,
+            stderr,
+        } => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        ChildOutcome::SpawnError(reason) => Err(format!("failed to start: {reason}")),
+        ChildOutcome::WaitError(reason) => Err(format!("wait failed: {reason}")),
+        ChildOutcome::Timeout { .. } => Err("timed out after 30s — check installation".into()),
+        ChildOutcome::OutputLimitExceeded { .. } => {
+            Err("output limit exceeded — check installation".into())
         }
-        buf
-    }));
-    let mut stderr_thread = Some(std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut h) = stderr_handle {
-            let _ = h.read_to_end(&mut buf);
-        }
-        buf
-    }));
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    // wait() after kill() to reap the zombie.
-                    let _ = child.wait();
-                    if let Some(t) = stdout_thread.take() {
-                        let _ = t.join();
-                    }
-                    if let Some(t) = stderr_thread.take() {
-                        let _ = t.join();
-                    }
-                    break Err(format!("{cmd} timed out after 30s — check installation"));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(t) = stdout_thread.take() {
-                    let _ = t.join();
-                }
-                if let Some(t) = stderr_thread.take() {
-                    let _ = t.join();
-                }
-                break Err(format!("{cmd} wait failed: {e}"));
-            }
-        }
-    };
-
-    match status {
-        Ok(exit_status) => {
-            let stdout_buf = stdout_thread
-                .take()
-                .and_then(|t| t.join().ok())
-                .unwrap_or_default();
-            let stderr_buf = stderr_thread
-                .take()
-                .and_then(|t| t.join().ok())
-                .unwrap_or_default();
-            Ok(std::process::Output {
-                status: exit_status,
-                stdout: stdout_buf,
-                stderr: stderr_buf,
-            })
-        }
-        Err(e) => Err(e),
     }
 }
 
@@ -434,6 +397,35 @@ fn cleanup_old_backups(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_runner_preserves_short_legitimate_output() {
+        let shell =
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
+                .unwrap();
+        let output = run_cli_with(
+            &shell,
+            &["-c", "printf setup-ok"],
+            tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(2), 64, 64),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"setup-ok");
+    }
+
+    #[test]
+    fn cli_runner_rejects_output_over_its_bound() {
+        let shell =
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
+                .unwrap();
+        let error = run_cli_with(
+            &shell,
+            &["-c", "printf 12345"],
+            tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(2), 4, 64),
+        )
+        .unwrap_err();
+        assert!(error.contains("output limit"));
+    }
 
     #[test]
     fn atomic_write_creates_file() {

@@ -2,8 +2,6 @@
 use libc;
 use std::fs;
 use std::path::PathBuf;
-#[cfg(unix)]
-use std::process::Command;
 
 use crate::assets;
 
@@ -72,6 +70,18 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
 
     let shell = shell.unwrap_or_else(|| detect_shell());
 
+    let prompt_executable = if prompt_status {
+        match tirith_core::trusted_child::TrustedExecutable::current() {
+            Ok(executable) => Some(executable),
+            Err(error) => {
+                eprintln!("tirith: cannot bind prompt status to the running executable: {error}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     let hook_dir = find_hook_dir();
 
     match shell {
@@ -86,7 +96,10 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                 return 1;
             }
             if prompt_status {
-                println!("{}", prompt_status_snippet("zsh"));
+                println!(
+                    "{}",
+                    prompt_status_snippet_for("zsh", prompt_executable.as_ref().unwrap().path())
+                );
             }
             0
         }
@@ -101,7 +114,10 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                 return 1;
             }
             if prompt_status {
-                println!("{}", prompt_status_snippet("bash"));
+                println!(
+                    "{}",
+                    prompt_status_snippet_for("bash", prompt_executable.as_ref().unwrap().path())
+                );
             }
             0
         }
@@ -116,7 +132,10 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                 return 1;
             }
             if prompt_status {
-                println!("{}", prompt_status_snippet("fish"));
+                println!(
+                    "{}",
+                    prompt_status_snippet_for("fish", prompt_executable.as_ref().unwrap().path())
+                );
             }
             0
         }
@@ -133,7 +152,13 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                 return 1;
             }
             if prompt_status {
-                println!("{}", prompt_status_snippet("powershell"));
+                println!(
+                    "{}",
+                    prompt_status_snippet_for(
+                        "powershell",
+                        prompt_executable.as_ref().unwrap().path(),
+                    )
+                );
             }
             0
         }
@@ -150,7 +175,13 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
             if prompt_status {
                 // Nushell can't be wired via eval; emit a manual-install pointer
                 // (the shipped hook does the real wiring).
-                println!("{}", prompt_status_snippet("nushell"));
+                println!(
+                    "{}",
+                    prompt_status_snippet_for(
+                        "nushell",
+                        prompt_executable.as_ref().unwrap().path(),
+                    )
+                );
             }
             0
         }
@@ -167,63 +198,76 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
 /// guarded against double-eval (so PS1/PROMPT isn't double-wrapped) and uses
 /// single quotes around the command substitution so it defers to prompt-render
 /// time (the only quoting that produces a live status).
-pub(crate) fn prompt_status_snippet(shell: &str) -> String {
+pub(crate) fn prompt_status_snippet_for(shell: &str, executable: &std::path::Path) -> String {
+    let executable = executable.display().to_string();
+    let posix_executable = posix_single_quote(&executable);
+    let powershell_executable = powershell_single_quote(&executable);
     match shell {
-        "zsh" => [
-            "# >>> tirith prompt-status (M8 ch6) >>>",
-            "if [[ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]]; then",
-            "  _TIRITH_PROMPT_STATUS_LOADED=1",
-            "  setopt PROMPT_SUBST",
-            "  PROMPT='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PROMPT\"",
-            "fi",
-            "# <<< tirith prompt-status (M8 ch6) <<<",
-        ]
-        .join("\n"),
-        "bash" => [
-            "# >>> tirith prompt-status (M8 ch6) >>>",
-            "if [ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]; then",
-            "  _TIRITH_PROMPT_STATUS_LOADED=1",
-            "  PS1='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PS1\"",
-            "fi",
-            "# <<< tirith prompt-status (M8 ch6) <<<",
-        ]
-        .join("\n"),
+        "zsh" => {
+            let substitution = posix_single_quote(&format!(
+                "$(TIRITH_STATUS=\"${{TIRITH_STATUS:-}}\" {posix_executable} prompt-status --short) "
+            ));
+            [
+                "# >>> tirith prompt-status (M8 ch6) >>>".to_string(),
+                "if [[ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]]; then".to_string(),
+                "  _TIRITH_PROMPT_STATUS_LOADED=1".to_string(),
+                "  setopt PROMPT_SUBST".to_string(),
+                format!("  PROMPT={substitution}\"$PROMPT\""),
+                "fi".to_string(),
+                "# <<< tirith prompt-status (M8 ch6) <<<".to_string(),
+            ]
+            .join("\n")
+        }
+        "bash" => {
+            let substitution = posix_single_quote(&format!(
+                "$(TIRITH_STATUS=\"${{TIRITH_STATUS:-}}\" {posix_executable} prompt-status --short) "
+            ));
+            [
+                "# >>> tirith prompt-status (M8 ch6) >>>".to_string(),
+                "if [ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]; then".to_string(),
+                "  _TIRITH_PROMPT_STATUS_LOADED=1".to_string(),
+                format!("  PS1={substitution}\"$PS1\""),
+                "fi".to_string(),
+                "# <<< tirith prompt-status (M8 ch6) <<<".to_string(),
+            ]
+            .join("\n")
+        }
         "fish" => [
-            "# >>> tirith prompt-status (M8 ch6) >>>",
-            "if not set -q _TIRITH_PROMPT_STATUS_LOADED",
-            "    set -g _TIRITH_PROMPT_STATUS_LOADED 1",
-            "    functions -q fish_right_prompt; and functions -e _tirith_orig_fish_right_prompt",
-            "    if functions -q fish_right_prompt",
-            "        functions -c fish_right_prompt _tirith_orig_fish_right_prompt",
-            "    end",
-            "    function fish_right_prompt",
-            "        env TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short",
-            "        if functions -q _tirith_orig_fish_right_prompt",
-            "            _tirith_orig_fish_right_prompt",
-            "        end",
-            "    end",
-            "end",
-            "# <<< tirith prompt-status (M8 ch6) <<<",
+            "# >>> tirith prompt-status (M8 ch6) >>>".to_string(),
+            "if not set -q _TIRITH_PROMPT_STATUS_LOADED".to_string(),
+            "    set -g _TIRITH_PROMPT_STATUS_LOADED 1".to_string(),
+            "    functions -q fish_right_prompt; and functions -e _tirith_orig_fish_right_prompt".to_string(),
+            "    if functions -q fish_right_prompt".to_string(),
+            "        functions -c fish_right_prompt _tirith_orig_fish_right_prompt".to_string(),
+            "    end".to_string(),
+            "    function fish_right_prompt".to_string(),
+            format!("        env TIRITH_STATUS=\"$TIRITH_STATUS\" {posix_executable} prompt-status --short"),
+            "        if functions -q _tirith_orig_fish_right_prompt".to_string(),
+            "            _tirith_orig_fish_right_prompt".to_string(),
+            "        end".to_string(),
+            "    end".to_string(),
+            "end".to_string(),
+            "# <<< tirith prompt-status (M8 ch6) <<<".to_string(),
         ]
         .join("\n"),
         "powershell" | "pwsh" => [
-            "# >>> tirith prompt-status (M8 ch6) >>>",
-            "if (-not $global:_TIRITH_PROMPT_STATUS_LOADED) {",
-            "    $global:_TIRITH_PROMPT_STATUS_LOADED = $true",
-            "    if (Test-Path Function:prompt) {",
-            "        Copy-Item Function:prompt Function:_tirith_orig_prompt -Force",
-            "    }",
-            "    function global:prompt {",
-            "        $_tps = $env:TIRITH_STATUS; $env:TIRITH_STATUS = $global:TIRITH_STATUS",
-            "        try { $line = (& tirith prompt-status --short) 2>$null } finally { if ($null -eq $_tps) { Remove-Item Env:\\TIRITH_STATUS -ErrorAction SilentlyContinue } else { $env:TIRITH_STATUS = $_tps } }",
-            "        if (Get-Command _tirith_orig_prompt -ErrorAction SilentlyContinue) {",
-            "            \"$line $(_tirith_orig_prompt)\"",
-            "        } else {",
-            "            \"$line PS $($executionContext.SessionState.Path.CurrentLocation)> \"",
-            "        }",
-            "    }",
-            "}",
-            "# <<< tirith prompt-status (M8 ch6) <<<",
+            "# >>> tirith prompt-status (M8 ch6) >>>".to_string(),
+            "if (-not $global:_TIRITH_PROMPT_STATUS_LOADED) {".to_string(),
+            "    $global:_TIRITH_PROMPT_STATUS_LOADED = $true".to_string(),
+            "    if (Test-Path Function:prompt) {".to_string(),
+            "        Copy-Item Function:prompt Function:_tirith_orig_prompt -Force".to_string(),
+            "    }".to_string(),
+            "    function global:prompt {".to_string(),
+            "        $_tps = $env:TIRITH_STATUS; $env:TIRITH_STATUS = $global:TIRITH_STATUS".to_string(),
+            format!("        try {{ $line = (& {powershell_executable} prompt-status --short) 2>$null }} finally {{ if ($null -eq $_tps) {{ Remove-Item Env:\\TIRITH_STATUS -ErrorAction SilentlyContinue }} else {{ $env:TIRITH_STATUS = $_tps }} }}"),
+            "        if (Get-Command _tirith_orig_prompt -ErrorAction SilentlyContinue) {".to_string(),
+            "            \"$line $(_tirith_orig_prompt)\"".to_string(),
+            "        } else {".to_string(),
+            "            \"$line PS $($executionContext.SessionState.Path.CurrentLocation)> \"".to_string(),
+            "        }".to_string(),
+            "    }".to_string(),
+            "}".to_string(),
+            "# <<< tirith prompt-status (M8 ch6) <<<".to_string(),
         ]
         .join("\n"),
         // Nushell wiring lives in config.nu and can't be spliced via `eval`;
@@ -313,15 +357,28 @@ fn detect_shell_from_parent() -> Option<&'static str> {
 
 #[cfg(unix)]
 fn read_process(pid: libc::pid_t) -> Option<(String, libc::pid_t)> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm=", "-o", "ppid="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable};
+
+    let program = TrustedExecutable::from_system_candidates(&[
+        std::path::Path::new("/bin/ps"),
+        std::path::Path::new("/usr/bin/ps"),
+    ])
+    .ok()?;
+    let pid = pid.to_string();
+    let spec = ChildSpec::new(
+        ["-p", pid.as_str(), "-o", "comm=", "-o", "ppid="],
+        ChildLimits::new(std::time::Duration::from_secs(1), 16 * 1024, 16 * 1024),
+    );
+    let ChildOutcome::Completed { status, stdout, .. } =
+        tirith_core::trusted_child::run(&program, &spec)
+    else {
+        return None;
+    };
+    if !status.success() {
         return None;
     }
 
-    let line = String::from_utf8_lossy(&output.stdout);
+    let line = String::from_utf8_lossy(&stdout);
     let mut parts = line.split_whitespace();
     let name = parts.next()?.to_string();
     let ppid = parts.next()?.parse::<libc::pid_t>().ok()?;
@@ -488,8 +545,14 @@ fn materialize_hooks() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_shell_name, posix_single_quote, powershell_single_quote, prompt_status_snippet,
+        normalize_shell_name, posix_single_quote, powershell_single_quote,
+        prompt_status_snippet_for,
     };
+    use std::path::Path;
+
+    fn prompt_status_snippet(shell: &str) -> String {
+        prompt_status_snippet_for(shell, Path::new("/opt/Tirith Bin/tirith"))
+    }
 
     #[test]
     fn normalize_shell_name_from_paths_and_login_shells() {
@@ -568,17 +631,15 @@ mod tests {
         // Single-quoted so PROMPT re-renders each redraw, AND the non-exported
         // TIRITH_STATUS is forwarded inline so the child can actually read it
         // (a bare `tirith prompt-status` child sees a non-exported var as unset).
-        assert!(
-            s.contains("'$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '")
-        );
+        assert!(s.contains("/opt/Tirith Bin/tirith"));
+        assert!(!s.contains(" tirith prompt-status --short"));
     }
 
     #[test]
     fn prompt_status_snippet_bash_uses_ps1_with_single_quoted_subst() {
         let s = prompt_status_snippet("bash");
-        assert!(s.contains(
-            "PS1='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PS1\""
-        ));
+        assert!(s.contains("/opt/Tirith Bin/tirith"));
+        assert!(!s.contains(" tirith prompt-status --short"));
         assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
         assert!(s.contains("# >>> tirith prompt-status (M8 ch6) >>>"));
         assert!(s.contains("# <<< tirith prompt-status (M8 ch6) <<<"));
@@ -589,7 +650,7 @@ mod tests {
         let s = prompt_status_snippet("fish");
         assert!(s.contains("function fish_right_prompt"));
         // Forwards the non-exported TIRITH_STATUS via `env` so the child sees it.
-        assert!(s.contains("env TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short"));
+        assert!(s.contains("'/opt/Tirith Bin/tirith' prompt-status --short"));
         assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
     }
 
@@ -609,8 +670,21 @@ mod tests {
         for shell in ["powershell", "pwsh"] {
             let s = prompt_status_snippet(shell);
             assert!(s.contains("function global:prompt"), "shell={shell}");
-            assert!(s.contains("tirith prompt-status --short"), "shell={shell}");
+            assert!(
+                s.contains("'/opt/Tirith Bin/tirith' prompt-status --short"),
+                "shell={shell}"
+            );
             assert!(s.contains("$global:_TIRITH_PROMPT_STATUS_LOADED"));
+        }
+    }
+
+    #[test]
+    fn prompt_status_snippet_quotes_an_executable_with_a_single_quote() {
+        let executable = Path::new("/opt/Tirith's Bin/tirith");
+        for shell in ["zsh", "bash", "fish", "powershell"] {
+            let snippet = prompt_status_snippet_for(shell, executable);
+            assert!(snippet.contains("Tirith"), "shell={shell}: {snippet}");
+            assert!(!snippet.contains(" tirith prompt-status --short"));
         }
     }
 

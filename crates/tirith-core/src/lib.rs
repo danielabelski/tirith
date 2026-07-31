@@ -83,6 +83,7 @@ pub mod threatdb;
 pub mod threatdb_api;
 pub mod threatdb_feeds;
 pub mod tokenize;
+pub mod trusted_child;
 pub mod url_validate;
 pub mod util;
 pub mod util_build_dirs;

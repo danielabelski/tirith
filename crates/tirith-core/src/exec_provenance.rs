@@ -10,7 +10,7 @@
 //! Windows/Linux report not-applicable), and package-manager ownership by
 //! matching well-known install roots.
 //!
-//! Both child processes are bounded by [`crate::util::run_shell_with_timeout`]
+//! Both child processes are bounded by [`crate::util::run_trusted_with_timeout`]
 //! (2s, args as an array — no shell/injection); a timeout or missing binary
 //! degrades to "unknown", never a hang. Provenance is gathered at ANALYSIS
 //! time — TOCTOU: the file could be replaced before the shell executes it.
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
+use crate::util::{run_trusted_with_timeout, ShellTimeoutOutcome};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// "Recently modified" window — a binary written within this many seconds of
@@ -29,7 +29,7 @@ pub const RECENT_MODIFY_SECS: u64 = 5 * 60;
 
 /// Child-process deadline for `file` / `codesign` (risk #1: codesign latency).
 const SHELL_TIMEOUT: Duration = Duration::from_millis(2000);
-const SHELL_POLL: Duration = Duration::from_millis(20);
+const FILE_OUTPUT_CAP: usize = 4096;
 
 /// Code-signature verification outcome (platform-dependent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,12 +282,13 @@ fn modified_secs_ago(md: &std::fs::Metadata) -> Option<u64> {
 /// `None` on missing `file`, non-zero exit, or timeout.
 fn file_brief(path: &Path) -> Option<String> {
     let path_str = path.to_str()?;
-    match run_shell_with_timeout(
-        "file",
+    let program = crate::trusted_child::resolve_ambient("file").ok()?;
+    match run_trusted_with_timeout(
+        &program,
         &["--brief", path_str],
         SHELL_TIMEOUT,
-        SHELL_POLL,
-        std::process::Stdio::null(),
+        FILE_OUTPUT_CAP,
+        &[],
     ) {
         ShellTimeoutOutcome::Completed { status, stdout } if status.success() => {
             // Collapse whitespace so a multi-arch Mach-O stays a single line.
@@ -310,12 +311,19 @@ fn verify_signature(path: &Path) -> SignatureStatus {
     let Some(path_str) = path.to_str() else {
         return SignatureStatus::NotApplicable;
     };
-    match run_shell_with_timeout(
-        "codesign",
+    let Ok(program) =
+        crate::trusted_child::TrustedExecutable::from_system_candidates(&[Path::new(
+            "/usr/bin/codesign",
+        )])
+    else {
+        return SignatureStatus::NotApplicable;
+    };
+    match run_trusted_with_timeout(
+        &program,
         &["--verify", "--strict", path_str],
         SHELL_TIMEOUT,
-        SHELL_POLL,
-        std::process::Stdio::null(),
+        FILE_OUTPUT_CAP,
+        &[],
     ) {
         ShellTimeoutOutcome::Completed { status, .. } => {
             if status.success() {

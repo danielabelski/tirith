@@ -3,9 +3,8 @@
 use std::fs::File;
 use std::io::BufRead;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::process::ExitStatus;
+use std::time::Duration;
 
 /// Why [`open_regular_capped`] refused to hand back a usable reader.
 #[derive(Debug)]
@@ -440,13 +439,13 @@ fn collect_lines_inner<R: BufRead>(reader: R, trim: bool) -> (Vec<String>, bool)
     (out, complete)
 }
 
-/// Outcome of [`run_shell_with_timeout`]. Callers map this onto their own error
+/// Outcome of [`run_trusted_with_timeout`]. Callers map this onto their own error
 /// type (e.g. `ContextDetectFailure`).
 #[derive(Debug)]
 pub enum ShellTimeoutOutcome {
     /// Child completed within the deadline. Callers decide how to treat non-zero.
     Completed { status: ExitStatus, stdout: Vec<u8> },
-    /// `spawn()` failed `NotFound` — binary not on PATH (often "not configured").
+    /// Trusted resolution found no installed binary (often "not configured").
     NotFound,
     /// `spawn()` failed otherwise; the string is a short reason.
     SpawnError(String),
@@ -454,75 +453,36 @@ pub enum ShellTimeoutOutcome {
     WaitError(String),
     /// Deadline elapsed; the child was killed and reaped.
     Timeout,
+    /// Captured output exceeded the caller's explicit bound.
+    OutputLimitExceeded,
 }
 
-/// Spawn a child with stdout piped, drain stdout on a helper thread (so the pipe
-/// buffer never blocks the child), and poll `try_wait()` against a deadline,
-/// killing + reaping on timeout. Stderr is delegated via `stderr_stdio` — most
-/// callers pass `Stdio::null()`; `Stdio::piped()` requires the caller to drain it.
-/// Consolidates two near-identical copies (PR-127 review #8).
-pub fn run_shell_with_timeout(
-    program: &str,
+/// Compatibility adapter for the migrated core callers. The dangerous program
+/// string is gone: callers must resolve a [`TrustedExecutable`] first. Capture,
+/// timeout, environment clearing, and process-tree cleanup are owned by the
+/// shared supervisor.
+pub fn run_trusted_with_timeout(
+    program: &crate::trusted_child::TrustedExecutable,
     args: &[&str],
     timeout: Duration,
-    poll_interval: Duration,
-    stderr_stdio: Stdio,
+    stdout_cap: usize,
+    inherit_env: &[&str],
 ) -> ShellTimeoutOutcome {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(stderr_stdio)
-        .stdin(Stdio::null());
+    use crate::trusted_child::{ChildLimits, ChildOutcome, ChildSpec};
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return ShellTimeoutOutcome::NotFound;
+    let mut spec = ChildSpec::new(args, ChildLimits::new(timeout, stdout_cap, 64 * 1024))
+        .inherit_env(inherit_env);
+    if let Some(path) = crate::trusted_child::sanitized_ambient_path() {
+        spec = spec.env("PATH", path);
+    }
+    match crate::trusted_child::run(program, &spec) {
+        ChildOutcome::Completed { status, stdout, .. } => {
+            ShellTimeoutOutcome::Completed { status, stdout }
         }
-        Err(e) => {
-            return ShellTimeoutOutcome::SpawnError(format!("spawn {program}: {e}"));
-        }
-    };
-
-    // Drain stdout on a helper thread so the pipe buffer never blocks the child.
-    let stdout_handle: Option<JoinHandle<Vec<u8>>> = child.stdout.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            use std::io::Read as _;
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = stdout_handle
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_default();
-                return ShellTimeoutOutcome::Completed { status, stdout };
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(h) = stdout_handle {
-                        let _ = h.join();
-                    }
-                    return ShellTimeoutOutcome::Timeout;
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(h) = stdout_handle {
-                    let _ = h.join();
-                }
-                return ShellTimeoutOutcome::WaitError(format!("try_wait {program}: {e}"));
-            }
-        }
+        ChildOutcome::SpawnError(reason) => ShellTimeoutOutcome::SpawnError(reason),
+        ChildOutcome::WaitError(reason) => ShellTimeoutOutcome::WaitError(reason),
+        ChildOutcome::Timeout { .. } => ShellTimeoutOutcome::Timeout,
+        ChildOutcome::OutputLimitExceeded { .. } => ShellTimeoutOutcome::OutputLimitExceeded,
     }
 }
 

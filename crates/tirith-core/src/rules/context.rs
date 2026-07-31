@@ -8,8 +8,8 @@
 //!
 //! Two short-circuit gates before consulting [`crate::context_detect`]:
 //! empty `context_labels` table → rule cannot fire; `context_guard_enabled:
-//! false` → operator opt-out. After the gates, [`crate::context_detect::detect_all`]
-//! (5s cached) supplies the active context; only a `critical`/`production`
+//! false` → operator opt-out. After the gates, the selected provider's cached
+//! detector supplies the active context; only a `critical`/`production`
 //! label emits a finding.
 
 use crate::context_detect::{self, Provider};
@@ -46,21 +46,17 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         None => return Vec::new(),
     };
 
-    let detection = context_detect::detect_all();
-
-    // Surface a provider detection failure (timeout/exec/parse) on stderr so the
-    // operator knows the verdict can't safely fall back to "allow" (PR-127 finding #5).
-    if let Some(failure) = detection.failures.get(&provider) {
-        eprintln!(
-            "tirith: warning: {} context detection failed ({}); rule may not fire correctly for this command",
-            provider.as_str(),
-            failure,
-        );
-    }
-
-    let active = match detection.contexts.get(&provider) {
-        Some(ctx) => ctx,
-        None => return Vec::new(),
+    let active = match context_detect::detect_provider(provider) {
+        Ok(active) => active,
+        Err(context_detect::ContextDetectFailure::NotConfigured) => return Vec::new(),
+        Err(failure) => {
+            eprintln!(
+                "tirith: warning: {} context detection failed ({}); rule may not fire correctly for this command",
+                provider.as_str(),
+                failure,
+            );
+            return Vec::new();
+        }
     };
 
     let label_key = active.label_key();

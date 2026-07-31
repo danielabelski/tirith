@@ -34,11 +34,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
+use crate::util::{run_trusted_with_timeout, ShellTimeoutOutcome};
 use crate::verdict::{RuleId, Severity};
 
 /// Budget for each runtime shell-out (matches the M8/M9-ch2 context detector).
 const RUNTIME_SHELL_TIMEOUT: Duration = Duration::from_millis(1500);
+const RUNTIME_SHELL_OUTPUT_CAP: usize = 1024 * 1024;
 
 /// Runtime introspection cache TTL, keyed by process PID so repeated
 /// `--include-runtime` scans reuse the enumeration. Static scans don't touch it.
@@ -859,12 +860,15 @@ enum RuntimeOutcome {
 /// Run a shell with no-rc flags via the shared timeout helper. Missing binary /
 /// non-zero exit / timeout → [`RuntimeOutcome::Unsupported`].
 fn run_no_rc(program: &str, args: &[&str]) -> RuntimeOutcome {
-    match run_shell_with_timeout(
-        program,
+    let Ok(program) = crate::trusted_child::resolve_ambient(program) else {
+        return RuntimeOutcome::Unsupported;
+    };
+    match run_trusted_with_timeout(
+        &program,
         args,
         RUNTIME_SHELL_TIMEOUT,
-        Duration::from_millis(25),
-        std::process::Stdio::null(),
+        RUNTIME_SHELL_OUTPUT_CAP,
+        &[],
     ) {
         ShellTimeoutOutcome::Completed { status, stdout } if status.success() => {
             RuntimeOutcome::Output(String::from_utf8_lossy(&stdout).into_owned())

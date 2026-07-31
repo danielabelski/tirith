@@ -299,14 +299,48 @@ pub fn audit_path_str(
 /// Resolve a bare command NAME against `$PATH`, returning every dir (in order)
 /// holding an executable of that name. Does NOT mutate the process environment.
 pub fn which_all(command: &str, path_value: &str) -> Vec<PathBuf> {
+    which_all_os(command, std::ffi::OsStr::new(path_value))
+}
+
+/// OS-string variant used by security-sensitive callers so non-UTF-8 PATH
+/// entries are inspected in-process rather than delegated to a shell.
+pub fn which_all_os(command: &str, path_value: &std::ffi::OsStr) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for dir in split_path(path_value) {
+    for dir in std::env::split_paths(path_value) {
         let candidate = dir.join(command);
         if is_executable_file(&candidate) {
             out.push(candidate);
         }
+        #[cfg(windows)]
+        if Path::new(command).extension().is_none() {
+            for extension in windows_path_extensions() {
+                let candidate = dir.join(format!("{command}{extension}"));
+                if is_executable_file(&candidate) {
+                    out.push(candidate);
+                }
+            }
+        }
     }
     out
+}
+
+#[cfg(windows)]
+fn windows_path_extensions() -> Vec<String> {
+    std::env::var("PATHEXT")
+        .ok()
+        .map(|value| {
+            value
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            [".com", ".exe", ".bat", ".cmd"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        })
 }
 
 /// `true` when `path` is under one of [`SYSTEM_PATH_DIRS`]. Used by
