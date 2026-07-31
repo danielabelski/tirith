@@ -4,10 +4,11 @@
 # They require TIRITH_THREATDB_PATH to point to tests/fixtures/test-threatdb.dat,
 # which is set up automatically by the test_threatintel_fixtures() test.
 #
-# The test DB contains:
+# The committed test DB plus the generated test-only supplemental layer contain:
 #   - npm/evil-package versions 1.0.0, 1.0.1 (Confirmed malicious)
 #   - pypi/malware-pkg all versions (Confirmed, all_versions_malicious)
 #   - npm/borderline-pkg version 2.0.0 (Medium confidence)
+#   - maven/com.evil:malicious-plugin version 1.0 (Confirmed malicious)
 #   - IP 203.0.113.50 (Feodo C2)
 #   - Typosquat: npm/reacct -> react
 #   - Typosquat: pypi/reqeusts -> requests
@@ -139,6 +140,139 @@ expected_rules = ["threat_package_similar_name"]
 name = "ssh_to_malicious_ip"
 min_milestone = 1
 input = "ssh 203.0.113.50"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_ip"]
+
+# repo-0119 / pr173-0018 — effective package command identity must survive
+# wrapper chains and platform-qualified launchers.
+[[fixture]]
+name = "wrapped_sudo_pip_malicious_package"
+min_milestone = 1
+input = "sudo pip install malware-pkg"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "wrapped_env_command_npm_malicious_package"
+min_milestone = 1
+input = "env REGION=test command npm install evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "windows_uppercase_pip_exe_malicious_package"
+min_milestone = 1
+input = 'C:\Tools\Python\PIP.EXE INSTALL malware-pkg'
+shell = "powershell"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "windows_npx_cmd_attached_malicious_package"
+min_milestone = 1
+input = 'C:\Tools\node\npx.cmd --package=evil-package@1.0.0 entrypoint'
+shell = "powershell"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "quoted_windows_pip_path_malicious_package"
+min_milestone = 1
+input = '"C:\Program Files\Python\pip.exe" install malware-pkg'
+shell = "cmd"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+# repo-0120 — Maven/Gradle command shapes must cross tier one and reach the
+# signed threat DB through the complete engine pipeline.
+[[fixture]]
+name = "maven_plugin_coordinate_reaches_threat_db"
+min_milestone = 1
+input = "mvn com.evil:malicious-plugin:1.0:run"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "gradle_coordinate_reaches_threat_db"
+min_milestone = 1
+input = "./gradlew com.evil:malicious-plugin:1.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "windows_gradle_wrapper_reaches_threat_db"
+min_milestone = 1
+input = 'C:\repo\gradlew.bat com.evil:malicious-plugin:1.0'
+shell = "cmd"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+# repo-0121 / pr173-0019 — attached/repeated package forms identify every
+# package npx places on PATH, while options after the entrypoint belong to it.
+[[fixture]]
+name = "npx_attached_long_malicious_package"
+min_milestone = 1
+input = "npx --package=evil-package@1.0.0 entrypoint"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "npx_attached_short_malicious_package"
+min_milestone = 1
+input = "npx -pevil-package@1.0.0 entrypoint"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "npx_value_options_then_malicious_package"
+min_milestone = 1
+input = "npx --registry https://registry.npmjs.org --workspace app evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "npx_child_package_option_is_not_npx_package"
+min_milestone = 1
+input = "npx safe-package --package=evil-package@1.0.0"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# repo-0122 — normalize the actual shell token before extracting IOC identity.
+[[fixture]]
+name = "quoted_posix_malicious_ip"
+min_milestone = 1
+input = "ssh '203.0.113.50'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_ip"]
+
+[[fixture]]
+name = "quoted_powershell_malicious_ip"
+min_milestone = 1
+input = 'ssh "203.0.113.50"'
+shell = "powershell"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_ip"]
+
+[[fixture]]
+name = "quoted_cmd_malicious_ip"
+min_milestone = 1
+input = 'ssh "203.0.113.50"'
+shell = "cmd"
 context = "exec"
 expected_action = "block"
 expected_rules = ["threat_malicious_ip"]

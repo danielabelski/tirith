@@ -329,6 +329,10 @@ fn test_aifile_fixtures() {
 
 #[test]
 fn test_threatintel_fixtures() {
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+    use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbWriter, ThreatSource};
+
     // Point the threat DB cache at the test fixture DB so DB-dependent rules can fire.
     let test_db_path = fixtures_dir().join("test-threatdb.dat");
     assert!(
@@ -336,7 +340,29 @@ fn test_threatintel_fixtures() {
         "Test threat DB not found at {}. Run: cargo test -p tirith-core --test generate_test_fixtures -- --ignored",
         test_db_path.display()
     );
+
+    // The committed primary fixture's signing key is intentionally unavailable.
+    // Add the Maven regression record through the supported unsigned local
+    // supplemental layer instead of rotating the embedded production trust key.
+    let supplemental_dir = tempfile::tempdir().expect("create supplemental fixture dir");
+    let supplemental_path = supplemental_dir.path().join("maven-supplemental.dat");
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut supplemental = ThreatDbWriter::new(1_700_000_001, 1);
+    supplemental.add_package(
+        Ecosystem::Maven,
+        "com.evil:malicious-plugin",
+        &["1.0"],
+        ThreatSource::OssfMalicious,
+        Confidence::Confirmed,
+        false,
+        Some("https://example.com/advisory/malicious-maven-plugin"),
+    );
+    supplemental
+        .write_to(&supplemental_path, &signing_key)
+        .expect("write Maven supplemental fixture");
+
     std::env::set_var("TIRITH_THREATDB_PATH", &test_db_path);
+    std::env::set_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH", &supplemental_path);
     tirith_core::threatdb::ThreatDb::refresh_cache();
 
     let fixtures = load_fixtures("threatintel.toml");
@@ -347,6 +373,7 @@ fn test_threatintel_fixtures() {
     eprintln!("Passed {count} threatintel fixtures");
 
     std::env::remove_var("TIRITH_THREATDB_PATH");
+    std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
     tirith_core::threatdb::ThreatDb::refresh_cache();
 }
 

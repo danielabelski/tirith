@@ -51,7 +51,7 @@ pub fn enrich_command(
     let mut seen = HashSet::new();
 
     let segments = crate::tokenize::tokenize(input, shell);
-    let packages = threatintel::extract_packages(&segments);
+    let packages = threatintel::extract_packages_for_shell(&segments, shell);
     let urls = extract::extract_urls(input, shell);
 
     for package in packages {

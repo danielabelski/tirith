@@ -50,51 +50,86 @@ fn intent_from_opt_token(token: Option<&str>) -> VersionIntent {
     }
 }
 
+/// POSIX compatibility entry point for callers that already tokenize without a
+/// shell parameter.
+pub fn extract_packages(segments: &[Segment]) -> Vec<PackageRef> {
+    extract_packages_for_shell(segments, ShellType::Posix)
+}
+
 /// Extract package references from tokenized shell segments. Recognizes
 /// install/add commands for pip, npm, yarn, pnpm, bun, npx, cargo, gem, go,
-/// composer, dotnet; skips flags and known non-package arguments.
-pub fn extract_packages(segments: &[Segment]) -> Vec<PackageRef> {
+/// composer, dotnet, Maven, and Gradle; skips flags and known non-package
+/// arguments.
+///
+/// Command identity is resolved through the same wrapper resolver used by the
+/// URL and command rules, then normalized using the selected shell. This keeps
+/// `sudo pip ...`, `env npm ...`, Windows paths, and platform launcher suffixes
+/// on the same threat-intelligence path as their bare forms.
+pub fn extract_packages_for_shell(segments: &[Segment], shell: ShellType) -> Vec<PackageRef> {
     let mut packages = Vec::new();
 
     for seg in segments {
-        let cmd = match &seg.command {
-            Some(c) => c.to_lowercase(),
+        let (resolved_command, resolved_args) = match crate::extract::resolve_wrapped_command(seg) {
+            Some(resolved) => resolved,
             None => continue,
         };
 
-        // `/usr/bin/pip3` -> `pip3`.
-        let cmd_name = cmd.rsplit('/').next().unwrap_or(&cmd);
+        let cmd_name = package_command_name(&resolved_command, shell);
+        let args: Vec<String> = resolved_args
+            .iter()
+            .map(|arg| crate::rules::command::normalize_shell_token(arg, shell))
+            .collect();
 
-        match cmd_name {
+        match cmd_name.as_str() {
             "pip" | "pip3" | "uv" => {
-                extract_pip_packages(&seg.args, &mut packages);
+                extract_pip_packages(&args, &mut packages);
             }
             "npm" | "npx" | "yarn" | "pnpm" | "bun" => {
-                extract_npm_packages(cmd_name, &seg.args, &mut packages);
+                extract_npm_packages(&cmd_name, &args, &mut packages);
             }
             "cargo" => {
-                extract_cargo_packages(&seg.args, &mut packages);
+                extract_cargo_packages(&args, &mut packages);
             }
             "gem" => {
-                extract_gem_packages(&seg.args, &mut packages);
+                extract_gem_packages(&args, &mut packages);
             }
             "go" => {
-                extract_go_packages(&seg.args, &mut packages);
+                extract_go_packages(&args, &mut packages);
             }
             "composer" => {
-                extract_composer_packages(&seg.args, &mut packages);
+                extract_composer_packages(&args, &mut packages);
             }
             "dotnet" => {
-                extract_dotnet_packages(&seg.args, &mut packages);
+                extract_dotnet_packages(&args, &mut packages);
             }
-            "mvn" | "gradle" | "gradlew" => {
-                extract_maven_packages(&seg.args, &mut packages);
+            "mvn" | "mvnw" | "gradle" | "gradlew" => {
+                extract_maven_packages(&args, &mut packages);
             }
             _ => {}
         }
     }
 
     packages
+}
+
+/// Return a normalized package-manager launcher name. Both path separators are
+/// accepted deliberately: commands can arrive from copied cross-platform
+/// snippets, and PowerShell accepts `/` as well as `\` in executable paths.
+/// Windows launcher suffixes are stripped only at the final path component.
+fn package_command_name(command: &str, shell: ShellType) -> String {
+    let normalized = crate::rules::command::normalize_shell_token(command.trim(), shell);
+    let basename = normalized
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(normalized.as_str())
+        .to_ascii_lowercase();
+
+    for suffix in [".exe", ".cmd", ".bat", ".com", ".ps1"] {
+        if let Some(stem) = basename.strip_suffix(suffix) {
+            return stem.to_string();
+        }
+    }
+    basename
 }
 
 /// Flags for pip that consume the next argument (so it should be skipped).
@@ -223,28 +258,73 @@ fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<Pack
     let mut iter = args.iter().peekable();
     let mut found_subcmd = false;
 
-    // npx is special: `npx foo` runs `foo` directly; `--package`/-p overrides
-    // (then the first positional is an entry point, not a package).
+    // npx is special: `npx foo` runs `foo` directly; one or more
+    // `--package`/`-p` options override that inference (then the first
+    // positional is an entry point, not a package). npx requires its own
+    // options before the first positional, so stop option parsing there: a
+    // later `--package=...` belongs to the executed program.
     if cmd_name == "npx" {
         let mut has_explicit_package = false;
-        while let Some(arg) = iter.next() {
-            if arg.starts_with('-') {
-                if arg == "--package" || arg == "-p" {
-                    if let Some(pkg_arg) = iter.next() {
-                        if let Some(pr) = parse_npm_package_spec(pkg_arg) {
+        let mut first_positional = None;
+        let mut options_enabled = true;
+        let mut i = 0;
+
+        while i < args.len() {
+            let arg = args[i].as_str();
+
+            if options_enabled && arg == "--" {
+                options_enabled = false;
+                i += 1;
+                continue;
+            }
+
+            if options_enabled {
+                if let Some(spec) = npx_attached_package_spec(arg) {
+                    if let Some(pr) = parse_npx_package_spec(spec) {
+                        packages.push(pr);
+                        has_explicit_package = true;
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                if matches!(arg, "--package" | "-p") {
+                    if let Some(spec) = args.get(i + 1).map(String::as_str) {
+                        if let Some(pr) = parse_npx_package_spec(spec) {
                             packages.push(pr);
                             has_explicit_package = true;
                         }
                     }
+                    i += 2;
+                    continue;
                 }
-                continue;
-            }
-            if !has_explicit_package {
-                if let Some(pr) = parse_npm_package_spec(arg) {
-                    packages.push(pr);
+
+                if npx_split_option_takes_value(arg)
+                    || npx_split_option_takes_conditional_value(
+                        arg,
+                        args.get(i + 1).map(String::as_str),
+                    )
+                {
+                    // `--call`, workspace, shell, and legacy npx options carry
+                    // command/config values, never inferred package identity.
+                    i += 2;
+                    continue;
+                }
+
+                if npx_has_attached_non_package_value(arg) || arg.starts_with('-') {
+                    i += 1;
+                    continue;
                 }
             }
+
+            first_positional = Some(arg);
             break;
+        }
+
+        if !has_explicit_package {
+            if let Some(pr) = first_positional.and_then(parse_npx_package_spec) {
+                packages.push(pr);
+            }
         }
         return;
     }
@@ -274,6 +354,152 @@ fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<Pack
             packages.push(pr);
         }
     }
+}
+
+/// Explicit package forms accepted by the npx executable. `-p` is npx's
+/// package shorthand (unlike `npm exec`, where it means `--parseable`). npm's
+/// option parser accepts both `-p=value` and a short option with an attached
+/// value, so retain both forms.
+fn npx_attached_package_spec(arg: &str) -> Option<&str> {
+    if let Some(spec) = arg.strip_prefix("--package=") {
+        return Some(spec);
+    }
+    let spec = arg.strip_prefix("-p")?;
+    if spec.is_empty() {
+        return None;
+    }
+    Some(spec.strip_prefix('=').unwrap_or(spec))
+}
+
+/// npm allows any config key before an npx positional. Keep the value-taking
+/// keys in one explicit table so their following values cannot be mistaken for
+/// the package/entrypoint. Boolean-only keys are intentionally absent: their
+/// next token remains the inferred package. Array-valued keys consume one token
+/// per occurrence, matching npm's argv parser.
+const NPX_VALUE_LONG_OPTIONS: &[&str] = &[
+    "--_auth",
+    "--access",
+    "--also",
+    "--audit-level",
+    "--auth-type",
+    "--before",
+    "--browser",
+    "--ca",
+    "--cache",
+    "--cache-max",
+    "--cache-min",
+    "--cafile",
+    "--call",
+    "--cert",
+    "--cidr",
+    "--cpu",
+    "--depth",
+    "--diff",
+    "--diff-dst-prefix",
+    "--diff-src-prefix",
+    "--diff-unified",
+    "--editor",
+    "--expect-result-count",
+    "--fetch-retries",
+    "--fetch-retry-factor",
+    "--fetch-retry-maxtimeout",
+    "--fetch-retry-mintimeout",
+    "--fetch-timeout",
+    "--git",
+    "--globalconfig",
+    "--heading",
+    "--https-proxy",
+    "--include",
+    "--init-author-email",
+    "--init-author-name",
+    "--init-author-url",
+    "--init-license",
+    "--init-module",
+    "--init-version",
+    "--init.author.email",
+    "--init.author.name",
+    "--init.author.url",
+    "--init.license",
+    "--init.module",
+    "--init.version",
+    "--install-strategy",
+    "--key",
+    "--libc",
+    "--local-address",
+    "--location",
+    "--lockfile-version",
+    "--loglevel",
+    "--logs-dir",
+    "--logs-max",
+    "--maxsockets",
+    "--message",
+    "--node-arg",
+    "--node-options",
+    "--noproxy",
+    "--npm",
+    "--omit",
+    "--only",
+    "--os",
+    "--otp",
+    "--pack-destination",
+    "--prefix",
+    "--preid",
+    "--provenance-file",
+    "--proxy",
+    "--registry",
+    "--replace-registry-host",
+    "--save-prefix",
+    "--sbom-format",
+    "--sbom-type",
+    "--scope",
+    "--script-shell",
+    "--searchexclude",
+    "--searchlimit",
+    "--searchopts",
+    "--searchstaleness",
+    "--shell",
+    "--tag",
+    "--tag-version-prefix",
+    "--umask",
+    "--user-agent",
+    "--userconfig",
+    "--viewer",
+    "--which",
+    "--workspace",
+];
+
+fn npx_split_option_takes_value(arg: &str) -> bool {
+    NPX_VALUE_LONG_OPTIONS.contains(&arg) || matches!(arg, "-c" | "-w" | "-n" | "-C" | "-L" | "-m")
+}
+
+/// npm's `color` config is a Boolean with one extra enum value. Its following
+/// token is consumed only when it is a Boolean spelling or `always`; an
+/// arbitrary token remains npx's entrypoint/package. Treating every following
+/// token as the option value would hide `npx --color malicious-package`.
+fn npx_split_option_takes_conditional_value(arg: &str, next: Option<&str>) -> bool {
+    arg == "--color"
+        && next.is_some_and(|value| {
+            value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("always")
+        })
+}
+
+fn npx_has_attached_non_package_value(arg: &str) -> bool {
+    if arg.starts_with("--") && arg.contains('=') {
+        return true;
+    }
+
+    ["-c", "-w", "-n", "-C", "-L", "-m"]
+        .iter()
+        .any(|prefix| arg.starts_with(prefix) && arg.len() > prefix.len())
+}
+
+fn parse_npx_package_spec(spec: &str) -> Option<PackageRef> {
+    if spec.is_empty() || spec.starts_with('-') {
+        return None;
+    }
+    parse_npm_package_spec(spec)
 }
 
 /// Parse an npm-style package spec: `@scope/name@version` or `name@version`.
@@ -571,9 +797,12 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // Gradle dependency notation: `group:artifact:version` (at least one colon required).
+        // Gradle dependency notation: `group:artifact:version`. Requiring all
+        // three components also keeps Maven lifecycle goals such as
+        // `dependency:get` from being misclassified as package coordinates.
         let parts: Vec<&str> = arg.splitn(4, ':').collect();
-        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        if parts.len() >= 3 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[2].is_empty()
+        {
             let name = format!("{}:{}", parts[0], parts[1]);
             let version = intent_from_opt_token(parts.get(2).copied());
             packages.push(PackageRef {
@@ -589,10 +818,19 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
 /// `user@IP:port`. Does NOT match IPv6, non-IP text, or IPs inside URLs (those
 /// are handled by URL extraction).
 pub fn extract_ipv4_from_token(token: &str) -> Option<Ipv4Addr> {
-    let after_at = if let Some(at_pos) = token.rfind('@') {
-        &token[at_pos + 1..]
+    extract_ipv4_from_token_for_shell(token, ShellType::Posix)
+}
+
+/// Shell-aware form used by the engine. Keeping the POSIX compatibility helper
+/// above avoids forcing callers that already hold normalized tokens to invent a
+/// shell while ensuring command analysis follows the selected shell's quoting
+/// and escaping rules.
+pub fn extract_ipv4_from_token_for_shell(token: &str, shell: ShellType) -> Option<Ipv4Addr> {
+    let normalized = crate::rules::command::normalize_shell_token(token.trim(), shell);
+    let after_at = if let Some(at_pos) = normalized.rfind('@') {
+        &normalized[at_pos + 1..]
     } else {
-        token
+        normalized.as_str()
     };
 
     // Only strip a trailing `:NNNN`; anything else after `:` is likely an IPv6
@@ -762,7 +1000,7 @@ pub fn check(
     let mut findings = Vec::new();
 
     let segments = crate::tokenize::tokenize(input, shell);
-    let packages = extract_packages(&segments);
+    let packages = extract_packages_for_shell(&segments, shell);
 
     for pkg in &packages {
         let db_eco = pkg.ecosystem;
@@ -942,7 +1180,7 @@ pub fn check(
     // IP literals in command tokens (ssh/scp/nc and friends).
     for seg in &segments {
         for arg in &seg.args {
-            if let Some(ip) = extract_ipv4_from_token(arg) {
+            if let Some(ip) = extract_ipv4_from_token_for_shell(arg, shell) {
                 if checked_ips.insert(ip) {
                     if let Some(m) = db.check_ip(ip) {
                         let (rule_id, severity, threat_type) = ip_rule_for_source(m.source);
@@ -981,8 +1219,12 @@ mod tests {
     use crate::tokenize;
 
     fn tokenize_and_extract(input: &str) -> Vec<PackageRef> {
-        let segments = tokenize::tokenize(input, ShellType::Posix);
-        extract_packages(&segments)
+        tokenize_and_extract_for_shell(input, ShellType::Posix)
+    }
+
+    fn tokenize_and_extract_for_shell(input: &str, shell: ShellType) -> Vec<PackageRef> {
+        let segments = tokenize::tokenize(input, shell);
+        extract_packages_for_shell(&segments, shell)
     }
 
     #[test]
@@ -1087,6 +1329,63 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_package_commands_use_effective_identity() {
+        for command in [
+            "sudo pip install malware-pkg",
+            "env REGION=test npm install evil-package@1.0.0",
+            "command npx --package=evil-package@1.0.0 entrypoint",
+            "time -p gem install malicious-gem",
+            "doas -u root cargo install suspicious-crate",
+            "sudo env REGION=test command pip install malware-pkg",
+        ] {
+            assert_eq!(
+                tokenize_and_extract(command).len(),
+                1,
+                "wrapped package command was not resolved: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_qualified_package_commands_normalize_paths_and_suffixes() {
+        for command in [
+            r"C:\Tools\Python\PIP.EXE INSTALL malware-pkg",
+            r"C:\Tools\node\npm.cmd install evil-package@1.0.0",
+            r"C:/Tools/node/npx.com --package=evil-package@1.0.0 entrypoint",
+            r"C:\Tools\gradle\gradlew.bat com.evil:plugin:1.0",
+        ] {
+            let pkgs = tokenize_and_extract_for_shell(command, ShellType::PowerShell);
+            assert_eq!(
+                pkgs.len(),
+                1,
+                "platform launcher was not resolved: {command}"
+            );
+        }
+
+        let quoted_cmd = tokenize_and_extract_for_shell(
+            r#""C:\Program Files\Python\pip.exe" install malware-pkg"#,
+            ShellType::Cmd,
+        );
+        assert_eq!(quoted_cmd.len(), 1, "quoted Cmd executable path was missed");
+    }
+
+    #[test]
+    fn quoted_package_arguments_are_normalized_for_the_selected_shell() {
+        let posix = tokenize_and_extract("pip install 'malware-pkg'");
+        assert_eq!(posix[0].name, "malware-pkg");
+
+        let powershell = tokenize_and_extract_for_shell(
+            r#"npm.cmd install "evil-package@1.0.0""#,
+            ShellType::PowerShell,
+        );
+        assert_eq!(powershell[0].name, "evil-package");
+        assert_eq!(
+            powershell[0].version,
+            VersionIntent::Exact("1.0.0".to_string())
+        );
+    }
+
+    #[test]
     fn npm_install_single() {
         let pkgs = tokenize_and_extract("npm install lodash");
         assert_eq!(pkgs.len(), 1);
@@ -1171,6 +1470,91 @@ mod tests {
         let pkgs = tokenize_and_extract("npx --package typescript tsc");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "typescript");
+    }
+
+    #[test]
+    fn npx_attached_package_forms_extract_the_explicit_package() {
+        for command in [
+            "npx --package=evil-package@1.0.0 entrypoint",
+            "npx -pevil-package@1.0.0 entrypoint",
+            "npx -p=evil-package@1.0.0 entrypoint",
+        ] {
+            let pkgs = tokenize_and_extract(command);
+            assert_eq!(pkgs.len(), 1, "attached form missed: {command}");
+            assert_eq!(pkgs[0].name, "evil-package");
+            assert_eq!(pkgs[0].version, VersionIntent::Exact("1.0.0".into()));
+        }
+    }
+
+    #[test]
+    fn npx_collects_every_explicit_package_before_the_entrypoint() {
+        let pkgs = tokenize_and_extract(
+            "npx --package safe-package -pevil-package@1.0.0 --package=@scope/tool run",
+        );
+        let names: Vec<&str> = pkgs.iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(names, ["safe-package", "evil-package", "@scope/tool"]);
+    }
+
+    #[test]
+    fn npx_consumes_value_options_before_inferring_the_package() {
+        let pkgs = tokenize_and_extract(
+            "npx --registry https://registry.example --script-shell /bin/bash \
+             --workspace app evil-package@1.0.0",
+        );
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "evil-package");
+    }
+
+    #[test]
+    fn npx_boolean_options_do_not_consume_the_inferred_package() {
+        let pkgs = tokenize_and_extract("npx --yes --quiet evil-package@1.0.0");
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "evil-package");
+
+        for option in ["--expect-results", "--optional", "--production", "--color"] {
+            let command = format!("npx {option} evil-package@1.0.0");
+            let pkgs = tokenize_and_extract(&command);
+            assert_eq!(
+                pkgs.len(),
+                1,
+                "Boolean option consumed entrypoint: {option}"
+            );
+            assert_eq!(pkgs[0].name, "evil-package");
+        }
+    }
+
+    #[test]
+    fn npx_color_consumes_only_its_documented_explicit_values() {
+        for value in ["always", "true", "false", "ALWAYS"] {
+            let command = format!("npx --color {value} evil-package@1.0.0");
+            let pkgs = tokenize_and_extract(&command);
+            assert_eq!(pkgs.len(), 1, "color value was not consumed: {value}");
+            assert_eq!(pkgs[0].name, "evil-package");
+        }
+    }
+
+    #[test]
+    fn npx_call_value_is_not_inferred_as_a_package() {
+        for command in ["npx --call evil-package", "npx -cevil-package"] {
+            assert!(
+                tokenize_and_extract(command).is_empty(),
+                "call command text is not a package: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn npx_options_after_the_entrypoint_belong_to_the_child() {
+        let pkgs = tokenize_and_extract("npx safe-package --package=evil-package@1.0.0");
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "safe-package");
+    }
+
+    #[test]
+    fn npx_double_dash_starts_the_inferred_package() {
+        let pkgs = tokenize_and_extract("npx -- evil-package@1.0.0 --yes");
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "evil-package");
     }
 
     #[test]
@@ -1351,6 +1735,36 @@ mod tests {
     }
 
     #[test]
+    fn maven_plugin_coordinate_is_extracted() {
+        let pkgs = tokenize_and_extract("mvn com.evil:malicious-plugin:1.0:run");
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].ecosystem, Ecosystem::Maven);
+        assert_eq!(pkgs[0].name, "com.evil:malicious-plugin");
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("1.0".to_string()));
+    }
+
+    #[test]
+    fn maven_wrapper_dependency_get_coordinate_is_extracted() {
+        let pkgs = tokenize_and_extract(
+            "./mvnw dependency:get -Dartifact=com.evil:malicious-plugin:1.0:jar",
+        );
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "com.evil:malicious-plugin");
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("1.0".to_string()));
+    }
+
+    #[test]
+    fn gradle_wrapper_coordinate_is_extracted() {
+        let pkgs = tokenize_and_extract_for_shell(
+            r"C:\repo\gradlew.bat com.evil:malicious-plugin:1.0",
+            ShellType::Cmd,
+        );
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].ecosystem, Ecosystem::Maven);
+        assert_eq!(pkgs[0].name, "com.evil:malicious-plugin");
+    }
+
+    #[test]
     fn no_packages_in_ls() {
         let pkgs = tokenize_and_extract("ls -la");
         assert!(pkgs.is_empty());
@@ -1437,6 +1851,31 @@ mod tests {
     fn ipv4_in_brackets() {
         let ip = extract_ipv4_from_token("[10.0.0.1]");
         assert_eq!(ip, Some(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn ipv4_shell_quotes_and_escapes_are_normalized() {
+        for (token, shell) in [
+            ("'203.0.113.50'", ShellType::Posix),
+            (r#""203.0.113.50""#, ShellType::Posix),
+            (r"203\.0\.113\.50", ShellType::Posix),
+            ("$'203.0.113.50'", ShellType::Posix),
+            ("'203.0.113.50'", ShellType::PowerShell),
+            (r#""203.0.113.50""#, ShellType::Cmd),
+        ] {
+            assert_eq!(
+                extract_ipv4_from_token_for_shell(token, shell),
+                Some(Ipv4Addr::new(203, 0, 113, 50)),
+                "quoted IP missed for {shell:?}: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn quotes_that_survive_shell_evaluation_are_not_removed_twice() {
+        assert!(
+            extract_ipv4_from_token_for_shell(r#""'203.0.113.50'""#, ShellType::Posix).is_none()
+        );
     }
 
     #[test]

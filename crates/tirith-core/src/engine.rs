@@ -153,7 +153,7 @@ pub fn build_dsl_backing(
     let mut packages: Vec<(String, String, crate::custom_rule_dsl::PkgReputation)> = Vec::new();
     if scan_context != ScanContext::FileScan {
         let segments = crate::tokenize::tokenize(analyzed_input, shell);
-        for pkg in crate::rules::threatintel::extract_packages(&segments) {
+        for pkg in crate::rules::threatintel::extract_packages_for_shell(&segments, shell) {
             // Lowercase before BOTH lookup and storage: case-insensitive
             // ecosystems (PyPI, the threat-DB/popular indexes) would otherwise make
             // `package.*` casing-dependent — matching `requests` but missing
