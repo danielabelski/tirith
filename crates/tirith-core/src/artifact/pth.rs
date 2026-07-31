@@ -447,48 +447,6 @@ fn normalize_for_template(line: &str) -> String {
     out
 }
 
-/// `true` if the body carries a dynamic CODE-EXECUTION capability OTHER than a bare
-/// `__import__`. The canonical distutils and namespace bootstraps legitimately use
-/// `__import__(...)` (for `_distutils_hack` / importlib), so it is NOT disqualifying;
-/// but an injected `exec(`/`eval(`/`compile(`/deserializer sandwiched between a
-/// template's required prefix and suffix is a trojaned payload, not a benign template.
-/// Computed over the deobfuscated haystacks, like `scan_capabilities`.
-fn has_injected_code_exec(line: &str) -> bool {
-    let haystacks = capability_haystacks(line);
-    let tokens: Vec<&str> = DYNAMIC_EXEC_TOKENS
-        .iter()
-        .copied()
-        .filter(|t| *t != "__import__")
-        .collect();
-    any_contains(&haystacks, &tokens)
-}
-
-/// `true` if the line MUTATES `sys.path` (insert / append / extend / `+=`). A benign editable
-/// or namespace bootstrap NEVER does this: it imports via `importlib` / `__import__` and
-/// appends to a MODULE's `__path__`, never to the global `sys.path`. That is why
-/// `caps.sys_path_search` is too broad to gate the templates (the canonical namespace line
-/// trips it via `importlib` / `__import__`), whereas a `sys.path.insert(0, '/evil')` smuggled
-/// into a template-shaped line is a path-injection payload that MUST disqualify the template.
-fn mutates_sys_path(line: &str) -> bool {
-    const SYS_PATH_MUTATORS: &[&str] = &[
-        "sys.path.insert",
-        "sys.path.append",
-        "sys.path.extend",
-        "sys.path+=",
-    ];
-    // capability_haystacks gives lowercased + deobfuscated forms; add a fully
-    // whitespace-stripped form too, so `sys.path += [x]` / `sys . path . insert(...)` cannot
-    // evade the match via spacing.
-    let mut haystacks = capability_haystacks(line);
-    haystacks.push(
-        line.chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-            .to_ascii_lowercase(),
-    );
-    any_contains(&haystacks, SYS_PATH_MUTATORS)
-}
-
 /// `true` if the COMPLETE normalized line matches a canonical benign bootstrap.
 ///
 /// These are real setuptools / editable-install / namespace-package one-liners
@@ -496,35 +454,22 @@ fn mutates_sys_path(line: &str) -> bool {
 /// the WHOLE line: `<template>; os.system(...)` does not match, because the
 /// trailing statement is part of the normalized line.
 ///
-/// The setuptools editable finder and `-nspkg` bootstraps embed the distribution
-/// name, so we match them STRUCTURALLY (a prefix/suffix shape) rather than by an
-/// exact literal, while still requiring the whole line to fit the template (no
-/// trailing statement after the recognized call).
+/// Parameterized module/namespace names are accepted only when they are valid
+/// Python identifiers and the complete line can be regenerated from one of the
+/// exact known templates. There is no capability denylist here: any extra
+/// statement changes the line and invalidates the exemption.
 fn is_benign_template(line: &str) -> bool {
     let norm = normalize_for_template(line);
 
-    // 1. distutils precedence shim (setuptools `distutils-precedence.pth`). The
-    //    canonical line is exactly:
-    //    `import os; var = 'SETUPTOOLS_USE_DISTUTILS' or '...'; ...; __import__('_distutils_hack').add_shim()`
-    //    Its tail is always the `_distutils_hack` add_shim call. Match the shape:
-    //    starts with `import os;` and ends with the add_shim() call and nothing
-    //    after it.
-    if norm.starts_with("import os;")
-        && (norm.ends_with("__import__('_distutils_hack').add_shim()")
-            || norm.ends_with("__import__(\"_distutils_hack\").add_shim()"))
-    {
-        // Defense in depth (mirrors the namespace template below): the shape match
-        // alone is bypassable, e.g. `import os; os.system('curl|sh'); __import__(
-        // '_distutils_hack').add_shim()`, so a payload capability disqualifies it.
-        let caps = scan_capabilities(line);
-        if !caps.subprocess
-            && !caps.network
-            && !caps.cross_runtime
-            && !has_injected_code_exec(line)
-            && !mutates_sys_path(line)
-        {
-            return true;
-        }
+    // 1. setuptools `distutils-precedence.pth`: exact statement sequence and
+    // identifiers. Prefix/suffix matching is unsafe because arbitrary Python can
+    // be inserted between the two.
+    const DISTUTILS_TEMPLATES: &[&str] = &[
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim()",
+        "import os; var = \"SETUPTOOLS_USE_DISTUTILS\"; enabled = os.environ.get(var, \"local\") == \"local\"; enabled and __import__(\"_distutils_hack\").add_shim()",
+    ];
+    if DISTUTILS_TEMPLATES.contains(&norm.as_str()) {
+        return true;
     }
 
     // 2. setuptools editable finder bootstrap, e.g.
@@ -536,53 +481,78 @@ fn is_benign_template(line: &str) -> bool {
         if let Some((module, tail)) = rest.split_once(';') {
             let module = module.trim();
             let tail = tail.trim();
-            if module.starts_with("__editable__")
+            if is_python_identifier(module)
+                && module.starts_with("__editable__")
                 && module.ends_with("_finder")
                 && tail == format!("{module}.install()")
             {
-                // Defense in depth (mirrors the namespace template): a payload
-                // capability disqualifies the line even when the shape matches.
-                let caps = scan_capabilities(line);
-                if !caps.subprocess
-                    && !caps.network
-                    && !caps.cross_runtime
-                    && !has_injected_code_exec(line)
-                    && !mutates_sys_path(line)
-                {
-                    return true;
-                }
+                return true;
             }
         }
     }
 
-    // 3. setuptools namespace-package bootstrap (`-nspkg.pth`). The canonical line
-    //    is a single `import sys, types, os; ...` that ends in a
-    //    `m and setattr(sys.modules[p], n, m)` / `importlib` namespace declaration.
-    //    These are long and version-stable. Match the well-known opening AND the
-    //    fact that it is a namespace declaration (mentions `types.ModuleType` and
-    //    `sys.modules`), with no shell/network/cross-runtime capability present.
-    if norm.starts_with("import sys, types, os;")
-        && norm.contains("types.ModuleType")
-        && norm.contains("sys.modules")
-    {
-        // Defense in depth: even a namespace bootstrap must not carry a PAYLOAD
-        // capability. The canonical template legitimately calls `__import__(...)`
-        // for importlib (a dynamic-import mechanic) and touches `sys.path`, so
-        // those are NOT disqualifying; but a subprocess spawn, a network call, or a
-        // cross-runtime launch means the template was trojaned, so fall through and
-        // analyze it on its merits.
-        let caps = scan_capabilities(line);
-        if !caps.subprocess
-            && !caps.network
-            && !caps.cross_runtime
-            && !has_injected_code_exec(line)
-            && !mutates_sys_path(line)
-        {
-            return true;
-        }
+    // 3. setuptools namespace-package bootstrap (`-nspkg.pth`). Validate the
+    // exact generated semantics with one consistently reused namespace literal.
+    is_canonical_namespace_template(&norm)
+}
+
+/// A single importable Python identifier (no dots, aliases, calls, or separators).
+fn is_python_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Validate the exact namespace bootstrap variants covered by setuptools' legacy
+/// generator. The namespace is data only: every dotted component must be a Python
+/// identifier, and the same literal is substituted at every use site.
+fn is_canonical_namespace_template(norm: &str) -> bool {
+    let marker = "sys.modules.setdefault('";
+    let Some(start) = norm.find(marker).map(|p| p + marker.len()) else {
+        return false;
+    };
+    let Some(end_rel) = norm[start..].find('\'') else {
+        return false;
+    };
+    let namespace = &norm[start..start + end_rel];
+    if namespace.is_empty() || !namespace.split('.').all(is_python_identifier) {
+        return false;
     }
 
-    false
+    let simple = format!(
+        "import sys, types, os; m = sys.modules.setdefault('{namespace}', types.ModuleType('{namespace}'))"
+    );
+    if norm == simple {
+        return true;
+    }
+
+    let tuple = namespace
+        .split('.')
+        .map(|part| format!("'{part}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tuple = if namespace.contains('.') {
+        format!("({tuple})")
+    } else {
+        format!("({tuple},)")
+    };
+    let prefix = format!(
+        "import sys, types, os; has_mfs = sys.version_info > (3, 5); p = os.path.join(sys._getframe(1).f_locals['sitedir'], *{tuple}); importlib = has_mfs and __import__('importlib.util'); has_mfs and __import__('importlib.machinery'); "
+    );
+    let legacy = format!(
+        "{prefix}m = has_mfs and sys.modules.setdefault('{namespace}', types.ModuleType('{namespace}')); m = m or sys.modules.setdefault('{namespace}', types.ModuleType('{namespace}'))"
+    );
+    if norm == legacy {
+        return true;
+    }
+
+    let generated = format!(
+        "{prefix}m = has_mfs and sys.modules.setdefault('{namespace}', importlib.util.module_from_spec(importlib.machinery.PathFinder.find_spec('{namespace}', [os.path.dirname(p)]))); m = m or sys.modules.setdefault('{namespace}', types.ModuleType('{namespace}')); mp = (m or []) and m.__dict__.setdefault('__path__',[]); (p not in mp) and mp.append(p)"
+    );
+    norm == generated
 }
 
 /// `true` if the WHOLE body is exactly one or more benign-template lines (plus
@@ -1031,9 +1001,9 @@ mod tests {
         );
     }
 
-    /// A line matching the distutils template SHAPE but carrying a payload
-    /// (subprocess/network/cross-runtime) is NOT benign: the capability scan
-    /// disqualifies it, so the hook still fires (closes the template-bypass hole).
+    /// A line matching the distutils template SHAPE but carrying any additional
+    /// statement is NOT benign: only the exact canonical statement sequence is
+    /// exempt, independent of whether a capability denylist recognizes the payload.
     #[test]
     fn trojaned_distutils_template_is_not_benign() {
         let trojan =
@@ -1045,6 +1015,36 @@ mod tests {
         // The canonical (payload-free) shim is still recognized as benign.
         let canonical = "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim()";
         assert!(is_benign_template(canonical));
+    }
+
+    #[test]
+    fn reflective_distutils_payload_cannot_use_template_exemption() {
+        // This bypasses the old finite capability denylist (`os.system` is never a
+        // literal token) while still executing a shell. Exact semantic matching
+        // rejects it solely because it is not the canonical template.
+        let trojan =
+            "import os; os.__dict__['system']('id'); __import__('_distutils_hack').add_shim()";
+        assert!(!is_benign_template(trojan));
+        let analysis = analyze_body(trojan, &loc(), StartupHookKind::Pth);
+        assert!(!analysis.all_benign_templates);
+        assert!(analysis
+            .signals
+            .iter()
+            .any(|signal| signal.kind == ArtifactSignalKind::PthExecutableLine));
+    }
+
+    #[test]
+    fn namespace_shape_with_unrecognized_file_write_is_not_benign() {
+        // `open(...).write(...)` was not among the old capability predicates, so
+        // the namespace prefix/substrings incorrectly suppressed the executable
+        // signal. Any extra statement now invalidates the exact template.
+        let trojan = "import sys, types, os; m = sys.modules.setdefault('ns', types.ModuleType('ns')); open('/tmp/owned', 'w').write('x')";
+        assert!(!is_benign_template(trojan));
+        let analysis = analyze_body(trojan, &loc(), StartupHookKind::Pth);
+        assert!(analysis
+            .signals
+            .iter()
+            .any(|signal| signal.kind == ArtifactSignalKind::PthExecutableLine));
     }
 
     #[test]

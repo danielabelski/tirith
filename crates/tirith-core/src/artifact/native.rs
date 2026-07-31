@@ -433,13 +433,21 @@ fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     // capability sets (spawn / dynamic-loader / network) because an import means the
     // module actually references the API, unlike a `.rodata` string mention.
     if let Ok(imports) = obj.imports() {
+        if imports.len() > caps::MAX_IMPORTS {
+            facts.coverage = NativeCoverage::Partial;
+        }
         for imp in imports.iter().take(caps::MAX_IMPORTS) {
-            if let Ok(name) = std::str::from_utf8(imp.name()) {
-                let lower = name.to_ascii_lowercase();
-                classify_capability_import(&lower, facts);
-                facts.imports.insert(lower);
+            match std::str::from_utf8(imp.name()) {
+                Ok(name) => {
+                    let lower = name.to_ascii_lowercase();
+                    classify_capability_import(&lower, facts);
+                    facts.imports.insert(lower);
+                }
+                Err(_) => facts.coverage = NativeCoverage::Partial,
             }
         }
+    } else {
+        facts.coverage = NativeCoverage::Partial;
     }
 
     // Exported symbols: collect `PyInit_*` and detect a `DllMain` export (PE) /
@@ -448,9 +456,13 @@ fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     for sym in obj.symbols() {
         symbol_count += 1;
         if symbol_count > caps::MAX_SYMBOLS {
+            facts.coverage = NativeCoverage::Partial;
             break;
         }
-        let Ok(name) = sym.name() else { continue };
+        let Ok(name) = sym.name() else {
+            facts.coverage = NativeCoverage::Partial;
+            continue;
+        };
         if name.starts_with("PyInit_") || name.starts_with("_PyInit_") {
             facts.py_init_exports.insert(name.to_string());
         }
@@ -465,9 +477,13 @@ fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     for sym in obj.dynamic_symbols() {
         dyn_count += 1;
         if dyn_count > caps::MAX_SYMBOLS {
+            facts.coverage = NativeCoverage::Partial;
             break;
         }
-        let Ok(name) = sym.name() else { continue };
+        let Ok(name) = sym.name() else {
+            facts.coverage = NativeCoverage::Partial;
+            continue;
+        };
         if name.starts_with("PyInit_") || name.starts_with("_PyInit_") {
             facts.py_init_exports.insert(name.to_string());
         }
@@ -483,9 +499,16 @@ fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     for sec in obj.sections() {
         section_count += 1;
         if section_count > caps::MAX_SECTIONS {
+            facts.coverage = NativeCoverage::Partial;
             break;
         }
-        let name = sec.name().unwrap_or("");
+        let name = match sec.name() {
+            Ok(name) => name,
+            Err(_) => {
+                facts.coverage = NativeCoverage::Partial;
+                continue;
+            }
+        };
         // A constructor/init/TLS section only RUNS code when it is non-empty: an
         // empty `.init_array` (which honest toolchains do emit) holds zero function
         // pointers and triggers nothing, so an empty section is not an execution
@@ -529,18 +552,28 @@ fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     for sec in obj.sections() {
         scanned_sections += 1;
         if scanned_sections > caps::MAX_SECTIONS {
+            facts.coverage = NativeCoverage::Partial;
             break;
         }
         if scanned_total >= caps::MAX_TOTAL_SECTION_SCAN_BYTES {
+            // Reaching the aggregate cap is complete only when there is no next
+            // section; entering this iteration proves bytes remain unexamined.
+            facts.coverage = NativeCoverage::Partial;
             break;
         }
-        if let Ok(data) = sec.data() {
-            // Take at most the per-section cap AND at most what remains of the
-            // aggregate budget, whichever is smaller.
-            let remaining = caps::MAX_TOTAL_SECTION_SCAN_BYTES - scanned_total;
-            let take = data.len().min(caps::MAX_SECTION_SCAN_BYTES).min(remaining);
-            scan_bytes_strings(&data[..take], facts);
-            scanned_total += take;
+        match sec.data() {
+            Ok(data) => {
+                // Take at most the per-section cap AND at most what remains of the
+                // aggregate budget, whichever is smaller.
+                let remaining = caps::MAX_TOTAL_SECTION_SCAN_BYTES - scanned_total;
+                let take = data.len().min(caps::MAX_SECTION_SCAN_BYTES).min(remaining);
+                if take < data.len() {
+                    facts.coverage = NativeCoverage::Partial;
+                }
+                scan_bytes_strings(&data[..take], facts);
+                scanned_total += take;
+            }
+            Err(_) => facts.coverage = NativeCoverage::Partial,
         }
     }
 }
@@ -555,6 +588,9 @@ fn parse_fat_macho(bytes: &[u8], facts: &mut NativeFacts) -> bool {
     // both is simplest and each parse is bounded.)
     if let Ok(fat) = MachOFatFile64::parse(bytes) {
         let arches = fat.arches();
+        if arches.len() > caps::MAX_FAT_ARCHES {
+            facts.coverage = NativeCoverage::Partial;
+        }
         for (i, arch) in arches.iter().enumerate() {
             if i >= caps::MAX_FAT_ARCHES {
                 break;
@@ -562,16 +598,21 @@ fn parse_fat_macho(bytes: &[u8], facts: &mut NativeFacts) -> bool {
             if facts.arch.is_none() {
                 facts.arch = architecture_label(arch.architecture());
             }
-            if let Ok(slice) = arch.data(bytes) {
-                if let Ok(obj) = object::read::File::parse(slice) {
-                    extract_from_object(&obj, facts);
-                }
+            match arch.data(bytes) {
+                Ok(slice) => match object::read::File::parse(slice) {
+                    Ok(obj) => extract_from_object(&obj, facts),
+                    Err(_) => facts.coverage = NativeCoverage::Partial,
+                },
+                Err(_) => facts.coverage = NativeCoverage::Partial,
             }
         }
         return true;
     }
     if let Ok(fat) = MachOFatFile32::parse(bytes) {
         let arches = fat.arches();
+        if arches.len() > caps::MAX_FAT_ARCHES {
+            facts.coverage = NativeCoverage::Partial;
+        }
         for (i, arch) in arches.iter().enumerate() {
             if i >= caps::MAX_FAT_ARCHES {
                 break;
@@ -579,10 +620,12 @@ fn parse_fat_macho(bytes: &[u8], facts: &mut NativeFacts) -> bool {
             if facts.arch.is_none() {
                 facts.arch = architecture_label(arch.architecture());
             }
-            if let Ok(slice) = arch.data(bytes) {
-                if let Ok(obj) = object::read::File::parse(slice) {
-                    extract_from_object(&obj, facts);
-                }
+            match arch.data(bytes) {
+                Ok(slice) => match object::read::File::parse(slice) {
+                    Ok(obj) => extract_from_object(&obj, facts),
+                    Err(_) => facts.coverage = NativeCoverage::Partial,
+                },
+                Err(_) => facts.coverage = NativeCoverage::Partial,
             }
         }
         return true;
@@ -791,15 +834,20 @@ fn scan_bytes_strings(bytes: &[u8], facts: &mut NativeFacts) {
             // enough for token detection; an unbounded run is a DoS lever).
             if current.len() < caps::MAX_SECTION_SCAN_BYTES {
                 current.push(b);
+            } else {
+                // Prefix-only treatment of a giant run can hide tokens after the
+                // cap. Keep memory bounded but make the result explicitly Partial.
+                facts.coverage = NativeCoverage::Partial;
             }
         } else {
             if current.len() >= 4 {
                 if let Ok(s) = std::str::from_utf8(&current) {
-                    scan_one_string(s, facts);
-                    examined += 1;
                     if examined >= caps::MAX_STRINGS_SCANNED {
+                        facts.coverage = NativeCoverage::Partial;
                         return;
                     }
+                    scan_one_string(s, facts);
+                    examined += 1;
                 }
             }
             current.clear();
@@ -807,7 +855,11 @@ fn scan_bytes_strings(bytes: &[u8], facts: &mut NativeFacts) {
     }
     if current.len() >= 4 {
         if let Ok(s) = std::str::from_utf8(&current) {
-            scan_one_string(s, facts);
+            if examined >= caps::MAX_STRINGS_SCANNED {
+                facts.coverage = NativeCoverage::Partial;
+            } else {
+                scan_one_string(s, facts);
+            }
         }
     }
 }
@@ -937,7 +989,7 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
     // A `PyInit_*` substring (the streaming-view path has no symbol table; harmless
     // on the buffered path where the real export is already recorded).
     if facts.py_init_exports.len() < caps::MAX_SYMBOLS {
-        if let Some(pos) = s.find("PyInit_") {
+        for (pos, _) in s.match_indices("PyInit_") {
             let name: String = s[pos..]
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -945,6 +997,9 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
                 .collect();
             if name.len() > "PyInit_".len() {
                 facts.py_init_exports.insert(name);
+                if facts.py_init_exports.len() >= caps::MAX_SYMBOLS {
+                    break;
+                }
             }
         }
     }
@@ -2443,6 +2498,56 @@ mod tests {
         // cannot silently claim it was completely triaged.
         assert_eq!(NativeCoverage::default(), NativeCoverage::Partial);
         assert_eq!(NativeFacts::default().coverage, NativeCoverage::Partial);
+    }
+
+    #[test]
+    fn printable_run_cap_edge_marks_only_truncated_run_partial() {
+        let mut at_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_bytes_strings(&vec![b'A'; caps::MAX_SECTION_SCAN_BYTES], &mut at_cap);
+        assert_eq!(
+            at_cap.coverage,
+            NativeCoverage::Full,
+            "a run exactly at the cap was fully inspected"
+        );
+
+        let mut over_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_bytes_strings(&vec![b'A'; caps::MAX_SECTION_SCAN_BYTES + 1], &mut over_cap);
+        assert_eq!(
+            over_cap.coverage,
+            NativeCoverage::Partial,
+            "a single hidden byte beyond the retained run must downgrade coverage"
+        );
+    }
+
+    #[test]
+    fn printable_string_count_cap_edge_is_reported() {
+        fn strings(count: usize) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(count * 5);
+            for _ in 0..count {
+                bytes.extend_from_slice(b"ABCD\0");
+            }
+            bytes
+        }
+
+        let mut at_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_bytes_strings(&strings(caps::MAX_STRINGS_SCANNED), &mut at_cap);
+        assert_eq!(at_cap.coverage, NativeCoverage::Full);
+
+        let mut over_cap = NativeFacts {
+            coverage: NativeCoverage::Full,
+            ..NativeFacts::default()
+        };
+        scan_bytes_strings(&strings(caps::MAX_STRINGS_SCANNED + 1), &mut over_cap);
+        assert_eq!(over_cap.coverage, NativeCoverage::Partial);
     }
 
     // ------------------------------------------------------------------

@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use crate::artifact::archive::{
     self, is_wheel_filename, ArchiveOutcome, MemberVisitor, NativeMemberHandoff,
 };
-use crate::artifact::native::triage_native;
+use crate::artifact::native::{triage_native, NativeCoverage};
 use crate::artifact::pth::{self, StartupHookKind};
 use crate::artifact::record::{verify_wheel_record, NormalizedInstalledPath, OwnershipIndex};
 use crate::artifact::wheel::parse_record;
@@ -348,6 +348,27 @@ fn inspect_wheel<R: std::io::Read + std::io::Seek>(
     // corroboration.
     for handoff in &visitor.native {
         let triage = triage_native(handoff, false, false);
+        if triage.facts.coverage == NativeCoverage::Partial {
+            let location = handoff.location().clone();
+            let already_recorded = inspection.coverage.gaps.iter().any(|gap| {
+                gap.kind == CoverageGapKind::NativeTruncated && gap.location == location
+            });
+            if !already_recorded {
+                inspection.coverage.gaps.push(CoverageGap {
+                    location,
+                    kind: CoverageGapKind::NativeTruncated,
+                    sha256: None,
+                });
+                // A buffered native member was counted complete by the archive
+                // reader, but cap exhaustion/malformed deep parsing means its
+                // content analysis is only partial. Streaming members were never
+                // counted as inspected in the first place.
+                if matches!(handoff, NativeMemberHandoff::Buffered { .. }) {
+                    inspection.coverage.members_inspected =
+                        inspection.coverage.members_inspected.saturating_sub(1);
+                }
+            }
+        }
         inspection.signals.extend(triage.signals);
         inspection.execution_edges.extend(triage.edges);
         if let Some(finding) = triage.finding {
@@ -481,9 +502,39 @@ impl ArtifactSetInspection {
             if m.inspected.rejected {
                 findings.push(structural_rejection_finding(&m.path, &m.inspected));
             }
+            let coverage_gaps = m.inspected.inspection.effective_coverage_gaps();
+            findings.extend(crate::artifact::artifact_analysis_incomplete_findings(
+                &coverage_gaps,
+                None,
+                true,
+            ));
         }
+        findings.extend(crate::artifact::artifact_analysis_incomplete_findings(
+            &self.gaps, None, true,
+        ));
         findings.extend(self.cross_findings.iter().cloned());
         findings
+    }
+
+    /// Every typed coverage gap across the requested set and each successfully
+    /// opened member inspection. Used by verdict/install consumers to apply the
+    /// enforcing coverage floor after policy finalization.
+    pub fn all_coverage_gaps(&self) -> Vec<CoverageGap> {
+        let mut gaps = self.gaps.clone();
+        for member in &self.members {
+            gaps.extend(member.inspected.inspection.effective_coverage_gaps());
+        }
+        gaps
+    }
+
+    /// Whether every requested artifact and every member within it was completely
+    /// inspected. Structural rejection is enforced separately by its typed finding.
+    pub fn is_complete(&self) -> bool {
+        self.gaps.is_empty()
+            && self
+                .members
+                .iter()
+                .all(|member| member.inspected.inspection.coverage.is_complete())
     }
 }
 
@@ -1583,6 +1634,56 @@ mod tests {
             Ok(ArtifactMagic::Unknown),
             "a clean empty read is Unknown magic, not an Unreadable fault"
         );
+    }
+
+    #[test]
+    fn malformed_buffered_native_member_becomes_typed_incomplete_finding() {
+        use crate::verdict::{action_from_findings, Action, RuleId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = build_wheel(&[
+            ("demo/_broken.abi3.so", b"not a parseable object"),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n",
+            ),
+            (
+                "demo-1.0.dist-info/RECORD",
+                b"demo-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &bytes);
+        let set = inspect_artifact_set(std::slice::from_ref(&path));
+        let inspection = &set.members[0].inspected.inspection;
+
+        assert!(!set.members[0].inspected.rejected);
+        assert!(inspection.coverage.gaps.iter().any(|gap| {
+            gap.kind == CoverageGapKind::NativeTruncated
+                && gap.location.member_path.as_deref() == Some("demo/_broken.abi3.so")
+        }));
+        assert!(!inspection.coverage.is_complete());
+
+        let findings = set.all_findings(None);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+        assert_eq!(action_from_findings(&findings), Action::Block);
+    }
+
+    #[test]
+    fn unsupported_set_member_is_not_an_empty_allow() {
+        use crate::verdict::{action_from_findings, Action, RuleId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp(&dir, "demo-1.0.tar.gz", b"\x1f\x8bnot-a-wheel");
+        let set = inspect_artifact_set(&[path]);
+        assert!(set.members.is_empty());
+        assert!(!set.is_complete());
+        let findings = set.all_findings(None);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+        assert_eq!(action_from_findings(&findings), Action::Block);
     }
 
     /// `all_findings` synthesizes a `WheelStructurallyRejected` finding for a member

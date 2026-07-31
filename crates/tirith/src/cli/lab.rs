@@ -393,7 +393,15 @@ fn inspect_artifact_paths(paths: &[std::path::PathBuf]) -> tirith_core::verdict:
     let findings = set.all_findings(None);
     // Tier 3 by construction (no tier-1 command gate on this seam), mirroring
     // `crate::artifact::firewall::firewall_resolved_set`.
-    finalize_static_verdict(findings, &Policy::default(), 3, Timings::default())
+    let policy = Policy::default();
+    let mut verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
+    tirith_core::artifact::enforce_artifact_coverage_floor(
+        &mut verdict,
+        &set.all_coverage_gaps(),
+        Some(&policy),
+        true,
+    );
+    verdict
 }
 
 /// Resolve a corpus `artifact_path` (relative) into an absolute path under

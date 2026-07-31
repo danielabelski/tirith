@@ -54,9 +54,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::location::SubjectLocation;
 use crate::policy::Policy;
-use crate::scan::CoverageGap;
+use crate::scan::{CoverageGap, CoverageGapKind};
 use crate::threatdb::{Ecosystem, ThreatDb};
-use crate::verdict::{Finding, Timings, Verdict};
+use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings, Verdict};
 
 /// The hardened, streaming, wheel-only ZIP reader (PR A4). Separates hard
 /// structural violations from coverage limits and hands native members to B7.
@@ -284,6 +284,34 @@ impl ArtifactInspection {
         }
         Ok(())
     }
+
+    /// Return every explicit coverage gap, with a fail-safe synthetic gap when
+    /// the coverage counters prove the inspection incomplete but no producer
+    /// supplied a reason. Verdict consumers must use this projection instead of
+    /// trusting `gaps.is_empty()` alone: entry enumeration and content inspection
+    /// are independently bounded.
+    pub(crate) fn effective_coverage_gaps(&self) -> Vec<CoverageGap> {
+        let mut gaps = self.coverage.gaps.clone();
+        if !self.coverage.is_complete() && gaps.is_empty() {
+            gaps.push(CoverageGap {
+                location: match &self.subject {
+                    InspectionSubject::Artifact(identity) => {
+                        SubjectLocation::from_path(identity.filename.clone())
+                    }
+                    InspectionSubject::GenericArchive(identity) => {
+                        SubjectLocation::from_path(identity.filename.clone())
+                    }
+                    InspectionSubject::InstalledDistribution(identity) => {
+                        identity.dist_info_path.clone()
+                    }
+                    InspectionSubject::InstalledFile(identity) => identity.location.clone(),
+                },
+                kind: CoverageGapKind::Truncated,
+                sha256: None,
+            });
+        }
+        gaps
+    }
 }
 
 /// A granular, policy-independent observation about a subject. Correlation (in
@@ -472,11 +500,18 @@ pub enum ArtifactFileKind {
 /// is one coverage concept across the scanner and the artifact model.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectionCoverage {
-    /// How many archive members / installed files were actually inspected.
-    pub members_inspected: usize,
-    /// How many were present in total (so `members_inspected < members_total`
-    /// means the inspection is incomplete even before reading `gaps`).
+    /// How many were present in total (so either enumeration or inspection below
+    /// this value means coverage is incomplete even before reading `gaps`).
     pub members_total: usize,
+    /// How many member records were retained and structurally validated. This is
+    /// distinct from [`Self::members_total`]: an entry-count cap can know the ZIP
+    /// directory's total while retaining metadata for only a bounded prefix.
+    #[serde(default)]
+    pub members_enumerated: usize,
+    /// How many members were completely content-inspected. A member that was
+    /// merely counted/enumerated, partially streamed, unreadable, or structurally
+    /// rejected is not included.
+    pub members_inspected: usize,
     /// The specific members/files that were not fully analyzed, each with its
     /// reason. Empty means full coverage.
     #[serde(default)]
@@ -486,22 +521,119 @@ pub struct InspectionCoverage {
 impl InspectionCoverage {
     /// Whether every member was inspected and no gap was recorded.
     ///
-    /// A default (`0`/`0`) coverage reports complete BY CONSTRUCTION: an unmeasured
+    /// A default (`0`/`0`/`0`) coverage reports complete BY CONSTRUCTION: an unmeasured
     /// skeleton has no gaps and `0 == 0`, matching `new()`'s "full coverage until an
     /// analyzer records otherwise" contract. Analyzers set real totals before relying
     /// on this, so it is not "vacuously true" in any path that actually consults it.
     pub fn is_complete(&self) -> bool {
         debug_assert!(
-            self.members_inspected <= self.members_total,
-            "InspectionCoverage inconsistent: members_inspected {} > members_total {}",
+            self.members_inspected <= self.members_enumerated
+                && self.members_enumerated <= self.members_total,
+            "InspectionCoverage inconsistent: inspected {} > enumerated {} or enumerated > total {}",
             self.members_inspected,
+            self.members_enumerated,
             self.members_total
         );
         // `==` rather than `>=`: members_inspected can never legitimately exceed
         // members_total, so an inconsistent (forged) count returns not-complete in
         // release builds instead of silently passing, while the debug_assert above
         // surfaces it loudly in tests.
-        self.gaps.is_empty() && self.members_inspected == self.members_total
+        self.gaps.is_empty()
+            && self.members_enumerated == self.members_total
+            && self.members_inspected == self.members_total
+    }
+}
+
+/// Convert artifact-internal coverage gaps into typed `AnalysisIncomplete`
+/// findings. Artifact gaps are always security-relevant: they describe bytes in
+/// an installable artifact, not an ordinary oversized text file.
+///
+/// `fail_closed` is used by the package firewall/install path, where every byte
+/// must be covered before extraction. Other artifact-evaluation surfaces retain
+/// the configured gap action, but floor it at Warn so an incomplete artifact can
+/// never finalize as Allow. `scan.require_complete` upgrades every artifact gap
+/// to the fail-closed Block grade.
+pub(crate) fn artifact_analysis_incomplete_findings(
+    gaps: &[CoverageGap],
+    policy: Option<&Policy>,
+    fail_closed: bool,
+) -> Vec<Finding> {
+    use crate::policy::GapAction;
+
+    gaps.iter()
+        .map(|gap| {
+            let configured = policy
+                .map(|p| p.scan.action_for_gap_kind(gap.kind))
+                .unwrap_or(GapAction::Fail);
+            let must_fail = fail_closed
+                || policy.is_some_and(|p| p.scan.require_complete)
+                || configured == GapAction::Fail;
+            let severity = if must_fail {
+                Severity::High
+            } else {
+                // Ignore is deliberately floored to Warn for an installable
+                // artifact. The typed gap remains visible and cannot yield Allow.
+                Severity::Medium
+            };
+            let location = gap.location.to_string();
+            let detail = match gap.sha256.as_deref() {
+                Some(hash) => format!("{} ({}); sha256={hash}", location, gap.kind.as_str()),
+                None => format!("{} ({})", location, gap.kind.as_str()),
+            };
+            Finding {
+                rule_id: RuleId::AnalysisIncomplete,
+                severity,
+                title: "Artifact analysis incomplete".to_string(),
+                description: format!(
+                    "An installable artifact member was not fully analyzed ({}): {}. \
+                     The artifact is not provably safe to install.",
+                    gap.kind.as_str(),
+                    location
+                ),
+                evidence: vec![Evidence::Text { detail }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }
+        })
+        .collect()
+}
+
+/// Restore the minimum action and typed findings required by artifact coverage
+/// after the shared policy finalizer runs. Severity overrides and paranoia are
+/// presentation/policy controls; neither may turn an incomplete installable
+/// artifact into `Allow`, and the enforcing firewall path may never fall below
+/// `Block`.
+pub fn enforce_artifact_coverage_floor(
+    verdict: &mut Verdict,
+    gaps: &[CoverageGap],
+    policy: Option<&Policy>,
+    fail_closed: bool,
+) {
+    if gaps.is_empty() {
+        return;
+    }
+    let required = artifact_analysis_incomplete_findings(gaps, policy, fail_closed);
+    let block_required = required.iter().any(|f| f.severity >= Severity::High);
+
+    for required_finding in required {
+        if let Some(existing) = verdict.findings.iter_mut().find(|existing| {
+            existing.rule_id == RuleId::AnalysisIncomplete
+                && existing.description == required_finding.description
+        }) {
+            if existing.severity < required_finding.severity {
+                existing.severity = required_finding.severity;
+            }
+        } else {
+            verdict.findings.push(required_finding);
+        }
+    }
+
+    if block_required {
+        verdict.action = Action::Block;
+    } else if verdict.action == Action::Allow {
+        verdict.action = Action::Warn;
     }
 }
 
@@ -526,10 +658,19 @@ pub fn evaluate_artifact(
     policy: &Policy,
     threat_db: Option<&ThreatDb>,
 ) -> Verdict {
-    let findings = correlate_findings(inspection, threat_db);
+    let coverage_gaps = inspection.effective_coverage_gaps();
+    let mut findings = correlate_findings(inspection, threat_db);
+    findings.extend(artifact_analysis_incomplete_findings(
+        &coverage_gaps,
+        Some(policy),
+        false,
+    ));
     // Artifact/scan-path verdicts are tier-3 by construction (they never run the
     // tier-1 command gate); timings are not measured on this seam.
-    crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default())
+    let mut verdict =
+        crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default());
+    enforce_artifact_coverage_floor(&mut verdict, &coverage_gaps, Some(policy), false);
+    verdict
 }
 
 /// Evaluate an inspection that also carries the per-member native-chain findings
@@ -544,12 +685,21 @@ pub fn evaluate_inspected_artifact(
     policy: &Policy,
     threat_db: Option<&ThreatDb>,
 ) -> Verdict {
-    let findings = crate::artifact::correlate::correlate_inspection_findings(
+    let coverage_gaps = inspection.effective_coverage_gaps();
+    let mut findings = crate::artifact::correlate::correlate_inspection_findings(
         inspection,
         native_findings,
         threat_db,
     );
-    crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default())
+    findings.extend(artifact_analysis_incomplete_findings(
+        &coverage_gaps,
+        Some(policy),
+        false,
+    ));
+    let mut verdict =
+        crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default());
+    enforce_artifact_coverage_floor(&mut verdict, &coverage_gaps, Some(policy), false);
+    verdict
 }
 
 /// PEP 503 distribution-name normalization (lowercase; collapse any run of
@@ -701,8 +851,9 @@ mod tests {
             confidence: EdgeConfidence::Medium,
         });
         inspection.coverage = InspectionCoverage {
-            members_inspected: 3,
             members_total: 4,
+            members_enumerated: 4,
+            members_inspected: 3,
             gaps: vec![CoverageGap {
                 location: SubjectLocation::member("demo-1.2.3-py3-none-any.whl", "big.bin"),
                 kind: crate::scan::CoverageGapKind::Oversized,
@@ -749,16 +900,87 @@ mod tests {
         );
     }
 
-    /// A default (0/0) coverage is complete BY CONSTRUCTION (the documented contract,
-    /// so the 0/0 case is not later mistaken for a bug).
+    /// A default (0/0/0) coverage is complete BY CONSTRUCTION (the documented
+    /// contract, so the empty case is not later mistaken for a bug).
     #[test]
     fn default_coverage_is_complete_by_construction() {
         let cov = InspectionCoverage {
-            members_inspected: 0,
             members_total: 0,
+            members_enumerated: 0,
+            members_inspected: 0,
             gaps: Vec::new(),
         };
         assert!(cov.is_complete());
+    }
+
+    fn incomplete_artifact_inspection() -> ArtifactInspection {
+        let mut inspection = ArtifactInspection::new(artifact_subject());
+        inspection.coverage = InspectionCoverage {
+            members_total: 1,
+            members_enumerated: 1,
+            members_inspected: 0,
+            gaps: vec![CoverageGap {
+                location: SubjectLocation::member("demo-1.2.3-py3-none-any.whl", "demo/hidden.pth"),
+                kind: crate::scan::CoverageGapKind::MemberTooLarge,
+                sha256: None,
+            }],
+        };
+        inspection
+    }
+
+    #[test]
+    fn incomplete_artifact_evaluation_cannot_finalize_allow() {
+        let inspection = incomplete_artifact_inspection();
+        let verdict = evaluate_artifact(&inspection, &Policy::default(), None);
+        assert_eq!(verdict.action, Action::Warn);
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn incomplete_counters_without_explicit_gap_cannot_finalize_allow() {
+        let mut inspection = ArtifactInspection::new(artifact_subject());
+        inspection.coverage = InspectionCoverage {
+            members_total: 2,
+            members_enumerated: 1,
+            members_inspected: 1,
+            gaps: Vec::new(),
+        };
+
+        let verdict = evaluate_artifact(&inspection, &Policy::default(), None);
+        assert_eq!(verdict.action, Action::Warn);
+        assert!(verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete
+                && finding.description.contains("truncated")
+        }));
+    }
+
+    #[test]
+    fn require_complete_blocks_incomplete_artifact_evaluation() {
+        let inspection = incomplete_artifact_inspection();
+        let mut policy = Policy::default();
+        policy.scan.require_complete = true;
+        let verdict = evaluate_artifact(&inspection, &policy, None);
+        assert_eq!(verdict.action, Action::Block);
+        assert!(verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+        }));
+    }
+
+    #[test]
+    fn severity_override_cannot_hide_artifact_incompleteness() {
+        let inspection = incomplete_artifact_inspection();
+        let mut policy = Policy::default();
+        policy
+            .severity_overrides
+            .insert("analysis_incomplete".to_string(), Severity::Info);
+        let verdict = evaluate_artifact(&inspection, &policy, None);
+        assert_eq!(verdict.action, Action::Warn);
+        assert!(verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete && finding.severity >= Severity::Medium
+        }));
     }
 
     /// A value written before `schema_version` existed (it is absent from the
@@ -797,8 +1019,9 @@ mod tests {
     #[should_panic(expected = "inconsistent")]
     fn inspection_coverage_rejects_inconsistent_counters() {
         let cov = InspectionCoverage {
-            members_inspected: 5,
             members_total: 4,
+            members_enumerated: 4,
+            members_inspected: 5,
             gaps: Vec::new(),
         };
         let _ = cov.is_complete();

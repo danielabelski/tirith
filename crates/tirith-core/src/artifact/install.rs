@@ -1263,6 +1263,33 @@ mod tests {
         ])
     }
 
+    /// A hash-valid/RECORD-valid wheel whose native member cannot be deeply
+    /// parsed. This must never reach approved.txt or the capsule launch plan.
+    fn incomplete_native_wheel() -> Vec<u8> {
+        let native = b"not a parseable ELF/Mach-O/PE object";
+        let metadata = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n";
+        let wheel =
+            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: false\nTag: cp311-none-any\n";
+        let record = format!(
+            "demo/_broken.abi3.so,{},{}\n\
+             demo-1.0.dist-info/METADATA,{},{}\n\
+             demo-1.0.dist-info/WHEEL,{},{}\n\
+             demo-1.0.dist-info/RECORD,,\n",
+            record_sha256_cell(native),
+            native.len(),
+            record_sha256_cell(metadata),
+            metadata.len(),
+            record_sha256_cell(wheel),
+            wheel.len(),
+        );
+        build_wheel(&[
+            ("demo/_broken.abi3.so", native),
+            ("demo-1.0.dist-info/METADATA", metadata),
+            ("demo-1.0.dist-info/WHEEL", wheel),
+            ("demo-1.0.dist-info/RECORD", record.as_bytes()),
+        ])
+    }
+
     /// A store + open transaction over a fresh temp root.
     fn store_with_txn(id: &str) -> (tempfile::TempDir, QuarantineStore, QuarantineTransaction) {
         let root = tempfile::tempdir().unwrap();
@@ -1555,6 +1582,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rebind_refuses_incomplete_native_analysis_before_plan_creation() {
+        let bytes = incomplete_native_wheel();
+        let digest = sha256_hex(&bytes);
+        let (_root, store, txn) = store_with_txn("rebind-native-incomplete");
+        store.ingest_bytes(&bytes, &digest).unwrap();
+        let resolved = ResolvedSet {
+            locked_requirements: String::new(),
+            artifacts: vec![ResolvedArtifact {
+                wheel_filename: "demo-1.0-py3-none-any.whl".to_string(),
+                sha256: digest,
+            }],
+        };
+        let env = txn.dir().join("env");
+        let err = rebind_for_install(&resolved, &txn, &Policy::default(), None, 0, &env, &[])
+            .expect_err("incomplete native analysis must not produce an install plan");
+        match err {
+            InstallError::RebindBlocked {
+                verdict,
+                integrity_mismatch,
+            } => {
+                assert!(!integrity_mismatch);
+                assert_eq!(verdict.action, crate::verdict::Action::Block);
+                assert!(verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+            }
+            other => panic!("expected RebindBlocked, got {other:?}"),
+        }
     }
 
     #[test]

@@ -135,6 +135,7 @@ pub fn firewall_resolved_set(
     // approved bytes, so inspecting them would describe content we are about to
     // refuse to install anyway.
     let set_inspection = inspect_artifact_set(&materialized);
+    let coverage_gaps = set_inspection.all_coverage_gaps();
 
     let mut findings = integrity_findings.clone();
     findings.extend(set_inspection.all_findings(threat_db));
@@ -142,8 +143,18 @@ pub fn firewall_resolved_set(
     // Artifact/firewall verdicts are tier-3 by construction (they never run the
     // tier-1 command gate); timings are not measured on this seam, matching
     // `crate::artifact::evaluate_artifact`.
-    let verdict =
+    let mut verdict =
         crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default());
+    // Package installation requires complete artifact coverage irrespective of
+    // presentation/severity overrides. The typed AnalysisIncomplete findings were
+    // routed through the shared finalizer above; restore their Block floor if a
+    // policy or paranoia setting attempted to downgrade/drop them.
+    crate::artifact::enforce_artifact_coverage_floor(
+        &mut verdict,
+        &coverage_gaps,
+        Some(policy),
+        true,
+    );
 
     FirewallOutcome {
         verdict,
@@ -287,6 +298,34 @@ mod tests {
         benign_wheel("demo", "a")
     }
 
+    /// A structurally valid wheel whose native member fully streams/hashes but
+    /// cannot be deeply parsed. RECORD is complete and correct, so the only
+    /// fail-closed cause is native analysis coverage.
+    fn incomplete_native_wheel() -> Vec<u8> {
+        let native = b"not a parseable ELF/Mach-O/PE object";
+        let metadata = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n";
+        let wheel =
+            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: false\nTag: cp311-none-any\n";
+        let record = format!(
+            "demo/_broken.abi3.so,{},{}\n\
+             demo-1.0.dist-info/METADATA,{},{}\n\
+             demo-1.0.dist-info/WHEEL,{},{}\n\
+             demo-1.0.dist-info/RECORD,,\n",
+            record_sha256_cell(native),
+            native.len(),
+            record_sha256_cell(metadata),
+            metadata.len(),
+            record_sha256_cell(wheel),
+            wheel.len(),
+        );
+        build_wheel(&[
+            ("demo/_broken.abi3.so", native),
+            ("demo-1.0.dist-info/METADATA", metadata),
+            ("demo-1.0.dist-info/WHEEL", wheel),
+            ("demo-1.0.dist-info/RECORD", record.as_bytes()),
+        ])
+    }
+
     /// A store + open transaction over a fresh temp root.
     fn store_with_txn(id: &str) -> (tempfile::TempDir, QuarantineStore, QuarantineTransaction) {
         let root = tempfile::tempdir().unwrap();
@@ -333,6 +372,33 @@ mod tests {
         // The materialised copy is the validated wheel name, inside the txn dir.
         assert!(outcome.materialized[0].ends_with(filename));
         assert!(outcome.materialized[0].starts_with(txn.dir()));
+    }
+
+    #[test]
+    fn firewall_blocks_incomplete_native_analysis_even_with_downgrade_override() {
+        let bytes = incomplete_native_wheel();
+        let digest = sha256_hex(&bytes);
+        let filename = "demo-1.0-py3-none-any.whl";
+        let (_root, store, txn) = store_with_txn("fw-native-incomplete");
+        store.ingest_bytes(&bytes, &digest).unwrap();
+        let resolved = ResolvedSet {
+            locked_requirements: format!("demo==1.0 \\\n    --hash=sha256:{digest}\n"),
+            artifacts: vec![ResolvedArtifact {
+                wheel_filename: filename.to_string(),
+                sha256: digest,
+            }],
+        };
+        let mut policy = Policy::default();
+        policy
+            .severity_overrides
+            .insert("analysis_incomplete".to_string(), Severity::Info);
+
+        let outcome = firewall_resolved_set(&resolved, &txn, &policy, None);
+        assert!(!outcome.set_inspection.is_complete());
+        assert_eq!(outcome.verdict.action, Action::Block);
+        assert!(outcome.verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete && finding.severity >= Severity::High
+        }));
     }
 
     /// The integrity re-bind: if the quarantine blob is swapped (different bytes

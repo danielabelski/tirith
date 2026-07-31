@@ -276,13 +276,16 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     for candidate in candidates {
         match candidate {
             ScanCandidate::Artifact(path) => {
-                let (mut results, gap) =
+                let (mut results, gaps) =
                     inspect_artifact_candidate(&path, artifact_threat_db.as_deref());
-                if let Some(gap) = gap {
-                    skipped_count += 1;
-                    coverage_gaps.push(gap);
-                } else {
+                if gaps.is_empty() {
                     scanned_count += 1;
+                } else {
+                    // Candidate-level counter: one partially/uninspected artifact
+                    // counts as one skipped candidate, while `coverage_gaps` keeps
+                    // every member-level reason.
+                    skipped_count += 1;
+                    coverage_gaps.extend(gaps);
                 }
                 file_results.append(&mut results);
             }
@@ -325,11 +328,10 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
 }
 
 /// Magic-dispatch one artifact candidate into the artifact scanner (B8a). Returns
-/// the member-qualified [`FileScanResult`]s its findings produce, plus an optional
-/// [`CoverageGap`] when the candidate could not be inspected as a wheel (an sdist /
-/// unknown magic / unreadable / oversize), so an artifact is never silently
-/// dropped. A successfully inspected wheel with NO findings still yields one empty
-/// result (located at the wheel) so it counts as scanned.
+/// the member-qualified [`FileScanResult`]s its findings produce, plus every typed
+/// [`CoverageGap`] from outer-file dispatch and accepted partial member analysis,
+/// so an artifact is never silently dropped. A successfully inspected wheel with
+/// NO findings still yields one empty result (located at the wheel).
 ///
 /// Each finding becomes its OWN result located at the finding's member-qualified
 /// path (`foo.whl!/pkg/bootstrap.pth`, B8f) when one is recoverable from the
@@ -341,7 +343,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
 fn inspect_artifact_candidate(
     path: &Path,
     threat_db: Option<&crate::threatdb::ThreatDb>,
-) -> (Vec<FileScanResult>, Option<CoverageGap>) {
+) -> (Vec<FileScanResult>, Vec<CoverageGap>) {
     use crate::artifact::inspect::{inspect_artifact_file, InspectedArtifact};
 
     let inspected: InspectedArtifact = match inspect_artifact_file(path) {
@@ -351,11 +353,11 @@ fn inspect_artifact_candidate(
             // for a later content-addressed lookup) so it is never read as clean.
             return (
                 Vec::new(),
-                Some(CoverageGap {
+                vec![CoverageGap {
                     location: SubjectLocation::from_path(path.to_path_buf()),
                     kind: e.gap_kind(),
                     sha256: hash_path_within_budget(path),
-                }),
+                }],
             );
         }
     };
@@ -384,6 +386,13 @@ fn inspect_artifact_candidate(
 
     let mut results: Vec<FileScanResult> = Vec::new();
     for finding in verdict.findings {
+        // The scan driver owns coverage-finding assembly from `coverage_gaps` so
+        // policy actions, SARIF locations, and exit status stay single-sourced.
+        // `evaluate_inspected_artifact` also protects direct consumers, hence the
+        // filtering here to avoid duplicate AnalysisIncomplete rows.
+        if finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete {
+            continue;
+        }
         // Locate the finding at its member-qualified location when one is present in
         // the evidence (B8f); else at the outer wheel.
         let loc = artifact_finding_location(&finding, path, &known_members);
@@ -401,15 +410,13 @@ fn inspect_artifact_candidate(
     // condition. Any signal findings that DID fire from the partial inspection are returned
     // alongside the gap. `Unsupported` on a `.whl` is security-relevant, so the gap is not
     // silently benign.
+    let mut coverage_gaps = inspected.inspection.effective_coverage_gaps();
     if inspected.rejected {
-        return (
-            results,
-            Some(CoverageGap {
-                location: SubjectLocation::from_path(path.to_path_buf()),
-                kind: CoverageGapKind::Unsupported,
-                sha256: hash_path_within_budget(path),
-            }),
-        );
+        coverage_gaps.push(CoverageGap {
+            location: SubjectLocation::from_path(path.to_path_buf()),
+            kind: CoverageGapKind::Unsupported,
+            sha256: hash_path_within_budget(path),
+        });
     }
 
     // A clean wheel (no findings) still counts as scanned: emit one empty result at
@@ -422,7 +429,7 @@ fn inspect_artifact_candidate(
         });
     }
 
-    (results, None)
+    (results, coverage_gaps)
 }
 
 /// The set of member-qualified location strings (`<wheel>!/<member>`) the
@@ -1996,6 +2003,45 @@ mod tests {
                 .any(|r| { !r.findings.is_empty() && r.path.display().to_string().contains("!/") }),
             "an artifact finding must carry a member-qualified `foo.whl!/member` path"
         );
+    }
+
+    #[test]
+    fn directory_scan_propagates_accepted_wheel_internal_gap() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            (
+                "demo/_broken.abi3.so",
+                b"not a parseable ELF/Mach-O/PE object".as_slice(),
+            ),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
+            ),
+            (
+                "demo-1.0.dist-info/RECORD",
+                b"demo/_broken.abi3.so,,\ndemo-1.0.dist-info/METADATA,,\ndemo-1.0.dist-info/RECORD,,\n"
+                    .as_slice(),
+            ),
+        ] {
+            zw.start_file(name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        let wheel_bytes = zw.finish().unwrap().into_inner();
+        std::fs::write(root.join("demo-1.0-py3-none-any.whl"), wheel_bytes).unwrap();
+
+        let result = scan_tree(root, None);
+        assert_eq!(result.scanned_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert!(result
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.kind == CoverageGapKind::NativeTruncated));
     }
 
     /// B8 re-review: a structurally REJECTED wheel (path traversal) with NO B5/B6/B7 signal

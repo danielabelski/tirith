@@ -266,11 +266,17 @@ fn inspect_artifacts(paths: &[PathBuf], json: bool) -> i32 {
     // consumer (firewall / lab / this surface) fails closed by construction, and a CI consumer
     // gating on `findings.length` cannot pass a path-traversal wheel.
     let findings = set.all_findings(db.as_deref());
-    let verdict = tirith_core::escalation::finalize_static_verdict(
+    let mut verdict = tirith_core::escalation::finalize_static_verdict(
         findings,
         &policy,
         3,
         tirith_core::verdict::Timings::default(),
+    );
+    tirith_core::artifact::enforce_artifact_coverage_floor(
+        &mut verdict,
+        &set.all_coverage_gaps(),
+        Some(&policy),
+        true,
     );
 
     // The verdict's own exit code, computed up front so a write failure can preserve it.
