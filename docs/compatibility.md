@@ -124,8 +124,8 @@ The following detection rules apply when `--shell powershell` is passed to
 |---------|-------------------|
 | `base64_decode_execute` | `powershell -EncodedCommand <base64>` and `-enc` / `-ec` aliases |
 | `pipe_to_interpreter` | `iwr url \| iex`, `irm url \| iex`, and full `Invoke-WebRequest` / `Invoke-RestMethod` forms |
-| `ps_set_execution_policy_bypass` | `Set-ExecutionPolicy Bypass`, `powershell -ExecutionPolicy Bypass`, and the `-ep` short alias |
-| `ps_defender_exclusion` | `Add-MpPreference -ExclusionPath`, `-ExclusionProcess`, or `-ExclusionExtension` |
+| `ps_set_execution_policy_bypass` | `Set-ExecutionPolicy Bypass`, `powershell -ExecutionPolicy Bypass`, the `-ep` alias, and valid unambiguous `-ex…` prefixes |
+| `ps_defender_exclusion` | `Add-MpPreference -ExclusionPath`, `-ExclusionProcess`, or `-ExclusionExtension`, including valid unambiguous parameter prefixes |
 | `ps_inline_download_execute` | `iex (iwr https://…)` — inline download-execute form where `iex` is the leading command |
 
 `tirith run` and `tirith fetch` are Unix-only and do not apply to PowerShell

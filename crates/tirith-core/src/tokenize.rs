@@ -316,6 +316,23 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                 i += 2;
                 continue;
             }
+            // A leading single `&` is PowerShell's call operator and remains
+            // part of the segment. Once a command/pipeline already precedes
+            // it, the same token is the background statement terminator and
+            // the following command must be analyzed as a new segment.
+            '&' if !current.trim().is_empty() && !current.ends_with('>') => {
+                push_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
+                current.clear();
+                preceding_sep = Some("&".to_string());
+                i += 1;
+                continue;
+            }
             // PowerShell logical `-and` / `-or` operators.
             '-' if current.ends_with(char::is_whitespace) || current.is_empty() => {
                 let remaining = &input[byte_off..];
@@ -781,17 +798,27 @@ mod tests {
     }
 
     #[test]
-    fn ps_tokenizer_bare_single_ampersand_not_separator() {
-        // Bare `&` (PS call / background operator) is NOT a chain operator on
-        // its own. Single `&` must fall through to the catch-all and be part
-        // of the current segment, so this tokenizes as ONE segment.
+    fn ps_tokenizer_background_ampersand_starts_a_new_segment() {
         let segs = tokenize("Get-Job & Get-Process", ShellType::PowerShell);
-        assert_eq!(
-            segs.len(),
-            1,
-            "expected 1 segment (single & is not a separator), got {:?}",
-            segs
-        );
+        assert_eq!(segs.len(), 2, "expected background split, got {segs:?}");
+        assert_eq!(segs[0].command.as_deref(), Some("Get-Job"));
+        assert_eq!(segs[1].preceding_separator.as_deref(), Some("&"));
+        assert_eq!(segs[1].command.as_deref(), Some("Get-Process"));
+    }
+
+    #[test]
+    fn ps_tokenizer_leading_ampersand_remains_the_call_operator() {
+        let segs = tokenize("& 'Set-ExecutionPolicy' Bypass", ShellType::PowerShell);
+        assert_eq!(segs.len(), 1, "expected one call segment, got {segs:?}");
+        assert_eq!(segs[0].command.as_deref(), Some("&"));
+        assert_eq!(segs[0].args, vec!["'Set-ExecutionPolicy'", "Bypass"]);
+    }
+
+    #[test]
+    fn ps_tokenizer_redirection_ampersand_is_not_a_background_separator() {
+        let segs = tokenize("Write-Error boom 2>&1", ShellType::PowerShell);
+        assert_eq!(segs.len(), 1, "redirection must stay intact: {segs:?}");
+        assert_eq!(segs[0].args.last().map(String::as_str), Some("2>&1"));
     }
 
     #[test]

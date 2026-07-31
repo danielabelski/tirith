@@ -43,6 +43,27 @@ pub fn check(input: &str, shell: ShellType) -> Vec<Finding> {
     findings
 }
 
+/// Resolve the literal command PowerShell will invoke for a segment. A leading
+/// `&` is the call operator, not the command itself; its first argument is the
+/// effective command and the remaining arguments belong to that command.
+/// Dynamic expressions remain unmatched because Tirith cannot safely infer
+/// their runtime value.
+fn effective_command(seg: &tokenize::Segment, shell: ShellType) -> Option<(String, &[String])> {
+    let command = seg.command.as_ref()?;
+    let command_base = normalize_cmd_base(command, shell);
+    if command_base != "&" {
+        return Some((command_base, &seg.args));
+    }
+
+    let (invoked, args) = seg.args.split_first()?;
+    let invoked_base = normalize_cmd_base(invoked, shell);
+    if invoked_base.is_empty() {
+        None
+    } else {
+        Some((invoked_base, args))
+    }
+}
+
 /// Detect both shapes of `Set-ExecutionPolicy Bypass`:
 /// 1. Cmdlet form — leader `set-executionpolicy` with `bypass` in the args.
 ///    Note: `sep` is NOT matched — it is not a default alias (`Get-Alias sep`
@@ -56,8 +77,9 @@ fn check_set_execution_policy(
     findings: &mut Vec<Finding>,
 ) {
     for seg in segments {
-        let Some(ref cmd) = seg.command else { continue };
-        let cmd_base = normalize_cmd_base(cmd, shell);
+        let Some((cmd_base, args)) = effective_command(seg, shell) else {
+            continue;
+        };
 
         let cmdlet_path = cmd_base.as_str() == "set-executionpolicy";
         let flag_path = matches!(cmd_base.as_str(), "powershell" | "pwsh");
@@ -70,10 +92,10 @@ fn check_set_execution_policy(
         // colon-joined form was the pre-fix gap. `has_execution_policy_bypass_flag`
         // covers all named forms; the positional check below covers the rest.
         if cmdlet_path {
-            let mentions_bypass = seg.args.iter().any(|a| {
+            let mentions_bypass = args.iter().any(|a| {
                 let n = normalize_shell_token(a.trim(), shell);
                 n.eq_ignore_ascii_case("bypass")
-            }) || has_execution_policy_bypass_flag(&seg.args, shell);
+            }) || has_execution_policy_bypass_flag(args, shell);
             if mentions_bypass {
                 findings.push(Finding {
                     rule_id: RuleId::PsSetExecutionPolicyBypass,
@@ -98,7 +120,7 @@ fn check_set_execution_policy(
         }
 
         // Flag form: -ExecutionPolicy Bypass somewhere in args.
-        if flag_path && has_execution_policy_bypass_flag(&seg.args, shell) {
+        if flag_path && has_execution_policy_bypass_flag(args, shell) {
             findings.push(Finding {
                 rule_id: RuleId::PsSetExecutionPolicyBypass,
                 severity: Severity::High,
@@ -123,42 +145,48 @@ fn check_set_execution_policy(
 
 /// True if `args` has both a `-ExecutionPolicy`-style flag and a `Bypass` value,
 /// in any binding form: separated (`-ExecutionPolicy Bypass`) or joined with
-/// `=`/`:` (PR #121 item 12), and the `-ep` / `-ex` aliases (PS accepts any
-/// unambiguous prefix; `-ex` appears in published payloads).
+/// `=`/`:` (PR #121 item 12), the `-ep` alias, and every unambiguous `-ex...`
+/// prefix PowerShell accepts for `-ExecutionPolicy`.
 fn has_execution_policy_bypass_flag(args: &[String], shell: ShellType) -> bool {
-    // Constant array (not chained `strip_prefix`) so the joined- and
-    // separated-form branches share the same names.
-    const FLAG_NAMES: &[&str] = &["-executionpolicy", "-ep", "-ex"];
-
     for (i, arg) in args.iter().enumerate() {
         let n = normalize_shell_token(arg.trim(), shell);
         let lower = n.to_ascii_lowercase();
+        let (name, joined_value) = split_powershell_parameter(&lower);
+        if !is_execution_policy_parameter(name) {
+            continue;
+        }
 
         // Joined form `-<flag>=Bypass` / `-<flag>:Bypass`: PS treats `:` and `=`
         // as equivalent. The colon form is favored in payloads because some
         // detectors only check `=` (PR #121 item 12 mandates both).
-        for flag in FLAG_NAMES {
-            for sep in ['=', ':'] {
-                let prefix = format!("{flag}{sep}");
-                if let Some(value) = lower.strip_prefix(&prefix) {
-                    if value.trim_matches(|c: char| c == '"' || c == '\'') == "bypass" {
-                        return true;
-                    }
-                }
+        if let Some(value) = joined_value {
+            if value.trim_matches(|c: char| c == '"' || c == '\'') == "bypass" {
+                return true;
             }
+            continue;
         }
 
         // Separated form `-<flag> Bypass` (value in args[i+1]).
-        if FLAG_NAMES.contains(&lower.as_str()) {
-            if let Some(next) = args.get(i + 1) {
-                let next_n = normalize_shell_token(next.trim(), shell);
-                if next_n.eq_ignore_ascii_case("bypass") {
-                    return true;
-                }
+        if let Some(next) = args.get(i + 1) {
+            let next_n = normalize_shell_token(next.trim(), shell);
+            if next_n.eq_ignore_ascii_case("bypass") {
+                return true;
             }
         }
     }
     false
+}
+
+fn split_powershell_parameter(parameter: &str) -> (&str, Option<&str>) {
+    let Some(separator) = parameter.find(['=', ':']) else {
+        return (parameter, None);
+    };
+    (&parameter[..separator], Some(&parameter[separator + 1..]))
+}
+
+fn is_execution_policy_parameter(parameter: &str) -> bool {
+    parameter == "-ep"
+        || (parameter.len() >= "-ex".len() && "-executionpolicy".starts_with(parameter))
 }
 
 /// Detect `Add-MpPreference -ExclusionPath|-ExclusionProcess|-ExclusionExtension`
@@ -169,21 +197,17 @@ fn check_defender_exclusion(
     findings: &mut Vec<Finding>,
 ) {
     for seg in segments {
-        let Some(ref cmd) = seg.command else { continue };
-        let cmd_base = normalize_cmd_base(cmd, shell);
+        let Some((cmd_base, args)) = effective_command(seg, shell) else {
+            continue;
+        };
         if cmd_base != "add-mppreference" {
             continue;
         }
 
-        let mentions_exclusion = seg.args.iter().any(|a| {
+        let mentions_exclusion = args.iter().any(|a| {
             let n = normalize_shell_token(a.trim(), shell).to_ascii_lowercase();
-            // Bare flag plus joined `=`/`:` forms. PR #121 item 12 adds the colon
-            // form (`-ExclusionPath:C:\...`), a payload shape that previously
-            // passed tier-3 with no finding.
-            const FLAGS: &[&str] = &["-exclusionpath", "-exclusionprocess", "-exclusionextension"];
-            FLAGS.iter().any(|f| {
-                n == *f || n.starts_with(&format!("{f}=")) || n.starts_with(&format!("{f}:"))
-            })
+            let (name, _) = split_powershell_parameter(&n);
+            is_unique_defender_exclusion_parameter(name)
         });
         if !mentions_exclusion {
             continue;
@@ -210,6 +234,16 @@ fn check_defender_exclusion(
     }
 }
 
+fn is_unique_defender_exclusion_parameter(parameter: &str) -> bool {
+    const PARAMETERS: &[&str] = &["-exclusionpath", "-exclusionprocess", "-exclusionextension"];
+    PARAMETERS
+        .iter()
+        .filter(|full_name| full_name.starts_with(parameter))
+        .take(2)
+        .count()
+        == 1
+}
+
 /// Detect inline `iex (iwr https://...)` where `iex`/`invoke-expression` LEADS
 /// the segment and an arg contains `://`.
 ///
@@ -231,8 +265,9 @@ fn check_inline_download_execute(
             }
         }
 
-        let Some(ref cmd) = seg.command else { continue };
-        let cmd_base = normalize_cmd_base(cmd, shell);
+        let Some((cmd_base, args)) = effective_command(seg, shell) else {
+            continue;
+        };
         // Match `iex (iwr ...)` (space before `(` → clean `iex` + arg) and
         // `iex(iwr ...)` (no space → the tokenizer pulls `(` into the command
         // token, e.g. `iex(iwr`). Both are identical to PowerShell.
@@ -247,7 +282,7 @@ fn check_inline_download_execute(
         // The URL may be in the args (whitespace form) or in the command token
         // itself (e.g. `iex(iwr,https://...)` pulls `://` into it). Scan both.
         let has_url_arg = cmd_base.contains("://")
-            || seg.args.iter().any(|a| {
+            || args.iter().any(|a| {
                 let n = normalize_shell_token(a.trim(), shell);
                 n.contains("://")
             });

@@ -378,13 +378,13 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         id: "ps_set_execution_policy",
         tier1_exec_fragments: &[
             r"(?i:Set-ExecutionPolicy)\b",
-            // PR #121 item 12: `-ex` is the shortest unambiguous prefix of
-            // `-ExecutionPolicy`; without it, `powershell -ex Bypass …` fast-exits
-            // at tier-1 before reaching the tier-3 rule.
-            r"-(?i:ExecutionPolicy|ep|ex)\b",
+            // PowerShell accepts every unambiguous `-ex...` prefix of
+            // `-ExecutionPolicy`. Keep tier 1 a conservative superset; tier 3
+            // performs the exact prefix and value validation.
+            r"(?i)-(?:ep|ex[a-z]*)(?:\b|[:=])",
         ],
         tier1_paste_only_fragments: &[],
-        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe -ExecutionPolicy / -ep / -ex flag form",
+        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe unambiguous -ExecutionPolicy prefixes / -ep alias",
     },
     PatternEntry {
         id: "ps_defender_exclusion",
