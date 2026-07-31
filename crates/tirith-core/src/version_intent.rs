@@ -357,6 +357,12 @@ impl ReleaseVersion {
         if segments.is_empty() {
             return None;
         }
+        // PEP 440 treats missing release segments as zero. Store a single
+        // canonical representation so derived Eq agrees with Ord and ordered
+        // collections observe one identity for `1.4`, `1.4.0`, and so on.
+        while segments.len() > 1 && segments.last() == Some(&0) {
+            segments.pop();
+        }
         Some(ReleaseVersion { segments })
     }
 }
@@ -534,6 +540,30 @@ mod tests {
         let a = ReleaseVersion::parse("1.4").unwrap();
         let b = ReleaseVersion::parse("1.4.0").unwrap();
         assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+        assert_eq!(a, b, "Eq must agree with Ord for trailing-zero forms");
+    }
+
+    #[test]
+    fn trailing_zero_versions_are_one_ordered_collection_key() {
+        // pr173-0028: ordered collections must observe the same identity as `==`.
+        let short = ReleaseVersion::parse("1.4").unwrap();
+        let padded = ReleaseVersion::parse("1.4.0.0").unwrap();
+        let mut versions = std::collections::BTreeSet::new();
+        assert!(versions.insert(short.clone()));
+        assert!(!versions.insert(padded.clone()));
+        assert_eq!(short, padded);
+        assert!(versions.contains(&padded));
+    }
+
+    #[test]
+    fn canonicalization_preserves_nonzero_ordering_and_zero_versions() {
+        // Legitimate controls: removing redundant trailing zeroes must not alter
+        // numeric ordering, and all-zero versions remain valid values.
+        assert!(ReleaseVersion::parse("1.4.1").unwrap() > ReleaseVersion::parse("1.4").unwrap());
+        assert_eq!(
+            ReleaseVersion::parse("0").unwrap(),
+            ReleaseVersion::parse("0.0.0").unwrap()
+        );
     }
 
     #[test]
