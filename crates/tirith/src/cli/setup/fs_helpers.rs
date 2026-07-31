@@ -2,9 +2,8 @@
 //! directory validation, CLI subprocess runner, and backup management.
 
 use std::ffi::{CStr, CString, OsStr};
-use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -196,12 +195,23 @@ struct StableFileState {
     digest: [u8; 32],
 }
 
-fn stable_state_at(parent: &fs::File, name: &CStr) -> Result<Option<StableFileState>, String> {
+fn open_stable_file_at(
+    parent: &fs::File,
+    name: &CStr,
+) -> Result<Option<(fs::File, StableFileState)>, String> {
+    open_stable_file_at_with_access(parent, name, libc::O_RDONLY)
+}
+
+fn open_stable_file_at_with_access(
+    parent: &fs::File,
+    name: &CStr,
+    access: libc::c_int,
+) -> Result<Option<(fs::File, StableFileState)>, String> {
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            access | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -235,12 +245,17 @@ fn stable_state_at(parent: &fs::File, name: &CStr) -> Result<Option<StableFileSt
     {
         return Err("publication identity changed while it was inspected".into());
     }
-    Ok(Some(StableFileState {
+    let state = StableFileState {
         identity: FileIdentity::from_metadata(&after),
         size: after.len(),
         mode: after.mode() & 0o7777,
         digest: Sha256::digest(&bytes).into(),
-    }))
+    };
+    Ok(Some((file, state)))
+}
+
+fn stable_state_at(parent: &fs::File, name: &CStr) -> Result<Option<StableFileState>, String> {
+    open_stable_file_at(parent, name).map(|opened| opened.map(|(_, state)| state))
 }
 
 fn stable_state_from_snapshot(snapshot: &PlatformSnapshot) -> Option<StableFileState> {
@@ -279,27 +294,6 @@ struct FileGeneration {
     changed_nanoseconds: i64,
 }
 
-fn metadata_at(parent: &fs::File, name: &CStr) -> Option<fs::Metadata> {
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return None;
-    }
-    let file = unsafe { fs::File::from_raw_fd(fd) };
-    file.metadata().ok().filter(|metadata| metadata.is_file())
-}
-
-fn name_has_identity(parent: &fs::File, name: &CStr, expected: &FileIdentity) -> bool {
-    metadata_at(parent, name)
-        .map(|metadata| FileIdentity::from_metadata(&metadata) == *expected)
-        .unwrap_or(false)
-}
-
 fn exchange_names(parent: &fs::File, left: &CStr, right: &CStr) -> Result<(), String> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let result = unsafe {
@@ -328,6 +322,48 @@ fn exchange_names(parent: &fs::File, left: &CStr, right: &CStr) -> Result<(), St
         target_os = "ios"
     )))]
     return Err("this Unix platform has no atomic pathname-exchange API".into());
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    if result < 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn move_no_replace(parent: &fs::File, source: &CStr, destination: &CStr) -> Result<(), String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    return Err("this Unix platform has no atomic no-replace rename API".into());
 
     #[cfg(any(
         target_os = "linux",
@@ -521,74 +557,48 @@ pub fn atomic_write(
     Ok(())
 }
 
-fn stable_lock_name(destination: &CStr) -> CString {
-    let digest = Sha256::digest(destination.to_bytes());
-    let mut name = String::from(".tirith-setup-lock-");
-    for byte in digest {
-        let _ = write!(&mut name, "{byte:02x}");
+fn open_lock_anchor(scope_root: &Path) -> Result<fs::File, String> {
+    let mut anchor = absolute(scope_root)?;
+    while !anchor.exists() {
+        if !anchor.pop() {
+            return Err(format!(
+                "cannot find existing setup lock anchor for {}",
+                scope_root.display()
+            ));
+        }
     }
-    CString::new(name).expect("hex lock name contains no NUL")
+    let canonical = anchor
+        .canonicalize()
+        .map_err(|error| format!("canonicalize setup lock anchor: {error}"))?;
+    open_dir(&canonical)
 }
 
-fn open_lock_file(parent: &ScopedParent) -> Result<fs::File, String> {
-    let name = stable_lock_name(&parent.name);
-    let fd = (0..3)
-        .find_map(|attempt| {
-            let fd = unsafe {
-                libc::openat(
-                    parent.dir.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDWR
-                        | libc::O_CREAT
-                        | libc::O_NONBLOCK
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o600,
-                )
-            };
-            if fd >= 0 {
-                return Some(Ok(fd));
-            }
-            let error = std::io::Error::last_os_error();
-            let transient = error.kind() == std::io::ErrorKind::Interrupted
-                || error.kind() == std::io::ErrorKind::NotFound;
-            if transient && attempt < 2 {
-                std::thread::yield_now();
-                None
-            } else {
-                Some(Err(error))
-            }
-        })
-        .expect("bounded lock-open loop returns on its final attempt")
-        .map_err(|error| format!("open stable setup lock without following links: {error}"))?;
-    let file = unsafe { fs::File::from_raw_fd(fd) };
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("inspect stable setup lock: {error}"))?;
-    if !metadata.is_file() {
-        return Err("stable setup lock is not a regular file — refusing for safety".into());
-    }
-    Ok(file)
-}
-
-fn open_lock(parent: &ScopedParent) -> Result<fs::File, String> {
-    let file = open_lock_file(parent)?;
-    file.lock_exclusive()
-        .map_err(|error| format!("lock setup destination: {error}"))?;
-    Ok(file)
+pub(crate) struct PlatformLock {
+    _anchor: fs::File,
 }
 
 pub(crate) struct PlatformTransaction {
     parent: ScopedParent,
     path: PathBuf,
-    _lock: fs::File,
+    _lock: PlatformLock,
 }
 
 impl PlatformTransaction {
-    pub(crate) fn begin(path: &Path, scope_root: &Path) -> Result<Self, String> {
+    pub(crate) fn lock(_path: &Path, scope_root: &Path) -> Result<PlatformLock, String> {
+        let anchor = open_lock_anchor(scope_root)?;
+        anchor
+            .lock_exclusive()
+            .map_err(|error| format!("lock setup scope without creating a lock file: {error}"))?;
+        Ok(PlatformLock { _anchor: anchor })
+    }
+
+    pub(crate) fn begin(
+        path: &Path,
+        scope_root: &Path,
+        lock: PlatformLock,
+    ) -> Result<Self, String> {
         let parent = scoped_parent(path, scope_root, true)?
             .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
-        let lock = open_lock(&parent)?;
         Ok(Self {
             parent,
             path: path.to_path_buf(),
@@ -597,10 +607,8 @@ impl PlatformTransaction {
     }
 
     #[cfg(test)]
-    fn lock_is_contended(path: &Path, scope_root: &Path) -> Result<bool, String> {
-        let parent = scoped_parent(path, scope_root, true)?
-            .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
-        let file = open_lock_file(&parent)?;
+    fn lock_is_contended(_path: &Path, scope_root: &Path) -> Result<bool, String> {
+        let file = open_lock_anchor(scope_root)?;
         match file.try_lock_exclusive() {
             Ok(()) => {
                 let _ = fs2::FileExt::unlock(&file);
@@ -661,17 +669,9 @@ impl PlatformTransaction {
             parent: &self.parent.dir,
             name,
             file: Some(unsafe { fs::File::from_raw_fd(fd) }),
-            identity: None,
             state: None,
             armed: true,
         };
-        let created_metadata = guard
-            .file
-            .as_ref()
-            .expect("new temp owns file")
-            .metadata()
-            .map_err(|error| format!("inspect new temporary file: {error}"))?;
-        guard.identity = Some(FileIdentity::from_metadata(&created_metadata));
         let file = guard.file.as_mut().expect("new temp owns file");
         file.write_all(bytes)
             .map_err(|error| format!("write temporary file: {error}"))?;
@@ -700,7 +700,7 @@ impl PlatformTransaction {
         mut temp: TempGuard<'_>,
         expected: &PlatformSnapshot,
         #[cfg(test)] test_hook: &mut impl FnMut(super::fs_transaction::TestStage) -> Result<(), String>,
-    ) -> Result<PublicationOutcome, String> {
+    ) -> Result<PublicationGuard<'_>, String> {
         let expected_exists = expected.bytes.is_some();
         let private_path = self
             .path
@@ -709,12 +709,51 @@ impl PlatformTransaction {
             .join(OsStr::from_bytes(temp.name.to_bytes()));
         temp.validate_name()?;
         self.validate_snapshot(expected)?;
+        let expected_state = stable_state_from_snapshot(expected);
+        let held_original = if let Some(expected_state) = expected_state.as_ref() {
+            Some(
+                match open_stable_file_at_with_access(
+                    &self.parent.dir,
+                    &self.parent.name,
+                    libc::O_RDWR,
+                ) {
+                    Ok(Some(held)) if &held.1 == expected_state => held,
+                    Ok(Some(_)) => {
+                        return Err(format!(
+                            "{} changed before its recovery identity could be held",
+                            self.path.display()
+                        ))
+                    }
+                    Ok(None) => {
+                        return Err(format!(
+                            "{} disappeared before its recovery identity could be held",
+                            self.path.display()
+                        ))
+                    }
+                    Err(write_error) => {
+                        // A read-only original can still be retained exactly; it
+                        // simply cannot be scrubbed after the durability gate.
+                        match open_stable_file_at(&self.parent.dir, &self.parent.name) {
+                        Ok(Some(held)) if &held.1 == expected_state => held,
+                        observed => {
+                            return Err(format!(
+                                "hold exact original {} for recovery ({write_error}); read-only fallback was {observed:?}",
+                                self.path.display()
+                            ))
+                        }
+                    }
+                    }
+                },
+            )
+        } else {
+            None
+        };
         #[cfg(test)]
         test_hook(super::fs_transaction::TestStage::PublicationReady)?;
 
         if expected_exists {
-            let expected_state =
-                stable_state_from_snapshot(expected).expect("existing snapshot has a stable state");
+            let expected_state = expected_state.expect("existing snapshot has a stable state");
+            let held_original = held_original.expect("existing snapshot has a held original");
 
             // An atomic exchange retains both pathname operands. That lets us
             // prove *after the syscall* that the installed inode is our exact
@@ -727,27 +766,40 @@ impl PlatformTransaction {
                     self.path.display()
                 )
             })?;
+            let recovery = RecoveryIdentity {
+                parent: &self.parent.dir,
+                name: temp.name.clone(),
+                display_path: private_path.clone(),
+                file: held_original.0,
+                state: expected_state.clone(),
+            };
 
             let installed = match stable_state_at(&self.parent.dir, &self.parent.name) {
                 Ok(state) => state,
                 Err(error) => {
                     temp.armed = false;
-                    return Ok(PublicationOutcome::RecoveryRequired(format!(
-                        "published {} but could not verify the installed identity ({error}); retained the private entry at {} for manual recovery",
-                        self.path.display(),
-                        private_path.display()
-                    )));
+                    return Ok(PublicationGuard::uncertain(
+                        format!(
+                            "published {} but could not verify the installed identity ({error}); retained the private entry at {} for manual recovery",
+                            self.path.display(),
+                            private_path.display()
+                        ),
+                        Some(recovery),
+                    ));
                 }
             };
             let displaced = match stable_state_at(&self.parent.dir, &temp.name) {
                 Ok(state) => state,
                 Err(error) => {
                     temp.armed = false;
-                    return Ok(PublicationOutcome::RecoveryRequired(format!(
-                        "published {} but could not verify its displaced identity at {} ({error}); retained both names for manual recovery",
-                        self.path.display(),
-                        private_path.display()
-                    )));
+                    return Ok(PublicationGuard::uncertain(
+                        format!(
+                            "published {} but could not verify its displaced identity at {} ({error}); retained both names for manual recovery",
+                            self.path.display(),
+                            private_path.display()
+                        ),
+                        Some(recovery),
+                    ));
                 }
             };
             let installed_matches = installed.as_ref() == temp.state.as_ref();
@@ -777,121 +829,118 @@ impl PlatformTransaction {
                     }
                 }
                 temp.armed = false;
-                return Ok(PublicationOutcome::RecoveryRequired(format!(
-                    "{} or its prepared replacement changed at publication and rollback could not be proven; retained destination identity {:?} and private identity {:?} at {} for manual recovery",
-                    self.path.display(),
-                    installed,
-                    displaced,
-                    private_path.display()
-                )));
-            }
-
-            // The old destination now has the private temporary name. Remove
-            // it only while that name still identifies the generation proved
-            // above. A mismatch is retained rather than deleting another
-            // writer's file.
-            let cleanup_state = stable_state_at(&self.parent.dir, &temp.name);
-            if cleanup_state
-                .as_ref()
-                .is_ok_and(|state| state.as_ref() == Some(&expected_state))
-            {
-                if unsafe { libc::unlinkat(self.parent.dir.as_raw_fd(), temp.name.as_ptr(), 0) } < 0
-                {
-                    let error = std::io::Error::last_os_error();
-                    let observed = stable_state_at(&self.parent.dir, &temp.name);
-                    temp.armed = false;
-                    return Ok(PublicationOutcome::RecoveryRequired(format!(
-                        "published {} but could not remove its displaced private entry at {} ({error}); observed identity state {:?}, manual recovery required",
+                return Ok(PublicationGuard::uncertain(
+                    format!(
+                        "{} or its prepared replacement changed at publication and rollback could not be proven; retained destination identity {:?} and private identity {:?} at {} for manual recovery",
                         self.path.display(),
-                        private_path.display(),
-                        observed
-                    )));
-                }
-            } else {
-                temp.armed = false;
-                return Ok(PublicationOutcome::RecoveryRequired(format!(
-                    "published {} but the displaced private entry at {} could not be safely validated before cleanup ({:?}); retained it for manual recovery",
-                    self.path.display(),
-                    private_path.display(),
-                    cleanup_state
-                )));
-            }
-            temp.armed = false;
-        } else {
-            // `linkat` is an atomic no-replace publication for an expected-
-            // absent destination. It closes the check/rename overwrite race.
-            let linked = unsafe {
-                libc::linkat(
-                    self.parent.dir.as_raw_fd(),
-                    temp.name.as_ptr(),
-                    self.parent.dir.as_raw_fd(),
-                    self.parent.name.as_ptr(),
-                    0,
-                )
-            };
-            if linked < 0 {
-                return Err(format!(
-                    "publish {} atomically without replacement: {}",
-                    self.path.display(),
-                    std::io::Error::last_os_error()
+                        installed,
+                        displaced,
+                        private_path.display()
+                    ),
+                    Some(recovery),
                 ));
             }
+
+            // Hold the exact displaced inode through the shared directory
+            // fsync. Unix has no pathname-CAS unlink, so cleanup is never a
+            // check-then-unlink: the durable commit retains this recovery
+            // identity (or materializes it from this handle if its name moves).
+            let recovery = match stable_state_at(&self.parent.dir, &temp.name) {
+                Ok(Some(state)) if state == expected_state && recovery.state == state => recovery,
+                observed => {
+                    temp.armed = false;
+                    return Ok(PublicationGuard::uncertain(
+                        format!(
+                            "published {} but could not retain the exact displaced identity ({observed:?}); private recovery name is {}",
+                            self.path.display(),
+                            private_path.display()
+                        ),
+                        Some(recovery),
+                    ));
+                }
+            };
+            let installed = RecoveryIdentity {
+                parent: &self.parent.dir,
+                name: self.parent.name.clone(),
+                display_path: self.path.clone(),
+                file: temp.file.take().expect("prepared temp handle remains held"),
+                state: temp.state.clone().expect("prepared temp has stable state"),
+            };
+            temp.armed = false;
+            Ok(PublicationGuard::with_recovery(recovery, installed))
+        } else {
+            // Move the prepared name atomically with no-replace semantics.
+            // Unlike link+unlink, this leaves no duplicate name requiring an
+            // unsafe check-then-path-delete cleanup.
+            move_no_replace(&self.parent.dir, &temp.name, &self.parent.name).map_err(|error| {
+                format!(
+                    "publish {} atomically without replacement: {error}",
+                    self.path.display()
+                )
+            })?;
             let installed = match stable_state_at(&self.parent.dir, &self.parent.name) {
                 Ok(state) => state,
                 Err(error) => {
+                    let recovery = RecoveryIdentity {
+                        parent: &self.parent.dir,
+                        name: self.parent.name.clone(),
+                        display_path: self.path.clone(),
+                        file: temp.file.take().expect("prepared temp handle remains held"),
+                        state: temp.state.clone().expect("prepared temp has stable state"),
+                    };
                     temp.armed = false;
-                    return Ok(PublicationOutcome::RecoveryRequired(format!(
-                        "published new destination {} but could not verify its identity ({error}); retained private link {} for manual recovery",
-                        self.path.display(),
-                        private_path.display()
-                    )));
+                    return Ok(PublicationGuard::uncertain(
+                        format!(
+                            "published new destination {} but could not verify its identity ({error}); prepared identity remains held for recovery",
+                            self.path.display(),
+                        ),
+                        Some(recovery),
+                    ));
                 }
             };
             if installed.as_ref() != temp.state.as_ref() {
-                // A same-user writer replaced the source name between the
-                // validation and link. Remove only the extra hard-link to that
-                // still-present identity; never touch its source name.
-                let source = stable_state_at(&self.parent.dir, &temp.name);
-                let mut removed = false;
-                if source.as_ref().is_ok_and(|state| state == &installed) {
-                    removed = unsafe {
-                        libc::unlinkat(self.parent.dir.as_raw_fd(), self.parent.name.as_ptr(), 0)
-                    } == 0;
-                }
-                let live_destination = stable_state_at(&self.parent.dir, &self.parent.name);
-                if removed && live_destination.as_ref().is_ok_and(Option::is_none) {
+                // Roll back with another no-replace rename. No pathname is
+                // ever deleted, even when the prepared source was swapped.
+                if move_no_replace(&self.parent.dir, &self.parent.name, &temp.name).is_ok()
+                    && stable_state_at(&self.parent.dir, &self.parent.name)
+                        .as_ref()
+                        .is_ok_and(Option::is_none)
+                    && stable_state_at(&self.parent.dir, &temp.name)
+                        .as_ref()
+                        .is_ok_and(|state| state == &installed)
+                {
                     return Err(format!(
-                        "prepared replacement for {} changed at publication; removed the wrong identity and published nothing",
+                        "prepared replacement for {} changed at publication; restored the moved identity and published nothing",
                         self.path.display()
                     ));
                 }
+                let recovery = RecoveryIdentity {
+                    parent: &self.parent.dir,
+                    name: self.parent.name.clone(),
+                    display_path: self.path.clone(),
+                    file: temp.file.take().expect("prepared temp handle remains held"),
+                    state: temp.state.clone().expect("prepared temp has stable state"),
+                };
                 temp.armed = false;
-                return Ok(PublicationOutcome::RecoveryRequired(format!(
-                    "prepared replacement for {} changed during publication; rollback could not be proven (source {:?}, destination {:?}); retained private entry {} for manual recovery",
-                    self.path.display(),
-                    source,
-                    live_destination,
-                    private_path.display()
-                )));
+                return Ok(PublicationGuard::uncertain(
+                    format!(
+                        "prepared replacement for {} changed during publication; rollback could not be proven (destination {:?}); retained both names for manual recovery",
+                        self.path.display(),
+                        stable_state_at(&self.parent.dir, &self.parent.name)
+                    ),
+                    Some(recovery),
+                ));
             }
-            if unsafe { libc::unlinkat(self.parent.dir.as_raw_fd(), temp.name.as_ptr(), 0) } == 0 {
-                temp.armed = false;
-            } else {
-                // The destination is already visible, so the shared layer must
-                // still fsync the parent. Do not let Drop's best-effort cleanup
-                // turn an unresolved private name into a reported success.
-                let error = std::io::Error::last_os_error();
-                let observed = stable_state_at(&self.parent.dir, &temp.name);
-                temp.armed = false;
-                return Ok(PublicationOutcome::RecoveryRequired(format!(
-                    "published {} but could not remove its private temporary link at {} ({error}); observed identity state {:?}, manual recovery required",
-                    self.path.display(),
-                    private_path.display(),
-                    observed
-                )));
-            }
+            let installed = RecoveryIdentity {
+                parent: &self.parent.dir,
+                name: self.parent.name.clone(),
+                display_path: self.path.clone(),
+                file: temp.file.take().expect("prepared temp handle remains held"),
+                state: temp.state.clone().expect("prepared temp has stable state"),
+            };
+            temp.armed = false;
+            Ok(PublicationGuard::clean(installed))
         }
-        Ok(PublicationOutcome::Clean)
     }
 
     pub(crate) fn sync_parent(&self) -> Result<(), String> {
@@ -901,10 +950,7 @@ impl PlatformTransaction {
             .map_err(|error| format!("sync destination directory after publication: {error}"))
     }
 
-    pub(crate) fn create_backup<'a>(
-        &'a self,
-        snapshot: &PlatformSnapshot,
-    ) -> Result<BackupGuard<'a>, String> {
+    pub(crate) fn create_backup(&self, snapshot: &PlatformSnapshot) -> Result<BackupGuard, String> {
         let bytes = snapshot
             .bytes
             .as_deref()
@@ -939,20 +985,10 @@ impl PlatformTransaction {
             .unwrap_or_else(|| Path::new("."))
             .join(OsStr::from_bytes(name.to_bytes()));
         let mut guard = BackupGuard {
-            parent: &self.parent.dir,
-            name,
             display_path,
             file: Some(unsafe { fs::File::from_raw_fd(fd) }),
-            identity: None,
             armed: true,
         };
-        let created_metadata = guard
-            .file
-            .as_ref()
-            .expect("new backup owns file")
-            .metadata()
-            .map_err(|error| format!("inspect new backup: {error}"))?;
-        guard.identity = Some(FileIdentity::from_metadata(&created_metadata));
         let file = guard.file.as_mut().expect("new backup owns file");
         file.write_all(bytes)
             .map_err(|error| format!("write backup from locked snapshot: {error}"))?;
@@ -977,55 +1013,224 @@ impl PlatformTransaction {
         Ok(guard)
     }
 
-    pub(crate) fn cleanup_old_backups(&self, keep: Option<&BackupGuard<'_>>) -> Result<(), String> {
-        let prefix = [self.parent.name.to_bytes(), b".tirith-backup-"].concat();
-        let entries = directory_entries(&self.parent.dir)?;
-        let keep_present = keep.is_some_and(|guard| {
-            entries
-                .iter()
-                .any(|name| name.as_c_str() == guard.name.as_c_str())
-        });
-        let mut backups = entries
-            .into_iter()
-            .filter(|name| {
-                name.to_bytes().starts_with(&prefix)
-                    && keep.is_none_or(|guard| name.as_c_str() != guard.name.as_c_str())
-            })
-            .collect::<Vec<_>>();
-        backups.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        let keep_slots = usize::from(keep_present);
-        let remove_count = backups.len().saturating_sub(5 - keep_slots);
-        let mut removed = false;
-        for old in &backups[..remove_count] {
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            let status = unsafe {
-                libc::fstatat(
-                    self.parent.dir.as_raw_fd(),
-                    old.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if status < 0 || unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
-                continue;
-            }
-            if unsafe { libc::unlinkat(self.parent.dir.as_raw_fd(), old.as_ptr(), 0) } == 0 {
-                removed = true;
-            } else {
-                eprintln!(
-                    "tirith: could not clean old backup {}: {}",
-                    old.to_string_lossy(),
-                    std::io::Error::last_os_error()
-                );
-            }
+    pub(crate) fn cleanup_old_backups(&self, _keep: Option<&BackupGuard>) -> Result<(), String> {
+        // A previous-run backup pathname has no live capability tying it to
+        // the file Tirith originally created. Never turn a pathname check into
+        // a later unlink: cleanup is restricted to guards that still hold the
+        // exact file handle, and those guards scrub through that handle.
+        Ok(())
+    }
+}
+
+struct RecoveryIdentity<'a> {
+    parent: &'a fs::File,
+    name: CString,
+    display_path: PathBuf,
+    file: fs::File,
+    state: StableFileState,
+}
+
+impl RecoveryIdentity<'_> {
+    fn scrub_exact(&mut self) -> Result<(), String> {
+        self.file
+            .set_len(0)
+            .map_err(|error| format!("scrub exact displaced identity: {error}"))?;
+        if unsafe { libc::fchmod(self.file.as_raw_fd(), 0o600) } < 0 {
+            eprintln!(
+                "tirith: could not restrict scrubbed displaced identity: {}",
+                std::io::Error::last_os_error()
+            );
         }
-        if removed {
-            self.parent
-                .dir
-                .sync_all()
-                .map_err(|error| format!("sync backup retention changes: {error}"))?;
+        if let Err(error) = self.file.sync_all() {
+            eprintln!("tirith: could not sync scrubbed displaced identity: {error}");
         }
         Ok(())
+    }
+
+    fn materialize_copy(&mut self) -> Result<PathBuf, String> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("seek exact displaced recovery identity: {error}"))?;
+        let mut bytes = Vec::with_capacity(self.state.size as usize);
+        (&mut self.file)
+            .take(super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read exact displaced recovery identity: {error}"))?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if bytes.len() as u64 != self.state.size || digest != self.state.digest {
+            return Err("exact displaced recovery identity changed while held".into());
+        }
+
+        let name = CString::new(format!(
+            ".tirith-recovery-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .expect("UUID recovery name contains no NUL");
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "create exclusive recovery copy: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut copy = unsafe { fs::File::from_raw_fd(fd) };
+        let write_result = (|| {
+            copy.write_all(&bytes)
+                .map_err(|error| format!("write exact recovery copy: {error}"))?;
+            if unsafe { libc::fchmod(copy.as_raw_fd(), self.state.mode as libc::mode_t) } < 0 {
+                return Err(format!(
+                    "set exact recovery-copy permissions: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            copy.sync_all()
+                .map_err(|error| format!("sync exact recovery copy: {error}"))?;
+            self.parent
+                .sync_all()
+                .map_err(|error| format!("sync exact recovery-copy directory entry: {error}"))
+        })();
+        if let Err(error) = write_result {
+            let _ = copy.set_len(0);
+            let _ = copy.sync_all();
+            return Err(error);
+        }
+        Ok(self
+            .display_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(OsStr::from_bytes(name.to_bytes())))
+    }
+
+    fn ensure_recovery_path(&mut self) -> Result<PathBuf, String> {
+        if stable_state_at(self.parent, &self.name)
+            .as_ref()
+            .is_ok_and(|state| state.as_ref() == Some(&self.state))
+        {
+            Ok(self.display_path.clone())
+        } else {
+            self.materialize_copy()
+        }
+    }
+}
+
+pub(crate) struct PublicationGuard<'a> {
+    installed: Option<RecoveryIdentity<'a>>,
+    recovery: Option<RecoveryIdentity<'a>>,
+    terminal_error: Option<String>,
+}
+
+impl<'a> PublicationGuard<'a> {
+    fn clean(installed: RecoveryIdentity<'a>) -> Self {
+        Self {
+            installed: Some(installed),
+            recovery: None,
+            terminal_error: None,
+        }
+    }
+
+    fn with_recovery(recovery: RecoveryIdentity<'a>, installed: RecoveryIdentity<'a>) -> Self {
+        Self {
+            installed: Some(installed),
+            recovery: Some(recovery),
+            terminal_error: None,
+        }
+    }
+
+    fn uncertain(message: String, recovery: Option<RecoveryIdentity<'a>>) -> Self {
+        Self {
+            installed: None,
+            recovery,
+            terminal_error: Some(message),
+        }
+    }
+
+    pub(crate) fn retain_for_recovery(&mut self) -> String {
+        let installed = self.installed.as_mut().map(|identity| {
+            identity
+                .ensure_recovery_path()
+                .map(|path| format!("retained exact installed identity at {}", path.display()))
+                .unwrap_or_else(|error| {
+                    format!("could not materialize installed recovery: {error}")
+                })
+        });
+        let exact = self.recovery.as_mut().map(|recovery| {
+            recovery
+                .ensure_recovery_path()
+                .map(|path| format!("retained exact displaced recovery at {}", path.display()))
+                .unwrap_or_else(|error| {
+                    format!("could not materialize displaced recovery: {error}")
+                })
+        });
+        match (&self.terminal_error, exact, installed) {
+            (Some(error), Some(recovery), Some(installed)) => {
+                format!("{error}; {recovery}; {installed}")
+            }
+            (Some(error), Some(recovery), None) => format!("{error}; {recovery}"),
+            (Some(error), None, Some(installed)) => format!("{error}; {installed}"),
+            (Some(error), None, None) => error.clone(),
+            (None, Some(recovery), Some(installed)) => format!("{recovery}; {installed}"),
+            (None, Some(recovery), None) => recovery,
+            (None, None, Some(installed)) => installed,
+            (None, None, None) => "new destination has no recovery identity".into(),
+        }
+    }
+
+    pub(crate) fn finish_after_durability(mut self) -> Result<PublicationOutcome, String> {
+        if let Some(error) = self.terminal_error.take() {
+            let recovery = self.recovery.as_mut().map(|identity| {
+                identity
+                    .ensure_recovery_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|copy_error| format!("unavailable ({copy_error})"))
+            });
+            return Err(match recovery {
+                Some(path) => format!("{error}; exact recovery: {path}"),
+                None => error,
+            });
+        }
+        if let Some(installed) = self.installed.as_mut() {
+            let live = stable_state_at(installed.parent, &installed.name);
+            if live.as_ref().is_err()
+                || live.as_ref().ok().and_then(Option::as_ref) != Some(&installed.state)
+            {
+                let installed_recovery = installed
+                    .ensure_recovery_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|error| format!("unavailable ({error})"));
+                let displaced_recovery = self.recovery.as_mut().map(|identity| {
+                    identity
+                        .ensure_recovery_path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|error| format!("unavailable ({error})"))
+                });
+                return Err(match displaced_recovery {
+                    Some(displaced) => format!(
+                        "installed destination identity changed before transaction completion; installed recovery: {installed_recovery}; displaced recovery: {displaced}"
+                    ),
+                    None => format!(
+                        "installed destination identity changed before transaction completion; installed recovery: {installed_recovery}"
+                    ),
+                });
+            }
+        }
+        let Some(recovery) = self.recovery.as_mut() else {
+            return Ok(PublicationOutcome::Clean);
+        };
+        if recovery.scrub_exact().is_ok() {
+            return Ok(PublicationOutcome::Clean);
+        }
+        let path = recovery.ensure_recovery_path()?;
+        Ok(PublicationOutcome::RecoveryRetained(format!(
+            "durable update retained the exact displaced original at {} because Unix has no identity-bound pathname deletion primitive",
+            path.display()
+        )))
     }
 }
 
@@ -1033,7 +1238,6 @@ pub(crate) struct TempGuard<'a> {
     parent: &'a fs::File,
     name: CString,
     file: Option<fs::File>,
-    identity: Option<FileIdentity>,
     state: Option<StableFileState>,
     armed: bool,
 }
@@ -1056,28 +1260,26 @@ impl TempGuard<'_> {
 
 impl Drop for TempGuard<'_> {
     fn drop(&mut self) {
-        self.file.take();
-        if self.armed
-            && self
-                .identity
-                .as_ref()
-                .is_some_and(|identity| name_has_identity(self.parent, &self.name, identity))
-        {
-            let _ = unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
+        if self.armed {
+            // Scrub only the inode represented by our held capability. If an
+            // attacker swaps the pathname, their file is never selected for
+            // cleanup. The zero-length tombstone is intentionally retained.
+            if let Some(file) = self.file.as_mut() {
+                let _ = file.set_len(0);
+                let _ = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+                let _ = file.sync_all();
+            }
         }
     }
 }
 
-pub(crate) struct BackupGuard<'a> {
-    parent: &'a fs::File,
-    name: CString,
+pub(crate) struct BackupGuard {
     display_path: PathBuf,
     file: Option<fs::File>,
-    identity: Option<FileIdentity>,
     armed: bool,
 }
 
-impl BackupGuard<'_> {
+impl BackupGuard {
     pub(crate) fn commit(&mut self) {
         self.armed = false;
         eprintln!("tirith: backup at {}", self.path().display());
@@ -1093,50 +1295,18 @@ impl BackupGuard<'_> {
     }
 }
 
-impl Drop for BackupGuard<'_> {
+impl Drop for BackupGuard {
     fn drop(&mut self) {
-        self.file.take();
-        if self.armed
-            && self
-                .identity
-                .as_ref()
-                .is_some_and(|identity| name_has_identity(self.parent, &self.name, identity))
-        {
-            let _ = unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
-            let _ = self.parent.sync_all();
+        if self.armed {
+            // As with temporary cleanup, scrub the exact held inode rather
+            // than deleting whichever object later occupies the pathname.
+            if let Some(file) = self.file.as_mut() {
+                let _ = file.set_len(0);
+                let _ = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+                let _ = file.sync_all();
+            }
         }
     }
-}
-
-fn directory_entries(parent: &fs::File) -> Result<Vec<CString>, String> {
-    let duplicate = unsafe { libc::dup(parent.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(format!(
-            "duplicate backup-directory handle: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let directory = unsafe { libc::fdopendir(duplicate) };
-    if directory.is_null() {
-        unsafe { libc::close(duplicate) };
-        return Err(format!(
-            "enumerate backup directory: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let mut entries = Vec::new();
-    loop {
-        let entry = unsafe { libc::readdir(directory) };
-        if entry.is_null() {
-            break;
-        }
-        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if let Ok(name) = CString::new(bytes) {
-            entries.push(name);
-        }
-    }
-    unsafe { libc::closedir(directory) };
-    Ok(entries)
 }
 
 /// Write a hook script with executable permissions.
@@ -1198,7 +1368,7 @@ pub fn write_hook_script(
             "[dry-run] would correct {} permissions to mode 0755",
             path.display()
         ),
-        (Action::FixMode, TransactionOutcome::Written) => eprintln!(
+        (Action::FixMode, outcome) if outcome.was_written() => eprintln!(
             "tirith: {} already configured, fixed permissions",
             path.display()
         ),
@@ -1211,7 +1381,7 @@ pub fn write_hook_script(
             path.display(),
             content.len()
         ),
-        (Action::Write, TransactionOutcome::Written) => {
+        (Action::Write, outcome) if outcome.was_written() => {
             eprintln!("tirith: wrote {}", path.display())
         }
         _ => {}
@@ -1376,6 +1546,13 @@ mod tests {
                 name.starts_with(".tirith-setup-") && name.ends_with(".tmp")
             })
             .map(|entry| entry.path())
+            .collect()
+    }
+
+    fn nonempty(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+        paths
+            .into_iter()
+            .filter(|path| fs::metadata(path).is_ok_and(|metadata| metadata.len() != 0))
             .collect()
     }
 
@@ -1589,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn same_second_backups_are_unique_and_retention_keeps_five() {
+    fn same_second_backups_are_unique_without_unsafe_path_pruning() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -1600,7 +1777,7 @@ mod tests {
             update_with_backup(&path, dir.path(), &format!("value-{index}")).unwrap();
         }
         let retained = backup_paths(dir.path());
-        assert_eq!(retained.len(), 5);
+        assert_eq!(retained.len(), 8);
         assert!(retained
             .iter()
             .any(|backup| fs::read_to_string(backup).unwrap() == "value-4"));
@@ -1731,6 +1908,37 @@ mod tests {
     }
 
     #[test]
+    fn drifted_transform_is_recomputed_and_capped_before_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "base").unwrap();
+        let oversized = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
+        let error = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |snapshot| {
+                if snapshot.text(&path)? == Some("base") {
+                    Ok(FileUpdate::write_text("small".into(), 0o600).with_backup(true))
+                } else {
+                    Ok(FileUpdate::write_text(oversized.clone(), 0o600).with_backup(true))
+                }
+            },
+            |stage| {
+                if stage == TestStage::PreflightReady {
+                    fs::write(&path, "drift").unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("setup file limit"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "drift");
+        assert!(backup_paths(root.path()).is_empty());
+        assert!(temporary_setup_paths(root.path()).is_empty());
+    }
+
+    #[test]
     fn transformed_payload_rejects_cap_plus_one_in_dry_run_without_side_effects() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("missing").join("too-large.json");
@@ -1764,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn non_cooperating_generation_change_is_rejected_and_temp_is_removed() {
+    fn non_cooperating_generation_change_is_rejected_and_temp_is_scrubbed() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -1781,19 +1989,7 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("changed while setup"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "editor-change");
-        assert!(!fs::read_dir(root.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".tirith-setup-")
-                    && !entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".tirith-setup-lock-")
-            }));
+        assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
     }
 
     #[test]
@@ -1860,7 +2056,7 @@ mod tests {
             FileIdentity::from_metadata(&fs::metadata(&original_hold).unwrap()),
             original_identity
         );
-        assert!(temporary_setup_paths(root.path()).is_empty());
+        assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
     }
 
     #[test]
@@ -1906,7 +2102,7 @@ mod tests {
             FileIdentity::from_metadata(&fs::metadata(attacker_path).unwrap()),
             attacker_identity.unwrap()
         );
-        assert_eq!(fs::read_to_string(&held_prepared).unwrap(), "tirith-update");
+        assert_eq!(fs::read_to_string(&held_prepared).unwrap(), "");
         assert_eq!(
             FileIdentity::from_metadata(&fs::metadata(held_prepared).unwrap()),
             prepared_identity.unwrap()
@@ -1950,24 +2146,12 @@ mod tests {
             },
         );
         assert!(result.is_err());
-        assert!(backup_paths(root.path()).is_empty());
-        assert!(!fs::read_dir(root.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".tirith-setup-")
-                    && !entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".tirith-setup-lock-")
-            }));
+        assert!(nonempty(backup_paths(root.path())).is_empty());
+        assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
     }
 
     #[test]
-    fn failure_after_temp_sync_removes_temp_and_transaction_backup() {
+    fn failure_after_temp_sync_scrubs_temp_and_transaction_backup() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -1985,7 +2169,42 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("injected failure"));
         assert_eq!(fs::read_to_string(path).unwrap(), "before");
-        assert!(backup_paths(root.path()).is_empty());
+        assert!(nonempty(backup_paths(root.path())).is_empty());
+        assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
+    }
+
+    #[test]
+    fn swapped_backup_cleanup_scrubs_only_the_held_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let held_backup = root.path().join("held-original-backup");
+        fs::write(&path, "before-secret").unwrap();
+        let mut attacker_backup = None;
+
+        let error = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o644).with_backup(true)),
+            |stage| {
+                if stage == TestStage::TempSynced {
+                    let backup = backup_paths(root.path()).pop().unwrap();
+                    fs::rename(&backup, &held_backup).unwrap();
+                    fs::write(&backup, "attacker-backup").unwrap();
+                    attacker_backup = Some(backup);
+                    return Err("injected failure after backup swap".into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected failure"));
+        assert_eq!(
+            fs::read_to_string(attacker_backup.unwrap()).unwrap(),
+            "attacker-backup"
+        );
+        assert_eq!(fs::read_to_string(held_backup).unwrap(), "");
+        assert_eq!(fs::read_to_string(path).unwrap(), "before-secret");
     }
 
     #[test]
@@ -2007,6 +2226,32 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("durability"));
         assert_eq!(fs::read_to_string(path).unwrap(), "after");
+        assert_eq!(backup_paths(root.path()).len(), 1);
+    }
+
+    #[test]
+    fn installed_name_swap_before_completion_is_detected_without_deleting_attacker() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let moved_install = root.path().join("writer-moved-install");
+        fs::write(&path, "before").unwrap();
+        let error = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o644).with_backup(true)),
+            |stage| {
+                if stage == TestStage::Published {
+                    fs::rename(&path, &moved_install).unwrap();
+                    fs::write(&path, "attacker").unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("installed destination identity changed"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "attacker");
+        assert_eq!(fs::read_to_string(moved_install).unwrap(), "after");
         assert_eq!(backup_paths(root.path()).len(), 1);
     }
 

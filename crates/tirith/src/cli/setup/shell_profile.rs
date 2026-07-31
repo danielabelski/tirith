@@ -343,7 +343,7 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
         },
         || revalidate_profile_selection(shell, &home, &profile_path),
     )?;
-    if outcome == super::fs_helpers::TransactionOutcome::Written {
+    if outcome.was_written() {
         eprintln!(
             "tirith: {completed_verb} shell hook in {}",
             profile_path.display()

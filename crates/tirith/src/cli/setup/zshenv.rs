@@ -103,7 +103,7 @@ pub fn offer_zshenv_guard(
             Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644))
         },
     )?;
-    if outcome == super::fs_helpers::TransactionOutcome::Written {
+    if outcome.was_written() {
         eprintln!(
             "tirith: {completed_verb} tirith-guard block in {}",
             zshenv_path.display()

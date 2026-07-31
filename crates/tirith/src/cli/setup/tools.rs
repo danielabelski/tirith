@@ -907,7 +907,7 @@ fn write_owned_json(
         }
         Ok(fs_helpers::FileUpdate::write_text(content.to_string(), 0o644).with_backup(backup))
     })?;
-    if outcome == fs_helpers::TransactionOutcome::Written {
+    if outcome.was_written() {
         eprintln!("tirith: wrote {}", path.display());
     }
     Ok(())

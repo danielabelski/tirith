@@ -441,7 +441,7 @@ mod run_impl {
                 ))
             },
         )?;
-        if outcome == fs_helpers::TransactionOutcome::Written {
+        if outcome.was_written() {
             eprintln!("tirith: wrote {}", gateway_path.display());
         }
         Ok(gateway_path)

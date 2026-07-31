@@ -99,21 +99,28 @@ pub(crate) enum TransactionOutcome {
     Unchanged,
     DryRunWouldWrite,
     Written,
+    WrittenWithRecovery,
 }
 
-/// Result of the atomic name operation. Some platforms can complete the
-/// publication but then be unable to remove a private displaced entry. That
-/// is not a clean success: the shared layer must still run the durability
-/// barrier, then return an actionable recovery error (and retain any requested
-/// backup) instead of silently reporting `Written`.
+impl TransactionOutcome {
+    pub(crate) fn was_written(self) -> bool {
+        matches!(self, Self::Written | Self::WrittenWithRecovery)
+    }
+}
+
+/// Honest result after the platform publication capability has survived the
+/// durability gate. Windows cannot prove ReplaceFileW's directory/name
+/// transition durable, so it returns a successful-but-degraded outcome with
+/// exact recovery material instead of claiming a clean commit.
 pub(crate) enum PublicationOutcome {
     Clean,
-    RecoveryRequired(String),
+    RecoveryRetained(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(test)]
 pub(crate) enum TestStage {
+    PreflightReady,
     TempSynced,
     SnapshotValidated,
     PublicationReady,
@@ -182,7 +189,7 @@ where
     V: FnMut() -> Result<(), String>,
 {
     // Compute and cap the transformed payload before creating a parent,
-    // stable lock, backup, or temporary file. Missing-parent dry runs and
+    // persistent lock file, backup, or temporary file. Missing-parent dry runs and
     // rejected oversized writes therefore remain completely non-mutating.
     revalidate_selection()?;
     let preflight_snapshot = FileSnapshot {
@@ -190,6 +197,8 @@ where
     };
     let mut update = transform(&preflight_snapshot)?;
     validate_update_size(&update)?;
+    #[cfg(test)]
+    test_hook(TestStage::PreflightReady)?;
 
     if dry_run {
         return match update {
@@ -198,11 +207,14 @@ where
         };
     }
 
-    // Creating and locking the stable sibling is intentionally restricted to
-    // mutating runs. The parent handles and lock live through retention.
-    let transaction = PlatformTransaction::begin(path, scope_root)?;
+    // Acquire a transient cross-process synchronization capability that does
+    // not create a lock file or destination parent. Re-read and recompute
+    // while holding it, so a drifted oversized transform is rejected before
+    // any persistent filesystem side effect.
+    let transaction_lock = PlatformTransaction::lock(path, scope_root)?;
+    revalidate_selection()?;
     let snapshot = FileSnapshot {
-        inner: transaction.read_snapshot()?,
+        inner: super::fs_helpers::read_snapshot_scoped(path, scope_root)?,
     };
     if snapshot.inner != preflight_snapshot.inner {
         // A cooperative writer may have completed between the side-effect-free
@@ -221,6 +233,12 @@ where
         return Ok(TransactionOutcome::Unchanged);
     };
 
+    // Parent creation begins only after the final locked transform has passed
+    // the cap. The transient lock is transferred into the transaction and
+    // remains held through publication, durability, backup, and retention.
+    let transaction = PlatformTransaction::begin(path, scope_root, transaction_lock)?;
+    transaction.validate_snapshot(&snapshot.inner)?;
+
     let mut backup_guard = if backup && snapshot.exists() {
         Some(transaction.create_backup(&snapshot.inner)?)
     } else {
@@ -228,7 +246,8 @@ where
     };
 
     // `TempGuard` is armed before any bytes are written. Every error from this
-    // point until publication removes the secret-bearing temporary sibling.
+    // point until publication neutralizes the exact temporary identity through
+    // a held capability; no cleanup re-selects a possibly swapped pathname.
     let temp = transaction.prepare_temp(&bytes, mode, preserve_existing_mode, &snapshot.inner)?;
     #[cfg(test)]
     test_hook(TestStage::TempSynced)?;
@@ -238,7 +257,7 @@ where
     #[cfg(test)]
     test_hook(TestStage::SnapshotValidated)?;
 
-    let publication = transaction.publish(
+    let mut publication = transaction.publish(
         temp,
         &snapshot.inner,
         #[cfg(test)]
@@ -253,32 +272,32 @@ where
     #[cfg(not(test))]
     let post_publication = transaction.sync_parent();
     if let Err(error) = post_publication {
-        let recovery_context = match publication {
-            PublicationOutcome::Clean => String::new(),
-            PublicationOutcome::RecoveryRequired(message) => format!("; {message}"),
-        };
+        let recovery_context = publication.retain_for_recovery();
         if let Some(backup) = backup_guard.as_mut() {
             let recovery = backup.retain_for_recovery();
             return Err(format!(
-                "{error}; publication completed but durability was not confirmed{recovery_context}; retained recovery backup at {}",
+                "{error}; publication completed but durability was not confirmed; {recovery_context}; retained recovery backup at {}",
                 recovery.display()
             ));
         }
         return Err(format!(
-            "{error}; publication completed but durability was not confirmed{recovery_context}"
+            "{error}; publication completed but durability was not confirmed; {recovery_context}"
         ));
     }
 
-    if let PublicationOutcome::RecoveryRequired(message) = publication {
-        if let Some(backup) = backup_guard.as_mut() {
-            let recovery = backup.retain_for_recovery();
-            return Err(format!(
-                "{message}; retained recovery backup at {}",
-                recovery.display()
-            ));
+    let publication_outcome = match publication.finish_after_durability() {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(backup) = backup_guard.as_mut() {
+                let recovery = backup.retain_for_recovery();
+                return Err(format!(
+                    "{error}; retained recovery backup at {}",
+                    recovery.display()
+                ));
+            }
+            return Err(error);
         }
-        return Err(message);
-    }
+    };
     if let Some(backup) = backup_guard.as_mut() {
         backup.commit();
     }
@@ -289,7 +308,13 @@ where
         }
     }
 
-    Ok(TransactionOutcome::Written)
+    match publication_outcome {
+        PublicationOutcome::Clean => Ok(TransactionOutcome::Written),
+        PublicationOutcome::RecoveryRetained(message) => {
+            eprintln!("tirith: WARNING: {message}");
+            Ok(TransactionOutcome::WrittenWithRecovery)
+        }
+    }
 }
 
 #[cfg(test)]
