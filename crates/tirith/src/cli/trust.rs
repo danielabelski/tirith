@@ -1,11 +1,14 @@
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use serde::{Deserialize, Serialize};
+
+pub use tirith_core::policy::TrustScopeKind as ScopeKind;
 
 /// Default TTL for a `trust add` with neither `--ttl` nor `--permanent`. Trust
 /// expires by default; permanent trust must be chosen explicitly.
 const DEFAULT_TTL: &str = "30d";
+const TRUST_STORE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// A single entry in trust.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,106 +41,9 @@ impl Default for TrustStore {
     }
 }
 
-/// How broad a trust pattern is, declared narrowest-first so the derived `Ord`
-/// agrees: `ScopeKind::Exact < ScopeKind::BareTld` (broader = riskier).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScopeKind {
-    /// A specific URL, path, or checksum-like literal — trusts exactly one thing.
-    Exact,
-    /// A non-domain substring fragment (e.g. `repo/get-pip.py`) — trusts any
-    /// URL/command containing that substring.
-    Substring,
-    /// A whole domain and all its subdomains (e.g. `github.com`).
-    Domain,
-    /// A wildcard domain (e.g. `*.example.com`).
-    Wildcard,
-    /// A bare top-level domain (e.g. `com`, `dev`) — trusts every host under
-    /// that TLD. Almost always a mistake.
-    BareTld,
-}
-
-impl ScopeKind {
-    /// Short human label for listings.
-    fn label(self) -> &'static str {
-        match self {
-            ScopeKind::Exact => "exact",
-            ScopeKind::Substring => "substring",
-            ScopeKind::Domain => "domain",
-            ScopeKind::Wildcard => "wildcard",
-            ScopeKind::BareTld => "bare-TLD",
-        }
-    }
-
-    /// One-line description of what an entry of this kind covers.
-    fn coverage(self) -> &'static str {
-        match self {
-            ScopeKind::Exact => "matches this exact string only",
-            ScopeKind::Substring => "matches any URL or command containing this substring",
-            ScopeKind::Domain => "matches this domain and every subdomain under it",
-            ScopeKind::Wildcard => "matches every subdomain of this domain",
-            ScopeKind::BareTld => "matches every host under this entire top-level domain",
-        }
-    }
-
-    /// True when an entry of this kind is broad enough that `trust add` should
-    /// require an explicit `--broad` opt-in.
-    fn is_broad(self) -> bool {
-        matches!(
-            self,
-            ScopeKind::Domain | ScopeKind::Wildcard | ScopeKind::BareTld
-        )
-    }
-
-    /// True when an entry of this kind is dangerously broad and deserves a
-    /// standing warning wherever it is shown.
-    fn is_dangerous(self) -> bool {
-        matches!(self, ScopeKind::Wildcard | ScopeKind::BareTld)
-    }
-}
-
-/// Small set of public suffixes to distinguish a *bare* TLD (`com`) from a
-/// registrable domain (`example.com`). Not a full PSL — just enough to reject
-/// `trust add com` by default.
-const KNOWN_TLDS: &[&str] = &[
-    "com", "net", "org", "io", "dev", "sh", "co", "ai", "app", "xyz", "info", "biz", "me", "us",
-    "uk", "de", "fr", "ru", "cn", "jp", "in", "br", "ca", "au", "eu", "gov", "edu", "mil", "tv",
-    "cc", "ws", "to", "gg", "fm", "site", "online", "tech", "cloud", "store", "live", "run", "id",
-];
-
 /// Classify how broad a trust pattern is.
 pub fn classify_scope(pattern: &str) -> ScopeKind {
-    let p = pattern.trim().to_lowercase();
-
-    if let Some(rest) = p.strip_prefix("*.") {
-        // `*.com` is a bare-TLD wildcard — still the worst case.
-        if !rest.contains('.') && KNOWN_TLDS.contains(&rest) {
-            return ScopeKind::BareTld;
-        }
-        return ScopeKind::Wildcard;
-    }
-
-    // A scheme, path, query, or fragment pins a specific URL/resource → Exact.
-    if p.contains("://") || p.contains('/') || p.contains('?') || p.contains('#') {
-        return ScopeKind::Exact;
-    }
-
-    // Bare token, no dot: a bare TLD or a non-domain substring fragment.
-    if !p.contains('.') {
-        if KNOWN_TLDS.contains(&p.as_str()) {
-            return ScopeKind::BareTld;
-        }
-        return ScopeKind::Substring;
-    }
-
-    // At least one dot, no path: a `host.tld`-shaped registrable domain.
-    let labels: Vec<&str> = p.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.len() >= 2 {
-        ScopeKind::Domain
-    } else {
-        // Trailing-dot oddity → substring.
-        ScopeKind::Substring
-    }
+    tirith_core::policy::classify_trust_pattern(pattern)
 }
 
 /// A unified trust listing row shown by `trust list`.
@@ -160,14 +66,27 @@ struct TrustListRow {
 /// when the error mentions "git repository" (i.e., `--scope repo` failed
 /// because we are outside a git repo).
 fn print_trust_error(subcmd: &str, err: &str, hint_pattern: Option<&str>) {
+    let subcmd = human(subcmd);
+    let err = human(err);
     eprintln!("tirith: trust {subcmd}: {err}");
     if err.contains("git repository") {
         if let Some(pattern) = hint_pattern {
-            eprintln!("  try: tirith trust {subcmd} {pattern} --scope user");
+            let display_pattern = human(pattern);
+            let quoted = tirith_core::safe_command::shell_single_quote(&display_pattern)
+                .unwrap_or_else(|| "'[unsafe pattern]'".to_string());
+            eprintln!("  try: tirith trust {subcmd} {} --scope user", quoted);
         } else {
             eprintln!("  try: tirith trust {subcmd} --scope user");
         }
     }
+}
+
+fn human(value: &str) -> String {
+    super::sanitize_for_human_output(value, false)
+}
+
+fn human_multiline(value: &str) -> String {
+    super::sanitize_for_human_output(value, true)
 }
 
 /// Serialize `value` as pretty JSON to stdout. Returns `0` on success, `1` on a
@@ -209,24 +128,304 @@ fn trust_store_path(scope: &str) -> Result<std::path::PathBuf, String> {
 /// Returns `Ok(default)` if the file does not exist, or `Err` if the file
 /// exists but cannot be parsed (prevents silent data loss on corruption).
 fn load_store(path: &std::path::Path) -> Result<TrustStore, String> {
-    match fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content)
-            .map_err(|e| format!("corrupt trust store at {}: {e}", path.display())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(TrustStore::default()),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-    }
+    let bytes = match tirith_core::util::read_text_no_follow_capped(path, TRUST_STORE_MAX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(tirith_core::util::OpenRegularError::NotFound) => return Ok(TrustStore::default()),
+        Err(tirith_core::util::OpenRegularError::NotRegularFile) => {
+            return Err(format!(
+                "refusing non-regular or symlinked trust store at {}",
+                path.display()
+            ))
+        }
+        Err(tirith_core::util::OpenRegularError::TooLarge) => {
+            return Err(format!(
+                "trust store at {} exceeds the {} byte limit",
+                path.display(),
+                TRUST_STORE_MAX_BYTES
+            ))
+        }
+        Err(tirith_core::util::OpenRegularError::Io(error)) => {
+            return Err(format!("cannot read {}: {error}", path.display()))
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("corrupt trust store at {}: {e}", path.display()))
 }
 
-/// Write the trust store to a path, creating parent directories as needed.
+/// Write a user trust store crash-atomically. Repo stores use the stronger
+/// descriptor-relative implementation below.
 fn write_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create directory {}: {e}", parent.display()))?;
     }
-    let json = serde_json::to_string_pretty(store)
+    let json = serde_json::to_vec_pretty(store)
         .map_err(|e| format!("failed to serialize trust store: {e}"))?;
-    fs::write(path, json).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    if json.len() as u64 > TRUST_STORE_MAX_BYTES {
+        return Err(format!(
+            "refusing to write trust store above the {TRUST_STORE_MAX_BYTES} byte limit"
+        ));
+    }
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(format!(
+                "refusing non-regular or symlinked trust store at {}",
+                path.display()
+            ));
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "trust store has no parent directory".to_string())?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("failed to create trust-store temp file: {e}"))?;
+    tmp.write_all(&json)
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|e| format!("failed to write trust-store temp file: {e}"))?;
+    tmp.persist(path)
+        .map_err(|e| format!("failed to publish {}: {}", path.display(), e.error))?;
     Ok(())
+}
+
+fn load_store_scoped(scope: &str, path: &std::path::Path) -> Result<TrustStore, String> {
+    if scope == "repo" {
+        load_repo_store(path)
+    } else {
+        load_store(path)
+    }
+}
+
+fn write_store_scoped(
+    scope: &str,
+    path: &std::path::Path,
+    store: &TrustStore,
+) -> Result<(), String> {
+    if scope == "repo" {
+        write_repo_store(path, store)
+    } else {
+        write_store(path, store)
+    }
+}
+
+#[cfg(unix)]
+fn open_repo_trust_dir(path: &std::path::Path, create: bool) -> Result<std::fs::File, String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let root = path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
+    let root_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+        .map_err(|e| format!("cannot open repository root {}: {e}", root.display()))?;
+    let name = CString::new(".tirith").expect("static component has no NUL");
+    if create {
+        let rc = unsafe { libc::mkdirat(root_fd.as_raw_fd(), name.as_ptr(), 0o755) };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(format!("cannot create repo .tirith directory: {error}"));
+            }
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            root_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "refusing repo trust path with a missing, symlinked, or non-directory .tirith component: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let dir = match open_repo_trust_dir(path, false) {
+        Ok(dir) => dir,
+        Err(error) => match path.parent().map(fs::symlink_metadata) {
+            Some(Err(io_error)) if io_error.kind() == io::ErrorKind::NotFound => {
+                return Ok(TrustStore::default())
+            }
+            _ => return Err(error),
+        },
+    };
+    let name = CString::new("trust.json").expect("static component has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(TrustStore::default());
+        }
+        return Err(format!(
+            "refusing repo trust store {}: {error}",
+            path.display()
+        ));
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect repo trust store: {e}"))?;
+    if !meta.is_file() {
+        return Err("repo trust store is not a regular file".to_string());
+    }
+    if meta.len() > TRUST_STORE_MAX_BYTES {
+        return Err(format!(
+            "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(TRUST_STORE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read repo trust store: {e}"))?;
+    if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
+        return Err(format!(
+            "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("corrupt trust store at {}: {e}", path.display()))
+}
+
+#[cfg(unix)]
+fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let dir = open_repo_trust_dir(path, true)?;
+    let dest = CString::new("trust.json").expect("static component has no NUL");
+
+    // Refuse an existing symlink, directory, FIFO, device, or socket. A later
+    // destination swap is still safe: renameat replaces the directory entry and
+    // never follows it.
+    let existing_fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            dest.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if existing_fd >= 0 {
+        // SAFETY: `openat` returned a fresh owned descriptor.
+        let existing = unsafe { std::fs::File::from_raw_fd(existing_fd) };
+        if !existing
+            .metadata()
+            .map_err(|e| format!("cannot inspect repo trust destination: {e}"))?
+            .is_file()
+        {
+            return Err("repo trust destination is not a regular file".to_string());
+        }
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(format!("refusing repo trust destination: {error}"));
+        }
+    }
+
+    let bytes = serde_json::to_vec_pretty(store)
+        .map_err(|e| format!("failed to serialize trust store: {e}"))?;
+    if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
+        return Err(format!(
+            "refusing to write repo trust store above the {TRUST_STORE_MAX_BYTES} byte limit"
+        ));
+    }
+    let temp_name = format!(".trust.json.{}.tmp", uuid::Uuid::new_v4());
+    let temp = CString::new(temp_name.as_str()).expect("UUID temp name has no NUL");
+    let temp_fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666,
+        )
+    };
+    if temp_fd < 0 {
+        return Err(format!(
+            "cannot create repo trust temp file: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor.
+    let mut temp_file = unsafe { std::fs::File::from_raw_fd(temp_fd) };
+    let publish = temp_file
+        .write_all(&bytes)
+        .and_then(|()| temp_file.sync_all())
+        .and_then(|()| {
+            let rc = unsafe {
+                libc::renameat(
+                    dir.as_raw_fd(),
+                    temp.as_ptr(),
+                    dir.as_raw_fd(),
+                    dest.as_ptr(),
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    if let Err(error) = publish {
+        unsafe {
+            libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
+        }
+        return Err(format!(
+            "failed to atomically publish repo trust store: {error}"
+        ));
+    }
+    dir.sync_all()
+        .map_err(|e| format!("failed to sync repo trust directory: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
+    let root = path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
+    if path.parent().is_some_and(std::path::Path::exists)
+        && !tirith_core::util::canonical_within(path, root)
+    {
+        return Err("refusing repo trust path outside the repository root".to_string());
+    }
+    load_store(path)
+}
+
+#[cfg(not(unix))]
+fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
+    let root = path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
+    let dir = path.parent().expect("checked above");
+    if !dir.exists() {
+        fs::create_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    if !tirith_core::util::canonical_within(path, root) {
+        return Err("refusing repo trust path outside the repository root".to_string());
+    }
+    write_store(path, store)
 }
 
 /// Parse a duration string like "1h", "7d", "30d" into an expiry timestamp.
@@ -310,17 +509,7 @@ fn humanize_expiry(ttl_expires: Option<&str>) -> Option<String> {
 
 /// Validate a pattern for trust add.
 fn validate_pattern(pattern: &str, policy: &tirith_core::policy::Policy) -> Result<(), String> {
-    if pattern.is_empty() {
-        return Err("pattern must not be empty".to_string());
-    }
-    // Reject control chars (< 0x20, except tab) to stop ANSI escapes / NULs in entries.
-    for (i, b) in pattern.bytes().enumerate() {
-        if b < 0x20 && b != b'\t' {
-            return Err(format!(
-                "pattern contains control character at byte offset {i} (0x{b:02x})"
-            ));
-        }
-    }
+    tirith_core::policy::validate_trust_pattern(pattern)?;
     if policy.is_blocklisted(pattern) {
         return Err(format!(
             "pattern '{pattern}' is in the blocklist and cannot be trusted"
@@ -342,6 +531,18 @@ pub fn add(
     scope: &str,
     json: bool,
 ) -> i32 {
+    if let Some(rule_id) = rule_id {
+        if human(rule_id) != rule_id {
+            eprintln!("tirith: trust add: rule id contains unsafe display characters");
+            return 1;
+        }
+    }
+    if let Some(reason) = reason {
+        if tirith_core::mcp::output_filter::sanitize_for_display(reason) != reason {
+            eprintln!("tirith: trust add: reason contains unsafe display characters");
+            return 1;
+        }
+    }
     // Validate against policy plus flat user/org blocklists loaded below.
     let mut policy = tirith_core::policy::Policy::discover(None);
     policy.load_user_lists();
@@ -363,7 +564,8 @@ pub fn add(
     let scope_kind = classify_scope(pattern);
     if scope_kind.is_broad() && !broad {
         eprintln!(
-            "tirith: trust add: '{pattern}' is a {} pattern — {}.",
+            "tirith: trust add: '{}' is a {} pattern — {}.",
+            human(pattern),
             scope_kind.label(),
             scope_kind.coverage()
         );
@@ -373,8 +575,9 @@ pub fn add(
         );
         if scope_kind == ScopeKind::BareTld {
             eprintln!(
-                "  Note: trusting a bare TLD allows EVERY host under '.{pattern}' — \
-                 this is almost never what you want."
+                "  Note: trusting a bare TLD allows EVERY host under '.{}' — \
+                 this is almost never what you want.",
+                human(pattern)
             );
         }
         return 1;
@@ -388,7 +591,7 @@ pub fn add(
         }
     };
 
-    let mut store = match load_store(&path) {
+    let mut store = match load_store_scoped(scope, &path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tirith: trust add: {e}");
@@ -424,7 +627,7 @@ pub fn add(
 
     store.entries.push(entry);
 
-    if let Err(e) = write_store(&path, &store) {
+    if let Err(e) = write_store_scoped(scope, &path, &store) {
         eprintln!("tirith: trust add: {e}");
         return 1;
     }
@@ -450,8 +653,11 @@ pub fn add(
         None => ", permanent (no expiry)".to_string(),
     };
     eprintln!(
-        "tirith: trusted '{pattern}' (scope: {scope}, {} pattern{ttl_note})",
-        scope_kind.label()
+        "tirith: trusted '{}' (scope: {}, {} pattern{})",
+        human(pattern),
+        human(scope),
+        scope_kind.label(),
+        human(&ttl_note)
     );
     if scope_kind.is_dangerous() {
         eprintln!(
@@ -495,19 +701,19 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
     } else {
         let max_pat = rows
             .iter()
-            .map(|r| r.pattern.len())
+            .map(|r| human(&r.pattern).len())
             .max()
             .unwrap_or(7)
             .max(7);
         let max_src = rows
             .iter()
-            .map(|r| r.source.len())
+            .map(|r| human(&r.source).len())
             .max()
             .unwrap_or(6)
             .max(6);
         let max_rule = rows
             .iter()
-            .map(|r| r.rule_id.as_ref().map(|s| s.len()).unwrap_or(1))
+            .map(|r| r.rule_id.as_ref().map(|s| human(s).len()).unwrap_or(1))
             .max()
             .unwrap_or(4)
             .max(4);
@@ -533,12 +739,14 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
         );
         let mut any_dangerous = false;
         for row in &rows {
-            let rule_display = row.rule_id.as_deref().unwrap_or("-");
+            let pattern_display = human(&row.pattern);
+            let rule_display = human(row.rule_id.as_deref().unwrap_or("-"));
+            let source_display = human(&row.source);
             let expires_display = match (&row.expires, row.expired) {
-                (Some(exp), true) => format!("{exp} (EXPIRED)"),
+                (Some(exp), true) => format!("{} (EXPIRED)", human(exp)),
                 (Some(exp), false) => match humanize_expiry(Some(exp)) {
-                    Some(h) => format!("{exp} ({h})"),
-                    None => exp.clone(),
+                    Some(h) => format!("{} ({})", human(exp), human(&h)),
+                    None => human(exp),
                 },
                 (None, _) => "permanent".to_string(),
             };
@@ -548,7 +756,7 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
             }
             eprintln!(
                 "{:<max_pat$}  {:<max_rule$}  {:<max_scope$}  {:<max_src$}  {}",
-                row.pattern, rule_display, scope_display, row.source, expires_display
+                pattern_display, rule_display, scope_display, source_display, expires_display
             );
         }
         if any_dangerous {
@@ -585,7 +793,7 @@ fn collect_rows(scope: &str, show_expired: bool) -> Result<Vec<TrustListRow>, St
                 continue;
             }
         };
-        let store = load_store(&path)?;
+        let store = load_store_scoped(s, &path)?;
         let source = format!("trust-{s}");
         for entry in &store.entries {
             let expired = is_expired(entry);
@@ -702,7 +910,7 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
         }
     };
 
-    let mut store = match load_store(&path) {
+    let mut store = match load_store_scoped(scope, &path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tirith: trust remove: {e}");
@@ -723,18 +931,25 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
 
     let removed = before_len - store.entries.len();
     if removed == 0 {
-        eprintln!("tirith: trust remove: no matching entry found for '{pattern}'");
+        eprintln!(
+            "tirith: trust remove: no matching entry found for '{}'",
+            human(pattern)
+        );
         return 1;
     }
 
-    if let Err(e) = write_store(&path, &store) {
+    if let Err(e) = write_store_scoped(scope, &path, &store) {
         eprintln!("tirith: trust remove: {e}");
         return 1;
     }
 
     tirith_core::audit::log_trust_change(pattern, rule_id, "remove", None, scope);
 
-    eprintln!("tirith: removed {removed} trust entry/entries for '{pattern}' (scope: {scope})");
+    eprintln!(
+        "tirith: removed {removed} trust entry/entries for '{}' (scope: {})",
+        human(pattern),
+        human(scope)
+    );
     0
 }
 
@@ -893,7 +1108,24 @@ fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> St
     };
     let broad = if needs_broad { " --broad" } else { "" };
     match rule_id {
-        Some(rid) => format!("tirith trust add {quoted}{broad} --rule {rid} --ttl {DEFAULT_TTL}"),
+        Some(rid) => {
+            let rid = human(rid);
+            let rid = if rid
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                && !rid.is_empty()
+            {
+                rid
+            } else {
+                let Some(quoted) = tirith_core::safe_command::shell_single_quote(&rid) else {
+                    return "# trust this target manually with `tirith trust add` \
+                            (its rule id contains characters unsafe to embed in a suggested command)."
+                        .to_string();
+                };
+                quoted
+            };
+            format!("tirith trust add {quoted}{broad} --rule {rid} --ttl {DEFAULT_TTL}")
+        }
         None => format!("tirith trust add {quoted}{broad} --ttl {DEFAULT_TTL}"),
     }
 }
@@ -989,17 +1221,17 @@ pub fn last() -> i32 {
     };
 
     if let Some(ts) = val.get("timestamp").and_then(|v| v.as_str()) {
-        eprintln!("Last trigger at: {ts}");
+        eprintln!("Last trigger at: {}", human(ts));
     }
     if let Some(cmd) = val.get("command_redacted").and_then(|v| v.as_str()) {
-        eprintln!("Command: {cmd}");
+        eprintln!("Command: {}", human(cmd));
     }
 
     let mut domains: Vec<String> = Vec::new();
     if let Some(findings) = val.get("findings").and_then(|v| v.as_array()) {
         for finding in findings {
             if let Some(title) = finding.get("title").and_then(|v| v.as_str()) {
-                eprintln!("  - {title}");
+                eprintln!("  - {}", human(title));
             }
             if let Some(evidence) = finding.get("evidence").and_then(|v| v.as_array()) {
                 for ev in evidence {
@@ -1027,8 +1259,9 @@ pub fn last() -> i32 {
     }
 
     for domain in &domains {
+        let display_domain = human(domain);
         eprintln!();
-        eprint!("Trust {domain}? [y/N/r(rule-scoped)/t(temporary 7d)] ");
+        eprint!("Trust {display_domain}? [y/N/r(rule-scoped)/t(temporary 7d)] ");
         let _ = io::stderr().flush();
 
         let stdin = io::stdin();
@@ -1051,7 +1284,7 @@ pub fn last() -> i32 {
                 // that fired on a DIFFERENT target would be over-broad.
                 let host_rules = rules_for_host(&val, domain);
                 if host_rules.is_empty() {
-                    eprintln!("tirith: no rule IDs for {domain}, adding global trust");
+                    eprintln!("tirith: no rule IDs for {display_domain}, adding global trust");
                     add(domain, None, None, false, true, None, "user", false);
                 } else {
                     for rid in &host_rules {
@@ -1064,7 +1297,7 @@ pub fn last() -> i32 {
                 add(domain, None, Some("7d"), false, true, None, "user", false);
             }
             _ => {
-                eprintln!("tirith: skipped {domain}");
+                eprintln!("tirith: skipped {display_domain}");
             }
         }
     }
@@ -1119,11 +1352,7 @@ fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) ->
             }
         };
 
-        if !path.exists() {
-            continue;
-        }
-
-        let mut store = match load_store(&path) {
+        let mut store = match load_store_scoped(s, &path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("tirith: trust {action_label}: {e}");
@@ -1143,7 +1372,7 @@ fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) ->
         let removed = before - store.entries.len();
 
         if removed > 0 {
-            if let Err(e) = write_store(&path, &store) {
+            if let Err(e) = write_store_scoped(s, &path, &store) {
                 eprintln!("tirith: trust {action_label}: {e}");
                 return 1;
             }
@@ -1245,7 +1474,7 @@ pub fn explain(pattern: &str, scope: &str, json: bool) -> i32 {
                 continue;
             }
         };
-        let store = match load_store(&path) {
+        let store = match load_store_scoped(s, &path) {
             Ok(st) => st,
             Err(e) => {
                 eprintln!("tirith: trust explain: {e}");
@@ -1310,7 +1539,11 @@ pub fn explain(pattern: &str, scope: &str, json: bool) -> i32 {
     if !report.found {
         // Still explain what *would* happen if this pattern were trusted.
         let kind = classify_scope(pattern);
-        eprintln!("tirith: '{pattern}' is not currently trusted in scope '{scope}'.");
+        eprintln!(
+            "tirith: '{}' is not currently trusted in scope '{}'.",
+            human(pattern),
+            human(scope)
+        );
         eprintln!(
             "  If added, it would be a {} entry — {}.",
             kind.label(),
@@ -1322,27 +1555,27 @@ pub fn explain(pattern: &str, scope: &str, json: bool) -> i32 {
         return 0;
     }
 
-    println!("trust explain: {pattern}");
+    println!("trust explain: {}", human(pattern));
     for (i, m) in report.matches.iter().enumerate() {
         if i > 0 {
             println!();
         }
-        println!("  source:   {}", m.source);
+        println!("  source:   {}", human(&m.source));
         println!(
             "  scope:    {} — {}",
             m.scope_kind.label(),
-            m.scope_coverage
+            human(&m.scope_coverage)
         );
         if let Some(rid) = &m.rule_id {
-            println!("  rule:     {rid} (suppresses this rule only)");
+            println!("  rule:     {} (suppresses this rule only)", human(rid));
         } else {
             println!("  rule:     (global — suppresses every rule)");
         }
         if let Some(added) = &m.added {
-            println!("  added:    {added}");
+            println!("  added:    {}", human(added));
         }
         match &m.reason {
-            Some(r) => println!("  reason:   {r}"),
+            Some(r) => println!("  reason:   {}", human_multiline(r)),
             None => println!("  reason:   (none recorded)"),
         }
         match (&m.ttl_expires, m.permanent) {
@@ -1353,7 +1586,7 @@ pub fn explain(pattern: &str, scope: &str, json: bool) -> i32 {
                     .as_deref()
                     .map(|h| format!(" ({h})"))
                     .unwrap_or_default();
-                println!("  expires:  {exp}{suffix}");
+                println!("  expires:  {}{}", human(exp), human(&suffix));
             }
             (None, false) => println!("  expires:  never (permanent)"),
         }
@@ -1660,7 +1893,11 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
         };
         println!(
             "{:<26} {:<8} {:<6} {}{}",
-            r.timestamp, r.action, r.scope, r.pattern, rule_suffix
+            human(&r.timestamp),
+            human(&r.action),
+            human(&r.scope),
+            human(&r.pattern),
+            human(&rule_suffix)
         );
     }
     0
@@ -1752,11 +1989,11 @@ pub fn diff(json: bool) -> i32 {
     }
 
     match &report.baseline_recorded_at {
-        Some(ts) => println!("trust diff (since {ts})"),
+        Some(ts) => println!("trust diff (since {})", human(ts)),
         None => println!("trust diff"),
     }
     if let Some(note) = &report.note {
-        println!("  note: {note}");
+        println!("  note: {}", human_multiline(note));
         return 0;
     }
     if report.unchanged {
@@ -1772,10 +2009,11 @@ pub fn diff(json: bool) -> i32 {
                 .map(|r| format!(" [rule: {r}]"))
                 .unwrap_or_default();
             println!(
-                "    + {} ({}, {}){rule}",
-                e.pattern,
-                e.source,
-                e.scope_kind.label()
+                "    + {} ({}, {}){}",
+                human(&e.pattern),
+                human(&e.source),
+                e.scope_kind.label(),
+                human(&rule)
             );
         }
     }
@@ -1788,10 +2026,11 @@ pub fn diff(json: bool) -> i32 {
                 .map(|r| format!(" [rule: {r}]"))
                 .unwrap_or_default();
             println!(
-                "    - {} ({}, {}){rule}",
-                e.pattern,
-                e.source,
-                e.scope_kind.label()
+                "    - {} ({}, {}){}",
+                human(&e.pattern),
+                human(&e.source),
+                e.scope_kind.label(),
+                human(&rule)
             );
         }
     }
@@ -1934,9 +2173,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_pattern_tab_ok() {
+    fn test_validate_pattern_rejects_tab_and_deceptive_unicode() {
         let policy = tirith_core::policy::Policy::default();
-        assert!(validate_pattern("hello\tworld", &policy).is_ok());
+        assert!(validate_pattern("hello\tworld", &policy).is_err());
+        assert!(validate_pattern("hello\u{202e}world", &policy).is_err());
+        assert!(validate_pattern("hello\u{200b}world", &policy).is_err());
     }
 
     #[test]
@@ -2008,6 +2249,104 @@ mod tests {
         assert_eq!(loaded.entries[0].pattern, "example.com");
         assert_eq!(loaded.entries[0].rule_id.as_deref(), Some("shortened_url"));
         assert_eq!(loaded.entries[0].reason.as_deref(), Some("internal mirror"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_store_roundtrip_is_atomic_and_leaves_no_temp_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".tirith/trust.json");
+        let store = TrustStore {
+            version: 1,
+            entries: vec![TrustEntry {
+                pattern: "https://example.com/install.sh".into(),
+                rule_id: None,
+                ttl_expires: None,
+                added: "2026-07-31T00:00:00Z".into(),
+                source: "cli".into(),
+                reason: None,
+            }],
+        };
+        write_repo_store(&path, &store).unwrap();
+        assert_eq!(load_repo_store(&path).unwrap().entries.len(), 1);
+        let names: Vec<_> = fs::read_dir(root.path().join(".tirith"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("trust.json")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_store_rejects_symlinked_directory_component() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_store = outside.path().join("trust.json");
+        fs::write(&outside_store, r#"{"version":1,"entries":[]}"#).unwrap();
+        symlink(outside.path(), root.path().join(".tirith")).unwrap();
+        let path = root.path().join(".tirith/trust.json");
+        let before = fs::read(&outside_store).unwrap();
+
+        assert!(load_repo_store(&path).is_err());
+        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
+        assert_eq!(fs::read(&outside_store).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_store_rejects_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), r#"{"version":1,"entries":[]}"#).unwrap();
+        fs::create_dir(root.path().join(".tirith")).unwrap();
+        let path = root.path().join(".tirith/trust.json");
+        symlink(outside.path(), &path).unwrap();
+        let before = fs::read(outside.path()).unwrap();
+
+        assert!(load_repo_store(&path).is_err());
+        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
+        assert_eq!(fs::read(outside.path()).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_store_rejects_oversized_and_non_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".tirith")).unwrap();
+        let path = root.path().join(".tirith/trust.json");
+        fs::write(&path, vec![b'x'; TRUST_STORE_MAX_BYTES as usize + 1]).unwrap();
+        assert!(load_repo_store(&path).is_err());
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(load_repo_store(&path).is_err());
+        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
+    }
+
+    #[test]
+    fn human_trust_fields_strip_terminal_forgery_but_json_stays_raw() {
+        let raw = "safe\u{1b}]52;c;Y2xpcA\u{7}\u{1b}[2J\nFORGED\u{202e}\u{200b}";
+        let one_line = human(raw);
+        let multiline = human_multiline(raw);
+        for rendered in [&one_line, &multiline] {
+            assert!(!rendered.contains('\u{1b}'));
+            assert!(!rendered.contains('\u{202e}'));
+            assert!(!rendered.contains('\u{200b}'));
+        }
+        assert!(!one_line.contains('\n'));
+        assert!(multiline.contains("\n  FORGED"));
+
+        let structured = serde_json::to_string(&serde_json::json!({"pattern": raw})).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&structured).unwrap();
+        assert_eq!(decoded["pattern"], raw);
+        assert!(
+            !structured.contains('\u{1b}'),
+            "JSON must escape raw ESC bytes"
+        );
     }
 
     #[test]
@@ -2119,6 +2458,8 @@ mod tests {
         assert_eq!(classify_scope("com"), ScopeKind::BareTld);
         assert_eq!(classify_scope("dev"), ScopeKind::BareTld);
         assert_eq!(classify_scope("io"), ScopeKind::BareTld);
+        assert_eq!(classify_scope("zip"), ScopeKind::BareTld);
+        assert_eq!(classify_scope("co.uk"), ScopeKind::BareTld);
         // A wildcard over a bare TLD is the worst case — still bare-TLD.
         assert_eq!(classify_scope("*.com"), ScopeKind::BareTld);
     }
@@ -2132,7 +2473,7 @@ mod tests {
     #[test]
     fn test_scope_kind_broad_and_dangerous() {
         assert!(!ScopeKind::Exact.is_broad());
-        assert!(!ScopeKind::Substring.is_broad());
+        assert!(ScopeKind::Substring.is_broad());
         assert!(ScopeKind::Domain.is_broad());
         assert!(ScopeKind::Wildcard.is_broad());
         assert!(ScopeKind::BareTld.is_broad());

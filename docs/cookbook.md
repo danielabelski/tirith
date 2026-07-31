@@ -249,7 +249,8 @@ as-is; trusting a whole domain is broad and must be opted into with `--broad`.
 Entries expire after 30 days by default, so a temporary allow does not linger.
 
 ```bash
-# Narrow: trust one exact resource. Expires in 30 days.
+# Narrow: trust one exact HTTPS resource. Expires in 30 days.
+# Schemeless host/path patterns are normalized as HTTPS.
 tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
 
 # Broad: trust a whole domain for one rule only. --broad is required.

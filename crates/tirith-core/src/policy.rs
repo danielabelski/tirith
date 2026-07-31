@@ -2005,12 +2005,20 @@ impl Policy {
 
     /// Read a trust.json file and merge non-expired entries into the policy.
     fn merge_trust_store(&mut self, path: &Path) {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return,
+        const TRUST_STORE_READ_CAP: u64 = 1024 * 1024;
+        let bytes = match crate::util::read_text_no_follow_capped(path, TRUST_STORE_READ_CAP) {
+            Ok(bytes) => bytes,
+            Err(crate::util::OpenRegularError::NotFound) => return,
+            Err(error) => {
+                crate::audit::audit_diagnostic(format!(
+                    "tirith: trust: refusing unreadable, non-regular, symlinked, or oversized store at {}: {error:?}",
+                    path.display()
+                ));
+                return;
+            }
         };
 
-        let store: serde_json::Value = match serde_json::from_str(&content) {
+        let store: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(e) => {
                 crate::audit::audit_diagnostic(format!(
@@ -2039,14 +2047,19 @@ impl Policy {
             }
 
             let pattern = match entry.get("pattern").and_then(|v| v.as_str()) {
-                Some(p) if !p.is_empty() => p.to_string(),
+                Some(p) if validate_trust_pattern(p).is_ok() => p.to_string(),
                 _ => continue,
             };
 
-            let rule_id = entry
-                .get("rule_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let rule_id = match entry.get("rule_id") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => match value.as_str() {
+                    Some(rid) if validate_trust_pattern(rid).is_ok() => Some(rid.to_string()),
+                    // Never reinterpret a malformed rule-scoped entry as global
+                    // trust; skip it instead.
+                    _ => continue,
+                },
+            };
 
             match rule_id {
                 Some(rid) => {
@@ -2114,12 +2127,92 @@ impl Policy {
     }
 }
 
-fn is_domain_pattern(p: &str) -> bool {
-    !p.contains("://")
-        && !p.contains('/')
-        && !p.contains('?')
-        && !p.contains('#')
-        && !p.contains(':')
+/// Canonical trust-pattern classification shared by policy enforcement and the
+/// `tirith trust` UI.  Any class other than `Exact` can match more than one
+/// resource and therefore requires the CLI's explicit `--broad` opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustScopeKind {
+    Exact,
+    Substring,
+    Domain,
+    Wildcard,
+    BareTld,
+}
+
+impl TrustScopeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Substring => "substring",
+            Self::Domain => "domain",
+            Self::Wildcard => "wildcard",
+            Self::BareTld => "bare-TLD",
+        }
+    }
+
+    pub fn coverage(self) -> &'static str {
+        match self {
+            Self::Exact => "matches this exact normalized URL or literal only",
+            Self::Substring => "matches any URL or command containing this substring",
+            Self::Domain => "matches this domain and every subdomain under it",
+            Self::Wildcard => "matches this domain and every subdomain under it",
+            Self::BareTld => "matches every host under this entire public suffix",
+        }
+    }
+
+    pub fn is_broad(self) -> bool {
+        !matches!(self, Self::Exact)
+    }
+
+    pub fn is_dangerous(self) -> bool {
+        matches!(self, Self::Wildcard | Self::BareTld)
+    }
+}
+
+/// Reject values that would be rewritten by the terminal display scrub.  This
+/// is used when importing trust-store patterns as enforcement rules, so a
+/// hand-edited store cannot introduce a value that the CLI itself refuses.
+pub fn validate_trust_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.trim().is_empty() {
+        return Err("pattern must not be empty".to_string());
+    }
+    if pattern.trim() != pattern {
+        return Err("pattern must not have leading or trailing whitespace".to_string());
+    }
+    if pattern.chars().any(char::is_control)
+        || crate::mcp::output_filter::sanitize_for_display(pattern) != pattern
+    {
+        return Err("pattern contains terminal-control or deceptive Unicode characters".into());
+    }
+    Ok(())
+}
+
+/// Classify a trust pattern using the same grammar the matcher enforces.
+pub fn classify_trust_pattern(pattern: &str) -> TrustScopeKind {
+    let p = pattern.trim().to_lowercase();
+    if let Some(rest) = p.strip_prefix("*.") {
+        return if crate::data::is_public_suffix(rest.trim_end_matches('.')) {
+            TrustScopeKind::BareTld
+        } else {
+            TrustScopeKind::Wildcard
+        };
+    }
+
+    // A URL or resource path is one exact resource. Schemeless host/path
+    // patterns are normalized as HTTPS references by `normalize_exact_url`.
+    if p.contains("://") || p.contains('/') || p.contains('?') || p.contains('#') {
+        return TrustScopeKind::Exact;
+    }
+
+    let host = p.trim_end_matches('.');
+    if crate::data::is_public_suffix(host) {
+        return TrustScopeKind::BareTld;
+    }
+    if host.contains('.') {
+        return TrustScopeKind::Domain;
+    }
+    TrustScopeKind::Substring
 }
 
 fn extract_host_for_match(url: &str) -> Option<String> {
@@ -2149,18 +2242,40 @@ fn domain_matches(host: &str, pattern: &str) -> bool {
     host == pattern || host.ends_with(&format!(".{pattern}"))
 }
 
+/// Normalize an absolute URL, or a documented schemeless `host/path` resource
+/// (treated as HTTPS), using `url`'s canonical scheme/host/default-port/path
+/// representation. Query and fragment remain part of the equality key.
+fn normalize_exact_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let parsed = if trimmed.contains("://") {
+        url::Url::parse(trimmed).ok()?
+    } else if trimmed.contains('/') {
+        url::Url::parse(&format!("https://{trimmed}")).ok()?
+    } else {
+        return None;
+    };
+    parsed.host_str()?;
+    Some(parsed.to_string())
+}
+
 pub fn allowlist_pattern_matches(pattern: &str, url: &str) -> bool {
-    let p = pattern.to_lowercase();
-    if p.is_empty() {
+    let p = pattern.trim();
+    if validate_trust_pattern(p).is_err() {
         return false;
     }
-    if is_domain_pattern(&p) {
-        if let Some(host) = extract_host_for_match(url) {
-            return domain_matches(&host, &p);
+    match classify_trust_pattern(p) {
+        TrustScopeKind::Exact => match (normalize_exact_url(p), normalize_exact_url(url)) {
+            (Some(pattern_url), Some(candidate_url)) => pattern_url == candidate_url,
+            // Non-URL exact literals remain exact and case-sensitive.
+            _ => p == url.trim(),
+        },
+        TrustScopeKind::Domain | TrustScopeKind::Wildcard | TrustScopeKind::BareTld => {
+            extract_host_for_match(url)
+                .map(|host| domain_matches(&host, &p.to_lowercase()))
+                .unwrap_or(false)
         }
-        return false;
+        TrustScopeKind::Substring => url.to_lowercase().contains(&p.to_lowercase()),
     }
-    url.to_lowercase().contains(&p)
 }
 
 /// Discover policy path by walking up from cwd to .git boundary.
@@ -2661,6 +2776,73 @@ custom_rules:
             ..Default::default()
         };
         assert!(p.is_allowlisted("example.com:8080/path"));
+    }
+
+    #[test]
+    fn exact_url_trust_uses_normalized_equality_not_substrings() {
+        let trusted = "https://TRUSTED.example:443/install.sh?channel=stable#run";
+        assert!(allowlist_pattern_matches(
+            trusted,
+            "https://trusted.example/install.sh?channel=stable#run"
+        ));
+        assert!(!allowlist_pattern_matches(
+            trusted,
+            "https://evil.example/?next=https://TRUSTED.example:443/install.sh?channel=stable#run"
+        ));
+        assert!(!allowlist_pattern_matches(
+            trusted,
+            "http://trusted.example/install.sh?channel=stable#run"
+        ));
+        assert!(!allowlist_pattern_matches(
+            trusted,
+            "https://trusted.example/install.sh?channel=other#run"
+        ));
+    }
+
+    #[test]
+    fn schemeless_exact_resource_preserves_documented_https_compatibility() {
+        assert!(allowlist_pattern_matches(
+            "raw.githubusercontent.com/org/repo/main/get.sh",
+            "https://raw.githubusercontent.com/org/repo/main/get.sh"
+        ));
+        assert!(!allowlist_pattern_matches(
+            "raw.githubusercontent.com/org/repo/main/get.sh",
+            "http://raw.githubusercontent.com/org/repo/main/get.sh"
+        ));
+    }
+
+    #[test]
+    fn scope_classification_uses_embedded_public_suffix_data() {
+        assert_eq!(classify_trust_pattern("zip"), TrustScopeKind::BareTld);
+        assert_eq!(classify_trust_pattern("co.uk"), TrustScopeKind::BareTld);
+        assert_eq!(
+            classify_trust_pattern("example.co.uk"),
+            TrustScopeKind::Domain
+        );
+        assert_eq!(classify_trust_pattern("*.co.uk"), TrustScopeKind::BareTld);
+        assert!(TrustScopeKind::Substring.is_broad());
+    }
+
+    #[test]
+    fn malformed_loaded_trust_fields_are_skipped_not_widened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "entries": [
+                {"pattern":"https://safe.example/x","rule_id":"bad\u001b[2J"},
+                {"pattern":"https://evil.example/\u202ehidden"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let mut policy = Policy::default();
+        policy.merge_trust_store(&path);
+        assert!(!policy.is_allowlisted("https://safe.example/x"));
+        assert!(!policy.is_allowlisted("https://evil.example/hidden"));
+        assert!(policy.allowlist_rules.is_empty());
     }
 
     #[test]

@@ -830,6 +830,7 @@ works, and entries expire after 30 days unless you opt out.
 
 ```bash
 # Narrowest scope, a specific URL or path is accepted as-is, 30-day TTL.
+# A schemeless host/path is normalized as HTTPS for exact matching.
 tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
 
 # A whole domain / wildcard / bare TLD is broad, it must be opted into.
@@ -845,8 +846,10 @@ tirith trust gc --expired         # drop expired entries
 ```
 
 Each entry's **scope** is classified as `exact`, `substring`, `domain`,
-`wildcard`, or `bare-TLD`. A broad scope (`domain` / `wildcard` / `bare-TLD`)
-requires `--broad`, so a sweeping allow is always a deliberate choice. All
+`wildcard`, or `bare-TLD`. Every non-exact scope (`substring` / `domain` /
+`wildcard` / `bare-TLD`) requires `--broad`, so a sweeping allow is always a
+deliberate choice. Exact URLs use normalized URL equality (including scheme,
+host, effective port, path, query, and fragment), never substring matching. All
 subcommands support `--format json`. Trust stores written by older versions of
 tirith keep working unchanged, an entry with no TTL is treated as permanent.
 
