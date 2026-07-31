@@ -955,6 +955,8 @@ pub fn gather_doctor_info() -> CapsuleDoctorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use tirith_core::capsule::NetworkPolicy;
 
     #[test]
@@ -1026,6 +1028,10 @@ mod tests {
     fn macos_contained_command_os_preserves_argv() {
         use std::os::unix::ffi::OsStringExt;
 
+        // The production builder creates a temporary HOME from process-global
+        // TMPDIR. Serialize with the tests that deliberately mutate TMPDIR so
+        // this legitimate control cannot inherit their failure fixture.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let spec = CapsuleSpec::locked_down();
         let selected = SelectedBackend {
             backend_id: "seatbelt",
@@ -1153,11 +1159,11 @@ mod tests {
         assert_eq!(sel.backend_id, "seatbelt");
         assert!(!sel.is_degraded(), "spec must be enforceable: {sel:?}");
 
-        // Plant the vars, build the command (which snapshots the env via env_clear +
-        // surviving_vars), then immediately remove them — keeping the global-env
-        // window minimal so parallel tests are unaffected.
-        std::env::set_var(secret_name, secret_val);
-        std::env::set_var(marker_name, marker_val);
+        // Plant the vars while holding the crate-wide environment lock. RAII
+        // guards restore both values even if an assertion panics.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _secret = EnvGuard::set(secret_name, std::path::Path::new(secret_val));
+        let _marker = EnvGuard::set(marker_name, std::path::Path::new(marker_val));
         let cmd = build_contained_command(&spec, "/usr/bin/printenv", &[], &sel)
             .expect("build contained command");
         // The env the child WILL receive: the Command's explicit env overrides.
@@ -1170,9 +1176,6 @@ mod tests {
                 )
             })
             .collect();
-        std::env::remove_var(secret_name);
-        std::env::remove_var(marker_name);
-
         // The sensitive var must be ABSENT from the child's environment (env_clear
         // dropped the inherited copy and surviving_vars refused to re-add it).
         assert!(
@@ -1284,22 +1287,12 @@ mod tests {
         let sel = select_backend(&spec);
         assert_eq!(sel.backend_id, "seatbelt");
 
-        // Save and repoint TMPDIR at a path that cannot be created (a component is a
-        // non-existent file), so the production tempfile factory errors. Restored in
-        // the guard's Drop so a panic still cleans up.
-        struct TmpdirGuard(Option<std::ffi::OsString>);
-        impl Drop for TmpdirGuard {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(v) => std::env::set_var("TMPDIR", v),
-                    None => std::env::remove_var("TMPDIR"),
-                }
-            }
-        }
-        let _guard = TmpdirGuard(std::env::var_os("TMPDIR"));
-        std::env::set_var(
+        // Repoint TMPDIR at a path that cannot be created, serialized against
+        // every test that reads or mutates process-global environment state.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmpdir = EnvGuard::set(
             "TMPDIR",
-            "/tirith-im5-nonexistent-base-xyz/deeper/still-missing",
+            std::path::Path::new("/tirith-im5-nonexistent-base-xyz/deeper/still-missing"),
         );
 
         let result = build_contained_command(&spec, "/usr/bin/true", &[], &sel);
