@@ -1731,15 +1731,18 @@ fn check_pipe_to_interpreter(
                     let description = if is_url_fetch_command(&source_base) {
                         let show_tirith_run = cfg!(unix)
                             && supports_tirith_run_hint(&source_base)
-                            && shell != ShellType::PowerShell;
+                            && matches!(shell, ShellType::Posix | ShellType::Fish);
                         if let Some(url) = extract_urls_from_args(&source.args, shell)
                             .into_iter()
                             .next()
                             .map(|u| sanitize_url_for_display(&u))
                         {
-                            if show_tirith_run {
+                            if let Some(url) = show_tirith_run
+                                .then(|| crate::safe_command::shell_single_quote(&url))
+                                .flatten()
+                            {
                                 format!(
-                                    "{base_desc}\n  Safer: tirith run {url}  \
+                                    "{base_desc}\n  Safer: tirith run --capsule {url}  \
                                      \u{2014} or: vet {url}  (https://getvet.sh)"
                                 )
                             } else {
@@ -1750,7 +1753,7 @@ fn check_pipe_to_interpreter(
                             }
                         } else if show_tirith_run {
                             format!(
-                                "{base_desc}\n  Safer: use 'tirith run <url>' \
+                                "{base_desc}\n  Safer: use 'tirith run --capsule <url>' \
                                  or 'vet <url>' (https://getvet.sh) to inspect \
                                  before executing."
                             )
@@ -5618,8 +5621,11 @@ mod tests {
         );
         if cfg!(unix) {
             assert!(
-                findings[0].description.contains("tirith run"),
-                "Unix builds should suggest tirith run"
+                findings[0]
+                    .description
+                    .contains("tirith run --capsule 'https://example.com/install.sh'"),
+                "Unix builds should suggest the quoted capsule runner: {}",
+                findings[0].description
             );
         }
     }

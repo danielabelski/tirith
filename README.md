@@ -673,13 +673,13 @@ where a transformation is genuinely safer and correct:
 
 ```bash
 tirith check --suggest -- 'curl https://example-cli.dev/i.sh | bash'
-# → try: curl -fsSL -o /tmp/tirith-review.sh https://example-cli.dev/i.sh \
-#        && less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh
+# → try: tirith run --capsule 'https://example-cli.dev/i.sh'
 ```
 
-It rewrites pipe-to-shell into download-review-run, drops insecure-TLS flags
-(`-k` / `--insecure` / `--no-check-certificate`), and switches plain `http://`
-to `https://`. For findings with no safe mechanical rewrite (homograph
+It routes pipe-to-shell through Tirith's bounded, reviewed, hash-verified,
+fail-closed capsule runner, drops insecure-TLS flags (`-k` / `--insecure` /
+`--no-check-certificate`), and switches plain `http://` to `https://`. For
+findings with no safe mechanical rewrite (homograph
 hostnames, archive-extract targets, …) it says so plainly and shows the
 remediation instead, it never emits a bogus suggestion. The flag is advisory:
 it changes neither the verdict nor the exit code.
@@ -707,7 +707,7 @@ The everyday commands:
 | `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds a safer rewrite) |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
 | `tirith scan [path]` | Scan files, directories, and configs (`--profile`, `--format sarif`, `--ci`) |
-| `tirith run <url>` | Safe `curl \| bash` replacement: download, analyze, review, then execute (Unix) |
+| `tirith run --capsule <url>` | Safe `curl \| bash` replacement: download, analyze, review, then execute contained (Unix) |
 | `tirith fix -- <cmd>` | Interactively rewrite a risky command into a safer form |
 | `tirith score <url>` / `diff <url>` | Break down a URL's trust signals, or show where suspicious characters hide |
 | `tirith explain --rule <id>` / `why` | Rule docs and remediation, or explain the last trigger |

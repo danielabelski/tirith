@@ -529,6 +529,35 @@ fn materialize_execution_file(
     })
 }
 
+/// Atomically publish downloaded bytes at their content-addressed cache path.
+///
+/// Bytes are written through a random sibling file and `persist` performs the
+/// final rename. The destination is never opened for writing, so a precreated
+/// symlink at the predictable digest name cannot redirect writes to its target.
+fn persist_cache_entry(cache_dir: &Path, cached_path: &Path, content: &[u8]) -> Result<(), String> {
+    let mut tmp =
+        tempfile::NamedTempFile::new_in(cache_dir).map_err(|e| format!("tempfile: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("permissions: {e}"))?;
+    }
+    tmp.write_all(content)
+        .map_err(|e| format!("write cache: {e}"))?;
+    // fsync bytes before rename so a crash cannot leave a partial cache entry.
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync cache: {e}"))?;
+    tmp.persist(cached_path)
+        .map_err(|e| format!("persist cache: {e}"))?;
+    // Also fsync the parent directory so the rename itself is crash-durable.
+    // Best-effort: persist already succeeded, so a dir-fsync failure is logged.
+    crate::util::fsync_parent_dir_logged(cached_path, "run cache");
+    Ok(())
+}
+
 pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     if !opts.no_exec && !opts.interactive {
         return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
@@ -547,31 +576,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         .join("cache");
     fs::create_dir_all(&cache_dir).map_err(|e| format!("create cache: {e}"))?;
     let cached_path = cache_dir.join(&sha256);
-    {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let mut tmp = NamedTempFile::new_in(&cache_dir).map_err(|e| format!("tempfile: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tmp.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("permissions: {e}"))?;
-        }
-        tmp.write_all(&content)
-            .map_err(|e| format!("write cache: {e}"))?;
-        // fsync bytes before rename so a crash can't leave a partial cache entry.
-        tmp.as_file()
-            .sync_all()
-            .map_err(|e| format!("sync cache: {e}"))?;
-        tmp.persist(&cached_path)
-            .map_err(|e| format!("persist cache: {e}"))?;
-        // Also fsync the parent dir so the rename itself is crash-durable
-        // (CodeRabbit R9 #B). Best-effort: persist already succeeded, so a
-        // dir-fsync failure is logged not propagated (R13 #5). Unix-only.
-        crate::util::fsync_parent_dir_logged(&cached_path, "run cache");
-    }
+    persist_cache_entry(&cache_dir, &cached_path, &content)?;
 
     let cwd = std::env::current_dir().ok();
     let mut review =
@@ -983,14 +988,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cache_path_replacement_cannot_change_execution_bytes() {
+    fn precreated_cache_symlink_never_redirects_download_bytes() {
+        use std::os::unix::fs::symlink;
+
         let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir(&cache_dir).unwrap();
         let content = b"#!/bin/sh\nprintf 'reviewed\\n'\n";
         let sha = sha256_hex(content);
-        let cache_path = dir.path().join(&sha);
+        let cache_path = cache_dir.join(&sha);
+        let victim = dir.path().join("victim");
+        let victim_content = b"must remain unchanged";
+        std::fs::write(&victim, victim_content).unwrap();
+        symlink(&victim, &cache_path).unwrap();
+
+        persist_cache_entry(&cache_dir, &cache_path, content).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), victim_content);
+        assert!(
+            !std::fs::symlink_metadata(&cache_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "atomic cache publication must replace, never follow, a precreated symlink"
+        );
+        assert_eq!(std::fs::read(&cache_path).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_review_cache_swap_cannot_change_execution_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let content = b"#!/bin/sh\nprintf 'reviewed\\n'\n";
+        let sha = sha256_hex(content);
+        let cache_path = cache_dir.join(&sha);
+        persist_cache_entry(&cache_dir, &cache_path, content).unwrap();
+
+        // Exercise the real in-memory review before simulating an attacker who
+        // swaps the stable content-addressed cache pathname after approval.
+        let review = review_script_bytes(content, true, false, Some(dir.path()))
+            .expect("review clean script bytes");
+        assert!(review.analysis_complete);
+        std::fs::remove_file(&cache_path).unwrap();
         std::fs::write(&cache_path, b"#!/bin/sh\nprintf 'replaced\\n'\n").unwrap();
 
-        let execution = materialize_execution_file(dir.path(), content, &sha).unwrap();
+        let execution = materialize_execution_file(&cache_dir, content, &sha).unwrap();
         assert_ne!(execution.path(), cache_path);
         assert_eq!(std::fs::read(execution.path()).unwrap(), content);
         assert_eq!(sha256_hex(&std::fs::read(execution.path()).unwrap()), sha);

@@ -149,15 +149,16 @@ exact command you ran:
 tirith check --suggest-safe-command -- 'curl https://example.com/install.sh | bash'
 # tirith: safer alternative
 #   curl_pipe_shell
-#     try: curl -fsSL -o /tmp/tirith-review.sh https://example.com/install.sh \
-#          && less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh
+#     try: tirith run --capsule 'https://example.com/install.sh'
 ```
 
-It also drops insecure-TLS flags and upgrades `http://` to `https://`. For
-findings with no safe mechanical rewrite it says so plainly instead of guessing.
-The flag is advisory — it never changes the verdict or exit code. Use
-`tirith explain --rule curl_pipe_shell --fix` to see a rule's remediation on its
-own.
+The runner bounds and analyzes the downloaded bytes in memory, asks for
+confirmation, then executes a hash-verified private copy inside a fail-closed
+capsule. Suggestions also drop insecure-TLS flags and upgrade `http://` to
+`https://`. For findings with no safe mechanical rewrite it says so plainly
+instead of guessing. The flag is advisory — it never changes the verdict or
+exit code. Use `tirith explain --rule curl_pipe_shell --fix` to see a rule's
+remediation on its own.
 
 ### Using tirith run (built-in, Unix only)
 

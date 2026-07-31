@@ -8,12 +8,11 @@
 //! wrong suggestion is worse than none: a partial transformation remains
 //! guidance-only and never crosses the executable field boundary.
 //!
-//! [`SafeSuggestion::safe_command`] is the only executable rewrite channel;
-//! multi-step rewrites are one string with steps joined by ` && `.
+//! [`SafeSuggestion::safe_command`] is the only executable rewrite channel.
 //!
 //! Eight mechanically scoped transformations, each requiring whole-command
 //! verification before executable use: pipe-to-shell
-//! (download-review-run), insecure TLS flag (drop it), plain HTTP→HTTPS,
+//! (hardened `tirith run --capsule`), insecure TLS flag (drop it), plain HTTP→HTTPS,
 //! typosquat (`<pm> install <target>`), sudo narrow (drop `sudo` when the inner
 //! command is `Allow`), env scrub (`env -u VAR …`), archive list-before-extract,
 //! and dotfile backup-then-redirect.
@@ -312,14 +311,16 @@ fn build_suggestion(
         | RuleId::PipeToInterpreter => match rewrite_pipe_to_shell(segments, shell) {
             Some(rewrite) => (
                 Some(rewrite),
-                "Downloads the script to a file you can review before running it, \
-                 instead of executing it sight-unseen."
+                "Delegates the bounded download, in-memory policy review, confirmation, \
+                 private hash-verified materialization, and execution to Tirith's \
+                 fail-closed capsule runner."
                     .to_string(),
             ),
             None => (
                 None,
-                "No safe one-line rewrite for this pipeline: capture the piped content \
-                 to a file, review it, then run that file."
+                "No safe executable rewrite is available on this platform or for this \
+                 pipeline. Download into a private location, verify and review the exact \
+                 bytes, then execute that same copy in a containment boundary."
                     .to_string(),
             ),
         },
@@ -415,11 +416,14 @@ fn is_shell_interpreter(name: &str) -> bool {
     )
 }
 
-/// Rewrite `<fetch> URL | <shell>` into a download-review-run sequence.
+/// Rewrite `<fetch> URL | <shell>` into one hardened runner invocation.
 ///
 /// `None` unless the command is exactly a single pipe from a URL-fetch command
 /// into a shell interpreter with exactly one `http(s)` URL on the fetch side.
-/// Anything more complex falls through to honest guidance.
+/// On Unix, `tirith run --capsule` owns the bounded download, in-memory review,
+/// confirmation, private hash-verified execution copy, and fail-closed capsule.
+/// Other platforms do not expose `tirith run`, so they fall through to honest
+/// guidance instead of receiving a raw temporary path.
 fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Option<String> {
     if segments.len() != 2 {
         return None;
@@ -450,19 +454,34 @@ fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Op
     if url.is_empty() {
         return None;
     }
-    // Single-quote the untrusted URL so `$( )`, backtick, `;`, `|`, `&`, and
-    // spaces in a hostile URL cannot break out of the generated command when it
-    // is run / eval'd. Refuse the rewrite if it can't be safely single-quoted.
-    let url = shell_single_quote(&url)?;
+    // Single-quote the untrusted URL using the caller shell's escaping rule so
+    // `$( )`, backtick, `;`, `|`, `&`, spaces, and embedded quotes cannot break
+    // out when the suggestion is run / eval'd. Cmd has no supported Unix runner
+    // contract, so it remains guidance-only.
+    let url = runner_url_quote(&url, shell)?;
 
-    // `curl` is the safe, universally-available downloader to suggest.
-    let fetch = match source_cmd.as_str() {
-        "wget" => format!("wget -O /tmp/tirith-review.sh {url}"),
-        _ => format!("curl -fsSL -o /tmp/tirith-review.sh {url}"),
-    };
-    Some(format!(
-        "{fetch} && less /tmp/tirith-review.sh && {sink_cmd} /tmp/tirith-review.sh"
-    ))
+    #[cfg(unix)]
+    {
+        Some(format!("tirith run --capsule {url}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = url;
+        None
+    }
+}
+
+fn runner_url_quote(url: &str, shell: ShellType) -> Option<String> {
+    match shell {
+        ShellType::Posix | ShellType::Fish => shell_single_quote(url),
+        ShellType::PowerShell => {
+            if url.bytes().any(|byte| byte == b'\n' || byte == b'\0') {
+                return None;
+            }
+            Some(format!("'{}'", url.replace('\'', "''")))
+        }
+        ShellType::Cmd => None,
+    }
 }
 
 /// Remove insecure TLS flags, preserving everything else verbatim.
@@ -1358,27 +1377,67 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn curl_pipe_bash_rewrites_to_download_review_run() {
+    fn curl_pipe_bash_rewrites_to_hardened_capsule_runner() {
         let cmd = "curl https://example.com/install.sh | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         assert_eq!(s.len(), 1);
         let sc = s[0].safe_command.as_deref().unwrap();
-        assert!(sc.contains("curl -fsSL -o /tmp/tirith-review.sh"), "{sc}");
-        assert!(sc.contains("https://example.com/install.sh"), "{sc}");
-        assert!(sc.contains("less /tmp/tirith-review.sh"), "{sc}");
-        assert!(sc.ends_with("bash /tmp/tirith-review.sh"), "{sc}");
+        assert_eq!(sc, "tirith run --capsule 'https://example.com/install.sh'");
+        assert!(!sc.contains("/tmp/"), "{sc}");
+        assert!(!sc.contains(" && "), "{sc}");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn wget_pipe_sh_uses_wget_o_flag() {
+    fn emitted_capsule_runner_reanalyzes_allow_with_original_policy_snapshot() {
+        let ctx = default_exec_context(
+            "curl https://example.com/install.sh | bash",
+            ShellType::Posix,
+        );
+        let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+        assert_ne!(verdict.action, Action::Allow, "original pipeline must flag");
+
+        let suggestions = suggest_verified_with_policy(&ctx, &verdict, &policy);
+        let command = suggestions
+            .iter()
+            .find_map(|suggestion| suggestion.safe_command.as_deref())
+            .expect("verified runner command");
+        assert_eq!(
+            command,
+            "tirith run --capsule 'https://example.com/install.sh'"
+        );
+
+        let candidate_ctx = context_with_input(&ctx, command.to_string());
+        let candidate = engine::analyze_with_policy_without_bypass(&candidate_ctx, &policy);
+        assert_eq!(
+            candidate.action,
+            Action::Allow,
+            "the exact emitted runner invocation must be Allow under the original policy snapshot: {candidate:?}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn pipe_to_shell_is_guidance_only_without_runner_support() {
+        let cmd = "curl https://example.com/install.sh | bash";
+        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let s = suggest(cmd, ShellType::Posix, &v);
+        assert!(s[0].safe_command.is_none());
+        assert!(s[0].rationale.contains("No safe executable rewrite"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wget_pipe_sh_uses_same_hardened_runner() {
         let cmd = "wget https://example.com/x.sh | sh";
         let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         let sc = s[0].safe_command.as_deref().unwrap();
-        assert!(sc.starts_with("wget -O /tmp/tirith-review.sh"), "{sc}");
-        assert!(sc.ends_with("sh /tmp/tirith-review.sh"), "{sc}");
+        assert_eq!(sc, "tirith run --capsule 'https://example.com/x.sh'");
+        assert!(!sc.contains("wget "), "{sc}");
     }
 
     #[test]
@@ -1490,13 +1549,44 @@ mod tests {
         assert_eq!(v.action, Action::Allow);
     }
 
+    #[cfg(unix)]
     #[test]
     fn powershell_exe_suffix_stripped_for_interpreter_match() {
         // bash.exe piped under PowerShell must still be recognized.
         let cmd = "curl https://example.com/x.sh | bash.exe";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::PowerShell, &v);
-        assert!(s[0].safe_command.is_some(), "{:?}", s[0]);
+        assert_eq!(
+            s[0].safe_command.as_deref(),
+            Some("tirith run --capsule 'https://example.com/x.sh'")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_runner_url_doubles_embedded_quote() {
+        let cmd = r#"curl "https://x/a'b;Write-Output pwned" | bash.exe"#;
+        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let s = suggest(cmd, ShellType::PowerShell, &v);
+        let command = s[0].safe_command.as_deref().expect("runner rewrite");
+        assert_eq!(
+            command,
+            "tirith run --capsule 'https://x/a''b;Write-Output pwned'"
+        );
+        assert!(
+            !command
+                .replace("'https://x/a''b;Write-Output pwned'", "")
+                .contains("Write-Output"),
+            "the PowerShell payload must remain inside the quoted URL: {command}"
+        );
+    }
+
+    #[test]
+    fn cmd_pipe_to_shell_remains_guidance_only() {
+        let cmd = "curl https://example.com/x.sh | bash.exe";
+        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let s = suggest(cmd, ShellType::Cmd, &v);
+        assert!(s[0].safe_command.is_none());
     }
 
     #[test]
@@ -1687,9 +1777,10 @@ mod tests {
         assert_eq!(shell_single_quote("a\0b"), None);
     }
 
-    // ── rewrite_pipe_to_shell — URL is single-quoted (PR124) ───────────────
+    // ── rewrite_pipe_to_shell — one runner invocation, quoted URL ──────────
 
     /// Drive a `<url> | bash` rewrite and return the emitted command.
+    #[cfg(unix)]
     fn pipe_rewrite(url_literal: &str) -> String {
         let cmd = format!("curl {url_literal} | bash");
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
@@ -1699,6 +1790,7 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a rewrite for {cmd:?}"))
     }
 
+    #[cfg(unix)]
     #[test]
     fn pipe_to_shell_quotes_command_substitution_url() {
         // The classic PR124 case: a single-quoted URL with `$(id)`.
@@ -1712,12 +1804,13 @@ mod tests {
             !sc.replace("'http://x/$(id)'", "").contains("$(id)"),
             "no bare $(id) may survive outside the quoted token: {sc}"
         );
-        assert!(
-            sc.starts_with("curl -fsSL -o /tmp/tirith-review.sh '"),
-            "{sc}"
-        );
+        assert!(sc.starts_with("tirith run --capsule '"), "{sc}");
+        assert!(!sc.contains("/tmp/"), "{sc}");
+        assert!(!sc.contains(" && "), "{sc}");
+        assert!(!sc.contains("less "), "{sc}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn pipe_to_shell_quotes_backtick_url() {
         let sc = pipe_rewrite("'http://x/`id`'");
@@ -1727,6 +1820,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pipe_to_shell_quotes_semicolon_rm_url() {
         // `;rm -rf ~` must end up inside the single quotes, not a top-level command.
@@ -1735,8 +1829,8 @@ mod tests {
             sc.contains("'http://x/a;rm -rf ~'"),
             "the ;rm payload must be inside single quotes: {sc}"
         );
-        // After removing the quoted token, no bare `;` separator remains before
-        // the legitimate ` && ` chain — i.e. `rm` is not its own command.
+        // After removing the quoted token, no bare `;` separator remains — i.e.
+        // `rm` is not its own command.
         let outside = sc.replace("'http://x/a;rm -rf ~'", "");
         assert!(
             !outside.contains(";rm"),
@@ -1744,6 +1838,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pipe_to_shell_quotes_space_in_url() {
         let sc = pipe_rewrite("'http://x/a b'");
@@ -1753,14 +1848,17 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pipe_to_shell_wget_quotes_command_substitution_url() {
-        // Same neutralization on the wget branch.
+        // The original downloader is discarded; the same runner and quoting
+        // contract applies to every recognized fetch command.
         let cmd = "wget 'http://x/$(id)' | sh";
         let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         let sc = s[0].safe_command.as_deref().unwrap();
-        assert!(sc.starts_with("wget -O /tmp/tirith-review.sh '"), "{sc}");
+        assert!(sc.starts_with("tirith run --capsule '"), "{sc}");
+        assert!(!sc.contains("wget "), "{sc}");
         assert!(sc.contains("'http://x/$(id)'"), "{sc}");
         assert!(
             !sc.replace("'http://x/$(id)'", "").contains("$(id)"),
@@ -1768,6 +1866,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pipe_to_shell_quotes_embedded_single_quote_url() {
         // A double-quoted URL carrying a literal single quote: the rewrite must

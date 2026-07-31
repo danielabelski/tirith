@@ -436,8 +436,9 @@ fn explain_fix_requires_rule() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn check_suggest_safe_command_rewrites_pipe_to_shell() {
+fn check_suggest_safe_command_routes_pipe_to_hardened_runner() {
     let out = tirith()
         .args([
             "check",
@@ -458,13 +459,11 @@ fn check_suggest_safe_command_rewrites_pipe_to_shell() {
         "expected safe-command block: {stderr}"
     );
     assert!(
-        stderr.contains("curl -fsSL -o /tmp/tirith-review.sh"),
-        "expected download-to-file rewrite: {stderr}"
+        stderr.contains("tirith run --capsule 'https://example.com/install.sh'"),
+        "expected hardened runner rewrite: {stderr}"
     );
-    assert!(
-        stderr.contains("bash /tmp/tirith-review.sh"),
-        "expected review-then-run step: {stderr}"
-    );
+    assert!(!stderr.contains("/tmp/"), "{stderr}");
+    assert!(!stderr.contains("less /tmp/"), "{stderr}");
 }
 
 #[test]
@@ -489,6 +488,7 @@ fn check_suggest_safe_command_drops_insecure_tls_flag() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn check_suggest_safe_command_json_embeds_suggestions() {
     let out = tirith()
@@ -514,9 +514,10 @@ fn check_suggest_safe_command_json_embeds_suggestions() {
     assert!(!suggestions.is_empty(), "expected at least one suggestion");
     let s = &suggestions[0];
     assert_eq!(s["rule_id"], "curl_pipe_shell");
-    assert!(s["safe_command"]
-        .as_str()
-        .is_some_and(|c| c.contains("/tmp/tirith-review.sh")));
+    assert_eq!(
+        s["safe_command"],
+        "tirith run --capsule 'https://example.com/install.sh'"
+    );
     // Findings still carry per-rule remediation independently of the flag.
     assert!(v["findings"][0]["remediation"]
         .as_str()
@@ -8089,6 +8090,7 @@ fn fix_clean_command_human_prints_no_fix_needed() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
     // Acceptance: `tirith fix --json --non-interactive -- "curl … | bash"` emits a valid JSON
@@ -8110,8 +8112,9 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
         .as_array()
         .expect("findings-present shape is a JSON array");
     assert!(!arr.is_empty(), "expected at least one suggestion");
-    // The pipe-to-shell rewrite must be present with the canonical
-    // /tmp/tirith-review.sh download-then-run shape.
+    // The pipe-to-shell rewrite must be one invocation of Tirith's hardened
+    // runner. No public fixed path, downloader, pager, or pathname reopen may
+    // escape through the executable field.
     let curl_pipe = arr
         .iter()
         .find(|s| s["rule_id"] == "curl_pipe_shell")
@@ -8119,14 +8122,13 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
     let sc = curl_pipe["safe_command"]
         .as_str()
         .expect("safe_command is a string for this transform");
-    assert!(
-        sc.contains("/tmp/tirith-review.sh"),
-        "rewrite must use the canonical review scratch path, got: {sc}"
-    );
-    assert!(
-        sc.contains("less /tmp/tirith-review.sh"),
-        "rewrite must include the review step, got: {sc}"
-    );
+    assert_eq!(sc, "tirith run --capsule 'https://example.com/install.sh'");
+    for forbidden in ["/tmp/", "curl ", "wget ", "less ", " && ", " | "] {
+        assert!(
+            !sc.contains(forbidden),
+            "runner rewrite must not expose historical stage {forbidden:?}: {sc}"
+        );
+    }
     // Every suggestion must carry a non-empty `remediation` (honest guidance)
     // — this is the discipline that prevents fabricated rewrites.
     for s in arr {
@@ -8141,6 +8143,7 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn fix_composes_multi_finding_rewrites_and_only_emits_an_allow_command() {
     // Regression for repo-0149: dropping only `-k` would leave both the plain-
@@ -8171,17 +8174,9 @@ fn fix_composes_multi_finding_rewrites_and_only_emits_an_allow_command() {
         "only the composed, verified command may be executable: {suggestions}"
     );
     let command = executable[0];
-    assert!(
-        !command.contains(" -k"),
-        "TLS bypass must be removed: {command}"
-    );
-    assert!(
-        command.contains("https://attacker.invalid/script"),
-        "plain HTTP must be upgraded in the composed command: {command}"
-    );
-    assert!(
-        command.contains("less /tmp/tirith-review.sh"),
-        "pipe-to-shell must become review-before-run: {command}"
+    assert_eq!(
+        command, "tirith run --capsule 'https://attacker.invalid/script'",
+        "TLS, transport, and pipe remediation must compose into one runner invocation"
     );
 
     let checked = tirith()

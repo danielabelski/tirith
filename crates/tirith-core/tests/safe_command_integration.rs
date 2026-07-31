@@ -258,6 +258,7 @@ fn archive_list_first_negative_non_archive_leader_no_rewrite() {
 // metacharacters (it must stay unquoted for `~`/`$HOME` expansion).
 
 /// End-to-end: run `suggest` on `cmd`, return the `curl_pipe_shell` rewrite.
+#[cfg(unix)]
 fn pipe_safe_command(cmd: &str) -> String {
     let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
     let s = suggest(cmd, ShellType::Posix, &v);
@@ -266,6 +267,31 @@ fn pipe_safe_command(cmd: &str) -> String {
         .unwrap_or_else(|| panic!("expected a pipe-to-shell rewrite for {cmd:?}"))
 }
 
+#[cfg(not(unix))]
+#[test]
+fn pipe_to_shell_public_contract_is_guidance_only_without_runner() {
+    let cmd = "curl https://example.com/install.sh | bash";
+    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+    let suggestions = suggest(cmd, ShellType::Posix, &v);
+    let entry = find_by_rule(&suggestions, "curl_pipe_shell").expect("rule entry");
+    assert!(entry.safe_command.is_none());
+    assert!(entry.rationale.contains("No safe executable rewrite"));
+}
+
+#[cfg(unix)]
+#[test]
+fn pipe_to_shell_public_contract_is_one_capsule_runner_invocation() {
+    let sc = pipe_safe_command("curl https://example.com/install.sh | bash");
+    assert_eq!(sc, "tirith run --capsule 'https://example.com/install.sh'");
+    for forbidden in ["/tmp/", "curl ", "wget ", "less ", " && ", " | "] {
+        assert!(
+            !sc.contains(forbidden),
+            "runner rewrite must not expose historical stage {forbidden:?}: {sc}"
+        );
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn pipe_to_shell_command_substitution_url_is_quoted_not_executed() {
     // The single-quoted hostile URL has its quotes stripped by the extractor,
@@ -278,6 +304,7 @@ fn pipe_to_shell_command_substitution_url_is_quoted_not_executed() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn pipe_to_shell_semicolon_rm_url_is_contained_in_quotes() {
     // `;rm -rf ~` must be inside the single quotes, never a top-level command.
@@ -289,21 +316,24 @@ fn pipe_to_shell_semicolon_rm_url_is_contained_in_quotes() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn pipe_to_shell_backtick_url_is_quoted() {
     let sc = pipe_safe_command("curl 'http://x/`id`' | bash");
     assert!(sc.contains("'https://x/`id`'"), "{sc}");
 }
 
+#[cfg(unix)]
 #[test]
 fn pipe_to_shell_wget_command_substitution_url_is_quoted() {
-    // The wget branch quotes the URL too.
+    // The original downloader is discarded; the runner quotes the URL itself.
     let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
     let s = suggest("wget 'http://x/$(id)' | sh", ShellType::Posix, &v);
     let sc = find_by_rule(&s, "wget_pipe_shell")
         .and_then(|e| e.safe_command.clone())
         .expect("wget pipe-to-shell rewrite expected");
-    assert!(sc.starts_with("wget -O /tmp/tirith-review.sh '"), "{sc}");
+    assert!(sc.starts_with("tirith run --capsule '"), "{sc}");
+    assert!(!sc.contains("wget "), "{sc}");
     assert!(sc.contains("'https://x/$(id)'"), "{sc}");
     assert!(
         !sc.replace("'https://x/$(id)'", "").contains("$(id)"),

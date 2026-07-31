@@ -603,12 +603,12 @@ $ tirith why
   Safe rewrite:
     curl -sSL https://install.example-cli.dev | bash
     or better:
-    tirith run https://install.example-cli.dev
+    tirith run --capsule 'https://install.example-cli.dev'
 ```
 
 Every warning comes with:
 1. Which rule triggered and the minimal proof
-2. A "safe rewrite" suggestion when possible (strip userinfo, resolve punycode, replace pipe-to-shell with `tirith run`, resolve shortened URL)
+2. A "safe rewrite" suggestion when possible (strip userinfo, resolve punycode, replace pipe-to-shell with quoted `tirith run --capsule`, resolve shortened URL)
 
 Developers forgive warnings when they come with a clean fix.
 
@@ -616,9 +616,10 @@ This remediation surface is now concrete: every finding carries a per-rule
 remediation (shown as a `Fix:` line and in `--format json`); `tirith explain
 --rule <id> --fix` prints a rule's remediation on its own; and `tirith check
 --suggest-safe-command` rewrites the actual command into a safer one wherever a
-transformation is genuinely correct (pipe-to-shell → download-review-run,
-insecure-TLS flag dropped, `http://` → `https://`). Where there is no safe
-mechanical rewrite, tirith says so plainly rather than inventing one.
+transformation is genuinely correct (pipe-to-shell → hardened
+`tirith run --capsule`, insecure-TLS flag dropped, `http://` → `https://`).
+Where there is no safe mechanical rewrite, tirith says so plainly rather than
+inventing one.
 
 ### 9. `tirith score` — URL risk score
 
@@ -842,7 +843,7 @@ No naked warnings. Every trigger includes:
 
 ```
   WARN: Pipe-to-shell detected.
-  Safe alternative: tirith run https://get.example-tool.sh
+  Safe alternative: tirith run --capsule 'https://get.example-tool.sh'
 ```
 
 ### Consistent prompt UI

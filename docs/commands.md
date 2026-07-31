@@ -12,7 +12,7 @@ everyday subset; this is the complete reference.
 | `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds a safer rewrite; `--defer` records a non-critical block as pending and exits 4 instead of blocking) |
 | `tirith paste` | Check pasted content (called by shell hooks; `--with-source` attributes the paste to its recorded clipboard origin) |
 | `tirith scan [path]` | Scan files, directories, and configs (`--include`, `--exclude`, `--profile`, `--format sarif`, `--ci`) |
-| `tirith run <url>` | Safe `curl \| bash` replacement: download, analyze, review, then execute (Unix) |
+| `tirith run --capsule <url>` | Safe `curl \| bash` replacement: download, analyze, review, then execute contained (Unix) |
 | `tirith fix -- <cmd>` | Interactively rewrite a risky command into a safer form; the chosen rewrite prints to stdout for `$(tirith fix ...)` |
 | `tirith view [file]` | Safe pager that neutralizes terminal-deception escape sequences before they reach your terminal |
 | `tirith score <url>` | Break down a URL's trust signals (`--explain` for the factor-by-factor derivation) |

