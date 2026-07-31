@@ -2937,12 +2937,14 @@ mod tests {
             format: Some(NativeFormat::MachOFat),
             ..NativeFacts::default()
         };
-        let mut budget = ExtractionBudget::default();
-        budget.imports_remaining = 0;
-        budget.import_descriptors_remaining = 0;
-        budget.symbols_remaining = 0;
-        budget.dynamic_symbols_remaining = 0;
-        budget.sections_remaining = 0;
+        let mut budget = ExtractionBudget {
+            imports_remaining: 0,
+            import_descriptors_remaining: 0,
+            symbols_remaining: 0,
+            dynamic_symbols_remaining: 0,
+            sections_remaining: 0,
+            ..ExtractionBudget::default()
+        };
 
         assert!(parse_fat_macho(&fat, &mut facts, &mut budget));
         assert_eq!(facts.coverage, NativeCoverage::Partial);
