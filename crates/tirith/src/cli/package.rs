@@ -466,6 +466,7 @@ fn run(
     explain: bool,
 ) -> i32 {
     let Some(eco) = Ecosystem::from_name(ecosystem) else {
+        let ecosystem = super::sanitize_for_human_output(ecosystem, false);
         eprintln!(
             "tirith package: unknown ecosystem '{ecosystem}'. \
              Known: npm, pypi, rubygems, crates.io, go, maven, nuget, packagist."
@@ -536,8 +537,8 @@ fn run(
         if !print_json(&breakdown, explain) {
             return 1;
         }
-    } else {
-        print_human(&breakdown, explain);
+    } else if !print_human(&breakdown, explain) {
+        return 1;
     }
     0
 }
@@ -652,8 +653,9 @@ fn gather_content_signals(
         Some(p) => {
             let pb = PathBuf::from(p);
             if !pb.exists() {
+                let display_path = super::sanitize_for_human_output(p, false);
                 eprintln!(
-                    "tirith package: --path '{p}' does not exist; \
+                    "tirith package: --path '{display_path}' does not exist; \
                      scoring with name signals only."
                 );
                 None
@@ -835,51 +837,73 @@ fn print_json(breakdown: &RiskBreakdown, explain: bool) -> bool {
     super::write_json_stdout(&out, "tirith package: failed to write JSON output")
 }
 
-fn print_human(breakdown: &RiskBreakdown, explain: bool) {
-    println!(
-        "tirith package risk: {} package '{}'",
-        breakdown.ecosystem, breakdown.name
-    );
-    println!(
-        "  risk score:  {}/100 ({})",
-        breakdown.score, breakdown.risk_level
-    );
+fn print_human(breakdown: &RiskBreakdown, explain: bool) -> bool {
+    let mut stdout = std::io::stdout().lock();
+    write_human(breakdown, explain, &mut stdout).is_ok()
+}
+
+/// Write package-risk human output while keeping raw structured values confined
+/// to the JSON path. Package names, registry metadata, advisory identifiers,
+/// local paths, and failure reasons can all be attacker-controlled; sanitize
+/// each value separately so it cannot inject terminal controls or forge rows.
+fn write_human(
+    breakdown: &RiskBreakdown,
+    explain: bool,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let ecosystem = super::sanitize_for_human_output(&breakdown.ecosystem, false);
+    let name = super::sanitize_for_human_output(&breakdown.name, false);
+    let risk_level = super::sanitize_for_human_output(breakdown.risk_level, false);
+
+    writeln!(w, "tirith package risk: {} package '{}'", ecosystem, name)?;
+    writeln!(w, "  risk score:  {}/100 ({})", breakdown.score, risk_level)?;
 
     match &breakdown.name_vs_popular {
         NameVsPopular::KnownPopular => {
-            println!("  name:        known-popular package (recognized)");
+            writeln!(w, "  name:        known-popular package (recognized)")?;
         }
         NameVsPopular::NearPopular {
             popular_name,
             distance,
         } => {
-            println!(
+            writeln!(
+                w,
                 "  name:        edit-distance {distance} from popular package '{popular_name}' \
-                 — possible typosquat/slopsquat"
-            );
+                 — possible typosquat/slopsquat",
+                popular_name = super::sanitize_for_human_output(popular_name, false),
+            )?;
         }
         NameVsPopular::Unknown => {
             if breakdown.threat_db_missing {
-                println!(
+                writeln!(
+                    w,
                     "  name:        unknown — threat DB not installed, \
                      popular-package comparison skipped"
-                );
+                )?;
             } else {
-                println!("  name:        not a known-popular package, and no near-miss");
+                writeln!(
+                    w,
+                    "  name:        not a known-popular package, and no near-miss"
+                )?;
             }
         }
     }
 
     if let Some(target) = &breakdown.malicious_typosquat_of {
-        println!("  threat DB:   listed as a known malicious typosquat of '{target}'");
+        writeln!(
+            w,
+            "  threat DB:   listed as a known malicious typosquat of '{}'",
+            super::sanitize_for_human_output(target, false)
+        )?;
     }
 
     match &breakdown.content_signals {
         ContentSignals::NotInspected => {
-            println!(
+            writeln!(
+                w,
                 "  content:     not inspected (no local package directory — \
                  pass --path to inspect install scripts and binary blobs)"
-            );
+            )?;
         }
         ContentSignals::Inspected {
             path,
@@ -888,16 +912,28 @@ fn print_human(breakdown: &RiskBreakdown, explain: bool) {
             has_binary_blob,
             binary_blob_detail,
         } => {
-            println!("  content:     inspected {path}");
+            writeln!(
+                w,
+                "  content:     inspected {}",
+                super::sanitize_for_human_output(path, false)
+            )?;
             match (has_install_script, install_script_detail) {
-                (true, Some(d)) => println!("               - install script: {d}"),
-                (true, None) => println!("               - install script: present"),
-                (false, _) => println!("               - install script: none"),
+                (true, Some(d)) => writeln!(
+                    w,
+                    "               - install script: {}",
+                    super::sanitize_for_human_output(d, false)
+                )?,
+                (true, None) => writeln!(w, "               - install script: present")?,
+                (false, _) => writeln!(w, "               - install script: none")?,
             }
             match (has_binary_blob, binary_blob_detail) {
-                (true, Some(d)) => println!("               - binary blob: {d}"),
-                (true, None) => println!("               - binary blob: present"),
-                (false, _) => println!("               - binary blob: none"),
+                (true, Some(d)) => writeln!(
+                    w,
+                    "               - binary blob: {}",
+                    super::sanitize_for_human_output(d, false)
+                )?,
+                (true, None) => writeln!(w, "               - binary blob: present")?,
+                (false, _) => writeln!(w, "               - binary blob: none")?,
             }
         }
     }
@@ -905,79 +941,115 @@ fn print_human(breakdown: &RiskBreakdown, explain: bool) {
     // API-signal seam — always reported so the offline/online scope is explicit.
     match &breakdown.api_signals {
         ApiSignals::NotComputed { reason } => {
-            println!("  api signals: not computed — {reason}");
+            writeln!(
+                w,
+                "  api signals: not computed — {}",
+                super::sanitize_for_human_output(reason, false)
+            )?;
         }
         ApiSignals::Unavailable { reason } => {
-            println!("  api signals: unavailable — {reason}");
+            writeln!(
+                w,
+                "  api signals: unavailable — {}",
+                super::sanitize_for_human_output(reason, false)
+            )?;
         }
         ApiSignals::Available { provenance } => {
-            print_api_provenance_human(provenance);
+            write_api_provenance_human(provenance, w)?;
         }
     }
 
     if explain {
-        print_breakdown_human(breakdown);
+        write_breakdown_human(breakdown, w)?;
     } else {
-        println!(
+        writeln!(
+            w,
             "  Run 'tirith package explain {} {}' for the factor-by-factor derivation.",
-            breakdown.ecosystem, breakdown.name
-        );
+            ecosystem, name
+        )?;
     }
+    Ok(())
 }
 
 /// Render the registry-API provenance for the human summary; an unknown datum
 /// shows as `unknown` so the reader sees what the registry didn't expose.
-fn print_api_provenance_human(p: &ApiProvenance) {
-    println!("  api signals: from the {} registry API", p.source);
+fn write_api_provenance_human(
+    p: &ApiProvenance,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "  api signals: from the {} registry API",
+        super::sanitize_for_human_output(&p.source, false)
+    )?;
     match p.package_age_days {
-        Some(d) => println!("               - package age: {d} day(s) since first publish"),
-        None => println!("               - package age: unknown (not reported)"),
+        Some(d) => writeln!(
+            w,
+            "               - package age: {d} day(s) since first publish"
+        )?,
+        None => writeln!(w, "               - package age: unknown (not reported)")?,
     }
     match (&p.latest_version, p.latest_version_age_days) {
-        (Some(v), Some(d)) => {
-            println!("               - latest version: {v} ({d} day(s) old)")
-        }
-        (Some(v), None) => println!("               - latest version: {v}"),
-        (None, _) => println!("               - latest version: unknown"),
+        (Some(v), Some(d)) => writeln!(
+            w,
+            "               - latest version: {} ({d} day(s) old)",
+            super::sanitize_for_human_output(v, false)
+        )?,
+        (Some(v), None) => writeln!(
+            w,
+            "               - latest version: {}",
+            super::sanitize_for_human_output(v, false)
+        )?,
+        (None, _) => writeln!(w, "               - latest version: unknown")?,
     }
     #[allow(deprecated)]
     match p.ownership_transferred {
-        Some(true) => {
-            println!("               - ownership: no listed owners (established package)")
-        }
-        Some(false) => println!("               - ownership: has listed owners"),
-        None => println!("               - ownership: unknown (registry exposes no owner field)"),
+        Some(true) => writeln!(
+            w,
+            "               - ownership: no listed owners (established package)"
+        )?,
+        Some(false) => writeln!(w, "               - ownership: has listed owners")?,
+        None => writeln!(
+            w,
+            "               - ownership: unknown (registry exposes no owner field)"
+        )?,
     }
     match p.version_spike {
-        Some(true) => println!("               - version jump: abnormal (major-version spike)"),
-        Some(false) => println!("               - version jump: normal"),
-        None => println!("               - version jump: unknown (one version only)"),
+        Some(true) => writeln!(
+            w,
+            "               - version jump: abnormal (major-version spike)"
+        )?,
+        Some(false) => writeln!(w, "               - version jump: normal")?,
+        None => writeln!(
+            w,
+            "               - version jump: unknown (one version only)"
+        )?,
     }
     match p.recent_downloads {
-        Some(dl) => println!("               - downloads: {dl} (recent window)"),
-        None => println!("               - downloads: unknown (not reported)"),
+        Some(dl) => writeln!(w, "               - downloads: {dl} (recent window)")?,
+        None => writeln!(w, "               - downloads: unknown (not reported)")?,
     }
     match p.has_source_repo {
-        Some(true) => println!("               - source repo: listed"),
-        Some(false) => println!("               - source repo: missing or unusable"),
-        None => println!("               - source repo: unknown (field not in API)"),
+        Some(true) => writeln!(w, "               - source repo: listed")?,
+        Some(false) => writeln!(w, "               - source repo: missing or unusable")?,
+        None => writeln!(
+            w,
+            "               - source repo: unknown (field not in API)"
+        )?,
     }
     if p.yanked_or_deprecated {
-        println!("               - status: latest version yanked / deprecated");
+        writeln!(
+            w,
+            "               - status: latest version yanked / deprecated"
+        )?;
     } else {
-        println!("               - status: latest version current");
+        writeln!(w, "               - status: latest version current")?;
     }
+    Ok(())
 }
 
-/// Render the factor breakdown so the reader can reproduce the score by hand
-/// (like `tirith score --explain`). Formatting lives in [`write_breakdown_human`]
-/// for buffer-based unit tests.
-fn print_breakdown_human(breakdown: &RiskBreakdown) {
-    let _ = write_breakdown_human(breakdown, &mut std::io::stdout().lock());
-}
-
-/// Write the factor breakdown to `w` — split from [`print_breakdown_human`] only
-/// so tests can capture the (identical) text.
+/// Write the factor breakdown to `w` so both the live renderer and tests use the
+/// same terminal-safe formatting.
 fn write_breakdown_human(
     breakdown: &RiskBreakdown,
     w: &mut impl std::io::Write,
@@ -995,16 +1067,21 @@ fn write_breakdown_human(
         writeln!(
             w,
             "    {sign}{:<4} {}  (running total: {running})",
-            factor.points, factor.label
+            factor.points,
+            super::sanitize_for_human_output(&factor.label, false)
         )?;
-        writeln!(w, "           {}", factor.detail)?;
+        writeln!(
+            w,
+            "           {}",
+            super::sanitize_for_human_output(&factor.detail, false)
+        )?;
     }
     writeln!(
         w,
         "    = {} / {}  ({}) — sum of every factor above",
         breakdown.score,
         package_risk::MAX_SCORE,
-        breakdown.risk_level
+        super::sanitize_for_human_output(breakdown.risk_level, false)
     )?;
     Ok(())
 }
@@ -1364,7 +1441,97 @@ mod tests {
         ));
         // Confirm the human renderer doesn't panic on a full provenance.
         if let ApiSignals::Available { provenance } = &breakdown.api_signals {
-            print_api_provenance_human(provenance);
+            let mut out = Vec::new();
+            write_api_provenance_human(provenance, &mut out).unwrap();
         }
+    }
+
+    #[test]
+    fn package_risk_human_output_sanitizes_every_untrusted_field() {
+        use tirith_core::package_risk::{
+            DepConfusionVerdict, OsvAdvisorySummary, RepoMismatchState, RepoMismatchVerdict,
+        };
+
+        let injected = "\u{1b}]52;c;Y2xpcGJvYXJk\u{7}\nFORGED\r\u{202e}\u{200b}";
+        #[allow(deprecated)]
+        let provenance = ApiProvenance {
+            source: format!("registry{injected}"),
+            latest_version: Some(format!("9.9.9{injected}")),
+            osv_advisories: Some(vec![OsvAdvisorySummary {
+                id: format!("GHSA{injected}"),
+                aliases: Vec::new(),
+                summary: None,
+                cvss: Some(9.8),
+                reference: None,
+            }]),
+            dep_confusion: Some(DepConfusionVerdict {
+                risk: true,
+                reason: format!("dependency mismatch{injected}"),
+            }),
+            repo_mismatch: Some(RepoMismatchVerdict {
+                state: RepoMismatchState::Mismatch,
+                reason: format!("repository mismatch{injected}"),
+            }),
+            ownership_transferred: None,
+            ..Default::default()
+        };
+        let signals = PackageSignals {
+            ecosystem: Ecosystem::Npm,
+            name: format!("package{injected}"),
+            version: None,
+            threat_db_missing: false,
+            name_vs_popular: NameVsPopular::NearPopular {
+                popular_name: format!("popular{injected}"),
+                distance: 1,
+            },
+            malicious_typosquat_of: Some(format!("target{injected}")),
+            content_signals: ContentSignals::Inspected {
+                path: format!("/tmp/package{injected}"),
+                has_install_script: true,
+                install_script_detail: Some(format!("install hook{injected}")),
+                has_binary_blob: true,
+                binary_blob_detail: Some(format!("native blob{injected}")),
+            },
+            api: ApiSignals::Available { provenance },
+        };
+        let breakdown = package_risk::score_package(&signals);
+
+        // Raw values stay intact for structured JSON consumers.
+        assert!(breakdown.name.contains('\u{1b}'));
+        assert!(breakdown
+            .factors
+            .iter()
+            .any(|factor| factor.detail.contains('\u{1b}')));
+
+        let mut buf = Vec::new();
+        write_human(&breakdown, true, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(!out.contains('\u{1b}'), "ESC reached human output: {out:?}");
+        assert!(!out.contains('\r'), "CR reached human output: {out:?}");
+        assert!(
+            !out.contains('\u{202e}'),
+            "bidi control reached output: {out:?}"
+        );
+        assert!(
+            !out.contains('\u{200b}'),
+            "zero-width control reached output: {out:?}"
+        );
+        assert!(
+            !out.contains("\nFORGED"),
+            "an injected newline forged a terminal row: {out:?}"
+        );
+        assert!(out.contains("package"));
+        assert!(out.contains("registry"));
+        assert!(out.contains("GHSA"));
+
+        let mut unavailable = breakdown.clone();
+        unavailable.api_signals = ApiSignals::unavailable(format!("timeout{injected}"));
+        let mut buf = Vec::new();
+        write_human(&unavailable, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.contains("\nFORGED"));
+        assert!(out.contains("api signals: unavailable"));
     }
 }
