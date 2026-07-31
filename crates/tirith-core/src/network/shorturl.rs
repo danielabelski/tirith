@@ -88,12 +88,7 @@ enum Hop {
 /// a shortener cannot steer us into an SSRF target (loopback / private /
 /// link-local / cloud-metadata).
 fn follow_redirects(start_url: &str) -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(HOP_TIMEOUT)
-        .user_agent("tirith-security/0.1")
-        .build()
-        .ok()?;
+    let client = shorturl_client(crate::ssrf_guard::fetch_resolver()).ok()?;
 
     follow_redirects_with(
         start_url,
@@ -112,6 +107,20 @@ fn follow_redirects(start_url: &str) -> Option<String> {
         },
         |url| crate::url_validate::validate_fetch_url(url).map(|_| ()),
     )
+}
+
+/// The production short-URL client builder, split so the connect-time rebind
+/// guard can be driven with a per-test resolver without mutable process DNS.
+fn shorturl_client(
+    resolver: std::sync::Arc<crate::ssrf_guard::SsrfGuardResolver>,
+) -> Result<reqwest::blocking::Client, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .dns_resolver(resolver)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(HOP_TIMEOUT)
+        .user_agent("tirith-security/0.1")
+        .build()
 }
 
 /// Pure redirect-following control flow with injected `fetch` and `validate`
@@ -247,9 +256,43 @@ mod tests {
         );
     }
 
-    // Note: resolve_shortened_url does real HTTP and is not tested in unit tests.
-    // Integration tests should be written separately against controlled servers.
-    // The redirect-following control flow below IS tested via injected closures.
+    #[test]
+    fn test_production_client_rejects_connect_time_private_rebind() {
+        use std::error::Error as _;
+
+        let url = "http://rebind.example.test/landing";
+        let preflight =
+            crate::url_validate::validate_fetch_url_with_resolver_for_test(url, &|host, _| {
+                assert_eq!(host, "rebind.example.test");
+                Ok(vec!["93.184.216.34".parse().unwrap()])
+            });
+        assert!(preflight.is_ok(), "the public preflight answer must pass");
+
+        let resolver = crate::ssrf_guard::fetch_resolver_with_lookup_for_test(|host| {
+            assert_eq!(host, "rebind.example.test");
+            Ok(vec!["127.0.0.1:9".parse().unwrap()])
+        });
+        let client = shorturl_client(resolver).expect("build guarded short-URL client");
+        let error = client
+            .get(url)
+            .send()
+            .expect_err("connect-time private DNS answer must be refused");
+
+        let mut messages = vec![error.to_string()];
+        let mut source = error.source();
+        while let Some(cause) = source {
+            messages.push(cause.to_string());
+            source = cause.source();
+        }
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("ssrf_guard") && message.contains("non-public address")
+            }),
+            "failure must come from the guarded resolver, got: {messages:?}"
+        );
+    }
+
+    // Redirect control flow remains hermetic via injected closures below.
 
     #[test]
     fn test_follow_redirects_over_limit_returns_none() {

@@ -144,21 +144,7 @@ impl CloakingResult {
 #[cfg(unix)]
 pub fn check(url: &str) -> Result<CloakingResult, String> {
     let validated_url = crate::url_validate::validate_fetch_url(url)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > 10 {
-                attempt.error("too many redirects")
-            } else if let Err(reason) =
-                crate::url_validate::validate_fetch_url(attempt.url().as_str())
-            {
-                attempt.error(reason)
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let client = cloaking_client(crate::ssrf_guard::fetch_resolver())?;
 
     const MAX_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 
@@ -282,6 +268,31 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
         agent_responses,
         diff_pairs,
     })
+}
+
+/// Build the exact client used by cloaking probes. The guarded resolver closes
+/// the gap between URL preflight DNS and the address selected for `connect()`.
+#[cfg(unix)]
+fn cloaking_client(
+    resolver: std::sync::Arc<crate::ssrf_guard::SsrfGuardResolver>,
+) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .dns_resolver(resolver)
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else if let Err(reason) =
+                crate::url_validate::validate_fetch_url(attempt.url().as_str())
+            {
+                attempt.error(reason)
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))
 }
 
 #[cfg(unix)]
@@ -514,7 +525,7 @@ mod tests {
     #[test]
     fn test_cloaking_rejects_localhost_target_before_fetch() {
         // Serialize with the empty-baseline test below: that test sets
-        // `TIRITH_ALLOW_PRIVATE_FETCH=1` process-wide, which (if it overlapped)
+        // `TIRITH_PRIVATE_FETCH_ALLOW` process-wide, which (if it overlapped)
         // would relax the very localhost rejection this test asserts.
         let _env_lock = crate::TEST_ENV_LOCK
             .lock()
@@ -523,6 +534,42 @@ mod tests {
             Ok(_) => panic!("expected localhost target to be rejected"),
             Err(err) => assert!(err.contains("localhost")),
         }
+    }
+
+    #[test]
+    fn test_production_client_rejects_connect_time_private_rebind() {
+        use std::error::Error as _;
+
+        let url = "http://rebind.example.test/cloaking";
+        let preflight =
+            crate::url_validate::validate_fetch_url_with_resolver_for_test(url, &|host, _| {
+                assert_eq!(host, "rebind.example.test");
+                Ok(vec!["93.184.216.34".parse().unwrap()])
+            });
+        assert!(preflight.is_ok(), "the public preflight answer must pass");
+
+        let resolver = crate::ssrf_guard::fetch_resolver_with_lookup_for_test(|host| {
+            assert_eq!(host, "rebind.example.test");
+            Ok(vec!["127.0.0.1:9".parse().unwrap()])
+        });
+        let client = cloaking_client(resolver).expect("build guarded cloaking client");
+        let error = client
+            .get(url)
+            .send()
+            .expect_err("connect-time private DNS answer must be refused");
+
+        let mut messages = vec![error.to_string()];
+        let mut source = error.source();
+        while let Some(cause) = source {
+            messages.push(cause.to_string());
+            source = cause.source();
+        }
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("ssrf_guard") && message.contains("non-public address")
+            }),
+            "failure must come from the guarded resolver, got: {messages:?}"
+        );
     }
 
     /// A real connect refusal (loopback port 1, nothing listening — no external
@@ -674,7 +721,7 @@ mod tests {
         let _env_lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _allow_private = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+        let _allow_private = EnvVarGuard::set("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");

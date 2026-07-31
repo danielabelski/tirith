@@ -752,8 +752,13 @@ That is the daily-driver set. tirith ships 74 commands in all, in 8 groups: scan
   can make outbound requests when configured. Core detection never phones home.
 - **Egress guard on fetches.** `tirith run`, `fetch --save`, and `command-card
   fetch` refuse private, loopback, and cloud-metadata hosts by default, and an
-  SSRF guard re-checks every redirect hop. Set `TIRITH_ALLOW_PRIVATE_FETCH=1` to
-  allow them.
+  SSRF guard re-checks DNS at connect time and on every redirect hop. To reach a
+  specific internal service, set `TIRITH_PRIVATE_FETCH_ALLOW` to a comma-separated
+  list of exact hostnames, private IPs, or bounded private CIDRs (for example,
+  `registry.internal,10.42.0.0/24`). The legacy broad
+  `TIRITH_ALLOW_PRIVATE_FETCH=1` switch is not honored. Link-local, special-use,
+  and cloud control-plane/credential endpoints remain blocked even when a host is
+  approved.
 
 ---
 

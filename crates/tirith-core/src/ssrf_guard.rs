@@ -20,57 +20,65 @@
 //! acceptable (it is the same call the validators already make on the blocking
 //! path).
 
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
-/// reqwest DNS resolver that drops any resolved address which is not a routable
-/// public destination, failing the lookup if nothing public remains.
-///
-/// `allow_private` relaxes the filter for user fetch paths that have opted in via
-/// `TIRITH_ALLOW_PRIVATE_FETCH=1` (see [`fetch_resolver`]); server paths use the
-/// strict [`ssrf_guard_resolver`] and never relax.
+/// reqwest DNS resolver that validates the complete answer set with the same
+/// classifier as URL preflight. A fetch resolver snapshots the operator's narrow
+/// host/CIDR policy; a server resolver accepts globally reachable addresses only.
 pub struct SsrfGuardResolver {
-    allow_private: bool,
+    mode: ResolverMode,
+    lookup: Arc<LookupFn>,
+}
+
+type LookupFn = dyn Fn(&str) -> Result<Vec<SocketAddr>, String> + Send + Sync;
+
+#[derive(Clone)]
+enum ResolverMode {
+    PublicOnly,
+    Fetch(Result<crate::url_validate::PrivateFetchPolicy, String>),
 }
 
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
-        let allow_private = self.allow_private;
+        let mode = self.mode.clone();
+        let lookup = Arc::clone(&self.lookup);
         Box::pin(async move {
-            // Port 0 is fine: the connector overrides it with the real port; we
-            // only care about the IPs the host resolves to.
-            let lookup = (host.as_str(), 0u16).to_socket_addrs();
-            let resolved =
-                lookup.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-            // Cloud-metadata IPs (IMDS — instance credentials) are dropped
-            // UNCONDITIONALLY, even under the `allow_private` carve-out: the
-            // `TIRITH_ALLOW_PRIVATE_FETCH` opt-in relaxes private/loopback/
-            // link-local destinations but must never reach a metadata endpoint,
-            // so a redirect or DNS-rebind can't land on IMDS once the env is set.
-            // Outside the carve-out the strict public-only filter already
-            // excludes them; this is the backstop for the relaxed path.
-            let filtered: Vec<std::net::SocketAddr> = if allow_private {
-                resolved
-                    .filter(|addr| !crate::url_validate::is_cloud_metadata_addr(addr))
-                    .collect()
-            } else {
-                resolved
-                    .filter(crate::url_validate::is_public_addr)
-                    .collect()
-            };
-
-            if filtered.is_empty() {
-                return Err(
-                    "ssrf_guard: host resolves to a non-public or empty address set".into(),
+            let resolved = lookup(&host).map_err(|reason| {
+                Box::new(std::io::Error::other(reason)) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            let addresses: Vec<std::net::IpAddr> =
+                resolved.iter().map(std::net::SocketAddr::ip).collect();
+            let decision = validate_answer_set(&mode, &host, &addresses);
+            if let Err(reason) = decision {
+                let error = std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("ssrf_guard: {reason}"),
                 );
+                return Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
             }
 
-            Ok(Box::new(filtered.into_iter()) as Addrs)
+            Ok(Box::new(resolved.into_iter()) as Addrs)
         })
+    }
+}
+
+fn validate_answer_set(
+    mode: &ResolverMode,
+    host: &str,
+    addresses: &[std::net::IpAddr],
+) -> Result<(), String> {
+    match mode {
+        ResolverMode::PublicOnly => {
+            crate::url_validate::validate_resolved_destination(host, addresses, None)
+        }
+        ResolverMode::Fetch(Ok(policy)) => {
+            crate::url_validate::validate_resolved_destination(host, addresses, Some(policy))
+        }
+        ResolverMode::Fetch(Err(reason)) => Err(reason.clone()),
     }
 }
 
@@ -78,18 +86,42 @@ impl Resolve for SsrfGuardResolver {
 /// installed via `ClientBuilder::dns_resolver`.
 pub fn ssrf_guard_resolver() -> Arc<SsrfGuardResolver> {
     Arc::new(SsrfGuardResolver {
-        allow_private: false,
+        mode: ResolverMode::PublicOnly,
+        lookup: Arc::new(system_lookup),
     })
 }
 
-/// Resolver for user fetch paths. Strict by default, but honors the explicit
-/// `TIRITH_ALLOW_PRIVATE_FETCH=1` opt-in (see
-/// [`crate::url_validate::allow_private_fetch`]) so a user can fetch a command
-/// card or script from an internal/localhost host. An attacker controls the URL,
-/// not the user's environment, so this cannot be enabled adversarially.
+/// Resolver for user fetch paths. It snapshots `TIRITH_PRIVATE_FETCH_ALLOW` and
+/// fails every lookup if that policy is invalid. The legacy broad
+/// `TIRITH_ALLOW_PRIVATE_FETCH=1` flag grants no access.
 pub fn fetch_resolver() -> Arc<SsrfGuardResolver> {
     Arc::new(SsrfGuardResolver {
-        allow_private: crate::url_validate::allow_private_fetch(),
+        mode: ResolverMode::Fetch(crate::url_validate::private_fetch_policy_from_env()),
+        lookup: Arc::new(system_lookup),
+    })
+}
+
+fn system_lookup(host: &str) -> Result<Vec<SocketAddr>, String> {
+    // Port 0 is fine: reqwest's connector replaces it with the request port; the
+    // guard only needs the IP identities returned by DNS.
+    (host, 0u16)
+        .to_socket_addrs()
+        .map(|addresses| addresses.collect())
+        .map_err(|error| error.to_string())
+}
+
+/// Per-instance resolver seam for hermetic connect-time rebinding tests. It is
+/// unavailable outside tests that explicitly enable `test-network-seams`, so
+/// production callers cannot replace system DNS or weaken the policy.
+#[cfg(any(test, feature = "test-network-seams"))]
+#[doc(hidden)]
+pub fn fetch_resolver_with_lookup_for_test<F>(lookup: F) -> Arc<SsrfGuardResolver>
+where
+    F: Fn(&str) -> Result<Vec<SocketAddr>, String> + Send + Sync + 'static,
+{
+    Arc::new(SsrfGuardResolver {
+        mode: ResolverMode::Fetch(Ok(crate::url_validate::PrivateFetchPolicy::default())),
+        lookup: Arc::new(lookup),
     })
 }
 
@@ -133,16 +165,16 @@ pub fn server_redirect_policy() -> reqwest::redirect::Policy {
 
 #[cfg(test)]
 mod tests {
-    use crate::url_validate::{is_cloud_metadata_addr, is_public_addr};
-    use std::net::SocketAddr;
+    use crate::url_validate::{is_cloud_metadata_addr, is_public_addr, PrivateFetchPolicy};
+    use std::net::{IpAddr, SocketAddr};
 
     fn sock(ip: &str) -> SocketAddr {
         SocketAddr::new(ip.parse().unwrap(), 0)
     }
 
-    // The resolver's decision is `is_public_addr` applied to each resolved
-    // address. We can't drive real DNS hermetically, so assert the filter the
-    // resolver uses behaves correctly on representative addresses.
+    fn ips(values: &[&str]) -> Vec<IpAddr> {
+        values.iter().map(|value| value.parse().unwrap()).collect()
+    }
 
     #[test]
     fn test_guard_filter_rejects_loopback() {
@@ -175,61 +207,98 @@ mod tests {
         let _r = super::ssrf_guard_resolver();
     }
 
-    // Under the `TIRITH_ALLOW_PRIVATE_FETCH` relaxation the resolver keeps
-    // private/loopback/link-local addresses (it skips `is_public_addr`) but must
-    // STILL drop cloud-metadata IPs via `is_cloud_metadata_addr`. We can't drive
-    // real DNS hermetically, so we pin the predicate the relaxed path filters on
-    // and replicate the relaxed filter over a representative resolved set.
-
     #[test]
-    fn test_metadata_filter_flags_imds_addresses() {
-        assert!(is_cloud_metadata_addr(&sock("169.254.169.254")));
-        assert!(is_cloud_metadata_addr(&sock("100.100.100.200")));
-        assert!(is_cloud_metadata_addr(&sock("fd00:ec2::254")));
-        assert!(is_cloud_metadata_addr(&sock("::ffff:169.254.169.254")));
-        // Non-metadata private/link-local addresses are NOT flagged — the
-        // carve-out may legitimately reach these.
-        assert!(!is_cloud_metadata_addr(&sock("169.254.1.1")));
-        assert!(!is_cloud_metadata_addr(&sock("127.0.0.1")));
-        assert!(!is_cloud_metadata_addr(&sock("10.0.0.1")));
-    }
-
-    #[test]
-    fn test_relaxed_filter_drops_metadata_keeps_private() {
-        // Mirror the `allow_private` branch of `SsrfGuardResolver::resolve`: it
-        // collects everything EXCEPT metadata IPs. The private 10.x address is
-        // kept under the carve-out; all three metadata IPs (AWS/GCP/Azure,
-        // Alibaba, and the AWS IPv6 IMDS) are dropped.
-        let resolved = [
-            sock("10.0.0.1"),
-            sock("169.254.169.254"),
-            sock("100.100.100.200"),
-            sock("fd00:ec2::254"),
-        ];
-        let kept: Vec<SocketAddr> = resolved
-            .into_iter()
-            .filter(|addr| !is_cloud_metadata_addr(addr))
-            .collect();
-        assert_eq!(
-            kept,
-            vec![sock("10.0.0.1")],
-            "relaxed resolver must drop every metadata IP but keep the private one"
+    fn test_strict_resolver_rejects_mixed_public_private_answer_set() {
+        let result = super::validate_answer_set(
+            &super::ResolverMode::PublicOnly,
+            "mixed.example",
+            &ips(&["93.184.216.34", "10.0.0.8"]),
         );
-    }
-
-    #[test]
-    fn test_relaxed_filter_metadata_only_yields_empty() {
-        // If a host resolves ONLY to metadata IPs, the relaxed filter empties the
-        // set, which the resolver turns into a hard lookup failure.
-        let resolved = [sock("169.254.169.254"), sock("fd00:ec2::254")];
-        let kept: Vec<SocketAddr> = resolved
-            .into_iter()
-            .filter(|addr| !is_cloud_metadata_addr(addr))
-            .collect();
         assert!(
-            kept.is_empty(),
-            "a metadata-only resolution must leave nothing to connect to"
+            result.is_err(),
+            "one private DNS answer must reject the set"
         );
+    }
+
+    #[test]
+    fn test_fetch_resolver_honors_exact_host_and_cidr_only() {
+        let host_policy = PrivateFetchPolicy::parse("registry.internal").unwrap();
+        let mode = super::ResolverMode::Fetch(Ok(host_policy));
+        assert!(
+            super::validate_answer_set(&mode, "registry.internal", &ips(&["10.42.0.8"])).is_ok()
+        );
+        assert!(
+            super::validate_answer_set(&mode, "sibling.internal", &ips(&["10.42.0.8"])).is_err()
+        );
+
+        let cidr_policy = PrivateFetchPolicy::parse("10.42.0.0/24").unwrap();
+        let mode = super::ResolverMode::Fetch(Ok(cidr_policy));
+        assert!(super::validate_answer_set(&mode, "any.internal", &ips(&["10.42.0.8"])).is_ok());
+        assert!(super::validate_answer_set(&mode, "any.internal", &ips(&["10.42.1.8"])).is_err());
+    }
+
+    #[test]
+    fn test_fetch_resolver_rejects_immutable_ranges_even_for_approved_host() {
+        let policy = PrivateFetchPolicy::parse("registry.internal").unwrap();
+        let mode = super::ResolverMode::Fetch(Ok(policy));
+        for address in [
+            "169.254.1.1",
+            "fe80::1",
+            "169.254.170.2",
+            "169.254.170.23",
+            "168.63.129.16",
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "64:ff9b:1::a9fe:a9fe",
+            "fec0::1",
+        ] {
+            assert!(
+                super::validate_answer_set(&mode, "registry.internal", &ips(&[address])).is_err(),
+                "{address} must remain denied"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fetch_resolver_rejects_public_plus_link_local_for_approved_host() {
+        let policy = PrivateFetchPolicy::parse("registry.internal").unwrap();
+        let mode = super::ResolverMode::Fetch(Ok(policy));
+        let result = super::validate_answer_set(
+            &mode,
+            "registry.internal",
+            &ips(&["93.184.216.34", "169.254.1.1"]),
+        );
+        assert!(
+            result.is_err(),
+            "a forbidden answer must reject the whole set"
+        );
+    }
+
+    #[test]
+    fn test_fetch_resolver_invalid_policy_fails_closed() {
+        let mode = super::ResolverMode::Fetch(Err("invalid allowlist".to_string()));
+        assert!(
+            super::validate_answer_set(&mode, "example.com", &ips(&["93.184.216.34"])).is_err()
+        );
+    }
+
+    #[test]
+    fn test_metadata_adapter_matches_expanded_control_plane_set() {
+        for address in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "169.254.0.23",
+            "100.100.100.200",
+            "168.63.129.16",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "::ffff:168.63.129.16",
+            "64:ff9b::169.254.170.2",
+        ] {
+            assert!(is_cloud_metadata_addr(&sock(address)), "{address}");
+        }
     }
 
     // server_redirect_decision: the testable core of the shared server redirect

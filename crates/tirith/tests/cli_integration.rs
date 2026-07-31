@@ -63,6 +63,7 @@ fn tirith() -> Command {
         "TIRITH_OFFLINE",
         "TIRITH_ALLOW_HTTP",
         "TIRITH_ALLOW_PRIVATE_FETCH",
+        "TIRITH_PRIVATE_FETCH_ALLOW",
         "TIRITH_CANARY_TOKEN",
         "TIRITH_SESSION_ID",
         "TIRITH_INTEGRATION",
@@ -11242,9 +11243,9 @@ fn command_card_mismatch_is_high_and_other_findings_fire() {
 }
 
 /// F6 first-hop SSRF guard: a private/loopback fetch must be REJECTED by DEFAULT
-/// (no opt-in). The sibling `command_card_fetch_rejects_unreachable_url` sets
-/// `TIRITH_ALLOW_PRIVATE_FETCH=1` which DISABLES the guard; this pins that without
-/// the opt-in the guard blocks the request before any connection is attempted.
+/// (no exception). The sibling `command_card_fetch_rejects_unreachable_url` adds
+/// an exact loopback exception; this pins that without one the guard blocks the
+/// request before any connection is attempted.
 #[cfg(unix)]
 #[test]
 fn command_card_fetch_blocks_private_url_without_opt_in() {
@@ -11252,7 +11253,9 @@ fn command_card_fetch_blocks_private_url_without_opt_in() {
     let out = tirith()
         .args(["command-card", "fetch", "http://127.0.0.1:9/nope.json"])
         .env("HOME", home.path())
-        .env_remove("TIRITH_ALLOW_PRIVATE_FETCH")
+        // The retired broad switch must not weaken the guard.
+        .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
+        .env_remove("TIRITH_PRIVATE_FETCH_ALLOW")
         .output()
         .expect("fetch");
     assert_eq!(
@@ -11277,9 +11280,9 @@ fn command_card_fetch_rejects_unreachable_url() {
     let out = tirith()
         .args(["command-card", "fetch", "http://127.0.0.1:9/nope.json"])
         .env("HOME", home.path())
-        // The localhost test endpoint is reachable only with the explicit
-        // private-fetch opt-in; the SSRF guard blocks 127.0.0.1 by default.
-        .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
+        // The localhost test endpoint is reachable only with an exact
+        // private-fetch exception; the SSRF guard blocks it by default.
+        .env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32")
         .output()
         .expect("fetch");
     assert_eq!(
@@ -11372,8 +11375,8 @@ fn command_card_fetch_is_idempotent_for_identical_bytes() {
             .args(["command-card", "fetch", &url])
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", cache.path())
-            // Reach the 127.0.0.1 test server past the default SSRF guard.
-            .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
+            // Reach only this loopback IP past the default SSRF guard.
+            .env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32")
             .output()
             .expect("fetch")
     };
@@ -11474,8 +11477,8 @@ fn command_card_fetch_rejects_card_over_read_cap() {
         .args(["command-card", "fetch", &url])
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", cache.path())
-        // Reach the 127.0.0.1 test server past the default SSRF guard.
-        .env("TIRITH_ALLOW_PRIVATE_FETCH", "1")
+        // Reach only this loopback IP past the default SSRF guard.
+        .env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32")
         .output()
         .expect("fetch");
 

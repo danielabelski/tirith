@@ -18,6 +18,9 @@ categories = ["development-tools"]
 # blocking from the artifact firewall.
 default = []
 artifact-hash-lookup = []
+# Enables hermetic, per-instance DNS lookup injection for cross-crate network
+# boundary tests. Never enabled by production/default builds.
+test-network-seams = []
 # native-yara (yara-x): DEFERRED by the PR-0 dependency spike, NOT wired here.
 # The plan pencilled in `native-yara = ["dep:yara-x"]` with yara-x 0.14, but on the
 # current registry yara-x 0.14 requires `intaglio >= 1.10`, and intaglio 1.10 (its

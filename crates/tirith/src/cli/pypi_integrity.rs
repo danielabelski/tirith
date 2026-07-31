@@ -186,15 +186,12 @@ fn fetch_provenance(project: &str, version: &str, filename: &str) -> Result<Stri
 fn fetch_provenance_at(url: &str) -> Result<String, FetchError> {
     // Run the URL through the same fetch validator the resolver / cloaking paths
     // use: HTTPS-or-HTTP, no embedded credentials, no private / loopback /
-    // metadata destination (after DNS), unless the explicit
-    // TIRITH_ALLOW_PRIVATE_FETCH opt-in is set (used by the mock-server test).
+    // metadata destination (after DNS), unless a narrow
+    // TIRITH_PRIVATE_FETCH_ALLOW entry covers it (used by the mock-server test).
     tirith_core::url_validate::validate_fetch_url(url)
         .map_err(|reason| FetchError::Transport(format!("URL rejected: {reason}")))?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .redirect(tirith_core::ssrf_guard::server_redirect_policy())
-        .build()
+    let client = pypi_integrity_client(tirith_core::ssrf_guard::fetch_resolver())
         .map_err(|e| FetchError::Transport(format!("HTTP client error: {e}")))?;
 
     let resp = client
@@ -224,6 +221,20 @@ fn fetch_provenance_at(url: &str) -> Result<String, FetchError> {
     }
     String::from_utf8(bytes.to_vec())
         .map_err(|_| FetchError::Transport("provenance response is not valid UTF-8".to_string()))
+}
+
+/// Build the exact client used by PyPI provenance fetches. The guarded resolver
+/// validates the DNS answer used by `connect()`, closing the preflight-to-connect
+/// rebinding window for the initial URL and every redirect.
+fn pypi_integrity_client(
+    resolver: std::sync::Arc<tirith_core::ssrf_guard::SsrfGuardResolver>,
+) -> Result<reqwest::blocking::Client, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .dns_resolver(resolver)
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .redirect(tirith_core::ssrf_guard::server_redirect_policy())
+        .build()
 }
 
 /// Construct the Integrity API provenance URL for a file. The project name is PEP
@@ -551,7 +562,7 @@ mod tests {
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     /// Serializes the two tests that toggle the process-wide
-    /// `TIRITH_ALLOW_PRIVATE_FETCH` env var, so a parallel run cannot have one test
+    /// `TIRITH_PRIVATE_FETCH_ALLOW` env var, so a parallel run cannot have one test
     /// clear the opt-in while the other is mid-fetch (the known env-race flake
     /// class). A poisoned lock is fine to recover from here — the guarded body only
     /// sets/removes one env var.
@@ -707,11 +718,11 @@ mod tests {
             .mock("GET", "/integrity/demo/1.0/demo.whl/provenance")
             .with_status(404)
             .create();
-        // Loopback fetch needs the explicit private-fetch opt-in.
-        std::env::set_var("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+        // Loopback fetch needs an exact private-fetch exception.
+        std::env::set_var("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
         let url = format!("{}/integrity/demo/1.0/demo.whl/provenance", server.url());
         let res = fetch_provenance_at(&url);
-        std::env::remove_var("TIRITH_ALLOW_PRIVATE_FETCH");
+        std::env::remove_var("TIRITH_PRIVATE_FETCH_ALLOW");
         assert!(matches!(res, Err(FetchError::NotFound)));
     }
 
@@ -725,12 +736,51 @@ mod tests {
             .with_status(200)
             .with_body(&body)
             .create();
-        std::env::set_var("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+        std::env::set_var("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
         let url = format!("{}/integrity/demo/1.0/demo.whl/provenance", server.url());
         let res = fetch_provenance_at(&url);
-        std::env::remove_var("TIRITH_ALLOW_PRIVATE_FETCH");
+        std::env::remove_var("TIRITH_PRIVATE_FETCH_ALLOW");
         let got = res.unwrap_or_else(|_| panic!("expected body"));
         assert!(got.contains("attestation_bundles"));
+    }
+
+    #[test]
+    fn production_client_rejects_connect_time_private_rebind() {
+        use std::error::Error as _;
+
+        let url = "http://rebind.example.test/integrity/demo/1.0/demo.whl/provenance";
+        let preflight = tirith_core::url_validate::validate_fetch_url_with_resolver_for_test(
+            url,
+            &|host, _| {
+                assert_eq!(host, "rebind.example.test");
+                Ok(vec!["93.184.216.34".parse().unwrap()])
+            },
+        );
+        assert!(preflight.is_ok(), "the public preflight answer must pass");
+
+        let resolver = tirith_core::ssrf_guard::fetch_resolver_with_lookup_for_test(|host| {
+            assert_eq!(host, "rebind.example.test");
+            Ok(vec!["127.0.0.1:9".parse().unwrap()])
+        });
+        let client = pypi_integrity_client(resolver).expect("build guarded PyPI client");
+        let error = client
+            .get(url)
+            .header("Accept", "application/vnd.pypi.integrity.v1+json")
+            .send()
+            .expect_err("connect-time private DNS answer must be refused");
+
+        let mut messages = vec![error.to_string()];
+        let mut source = error.source();
+        while let Some(cause) = source {
+            messages.push(cause.to_string());
+            source = cause.source();
+        }
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("ssrf_guard") && message.contains("non-public address")
+            }),
+            "failure must come from the guarded resolver, got: {messages:?}"
+        );
     }
 
     #[test]
@@ -740,7 +790,7 @@ mod tests {
         // loopback URL spuriously pass the validator).
         let _guard = PRIVATE_FETCH_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // Belt-and-suspenders: ensure the opt-in is off for this assertion.
-        std::env::remove_var("TIRITH_ALLOW_PRIVATE_FETCH");
+        std::env::remove_var("TIRITH_PRIVATE_FETCH_ALLOW");
         // Without the opt-in, a loopback URL is rejected by the fetch validator
         // before any request — the SSRF guard reuse.
         let res = fetch_provenance_at("http://127.0.0.1:9/integrity/x/1/x.whl/provenance");

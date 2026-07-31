@@ -2,12 +2,52 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
-type HostResolver = dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String>;
+type HostResolver<'a> = dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String> + 'a;
+
+#[cfg(any(test, feature = "test-network-seams"))]
+#[doc(hidden)]
+pub type TestHostResolver<'a> = dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String> + 'a;
 
 #[derive(Clone, Copy)]
 enum UrlValidationMode {
     Server,
     Fetch,
+}
+
+/// Exact host/IP/CIDR exceptions for user-initiated fetches.
+///
+/// This intentionally is not a general "allow private networking" switch. A
+/// policy can approve one hostname or a bounded private-use CIDR, while the
+/// centralized address classifier still unconditionally refuses link-local,
+/// cloud control-plane/credential, multicast, and other special-use space.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PrivateFetchPolicy {
+    hosts: Vec<String>,
+    cidrs: Vec<IpCidr>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IpCidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AddressScope {
+    Global,
+    PrivateUse,
+    Loopback,
+    LinkLocal,
+    CloudControlPlane,
+    SpecialUse,
+}
+
+const PRIVATE_FETCH_ALLOW_ENV: &str = "TIRITH_PRIVATE_FETCH_ALLOW";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PRIVATE_FETCH_POLICY: std::cell::RefCell<Option<Result<PrivateFetchPolicy, String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Validate a server URL for outbound requests: HTTPS unless `TIRITH_ALLOW_HTTP=1`,
@@ -22,20 +62,40 @@ pub fn validate_fetch_url(url: &str) -> Result<url::Url, String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Fetch, &resolve_host)
 }
 
+/// Hermetic preflight seam for crate tests that need to model the first DNS
+/// answer independently from the connect-time resolver answer.
+#[cfg(any(test, feature = "test-network-seams"))]
+#[doc(hidden)]
+pub fn validate_fetch_url_with_resolver_for_test(
+    url: &str,
+    resolver: &TestHostResolver<'_>,
+) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let strict_policy = PrivateFetchPolicy::default();
+    validate_parsed_url_with_resolver(
+        &parsed,
+        UrlValidationMode::Fetch,
+        resolver,
+        Some(&strict_policy),
+    )?;
+    Ok(parsed)
+}
+
 fn validate_outbound_url_with_resolver(
     url: &str,
     mode: UrlValidationMode,
-    resolver: &HostResolver,
+    resolver: &HostResolver<'_>,
 ) -> Result<url::Url, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
-    validate_parsed_url_with_resolver(&parsed, mode, resolver)?;
+    validate_parsed_url_with_resolver(&parsed, mode, resolver, None)?;
     Ok(parsed)
 }
 
 fn validate_parsed_url_with_resolver(
     parsed: &url::Url,
     mode: UrlValidationMode,
-    resolver: &HostResolver,
+    resolver: &HostResolver<'_>,
+    fetch_policy_override: Option<&PrivateFetchPolicy>,
 ) -> Result<(), String> {
     validate_scheme(parsed, mode)?;
 
@@ -52,16 +112,21 @@ fn validate_parsed_url_with_resolver(
         .trim_end_matches('.')
         .to_ascii_lowercase();
 
-    // Cloud metadata HOST NAMES are rejected first, BEFORE resolution and BEFORE
-    // the private-fetch carve-out, so the opt-in can never reach a metadata host
-    // (and so the rejection works offline, without a DNS lookup). These
-    // endpoints expose IAM credentials and instance config — never a legitimate
-    // "internal dev" target.
+    // Reject canonical metadata names before DNS. The connect-time resolver
+    // repeats this exact check so a redirect or rebind cannot bypass it.
     if is_cloud_metadata_host(&host_label) {
         return Err(format!(
             "refusing to connect to cloud metadata endpoint: {host_label}"
         ));
     }
+
+    let private_policy = match mode {
+        UrlValidationMode::Server => None,
+        UrlValidationMode::Fetch => Some(match fetch_policy_override {
+            Some(policy) => policy.clone(),
+            None => private_fetch_policy_from_env()?,
+        }),
+    };
 
     let port = parsed
         .port_or_known_default()
@@ -81,42 +146,7 @@ fn validate_parsed_url_with_resolver(
         }
     };
 
-    // Cloud metadata IP addresses are likewise rejected BEFORE the carve-out —
-    // the opt-in relaxes private/loopback/link-local, but a metadata IP
-    // (169.254.169.254, 100.100.100.200, fd00:ec2::254, or any encoded form) is
-    // never permitted. Screening the resolved set also catches a domain that
-    // resolves to a metadata IP (DNS-rebind into IMDS).
-    for ip in &addrs {
-        if is_cloud_metadata_ip(ip) {
-            return Err(format!(
-                "refusing to connect to cloud metadata endpoint: {host_label} -> {ip}"
-            ));
-        }
-    }
-
-    // Fetch paths honor an explicit opt-in to reach private/loopback/RFC1918/
-    // link-local destinations (fetching a command card or script from an
-    // internal registry, and tests that serve from 127.0.0.1). It is gated
-    // behind a user-set env var, so an attacker who only controls the URL
-    // cannot enable it. Server paths and the default fetch path stay locked to
-    // public destinations. The scheme, embedded-credential, and cloud-metadata
-    // checks above still apply — the carve-out only relaxes the remaining
-    // private/loopback/link-local classification, never metadata.
-    if matches!(mode, UrlValidationMode::Fetch) && allow_private_fetch() {
-        return Ok(());
-    }
-
-    if host_label == "localhost" || host_label.ends_with(".localhost") {
-        return Err(format!(
-            "refusing to connect to localhost destination: {host_label}"
-        ));
-    }
-
-    for ip in &addrs {
-        validate_resolved_ip(&host_label, ip)?;
-    }
-
-    Ok(())
+    validate_resolved_destination(&host_label, &addrs, private_policy.as_ref())
 }
 
 fn validate_scheme(parsed: &url::Url, mode: UrlValidationMode) -> Result<(), String> {
@@ -165,48 +195,329 @@ fn resolve_host(host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
     Ok(ips)
 }
 
-fn validate_resolved_ip(host: &str, ip: &IpAddr) -> Result<(), String> {
-    if is_forbidden_ip(ip) {
-        Err(format!(
-            "refusing to connect to non-public address: {host} -> {ip}"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 /// Whether a resolved socket address points at a routable, public destination.
 ///
-/// This is the single source of truth for the private/loopback/link-local/
-/// metadata/reserved CIDR classification used by both the URL validators (which
-/// resolve via `to_socket_addrs`) and the connect-time DNS guard in
-/// [`crate::ssrf_guard`]. Returns `false` for any address the validators would
-/// reject as non-public.
+/// [`classify_ip`] is the single source of truth for the IANA special-purpose
+/// and cloud control-plane classification used here, by the URL validators, and
+/// by the connect-time resolver.
 pub fn is_public_addr(addr: &SocketAddr) -> bool {
-    !is_forbidden_ip(&addr.ip())
+    classify_ip(&addr.ip()) == AddressScope::Global
 }
 
 /// Whether a resolved socket address is a cloud-metadata (IMDS) endpoint.
 ///
-/// `SocketAddr` adapter over [`is_cloud_metadata_ip`], used by the connect-time
-/// DNS guard in [`crate::ssrf_guard`] to drop metadata addresses even on the
-/// `TIRITH_ALLOW_PRIVATE_FETCH`-relaxed path (where [`is_public_addr`] is not
-/// applied). Metadata is never reachable, carve-out or not.
+/// `SocketAddr` adapter over the centralized cloud endpoint classifier.
 pub fn is_cloud_metadata_addr(addr: &SocketAddr) -> bool {
     is_cloud_metadata_ip(&addr.ip())
 }
 
-/// Whether fetch paths may reach private/loopback/link-local destinations, gated
-/// behind an explicit `TIRITH_ALLOW_PRIVATE_FETCH=1` opt-in (mirrors
-/// `TIRITH_ALLOW_HTTP`). Only honored for [`UrlValidationMode::Fetch`]; server
-/// paths stay locked. An attacker controls the fetched URL, not the user's
-/// environment, so a malicious command card or instruction cannot enable it.
-///
-/// This opt-in NEVER relaxes the cloud-metadata block (see
-/// `is_cloud_metadata_host` / `is_cloud_metadata_ip`): those endpoints expose
-/// instance credentials and are rejected ahead of the carve-out regardless.
+/// Whether a non-empty, syntactically valid narrow private-fetch allowlist is
+/// configured. `TIRITH_ALLOW_PRIVATE_FETCH=1` is deliberately no longer honored.
+/// Callers must list exact hosts, IPs, or bounded private CIDRs in
+/// `TIRITH_PRIVATE_FETCH_ALLOW`.
 pub fn allow_private_fetch() -> bool {
-    std::env::var("TIRITH_ALLOW_PRIVATE_FETCH").ok().as_deref() == Some("1")
+    private_fetch_policy_from_env()
+        .map(|policy| !policy.is_empty())
+        .unwrap_or(false)
+}
+
+pub(crate) fn private_fetch_policy_from_env() -> Result<PrivateFetchPolicy, String> {
+    #[cfg(test)]
+    if let Some(policy) = TEST_PRIVATE_FETCH_POLICY.with(|slot| slot.borrow().clone()) {
+        return policy;
+    }
+
+    let Some(raw) = std::env::var_os(PRIVATE_FETCH_ALLOW_ENV) else {
+        return Ok(PrivateFetchPolicy::default());
+    };
+    let value = raw.into_string().map_err(|_| {
+        format!("{PRIVATE_FETCH_ALLOW_ENV} must contain valid Unicode host/IP/CIDR entries")
+    })?;
+    PrivateFetchPolicy::parse(&value)
+}
+
+impl PrivateFetchPolicy {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        if value.trim().is_empty() {
+            return Ok(Self::default());
+        }
+
+        let mut policy = Self::default();
+        for (index, raw_entry) in value.split(',').enumerate() {
+            let entry = raw_entry.trim();
+            if entry.is_empty() {
+                return Err(format!(
+                    "invalid {PRIVATE_FETCH_ALLOW_ENV} entry {}: empty entries are not allowed",
+                    index + 1
+                ));
+            }
+            policy.add_entry(entry).map_err(|reason| {
+                format!(
+                    "invalid {PRIVATE_FETCH_ALLOW_ENV} entry {}: {reason}",
+                    index + 1
+                )
+            })?;
+        }
+        Ok(policy)
+    }
+
+    fn add_entry(&mut self, entry: &str) -> Result<(), String> {
+        if entry.contains('/') {
+            let cidr = IpCidr::parse(entry)?;
+            validate_private_fetch_cidr(&cidr)?;
+            if !self.cidrs.contains(&cidr) {
+                self.cidrs.push(cidr);
+            }
+            return Ok(());
+        }
+
+        if let Ok(ip) = entry.parse::<IpAddr>() {
+            let cidr = IpCidr::single(ip);
+            validate_private_fetch_cidr(&cidr)?;
+            if !self.cidrs.contains(&cidr) {
+                self.cidrs.push(cidr);
+            }
+            return Ok(());
+        }
+
+        if entry.contains('*') {
+            return Err("wildcard hosts are not allowed".to_string());
+        }
+
+        match url::Host::parse(entry).map_err(|_| "expected an exact hostname, IP, or CIDR")? {
+            url::Host::Domain(host) => {
+                let host = host.trim_end_matches('.').to_ascii_lowercase();
+                if host.is_empty() {
+                    return Err("hostname is empty".to_string());
+                }
+                if is_cloud_metadata_host(&host) {
+                    return Err("cloud metadata hostnames cannot be approved".to_string());
+                }
+                if !self.hosts.contains(&host) {
+                    self.hosts.push(host);
+                }
+                Ok(())
+            }
+            url::Host::Ipv4(ip) => self.add_ip_host(IpAddr::V4(ip)),
+            url::Host::Ipv6(ip) => self.add_ip_host(IpAddr::V6(ip)),
+        }
+    }
+
+    fn add_ip_host(&mut self, ip: IpAddr) -> Result<(), String> {
+        let cidr = IpCidr::single(ip);
+        validate_private_fetch_cidr(&cidr)?;
+        if !self.cidrs.contains(&cidr) {
+            self.cidrs.push(cidr);
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.cidrs.is_empty()
+    }
+
+    fn approves_host(&self, host: &str) -> bool {
+        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        self.hosts.iter().any(|allowed| allowed == &normalized)
+    }
+
+    fn approves_ip(&self, ip: &IpAddr) -> bool {
+        self.cidrs.iter().any(|cidr| cidr.contains(ip))
+    }
+}
+
+impl IpCidr {
+    fn parse(value: &str) -> Result<Self, String> {
+        let (address, prefix) = value
+            .split_once('/')
+            .ok_or_else(|| "CIDR is missing a prefix length".to_string())?;
+        if prefix.contains('/') {
+            return Err("CIDR contains more than one prefix separator".to_string());
+        }
+        let address = address.trim();
+        let address = if address.starts_with('[') || address.ends_with(']') {
+            address
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .ok_or_else(|| "CIDR has mismatched IPv6 brackets".to_string())?
+        } else {
+            address
+        };
+        let address = address
+            .parse::<IpAddr>()
+            .map_err(|_| "CIDR has an invalid IP address".to_string())?;
+        let prefix = prefix
+            .trim()
+            .parse::<u8>()
+            .map_err(|_| "CIDR has an invalid prefix length".to_string())?;
+        let cidr = Self::new(address, prefix)?;
+        if cidr.network != address {
+            return Err("CIDR network address has host bits set".to_string());
+        }
+        Ok(cidr)
+    }
+
+    fn new(address: IpAddr, prefix: u8) -> Result<Self, String> {
+        let network = match address {
+            IpAddr::V4(ip) => {
+                if prefix > 32 {
+                    return Err("IPv4 CIDR prefix must be between 0 and 32".to_string());
+                }
+                IpAddr::V4(Ipv4Addr::from(u32::from(ip) & ipv4_mask(prefix)))
+            }
+            IpAddr::V6(ip) => {
+                if prefix > 128 {
+                    return Err("IPv6 CIDR prefix must be between 0 and 128".to_string());
+                }
+                IpAddr::V6(Ipv6Addr::from(u128::from(ip) & ipv6_mask(prefix)))
+            }
+        };
+        Ok(Self { network, prefix })
+    }
+
+    fn single(ip: IpAddr) -> Self {
+        Self {
+            prefix: if ip.is_ipv4() { 32 } else { 128 },
+            network: ip,
+        }
+    }
+
+    fn contains(&self, address: &IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                u32::from(*address) & ipv4_mask(self.prefix) == u32::from(network)
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                u128::from(*address) & ipv6_mask(self.prefix) == u128::from(network)
+            }
+            _ => false,
+        }
+    }
+
+    fn contains_cidr(&self, other: &Self) -> bool {
+        self.network.is_ipv4() == other.network.is_ipv4()
+            && self.prefix <= other.prefix
+            && self.contains(&other.network)
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.network.is_ipv4() == other.network.is_ipv4()
+            && (self.contains(&other.network) || other.contains(&self.network))
+    }
+}
+
+fn validate_private_fetch_cidr(cidr: &IpCidr) -> Result<(), String> {
+    for immutable in immutable_cloud_cidrs() {
+        if cidr.overlaps(&immutable) {
+            return Err("CIDR overlaps a cloud control-plane or credential endpoint".to_string());
+        }
+    }
+
+    let eligible = private_fetch_parent_cidrs()
+        .iter()
+        .any(|parent| parent.contains_cidr(cidr));
+    if !eligible {
+        return Err(
+            "CIDRs must stay within RFC1918, shared-address, loopback, or IPv6 ULA space"
+                .to_string(),
+        );
+    }
+
+    // A site-sized ULA is narrow enough to express a real internal network;
+    // accepting fc00::/7 would recreate the broad bypass this allowlist replaces.
+    if cidr.network.is_ipv6() && cidr.prefix < 48 {
+        return Err("IPv6 ULA CIDRs must use a /48 or narrower prefix".to_string());
+    }
+    Ok(())
+}
+
+fn private_fetch_parent_cidrs() -> [IpCidr; 7] {
+    [
+        IpCidr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8).expect("valid CIDR"),
+        IpCidr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10).expect("valid CIDR"),
+        IpCidr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8).expect("valid CIDR"),
+        IpCidr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12).expect("valid CIDR"),
+        IpCidr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16).expect("valid CIDR"),
+        IpCidr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 128).expect("valid CIDR"),
+        IpCidr::new(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7).expect("valid CIDR"),
+    ]
+}
+
+fn immutable_cloud_cidrs() -> [IpCidr; 8] {
+    [
+        IpCidr::single(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
+        IpCidr::single(IpAddr::V4(Ipv4Addr::new(169, 254, 170, 2))),
+        IpCidr::single(IpAddr::V4(Ipv4Addr::new(169, 254, 170, 23))),
+        IpCidr::single(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 23))),
+        IpCidr::single(IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200))),
+        IpCidr::single(IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16))),
+        IpCidr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0)),
+            64,
+        )
+        .expect("valid CIDR"),
+        IpCidr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0)),
+            64,
+        )
+        .expect("valid CIDR"),
+    ]
+}
+
+/// Validate an entire DNS answer set using the same decision function used by
+/// the preflight validator and the reqwest connect-time resolver. One forbidden
+/// answer rejects the whole set; silently dropping a private answer would make
+/// the two boundaries disagree and leave rebinding behavior resolver-dependent.
+pub(crate) fn validate_resolved_destination(
+    host: &str,
+    addresses: &[IpAddr],
+    private_policy: Option<&PrivateFetchPolicy>,
+) -> Result<(), String> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if is_cloud_metadata_host(&host) {
+        return Err(format!(
+            "refusing to connect to cloud metadata endpoint: {host}"
+        ));
+    }
+    if addresses.is_empty() {
+        return Err(format!("failed to resolve host: {host}"));
+    }
+
+    for ip in addresses {
+        validate_destination_ip(&host, ip, private_policy)?;
+    }
+    Ok(())
+}
+
+fn validate_destination_ip(
+    host: &str,
+    ip: &IpAddr,
+    private_policy: Option<&PrivateFetchPolicy>,
+) -> Result<(), String> {
+    let scope = classify_ip(ip);
+    let host_approved = private_policy.is_some_and(|policy| policy.approves_host(host));
+    let ip_approved = private_policy.is_some_and(|policy| policy.approves_ip(ip));
+
+    match scope {
+        AddressScope::Global if !is_localhost_host(host) || host_approved => Ok(()),
+        AddressScope::Global => Err(format!(
+            "refusing to connect to localhost destination: {host} -> {ip}"
+        )),
+        AddressScope::PrivateUse | AddressScope::Loopback if host_approved || ip_approved => Ok(()),
+        AddressScope::CloudControlPlane => Err(format!(
+            "refusing to connect to cloud metadata endpoint: {host} -> {ip}"
+        )),
+        AddressScope::LinkLocal => Err(format!(
+            "refusing to connect to link-local address: {host} -> {ip}"
+        )),
+        AddressScope::PrivateUse | AddressScope::Loopback | AddressScope::SpecialUse => Err(
+            format!("refusing to connect to non-public address: {host} -> {ip}"),
+        ),
+    }
+}
+
+fn is_localhost_host(host: &str) -> bool {
+    host == "localhost" || host.ends_with(".localhost")
 }
 
 /// Canonical cloud-metadata host names. Reused by both the URL validators and
@@ -214,120 +525,171 @@ pub fn allow_private_fetch() -> bool {
 pub(crate) fn is_cloud_metadata_host(host: &str) -> bool {
     matches!(
         host.trim_end_matches('.').to_ascii_lowercase().as_str(),
-        "metadata.google.internal"
+        "metadata"
+            | "metadata.google.internal"
             | "metadata.google.com"
+            | "metadata.goog"
             | "instance-data"
             | "instance-data.ec2.internal"
     )
 }
 
-/// Canonical cloud-metadata IP addresses (the link-local/ULA IMDS endpoints that
-/// expose instance credentials). This is the single source of truth reused by
-/// both the URL validators and the connect-time DNS guard so the
-/// `TIRITH_ALLOW_PRIVATE_FETCH` carve-out — which otherwise relaxes private /
-/// loopback / link-local destinations — can never reach a metadata IP.
-///
-/// Mirrors the IPv4 set in `rules::command::METADATA_ENDPOINTS`
-/// (`169.254.169.254` AWS/GCP/Azure, `100.100.100.200` Alibaba) and adds the AWS
-/// IPv6 IMDS address `fd00:ec2::254`. IPv4-mapped / NAT64 / 6to4 / Teredo
-/// encodings of those IPv4 metadata addresses are decoded via
-/// [`embedded_ipv4_in_v6`] so a translated form can't slip past.
+/// Cloud control-plane and credential-service addresses that must remain denied
+/// even when an operator approves the surrounding private hostname or CIDR.
+/// IPv4-mapped, well-known NAT64, 6to4, Teredo, and compatible encodings are
+/// decoded so a textual address-family change cannot hide the endpoint.
 pub(crate) fn is_cloud_metadata_ip(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            matches!(v4.octets(), [169, 254, 169, 254] | [100, 100, 100, 200])
-        }
+        IpAddr::V4(v4) => matches!(
+            v4.octets(),
+            [169, 254, 169, 254] // AWS/GCP/Azure IMDS
+                | [169, 254, 170, 2] // AWS ECS credentials/task metadata
+                | [169, 254, 170, 23] // AWS EKS Pod Identity
+                | [169, 254, 0, 23] // Tencent Cloud metadata
+                | [100, 100, 100, 200] // Alibaba Cloud metadata
+                | [168, 63, 129, 16] // Azure WireServer/platform virtual IP
+        ),
         IpAddr::V6(v6) => {
             if let Some(v4) = embedded_ipv4_in_v6(v6) {
                 return is_cloud_metadata_ip(&IpAddr::V4(v4));
             }
-            // AWS IPv6 instance metadata service: fd00:ec2::254.
-            v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            // Deny the service subnets, not only today's terminal ::254, so the
+            // exception cannot expose adjacent control-plane listeners.
+            ipv6_in_prefix(*v6, Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0), 64)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0), 64)
         }
     }
 }
 
-fn is_forbidden_ip(ip: &IpAddr) -> bool {
+/// Classify an address against the IANA IPv4/IPv6 special-purpose registries
+/// (registry revision 2025-10-09), plus explicit cloud control-plane endpoints.
+/// This function is the only address-scope decision point for URL preflight and
+/// connect-time DNS validation.
+pub(crate) fn classify_ip(ip: &IpAddr) -> AddressScope {
+    if is_cloud_metadata_ip(ip) {
+        return AddressScope::CloudControlPlane;
+    }
+
     match ip {
         IpAddr::V4(v4) => {
-            // IANA's IPv4 special-purpose registry marks the whole
-            // 192.0.0.0/24 block non-global except the PCP/TURN anycast
-            // addresses. 192.88.99.0/24 is the deprecated 6to4 relay block and
-            // remains non-global, including the 192.88.99.2 6a44 anycast entry.
-            if matches!(v4.octets(), [192, 0, 0, 9] | [192, 0, 0, 10]) {
-                return false;
-            }
-            ipv4_in_prefix(*v4, [0, 0, 0, 0], 8)
-                || ipv4_in_prefix(*v4, [10, 0, 0, 0], 8)
+            if ipv4_in_prefix(*v4, [169, 254, 0, 0], 16) {
+                AddressScope::LinkLocal
+            } else if ipv4_in_prefix(*v4, [127, 0, 0, 0], 8) {
+                AddressScope::Loopback
+            } else if ipv4_in_prefix(*v4, [10, 0, 0, 0], 8)
                 || ipv4_in_prefix(*v4, [100, 64, 0, 0], 10)
-                || ipv4_in_prefix(*v4, [127, 0, 0, 0], 8)
-                || ipv4_in_prefix(*v4, [169, 254, 0, 0], 16)
                 || ipv4_in_prefix(*v4, [172, 16, 0, 0], 12)
-                || ipv4_in_prefix(*v4, [192, 0, 0, 0], 24)
-                || ipv4_in_prefix(*v4, [192, 0, 2, 0], 24)
-                || ipv4_in_prefix(*v4, [192, 88, 99, 0], 24)
                 || ipv4_in_prefix(*v4, [192, 168, 0, 0], 16)
-                || ipv4_in_prefix(*v4, [198, 18, 0, 0], 15)
-                || ipv4_in_prefix(*v4, [198, 51, 100, 0], 24)
-                || ipv4_in_prefix(*v4, [203, 0, 113, 0], 24)
-                || ipv4_in_prefix(*v4, [224, 0, 0, 0], 4)
-                || ipv4_in_prefix(*v4, [240, 0, 0, 0], 4)
+            {
+                AddressScope::PrivateUse
+            } else if is_globally_reachable_ipv4(*v4) {
+                AddressScope::Global
+            } else {
+                AddressScope::SpecialUse
+            }
         }
         IpAddr::V6(v6) => {
-            // The well-known NAT64 prefix is globally routed when its embedded
-            // IPv4 destination is. Other translated/transition ranges (mapped,
-            // local-use NAT64, 6to4, Teredo) are not accepted as global socket
-            // destinations by this server-side boundary.
-            let octets = v6.octets();
-            const NAT64_WELL_KNOWN_PREFIX: [u8; 12] =
-                [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
-            if octets.starts_with(&NAT64_WELL_KNOWN_PREFIX) {
-                let embedded = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
-                return is_forbidden_ip(&IpAddr::V4(embedded));
+            if ipv6_in_prefix(*v6, Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10) {
+                AddressScope::LinkLocal
+            } else if v6.is_loopback() {
+                AddressScope::Loopback
+            } else if ipv6_in_prefix(*v6, Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7) {
+                AddressScope::PrivateUse
+            } else if is_globally_reachable_ipv6(*v6) {
+                AddressScope::Global
+            } else {
+                AddressScope::SpecialUse
             }
-            // IANA globally reachable exceptions inside the otherwise special
-            // 2001::/23 protocol-assignment block.
-            if *v6 == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1)
-                || *v6 == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2)
-                || *v6 == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3)
-                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32)
-                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 4, 0x0112, 0, 0, 0, 0, 0), 48)
-                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28)
-                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0), 28)
-            {
-                return false;
-            }
-            // Default-deny unallocated/reserved IPv6 space: ordinary global
-            // unicast is 2000::/3. Then subtract every current non-global
-            // special-purpose subrange in that allocation.
-            !ipv6_in_prefix(*v6, Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3)
-                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23)
-                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32)
-                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16)
-                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20)
         }
     }
 }
 
-fn ipv4_in_prefix(address: Ipv4Addr, network: [u8; 4], prefix: u32) -> bool {
-    let address = u32::from(address);
-    let network = u32::from_be_bytes(network);
-    let mask = if prefix == 0 {
+fn is_globally_reachable_ipv4(ip: Ipv4Addr) -> bool {
+    // Globally reachable exceptions inside 192.0.0.0/24.
+    if matches!(ip.octets(), [192, 0, 0, 9] | [192, 0, 0, 10]) {
+        return true;
+    }
+
+    ![
+        ([0, 0, 0, 0], 8),
+        ([10, 0, 0, 0], 8),
+        ([100, 64, 0, 0], 10),
+        ([127, 0, 0, 0], 8),
+        ([169, 254, 0, 0], 16),
+        ([172, 16, 0, 0], 12),
+        ([192, 0, 0, 0], 24),
+        ([192, 0, 2, 0], 24),
+        ([192, 88, 99, 0], 24),
+        ([192, 168, 0, 0], 16),
+        ([198, 18, 0, 0], 15),
+        ([198, 51, 100, 0], 24),
+        ([203, 0, 113, 0], 24),
+        ([224, 0, 0, 0], 4),
+        ([240, 0, 0, 0], 4),
+    ]
+    .iter()
+    .any(|(network, prefix)| ipv4_in_prefix(ip, *network, *prefix))
+}
+
+fn is_globally_reachable_ipv6(ip: Ipv6Addr) -> bool {
+    // The well-known NAT64 prefix is globally reachable only when its embedded
+    // IPv4 destination is. The local-use 64:ff9b:1::/48 remains non-global.
+    let octets = ip.octets();
+    const NAT64_WELL_KNOWN_PREFIX: [u8; 12] = [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+    if octets.starts_with(&NAT64_WELL_KNOWN_PREFIX) {
+        let embedded = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+        return classify_ip(&IpAddr::V4(embedded)) == AddressScope::Global;
+    }
+
+    // More-specific globally reachable registrations inside IETF's otherwise
+    // non-global 2001::/23 protocol-assignment block.
+    if ip == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1)
+        || ip == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2)
+        || ip == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3)
+        || ipv6_in_prefix(ip, Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32)
+        || ipv6_in_prefix(ip, Ipv6Addr::new(0x2001, 4, 0x0112, 0, 0, 0, 0, 0), 48)
+        || ipv6_in_prefix(ip, Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28)
+        || ipv6_in_prefix(ip, Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0), 28)
+    {
+        return true;
+    }
+
+    // Default-deny unallocated/reserved IPv6 space: ordinary global unicast is
+    // 2000::/3, less the current non-global special-purpose subranges.
+    ipv6_in_prefix(ip, Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3)
+        && !ipv6_in_prefix(ip, Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23)
+        && !ipv6_in_prefix(ip, Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32)
+        && !ipv6_in_prefix(ip, Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16)
+        && !ipv6_in_prefix(ip, Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20)
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
         0
     } else {
         u32::MAX << (32 - prefix)
-    };
-    address & mask == network & mask
+    }
 }
 
-fn ipv6_in_prefix(address: Ipv6Addr, network: Ipv6Addr, prefix: u32) -> bool {
-    let address = u128::from(address);
-    let network = u128::from(network);
-    let mask = if prefix == 0 {
+fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
         0
     } else {
         u128::MAX << (128 - prefix)
-    };
+    }
+}
+
+fn ipv4_in_prefix(address: Ipv4Addr, network: [u8; 4], prefix: u8) -> bool {
+    let address = u32::from(address);
+    let network = u32::from_be_bytes(network);
+    let mask = ipv4_mask(prefix);
+    address & mask == network & mask
+}
+
+fn ipv6_in_prefix(address: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
+    let address = u128::from(address);
+    let network = u128::from(network);
+    let mask = ipv6_mask(prefix);
     address & mask == network & mask
 }
 
@@ -382,6 +744,10 @@ mod tests {
 
     fn resolver_with(ip: IpAddr) -> impl Fn(&str, u16) -> Result<Vec<IpAddr>, String> {
         move |_, _| Ok(vec![ip])
+    }
+
+    fn resolver_with_many(ips: Vec<IpAddr>) -> impl Fn(&str, u16) -> Result<Vec<IpAddr>, String> {
+        move |_, _| Ok(ips.clone())
     }
 
     #[test]
@@ -855,11 +1221,14 @@ mod tests {
             "192.88.99.1",
             "192.88.99.2",
             "100::1",
+            "100:0:0:1::1",
             "2001:2::1",
             "2001:db8::1",
             "2002:0808:0808::1",
             "3fff::1",
+            "5f00::1",
             "64:ff9b:1::808:808",
+            "fec0::1",
         ] {
             assert!(!is_public_addr(&sock(address)), "{address}");
         }
@@ -879,165 +1248,218 @@ mod tests {
         }
     }
 
-    // is_cloud_metadata_ip: the dedicated metadata-IP classifier the carve-out
-    // is screened against.
+    // Explicit cloud control-plane and credential endpoints are classified
+    // before IANA global/private scope.
 
     #[test]
     fn test_is_cloud_metadata_ip_matches_known_endpoints() {
-        assert!(is_cloud_metadata_ip(&"169.254.169.254".parse().unwrap()));
-        assert!(is_cloud_metadata_ip(&"100.100.100.200".parse().unwrap()));
-        assert!(is_cloud_metadata_ip(&"fd00:ec2::254".parse().unwrap()));
-        // Encoded forms of the IPv4 metadata address are decoded and matched.
-        assert!(is_cloud_metadata_ip(
-            &"::ffff:169.254.169.254".parse().unwrap()
-        ));
-        assert!(is_cloud_metadata_ip(
-            &"64:ff9b::169.254.169.254".parse().unwrap()
-        ));
+        for address in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "169.254.0.23",
+            "100.100.100.200",
+            "168.63.129.16",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "::ffff:168.63.129.16",
+            "64:ff9b::169.254.170.2",
+            "2002:a83f:8110::",
+            "2001::57c0:7eef",
+        ] {
+            assert!(is_cloud_metadata_ip(&address.parse().unwrap()), "{address}");
+        }
     }
 
     #[test]
     fn test_is_cloud_metadata_ip_ignores_non_metadata() {
-        // Other private/link-local addresses are NOT metadata (the carve-out may
-        // permit these) — only the IMDS endpoints above are metadata.
+        // Nearby addresses outside explicit service subnets stay in their normal
+        // IANA scope; link-local is independently immutable.
         assert!(!is_cloud_metadata_ip(&"169.254.1.1".parse().unwrap()));
         assert!(!is_cloud_metadata_ip(&"127.0.0.1".parse().unwrap()));
         assert!(!is_cloud_metadata_ip(&"10.0.0.1".parse().unwrap()));
         assert!(!is_cloud_metadata_ip(&"100.100.100.201".parse().unwrap()));
         assert!(!is_cloud_metadata_ip(&"8.8.8.8".parse().unwrap()));
-        assert!(!is_cloud_metadata_ip(&"fd00:ec2::255".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip(&"fd01:ec2::254".parse().unwrap()));
     }
 
-    // TIRITH_ALLOW_PRIVATE_FETCH carve-out: the opt-in relaxes private/loopback/
-    // link-local fetch targets, but must NEVER reach a cloud-metadata endpoint.
-    // `TEST_ENV_LOCK` serializes these env-mutating tests; `EnvVarGuard` restores
-    // the prior value on drop.
+    // Narrow private-fetch policy. Unit tests use a thread-local policy snapshot
+    // so parallel test threads cannot observe a process-wide environment race;
+    // CLI integration tests cover the real environment boundary in a child.
 
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
+    struct PrivatePolicyGuard {
+        previous: Option<Result<PrivateFetchPolicy, String>>,
     }
 
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
+    impl PrivatePolicyGuard {
+        fn from_value(value: &str) -> Self {
+            Self::install(PrivateFetchPolicy::parse(value))
+        }
+
+        fn disabled() -> Self {
+            Self::install(Ok(PrivateFetchPolicy::default()))
+        }
+
+        fn install(policy: Result<PrivateFetchPolicy, String>) -> Self {
+            let previous = TEST_PRIVATE_FETCH_POLICY.with(|slot| slot.replace(Some(policy)));
+            Self { previous }
         }
     }
 
-    impl Drop for EnvVarGuard {
+    impl Drop for PrivatePolicyGuard {
         fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
+            TEST_PRIVATE_FETCH_POLICY.with(|slot| {
+                slot.replace(self.previous.take());
+            });
         }
     }
 
     #[test]
-    fn test_private_fetch_carveout_still_blocks_metadata_ip_literal() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+    fn test_legacy_broad_private_fetch_flag_grants_nothing() {
+        let _policy = PrivatePolicyGuard::disabled();
 
-        // Even with the carve-out set, the AWS/GCP/Azure IMDS IP stays blocked.
-        let result = validate_fetch_url("http://169.254.169.254/latest/meta-data/");
-        assert!(
-            result.is_err(),
-            "metadata IP must stay blocked under TIRITH_ALLOW_PRIVATE_FETCH"
-        );
-        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
-
-        // Alibaba Cloud metadata IP, likewise.
-        let result = validate_fetch_url("http://100.100.100.200/");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+        assert!(validate_fetch_url("http://127.0.0.1/card.json").is_err());
+        assert!(validate_fetch_url("http://10.0.0.1/card.json").is_err());
+        assert!(!allow_private_fetch());
     }
 
     #[test]
-    fn test_private_fetch_carveout_still_blocks_metadata_hostname() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+    fn test_private_fetch_allowlist_accepts_only_exact_host_or_cidr() {
+        let _policy = PrivatePolicyGuard::from_value("127.0.0.1/32,10.42.0.0/24,registry.internal");
 
-        let result = validate_fetch_url("http://metadata.google.internal/");
-        assert!(
-            result.is_err(),
-            "metadata hostname must stay blocked under TIRITH_ALLOW_PRIVATE_FETCH"
-        );
-        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
-    }
+        assert!(validate_fetch_url("http://127.0.0.1/card.json").is_ok());
+        assert!(validate_fetch_url("http://10.42.0.8/card.json").is_ok());
+        assert!(validate_fetch_url("http://10.42.1.8/card.json").is_err());
 
-    #[test]
-    fn test_private_fetch_carveout_still_blocks_ipv6_metadata_literal() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
-
-        // AWS IPv6 IMDS address.
-        let result = validate_fetch_url("http://[fd00:ec2::254]/latest/meta-data/");
-        assert!(
-            result.is_err(),
-            "IPv6 metadata literal must stay blocked under TIRITH_ALLOW_PRIVATE_FETCH"
-        );
-        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
-    }
-
-    #[test]
-    fn test_private_fetch_carveout_still_blocks_domain_resolving_to_metadata() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
-
-        // A hostname (DNS-rebind style) that resolves to the metadata IP must be
-        // rejected even though the carve-out otherwise permits private targets.
-        let result = validate_outbound_url_with_resolver(
-            "http://internal.example.com/latest/meta-data/",
+        let approved = validate_outbound_url_with_resolver(
+            "http://registry.internal/card.json",
             UrlValidationMode::Fetch,
-            &resolver_with("169.254.169.254".parse().unwrap()),
+            &resolver_with("10.99.0.8".parse().unwrap()),
         );
-        assert!(
-            result.is_err(),
-            "domain resolving to metadata IP must stay blocked under the carve-out"
+        assert!(approved.is_ok());
+        let sibling = validate_outbound_url_with_resolver(
+            "http://sibling.internal/card.json",
+            UrlValidationMode::Fetch,
+            &resolver_with("10.99.0.8".parse().unwrap()),
         );
-        assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+        assert!(sibling.is_err());
     }
 
     #[test]
-    fn test_private_fetch_carveout_allows_genuine_private_hosts() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+    fn test_private_fetch_allowlist_rejects_cloud_endpoints_even_for_exact_host() {
+        let _policy = PrivatePolicyGuard::from_value("registry.internal");
 
-        // The carve-out still does its job: loopback and RFC1918 are reachable.
-        assert!(
-            validate_fetch_url("http://127.0.0.1/card.json").is_ok(),
-            "loopback must be allowed under TIRITH_ALLOW_PRIVATE_FETCH"
-        );
-        assert!(
-            validate_fetch_url("http://10.0.0.1/card.json").is_ok(),
-            "RFC1918 host must be allowed under TIRITH_ALLOW_PRIVATE_FETCH"
-        );
+        for address in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "169.254.0.23",
+            "100.100.100.200",
+            "168.63.129.16",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "::ffff:168.63.129.16",
+            "64:ff9b::169.254.170.2",
+        ] {
+            let result = validate_outbound_url_with_resolver(
+                "http://registry.internal/metadata",
+                UrlValidationMode::Fetch,
+                &resolver_with(address.parse().unwrap()),
+            );
+            assert!(result.is_err(), "{address} must remain denied");
+            assert!(result.unwrap_err().contains("cloud metadata endpoint"));
+        }
     }
 
     #[test]
-    fn test_private_fetch_carveout_does_not_apply_to_server_metadata() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvVarGuard::set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+    fn test_private_fetch_allowlist_never_relaxes_link_local_or_special_use() {
+        let _policy = PrivatePolicyGuard::from_value("registry.internal");
 
-        // Server paths never honor the carve-out at all, metadata or otherwise.
-        let result = validate_server_url("https://169.254.169.254/latest/meta-data/");
-        assert!(
-            result.is_err(),
-            "server path must ignore the fetch carve-out"
+        for address in [
+            "169.254.1.1",
+            "fe80::1",
+            "fec0::1",
+            "64:ff9b:1::808:808",
+            "100::1",
+            "5f00::1",
+        ] {
+            let result = validate_outbound_url_with_resolver(
+                "http://registry.internal/data",
+                UrlValidationMode::Fetch,
+                &resolver_with(address.parse().unwrap()),
+            );
+            assert!(result.is_err(), "{address} must remain denied");
+        }
+    }
+
+    #[test]
+    fn test_private_fetch_rejects_mixed_dns_answer_set_unless_every_ip_is_allowed() {
+        let _policy = PrivatePolicyGuard::from_value("10.42.0.0/24");
+
+        let mixed = resolver_with_many(vec![
+            "93.184.216.34".parse().unwrap(),
+            "10.43.0.8".parse().unwrap(),
+        ]);
+        assert!(validate_outbound_url_with_resolver(
+            "http://mixed.example/data",
+            UrlValidationMode::Fetch,
+            &mixed,
+        )
+        .is_err());
+
+        let approved_mixed = resolver_with_many(vec![
+            "93.184.216.34".parse().unwrap(),
+            "10.42.0.8".parse().unwrap(),
+        ]);
+        assert!(validate_outbound_url_with_resolver(
+            "http://mixed.example/data",
+            UrlValidationMode::Fetch,
+            &approved_mixed,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_private_fetch_policy_parser_fails_closed_on_broad_or_immutable_cidrs() {
+        for policy in [
+            "0.0.0.0/0",
+            "169.254.0.0/16",
+            "fe80::/64",
+            "fc00::/7",
+            "100.100.0.0/16",
+            "fd00:ec2::/64",
+            "fd20:ce::/64",
+            "*.internal",
+            "10.0.0.0/33",
+            "10.0.0.1/8",
+            "[[::1]]/128",
+            "10.0.0.0/8,",
+        ] {
+            assert!(PrivateFetchPolicy::parse(policy).is_err(), "{policy}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_private_fetch_env_fails_even_public_fetch_closed() {
+        let _policy = PrivatePolicyGuard::from_value("0.0.0.0/0");
+        let result = validate_outbound_url_with_resolver(
+            "https://example.com/",
+            UrlValidationMode::Fetch,
+            &resolver_with("93.184.216.34".parse().unwrap()),
         );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains(PRIVATE_FETCH_ALLOW_ENV));
+    }
+
+    #[test]
+    fn test_private_fetch_policy_does_not_apply_to_server_urls() {
+        let _policy = PrivatePolicyGuard::from_value("10.0.0.0/8");
+
+        let result = validate_outbound_url_with_resolver(
+            "https://registry.internal/data",
+            UrlValidationMode::Server,
+            &resolver_with("10.0.0.8".parse().unwrap()),
+        );
+        assert!(result.is_err(), "server URLs must ignore fetch exceptions");
     }
 }
