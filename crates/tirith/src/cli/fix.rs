@@ -1,5 +1,5 @@
 //! `tirith fix` — interactive presenter over
-//! `tirith_core::safe_command::suggest_verified`.
+//! `tirith_core::safe_command::suggest_verified_with_policy`.
 //!
 //! Thin shim: tokenize → `engine::analyze` → verified suggestion → present.
 //! Detection and final-command re-analysis live in `tirith-core`; this module is
@@ -111,7 +111,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
-    let verdict = engine::analyze_without_bypass_returning_policy(&ctx).0;
+    let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
 
     // Allow path: nothing to fix.
     if verdict.action == Action::Allow {
@@ -133,7 +133,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     // Verdict has findings — ask the library for verified suggestions. Only an
     // exact final command that re-analyzes to Allow under this same context can
     // populate `safe_command` and cross stdout/JSON execution contracts.
-    let suggestions = safe_command::suggest_verified(&ctx, &verdict);
+    let suggestions = safe_command::suggest_verified_with_policy(&ctx, &verdict, &policy);
 
     // JSON / non-interactive path: emit a plain JSON array, never prompt. Exit
     // 1 if no mechanical rewrite exists (guidance-only); 2 if rewrites are

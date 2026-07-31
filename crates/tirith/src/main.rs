@@ -840,8 +840,8 @@ Examples:
 
     /// Suggest a concrete safer rewrite for a command and (interactively) apply one
     #[command(after_help = "\
-Thin presenter over `tirith_core::safe_command::suggest_verified()` — the same
-verified engine backing `tirith check --suggest-safe-command`. Compatible
+Thin presenter over `tirith_core::safe_command::suggest_verified_with_policy()`
+— the same verified engine backing `tirith check --suggest-safe-command`. Compatible
 remediations are composed and the exact final command is re-analyzed under the
 same shell, context, and policy. Only an Allow result is exposed as
 `safe_command` or printed on stdout, so you can wrap `$(tirith fix -- '<cmd>')`

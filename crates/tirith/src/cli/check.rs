@@ -201,8 +201,11 @@ pub fn run(
     let origin = tirith_core::agent_origin::resolve_cli_origin(interactive);
 
     // M11 ch1 — a `--card <path>` sidecar is daemon-unsupported (v1), so it forces
-    // the local analysis path just like `--no-daemon`.
-    let use_daemon = !approval_check && !no_daemon && card.is_none();
+    // the local analysis path just like `--no-daemon`. Safe-command suggestions
+    // also force local analysis: candidate verification must reuse the exact
+    // policy snapshot returned with the original verdict, never combine a daemon
+    // verdict with a separately discovered client policy.
+    let use_daemon = !approval_check && !no_daemon && card.is_none() && !suggest_safe_command;
 
     // Local paths return the engine's policy to avoid a redundant
     // Policy::discover(); the daemon path returns None (analysis was server-side).
@@ -524,7 +527,11 @@ pub fn run(
                 card_ref: card.clone(),
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             };
-            tirith_core::safe_command::suggest_verified(&suggestion_ctx, &effective)
+            tirith_core::safe_command::suggest_verified_with_policy(
+                &suggestion_ctx,
+                &effective,
+                &policy,
+            )
         } else {
             Vec::new()
         };

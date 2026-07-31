@@ -2,11 +2,10 @@
 //!
 //! The engine behind `tirith check --suggest-safe-command`. Purely advisory
 //! (never influences detection, verdicts, or exit codes): it inspects a
-//! computed [`Verdict`] plus the command and proposes transformations. Callers
-//! that expose [`SafeSuggestion::safe_command`] as executable data must use
-//! [`suggest_verified`], which composes compatible transformations and
-//! re-analyzes the exact final command under the original analysis context.
-//! A wrong suggestion is worse than none: a partial transformation remains
+//! computed [`Verdict`] plus the command and proposes transformations. Every
+//! public suggestion constructor composes compatible transformations and
+//! re-analyzes the exact final command under the original analysis context. A
+//! wrong suggestion is worse than none: a partial transformation remains
 //! guidance-only and never crosses the executable field boundary.
 //!
 //! [`SafeSuggestion::safe_command`] is the only executable rewrite channel;
@@ -25,6 +24,7 @@ use std::sync::LazyLock;
 
 use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
+use crate::policy::Policy;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Action, Finding, RuleId, Severity, Verdict};
 
@@ -35,9 +35,7 @@ pub struct SafeSuggestion {
     /// The rule this addresses (snake_case, e.g. `curl_pipe_shell`).
     pub rule_id: String,
     /// A concrete command whose exact final form re-analyzed to
-    /// [`Action::Allow`], or `None` when only guidance is available. The
-    /// low-level [`suggest`] helper returns unverified transformation candidates
-    /// for compatibility; executable callers must use [`suggest_verified`].
+    /// [`Action::Allow`], or `None` when only guidance is available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_command: Option<String>,
     /// Why the suggestion is safer, or why no rewrite is possible.
@@ -69,17 +67,21 @@ pub fn sensitive_env_vars() -> &'static [&'static str] {
     &SENSITIVE_ENV_VARS
 }
 
-/// Build safe-command suggestions for every actionable finding in `verdict`,
-/// one [`SafeSuggestion`] per rule id (deduplicated).
+/// Build verified safe-command suggestions in a default non-interactive Exec
+/// context, one [`SafeSuggestion`] per rule id (deduplicated).
 ///
 /// Two command-shape transforms (`sudo_narrow`, `env_scrub`) also run once per
 /// verdict, keyed on the command shape / process env rather than a [`RuleId`].
-/// This is the low-level transformation layer used by [`suggest_verified`]. A
-/// candidate may address only one of several findings; it must not be exposed as
-/// executable without final verification. Empty when the verdict has no
-/// findings.
+/// The constructed context has no cwd/card/clipboard metadata; callers that own
+/// those values should use [`suggest_verified_with_policy`]. Empty when the
+/// verdict has no findings.
 pub fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSuggestion> {
-    let ctx = AnalysisContext {
+    let ctx = default_exec_context(cmd, shell);
+    suggest_verified(&ctx, verdict)
+}
+
+fn default_exec_context(cmd: &str, shell: ShellType) -> AnalysisContext {
+    AnalysisContext {
         input: cmd.to_string(),
         shell,
         scan_context: ScanContext::Exec,
@@ -92,21 +94,39 @@ pub fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSugges
         clipboard_html: None,
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
-    };
-    suggest_candidates(&ctx, verdict)
+    }
 }
 
 /// Build suggestions safe to expose through an executable stdout/eval/JSON
 /// contract.
 ///
-/// Every mechanical candidate is re-analyzed byte-for-byte with the original
-/// shell, scan context, cwd, and policy-discovery context. Compatible
-/// transformations are composed with a bounded breadth-first search. Only the
-/// shortest final command whose action is [`Action::Allow`] remains in a
-/// `safe_command` field. All other transformations are retained as static
-/// guidance, with their candidate command removed from the structured output.
+/// This convenience entry point discovers the original input's policy once,
+/// then delegates to [`suggest_verified_with_policy`]. Enforcement callers that
+/// already analyzed the original input should pass that exact returned policy
+/// snapshot to the latter function instead of discovering it again.
 pub fn suggest_verified(ctx: &AnalysisContext, verdict: &Verdict) -> Vec<SafeSuggestion> {
-    let mut suggestions = suggest_candidates(ctx, verdict);
+    if verdict.findings.is_empty() {
+        return Vec::new();
+    }
+    let policy = engine::analyze_without_bypass_returning_policy(ctx).1;
+    suggest_verified_with_policy(ctx, verdict, &policy)
+}
+
+/// Build suggestions safe to expose through an executable stdout/eval/JSON
+/// contract, bound to the exact policy snapshot used for the original verdict.
+///
+/// Every mechanical candidate is re-analyzed byte-for-byte with the original
+/// shell, scan context, cwd, and policy object. Compatible transformations are
+/// composed with a bounded breadth-first search. Only the shortest final
+/// command whose action is [`Action::Allow`] remains in a `safe_command` field.
+/// All other transformations are retained as static guidance, with their
+/// candidate command removed from structured output.
+pub fn suggest_verified_with_policy(
+    ctx: &AnalysisContext,
+    verdict: &Verdict,
+    policy: &Policy,
+) -> Vec<SafeSuggestion> {
+    let mut suggestions = suggest_candidates(ctx, verdict, Some(policy));
     let initial_candidates: Vec<(String, String)> = suggestions
         .iter()
         .filter_map(|suggestion| {
@@ -152,10 +172,10 @@ pub fn suggest_verified(ctx: &AnalysisContext, verdict: &Verdict) -> Vec<SafeSug
         examined += 1;
 
         let candidate_ctx = context_with_input(ctx, candidate.command.clone());
-        // Never let a process/inline bypass bless an executable suggestion. The
-        // same policy discovery and context still apply; only the explicit
-        // bypass escape hatch is excluded from verification.
-        let candidate_verdict = engine::analyze_without_bypass_returning_policy(&candidate_ctx).0;
+        // Never let a process/inline bypass or a policy-file race bless an
+        // executable suggestion. Every candidate uses the original resolved
+        // policy object; no policy discovery occurs in this loop.
+        let candidate_verdict = engine::analyze_with_policy_without_bypass(&candidate_ctx, policy);
         if candidate_verdict.action == Action::Allow {
             verified = Some(candidate);
             break;
@@ -165,7 +185,7 @@ pub fn suggest_verified(ctx: &AnalysisContext, verdict: &Verdict) -> Vec<SafeSug
             continue;
         }
 
-        for next in suggest_candidates(&candidate_ctx, &candidate_verdict) {
+        for next in suggest_candidates(&candidate_ctx, &candidate_verdict, Some(policy)) {
             let Some(command) = next.safe_command else {
                 continue;
             };
@@ -241,7 +261,11 @@ fn context_with_input(ctx: &AnalysisContext, input: String) -> AnalysisContext {
     }
 }
 
-fn suggest_candidates(ctx: &AnalysisContext, verdict: &Verdict) -> Vec<SafeSuggestion> {
+fn suggest_candidates(
+    ctx: &AnalysisContext,
+    verdict: &Verdict,
+    policy: Option<&Policy>,
+) -> Vec<SafeSuggestion> {
     let cmd = &ctx.input;
     let shell = ctx.shell;
     let segments = tokenize::tokenize(cmd, shell);
@@ -259,10 +283,11 @@ fn suggest_candidates(ctx: &AnalysisContext, verdict: &Verdict) -> Vec<SafeSugge
     // Command-shape transforms fire at most once per verdict, only when there
     // are findings to rewrite.
     if !verdict.findings.is_empty() {
-        if let Some(s) = build_sudo_narrow_suggestion(ctx, &segments, verdict) {
+        if let Some(s) = build_sudo_narrow_suggestion(ctx, &segments, verdict, policy) {
             out.push(s);
         }
-        if let Some(s) = build_env_scrub_suggestion(cmd, shell, verdict, ctx.cwd.as_deref()) {
+        if let Some(s) = build_env_scrub_suggestion(cmd, shell, verdict, ctx.cwd.as_deref(), policy)
+        {
             out.push(s);
         }
     }
@@ -907,6 +932,7 @@ fn build_sudo_narrow_suggestion(
     ctx: &AnalysisContext,
     segments: &[tokenize::Segment],
     _verdict: &Verdict,
+    policy: Option<&Policy>,
 ) -> Option<SafeSuggestion> {
     let cmd = &ctx.input;
     let shell = ctx.shell;
@@ -951,7 +977,10 @@ fn build_sudo_narrow_suggestion(
     // (iv) re-analyze the stripped command; if it still flags, sudo wasn't the
     // dangerous part — per-finding suggestions cover it.
     let inner_ctx = context_with_input(ctx, inner.clone());
-    let inner_verdict = engine::analyze_without_bypass_returning_policy(&inner_ctx).0;
+    let inner_verdict = match policy {
+        Some(snapshot) => engine::analyze_with_policy_without_bypass(&inner_ctx, snapshot),
+        None => engine::analyze_without_bypass_returning_policy(&inner_ctx).0,
+    };
     if inner_verdict.action != Action::Allow {
         return None;
     }
@@ -973,10 +1002,17 @@ fn build_sudo_narrow_suggestion(
 /// Currently-set sensitive env vars in stable (deterministic) order. The
 /// effective list MERGES the built-in `sensitive_env.toml` names with the user's
 /// `policy.env_guard_sensitive_vars` (M9 ch4) so an `env -u …` rewrite never
-/// silently omits a user-declared secret. The partial-policy discover is cheap
-/// and only runs when this transform is being built.
-fn sensitive_env_set_in_process(cwd: Option<&str>) -> Vec<String> {
-    let policy = crate::policy::Policy::discover_partial(cwd);
+/// silently omits a user-declared secret. Verified callers reuse their captured
+/// snapshot; the private raw-candidate test path discovers a partial policy.
+fn sensitive_env_set_in_process(cwd: Option<&str>, policy: Option<&Policy>) -> Vec<String> {
+    let discovered;
+    let policy = match policy {
+        Some(snapshot) => snapshot,
+        None => {
+            discovered = Policy::discover_partial(cwd);
+            &discovered
+        }
+    };
     let effective = crate::env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
     effective
         .into_iter()
@@ -1064,6 +1100,7 @@ fn build_env_scrub_suggestion(
     shell: ShellType,
     verdict: &Verdict,
     cwd: Option<&str>,
+    policy: Option<&Policy>,
 ) -> Option<SafeSuggestion> {
     // Fire on the dedicated M9 ch4 rule (explicit, audit-visible) OR any
     // High-severity finding (M6 ch5 compat heuristic).
@@ -1086,7 +1123,7 @@ fn build_env_scrub_suggestion(
         return None;
     }
 
-    let set_vars = sensitive_env_set_in_process(cwd);
+    let set_vars = sensitive_env_set_in_process(cwd, policy);
     if set_vars.is_empty() {
         return None;
     }
@@ -1249,6 +1286,14 @@ mod tests {
     use super::*;
     use crate::verdict::{Evidence, Timings};
 
+    // Transformation-shape unit tests intentionally exercise the private raw
+    // candidate layer. Public `suggest` is covered by integration tests and may
+    // only return a command after whole-command verification.
+    fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSuggestion> {
+        let ctx = default_exec_context(cmd, shell);
+        suggest_candidates(&ctx, verdict, None)
+    }
+
     fn finding(rule_id: RuleId) -> Finding {
         Finding {
             rule_id,
@@ -1265,6 +1310,52 @@ mod tests {
 
     fn verdict_with(findings: Vec<Finding>) -> Verdict {
         Verdict::from_findings(findings, 3, Timings::default())
+    }
+
+    #[test]
+    fn verified_suggestions_reuse_original_policy_snapshot_after_file_change() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("git marker");
+        let policy_dir = repo.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).expect("policy dir");
+        let policy_path = policy_dir.join("policy.yaml");
+        std::fs::write(
+            &policy_path,
+            "custom_rules:\n  - id: forbid-example-fetch\n    when:\n      url.host: example.com\n    severity: medium\n    title: forbidden\n    context: [exec]\n",
+        )
+        .expect("write policy");
+
+        let mut ctx = default_exec_context("curl -k https://example.com/file", ShellType::Posix);
+        ctx.cwd = Some(repo.path().display().to_string());
+        let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::CustomRuleMatch),
+            "original snapshot must contain the repo-local custom rule: {verdict:?}"
+        );
+
+        // Simulate a policy TOCTOU between original analysis and candidate
+        // verification. The captured policy must remain authoritative.
+        std::fs::remove_file(&policy_path).expect("remove live policy");
+        let suggestions = suggest_verified_with_policy(&ctx, &verdict, &policy);
+        assert!(
+            suggestions
+                .iter()
+                .all(|suggestion| suggestion.safe_command.is_none()),
+            "removing the live file must not make a snapshot-forbidden candidate executable: {suggestions:?}"
+        );
+
+        let candidate_ctx = context_with_input(&ctx, "curl https://example.com/file".to_string());
+        let candidate_verdict = engine::analyze_with_policy_without_bypass(&candidate_ctx, &policy);
+        assert!(
+            candidate_verdict
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::CustomRuleMatch),
+            "snapshot re-analysis must retain the removed custom rule: {candidate_verdict:?}"
+        );
     }
 
     #[test]

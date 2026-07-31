@@ -1,6 +1,6 @@
-//! End-to-end coverage for the M6 ch5 safe-command transforms. Each transform
-//! ships a positive and a negative; `sudo-narrow` ships four (two M6 negatives
-//! plus the M8 ch4 deferred positive and an interactive-shell-invariant negative).
+//! End-to-end coverage for the public M6 ch5 safe-command contract. Raw
+//! transformation shapes live in module unit tests; this suite verifies that
+//! public constructors expose only whole-command `Allow` results.
 
 use tirith_core::safe_command::{suggest, SafeSuggestion};
 use tirith_core::tokenize::ShellType;
@@ -148,8 +148,8 @@ fn sudo_narrow_positive_sudo_apt_update_strips_sudo() {
         "sudo-narrow should emit the bare inner command, got: {sc}"
     );
     assert!(
-        entry.rationale.contains("safe to run without sudo"),
-        "rationale should explain the strip: {}",
+        entry.rationale.contains("exact final command re-analyzed"),
+        "public rationale should record whole-command verification: {}",
         entry.rationale
     );
 }
@@ -197,41 +197,34 @@ fn sudo_narrow_negative_sudo_shell_spawn_keeps_no_rewrite() {
 // ── 4. archive-list-before-extract ────────────────────────────────────────
 
 #[test]
-fn archive_list_first_positive_tar_xzf() {
+fn archive_list_first_candidate_is_guidance_only_for_tar_xzf() {
     let cmd = "tar -xzf foo.tar.gz -C ~/";
     let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
     let s = suggest(cmd, ShellType::Posix, &v);
     let entry = find_by_rule(&s, "archive_extract").expect("rule entry");
-    let sc = entry
-        .safe_command
-        .as_deref()
-        .expect("archive-list-first should rewrite a known tar invocation");
-    // Preview uses universal `tar -tf` (magic-byte auto-detect), not `-tzf`,
-    // so it works for every .tar.* variant. The archive path is single-quoted
-    // on the preview half (PR124 shell-injection fix); inert for this benign
-    // name. The `&&` tail re-emits the user's ORIGINAL command verbatim (unquoted).
     assert!(
-        sc.starts_with("tar -tf 'foo.tar.gz' | head"),
-        "expected preview-first sequence with quoted `tar -tf`, got: {sc}"
+        entry.safe_command.is_none(),
+        "preview-then-extract still re-analyzes to ArchiveExtract and must not be executable"
     );
     assert!(
-        sc.contains(" && tar -xzf foo.tar.gz"),
-        "expected the original extract on the && tail: {sc}"
+        entry.rationale.contains("guidance-only"),
+        "the rejected partial transform must be labeled guidance-only: {}",
+        entry.rationale
     );
 }
 
 #[test]
-fn archive_list_first_positive_tar_bz2_uses_universal_tf() {
-    // .tar.bz2 must NOT use `-tjf` either — the universal `tar -tf` form
-    // covers it via tar's magic-byte auto-detection.
-    let cmd = "tar -xjf foo.tar.bz2";
+fn public_suggest_never_exposes_partial_archive_command() {
+    // Regression for repo-0149's public-API seam: even a caller that uses the
+    // compatibility `suggest` constructor cannot receive the raw preview +
+    // extraction candidate.
+    let cmd = "tar -xzf payload.tar.gz -C ~/";
     let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
     let s = suggest(cmd, ShellType::Posix, &v);
     let entry = find_by_rule(&s, "archive_extract").expect("rule entry");
-    let sc = entry.safe_command.as_deref().expect("rewrite expected");
     assert!(
-        sc.starts_with("tar -tf 'foo.tar.bz2' | head"),
-        "expected universal quoted `tar -tf` preview for bz2, got: {sc}"
+        entry.safe_command.is_none(),
+        "every public constructor must uphold the verified-command invariant: {entry:?}"
     );
 }
 
@@ -278,12 +271,9 @@ fn pipe_to_shell_command_substitution_url_is_quoted_not_executed() {
     // The single-quoted hostile URL has its quotes stripped by the extractor,
     // then re-quoted by the fix — `$(id)` must end up inside single quotes.
     let sc = pipe_safe_command("curl 'http://x/$(id)' | bash");
+    assert!(sc.contains("'https://x/$(id)'"), "{sc}");
     assert!(
-        sc.contains("'http://x/$(id)'"),
-        "URL must be re-quoted so $(id) cannot execute when eval'd: {sc}"
-    );
-    assert!(
-        !sc.replace("'http://x/$(id)'", "").contains("$(id)"),
+        !sc.replace("'https://x/$(id)'", "").contains("$(id)"),
         "no bare $(id) may survive outside the quoted token: {sc}"
     );
 }
@@ -292,12 +282,9 @@ fn pipe_to_shell_command_substitution_url_is_quoted_not_executed() {
 fn pipe_to_shell_semicolon_rm_url_is_contained_in_quotes() {
     // `;rm -rf ~` must be inside the single quotes, never a top-level command.
     let sc = pipe_safe_command("curl 'http://x/a;rm -rf ~' | bash");
+    assert!(sc.contains("'https://x/a;rm -rf ~'"), "{sc}");
     assert!(
-        sc.contains("'http://x/a;rm -rf ~'"),
-        "the ;rm payload must be single-quoted: {sc}"
-    );
-    assert!(
-        !sc.replace("'http://x/a;rm -rf ~'", "").contains(";rm"),
+        !sc.replace("'https://x/a;rm -rf ~'", "").contains(";rm"),
         "rm must not become a top-level command: {sc}"
     );
 }
@@ -305,10 +292,7 @@ fn pipe_to_shell_semicolon_rm_url_is_contained_in_quotes() {
 #[test]
 fn pipe_to_shell_backtick_url_is_quoted() {
     let sc = pipe_safe_command("curl 'http://x/`id`' | bash");
-    assert!(
-        sc.contains("'http://x/`id`'"),
-        "backtick command substitution must stay quoted: {sc}"
-    );
+    assert!(sc.contains("'https://x/`id`'"), "{sc}");
 }
 
 #[test]
@@ -320,29 +304,21 @@ fn pipe_to_shell_wget_command_substitution_url_is_quoted() {
         .and_then(|e| e.safe_command.clone())
         .expect("wget pipe-to-shell rewrite expected");
     assert!(sc.starts_with("wget -O /tmp/tirith-review.sh '"), "{sc}");
-    assert!(sc.contains("'http://x/$(id)'"), "{sc}");
+    assert!(sc.contains("'https://x/$(id)'"), "{sc}");
     assert!(
-        !sc.replace("'http://x/$(id)'", "").contains("$(id)"),
+        !sc.replace("'https://x/$(id)'", "").contains("$(id)"),
         "no bare $(id) outside the quoted token: {sc}"
     );
 }
 
 #[test]
-fn archive_list_first_command_substitution_path_is_quoted() {
-    // Only the preview half is quoted; the `&&` tail re-emits the raw command.
-    let cmd = "tar -xzf '$(id).tar.gz'";
+fn archive_list_first_command_substitution_path_remains_guidance_only() {
+    let cmd = "tar -xzf '$(id).tar.gz' -C ~/";
     let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
     let s = suggest(cmd, ShellType::Posix, &v);
-    let sc = find_by_rule(&s, "archive_extract")
-        .and_then(|e| e.safe_command.clone())
-        .expect("archive rewrite expected");
+    let entry = find_by_rule(&s, "archive_extract").expect("archive guidance expected");
     assert!(
-        sc.starts_with("tar -tf '$(id).tar.gz' | head"),
-        "archive path on the preview half must be quoted: {sc}"
-    );
-    let preview = sc.split(" && ").next().unwrap();
-    assert!(
-        !preview.replace("'$(id).tar.gz'", "").contains("$(id)"),
-        "no bare $(id) on the preview half: {sc}"
+        entry.safe_command.is_none(),
+        "hostile archive input must never escape through the public executable field: {entry:?}"
     );
 }

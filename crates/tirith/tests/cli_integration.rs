@@ -473,6 +473,124 @@ fn check_suggest_safe_command_json_embeds_suggestions() {
         .is_some_and(|s| !s.is_empty()));
 }
 
+#[cfg(unix)]
+#[test]
+fn check_suggestions_never_mix_daemon_verdict_with_local_policy() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tirith_core::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(project.join(".git")).expect("git marker");
+
+    // Bind a test-owned fake daemon whose response represents a DIFFERENT
+    // policy: it returns only a custom denial and omits the local insecure-TLS
+    // finding. Before the fix, --suggest-safe-command contacted this socket and
+    // mixed that verdict with a separately discovered local policy snapshot.
+    let state_home = tmp.path().join("state");
+    let daemon_dir = state_home.join("tirith");
+    fs::create_dir_all(&daemon_dir).expect("daemon dir");
+    fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700))
+        .expect("private daemon dir");
+    let listener = UnixListener::bind(daemon_dir.join("daemon.sock")).expect("bind fake daemon");
+    listener.set_nonblocking(true).expect("nonblocking daemon");
+
+    let daemon_finding = Finding {
+        rule_id: RuleId::CustomRuleMatch,
+        severity: Severity::High,
+        title: "daemon-only policy denial".to_string(),
+        description: "forged response from a different policy snapshot".to_string(),
+        evidence: vec![Evidence::Text {
+            detail: "policy=daemon-only".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: Some("daemon-only".to_string()),
+    };
+    let response = serde_json::json!({
+        "action": Action::Block,
+        "findings": [&daemon_finding],
+        "exit_code": 1,
+        "bypass_honored": false,
+        "bypass_available": false,
+        "policy_path_used": "/daemon-only/policy.yaml",
+        "timings_ms": Timings::default(),
+        "tier_reached": 3,
+        "raw_findings": [&daemon_finding],
+        "raw_action": "Block"
+    })
+    .to_string()
+        + "\n";
+
+    let contacted = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let contacted_server = Arc::clone(&contacted);
+    let stop_server = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        use std::io::{BufRead as _, Write as _};
+        while !stop_server.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    contacted_server.store(true, Ordering::Release);
+                    let mut line = String::new();
+                    let mut reader = std::io::BufReader::new(
+                        stream.try_clone().expect("clone fake-daemon stream"),
+                    );
+                    let _ = reader.read_line(&mut line);
+                    let _ = stream.write_all(response.as_bytes());
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let out = tirith_in_proj(&project)
+        .env("XDG_STATE_HOME", &state_home)
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--offline",
+            "--suggest-safe-command",
+            "--format",
+            "json",
+            "--",
+            "curl -k https://example.com/file",
+        ])
+        .output()
+        .expect("run local suggestion analysis");
+    stop.store(true, Ordering::Release);
+    server.join().expect("join fake daemon");
+
+    assert!(
+        !contacted.load(Ordering::Acquire),
+        "suggestion mode must not contact a daemon with an independent policy snapshot"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "suggestion output must be JSON: {error}; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert!(
+        json["safe_suggestions"]
+            .as_array()
+            .is_some_and(|suggestions| suggestions.iter().any(|suggestion| {
+                suggestion["safe_command"] == "curl https://example.com/file"
+            })),
+        "the local policy/verdict pair must drive suggestions: {json}"
+    );
+}
+
 #[test]
 fn check_without_suggest_flag_omits_suggestions_but_keeps_remediation() {
     let out = tirith()
@@ -7848,7 +7966,7 @@ fn explain_fix_without_rule_or_finding_is_rejected() {
 }
 
 // tirith fix (M6 ch4). `tirith fix` is a thin presenter over
-// `safe_command::suggest_verified()`.
+// `safe_command::suggest_verified_with_policy()`.
 
 #[test]
 fn fix_clean_command_exits_zero_with_no_findings_envelope() {
