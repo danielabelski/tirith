@@ -534,6 +534,18 @@ fn validate_scan_config(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
 }
 
 fn validate_custom_dlp_patterns(field: &str, patterns: &[String], issues: &mut Vec<PolicyIssue>) {
+    if patterns.len() > crate::redact::MAX_CUSTOM_DLP_PATTERNS {
+        issues.push(PolicyIssue {
+            level: IssueLevel::Error,
+            message: format!(
+                "{field}: too many patterns ({}, max {})",
+                patterns.len(),
+                crate::redact::MAX_CUSTOM_DLP_PATTERNS
+            ),
+            field: Some(field.to_string()),
+        });
+        return;
+    }
     for (i, pattern) in patterns.iter().enumerate() {
         if let Err(error) = crate::redact::compile_custom_dlp_pattern(pattern) {
             let field = format!("{field}[{i}]");
@@ -1205,6 +1217,8 @@ custom_rules:
             ("multibyte-at-limit", "é".repeat(512)),
             ("multibyte-over-limit", format!("{}a", "é".repeat(512))),
             ("invalid-regex", "(".to_string()),
+            ("zero-width-empty", "".to_string()),
+            ("zero-width-boundary", r"\b".to_string()),
             ("legitimate", r"PROJ-\d+".to_string()),
         ];
 
@@ -1231,6 +1245,35 @@ custom_rules:
             assert_eq!(
                 validator_accepts, runtime_accepts,
                 "share.customer_id_patterns parity failed for {name}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_dlp_validation_matches_runtime_pattern_count_cap() {
+        let count = crate::redact::MAX_CUSTOM_DLP_PATTERNS + 1;
+        let rows = "  - 'never-match'\n".repeat(count);
+        for (field, yaml) in [
+            (
+                "dlp_custom_patterns",
+                format!("dlp_custom_patterns:\n{rows}"),
+            ),
+            (
+                "share.customer_id_patterns",
+                format!(
+                    "share:\n  customer_id_patterns:\n{}",
+                    rows.replace("  -", "    -")
+                ),
+            ),
+        ] {
+            let issues = validate(&yaml);
+            assert!(
+                issues.iter().any(|issue| {
+                    issue.level == IssueLevel::Error
+                        && issue.field.as_deref() == Some(field)
+                        && issue.message.contains("too many patterns")
+                }),
+                "validator must reject the runtime-over-limit set for {field}: {issues:?}"
             );
         }
     }

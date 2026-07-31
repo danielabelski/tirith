@@ -3391,6 +3391,7 @@ dependencies = [
  "rand",
  "rand_core 0.6.4",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rust-mcp-schema",
  "serde",

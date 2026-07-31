@@ -39,6 +39,7 @@ artifact-hash-lookup = []
 [dependencies]
 url = { workspace = true }
 regex = { workspace = true }
+regex-syntax = { workspace = true }
 percent-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

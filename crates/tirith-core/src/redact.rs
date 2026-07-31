@@ -316,15 +316,28 @@ pub fn detect_canaries(input: &str) -> Vec<crate::canary::CanaryHit> {
 
 /// Maximum UTF-8 byte length accepted for a policy-provided DLP regex.
 pub(crate) const MAX_CUSTOM_DLP_PATTERN_BYTES: usize = 1024;
+/// Maximum number of policy-provided DLP regexes evaluated in one redaction.
+pub(crate) const MAX_CUSTOM_DLP_PATTERNS: usize = 128;
+/// Maximum raw regex matches collected before deterministic overlap merging.
+pub(crate) const MAX_CUSTOM_DLP_MATCHES: usize = 4096;
+/// Maximum bytes a one-pass custom replacement may add to its input.
+pub(crate) const MAX_CUSTOM_DLP_OUTPUT_OVERHEAD_BYTES: usize = 32 * 1024;
+
+const CUSTOM_REDACTION_MARKER: &str = "[REDACTED:custom]";
+const CUSTOMER_ID_REDACTION_MARKER: &str = "[REDACTED:customer_id]";
+const INCOMPLETE_REDACTION_MARKER: &str = "[REDACTED:incomplete]";
 
 /// Why a policy-provided DLP regex cannot be used at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CustomDlpPatternError {
+pub enum CustomDlpPatternError {
     TooLong {
         actual_bytes: usize,
         max_bytes: usize,
     },
     InvalidRegex,
+    /// The regex can match without consuming input, so replacement would be
+    /// insertion rather than redaction and could amplify output.
+    ZeroWidthMatch,
 }
 
 impl std::fmt::Display for CustomDlpPatternError {
@@ -338,9 +351,66 @@ impl std::fmt::Display for CustomDlpPatternError {
                 "pattern too long ({actual_bytes} bytes, max {max_bytes})"
             ),
             Self::InvalidRegex => write!(f, "invalid regex"),
+            Self::ZeroWidthMatch => write!(f, "pattern can match zero-width input"),
         }
     }
 }
+
+impl std::error::Error for CustomDlpPatternError {}
+
+/// A custom-redaction plan could not prove complete, bounded coverage.
+///
+/// Checked callers receive this typed outcome. The compatibility wrappers in
+/// this module deliberately replace the entire secret-bearing value with
+/// `[REDACTED:incomplete]` instead of returning partial output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedactionIncomplete {
+    PatternLimitExceeded {
+        actual: usize,
+        max: usize,
+    },
+    PatternRejected {
+        index: usize,
+        error: CustomDlpPatternError,
+    },
+    MatchLimitExceeded {
+        actual_at_least: usize,
+        max: usize,
+    },
+    OutputOverheadExceeded {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+}
+
+impl std::fmt::Display for RedactionIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PatternLimitExceeded { actual, max } => {
+                write!(f, "too many patterns ({actual}, max {max})")
+            }
+            Self::PatternRejected { index, error } => {
+                write!(f, "pattern at index {index} rejected: {error}")
+            }
+            Self::MatchLimitExceeded {
+                actual_at_least,
+                max,
+            } => write!(
+                f,
+                "too many matches (at least {actual_at_least}, max {max})"
+            ),
+            Self::OutputOverheadExceeded {
+                actual_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "replacement output overhead too large ({actual_bytes} bytes, max {max_bytes})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RedactionIncomplete {}
 
 /// Compile one policy-provided DLP regex using the runtime acceptance contract.
 pub(crate) fn compile_custom_dlp_pattern(pattern: &str) -> Result<Regex, CustomDlpPatternError> {
@@ -351,61 +421,190 @@ pub(crate) fn compile_custom_dlp_pattern(pattern: &str) -> Result<Regex, CustomD
             max_bytes: MAX_CUSTOM_DLP_PATTERN_BYTES,
         });
     }
+
+    // `Regex::is_match("")` misses boundary-only forms such as `\b`. The HIR
+    // property is computed for the whole regular language and therefore rejects
+    // every expression whose minimum possible match consumes zero bytes.
+    let hir = regex_syntax::parse(pattern).map_err(|_| CustomDlpPatternError::InvalidRegex)?;
+    if hir.properties().minimum_len() == Some(0) {
+        return Err(CustomDlpPatternError::ZeroWidthMatch);
+    }
     Regex::new(pattern).map_err(|_| CustomDlpPatternError::InvalidRegex)
 }
 
-fn warn_skipped_custom_dlp_pattern(pattern_kind: &str, index: usize, error: CustomDlpPatternError) {
-    eprintln!("tirith: warning: skipping {pattern_kind} pattern at index {index}: {error}");
+fn compile_custom_dlp_patterns(raw_patterns: &[String]) -> Result<Vec<Regex>, RedactionIncomplete> {
+    if raw_patterns.len() > MAX_CUSTOM_DLP_PATTERNS {
+        return Err(RedactionIncomplete::PatternLimitExceeded {
+            actual: raw_patterns.len(),
+            max: MAX_CUSTOM_DLP_PATTERNS,
+        });
+    }
+    raw_patterns
+        .iter()
+        .enumerate()
+        .map(|(index, pattern)| {
+            compile_custom_dlp_pattern(pattern)
+                .map_err(|error| RedactionIncomplete::PatternRejected { index, error })
+        })
+        .collect()
+}
+
+fn warn_incomplete_custom_redaction(pattern_kind: &str, error: &RedactionIncomplete) {
+    eprintln!(
+        "tirith: warning: {pattern_kind} redaction incomplete ({error}); fully redacting value"
+    );
 }
 
 /// Pre-compiled set of custom DLP patterns.
 pub struct CompiledCustomPatterns {
     patterns: Vec<Regex>,
+    incomplete: Option<RedactionIncomplete>,
 }
 
 impl CompiledCustomPatterns {
-    /// Compile custom DLP patterns once for reuse across calls.
+    /// Compile custom DLP patterns once for reuse across calls. Invalid or
+    /// over-budget sets remain explicitly incomplete, causing every subsequent
+    /// compatibility-wrapper redaction to fail closed.
     pub fn new(raw_patterns: &[String]) -> Self {
-        let patterns = raw_patterns
-            .iter()
-            .enumerate()
-            .filter_map(
-                |(index, pat_str)| match compile_custom_dlp_pattern(pat_str) {
-                    Ok(re) => Some(re),
-                    Err(error) => {
-                        warn_skipped_custom_dlp_pattern("custom DLP", index, error);
-                        None
-                    }
-                },
-            )
-            .collect();
-        Self { patterns }
-    }
-}
-
-/// Redact using both built-in and custom patterns from policy.
-pub fn redact_with_custom(input: &str, custom_patterns: &[String]) -> String {
-    let mut result = redact(input);
-    for (index, pat_str) in custom_patterns.iter().enumerate() {
-        match compile_custom_dlp_pattern(pat_str) {
-            Ok(re) => {
-                result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
-            }
+        match Self::try_new(raw_patterns) {
+            Ok(compiled) => compiled,
             Err(error) => {
-                warn_skipped_custom_dlp_pattern("custom DLP", index, error);
+                warn_incomplete_custom_redaction("custom DLP", &error);
+                Self {
+                    patterns: Vec::new(),
+                    incomplete: Some(error),
+                }
             }
         }
     }
-    result
+
+    /// Checked constructor for callers that need the typed incomplete reason.
+    pub fn try_new(raw_patterns: &[String]) -> Result<Self, RedactionIncomplete> {
+        Ok(Self {
+            patterns: compile_custom_dlp_patterns(raw_patterns)?,
+            incomplete: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatchInterval {
+    start: usize,
+    end: usize,
+}
+
+/// Apply every regex to the SAME input, merge overlapping byte intervals, then
+/// render exactly once. Replacement text can therefore never become input to a
+/// later policy regex.
+fn apply_custom_patterns_once(
+    input: &str,
+    patterns: &[Regex],
+    replacement: &str,
+) -> Result<(String, usize), RedactionIncomplete> {
+    let mut intervals = Vec::new();
+    for (index, regex) in patterns.iter().enumerate() {
+        for matched in regex.find_iter(input) {
+            if matched.start() == matched.end() {
+                return Err(RedactionIncomplete::PatternRejected {
+                    index,
+                    error: CustomDlpPatternError::ZeroWidthMatch,
+                });
+            }
+            if intervals.len() == MAX_CUSTOM_DLP_MATCHES {
+                return Err(RedactionIncomplete::MatchLimitExceeded {
+                    actual_at_least: MAX_CUSTOM_DLP_MATCHES + 1,
+                    max: MAX_CUSTOM_DLP_MATCHES,
+                });
+            }
+            intervals.push(MatchInterval {
+                start: matched.start(),
+                end: matched.end(),
+            });
+        }
+    }
+
+    if intervals.is_empty() {
+        return Ok((input.to_string(), 0));
+    }
+
+    intervals.sort_unstable_by_key(|interval| (interval.start, interval.end));
+    let mut merged: Vec<MatchInterval> = Vec::with_capacity(intervals.len());
+    for interval in intervals {
+        if let Some(last) = merged.last_mut() {
+            if interval.start < last.end {
+                last.end = last.end.max(interval.end);
+                continue;
+            }
+        }
+        merged.push(interval);
+    }
+
+    let removed_bytes: usize = merged.iter().map(|m| m.end - m.start).sum();
+    let replacement_bytes = replacement.len().saturating_mul(merged.len());
+    let projected_bytes = input
+        .len()
+        .saturating_sub(removed_bytes)
+        .saturating_add(replacement_bytes);
+    let overhead = projected_bytes.saturating_sub(input.len());
+    if overhead > MAX_CUSTOM_DLP_OUTPUT_OVERHEAD_BYTES {
+        return Err(RedactionIncomplete::OutputOverheadExceeded {
+            actual_bytes: overhead,
+            max_bytes: MAX_CUSTOM_DLP_OUTPUT_OVERHEAD_BYTES,
+        });
+    }
+
+    let mut output = String::with_capacity(projected_bytes);
+    let mut cursor = 0;
+    for interval in &merged {
+        output.push_str(&input[cursor..interval.start]);
+        output.push_str(replacement);
+        cursor = interval.end;
+    }
+    output.push_str(&input[cursor..]);
+    Ok((output, merged.len()))
+}
+
+/// Checked redaction using built-in and policy-provided custom patterns.
+pub fn try_redact_with_custom(
+    input: &str,
+    custom_patterns: &[String],
+) -> Result<String, RedactionIncomplete> {
+    let compiled = CompiledCustomPatterns::try_new(custom_patterns)?;
+    try_redact_with_compiled(input, &compiled)
+}
+
+/// Redact using both built-in and custom patterns from policy. Any incomplete
+/// policy plan fails closed by replacing the entire value.
+pub fn redact_with_custom(input: &str, custom_patterns: &[String]) -> String {
+    match try_redact_with_custom(input, custom_patterns) {
+        Ok(redacted) => redacted,
+        Err(error) => {
+            warn_incomplete_custom_redaction("custom DLP", &error);
+            INCOMPLETE_REDACTION_MARKER.to_string()
+        }
+    }
+}
+
+/// Checked redaction using built-in + pre-compiled custom patterns.
+pub fn try_redact_with_compiled(
+    input: &str,
+    compiled: &CompiledCustomPatterns,
+) -> Result<String, RedactionIncomplete> {
+    if let Some(error) = &compiled.incomplete {
+        return Err(error.clone());
+    }
+    let (custom_redacted, _) =
+        apply_custom_patterns_once(input, &compiled.patterns, CUSTOM_REDACTION_MARKER)?;
+    Ok(redact(&custom_redacted))
 }
 
 /// Redact using built-in + pre-compiled custom patterns (no per-call recompile).
+/// An incomplete compiled set fails closed for the whole value.
 pub fn redact_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> String {
-    let mut result = redact(input);
-    for re in &compiled.patterns {
-        result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
+    match try_redact_with_compiled(input, compiled) {
+        Ok(redacted) => redacted,
+        Err(_) => INCOMPLETE_REDACTION_MARKER.to_string(),
     }
-    result
 }
 
 /// Stable snake_case label for a built-in pattern (consumed by `--json` and the
@@ -441,8 +640,31 @@ pub fn redact_for_audience_with_custom(
     audience: ShareAudience,
     customer_id_patterns: &[String],
 ) -> RedactReport {
+    match try_redact_for_audience_with_custom(input, audience, customer_id_patterns) {
+        Ok(report) => report,
+        Err(error) => {
+            warn_incomplete_custom_redaction("customer_id", &error);
+            RedactReport {
+                redacted_content: INCOMPLETE_REDACTION_MARKER.to_string(),
+                redactions: vec![RedactionCount {
+                    label: "redaction_incomplete".to_string(),
+                    count: 1,
+                }],
+            }
+        }
+    }
+}
+
+/// Checked audience-aware redaction. A rejected or over-budget customer-ID
+/// pattern set returns a typed incomplete outcome without exposing partial text.
+pub fn try_redact_for_audience_with_custom(
+    input: &str,
+    audience: ShareAudience,
+    customer_id_patterns: &[String],
+) -> Result<RedactReport, RedactionIncomplete> {
     use std::collections::HashMap;
 
+    let customer_id_patterns = CompiledCustomPatterns::try_new(customer_id_patterns)?;
     let mut counts: HashMap<String, usize> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let bump =
@@ -456,9 +678,16 @@ pub fn redact_for_audience_with_custom(
             *counts.entry(label.to_string()).or_insert(0) += n;
         };
 
-    let mut result = input.to_string();
+    // 1. Policy-provided customer IDs are planned over the ORIGINAL input and
+    // rendered once. Later built-in/static replacements can never become input
+    // to an operator regex.
+    let (mut result, customer_id_matches) = apply_custom_patterns_once(
+        input,
+        &customer_id_patterns.patterns,
+        CUSTOMER_ID_REDACTION_MARKER,
+    )?;
 
-    // 1. Credential patterns first — ahead of built-ins so a built-in's labeled
+    // 2. Credential patterns — ahead of built-ins so a built-in's labeled
     //    output doesn't shadow a credential match.
     for entry in CREDENTIAL_REDACT_PATTERNS.iter() {
         let matches = entry.regex.find_iter(&result).count();
@@ -476,7 +705,7 @@ pub fn redact_for_audience_with_custom(
         }
     }
 
-    // 2. Built-in patterns (every audience) — long-tail providers not in
+    // 3. Built-in patterns (every audience) — long-tail providers not in
     //    credential_patterns.toml.
     for (idx, (label, regex)) in BUILTIN_PATTERNS.iter().enumerate() {
         let matches = regex.find_iter(&result).count();
@@ -488,23 +717,10 @@ pub fn redact_for_audience_with_custom(
         }
     }
 
-    // 3. Customer-ID patterns from policy (labeled `customer_id`, aggregated).
-    for (index, pat_str) in customer_id_patterns.iter().enumerate() {
-        match compile_custom_dlp_pattern(pat_str) {
-            Ok(re) => {
-                let matches = re.find_iter(&result).count();
-                if matches > 0 {
-                    result = re
-                        .replace_all(&result, "[REDACTED:customer_id]")
-                        .into_owned();
-                    bump("customer_id", matches, &mut counts, &mut order);
-                }
-            }
-            Err(error) => {
-                warn_skipped_custom_dlp_pattern("customer_id", index, error);
-            }
-        }
-    }
+    // Preserve the stable report ordering from the prior implementation even
+    // though the one-pass customer replacement itself must run on original
+    // input before any generated marker exists.
+    bump("customer_id", customer_id_matches, &mut counts, &mut order);
 
     // 4. Share patterns (audience-filtered).
     let token = audience.toml_token();
@@ -538,10 +754,10 @@ pub fn redact_for_audience_with_custom(
         })
         .collect();
 
-    RedactReport {
+    Ok(RedactReport {
         redacted_content: result,
         redactions,
-    }
+    })
 }
 
 /// Redact RFC1918 private IPv4 in hostname context. Returns `(new, n)`.
@@ -679,8 +895,13 @@ pub fn redact_shell_assignments(input: &str) -> String {
 /// Redact a command-like string for public output by scrubbing assignment values
 /// first, then applying built-in and custom DLP patterns.
 pub fn redact_command_text(input: &str, custom_patterns: &[String]) -> String {
+    let compiled = CompiledCustomPatterns::new(custom_patterns);
+    redact_command_text_with_compiled(input, &compiled)
+}
+
+fn redact_command_text_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> String {
     let scrubbed = redact_shell_assignments(input);
-    redact_with_custom(&scrubbed, custom_patterns)
+    redact_with_compiled(&scrubbed, compiled)
 }
 
 /// Return a redacted clone of the provided findings for public-facing output.
@@ -695,53 +916,110 @@ pub fn redacted_findings(
 
 /// Redact sensitive content from a Finding's string fields in-place.
 pub fn redact_finding(finding: &mut crate::verdict::Finding, custom_patterns: &[String]) {
-    finding.title = redact_with_custom(&finding.title, custom_patterns);
-    finding.description = redact_with_custom(&finding.description, custom_patterns);
+    let compiled = CompiledCustomPatterns::new(custom_patterns);
+    redact_finding_with_compiled(finding, &compiled);
+}
+
+fn redact_finding_with_compiled(
+    finding: &mut crate::verdict::Finding,
+    compiled: &CompiledCustomPatterns,
+) {
+    finding.title = redact_with_compiled(&finding.title, compiled);
+    finding.description = redact_with_compiled(&finding.description, compiled);
     if let Some(ref mut v) = finding.human_view {
-        *v = redact_with_custom(v, custom_patterns);
+        *v = redact_with_compiled(v, compiled);
     }
     if let Some(ref mut v) = finding.agent_view {
-        *v = redact_with_custom(v, custom_patterns);
+        *v = redact_with_compiled(v, compiled);
     }
     for ev in &mut finding.evidence {
-        redact_evidence(ev, custom_patterns);
+        redact_evidence(ev, compiled);
     }
 }
 
-fn redact_evidence(ev: &mut crate::verdict::Evidence, custom_patterns: &[String]) {
+fn redact_evidence(ev: &mut crate::verdict::Evidence, compiled: &CompiledCustomPatterns) {
     use crate::verdict::Evidence;
     match ev {
         Evidence::Url { raw } => {
-            *raw = redact_with_custom(raw, custom_patterns);
+            *raw = redact_with_compiled(raw, compiled);
         }
-        Evidence::CommandPattern { matched, .. } => {
-            *matched = redact_command_text(matched, custom_patterns);
+        Evidence::HostComparison {
+            raw_host,
+            similar_to,
+        } => {
+            *raw_host = redact_with_compiled(raw_host, compiled);
+            *similar_to = redact_with_compiled(similar_to, compiled);
         }
-        Evidence::EnvVar { value_preview, .. } => {
-            *value_preview = redact_with_custom(value_preview, custom_patterns);
+        Evidence::CommandPattern { pattern, matched } => {
+            *pattern = redact_with_compiled(pattern, compiled);
+            *matched = redact_command_text_with_compiled(matched, compiled);
+        }
+        Evidence::ByteSequence {
+            offset: _,
+            hex,
+            description,
+        } => {
+            *hex = redact_with_compiled(hex, compiled);
+            *description = redact_with_compiled(description, compiled);
+        }
+        Evidence::EnvVar {
+            name,
+            value_preview,
+        } => {
+            *name = redact_with_compiled(name, compiled);
+            *value_preview = redact_with_compiled(value_preview, compiled);
         }
         Evidence::Text { detail } => {
-            *detail = redact_command_text(detail, custom_patterns);
+            *detail = redact_command_text_with_compiled(detail, compiled);
         }
-        Evidence::ByteSequence { description, .. } => {
-            *description = redact_with_custom(description, custom_patterns);
+        Evidence::ThreatIntel {
+            source,
+            threat_type,
+            confidence: _,
+            reference,
+        } => {
+            *source = redact_with_compiled(source, compiled);
+            *threat_type = redact_with_compiled(threat_type, compiled);
+            if let Some(reference) = reference {
+                *reference = redact_with_compiled(reference, compiled);
+            }
         }
-        // HostComparison / HomoglyphAnalysis hold no user content — skip.
-        _ => {}
+        Evidence::HomoglyphAnalysis {
+            raw,
+            escaped,
+            suspicious_chars,
+        } => {
+            *raw = redact_with_compiled(raw, compiled);
+            *escaped = redact_with_compiled(escaped, compiled);
+            for suspicious in suspicious_chars {
+                let character = suspicious.character.to_string();
+                if redact_with_compiled(&character, compiled) != character {
+                    // `character` serializes as a one-character string. It
+                    // cannot hold a multi-character secret, but a one-character
+                    // custom DLP rule must still not leak through this field.
+                    suspicious.character = '\u{FFFD}';
+                }
+                suspicious.codepoint = redact_with_compiled(&suspicious.codepoint, compiled);
+                suspicious.description = redact_with_compiled(&suspicious.description, compiled);
+                suspicious.hex_bytes = redact_with_compiled(&suspicious.hex_bytes, compiled);
+            }
+        }
     }
 }
 
 /// Redact all findings in a verdict in-place.
 pub fn redact_verdict(verdict: &mut crate::verdict::Verdict, custom_patterns: &[String]) {
+    let compiled = CompiledCustomPatterns::new(custom_patterns);
     for f in &mut verdict.findings {
-        redact_finding(f, custom_patterns);
+        redact_finding_with_compiled(f, &compiled);
     }
 }
 
 /// Redact all findings in a slice in-place.
 pub fn redact_findings(findings: &mut [crate::verdict::Finding], custom_patterns: &[String]) {
+    let compiled = CompiledCustomPatterns::new(custom_patterns);
     for f in findings.iter_mut() {
-        redact_finding(f, custom_patterns);
+        redact_finding_with_compiled(f, &compiled);
     }
 }
 
@@ -937,20 +1215,155 @@ mod tests {
         assert!(redact_with_compiled(input, &compiled).contains("[REDACTED:custom]"));
 
         let over_limit = "z".repeat(MAX_CUSTOM_DLP_PATTERN_BYTES + 1);
+        assert!(matches!(
+            try_redact_with_custom(&over_limit, std::slice::from_ref(&over_limit)),
+            Err(RedactionIncomplete::PatternRejected {
+                index: 0,
+                error: CustomDlpPatternError::TooLong { .. },
+            })
+        ));
         assert_eq!(
             redact_with_custom(&over_limit, std::slice::from_ref(&over_limit)),
-            over_limit
+            INCOMPLETE_REDACTION_MARKER
         );
         let compiled = CompiledCustomPatterns::new(std::slice::from_ref(&over_limit));
-        assert_eq!(redact_with_compiled(&over_limit, &compiled), over_limit);
+        assert!(matches!(
+            try_redact_with_compiled(&over_limit, &compiled),
+            Err(RedactionIncomplete::PatternRejected {
+                index: 0,
+                error: CustomDlpPatternError::TooLong { .. },
+            })
+        ));
+        assert_eq!(
+            redact_with_compiled(&over_limit, &compiled),
+            INCOMPLETE_REDACTION_MARKER
+        );
 
+        assert!(matches!(
+            try_redact_for_audience_with_custom(
+                &over_limit,
+                ShareAudience::Slack,
+                std::slice::from_ref(&over_limit),
+            ),
+            Err(RedactionIncomplete::PatternRejected {
+                index: 0,
+                error: CustomDlpPatternError::TooLong { .. },
+            })
+        ));
         let report = redact_for_audience_with_custom(
             &over_limit,
             ShareAudience::Slack,
             std::slice::from_ref(&over_limit),
         );
-        assert_eq!(report.redacted_content, over_limit);
-        assert!(report.redactions.iter().all(|r| r.label != "customer_id"));
+        assert_eq!(report.redacted_content, INCOMPLETE_REDACTION_MARKER);
+        assert_eq!(report.redactions.len(), 1);
+        assert_eq!(report.redactions[0].label, "redaction_incomplete");
+    }
+
+    #[test]
+    fn custom_dlp_rejects_zero_width_patterns_and_fails_closed() {
+        for pattern in ["", r"\b", "a*"] {
+            assert!(matches!(
+                compile_custom_dlp_pattern(pattern),
+                Err(CustomDlpPatternError::ZeroWidthMatch)
+            ));
+            let patterns = vec![pattern.to_string()];
+            assert!(matches!(
+                try_redact_with_custom("top secret", &patterns),
+                Err(RedactionIncomplete::PatternRejected {
+                    index: 0,
+                    error: CustomDlpPatternError::ZeroWidthMatch,
+                })
+            ));
+            assert_eq!(
+                redact_with_custom("top secret", &patterns),
+                INCOMPLETE_REDACTION_MARKER
+            );
+        }
+    }
+
+    #[test]
+    fn custom_dlp_one_pass_merges_overlaps_without_replacement_amplification() {
+        let forward = vec!["A".to_string(), ".".to_string()];
+        let reverse = vec![".".to_string(), "A".to_string()];
+
+        assert_eq!(redact_with_custom("A", &forward), CUSTOM_REDACTION_MARKER);
+        assert_eq!(redact_with_custom("A", &reverse), CUSTOM_REDACTION_MARKER);
+
+        let built_in_secret = "AKIAIOSFODNN7EXAMPLE";
+        let inserted_marker_pattern = vec!["REDACTED".to_string()];
+        assert_eq!(
+            redact_with_custom(built_in_secret, &inserted_marker_pattern),
+            "[REDACTED:AWS Access Key]",
+            "custom patterns must only see original input, not built-in replacement text"
+        );
+
+        let input = "前TOKEN-秘密後";
+        let overlaps = vec!["TOKEN-秘密".to_string(), "秘密後".to_string()];
+        let reversed = overlaps.iter().rev().cloned().collect::<Vec<_>>();
+        let expected = format!("前{CUSTOM_REDACTION_MARKER}");
+        assert_eq!(redact_with_custom(input, &overlaps), expected);
+        assert_eq!(redact_with_custom(input, &reversed), expected);
+    }
+
+    #[test]
+    fn custom_dlp_pattern_match_and_output_budgets_have_legitimate_boundaries() {
+        let at_pattern_limit = vec!["never-match".to_string(); MAX_CUSTOM_DLP_PATTERNS];
+        assert_eq!(
+            try_redact_with_custom("legitimate café 東京", &at_pattern_limit).unwrap(),
+            "legitimate café 東京"
+        );
+        let over_pattern_limit = vec!["never-match".to_string(); MAX_CUSTOM_DLP_PATTERNS + 1];
+        assert!(matches!(
+            try_redact_with_custom("secret", &over_pattern_limit),
+            Err(RedactionIncomplete::PatternLimitExceeded {
+                actual,
+                max: MAX_CUSTOM_DLP_PATTERNS,
+            }) if actual == MAX_CUSTOM_DLP_PATTERNS + 1
+        ));
+        assert_eq!(
+            redact_with_custom("secret", &over_pattern_limit),
+            INCOMPLETE_REDACTION_MARKER
+        );
+
+        let long_token = "01234567890123456789";
+        let at_match_limit = long_token.repeat(MAX_CUSTOM_DLP_MATCHES);
+        let one_pattern = vec![long_token.to_string()];
+        let redacted = try_redact_with_custom(&at_match_limit, &one_pattern).unwrap();
+        assert_eq!(
+            redacted.matches(CUSTOM_REDACTION_MARKER).count(),
+            MAX_CUSTOM_DLP_MATCHES
+        );
+        let over_match_limit = long_token.repeat(MAX_CUSTOM_DLP_MATCHES + 1);
+        assert!(matches!(
+            try_redact_with_custom(&over_match_limit, &one_pattern),
+            Err(RedactionIncomplete::MatchLimitExceeded {
+                actual_at_least,
+                max: MAX_CUSTOM_DLP_MATCHES,
+            }) if actual_at_least == MAX_CUSTOM_DLP_MATCHES + 1
+        ));
+        assert_eq!(
+            redact_with_custom(&over_match_limit, &one_pattern),
+            INCOMPLETE_REDACTION_MARKER
+        );
+
+        let overhead_per_match = CUSTOM_REDACTION_MARKER.len() - 1;
+        assert_eq!(MAX_CUSTOM_DLP_OUTPUT_OVERHEAD_BYTES % overhead_per_match, 0);
+        let at_overhead_limit =
+            "x".repeat(MAX_CUSTOM_DLP_OUTPUT_OVERHEAD_BYTES / overhead_per_match);
+        assert!(try_redact_with_custom(&at_overhead_limit, &["x".into()]).is_ok());
+        let over_overhead_limit = format!("{at_overhead_limit}x");
+        assert!(matches!(
+            try_redact_with_custom(&over_overhead_limit, &["x".into()]),
+            Err(RedactionIncomplete::OutputOverheadExceeded {
+                max_bytes: MAX_CUSTOM_DLP_OUTPUT_OVERHEAD_BYTES,
+                ..
+            })
+        ));
+        assert_eq!(
+            redact_with_custom(&over_overhead_limit, &["x".into()]),
+            INCOMPLETE_REDACTION_MARKER
+        );
     }
 
     #[test]
@@ -1028,6 +1441,85 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("[REDACTED:AWS Access Key]"));
+    }
+
+    #[test]
+    fn redact_finding_covers_every_string_bearing_evidence_variant() {
+        use crate::threatdb::Confidence;
+        use crate::verdict::{Evidence, Finding, RuleId, Severity, SuspiciousChar};
+
+        const SENTINEL: &str = "SENTINEL_SECRET";
+        let tagged = |label: &str| format!("{label}-{SENTINEL}");
+        let mut finding = Finding {
+            rule_id: RuleId::SensitiveEnvExport,
+            severity: Severity::High,
+            title: "evidence coverage".into(),
+            description: "all variants".into(),
+            evidence: vec![
+                Evidence::Url { raw: tagged("url") },
+                Evidence::HostComparison {
+                    raw_host: tagged("raw-host"),
+                    similar_to: tagged("similar-to"),
+                },
+                Evidence::CommandPattern {
+                    pattern: tagged("pattern"),
+                    matched: format!("TOKEN={SENTINEL}"),
+                },
+                Evidence::ByteSequence {
+                    offset: 7,
+                    hex: tagged("hex"),
+                    description: tagged("byte-description"),
+                },
+                Evidence::EnvVar {
+                    name: tagged("env-name"),
+                    value_preview: tagged("env-preview"),
+                },
+                Evidence::Text {
+                    detail: tagged("text"),
+                },
+                Evidence::ThreatIntel {
+                    source: tagged("source"),
+                    threat_type: tagged("threat-type"),
+                    confidence: Confidence::Confirmed,
+                    reference: Some(tagged("reference")),
+                },
+                Evidence::HomoglyphAnalysis {
+                    raw: tagged("homoglyph-raw"),
+                    escaped: tagged("homoglyph-escaped"),
+                    suspicious_chars: vec![SuspiciousChar {
+                        offset: 0,
+                        character: 'S',
+                        codepoint: tagged("codepoint"),
+                        description: tagged("char-description"),
+                        hex_bytes: tagged("hex-bytes"),
+                    }],
+                },
+            ],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let patterns = vec![regex::escape(SENTINEL), "^S$".to_string()];
+
+        redact_finding(&mut finding, &patterns);
+
+        let serialized = serde_json::to_string(&finding.evidence).unwrap();
+        assert!(
+            !serialized.contains(SENTINEL),
+            "no Evidence string field may retain the sentinel: {serialized}"
+        );
+        assert_eq!(
+            finding.evidence.len(),
+            8,
+            "fixture must cover every variant"
+        );
+        match &finding.evidence[7] {
+            Evidence::HomoglyphAnalysis {
+                suspicious_chars, ..
+            } => assert_eq!(suspicious_chars[0].character, '\u{FFFD}'),
+            _ => panic!("expected HomoglyphAnalysis"),
+        }
     }
 
     #[test]
