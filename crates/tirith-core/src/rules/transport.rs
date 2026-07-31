@@ -152,30 +152,41 @@ struct CurlShortOptionScan {
     consumes_next: bool,
 }
 
+// curl's documented short options are partitioned by whether they consume a
+// value. Only options in these lists are valid cluster members. Source: the
+// curl online man page's current option table (https://curl.se/docs/manpage.html).
+const CURL_BOOLEAN_SHORT_OPTIONS: &[char] = &[
+    '#', '0', '1', '2', '3', '4', '6', ':', 'B', 'G', 'I', 'J', 'L', 'M', 'N', 'O', 'R', 'S', 'V',
+    'Z', 'a', 'f', 'g', 'i', 'j', 'k', 'l', 'n', 'p', 'q', 's', 'v',
+];
+
+const CURL_VALUE_SHORT_OPTIONS: &[char] = &[
+    'A', 'b', 'c', 'C', 'd', 'D', 'e', 'E', 'F', 'H', 'h', 'K', 'm', 'o', 'P', 'Q', 'r', 't', 'T',
+    'u', 'U', 'w', 'x', 'X', 'y', 'Y', 'z',
+];
+
 fn scan_curl_short_options(argument: &str) -> CurlShortOptionScan {
     if !argument.starts_with('-') || argument.starts_with("--") || argument.len() < 2 {
         return CurlShortOptionScan::default();
     }
 
-    // curl short options whose next bytes are the option's attached value. The
-    // list follows curl's documented single-letter options; stopping here keeps
-    // `-ok` (output file named `k`) distinct from the boolean cluster `-skL`.
-    const TAKES_VALUE: &[char] = &[
-        'A', 'b', 'c', 'C', 'd', 'D', 'e', 'E', 'F', 'H', 'h', 'K', 'm', 'o', 'P', 'Q', 'r', 't',
-        'T', 'u', 'U', 'w', 'x', 'X', 'y', 'Y', 'z',
-    ];
-
     let mut scan = CurlShortOptionScan::default();
     let mut options = argument[1..].chars().peekable();
     while let Some(option) = options.next() {
-        if option == 'k' {
-            scan.enables_insecure = true;
+        if CURL_BOOLEAN_SHORT_OPTIONS.contains(&option) {
+            scan.enables_insecure |= option == 'k';
             continue;
         }
-        if TAKES_VALUE.contains(&option) {
+        if CURL_VALUE_SHORT_OPTIONS.contains(&option) {
+            // Any remaining bytes are this option's attached value, not more
+            // options. Without an attached value, the next argv item is data.
             scan.consumes_next = options.peek().is_none();
             break;
         }
+
+        // curl rejects unknown short options. Discard any earlier `-k` from
+        // this invalid cluster because curl would fail before making a request.
+        return CurlShortOptionScan::default();
     }
     scan
 }
@@ -219,12 +230,77 @@ mod tests {
     }
 
     #[test]
+    fn curl_insecure_is_detected_around_every_boolean_short_option() {
+        for option in CURL_BOOLEAN_SHORT_OPTIONS {
+            for cluster in [format!("-{option}k"), format!("-k{option}")] {
+                let findings = check_insecure_flags("curl", &[cluster.clone()], true);
+                assert_eq!(
+                    findings.len(),
+                    1,
+                    "documented boolean cluster should enable -k: {cluster}"
+                );
+                assert_eq!(findings[0].rule_id, RuleId::InsecureTlsFlags);
+                assert_eq!(findings[0].severity, Severity::High);
+            }
+        }
+    }
+
+    #[test]
+    fn curl_unknown_short_options_invalidate_the_entire_cluster() {
+        for unknown in ['W', '!', '@', '='] {
+            for argument in [
+                format!("-{unknown}k"),
+                format!("-k{unknown}"),
+                format!("-s{unknown}k"),
+                format!("-ks{unknown}"),
+            ] {
+                let findings = check_insecure_flags("curl", &[argument.clone()], true);
+                assert!(
+                    findings.is_empty(),
+                    "invalid curl cluster must not elevate: {argument}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn curl_attached_values_are_not_reparsed_as_short_options() {
         for argument in ["-ok", "-Ask", "-dkey=k", "-Xk", "-Kconfig-k", "-Hk"] {
             let findings = check_insecure_flags("curl", &[argument.to_string()], true);
             assert!(
                 findings.is_empty(),
                 "attached value must not be parsed as a -k flag: {argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_curl_value_short_option_stops_cluster_parsing() {
+        for option in CURL_VALUE_SHORT_OPTIONS {
+            let attached_k_value = format!("-{option}k");
+            assert!(
+                check_insecure_flags("curl", &[attached_k_value.clone()], true).is_empty(),
+                "attached value must not be reparsed as -k: {attached_k_value}"
+            );
+
+            let separate_value = vec![format!("-{option}"), "-k".to_string()];
+            assert!(
+                check_insecure_flags("curl", &separate_value, true).is_empty(),
+                "separate value must not be reparsed as -k: {separate_value:?}"
+            );
+
+            let attached_value_then_insecure = vec![format!("-{option}value"), "-k".to_string()];
+            assert_eq!(
+                check_insecure_flags("curl", &attached_value_then_insecure, true).len(),
+                1,
+                "an attached value must leave the following -k active: {attached_value_then_insecure:?}"
+            );
+
+            let insecure_before_value = vec![format!("-k{option}"), "-k".to_string()];
+            assert_eq!(
+                check_insecure_flags("curl", &insecure_before_value, true).len(),
+                1,
+                "-k before a value option must be detected while its next argv remains data: {insecure_before_value:?}"
             );
         }
     }
