@@ -588,13 +588,33 @@ pub fn command_line_for(plan: &WindowsLaunchPlan) -> String {
     parts.join(" ")
 }
 
+/// Assemble a CRT-compatible Windows command line from an explicitly selected
+/// application path and argument vector. Shared by the AppContainer launcher and
+/// host-platform tests. Windows execution uses [`command_line_wide_from_parts`]
+/// so native values are never narrowed to UTF-8.
+pub fn command_line_from_parts(program: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(quote_arg_for_command_line(program));
+    for a in args {
+        parts.push(quote_arg_for_command_line(a));
+    }
+    parts.join(" ")
+}
+
 /// Assemble the exact native UTF-16 `lpCommandLine` buffer, excluding the final
 /// NUL terminator. Unlike [`command_line_for`], this never performs a lossy text
 /// conversion on Windows and therefore preserves unpaired surrogate code units.
 pub fn command_line_wide_for(plan: &WindowsLaunchPlan) -> Vec<u16> {
+    command_line_wide_from_parts(&plan.program, &plan.program_args)
+}
+
+/// Assemble the exact native UTF-16 command line for an arbitrary executable
+/// and argv. This is the shared execution boundary for AppContainer and trusted
+/// child launches; unpaired surrogate code units remain byte-for-byte native.
+pub fn command_line_wide_from_parts(program: &OsStr, args: &[OsString]) -> Vec<u16> {
     let mut out = Vec::new();
-    for (index, arg) in std::iter::once(&plan.program)
-        .chain(plan.program_args.iter())
+    for (index, arg) in std::iter::once(program)
+        .chain(args.iter().map(OsString::as_os_str))
         .enumerate()
     {
         if index != 0 {

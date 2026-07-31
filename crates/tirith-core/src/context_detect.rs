@@ -471,9 +471,23 @@ fn run_with_timeout(program: &str, args: &[&str]) -> Result<ShellOutOutput, Cont
         ShellTimeoutOutcome::NotFound => Err(ContextDetectFailure::NotConfigured),
         ShellTimeoutOutcome::SpawnError(reason) => Err(ContextDetectFailure::Io(reason)),
         ShellTimeoutOutcome::WaitError(reason) => Err(ContextDetectFailure::Io(reason)),
-        ShellTimeoutOutcome::Timeout => Err(ContextDetectFailure::Timeout),
-        ShellTimeoutOutcome::OutputLimitExceeded => Err(ContextDetectFailure::Io(
+        ShellTimeoutOutcome::Timeout {
+            cleanup_succeeded: true,
+        } => Err(ContextDetectFailure::Timeout),
+        ShellTimeoutOutcome::Timeout {
+            cleanup_succeeded: false,
+        } => Err(ContextDetectFailure::Io(
+            "context helper timed out and process-tree cleanup failed".to_string(),
+        )),
+        ShellTimeoutOutcome::OutputLimitExceeded {
+            cleanup_succeeded: true,
+        } => Err(ContextDetectFailure::Io(
             "context helper output exceeded the capture limit".to_string(),
+        )),
+        ShellTimeoutOutcome::OutputLimitExceeded {
+            cleanup_succeeded: false,
+        } => Err(ContextDetectFailure::Io(
+            "context helper exceeded the capture limit and process-tree cleanup failed".to_string(),
         )),
     }
 }

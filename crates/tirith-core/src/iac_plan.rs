@@ -461,6 +461,13 @@ fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, 
         }
     };
 
+    #[cfg(windows)]
+    let plan_path_string = plan_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve plan path {}: {error}", plan_path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(windows))]
     let plan_path_string = plan_path.to_string_lossy().into_owned();
     // The supervisor drains and caps stderr independently from the plan JSON.
     let executable =
@@ -502,13 +509,27 @@ fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, 
         ShellTimeoutOutcome::NotFound => Err(format!("{program}: binary not found on PATH")),
         ShellTimeoutOutcome::SpawnError(reason) => Err(reason),
         ShellTimeoutOutcome::WaitError(reason) => Err(reason),
-        ShellTimeoutOutcome::Timeout => Err(format!(
+        ShellTimeoutOutcome::Timeout {
+            cleanup_succeeded: true,
+        } => Err(format!(
             "{program} show -json exceeded {}s timeout",
             TERRAFORM_SHOW_TIMEOUT.as_secs()
         )),
-        ShellTimeoutOutcome::OutputLimitExceeded => Err(format!(
+        ShellTimeoutOutcome::Timeout {
+            cleanup_succeeded: false,
+        } => Err(format!(
+            "{program} show -json timed out and process-tree cleanup failed"
+        )),
+        ShellTimeoutOutcome::OutputLimitExceeded {
+            cleanup_succeeded: true,
+        } => Err(format!(
             "{program} show -json exceeded the {} byte output cap",
             MAX_PLAN_SIZE_BYTES
+        )),
+        ShellTimeoutOutcome::OutputLimitExceeded {
+            cleanup_succeeded: false,
+        } => Err(format!(
+            "{program} show -json exceeded its output cap and process-tree cleanup failed"
         )),
     }
 }

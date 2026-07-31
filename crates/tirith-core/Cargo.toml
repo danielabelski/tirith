@@ -105,6 +105,25 @@ jsonschema = { version = "0.46", default-features = false }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# The trusted-child boundary needs raw Windows APIs in core: ACL/owner inspection,
+# offline Authenticode verification, exact inherited-handle process creation, and
+# suspended Job Object assignment. `windows-sys` is already in the workspace's
+# resolved dependency graph; the explicit feature set is limited to those calls.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 # Linux runtime-containment capsule backend (Stack E2). Landlock = unprivileged
 # filesystem (and, on ABI v4 / Linux 6.7, port-level network) access control;
 # extrasafe = an ergonomic seccomp-BPF policy builder (wraps seccompiler). Both

@@ -1,12 +1,13 @@
 #![cfg(unix)]
 
 use std::ffi::OsStr;
+use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tirith_core::trusted_child::{
-    run, CaptureStream, ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable,
+    run, sanitized_path, CaptureStream, ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable,
 };
 
 fn make_executable(path: &Path, body: &str) {
@@ -33,6 +34,46 @@ fn trusted_lookup_rejects_a_denied_first_path_hit() {
 
     let error = TrustedExecutable::resolve_on_path("probe", &path, &[denied]).unwrap_err();
     assert!(error.to_string().contains("untrusted"));
+}
+
+#[test]
+fn trusted_lookup_rejects_a_denied_symlink_to_a_system_tool() {
+    let temp = tempfile::tempdir().unwrap();
+    let denied = temp.path().join("repo-bin");
+    std::fs::create_dir(&denied).unwrap();
+    symlink("/bin/sh", denied.join("probe")).unwrap();
+    let path = std::env::join_paths([&denied]).unwrap();
+
+    let error = TrustedExecutable::resolve_on_path("probe", &path, &[denied]).unwrap_err();
+    assert!(error.to_string().contains("untrusted"));
+}
+
+#[test]
+fn sanitized_path_rejects_a_denied_symlink_to_a_system_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let denied = temp.path().join("repo-bin");
+    std::fs::create_dir(&denied).unwrap();
+    let linked = denied.join("system-tools");
+    symlink("/usr/bin", &linked).unwrap();
+    let path = std::env::join_paths([&linked]).unwrap();
+
+    assert!(sanitized_path(&path, &[denied]).is_empty());
+}
+
+#[test]
+fn denied_origin_cannot_be_hidden_with_parent_components() {
+    let temp = tempfile::tempdir().unwrap();
+    let safe = temp.path().join("safe");
+    let denied = temp.path().join("repo-bin");
+    std::fs::create_dir(&safe).unwrap();
+    std::fs::create_dir(&denied).unwrap();
+    make_executable(&denied.join("probe"), "#!/bin/sh\nexit 0\n");
+    let traversal = safe.join("..").join("repo-bin");
+    let path = std::env::join_paths([&traversal]).unwrap();
+
+    let error = TrustedExecutable::resolve_on_path("probe", &path, &[denied.clone()]).unwrap_err();
+    assert!(error.to_string().contains("untrusted"));
+    assert!(sanitized_path(&path, &[denied]).is_empty());
 }
 
 #[test]

@@ -282,10 +282,20 @@ fn run_cli_with(
         }),
         ChildOutcome::SpawnError(reason) => Err(format!("failed to start: {reason}")),
         ChildOutcome::WaitError(reason) => Err(format!("wait failed: {reason}")),
-        ChildOutcome::Timeout { .. } => Err("timed out after 30s — check installation".into()),
-        ChildOutcome::OutputLimitExceeded { .. } => {
-            Err("output limit exceeded — check installation".into())
-        }
+        ChildOutcome::Timeout {
+            cleanup_succeeded: true,
+        } => Err("timed out after 30s — check installation".into()),
+        ChildOutcome::Timeout {
+            cleanup_succeeded: false,
+        } => Err("timed out and process-tree cleanup failed — check installation".into()),
+        ChildOutcome::OutputLimitExceeded {
+            cleanup_succeeded: true,
+            ..
+        } => Err("output limit exceeded — check installation".into()),
+        ChildOutcome::OutputLimitExceeded {
+            cleanup_succeeded: false,
+            ..
+        } => Err("output limit exceeded and process-tree cleanup failed".into()),
     }
 }
 

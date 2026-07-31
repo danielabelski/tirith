@@ -452,9 +452,9 @@ pub enum ShellTimeoutOutcome {
     /// `try_wait()` errored after spawn succeeded.
     WaitError(String),
     /// Deadline elapsed; the child was killed and reaped.
-    Timeout,
+    Timeout { cleanup_succeeded: bool },
     /// Captured output exceeded the caller's explicit bound.
-    OutputLimitExceeded,
+    OutputLimitExceeded { cleanup_succeeded: bool },
 }
 
 /// Compatibility adapter for the migrated core callers. The dangerous program
@@ -481,8 +481,12 @@ pub fn run_trusted_with_timeout(
         }
         ChildOutcome::SpawnError(reason) => ShellTimeoutOutcome::SpawnError(reason),
         ChildOutcome::WaitError(reason) => ShellTimeoutOutcome::WaitError(reason),
-        ChildOutcome::Timeout { .. } => ShellTimeoutOutcome::Timeout,
-        ChildOutcome::OutputLimitExceeded { .. } => ShellTimeoutOutcome::OutputLimitExceeded,
+        ChildOutcome::Timeout { cleanup_succeeded } => {
+            ShellTimeoutOutcome::Timeout { cleanup_succeeded }
+        }
+        ChildOutcome::OutputLimitExceeded {
+            cleanup_succeeded, ..
+        } => ShellTimeoutOutcome::OutputLimitExceeded { cleanup_succeeded },
     }
 }
 

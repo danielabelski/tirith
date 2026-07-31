@@ -514,10 +514,14 @@ pub fn is_executable_file(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         let _ = md;
-        matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("exe") | Some("bat") | Some("cmd") | Some("com")
-        )
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| {
+                ["exe", "bat", "cmd", "com"]
+                    .iter()
+                    .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+            })
+            .unwrap_or(false)
     }
 }
 

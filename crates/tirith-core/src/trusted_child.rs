@@ -2,19 +2,164 @@
 //!
 //! Security-sensitive callers resolve an executable once, validate its absolute
 //! identity, clear the ambient environment, and run it with explicit capture
-//! limits. On Unix every child owns a process group so a timeout or output flood
-//! terminates descendants as well as the direct child.
+//! limits. On Unix every child owns a process group. On Windows every child is
+//! created suspended, assigned to a kill-on-close Job Object, then resumed. A
+//! timeout or output flood therefore terminates descendants as well as the direct
+//! child on both platform families.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(windows))]
+use std::time::Instant;
+
+#[cfg(windows)]
+mod windows;
 
 #[derive(Debug, Clone)]
 pub struct TrustedExecutable {
     path: PathBuf,
+}
+
+/// How an absolute Windows executable was selected. The source is part of the
+/// provenance decision: a PATH-discovered program needs installed provenance,
+/// while a fixed absolute path/current image is explicit caller authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsExecutableSource {
+    /// Caller supplied a fixed absolute path.
+    ExplicitAbsolute,
+    /// Program was selected from the process PATH.
+    PathSearch,
+    /// Program is the image already running this process.
+    CurrentProcess,
+    /// Caller selected from a fixed OS-owned candidate list.
+    SystemCandidate,
+}
+
+/// Security-relevant owner class returned by the Windows ACL validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsOwnerClass {
+    /// Owner SID matches the current process token's user.
+    CurrentUser,
+    /// Owner SID is LocalSystem.
+    LocalSystem,
+    /// Owner SID is the built-in Administrators group.
+    Administrators,
+    /// Owner SID is the Windows Modules Installer service.
+    TrustedInstaller,
+    /// Owner is present but outside the recognized provenance principals.
+    Other,
+}
+
+/// Host facts consumed by the pure Windows trust policy. Keeping this decision
+/// separate from Win32 collection makes every allow/deny branch host-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsTrustFacts {
+    /// A broad low-trust principal can replace the file or an ancestor.
+    pub broad_write_access: bool,
+    /// Owner of the executable itself.
+    pub leaf_owner: WindowsOwnerClass,
+    /// Every owner from the executable through its ancestor chain is recognized.
+    pub owner_chain_trusted: bool,
+    /// ACL and owner evidence establish a protected current-user install tree.
+    pub secure_user_install: bool,
+    /// Path is under a canonical Windows or Program Files root.
+    pub protected_install_root: bool,
+    /// Offline WinVerifyTrust policy accepted the image signature.
+    pub authenticode_trusted: bool,
+}
+
+/// Provenance that authorized a Windows executable after ACL validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsTrustProvenance {
+    /// Fixed absolute caller authority plus secure ownership.
+    ExplicitAbsolute,
+    /// Already-running image plus secure ownership.
+    CurrentProcess,
+    /// Fixed system candidate under a protected install root.
+    SystemCandidate,
+    /// Offline Authenticode verification authorized the image.
+    Authenticode,
+    /// Protected install root and owner chain authorized PATH selection.
+    ProtectedInstall,
+    /// Secure current-user installation authorized PATH selection.
+    SecureUserInstall,
+}
+
+/// Decide whether collected Windows ACL/ownership/AuthentiCode evidence is
+/// sufficient for the executable-selection source. Broadly writable paths are
+/// never trusted, including when a file carries a valid signature: replacement
+/// of the path would otherwise bypass the signature checked before launch.
+pub fn evaluate_windows_trust(
+    source: WindowsExecutableSource,
+    facts: WindowsTrustFacts,
+) -> Result<WindowsTrustProvenance, &'static str> {
+    if facts.broad_write_access {
+        return Err("executable or parent path grants broad write access");
+    }
+    if !facts.owner_chain_trusted || facts.leaf_owner == WindowsOwnerClass::Other {
+        return Err("executable has an untrusted owner or ancestor owner");
+    }
+    match source {
+        WindowsExecutableSource::ExplicitAbsolute => Ok(WindowsTrustProvenance::ExplicitAbsolute),
+        WindowsExecutableSource::CurrentProcess => Ok(WindowsTrustProvenance::CurrentProcess),
+        WindowsExecutableSource::SystemCandidate => {
+            if facts.protected_install_root {
+                Ok(WindowsTrustProvenance::SystemCandidate)
+            } else if facts.authenticode_trusted {
+                Ok(WindowsTrustProvenance::Authenticode)
+            } else {
+                Err("system candidate lacks protected-root or Authenticode provenance")
+            }
+        }
+        WindowsExecutableSource::PathSearch => {
+            if facts.authenticode_trusted {
+                Ok(WindowsTrustProvenance::Authenticode)
+            } else if facts.protected_install_root {
+                Ok(WindowsTrustProvenance::ProtectedInstall)
+            } else if facts.secure_user_install {
+                Ok(WindowsTrustProvenance::SecureUserInstall)
+            } else {
+                Err("PATH executable lacks Authenticode or trusted install provenance")
+            }
+        }
+    }
+}
+
+/// Pure Windows DACL access-mask classifier used by the platform collector.
+/// Generic read includes `READ_CONTROL` and `SYNCHRONIZE`; neither is a mutation
+/// right, so this intentionally checks only generic write and concrete replace /
+/// metadata-write rights instead of intersecting a composite FILE_GENERIC_WRITE.
+pub fn windows_access_mask_grants_replacement(mask: u32, leaf: bool) -> bool {
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_APPEND_DATA: u32 = 0x0000_0004;
+    const FILE_WRITE_EA: u32 = 0x0000_0010;
+    const FILE_DELETE_CHILD: u32 = 0x0000_0040;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+
+    let ownership_or_delete = GENERIC_ALL | DELETE | WRITE_DAC | WRITE_OWNER;
+    let relevant = if leaf {
+        ownership_or_delete
+            | GENERIC_WRITE
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_DELETE_CHILD
+            | FILE_WRITE_ATTRIBUTES
+    } else {
+        ownership_or_delete | FILE_DELETE_CHILD
+    };
+    mask & relevant != 0
 }
 
 #[derive(Debug)]
@@ -59,6 +204,85 @@ impl fmt::Display for TrustedExecutableError {
 
 impl std::error::Error for TrustedExecutableError {}
 
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows::path_is_within(path, root)
+    }
+    #[cfg(not(windows))]
+    {
+        path == root || path.starts_with(root)
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !path.is_absolute() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+/// Return the denied root containing either the lexical selection path or any
+/// filesystem-resolved prefix of it. Checking each existing prefix preserves
+/// the origin evidence that full canonicalization loses when a symlink/reparse
+/// point escapes the denied tree; it also resolves Windows 8.3 aliases.
+fn denied_selection_origin(path: &Path, denied_roots: &[PathBuf]) -> Option<PathBuf> {
+    let roots = denied_roots
+        .iter()
+        .map(|root| {
+            let lexical = lexical_normalize(root);
+            let canonical = root
+                .canonicalize()
+                .ok()
+                .map(|canonical| lexical_normalize(&canonical));
+            (root, lexical, canonical)
+        })
+        .collect::<Vec<_>>();
+    let lexical_path = lexical_normalize(path);
+
+    for (original, lexical_root, canonical_root) in &roots {
+        if path_is_within(&lexical_path, lexical_root)
+            || canonical_root
+                .as_ref()
+                .is_some_and(|root| path_is_within(&lexical_path, root))
+        {
+            return Some((*original).clone());
+        }
+    }
+
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        if !prefix.is_absolute() {
+            continue;
+        }
+        let Ok(canonical_prefix) = prefix.canonicalize() else {
+            continue;
+        };
+        let canonical_prefix = lexical_normalize(&canonical_prefix);
+        for (original, lexical_root, canonical_root) in &roots {
+            let resolved_root = canonical_root.as_ref().unwrap_or(lexical_root);
+            if path_is_within(&canonical_prefix, resolved_root) {
+                return Some((*original).clone());
+            }
+        }
+    }
+    None
+}
+
 impl TrustedExecutable {
     /// Validate an explicitly selected absolute executable. Symlinks are
     /// canonicalized before the denied-root check and before execution.
@@ -66,8 +290,30 @@ impl TrustedExecutable {
         path: &Path,
         denied_roots: &[PathBuf],
     ) -> Result<Self, TrustedExecutableError> {
+        Self::from_absolute_with_source(
+            path,
+            denied_roots,
+            WindowsExecutableSource::ExplicitAbsolute,
+        )
+    }
+
+    fn from_absolute_with_source(
+        path: &Path,
+        denied_roots: &[PathBuf],
+        _source: WindowsExecutableSource,
+    ) -> Result<Self, TrustedExecutableError> {
         if !path.is_absolute() {
             return Err(TrustedExecutableError::NotAbsolute(path.to_path_buf()));
+        }
+        // Reject attacker-controlled selection origin before following symlinks /
+        // reparse points. Otherwise `repo/bin/tool -> C:\Windows\...\other.exe`
+        // would canonicalize outside the denied root and let the repo substitute
+        // an argument-incompatible trusted image for the requested helper name.
+        if let Some(root) = denied_selection_origin(path, denied_roots) {
+            return Err(TrustedExecutableError::Untrusted {
+                path: path.to_path_buf(),
+                root,
+            });
         }
         let canonical = path
             .canonicalize()
@@ -80,7 +326,7 @@ impl TrustedExecutable {
         }
         for root in denied_roots {
             let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if canonical == canonical_root || canonical.starts_with(&canonical_root) {
+            if path_is_within(&canonical, &canonical_root) {
                 return Err(TrustedExecutableError::Untrusted {
                     path: canonical,
                     root: canonical_root,
@@ -102,6 +348,13 @@ impl TrustedExecutable {
                 });
             }
         }
+        #[cfg(windows)]
+        windows::validate_executable(&canonical, _source).map_err(|reason| {
+            TrustedExecutableError::InvalidPath {
+                path: canonical.clone(),
+                reason,
+            }
+        })?;
         Ok(Self { path: canonical })
     }
 
@@ -119,13 +372,21 @@ impl TrustedExecutable {
             }
             let direct = dir.join(name);
             if crate::path_audit::is_executable_file(&direct) {
-                return Self::from_absolute_or_canonical(&direct, denied_roots);
+                return Self::from_absolute_or_canonical(
+                    &direct,
+                    denied_roots,
+                    WindowsExecutableSource::PathSearch,
+                );
             }
             #[cfg(windows)]
             for extension in windows_path_extensions() {
                 let candidate = dir.join(format!("{name}{extension}"));
                 if crate::path_audit::is_executable_file(&candidate) {
-                    return Self::from_absolute_or_canonical(&candidate, denied_roots);
+                    return Self::from_absolute_or_canonical(
+                        &candidate,
+                        denied_roots,
+                        WindowsExecutableSource::PathSearch,
+                    );
                 }
             }
         }
@@ -135,9 +396,10 @@ impl TrustedExecutable {
     fn from_absolute_or_canonical(
         path: &Path,
         denied_roots: &[PathBuf],
+        source: WindowsExecutableSource,
     ) -> Result<Self, TrustedExecutableError> {
         if path.is_absolute() {
-            Self::from_absolute(path, denied_roots)
+            Self::from_absolute_with_source(path, denied_roots, source)
         } else {
             let absolute = std::env::current_dir()
                 .map_err(|e| TrustedExecutableError::InvalidPath {
@@ -145,14 +407,18 @@ impl TrustedExecutable {
                     reason: e.to_string(),
                 })?
                 .join(path);
-            Self::from_absolute(&absolute, denied_roots)
+            Self::from_absolute_with_source(&absolute, denied_roots, source)
         }
     }
 
     /// Resolve the first valid executable from fixed absolute candidates.
     pub fn from_system_candidates(candidates: &[&Path]) -> Result<Self, TrustedExecutableError> {
         for candidate in candidates {
-            if let Ok(executable) = Self::from_absolute(candidate, &[]) {
+            if let Ok(executable) = Self::from_absolute_with_source(
+                candidate,
+                &[],
+                WindowsExecutableSource::SystemCandidate,
+            ) {
                 return Ok(executable);
             }
         }
@@ -170,7 +436,7 @@ impl TrustedExecutable {
             path: PathBuf::from("<current executable>"),
             reason: e.to_string(),
         })?;
-        Self::from_absolute(&path, &[])
+        Self::from_absolute_with_source(&path, &[], WindowsExecutableSource::CurrentProcess)
     }
 
     pub fn path(&self) -> &Path {
@@ -195,13 +461,16 @@ pub fn sanitized_path(path_value: &OsStr, denied_roots: &[PathBuf]) -> OsString 
         if !directory.is_absolute() {
             continue;
         }
+        if denied_selection_origin(&directory, denied_roots).is_some() {
+            continue;
+        }
         let canonical = match directory.canonicalize() {
             Ok(path) => path,
             Err(_) => continue,
         };
         if denied_roots.iter().any(|root| {
             let root = root.canonicalize().unwrap_or_else(|_| root.clone());
-            canonical == root || canonical.starts_with(root)
+            path_is_within(&canonical, &root)
         }) {
             continue;
         }
@@ -214,6 +483,10 @@ pub fn sanitized_path(path_value: &OsStr, denied_roots: &[PathBuf]) -> OsString 
             {
                 continue;
             }
+        }
+        #[cfg(windows)]
+        if !windows::validate_inherited_path_dir(&canonical) {
+            continue;
         }
         directories.push(canonical);
     }
@@ -388,6 +661,14 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 
 /// Execute a validated absolute program with an empty-by-default environment,
 /// bounded output, and a wall-clock deadline.
+#[cfg(windows)]
+pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
+    windows::run(executable, spec)
+}
+
+/// Execute a validated absolute program with an empty-by-default environment,
+/// bounded output, and a wall-clock deadline.
+#[cfg(not(windows))]
 pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     let mut command = Command::new(executable.path());
     command
@@ -496,6 +777,7 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     }
 }
 
+#[cfg(not(windows))]
 fn terminate_tree(child: &mut std::process::Child, child_pid: u32, already_reaped: bool) -> bool {
     let mut cleanup_succeeded = true;
     #[cfg(unix)]
@@ -509,7 +791,7 @@ fn terminate_tree(child: &mut std::process::Child, child_pid: u32, already_reape
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     {
         if child.kill().is_err() {
             cleanup_succeeded = false;

@@ -236,10 +236,20 @@ fn run_cli_with(
         }),
         ChildOutcome::SpawnError(reason) => Err(format!("failed to start: {reason}")),
         ChildOutcome::WaitError(reason) => Err(format!("wait failed: {reason}")),
-        ChildOutcome::Timeout { .. } => Err("timed out after 30s — check installation".into()),
-        ChildOutcome::OutputLimitExceeded { .. } => {
-            Err("output limit exceeded — check installation".into())
-        }
+        ChildOutcome::Timeout {
+            cleanup_succeeded: true,
+        } => Err("timed out after 30s — check installation".into()),
+        ChildOutcome::Timeout {
+            cleanup_succeeded: false,
+        } => Err("timed out and process-tree cleanup failed — check installation".into()),
+        ChildOutcome::OutputLimitExceeded {
+            cleanup_succeeded: true,
+            ..
+        } => Err("output limit exceeded — check installation".into()),
+        ChildOutcome::OutputLimitExceeded {
+            cleanup_succeeded: false,
+            ..
+        } => Err("output limit exceeded and process-tree cleanup failed".into()),
     }
 }
 
@@ -315,5 +325,42 @@ fn cleanup_old_backups(path: &Path) {
         if let Err(e) = fs::remove_file(old) {
             eprintln!("tirith: could not clean old backup {}: {e}", old.display());
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    fn cmd() -> tirith_core::trusted_child::TrustedExecutable {
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        tirith_core::trusted_child::TrustedExecutable::from_absolute(
+            &PathBuf::from(root).join("System32").join("cmd.exe"),
+            &[],
+        )
+        .expect("trusted system cmd.exe")
+    }
+
+    #[test]
+    fn windows_setup_runner_preserves_short_legitimate_output() {
+        let output = run_cli_with(
+            &cmd(),
+            &["/D", "/S", "/C", "<nul set /p =setup-ok"],
+            tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(5), 64, 64),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"setup-ok");
+    }
+
+    #[test]
+    fn windows_setup_runner_surfaces_output_limit() {
+        let error = run_cli_with(
+            &cmd(),
+            &["/D", "/S", "/C", "<nul set /p =12345"],
+            tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(5), 4, 64),
+        )
+        .unwrap_err();
+        assert!(error.contains("output limit"));
     }
 }
