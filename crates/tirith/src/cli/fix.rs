@@ -1,9 +1,11 @@
-//! `tirith fix` — interactive presenter over `tirith_core::safe_command::suggest`.
+//! `tirith fix` — interactive presenter over
+//! `tirith_core::safe_command::suggest_verified`.
 //!
-//! Thin shim: tokenize → `engine::analyze` → `safe_command::suggest` → present.
-//! Detection lives in `tirith-core`; this module is presentation + one-keystroke
-//! acceptance only. Never invents a rewrite — a finding whose `safe_command` is
-//! `None` is rendered as honest guidance from its `remediation` field.
+//! Thin shim: tokenize → `engine::analyze` → verified suggestion → present.
+//! Detection and final-command re-analysis live in `tirith-core`; this module is
+//! presentation + one-keystroke acceptance only. Never invents a rewrite — a
+//! finding whose `safe_command` is `None` is rendered as honest guidance from
+//! its `remediation` field.
 //!
 //! ## Exit codes (deliberately distinct from `tirith check`)
 //!
@@ -36,9 +38,10 @@
 //!   ```
 //! - **Findings present** → plain JSON array of `SafeSuggestion`:
 //!   ```text
-//!   [ { "rule_id": "...", "safe_command": "..." | null,
+//!   [ { "rule_id": "...", "safe_command": "<verified Allow command>",
 //!       "rationale": "...", "remediation": "..." }, ... ]
 //!   ```
+//!   `safe_command` is omitted when a transform is guidance-only.
 //!
 //! The array shape is the M6 acceptance criterion; the envelope is the honest
 //! negative case so a parser doesn't read an empty `[]` as "nothing was wrong".
@@ -88,8 +91,10 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         }
     };
 
-    // Use `analyze` (not `analyze_returning_policy`): fix is advisory, never
-    // gates on policy, and does not audit log.
+    // Analyze without honoring the explicit bypass: a bypass may let the user
+    // run the original command, but it must never bless an executable fix.
+    // Policy discovery still runs normally and is preserved by the verification
+    // context below. `fix` remains advisory and does not audit log.
     let ctx = AnalysisContext {
         input: cmd.clone(),
         shell: shell_type,
@@ -106,7 +111,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
-    let verdict = engine::analyze(&ctx);
+    let verdict = engine::analyze_without_bypass_returning_policy(&ctx).0;
 
     // Allow path: nothing to fix.
     if verdict.action == Action::Allow {
@@ -125,8 +130,10 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         return 0;
     }
 
-    // Verdict has findings — ask the library for safe-command suggestions.
-    let suggestions = safe_command::suggest(&cmd, shell_type, &verdict);
+    // Verdict has findings — ask the library for verified suggestions. Only an
+    // exact final command that re-analyzes to Allow under this same context can
+    // populate `safe_command` and cross stdout/JSON execution contracts.
+    let suggestions = safe_command::suggest_verified(&ctx, &verdict);
 
     // JSON / non-interactive path: emit a plain JSON array, never prompt. Exit
     // 1 if no mechanical rewrite exists (guidance-only); 2 if rewrites are

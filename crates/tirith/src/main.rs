@@ -840,16 +840,17 @@ Examples:
 
     /// Suggest a concrete safer rewrite for a command and (interactively) apply one
     #[command(after_help = "\
-Thin presenter over `tirith_core::safe_command::suggest()` — the same engine
-backing `tirith check --suggest-safe-command`. Pick a numbered rewrite at the
-prompt and `fix` prints exactly that command on stdout, so you can wrap with
-`$(tirith fix -- '<cmd>')` and feed it straight into your shell.
+Thin presenter over `tirith_core::safe_command::suggest_verified()` — the same
+verified engine backing `tirith check --suggest-safe-command`. Compatible
+remediations are composed and the exact final command is re-analyzed under the
+same shell, context, and policy. Only an Allow result is exposed as
+`safe_command` or printed on stdout, so you can wrap `$(tirith fix -- '<cmd>')`
+and feed it straight into your shell.
 
-When no mechanical rewrite is possible (homograph hostnames, threat-DB hits)
-`fix` prints the honest per-rule remediation instead of fabricating a
-command. Detection lives in the engine; `fix` adds zero heuristics of its
-own. Dotfile-overwrite DOES have a mechanical rewrite (`cp <target>
-<target>.bak && <original>`) when the target file exists.
+When no complete Allow rewrite is possible (homograph hostnames, threat-DB
+hits, or a partial transform that still triggers another rule), `fix` prints
+the honest per-rule remediation instead of fabricating an executable command.
+Detection lives in the engine; `fix` adds zero heuristics of its own.
 
 Exit codes (deliberately distinct from `tirith check`):
   0  no fix needed (verdict was Allow) OR user accepted a rewrite
@@ -863,7 +864,8 @@ are deliberately different.
 JSON shape (`--json` / `--non-interactive`):
   - No findings → object: {applied, reason, verdict, command}
   - Findings present → plain array of SafeSuggestion (matches the
-    `safe_suggestions` array embedded in `tirith check --suggest --json`)
+    `safe_suggestions` array embedded in `tirith check --suggest --json`);
+    `safe_command` is omitted for guidance-only or partial transforms
 
 Examples:
   tirith fix -- 'curl https://example.com/install.sh | bash'

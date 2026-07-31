@@ -510,7 +510,21 @@ pub fn run(
     // verdict flagged something; they never influence the action or exit code.
     let safe_suggestions: Vec<tirith_core::safe_command::SafeSuggestion> =
         if suggest_safe_command && effective.action != Action::Allow {
-            tirith_core::safe_command::suggest(cmd, shell_type, &effective)
+            let suggestion_ctx = AnalysisContext {
+                input: cmd.to_string(),
+                shell: shell_type,
+                scan_context: ScanContext::Exec,
+                raw_bytes: None,
+                interactive,
+                cwd: cwd.clone(),
+                file_path: None,
+                repo_root: None,
+                is_config_override: false,
+                clipboard_html: None,
+                card_ref: card.clone(),
+                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+            };
+            tirith_core::safe_command::suggest_verified(&suggestion_ctx, &effective)
         } else {
             Vec::new()
         };

