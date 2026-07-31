@@ -49,6 +49,7 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
     }
 
     let mut state = OutputAnalyzerState::with_custom_seeds(custom_seeds);
+    let mut display_sanitizer = StreamingDisplaySanitizer::default();
     let mut sanitized = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut truncated = false;
@@ -83,10 +84,10 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
             }
             total_bytes += n as u64;
 
-            let chunk_str = String::from_utf8_lossy(&buf[..n]).into_owned();
-            let _ = engine::analyze_output_chunk(&chunk_str, &mut state);
-
-            sanitize_into(&buf[..n], &mut sanitized);
+            let decoded = display_sanitizer.push(&buf[..n], &mut sanitized);
+            if !decoded.is_empty() {
+                let _ = engine::analyze_output_chunk(&decoded, &mut state);
+            }
         }
         Ok(())
     })();
@@ -98,6 +99,13 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
                 .unwrap_or_else(|| "<stdin>".to_string())
         );
         return 1;
+    }
+
+    // Flush an incomplete final UTF-8 sequence as U+FFFD. Unterminated escape
+    // sequences and a trailing bare CR intentionally produce no display bytes.
+    let decoded_tail = display_sanitizer.finish(&mut sanitized);
+    if !decoded_tail.is_empty() {
+        let _ = engine::analyze_output_chunk(&decoded_tail, &mut state);
     }
 
     let verdict = engine::analyze_output_finalize_mut(&mut state);
@@ -119,115 +127,160 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
     verdict.action.exit_code()
 }
 
-/// Strip ANSI / OSC escape sequences and zero-width characters from `chunk`
-/// into `out`. Intentionally simple — we render plain text only.
-fn sanitize_into(chunk: &[u8], out: &mut Vec<u8>) {
-    let mut i = 0;
-    let n = chunk.len();
-    while i < n {
-        let b = chunk[i];
+/// Incremental UTF-8 decoder. Definite malformed subsequences become U+FFFD;
+/// only a potentially valid incomplete suffix is retained for the next chunk.
+/// This prevents both split-codepoint corruption and verbatim invalid-byte
+/// passthrough.
+#[derive(Debug, Default)]
+struct StreamingUtf8Decoder {
+    pending: Vec<u8>,
+}
 
-        if b == 0x1B {
-            if i + 1 < n {
-                match chunk[i + 1] {
-                    b'[' => {
-                        // CSI — final byte 0x40..=0x7E. Skip to and including final.
-                        let mut j = i + 2;
-                        while j < n {
-                            let cb = chunk[j];
-                            if (0x40..=0x7E).contains(&cb) {
-                                j += 1;
-                                break;
-                            }
-                            j += 1;
-                        }
-                        i = j;
-                        continue;
-                    }
-                    b']' | b'_' | b'P' => {
-                        // OSC / APC / DCS — terminated by BEL (0x07) or ST (\e\\).
-                        let mut j = i + 2;
-                        while j < n {
-                            if chunk[j] == 0x07 {
-                                j += 1;
-                                break;
-                            }
-                            if chunk[j] == 0x1B && j + 1 < n && chunk[j + 1] == b'\\' {
-                                j += 2;
-                                break;
-                            }
-                            j += 1;
-                        }
-                        i = j;
-                        continue;
-                    }
-                    _ => {
-                        // Lone ESC — drop it.
-                        i += 2;
-                        continue;
-                    }
+impl StreamingUtf8Decoder {
+    fn push(&mut self, chunk: &[u8]) -> String {
+        self.pending.extend_from_slice(chunk);
+        self.decode_available(false)
+    }
+
+    fn finish(&mut self) -> String {
+        self.decode_available(true)
+    }
+
+    fn decode_available(&mut self, eof: bool) -> String {
+        let mut decoded = String::new();
+        while !self.pending.is_empty() {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    decoded.push_str(valid);
+                    self.pending.clear();
+                    break;
                 }
-            } else {
-                // Trailing ESC, drop.
-                break;
-            }
-        }
+                Err(error) => {
+                    let valid_len = error.valid_up_to();
+                    if valid_len > 0 {
+                        // `valid_up_to` is guaranteed to end on a UTF-8 boundary.
+                        let valid = std::str::from_utf8(&self.pending[..valid_len])
+                            .expect("validated UTF-8 prefix");
+                        decoded.push_str(valid);
+                        self.pending.drain(..valid_len);
+                        continue;
+                    }
 
-        // Drop CR not followed by LF (display-overwriting); keep CRLF.
-        if b == b'\r' {
-            if i + 1 < n && chunk[i + 1] == b'\n' {
-                out.push(b'\r');
-                out.push(b'\n');
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
+                    if let Some(error_len) = error.error_len() {
+                        decoded.push('\u{FFFD}');
+                        self.pending.drain(..error_len);
+                        continue;
+                    }
 
-        // Other low control chars except \t and \n: drop.
-        if b < 0x20 && b != b'\t' && b != b'\n' {
-            i += 1;
-            continue;
-        }
-        if b == 0x7F {
-            i += 1;
-            continue;
-        }
-
-        // Strip zero-width characters. Multi-byte → decode the char.
-        if b >= 0xc0 {
-            let remaining = &chunk[i..];
-            if let Some(ch) = std::str::from_utf8(remaining)
-                .ok()
-                .or_else(|| std::str::from_utf8(&remaining[..remaining.len().min(4)]).ok())
-                .and_then(|s| s.chars().next())
-            {
-                if is_strippable_zero_width(ch) {
-                    i += ch.len_utf8();
-                    continue;
+                    // The entire remaining buffer is a potentially valid but
+                    // incomplete codepoint. Retain it across chunks; at EOF it
+                    // becomes one visible replacement character.
+                    if eof {
+                        decoded.push('\u{FFFD}');
+                        self.pending.clear();
+                    }
+                    break;
                 }
-                let len = ch.len_utf8();
-                out.extend_from_slice(&chunk[i..i + len]);
-                i += len;
-                continue;
             }
         }
-
-        out.push(b);
-        i += 1;
+        decoded
     }
 }
 
-fn is_strippable_zero_width(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{200B}' // ZWSP
-        | '\u{200C}' // ZWNJ
-        | '\u{200D}' // ZWJ
-        | '\u{2060}' // WORD JOINER
-        | '\u{FEFF}' // ZWNBSP / BOM
-    ) || ('\u{E0000}'..='\u{E007F}').contains(&ch)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TerminalState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    ControlString {
+        escape_seen: bool,
+    },
+}
+
+/// Stateful plain-text renderer for arbitrary byte streams. UTF-8, CRLF, CSI,
+/// OSC, APC, and DCS state all survive chunk boundaries. After control-sequence
+/// removal, the canonical core display scrub removes C0/C1 controls and every
+/// deceptive or invisible Unicode class used elsewhere by the CLI.
+#[derive(Debug, Default)]
+struct StreamingDisplaySanitizer {
+    decoder: StreamingUtf8Decoder,
+    terminal: TerminalState,
+    pending_cr: bool,
+}
+
+impl StreamingDisplaySanitizer {
+    /// Decode and sanitize one byte chunk. The returned string is the original
+    /// statefully decoded text for the output analyzer; `out` receives only safe
+    /// display bytes.
+    fn push(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> String {
+        let decoded = self.decoder.push(chunk);
+        self.sanitize_decoded(&decoded, out);
+        decoded
+    }
+
+    /// Flush a potentially incomplete UTF-8 suffix as U+FFFD. A pending bare CR
+    /// or unterminated terminal escape is discarded rather than made active.
+    fn finish(&mut self, out: &mut Vec<u8>) -> String {
+        let decoded = self.decoder.finish();
+        self.sanitize_decoded(&decoded, out);
+        self.pending_cr = false;
+        self.terminal = TerminalState::Ground;
+        decoded
+    }
+
+    fn sanitize_decoded(&mut self, decoded: &str, out: &mut Vec<u8>) {
+        let mut plain = String::with_capacity(decoded.len());
+        for ch in decoded.chars() {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if ch == '\n' {
+                    plain.push('\r');
+                    plain.push('\n');
+                    continue;
+                }
+            }
+
+            match self.terminal {
+                TerminalState::Ground => match ch {
+                    '\u{1B}' => self.terminal = TerminalState::Escape,
+                    '\u{009B}' => self.terminal = TerminalState::Csi,
+                    '\u{0090}' | '\u{009D}' | '\u{009F}' => {
+                        self.terminal = TerminalState::ControlString { escape_seen: false };
+                    }
+                    '\r' => self.pending_cr = true,
+                    _ => plain.push(ch),
+                },
+                TerminalState::Escape => {
+                    self.terminal = match ch {
+                        '[' => TerminalState::Csi,
+                        ']' | '_' | 'P' => TerminalState::ControlString { escape_seen: false },
+                        '\u{1B}' => TerminalState::Escape,
+                        _ => TerminalState::Ground,
+                    };
+                }
+                TerminalState::Csi => {
+                    if ch == '\u{1B}' {
+                        self.terminal = TerminalState::Escape;
+                    } else if ch.is_ascii() && ('@'..='~').contains(&ch) {
+                        self.terminal = TerminalState::Ground;
+                    }
+                }
+                TerminalState::ControlString { escape_seen } => {
+                    if ch == '\u{7}' || ch == '\u{009C}' || (escape_seen && ch == '\\') {
+                        self.terminal = TerminalState::Ground;
+                    } else {
+                        self.terminal = TerminalState::ControlString {
+                            escape_seen: ch == '\u{1B}',
+                        };
+                    }
+                }
+            }
+        }
+
+        let safe = tirith_core::mcp::output_filter::sanitize_for_display(&plain);
+        out.extend_from_slice(safe.as_bytes());
+    }
 }
 
 fn print_findings_human(verdict: &Verdict, path: Option<&Path>, total_bytes: u64, truncated: bool) {
@@ -294,6 +347,33 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    fn sanitize_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+        let mut sanitizer = StreamingDisplaySanitizer::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            let _ = sanitizer.push(chunk, &mut out);
+        }
+        let _ = sanitizer.finish(&mut out);
+        out
+    }
+
+    fn assert_safe_at_every_split(input: &[u8], expected: &[u8]) {
+        for split in 0..=input.len() {
+            let actual = sanitize_chunks([&input[..split], &input[split..]]);
+            assert_eq!(
+                actual, expected,
+                "unexpected output with byte split at {split} for {input:?}"
+            );
+        }
+
+        let byte_chunks = input.iter().map(std::slice::from_ref);
+        assert_eq!(
+            sanitize_chunks(byte_chunks),
+            expected,
+            "unexpected output when every byte is a separate chunk"
+        );
+    }
+
     #[test]
     fn view_clean_file_exits_zero() {
         let mut f = NamedTempFile::new().unwrap();
@@ -313,26 +393,67 @@ mod tests {
 
     #[test]
     fn sanitize_strips_csi_and_osc() {
-        let mut out = Vec::new();
-        sanitize_into(b"a\x1b[31mred\x1b[0mb", &mut out);
-        assert_eq!(out, b"aredb");
-
-        out.clear();
-        sanitize_into(b"prefix\x1b]52;c;aGVsbG8=\x07suffix", &mut out);
-        assert_eq!(out, b"prefixsuffix");
+        assert_safe_at_every_split(b"a\x1b[31mred\x1b[0mb", b"aredb");
+        assert_safe_at_every_split(b"prefix\x1b]52;c;aGVsbG8=\x07suffix", b"prefixsuffix");
+        assert_safe_at_every_split(b"prefix\x1b]0;title\x1b\\suffix", b"prefixsuffix");
+        assert_safe_at_every_split(b"prefix\x1b_Payload\x1b\\suffix", b"prefixsuffix");
+        assert_safe_at_every_split(b"prefix\x1bPPayload\x1b\\suffix", b"prefixsuffix");
     }
 
     #[test]
     fn sanitize_keeps_tabs_and_newlines() {
-        let mut out = Vec::new();
-        sanitize_into(b"a\tb\nc\r\nd", &mut out);
-        assert_eq!(out, b"a\tb\nc\r\nd");
+        assert_safe_at_every_split(b"a\tb\nc\r\nd", b"a\tb\nc\r\nd");
+        assert_safe_at_every_split(b"a\rb", b"ab");
     }
 
     #[test]
-    fn sanitize_strips_zero_width() {
-        let mut out = Vec::new();
-        sanitize_into("a\u{200B}b\u{200D}c".as_bytes(), &mut out);
-        assert_eq!(out, b"abc");
+    fn sanitize_preserves_split_utf8_and_never_copies_invalid_bytes() {
+        assert_safe_at_every_split("a包b".as_bytes(), "a包b".as_bytes());
+        assert_safe_at_every_split(b"a\xf0\x9f\x92b", "a\u{FFFD}b".as_bytes());
+        assert_safe_at_every_split(b"a\x80b", "a\u{FFFD}b".as_bytes());
+        assert!(std::str::from_utf8(&sanitize_chunks([b"\xff".as_slice()])).is_ok());
+    }
+
+    #[test]
+    fn sanitize_strips_every_display_deception_class_at_every_split() {
+        let dangerous = [
+            '\u{0001}',  // C0
+            '\u{007F}',  // DEL
+            '\u{0080}',  // C1 lower bound
+            '\u{009B}',  // C1 CSI
+            '\u{009F}',  // C1 upper bound
+            '\u{202E}',  // bidi override
+            '\u{200B}',  // zero width
+            '\u{E0001}', // Unicode tag
+            '\u{FE0F}',  // variation selector
+            '\u{3164}',  // Hangul filler
+            '\u{2061}',  // invisible math operator
+            '\u{180E}',  // invisible whitespace
+        ];
+
+        for ch in dangerous {
+            let input = format!("a{ch}b");
+            let expected: &[u8] = if matches!(ch, '\u{009B}' | '\u{009F}') {
+                b"a"
+            } else {
+                b"ab"
+            };
+            assert_safe_at_every_split(input.as_bytes(), expected);
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_complete_c1_range_at_every_split() {
+        for codepoint in 0x80..=0x9F {
+            let ch = char::from_u32(codepoint).unwrap();
+            let input = format!("a{ch}");
+            assert_safe_at_every_split(input.as_bytes(), b"a");
+        }
+    }
+
+    #[test]
+    fn sanitize_drops_unterminated_escape_payload_at_eof() {
+        assert_safe_at_every_split(b"safe\x1b]52;c;payload", b"safe");
+        assert_safe_at_every_split(b"safe\x1b[31", b"safe");
     }
 }
