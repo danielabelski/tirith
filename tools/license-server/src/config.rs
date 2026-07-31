@@ -28,7 +28,7 @@ impl Config {
             "ED25519_PRIVATE_KEY_HEX must be 64 hex chars (32 bytes)"
         );
 
-        let polar_webhook_secret = required_env("POLAR_WEBHOOK_SECRET");
+        let polar_webhook_secret = validated_webhook_secret(required_env("POLAR_WEBHOOK_SECRET"));
         let polar_api_key = required_env("POLAR_API_KEY");
 
         let enc_key_hex = required_env("RECEIPT_ENCRYPTION_KEY");
@@ -112,6 +112,13 @@ fn required_env(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| panic!("missing required env var: {key}"))
 }
 
+fn validated_webhook_secret(secret: String) -> String {
+    crate::webhook_verify::decode_webhook_secret(&secret).unwrap_or_else(|_| {
+        panic!("POLAR_WEBHOOK_SECRET must use whsec_ followed by a base64-encoded 24-64 byte key")
+    });
+    secret
+}
+
 fn optional_env(key: &str) -> Option<String> {
     std::env::var(key).ok().and_then(|v| {
         let v = v.trim().to_string();
@@ -121,4 +128,35 @@ fn optional_env(key: &str) -> Option<String> {
             Some(v)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validated_webhook_secret;
+    use base64::Engine as _;
+
+    #[test]
+    fn startup_validation_rejects_out_of_range_webhook_keys() {
+        for raw in [Vec::new(), vec![0x11; 23], vec![0x22; 65]] {
+            let secret = format!(
+                "whsec_{}",
+                base64::engine::general_purpose::STANDARD.encode(raw)
+            );
+            assert!(
+                std::panic::catch_unwind(|| validated_webhook_secret(secret)).is_err(),
+                "startup must fail before serving with a forgeable webhook key"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_validation_accepts_standard_webhooks_key_range() {
+        for length in [24, 32, 64] {
+            let secret = format!(
+                "whsec_{}",
+                base64::engine::general_purpose::STANDARD.encode(vec![0x33; length])
+            );
+            assert_eq!(validated_webhook_secret(secret.clone()), secret);
+        }
+    }
 }

@@ -4,6 +4,28 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Standard Webhooks requires symmetric signing keys to contain between 24
+/// and 64 bytes after decoding the `whsec_` payload.
+pub const MIN_WEBHOOK_SECRET_KEY_BYTES: usize = 24;
+pub const MAX_WEBHOOK_SECRET_KEY_BYTES: usize = 64;
+
+/// Decode and validate a Polar/Standard-Webhooks signing secret.
+///
+/// Kept public within the binary crate so configuration loading and request
+/// verification enforce the same format and bounded key-length invariant.
+pub fn decode_webhook_secret(secret: &str) -> Result<Vec<u8>, WebhookError> {
+    let key_b64 = secret
+        .strip_prefix("whsec_")
+        .ok_or(WebhookError::InvalidSecret)?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(key_b64)
+        .map_err(|_| WebhookError::InvalidSecret)?;
+    if !(MIN_WEBHOOK_SECRET_KEY_BYTES..=MAX_WEBHOOK_SECRET_KEY_BYTES).contains(&decoded.len()) {
+        return Err(WebhookError::InvalidSecret);
+    }
+    Ok(decoded)
+}
+
 /// Verify a Standard Webhooks signature (used by Polar.sh).
 ///
 /// - `secret`: `"whsec_<base64_key>"` — prefix stripped, remainder base64-decoded to get HMAC key.
@@ -20,12 +42,9 @@ pub fn verify_webhook(
     sig_header: &str,
     max_age_secs: i64,
 ) -> Result<(), WebhookError> {
-    let key_b64 = secret
-        .strip_prefix("whsec_")
-        .ok_or(WebhookError::InvalidSecret)?;
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|_| WebhookError::InvalidSecret)?;
+    // Defense in depth: configuration validates this at startup, but keep the
+    // request boundary independently safe for direct callers and future wiring.
+    let key_bytes = decode_webhook_secret(secret)?;
 
     // Replay protection: reject messages whose timestamp is out of window.
     let ts: i64 = timestamp
@@ -210,5 +229,43 @@ mod tests {
             300,
         );
         assert!(matches!(result, Err(WebhookError::InvalidSecret)));
+    }
+
+    #[test]
+    fn test_out_of_range_secret_lengths_are_rejected() {
+        for key in [
+            Vec::new(),
+            vec![0x41],
+            vec![0x42; MIN_WEBHOOK_SECRET_KEY_BYTES - 1],
+            vec![0x43; MAX_WEBHOOK_SECRET_KEY_BYTES + 1],
+        ] {
+            let secret = format!(
+                "whsec_{}",
+                base64::engine::general_purpose::STANDARD.encode(key)
+            );
+            assert!(
+                matches!(
+                    decode_webhook_secret(&secret),
+                    Err(WebhookError::InvalidSecret)
+                ),
+                "a Standard Webhooks secret must decode to 24 through 64 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_standard_webhooks_key_length_range_is_accepted() {
+        for length in [
+            MIN_WEBHOOK_SECRET_KEY_BYTES,
+            32,
+            MAX_WEBHOOK_SECRET_KEY_BYTES,
+        ] {
+            let key = vec![0x5a; length];
+            let secret = format!(
+                "whsec_{}",
+                base64::engine::general_purpose::STANDARD.encode(&key)
+            );
+            assert_eq!(decode_webhook_secret(&secret).unwrap(), key);
+        }
     }
 }
