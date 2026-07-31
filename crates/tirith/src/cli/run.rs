@@ -34,11 +34,17 @@ pub fn run(
                 #[derive(serde::Serialize)]
                 struct RunOutput<'a> {
                     receipt: &'a tirith_core::receipt::Receipt,
+                    verdict: Option<&'a tirith_core::verdict::Verdict>,
+                    analysis_complete: bool,
+                    refused: bool,
                     executed: bool,
                     exit_code: Option<i32>,
                 }
                 let out = RunOutput {
                     receipt: &result.receipt,
+                    verdict: result.verdict.as_ref(),
+                    analysis_complete: result.analysis_complete,
+                    refused: result.refused,
                     executed: result.executed,
                     exit_code: result.exit_code,
                 };
@@ -48,7 +54,7 @@ pub fn run(
                 println!();
             }
 
-            if result.executed {
+            if result.executed || result.refused {
                 result.exit_code.unwrap_or(1)
             } else {
                 0

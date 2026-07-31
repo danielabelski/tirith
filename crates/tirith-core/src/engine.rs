@@ -1807,17 +1807,25 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 /// (ch5): forces `fail_mode=Closed`, disables the bypass, elevates
 /// [`crate::incident::INCIDENT_ELEVATED_RULES`]. A corrupt flag fails SAFE.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
-    analyze_inner(ctx).0
+    analyze_inner(ctx, true).0
 }
 
 /// Like [`analyze`] but also returns the loaded policy, for enforcement callers
 /// (check/gateway/MCP) that need it — avoids a redundant `Policy::discover()`.
 pub fn analyze_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
-    analyze_inner(ctx)
+    analyze_inner(ctx, true)
+}
+
+/// Analyze without applying the process/inline bypass, while returning the one
+/// policy snapshot used for detection. Enforcement surfaces that must retain
+/// raw findings for an audited bypass use this entry point and decide whether
+/// that already-detected verdict may be bypassed afterwards.
+pub fn analyze_without_bypass_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
+    analyze_inner(ctx, false)
 }
 
 /// Shared implementation for `analyze()` and `analyze_returning_policy()`.
-fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
+fn analyze_inner(ctx: &AnalysisContext, honor_bypass: bool) -> (Verdict, Policy) {
     let start = Instant::now();
 
     let tier0_start = Instant::now();
@@ -1832,7 +1840,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
             ctx.shell,
         );
-    let bypass_requested = bypass_env || bypass_inline;
+    let bypass_requested = honor_bypass && (bypass_env || bypass_inline);
     let tier0_ms = tier0_start.elapsed().as_secs_f64() * 1000.0;
 
     let tier1_start = Instant::now();

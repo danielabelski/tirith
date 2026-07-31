@@ -877,6 +877,11 @@ fn run_url(
                         "tirith install: install script executed (receipt {}).",
                         tirith_core::receipt::short_hash(&result.receipt.sha256)
                     );
+                } else if result.refused {
+                    eprintln!(
+                        "tirith install: install script execution refused by body policy (receipt {}).",
+                        tirith_core::receipt::short_hash(&result.receipt.sha256)
+                    );
                 } else {
                     eprintln!(
                         "tirith install: install script downloaded and recorded, \
@@ -886,7 +891,7 @@ fn run_url(
                 }
                 true
             };
-            let outcome_code = if result.executed {
+            let outcome_code = if result.executed || result.refused {
                 result.exit_code.unwrap_or(1)
             } else {
                 0
@@ -1143,6 +1148,9 @@ fn print_url_outcome_json(result: &runner::RunResult) -> bool {
         "kind": "install_url_outcome",
         "sandboxed": false,
         "receipt": &result.receipt,
+        "verdict": &result.verdict,
+        "analysis_complete": result.analysis_complete,
+        "refused": result.refused,
         "executed": result.executed,
         "exit_code": result.exit_code,
     });
