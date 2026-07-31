@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
+use super::fs_transaction::PublicationOutcome;
 pub(crate) use super::fs_transaction::{
     transactional_update, transactional_update_checked, FileUpdate, TransactionOutcome,
 };
@@ -78,6 +79,70 @@ struct ValidatedParent {
 
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLACE_FILE_TEST_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnMut(&Path, &Path, &Path) -> Result<(), u32>>>,
+    > = std::cell::RefCell::new(None);
+}
+
+fn replace_file_call(
+    destination: &Path,
+    replacement: &Path,
+    displaced: &Path,
+) -> Result<(), windows::core::Error> {
+    #[cfg(test)]
+    if let Some(result) = REPLACE_FILE_TEST_HOOK.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|hook| hook(destination, replacement, displaced))
+    }) {
+        return result
+            .map_err(|code| windows::core::Error::from_hresult(HRESULT::from_win32(code)));
+    }
+
+    let destination_wide = wide(destination);
+    let replacement_wide = wide(replacement);
+    let displaced_wide = wide(displaced);
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(destination_wide.as_ptr()),
+            PCWSTR(replacement_wide.as_ptr()),
+            PCWSTR(displaced_wide.as_ptr()),
+            Default::default(),
+            None,
+            None,
+        )
+    }
+}
+
+fn unused_displaced_path(destination: &Path) -> Result<PathBuf, String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("no parent for {}", destination.display()))?;
+    let stem = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    for _ in 0..3 {
+        let candidate = parent.join(format!(
+            ".{stem}.tirith-displaced-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "inspect displaced-file recovery name {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err("could not reserve an unused displaced-file recovery name".into())
 }
 
 fn is_win32(error: &windows::core::Error, code: u32) -> bool {
@@ -532,7 +597,7 @@ fn stable_lock_path(parent: &ValidatedParent, destination: &Path) -> Result<Path
     Ok(parent.path.join(lock_name))
 }
 
-fn open_lock(parent: &ValidatedParent, destination: &Path) -> Result<fs::File, String> {
+fn open_lock_file(parent: &ValidatedParent, destination: &Path) -> Result<fs::File, String> {
     let lock_path = stable_lock_path(parent, destination)?;
     let lock_wide = wide(&lock_path);
     let owner_only = owner_only_descriptor()?;
@@ -561,6 +626,11 @@ fn open_lock(parent: &ValidatedParent, destination: &Path) -> Result<fs::File, S
         );
     }
     let file = owned.into_file();
+    Ok(file)
+}
+
+fn open_lock(parent: &ValidatedParent, destination: &Path) -> Result<fs::File, String> {
+    let file = open_lock_file(parent, destination)?;
     file.lock_exclusive()
         .map_err(|error| format!("lock setup destination: {error}"))?;
     Ok(file)
@@ -571,6 +641,7 @@ pub(crate) struct PlatformTransaction {
     destination: PathBuf,
     display_path: PathBuf,
     _lock: fs::File,
+    published_generation: std::cell::RefCell<Option<FileGeneration>>,
 }
 
 impl PlatformTransaction {
@@ -587,7 +658,27 @@ impl PlatformTransaction {
             destination,
             display_path: path.to_path_buf(),
             _lock: lock,
+            published_generation: std::cell::RefCell::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn lock_is_contended(path: &Path, scope_root: &Path) -> Result<bool, String> {
+        let parent = validated_parent(path, scope_root, true)?
+            .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
+        let destination = parent.path.join(
+            path.file_name()
+                .ok_or_else(|| format!("no file name for {}", path.display()))?,
+        );
+        let file = open_lock_file(&parent, &destination)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = fs2::FileExt::unlock(&file);
+                Ok(false)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(format!("probe setup destination lock: {error}")),
+        }
     }
 
     pub(crate) fn read_snapshot(&self) -> Result<PlatformSnapshot, String> {
@@ -674,7 +765,8 @@ impl PlatformTransaction {
         &self,
         mut temp: TempGuard<'_>,
         expected: &PlatformSnapshot,
-    ) -> Result<(), String> {
+        #[cfg(test)] test_hook: &mut impl FnMut(super::fs_transaction::TestStage) -> Result<(), String>,
+    ) -> Result<PublicationOutcome, String> {
         let expected_exists = expected.bytes.is_some();
         // ReplaceFileW documents two failure modes in which it may already
         // have moved one or both names. Keep a private, flushed copy of the
@@ -695,21 +787,20 @@ impl PlatformTransaction {
         // Creating the recovery copy can take time, so repeat the no-follow
         // generation/content/DACL check immediately before publication.
         self.validate_snapshot(expected)?;
+        #[cfg(test)]
+        test_hook(super::fs_transaction::TestStage::PublicationReady)?;
 
         let temp_wide = wide(&temp.path);
         let destination_wide = wide(&self.destination);
         match path_rules::publication_kind(expected_exists) {
             path_rules::PublicationKind::ReplacePreservingMetadata => {
-                if let Err(error) = unsafe {
-                    ReplaceFileW(
-                        PCWSTR(destination_wide.as_ptr()),
-                        PCWSTR(temp_wide.as_ptr()),
-                        PCWSTR::null(),
-                        Default::default(),
-                        None,
-                        None,
-                    )
-                } {
+                let SnapshotGeneration::Present(expected_generation) = &expected.generation else {
+                    unreachable!("existing snapshot has a generation")
+                };
+                let displaced_path = unused_displaced_path(&self.destination)?;
+                if let Err(error) =
+                    replace_file_call(&self.destination, &temp.path, &displaced_path)
+                {
                     let names_may_have_changed =
                         is_win32(&error, ERROR_UNABLE_TO_MOVE_REPLACEMENT.0)
                             || is_win32(&error, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2.0);
@@ -719,22 +810,117 @@ impl PlatformTransaction {
                             .expect("existing replacement has a recovery snapshot")
                             .path
                             .clone();
-                        recovery
+                        let destination_generation = generation_at(&self.destination);
+                        let replacement_generation = generation_at(&temp.path);
+                        let displaced_generation = generation_at(&displaced_path);
+
+                        // With an API backup name, ERROR_UNABLE_TO_MOVE_REPLACEMENT
+                        // documents that both original names remain. Prove that
+                        // exact identity state before treating it as a clean
+                        // failure; otherwise retain every artifact.
+                        if is_win32(&error, ERROR_UNABLE_TO_MOVE_REPLACEMENT.0)
+                            && destination_generation.as_ref() == Some(expected_generation)
+                            && replacement_generation.as_ref() == Some(&temp.generation)
+                            && displaced_generation.is_none()
+                        {
+                            return Err(format!(
+                                "replace {} failed before moving either identity: {error}",
+                                self.destination.display()
+                            ));
+                        }
+
+                        let _ = recovery
                             .as_mut()
                             .expect("existing replacement has a recovery snapshot")
-                            .commit();
+                            .retain_for_recovery();
                         temp.armed = false;
                         return Err(format!(
-                            "replace {} entered a partial Windows failure state ({error}); retained original snapshot at {} and replacement at {} for recovery",
+                            "replace {} entered a partial Windows failure state ({error}); retained the locked original snapshot at {}, destination identity {:?}, replacement identity {:?} at {}, and displaced identity {:?} at {}",
                             self.destination.display(),
                             recovery_path.display(),
-                            temp.path.display()
+                            destination_generation,
+                            replacement_generation,
+                            temp.path.display(),
+                            displaced_generation,
+                            displaced_path.display()
                         ));
                     }
                     return Err(format!(
                         "replace {} while preserving its DACL: {error}",
                         self.destination.display()
                     ));
+                }
+
+                let installed = generation_at(&self.destination);
+                let displaced = generation_at(&displaced_path);
+                if installed.as_ref() != Some(&temp.generation)
+                    || displaced.as_ref() != Some(expected_generation)
+                {
+                    // ReplaceFileW's backup captured the exact competing file.
+                    // Atomically restore it and keep our attempted replacement
+                    // at the original private temp name.
+                    let stable = generation_at(&self.destination) == installed
+                        && generation_at(&displaced_path) == displaced
+                        && generation_at(&temp.path).is_none();
+                    if stable
+                        && replace_file_call(&self.destination, &displaced_path, &temp.path).is_ok()
+                        && generation_at(&self.destination) == displaced
+                        && generation_at(&temp.path) == installed
+                    {
+                        return Err(format!(
+                            "{} or its prepared replacement changed at publication; restored the competing destination and published nothing",
+                            self.destination.display()
+                        ));
+                    }
+
+                    let recovery_path = recovery
+                        .as_mut()
+                        .expect("existing replacement has a recovery snapshot")
+                        .retain_for_recovery();
+                    temp.armed = false;
+                    return Err(format!(
+                        "{} or its prepared replacement changed at publication and rollback could not be proven; retained recovery snapshot {}, replacement {}, and displaced identity {}",
+                        self.destination.display(),
+                        recovery_path.display(),
+                        temp.path.display(),
+                        displaced_path.display()
+                    ));
+                }
+
+                // The exact flushed replacement is now installed and the API
+                // backup holds the exact displaced generation. Record that
+                // before cleanup so a cleanup problem is handled as a
+                // post-publication recovery outcome and still receives the
+                // mandatory FlushFileBuffers barrier in the shared layer.
+                self.published_generation
+                    .replace(Some(temp.generation.clone()));
+
+                if generation_at(&displaced_path).as_ref() == Some(expected_generation) {
+                    if let Err(error) = fs::remove_file(&displaced_path) {
+                        let recovery_path = recovery
+                            .as_mut()
+                            .expect("existing replacement has a recovery snapshot")
+                            .retain_for_recovery();
+                        temp.armed = false;
+                        return Ok(PublicationOutcome::RecoveryRequired(format!(
+                            "published {} but could not remove displaced identity {} ({error}); retained recovery snapshot {}",
+                            self.destination.display(),
+                            displaced_path.display(),
+                            recovery_path.display()
+                        )));
+                    }
+                } else {
+                    let recovery_path = recovery
+                        .as_mut()
+                        .expect("existing replacement has a recovery snapshot")
+                        .retain_for_recovery();
+                    temp.armed = false;
+                    return Ok(PublicationOutcome::RecoveryRequired(format!(
+                        "published {} but displaced identity changed at {}; refusing cleanup and retaining recovery snapshot {}",
+                        self.destination.display(),
+                        displaced_path.display(),
+                        recovery_path.display()
+                    )));
                 }
             }
             path_rules::PublicationKind::MoveWithoutReplacement => {
@@ -753,15 +939,81 @@ impl PlatformTransaction {
                         self.destination.display()
                     )
                 })?;
+                self.published_generation
+                    .replace(Some(temp.generation.clone()));
             }
         }
+        if generation_at(&self.destination).as_ref() != Some(&temp.generation) {
+            let recovery_path = recovery.as_mut().map(BackupGuard::retain_for_recovery);
+            temp.armed = false;
+            return Ok(PublicationOutcome::RecoveryRequired(format!(
+                "published destination {} no longer identifies the prepared replacement; retained published state for recovery{}",
+                self.destination.display(),
+                recovery_path
+                    .as_ref()
+                    .map(|path| format!(" and original snapshot at {}", path.display()))
+                    .unwrap_or_default()
+            )));
+        }
         temp.armed = false;
-        Ok(())
+        Ok(PublicationOutcome::Clean)
     }
 
     pub(crate) fn sync_parent(&self) -> Result<(), String> {
-        // Windows has no portable directory-fsync equivalent. The temporary
-        // file is explicitly FlushFileBuffers'd before ReplaceFileW/MoveFileExW.
+        // ReplaceFileW's nominal WRITE_THROUGH flag is explicitly unsupported.
+        // Re-open the installed identity with GENERIC_WRITE and use the
+        // documented FlushFileBuffers durability barrier, which writes all
+        // buffered information for this file to the device. Expected-absent
+        // publication additionally uses MoveFileExW(MOVEFILE_WRITE_THROUGH).
+        let destination_wide = wide(&self.destination);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(destination_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0 | FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|error| {
+            format!(
+                "open published destination {} for durability: {error}",
+                self.destination.display()
+            )
+        })?;
+        let owned = OwnedHandle(handle);
+        let info = handle_information(handle, &self.destination)?;
+        if !path_rules::attributes_are_safe(info.dwFileAttributes, false) {
+            return Err(format!(
+                "published destination {} changed before durability flush",
+                self.destination.display()
+            ));
+        }
+        let expected = self.published_generation.borrow().clone().ok_or_else(|| {
+            "no published identity available for durability validation".to_string()
+        })?;
+        if FileGeneration::from_info(&info) != expected {
+            return Err(format!(
+                "published destination {} changed before durability flush",
+                self.destination.display()
+            ));
+        }
+        unsafe { FlushFileBuffers(handle) }.map_err(|error| {
+            format!(
+                "flush published destination {} after replacement: {error}",
+                self.destination.display()
+            )
+        })?;
+        let after = handle_information(handle, &self.destination)?;
+        if FileGeneration::from_info(&after) != expected {
+            return Err(format!(
+                "published destination {} changed during durability flush",
+                self.destination.display()
+            ));
+        }
+        drop(owned);
         Ok(())
     }
 
@@ -818,6 +1070,7 @@ impl PlatformTransaction {
             file: Some(owned.into_file()),
             generation,
             armed: true,
+            announce_on_commit: announce,
         };
         let path_for_info = guard.path.clone();
         let synced_generation = {
@@ -832,9 +1085,6 @@ impl PlatformTransaction {
             )?)
         };
         guard.generation = synced_generation;
-        if announce {
-            eprintln!("tirith: backup at {}", guard.path.display());
-        }
         Ok(guard)
     }
 
@@ -925,11 +1175,20 @@ pub(crate) struct BackupGuard<'a> {
     file: Option<fs::File>,
     generation: FileGeneration,
     armed: bool,
+    announce_on_commit: bool,
 }
 
 impl BackupGuard<'_> {
     pub(crate) fn commit(&mut self) {
         self.armed = false;
+        if self.announce_on_commit {
+            eprintln!("tirith: backup at {}", self.path.display());
+        }
+    }
+
+    pub(crate) fn retain_for_recovery(&mut self) -> PathBuf {
+        self.armed = false;
+        self.path.clone()
     }
 }
 
@@ -1161,6 +1420,52 @@ mod tests {
         paths
     }
 
+    fn temporary_setup_paths(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                name.starts_with(".tirith-setup-") && name.ends_with(".tmp")
+            })
+            .collect()
+    }
+
+    fn displaced_paths(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .contains("tirith-displaced")
+            })
+            .collect()
+    }
+
+    struct ReplaceHookReset;
+
+    impl Drop for ReplaceHookReset {
+        fn drop(&mut self) {
+            REPLACE_FILE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn with_replace_hook<T>(
+        hook: impl FnMut(&Path, &Path, &Path) -> Result<(), u32> + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        REPLACE_FILE_TEST_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        let _reset = ReplaceHookReset;
+        run()
+    }
+
     fn update_with_backup(path: &Path, root: &Path, content: &str) -> Result<(), String> {
         transactional_update(path, root, false, |_| {
             Ok(FileUpdate::write_text(content.to_string(), 0o644).with_backup(true))
@@ -1378,6 +1683,137 @@ mod tests {
     }
 
     #[test]
+    fn destination_swap_after_validation_is_detected_and_competitor_is_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let original_hold = root.path().join("original-held-by-writer");
+        fs::write(&path, "original").unwrap();
+        let original_generation = generation_at(&path).unwrap();
+        let mut competitor_generation = None;
+
+        let error = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("tirith-update".into(), 0o644)),
+            |stage| {
+                if stage == TestStage::PublicationReady {
+                    fs::rename(&path, &original_hold).unwrap();
+                    fs::write(&path, "competing-writer").unwrap();
+                    competitor_generation = generation_at(&path);
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("restored the competing destination"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "competing-writer");
+        assert_eq!(generation_at(&path), competitor_generation);
+        assert_eq!(fs::read_to_string(&original_hold).unwrap(), "original");
+        assert_eq!(generation_at(&original_hold), Some(original_generation));
+        assert!(temporary_setup_paths(root.path()).is_empty());
+        assert!(displaced_paths(root.path()).is_empty());
+    }
+
+    #[test]
+    fn temp_swap_after_validation_never_publishes_attacker_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let held_prepared = root.path().join("prepared-held-by-writer");
+        fs::write(&path, "original").unwrap();
+        let original_generation = generation_at(&path).unwrap();
+        let mut attacker_path = None;
+        let mut attacker_generation = None;
+        let mut prepared_generation = None;
+
+        let error = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("tirith-update".into(), 0o644)),
+            |stage| {
+                if stage == TestStage::PublicationReady {
+                    let temp = temporary_setup_paths(root.path()).pop().unwrap();
+                    prepared_generation = generation_at(&temp);
+                    fs::rename(&temp, &held_prepared).unwrap();
+                    fs::write(&temp, "attacker-temp").unwrap();
+                    attacker_generation = generation_at(&temp);
+                    attacker_path = Some(temp);
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("restored the competing destination"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(generation_at(&path), Some(original_generation));
+        let attacker_path = attacker_path.unwrap();
+        assert_eq!(fs::read_to_string(&attacker_path).unwrap(), "attacker-temp");
+        assert_eq!(generation_at(&attacker_path), attacker_generation);
+        assert_eq!(fs::read_to_string(&held_prepared).unwrap(), "tirith-update");
+        assert_eq!(generation_at(&held_prepared), prepared_generation);
+    }
+
+    #[test]
+    fn unable_to_move_replacement_is_verified_as_clean_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "original").unwrap();
+        let original_generation = generation_at(&path).unwrap();
+
+        let error = with_replace_hook(
+            |_destination, _replacement, _displaced| Err(ERROR_UNABLE_TO_MOVE_REPLACEMENT.0),
+            || {
+                transactional_update(&path, root.path(), false, |_| {
+                    Ok(FileUpdate::write_text("tirith-update".into(), 0o644))
+                })
+                .unwrap_err()
+            },
+        );
+
+        assert!(error.contains("before moving either identity"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(generation_at(&path), Some(original_generation));
+        assert!(temporary_setup_paths(root.path()).is_empty());
+        assert!(displaced_paths(root.path()).is_empty());
+        assert!(backup_paths(root.path()).is_empty());
+    }
+
+    #[test]
+    fn unable_to_move_replacement_2_retains_exact_identity_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "original").unwrap();
+        let original_generation = generation_at(&path).unwrap();
+
+        let error = with_replace_hook(
+            |destination, _replacement, displaced| {
+                fs::rename(destination, displaced).unwrap();
+                Err(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2.0)
+            },
+            || {
+                transactional_update(&path, root.path(), false, |_| {
+                    Ok(FileUpdate::write_text("tirith-update".into(), 0o644))
+                })
+                .unwrap_err()
+            },
+        );
+
+        assert!(error.contains("partial Windows failure state"));
+        assert!(!path.exists());
+        let displaced = displaced_paths(root.path());
+        assert_eq!(displaced.len(), 1);
+        assert_eq!(fs::read_to_string(&displaced[0]).unwrap(), "original");
+        assert_eq!(generation_at(&displaced[0]), Some(original_generation));
+        let prepared = temporary_setup_paths(root.path());
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(fs::read_to_string(&prepared[0]).unwrap(), "tirith-update");
+        let recovery = backup_paths(root.path());
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(fs::read_to_string(&recovery[0]).unwrap(), "original");
+    }
+
+    #[test]
     fn publication_failure_rolls_back_only_its_backup_and_temp() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
@@ -1405,6 +1841,94 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(".tirith-setup-")
             }));
+    }
+
+    fn wait_for_marker(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for subprocess marker {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn subprocess_lock_child() {
+        let Some(role) = std::env::var_os("TIRITH_SETUP_LOCK_CHILD_ROLE") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os("TIRITH_SETUP_LOCK_ROOT").unwrap());
+        let path = root.join("config.txt");
+        match role.to_string_lossy().as_ref() {
+            "holder" => {
+                let entered = root.join("holder-entered");
+                let release = root.join("release-holder");
+                transactional_update_with_hook(
+                    &path,
+                    &root,
+                    |snapshot| {
+                        let mut content = snapshot.text(&path)?.unwrap().to_string();
+                        content.push_str("-holder");
+                        Ok(FileUpdate::write_text(content, 0o644))
+                    },
+                    |stage| {
+                        if stage == TestStage::TempSynced {
+                            fs::write(&entered, b"locked").unwrap();
+                            wait_for_marker(&release);
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            "contender" => {
+                assert!(PlatformTransaction::lock_is_contended(&path, &root).unwrap());
+                fs::write(root.join("contender-observed-lock"), b"contended").unwrap();
+                transactional_update(&path, &root, false, |snapshot| {
+                    let mut content = snapshot.text(&path)?.unwrap().to_string();
+                    content.push_str("-contender");
+                    Ok(FileUpdate::write_text(content, 0o644))
+                })
+                .unwrap();
+            }
+            other => panic!("unknown setup lock child role {other}"),
+        }
+    }
+
+    #[test]
+    fn cooperative_transactions_overlap_in_distinct_processes_and_recompute() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.txt");
+        fs::write(&path, "base").unwrap();
+        let test_binary = std::env::current_exe().unwrap();
+        let test_name = "cli::setup::fs_helpers::tests::subprocess_lock_child";
+
+        let mut holder = std::process::Command::new(&test_binary)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("TIRITH_SETUP_LOCK_CHILD_ROLE", "holder")
+            .env("TIRITH_SETUP_LOCK_ROOT", root.path())
+            .spawn()
+            .unwrap();
+        wait_for_marker(&root.path().join("holder-entered"));
+
+        let mut contender = std::process::Command::new(&test_binary)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("TIRITH_SETUP_LOCK_CHILD_ROLE", "contender")
+            .env("TIRITH_SETUP_LOCK_ROOT", root.path())
+            .spawn()
+            .unwrap();
+        wait_for_marker(&root.path().join("contender-observed-lock"));
+        assert!(holder.try_wait().unwrap().is_none());
+        assert!(contender.try_wait().unwrap().is_none());
+
+        fs::write(root.path().join("release-holder"), b"release").unwrap();
+        assert!(holder.wait().unwrap().success());
+        assert!(contender.wait().unwrap().success());
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("-holder") && content.contains("-contender"));
     }
 
     #[test]
@@ -1445,6 +1969,31 @@ mod tests {
         )
         .unwrap();
         assert!(read_to_string_scoped(&path, root.path()).is_err());
+    }
+
+    #[test]
+    fn transformed_payload_cap_is_enforced_before_parent_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing").join("too-large.json");
+        let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
+        let error = transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text(payload.clone(), 0o600))
+        })
+        .unwrap_err();
+        assert!(error.contains("setup file limit"));
+        assert!(!root.path().join("missing").exists());
+    }
+
+    #[test]
+    fn transformed_payload_exact_cap_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("exact-cap.json");
+        let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES);
+        transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text(payload.clone(), 0o600))
+        })
+        .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().len(), payload.len() as u64);
     }
 
     #[test]

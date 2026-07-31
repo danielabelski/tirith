@@ -72,7 +72,7 @@ pub fn merge_mcp_json_with_key(
             }
             backup = true;
         }
-        servers_obj.insert(server_name.to_string(), server_config);
+        servers_obj.insert(server_name.to_string(), server_config.clone());
         let content =
             serde_json::to_string_pretty(&config).map_err(|error| format!("serialize: {error}"))?;
         if dry_run {
@@ -140,7 +140,7 @@ pub fn merge_hooks_json(
 
         let backup = match matching_indices.len() {
             0 => {
-                event_arr.push(hook_entry);
+                event_arr.push(hook_entry.clone());
                 false
             }
             1 => {
@@ -162,7 +162,7 @@ pub fn merge_hooks_json(
                         path.display()
                     ));
                 }
-                event_arr[index] = hook_entry;
+                event_arr[index] = hook_entry.clone();
                 true
             }
             _ => {
@@ -182,7 +182,7 @@ pub fn merge_hooks_json(
                 for &index in matching_indices.iter().rev() {
                     event_arr.remove(index);
                 }
-                event_arr.push(hook_entry);
+                event_arr.push(hook_entry.clone());
                 true
             }
         };
@@ -252,7 +252,7 @@ pub fn merge_claude_mcp_server(
             }
             backup = true;
         }
-        servers_obj.insert(server_name.to_string(), server_config);
+        servers_obj.insert(server_name.to_string(), server_config.clone());
         let content =
             serde_json::to_string_pretty(&config).map_err(|error| format!("serialize: {error}"))?;
         if dry_run {

@@ -101,12 +101,34 @@ pub(crate) enum TransactionOutcome {
     Written,
 }
 
+/// Result of the atomic name operation. Some platforms can complete the
+/// publication but then be unable to remove a private displaced entry. That
+/// is not a clean success: the shared layer must still run the durability
+/// barrier, then return an actionable recovery error (and retain any requested
+/// backup) instead of silently reporting `Written`.
+pub(crate) enum PublicationOutcome {
+    Clean,
+    RecoveryRequired(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(test)]
 pub(crate) enum TestStage {
     TempSynced,
     SnapshotValidated,
+    PublicationReady,
     Published,
+}
+
+fn validate_update_size(update: &FileUpdate) -> Result<(), String> {
+    if let FileUpdate::Write { bytes, .. } = update {
+        if bytes.len() > MAX_SETUP_FILE_BYTES {
+            return Err(format!(
+                "setup output exceeds setup file limit of {MAX_SETUP_FILE_BYTES} bytes"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn transactional_update<F>(
@@ -116,7 +138,7 @@ pub(crate) fn transactional_update<F>(
     transform: F,
 ) -> Result<TransactionOutcome, String>
 where
-    F: FnOnce(&FileSnapshot) -> Result<FileUpdate, String>,
+    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
 {
     transactional_update_checked(path, scope_root, dry_run, transform, || Ok(()))
 }
@@ -133,7 +155,7 @@ pub(crate) fn transactional_update_checked<F, V>(
     revalidate_selection: V,
 ) -> Result<TransactionOutcome, String>
 where
-    F: FnOnce(&FileSnapshot) -> Result<FileUpdate, String>,
+    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     V: FnMut() -> Result<(), String>,
 {
     transactional_update_impl(
@@ -151,19 +173,26 @@ fn transactional_update_impl<F, V>(
     path: &Path,
     scope_root: &Path,
     dry_run: bool,
-    transform: F,
+    mut transform: F,
     mut revalidate_selection: V,
     #[cfg(test)] mut test_hook: impl FnMut(TestStage) -> Result<(), String>,
 ) -> Result<TransactionOutcome, String>
 where
-    F: FnOnce(&FileSnapshot) -> Result<FileUpdate, String>,
+    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     V: FnMut() -> Result<(), String>,
 {
+    // Compute and cap the transformed payload before creating a parent,
+    // stable lock, backup, or temporary file. Missing-parent dry runs and
+    // rejected oversized writes therefore remain completely non-mutating.
+    revalidate_selection()?;
+    let preflight_snapshot = FileSnapshot {
+        inner: super::fs_helpers::read_snapshot_scoped(path, scope_root)?,
+    };
+    let mut update = transform(&preflight_snapshot)?;
+    validate_update_size(&update)?;
+
     if dry_run {
-        let snapshot = FileSnapshot {
-            inner: super::fs_helpers::read_snapshot_scoped(path, scope_root)?,
-        };
-        return match transform(&snapshot)? {
+        return match update {
             FileUpdate::Unchanged => Ok(TransactionOutcome::Unchanged),
             FileUpdate::Write { .. } => Ok(TransactionOutcome::DryRunWouldWrite),
         };
@@ -175,7 +204,13 @@ where
     let snapshot = FileSnapshot {
         inner: transaction.read_snapshot()?,
     };
-    let update = transform(&snapshot)?;
+    if snapshot.inner != preflight_snapshot.inner {
+        // A cooperative writer may have completed between the side-effect-free
+        // preflight and our lock acquisition. Recompute under the lock so both
+        // updates are retained, then enforce the same cap again.
+        update = transform(&snapshot)?;
+        validate_update_size(&update)?;
+    }
     let FileUpdate::Write {
         bytes,
         mode,
@@ -203,15 +238,50 @@ where
     #[cfg(test)]
     test_hook(TestStage::SnapshotValidated)?;
 
-    transaction.publish(temp, &snapshot.inner)?;
-    // Publication completed. A later durability error must retain the backup
-    // as recovery material rather than rolling it back.
+    let publication = transaction.publish(
+        temp,
+        &snapshot.inner,
+        #[cfg(test)]
+        &mut test_hook,
+    )?;
+
+    // Publication completed. If a later durability gate fails, retain the
+    // exact backup and name it in the returned recovery message. A normal
+    // "backup at" announcement is emitted only after the durable commit.
+    #[cfg(test)]
+    let post_publication = test_hook(TestStage::Published).and_then(|()| transaction.sync_parent());
+    #[cfg(not(test))]
+    let post_publication = transaction.sync_parent();
+    if let Err(error) = post_publication {
+        let recovery_context = match publication {
+            PublicationOutcome::Clean => String::new(),
+            PublicationOutcome::RecoveryRequired(message) => format!("; {message}"),
+        };
+        if let Some(backup) = backup_guard.as_mut() {
+            let recovery = backup.retain_for_recovery();
+            return Err(format!(
+                "{error}; publication completed but durability was not confirmed{recovery_context}; retained recovery backup at {}",
+                recovery.display()
+            ));
+        }
+        return Err(format!(
+            "{error}; publication completed but durability was not confirmed{recovery_context}"
+        ));
+    }
+
+    if let PublicationOutcome::RecoveryRequired(message) = publication {
+        if let Some(backup) = backup_guard.as_mut() {
+            let recovery = backup.retain_for_recovery();
+            return Err(format!(
+                "{message}; retained recovery backup at {}",
+                recovery.display()
+            ));
+        }
+        return Err(message);
+    }
     if let Some(backup) = backup_guard.as_mut() {
         backup.commit();
     }
-    #[cfg(test)]
-    test_hook(TestStage::Published)?;
-    transaction.sync_parent()?;
 
     if backup_guard.is_some() {
         if let Err(error) = transaction.cleanup_old_backups(backup_guard.as_ref()) {
@@ -230,7 +300,7 @@ pub(crate) fn transactional_update_with_hook<F, H>(
     hook: H,
 ) -> Result<TransactionOutcome, String>
 where
-    F: FnOnce(&FileSnapshot) -> Result<FileUpdate, String>,
+    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     H: FnMut(TestStage) -> Result<(), String>,
 {
     transactional_update_impl(path, scope_root, false, transform, || Ok(()), hook)

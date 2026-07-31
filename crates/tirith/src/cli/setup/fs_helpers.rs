@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
+use super::fs_transaction::PublicationOutcome;
 pub(crate) use super::fs_transaction::{
     transactional_update, transactional_update_checked, FileUpdate, TransactionOutcome,
 };
@@ -132,6 +133,7 @@ fn scoped_parent(
             Ok(next) => dir = next,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
                 let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), component.as_ptr(), 0o755) };
+                let created = rc == 0;
                 if rc < 0 {
                     let mkdir_error = std::io::Error::last_os_error();
                     if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
@@ -141,6 +143,19 @@ fn scoped_parent(
                             canonical_root.display()
                         ));
                     }
+                }
+                if created {
+                    // `mkdirat` only makes the entry visible. Persist the
+                    // containing directory before descending so a crash cannot
+                    // leave a published file whose newly-created ancestor was
+                    // never committed to stable storage.
+                    dir.sync_all().map_err(|error| {
+                        format!(
+                            "sync directory after creating component {} below {}: {error}",
+                            component.to_string_lossy(),
+                            canonical_root.display()
+                        )
+                    })?;
                 }
                 dir = open_dir_at(&dir, &component).map_err(|e| {
                     format!(
@@ -171,6 +186,77 @@ fn scoped_parent(
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StableFileState {
+    identity: FileIdentity,
+    size: u64,
+    mode: u32,
+    digest: [u8; 32],
+}
+
+fn stable_state_at(parent: &fs::File, name: &CStr) -> Result<Option<StableFileState>, String> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(format!(
+            "open publication identity without following links: {error}"
+        ));
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let before = file
+        .metadata()
+        .map_err(|error| format!("inspect publication identity: {error}"))?;
+    if !before.is_file() || before.len() > super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 {
+        return Err("publication identity is not a bounded regular file".into());
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file)
+        .take(super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read publication identity: {error}"))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("reinspect publication identity: {error}"))?;
+    if before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || bytes.len() as u64 != after.len()
+    {
+        return Err("publication identity changed while it was inspected".into());
+    }
+    Ok(Some(StableFileState {
+        identity: FileIdentity::from_metadata(&after),
+        size: after.len(),
+        mode: after.mode() & 0o7777,
+        digest: Sha256::digest(&bytes).into(),
+    }))
+}
+
+fn stable_state_from_snapshot(snapshot: &PlatformSnapshot) -> Option<StableFileState> {
+    let SnapshotGeneration::Present(generation) = &snapshot.generation else {
+        return None;
+    };
+    let bytes = snapshot.bytes.as_ref()?;
+    Some(StableFileState {
+        identity: FileIdentity {
+            device: generation.device,
+            inode: generation.inode,
+        },
+        size: bytes.len() as u64,
+        mode: snapshot.mode.unwrap_or(0) & 0o7777,
+        digest: Sha256::digest(bytes).into(),
+    })
 }
 
 impl FileIdentity {
@@ -212,6 +298,48 @@ fn name_has_identity(parent: &fs::File, name: &CStr, expected: &FileIdentity) ->
     metadata_at(parent, name)
         .map(|metadata| FileIdentity::from_metadata(&metadata) == *expected)
         .unwrap_or(false)
+}
+
+fn exchange_names(parent: &fs::File, left: &CStr, right: &CStr) -> Result<(), String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            left.as_ptr(),
+            parent.as_raw_fd(),
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            left.as_ptr(),
+            parent.as_raw_fd(),
+            right.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    return Err("this Unix platform has no atomic pathname-exchange API".into());
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    if result < 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
 }
 
 impl FileGeneration {
@@ -402,7 +530,7 @@ fn stable_lock_name(destination: &CStr) -> CString {
     CString::new(name).expect("hex lock name contains no NUL")
 }
 
-fn open_lock(parent: &ScopedParent) -> Result<fs::File, String> {
+fn open_lock_file(parent: &ScopedParent) -> Result<fs::File, String> {
     let name = stable_lock_name(&parent.name);
     let fd = (0..3)
         .find_map(|attempt| {
@@ -440,6 +568,11 @@ fn open_lock(parent: &ScopedParent) -> Result<fs::File, String> {
     if !metadata.is_file() {
         return Err("stable setup lock is not a regular file — refusing for safety".into());
     }
+    Ok(file)
+}
+
+fn open_lock(parent: &ScopedParent) -> Result<fs::File, String> {
+    let file = open_lock_file(parent)?;
     file.lock_exclusive()
         .map_err(|error| format!("lock setup destination: {error}"))?;
     Ok(file)
@@ -461,6 +594,21 @@ impl PlatformTransaction {
             path: path.to_path_buf(),
             _lock: lock,
         })
+    }
+
+    #[cfg(test)]
+    fn lock_is_contended(path: &Path, scope_root: &Path) -> Result<bool, String> {
+        let parent = scoped_parent(path, scope_root, true)?
+            .ok_or_else(|| format!("cannot create parent for {}", path.display()))?;
+        let file = open_lock_file(&parent)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = fs2::FileExt::unlock(&file);
+                Ok(false)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(format!("probe setup destination lock: {error}")),
+        }
     }
 
     pub(crate) fn read_snapshot(&self) -> Result<PlatformSnapshot, String> {
@@ -499,7 +647,7 @@ impl PlatformTransaction {
             libc::openat(
                 self.parent.dir.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o600,
             )
         };
@@ -514,7 +662,7 @@ impl PlatformTransaction {
             name,
             file: Some(unsafe { fs::File::from_raw_fd(fd) }),
             identity: None,
-            generation: None,
+            state: None,
             armed: true,
         };
         let created_metadata = guard
@@ -538,7 +686,12 @@ impl PlatformTransaction {
         let synced_metadata = file
             .metadata()
             .map_err(|error| format!("inspect synced temporary file: {error}"))?;
-        guard.generation = Some(FileGeneration::from_metadata(&synced_metadata));
+        guard.state = Some(StableFileState {
+            identity: FileIdentity::from_metadata(&synced_metadata),
+            size: synced_metadata.len(),
+            mode: synced_metadata.mode() & 0o7777,
+            digest: Sha256::digest(bytes).into(),
+        });
         Ok(guard)
     }
 
@@ -546,24 +699,122 @@ impl PlatformTransaction {
         &self,
         mut temp: TempGuard<'_>,
         expected: &PlatformSnapshot,
-    ) -> Result<(), String> {
+        #[cfg(test)] test_hook: &mut impl FnMut(super::fs_transaction::TestStage) -> Result<(), String>,
+    ) -> Result<PublicationOutcome, String> {
         let expected_exists = expected.bytes.is_some();
+        let private_path = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(OsStr::from_bytes(temp.name.to_bytes()));
         temp.validate_name()?;
+        self.validate_snapshot(expected)?;
+        #[cfg(test)]
+        test_hook(super::fs_transaction::TestStage::PublicationReady)?;
+
         if expected_exists {
-            let result = unsafe {
-                libc::renameat(
-                    self.parent.dir.as_raw_fd(),
-                    temp.name.as_ptr(),
-                    self.parent.dir.as_raw_fd(),
-                    self.parent.name.as_ptr(),
+            let expected_state =
+                stable_state_from_snapshot(expected).expect("existing snapshot has a stable state");
+
+            // An atomic exchange retains both pathname operands. That lets us
+            // prove *after the syscall* that the installed inode is our exact
+            // flushed temp and the displaced inode is the exact generation we
+            // transformed. A pathname-only rename cannot provide this CAS
+            // property because either name can be swapped after validation.
+            exchange_names(&self.parent.dir, &temp.name, &self.parent.name).map_err(|error| {
+                format!(
+                    "publish {} by identity exchange: {error}",
+                    self.path.display()
                 )
+            })?;
+
+            let installed = match stable_state_at(&self.parent.dir, &self.parent.name) {
+                Ok(state) => state,
+                Err(error) => {
+                    temp.armed = false;
+                    return Ok(PublicationOutcome::RecoveryRequired(format!(
+                        "published {} but could not verify the installed identity ({error}); retained the private entry at {} for manual recovery",
+                        self.path.display(),
+                        private_path.display()
+                    )));
+                }
             };
-            if result < 0 {
-                return Err(format!(
-                    "publish {} atomically: {}",
+            let displaced = match stable_state_at(&self.parent.dir, &temp.name) {
+                Ok(state) => state,
+                Err(error) => {
+                    temp.armed = false;
+                    return Ok(PublicationOutcome::RecoveryRequired(format!(
+                        "published {} but could not verify its displaced identity at {} ({error}); retained both names for manual recovery",
+                        self.path.display(),
+                        private_path.display()
+                    )));
+                }
+            };
+            let installed_matches = installed.as_ref() == temp.state.as_ref();
+            let displaced_matches = displaced.as_ref() == Some(&expected_state);
+
+            if !installed_matches || !displaced_matches {
+                let rollback_safe = matches!(
+                    (
+                        stable_state_at(&self.parent.dir, &self.parent.name),
+                        stable_state_at(&self.parent.dir, &temp.name),
+                    ),
+                    (Ok(live_installed), Ok(live_displaced))
+                        if live_installed == installed && live_displaced == displaced
+                );
+                if rollback_safe
+                    && exchange_names(&self.parent.dir, &temp.name, &self.parent.name).is_ok()
+                {
+                    let restored = stable_state_at(&self.parent.dir, &self.parent.name);
+                    let replacement = stable_state_at(&self.parent.dir, &temp.name);
+                    if restored.as_ref().is_ok_and(|state| state == &displaced)
+                        && replacement.as_ref().is_ok_and(|state| state == &installed)
+                    {
+                        return Err(format!(
+                            "{} or its prepared replacement changed at publication; restored the competing destination and published nothing",
+                            self.path.display()
+                        ));
+                    }
+                }
+                temp.armed = false;
+                return Ok(PublicationOutcome::RecoveryRequired(format!(
+                    "{} or its prepared replacement changed at publication and rollback could not be proven; retained destination identity {:?} and private identity {:?} at {} for manual recovery",
                     self.path.display(),
-                    std::io::Error::last_os_error()
-                ));
+                    installed,
+                    displaced,
+                    private_path.display()
+                )));
+            }
+
+            // The old destination now has the private temporary name. Remove
+            // it only while that name still identifies the generation proved
+            // above. A mismatch is retained rather than deleting another
+            // writer's file.
+            let cleanup_state = stable_state_at(&self.parent.dir, &temp.name);
+            if cleanup_state
+                .as_ref()
+                .is_ok_and(|state| state.as_ref() == Some(&expected_state))
+            {
+                if unsafe { libc::unlinkat(self.parent.dir.as_raw_fd(), temp.name.as_ptr(), 0) } < 0
+                {
+                    let error = std::io::Error::last_os_error();
+                    let observed = stable_state_at(&self.parent.dir, &temp.name);
+                    temp.armed = false;
+                    return Ok(PublicationOutcome::RecoveryRequired(format!(
+                        "published {} but could not remove its displaced private entry at {} ({error}); observed identity state {:?}, manual recovery required",
+                        self.path.display(),
+                        private_path.display(),
+                        observed
+                    )));
+                }
+            } else {
+                temp.armed = false;
+                return Ok(PublicationOutcome::RecoveryRequired(format!(
+                    "published {} but the displaced private entry at {} could not be safely validated before cleanup ({:?}); retained it for manual recovery",
+                    self.path.display(),
+                    private_path.display(),
+                    cleanup_state
+                )));
             }
             temp.armed = false;
         } else {
@@ -585,21 +836,62 @@ impl PlatformTransaction {
                     std::io::Error::last_os_error()
                 ));
             }
+            let installed = match stable_state_at(&self.parent.dir, &self.parent.name) {
+                Ok(state) => state,
+                Err(error) => {
+                    temp.armed = false;
+                    return Ok(PublicationOutcome::RecoveryRequired(format!(
+                        "published new destination {} but could not verify its identity ({error}); retained private link {} for manual recovery",
+                        self.path.display(),
+                        private_path.display()
+                    )));
+                }
+            };
+            if installed.as_ref() != temp.state.as_ref() {
+                // A same-user writer replaced the source name between the
+                // validation and link. Remove only the extra hard-link to that
+                // still-present identity; never touch its source name.
+                let source = stable_state_at(&self.parent.dir, &temp.name);
+                let mut removed = false;
+                if source.as_ref().is_ok_and(|state| state == &installed) {
+                    removed = unsafe {
+                        libc::unlinkat(self.parent.dir.as_raw_fd(), self.parent.name.as_ptr(), 0)
+                    } == 0;
+                }
+                let live_destination = stable_state_at(&self.parent.dir, &self.parent.name);
+                if removed && live_destination.as_ref().is_ok_and(Option::is_none) {
+                    return Err(format!(
+                        "prepared replacement for {} changed at publication; removed the wrong identity and published nothing",
+                        self.path.display()
+                    ));
+                }
+                temp.armed = false;
+                return Ok(PublicationOutcome::RecoveryRequired(format!(
+                    "prepared replacement for {} changed during publication; rollback could not be proven (source {:?}, destination {:?}); retained private entry {} for manual recovery",
+                    self.path.display(),
+                    source,
+                    live_destination,
+                    private_path.display()
+                )));
+            }
             if unsafe { libc::unlinkat(self.parent.dir.as_raw_fd(), temp.name.as_ptr(), 0) } == 0 {
                 temp.armed = false;
             } else {
-                // The destination is already visible. Keep the guard armed so
-                // Drop retries cleanup, but continue to the mandatory parent
-                // fsync instead of reporting the completed publication as a
-                // failed transaction.
-                eprintln!(
-                    "tirith: published {} but initial temporary-link cleanup failed: {}",
+                // The destination is already visible, so the shared layer must
+                // still fsync the parent. Do not let Drop's best-effort cleanup
+                // turn an unresolved private name into a reported success.
+                let error = std::io::Error::last_os_error();
+                let observed = stable_state_at(&self.parent.dir, &temp.name);
+                temp.armed = false;
+                return Ok(PublicationOutcome::RecoveryRequired(format!(
+                    "published {} but could not remove its private temporary link at {} ({error}); observed identity state {:?}, manual recovery required",
                     self.path.display(),
-                    std::io::Error::last_os_error()
-                );
+                    private_path.display(),
+                    observed
+                )));
             }
         }
-        Ok(())
+        Ok(PublicationOutcome::Clean)
     }
 
     pub(crate) fn sync_parent(&self) -> Result<(), String> {
@@ -641,9 +933,15 @@ impl PlatformTransaction {
                 std::io::Error::last_os_error()
             ));
         }
+        let display_path = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(OsStr::from_bytes(name.to_bytes()));
         let mut guard = BackupGuard {
             parent: &self.parent.dir,
             name,
+            display_path,
             file: Some(unsafe { fs::File::from_raw_fd(fd) }),
             identity: None,
             armed: true,
@@ -676,14 +974,6 @@ impl PlatformTransaction {
             .dir
             .sync_all()
             .map_err(|error| format!("sync backup directory: {error}"))?;
-        eprintln!(
-            "tirith: backup at {}",
-            self.path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(OsStr::from_bytes(guard.name.to_bytes()))
-                .display()
-        );
         Ok(guard)
     }
 
@@ -744,18 +1034,17 @@ pub(crate) struct TempGuard<'a> {
     name: CString,
     file: Option<fs::File>,
     identity: Option<FileIdentity>,
-    generation: Option<FileGeneration>,
+    state: Option<StableFileState>,
     armed: bool,
 }
 
 impl TempGuard<'_> {
     fn validate_name(&self) -> Result<(), String> {
         let expected = self
-            .generation
+            .state
             .as_ref()
-            .expect("prepared temp has a synced generation");
-        let live = metadata_at(self.parent, &self.name)
-            .map(|metadata| FileGeneration::from_metadata(&metadata));
+            .expect("prepared temp has a synced state");
+        let live = stable_state_at(self.parent, &self.name)?;
         if live.as_ref() != Some(expected) {
             return Err(
                 "temporary setup file changed before publication; refusing for safety".into(),
@@ -782,6 +1071,7 @@ impl Drop for TempGuard<'_> {
 pub(crate) struct BackupGuard<'a> {
     parent: &'a fs::File,
     name: CString,
+    display_path: PathBuf,
     file: Option<fs::File>,
     identity: Option<FileIdentity>,
     armed: bool,
@@ -790,6 +1080,16 @@ pub(crate) struct BackupGuard<'a> {
 impl BackupGuard<'_> {
     pub(crate) fn commit(&mut self) {
         self.armed = false;
+        eprintln!("tirith: backup at {}", self.path().display());
+    }
+
+    pub(crate) fn retain_for_recovery(&mut self) -> PathBuf {
+        self.armed = false;
+        self.path()
+    }
+
+    fn path(&self) -> PathBuf {
+        self.display_path.clone()
     }
 }
 
@@ -1404,6 +1704,46 @@ mod tests {
     }
 
     #[test]
+    fn transformed_payload_accepts_exact_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("exact-cap.json");
+        let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES);
+        let outcome = transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text(payload.clone(), 0o600))
+        })
+        .unwrap();
+        assert_eq!(outcome, TransactionOutcome::Written);
+        assert_eq!(fs::metadata(path).unwrap().len(), payload.len() as u64);
+    }
+
+    #[test]
+    fn transformed_payload_rejects_cap_plus_one_before_live_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing").join("too-large.json");
+        let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
+        let error = transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text(payload.clone(), 0o600).with_backup(true))
+        })
+        .unwrap_err();
+        assert!(error.contains("setup file limit"));
+        assert!(!root.path().join("missing").exists());
+        assert!(backup_paths(root.path()).is_empty());
+    }
+
+    #[test]
+    fn transformed_payload_rejects_cap_plus_one_in_dry_run_without_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing").join("too-large.json");
+        let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
+        let error = transactional_update(&path, root.path(), true, |_| {
+            Ok(FileUpdate::write_text(payload.clone(), 0o600))
+        })
+        .unwrap_err();
+        assert!(error.contains("setup file limit"));
+        assert!(!root.path().join("missing").exists());
+    }
+
+    #[test]
     fn precreated_regular_and_symlink_backup_names_are_never_overwritten() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
@@ -1481,6 +1821,95 @@ mod tests {
         assert_eq!(
             fs::read_to_string(attacker_path.unwrap()).unwrap(),
             "attacker-replacement"
+        );
+    }
+
+    #[test]
+    fn destination_swap_after_validation_is_detected_and_competitor_is_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let original_hold = root.path().join("original-held-by-writer");
+        fs::write(&path, "original").unwrap();
+        let original_identity = FileIdentity::from_metadata(&fs::metadata(&path).unwrap());
+        let mut competitor_identity = None;
+
+        let error = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("tirith-update".into(), 0o644)),
+            |stage| {
+                if stage == TestStage::PublicationReady {
+                    fs::rename(&path, &original_hold).unwrap();
+                    fs::write(&path, "competing-writer").unwrap();
+                    competitor_identity =
+                        Some(FileIdentity::from_metadata(&fs::metadata(&path).unwrap()));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("restored the competing destination"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "competing-writer");
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(&path).unwrap()),
+            competitor_identity.unwrap()
+        );
+        assert_eq!(fs::read_to_string(&original_hold).unwrap(), "original");
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(&original_hold).unwrap()),
+            original_identity
+        );
+        assert!(temporary_setup_paths(root.path()).is_empty());
+    }
+
+    #[test]
+    fn temp_swap_after_validation_never_publishes_attacker_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let held_prepared = root.path().join("prepared-held-by-writer");
+        fs::write(&path, "original").unwrap();
+        let original_identity = FileIdentity::from_metadata(&fs::metadata(&path).unwrap());
+        let mut attacker_path = None;
+        let mut attacker_identity = None;
+        let mut prepared_identity = None;
+
+        let error = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("tirith-update".into(), 0o644)),
+            |stage| {
+                if stage == TestStage::PublicationReady {
+                    let temp = temporary_setup_paths(root.path()).pop().unwrap();
+                    prepared_identity =
+                        Some(FileIdentity::from_metadata(&fs::metadata(&temp).unwrap()));
+                    fs::rename(&temp, &held_prepared).unwrap();
+                    fs::write(&temp, "attacker-temp").unwrap();
+                    attacker_identity =
+                        Some(FileIdentity::from_metadata(&fs::metadata(&temp).unwrap()));
+                    attacker_path = Some(temp);
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("restored the competing destination"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(&path).unwrap()),
+            original_identity
+        );
+        let attacker_path = attacker_path.unwrap();
+        assert_eq!(fs::read_to_string(&attacker_path).unwrap(), "attacker-temp");
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(attacker_path).unwrap()),
+            attacker_identity.unwrap()
+        );
+        assert_eq!(fs::read_to_string(&held_prepared).unwrap(), "tirith-update");
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(held_prepared).unwrap()),
+            prepared_identity.unwrap()
         );
     }
 
@@ -1579,6 +2008,100 @@ mod tests {
         assert!(error.contains("durability"));
         assert_eq!(fs::read_to_string(path).unwrap(), "after");
         assert_eq!(backup_paths(root.path()).len(), 1);
+    }
+
+    fn wait_for_marker(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for subprocess marker {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn subprocess_lock_child() {
+        let Some(role) = std::env::var_os("TIRITH_SETUP_LOCK_CHILD_ROLE") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os("TIRITH_SETUP_LOCK_ROOT").unwrap());
+        let path = root.join("config.txt");
+        match role.to_string_lossy().as_ref() {
+            "holder" => {
+                let entered = root.join("holder-entered");
+                let release = root.join("release-holder");
+                transactional_update_with_hook(
+                    &path,
+                    &root,
+                    |snapshot| {
+                        let mut content = snapshot.text(&path)?.unwrap().to_string();
+                        content.push_str("-holder");
+                        Ok(FileUpdate::write_text(content, 0o644))
+                    },
+                    |stage| {
+                        if stage == TestStage::TempSynced {
+                            fs::write(&entered, b"locked").unwrap();
+                            wait_for_marker(&release);
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            "contender" => {
+                assert!(PlatformTransaction::lock_is_contended(&path, &root).unwrap());
+                fs::write(root.join("contender-observed-lock"), b"contended").unwrap();
+                transactional_update(&path, &root, false, |snapshot| {
+                    let mut content = snapshot.text(&path)?.unwrap().to_string();
+                    content.push_str("-contender");
+                    Ok(FileUpdate::write_text(content, 0o644))
+                })
+                .unwrap();
+            }
+            other => panic!("unknown setup lock child role {other}"),
+        }
+    }
+
+    #[test]
+    fn cooperative_transactions_overlap_in_distinct_processes_and_recompute() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.txt");
+        fs::write(&path, "base").unwrap();
+        let test_binary = std::env::current_exe().unwrap();
+        let test_name = "cli::setup::fs_helpers::tests::subprocess_lock_child";
+
+        let mut holder = std::process::Command::new(&test_binary)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("TIRITH_SETUP_LOCK_CHILD_ROLE", "holder")
+            .env("TIRITH_SETUP_LOCK_ROOT", root.path())
+            .spawn()
+            .unwrap();
+        wait_for_marker(&root.path().join("holder-entered"));
+
+        let mut contender = std::process::Command::new(&test_binary)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("TIRITH_SETUP_LOCK_CHILD_ROLE", "contender")
+            .env("TIRITH_SETUP_LOCK_ROOT", root.path())
+            .spawn()
+            .unwrap();
+        wait_for_marker(&root.path().join("contender-observed-lock"));
+        assert!(
+            holder.try_wait().unwrap().is_none(),
+            "holder must still own the lock when the contender proves overlap"
+        );
+        assert!(
+            contender.try_wait().unwrap().is_none(),
+            "contender must be blocked until the holder publishes"
+        );
+
+        fs::write(root.path().join("release-holder"), b"release").unwrap();
+        assert!(holder.wait().unwrap().success());
+        assert!(contender.wait().unwrap().success());
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("-holder") && content.contains("-contender"));
     }
 
     #[test]
