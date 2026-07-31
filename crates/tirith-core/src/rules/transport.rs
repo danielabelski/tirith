@@ -86,14 +86,39 @@ fn strip_quotes_simple(s: &str) -> String {
     }
 }
 
-/// Check command arguments for insecure TLS flags.
-pub fn check_insecure_flags(args: &[String], in_sink: bool) -> Vec<Finding> {
+/// Check command arguments for insecure TLS flags according to the resolved
+/// client's option grammar. In particular, curl permits boolean short options
+/// to be clustered, but the remainder of a cluster becomes data as soon as an
+/// option that consumes a value is reached.
+pub fn check_insecure_flags(client: &str, args: &[String], in_sink: bool) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let insecure_flags = ["-k", "--insecure", "--no-check-certificate"];
+    let mut options_ended = false;
+    let mut value_consumed = false;
 
     for arg in args {
         let clean = strip_quotes_simple(arg);
-        if insecure_flags.contains(&clean.as_str()) {
+        if options_ended {
+            continue;
+        }
+        if value_consumed {
+            value_consumed = false;
+            continue;
+        }
+        if clean == "--" {
+            options_ended = true;
+            continue;
+        }
+
+        let disables_verification = if client.eq_ignore_ascii_case("curl") {
+            let short_options = scan_curl_short_options(&clean);
+            value_consumed = short_options.consumes_next;
+            clean == "--insecure" || short_options.enables_insecure
+        } else if client.eq_ignore_ascii_case("wget") {
+            clean == "--no-check-certificate"
+        } else {
+            false
+        };
+        if disables_verification {
             let severity = if in_sink {
                 Severity::High
             } else {
@@ -121,6 +146,40 @@ pub fn check_insecure_flags(args: &[String], in_sink: bool) -> Vec<Finding> {
     findings
 }
 
+#[derive(Default)]
+struct CurlShortOptionScan {
+    enables_insecure: bool,
+    consumes_next: bool,
+}
+
+fn scan_curl_short_options(argument: &str) -> CurlShortOptionScan {
+    if !argument.starts_with('-') || argument.starts_with("--") || argument.len() < 2 {
+        return CurlShortOptionScan::default();
+    }
+
+    // curl short options whose next bytes are the option's attached value. The
+    // list follows curl's documented single-letter options; stopping here keeps
+    // `-ok` (output file named `k`) distinct from the boolean cluster `-skL`.
+    const TAKES_VALUE: &[char] = &[
+        'A', 'b', 'c', 'C', 'd', 'D', 'e', 'E', 'F', 'H', 'h', 'K', 'm', 'o', 'P', 'Q', 'r', 't',
+        'T', 'u', 'U', 'w', 'x', 'X', 'y', 'Y', 'z',
+    ];
+
+    let mut scan = CurlShortOptionScan::default();
+    let mut options = argument[1..].chars().peekable();
+    while let Some(option) = options.next() {
+        if option == 'k' {
+            scan.enables_insecure = true;
+            continue;
+        }
+        if TAKES_VALUE.contains(&option) {
+            scan.consumes_next = options.peek().is_none();
+            break;
+        }
+    }
+    scan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,14 +187,14 @@ mod tests {
     #[test]
     fn test_quoted_insecure_flags() {
         let args = vec!["\"-k\"".to_string(), "https://example.com".to_string()];
-        let findings = check_insecure_flags(&args, true);
+        let findings = check_insecure_flags("curl", &args, true);
         assert!(!findings.is_empty(), "should detect -k even when quoted");
     }
 
     #[test]
     fn test_single_quoted_insecure_flags() {
         let args = vec!["'-k'".to_string()];
-        let findings = check_insecure_flags(&args, true);
+        let findings = check_insecure_flags("curl", &args, true);
         assert!(
             !findings.is_empty(),
             "should detect -k even when single-quoted"
@@ -145,8 +204,85 @@ mod tests {
     #[test]
     fn test_unquoted_insecure_flags_still_work() {
         let args = vec!["-k".to_string()];
-        let findings = check_insecure_flags(&args, true);
+        let findings = check_insecure_flags("curl", &args, true);
         assert!(!findings.is_empty());
+    }
+
+    #[test]
+    fn curl_boolean_short_option_clusters_detect_insecure() {
+        for cluster in ["-skL", "-Lvk", "-ksS"] {
+            let findings = check_insecure_flags("curl", &[cluster.to_string()], true);
+            assert_eq!(findings.len(), 1, "cluster should enable -k: {cluster}");
+            assert_eq!(findings[0].rule_id, RuleId::InsecureTlsFlags);
+            assert_eq!(findings[0].severity, Severity::High);
+        }
+    }
+
+    #[test]
+    fn curl_attached_values_are_not_reparsed_as_short_options() {
+        for argument in ["-ok", "-Ask", "-dkey=k", "-Xk", "-Kconfig-k", "-Hk"] {
+            let findings = check_insecure_flags("curl", &[argument.to_string()], true);
+            assert!(
+                findings.is_empty(),
+                "attached value must not be parsed as a -k flag: {argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_separate_short_option_values_are_not_reparsed_as_flags() {
+        for args in [
+            vec!["-o".to_string(), "-k".to_string()],
+            vec!["-sH".to_string(), "-k".to_string()],
+        ] {
+            let findings = check_insecure_flags("curl", &args, true);
+            assert!(
+                findings.is_empty(),
+                "separate option value must not be parsed as -k: {args:?}"
+            );
+        }
+
+        let attached_value_then_real_flag = vec!["-Hheader".to_string(), "-k".to_string()];
+        assert_eq!(
+            check_insecure_flags("curl", &attached_value_then_real_flag, true).len(),
+            1,
+            "an attached value must not consume the following real option"
+        );
+    }
+
+    #[test]
+    fn option_terminator_and_non_curl_clusters_do_not_enable_insecure() {
+        let after_terminator = vec!["--".to_string(), "-k".to_string()];
+        assert!(check_insecure_flags("curl", &after_terminator, true).is_empty());
+        assert!(check_insecure_flags("wget", &["-skL".to_string()], true).is_empty());
+        assert!(check_insecure_flags("scp", &["--insecure".to_string()], true).is_empty());
+    }
+
+    #[test]
+    fn wrapped_curl_cluster_uses_resolved_client_grammar() {
+        for (command, shell) in [
+            (
+                "env MODE=safe curl -skL https://example.com/archive.tgz",
+                crate::tokenize::ShellType::Posix,
+            ),
+            (
+                r"C:\Windows\System32\curl.exe -skL https://example.com/archive.tgz",
+                crate::tokenize::ShellType::PowerShell,
+            ),
+        ] {
+            let findings = crate::rules::command::check(
+                command,
+                shell,
+                None,
+                crate::extract::ScanContext::Exec,
+            );
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::InsecureTlsFlags),
+                "resolved curl cluster should be blocked: {command}: {findings:?}"
+            );
+        }
     }
 
     #[test]

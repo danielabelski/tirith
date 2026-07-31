@@ -358,13 +358,14 @@ pub fn check(
 
     // source/. reuse transport rules: they execute the fetched body.
     for segment in &segments {
-        if let Some(ref cmd) = segment.command {
-            let cmd_base = normalize_cmd_base(cmd, shell);
-            if is_source_command(&cmd_base) {
-                let tls_findings =
-                    crate::rules::transport::check_insecure_flags(&segment.args, true);
-                findings.extend(tls_findings);
-            }
+        let Some((resolved_name, args)) = crate::extract::resolve_wrapped_command(segment) else {
+            continue;
+        };
+        let cmd_base = normalize_cmd_base(&resolved_name, shell);
+        if is_source_command(&cmd_base) {
+            let tls_findings =
+                crate::rules::transport::check_insecure_flags(&cmd_base, &args, true);
+            findings.extend(tls_findings);
         }
     }
 

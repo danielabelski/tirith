@@ -65,6 +65,14 @@ expected_action = "block"
 expected_rules = ["insecure_tls_flags"]
 
 [[fixture]]
+name = "curl_bundled_insecure_short_flag"
+min_milestone = 1
+input = "curl -skL https://example.com/install.sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
 name = "wget_no_check_cert"
 min_milestone = 1
 input = "wget --no-check-certificate https://example.com/install.sh"
