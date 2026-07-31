@@ -1095,4 +1095,33 @@ mod tests {
             );
         }
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_command_line_preserves_unpaired_surrogates() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let program = OsString::from_wide(&[u16::from(b'p'), 0xd800]);
+        let args = vec![
+            OsString::from_wide(&[0xdc00]),
+            OsString::from_wide(&[0xd801, u16::from(b' '), 0xdfff]),
+        ];
+
+        assert_eq!(
+            command_line_wide_from_parts(&program, &args),
+            vec![
+                u16::from(b'p'),
+                0xd800,
+                u16::from(b' '),
+                0xdc00,
+                u16::from(b' '),
+                u16::from(b'"'),
+                0xd801,
+                u16::from(b' '),
+                0xdfff,
+                u16::from(b'"'),
+            ],
+            "native quoting must preserve lone UTF-16 surrogates without replacement"
+        );
+    }
 }
