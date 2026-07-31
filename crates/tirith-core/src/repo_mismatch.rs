@@ -304,6 +304,14 @@ fn parse_known_git_host(url: &str) -> Option<KnownGitHost> {
     if !valid_repository_component(&repo) || components.is_empty() {
         return None;
     }
+    // GitLab reserves `-` as the delimiter before project routes such as
+    // `/-/raw/`. Check after normalizing the repository's optional `.git`
+    // suffix so `-.git` cannot become the reserved route segment later.
+    if matches!(kind, HostKind::GitLab)
+        && (repo == "-" || components.iter().any(|part| part == "-"))
+    {
+        return None;
+    }
     if !matches!(kind, HostKind::GitLab) && components.len() != 1 {
         return None;
     }
@@ -398,6 +406,9 @@ mod tests {
             "https://github.com/owner%2Frewrite/repo",
             "https://github.com/owner/%2E%2E/repo",
             "https://github.com.evil.invalid/owner/repo",
+            "https://gitlab.com/group/project/-/raw/HEAD/subdir",
+            "https://gitlab.com/group/-.git",
+            "https://gitlab.com/group/-%2Egit",
         ] {
             assert!(
                 parse_known_git_host(url).is_none(),
