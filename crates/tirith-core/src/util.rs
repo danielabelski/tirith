@@ -254,20 +254,29 @@ pub fn canonical_within(path: &Path, root: &Path) -> bool {
     let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return false;
     };
-    // Resolve path's real location even when `path` itself does not yet exist:
-    // canonicalize the (existing) parent, then re-attach the final component.
-    let resolved = match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => {
-            let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
-                return false;
-            };
-            canonical_parent.join(name)
-        }
-        // No parent or no filename (e.g. `/`, `.`, `..`): canonicalize directly.
-        _ => match std::fs::canonicalize(path) {
+    // Existing leaves must be canonicalized in full. Reattaching an existing
+    // leaf name to its canonical parent would accept a final-component symlink
+    // whose target escapes `root`.
+    let resolved = match std::fs::symlink_metadata(path) {
+        Ok(_) => match std::fs::canonicalize(path) {
             Ok(p) => p,
             Err(_) => return false,
         },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A genuinely missing target can still be classified by its real
+            // parent. A dangling symlink also reaches this arm via canonicalize,
+            // but symlink_metadata above sees the link itself and rejects it.
+            match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => {
+                    let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
+                        return false;
+                    };
+                    canonical_parent.join(name)
+                }
+                _ => return false,
+            }
+        }
+        Err(_) => return false,
     };
     resolved.starts_with(&canonical_root)
 }
@@ -577,18 +586,35 @@ pub fn fsync_parent_dir_logged(path: &Path, context: &str) {
 /// not propagated) and a no-op on non-unix; this does NOT recursively fsync a
 /// fully fresh ancestor chain (higher ancestors normally pre-exist).
 pub fn create_dir_durable(dir: &Path) -> std::io::Result<()> {
+    fn require_real_directory(dir: &Path) -> std::io::Result<()> {
+        let metadata = std::fs::symlink_metadata(dir)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists but is not a non-symlink directory",
+                    dir.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     match std::fs::create_dir(dir) {
         // We created the leaf: make its new entry in the parent durable.
         Ok(()) => {
+            require_real_directory(dir)?;
             fsync_parent_dir_logged(dir, "durable dir create");
             Ok(())
         }
-        // Already present (the steady-state path): nothing created, nothing to sync.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        // Already present: accept only a real directory. `create_dir` reports
+        // AlreadyExists for regular files and directory symlinks as well.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => require_real_directory(dir),
         // Ancestors missing (or a transient error): create the whole chain. Success
         // means we created `dir`, so fsync; otherwise propagate the original error.
         Err(_) => {
             std::fs::create_dir_all(dir)?;
+            require_real_directory(dir)?;
             fsync_parent_dir_logged(dir, "durable dir create");
             Ok(())
         }
@@ -979,6 +1005,25 @@ mod no_follow_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn canonical_within_resolves_existing_leaf_symlink() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"secret").unwrap();
+        let link = root.join("leaf.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        assert!(
+            !canonical_within(&link, &root),
+            "an existing leaf symlink that resolves outside root must be rejected"
+        );
+    }
+
     /// `sha256_from_handle` streams a digest that matches an independent Rust
     /// computation, and a file over the budget yields `BudgetExceeded` (no
     /// unbounded hash, no digest).
@@ -1248,6 +1293,28 @@ mod write_file_atomic_tests {
         let leaf = tmp.path().join("c");
         super::create_dir_durable(&leaf).expect("create leaf");
         assert!(leaf.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_durable_rejects_existing_symlink_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("linked-dir");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        assert!(
+            super::create_dir_durable(&link).is_err(),
+            "an existing directory symlink must not be accepted as a durable directory"
+        );
+    }
+
+    #[test]
+    fn create_dir_durable_rejects_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(super::create_dir_durable(&file).is_err());
     }
 }
 
