@@ -234,7 +234,9 @@ pub fn check_dsl(
             continue;
         };
 
-        if custom_rule_dsl::evaluate(clause, ctx) {
+        if custom_rule_dsl::evaluate_in_context(clause, ctx, context)
+            == custom_rule_dsl::TruthValue::True
+        {
             findings.push(make_finding(
                 rule,
                 format!("when-clause matched (rule '{}')", rule.id),
@@ -450,6 +452,36 @@ mod tests {
         assert_eq!(compiled.len(), 1);
         assert!(compiled[0].is_dsl());
         assert!(any_dsl_rules(&compiled));
+    }
+
+    #[test]
+    fn test_check_dsl_does_not_fire_from_negated_unavailable_branch() {
+        let rule = make_dsl_rule(
+            "mixed-any",
+            WhenClause::Any(vec![
+                WhenClause::CommandUsesSudo(true),
+                WhenClause::Not(Box::new(WhenClause::FilePathMatches(r"secret".into()))),
+            ]),
+            &["exec", "file"],
+        );
+        let compiled = compile_rules(&[rule]);
+        assert_eq!(compiled.len(), 1);
+
+        let command_miss = DslEvalContext::default();
+        assert!(
+            check_dsl(&command_miss, ScanContext::Exec, &compiled).is_empty(),
+            "not(file.path_matches) must not become true when file facts are unavailable"
+        );
+
+        let command_hit = DslEvalContext {
+            uses_sudo: true,
+            ..DslEvalContext::default()
+        };
+        assert_eq!(
+            check_dsl(&command_hit, ScanContext::Exec, &compiled).len(),
+            1,
+            "the legitimate command branch must still fire"
+        );
     }
 
     #[test]

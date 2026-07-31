@@ -343,6 +343,27 @@ pub struct DslEvalContext<'a> {
     pub mcp_tool: Option<&'a str>,
 }
 
+/// Three-valued result for context-aware DSL evaluation. `Unknown` means the
+/// current scan context did not populate the fact family a predicate needs; it
+/// is never coerced to `false`, because negating that value would manufacture a
+/// match from absent data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruthValue {
+    True,
+    False,
+    Unknown,
+}
+
+impl From<bool> for TruthValue {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::True
+        } else {
+            Self::False
+        }
+    }
+}
+
 /// The set of [`ScanContext`]s in which a clause CAN be fully evaluated — every
 /// fact it references is populated by [`build_dsl_backing`] for that context.
 /// The clause's satisfiable-context set (CodeRabbit M13 round-9 R9-1).
@@ -687,7 +708,10 @@ fn cached_regex(pat: &str) -> Option<Regex> {
     })
 }
 
-/// Evaluate a `when:` clause against the extracted analysis data.
+/// Evaluate a `when:` clause against a context that promises all referenced
+/// fact families are available. Enforcement callers should prefer
+/// [`evaluate_in_context`]; this compatibility facade preserves the original
+/// two-valued API for tests and callers with complete data.
 pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
     match clause {
         WhenClause::All(cs) => cs.iter().all(|c| evaluate(c, ctx)),
@@ -748,6 +772,87 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
 
         WhenClause::AgentKind(k) => ctx.agent_kind.is_some_and(|a| a.eq_ignore_ascii_case(k)),
         WhenClause::McpTool(t) => ctx.mcp_tool.is_some_and(|m| m.eq_ignore_ascii_case(t)),
+    }
+}
+
+fn predicate_available(clause: &WhenClause, ctx: &DslEvalContext, context: ScanContext) -> bool {
+    match clause {
+        WhenClause::CommandHasPipelineTo(_) | WhenClause::CommandUsesSudo(_) => {
+            matches!(context, ScanContext::Exec | ScanContext::Paste)
+        }
+        WhenClause::CommandCwdIn(_) => {
+            matches!(context, ScanContext::Exec | ScanContext::Paste) && ctx.cwd.is_some()
+        }
+        WhenClause::UrlHost(_)
+        | WhenClause::UrlHostMatches(_)
+        | WhenClause::UrlScheme(_)
+        | WhenClause::UrlReputation(_)
+        | WhenClause::UrlDomainNotIn(_)
+        | WhenClause::PackageEcosystem(_)
+        | WhenClause::PackageNameMatches(_)
+        | WhenClause::PackageReputation(_) => {
+            matches!(context, ScanContext::Exec | ScanContext::Paste)
+        }
+        WhenClause::FilePathMatches(_) => {
+            context == ScanContext::FileScan && ctx.file_path.is_some()
+        }
+        WhenClause::AgentKind(_) => ctx.agent_kind.is_some(),
+        WhenClause::McpTool(_) => ctx.mcp_tool.is_some(),
+        WhenClause::All(_) | WhenClause::Any(_) | WhenClause::Not(_) => true,
+    }
+}
+
+/// Evaluate a clause using strong Kleene logic for facts unavailable in the
+/// current scan context.
+///
+/// - `not(unknown)` remains `unknown`.
+/// - `all` lets `false` dominate, otherwise propagates `unknown`.
+/// - `any` lets `true` dominate, otherwise propagates `unknown`.
+///
+/// Enforcement fires a rule only for [`TruthValue::True`].
+pub fn evaluate_in_context(
+    clause: &WhenClause,
+    ctx: &DslEvalContext,
+    context: ScanContext,
+) -> TruthValue {
+    match clause {
+        WhenClause::All(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match evaluate_in_context(child, ctx, context) {
+                    TruthValue::False => return TruthValue::False,
+                    TruthValue::Unknown => saw_unknown = true,
+                    TruthValue::True => {}
+                }
+            }
+            if saw_unknown {
+                TruthValue::Unknown
+            } else {
+                TruthValue::True
+            }
+        }
+        WhenClause::Any(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match evaluate_in_context(child, ctx, context) {
+                    TruthValue::True => return TruthValue::True,
+                    TruthValue::Unknown => saw_unknown = true,
+                    TruthValue::False => {}
+                }
+            }
+            if saw_unknown {
+                TruthValue::Unknown
+            } else {
+                TruthValue::False
+            }
+        }
+        WhenClause::Not(child) => match evaluate_in_context(child, ctx, context) {
+            TruthValue::True => TruthValue::False,
+            TruthValue::False => TruthValue::True,
+            TruthValue::Unknown => TruthValue::Unknown,
+        },
+        leaf if !predicate_available(leaf, ctx, context) => TruthValue::Unknown,
+        leaf => evaluate(leaf, ctx).into(),
     }
 }
 
@@ -1252,6 +1357,73 @@ any:
         assert!(
             sat.intersects_declared(&[ScanContext::FileScan]),
             "any(command, file) must be evaluable under [file] (file branch)"
+        );
+    }
+
+    #[test]
+    fn context_evaluation_does_not_negate_unavailable_facts_into_matches() {
+        let clause = WhenClause::Any(vec![
+            WhenClause::CommandUsesSudo(true),
+            WhenClause::Not(Box::new(WhenClause::FilePathMatches(
+                r"secrets".to_string(),
+            ))),
+        ]);
+
+        let command_miss = DslEvalContext::default();
+        assert_eq!(
+            evaluate_in_context(&clause, &command_miss, ScanContext::Exec),
+            TruthValue::Unknown,
+            "an unavailable file fact must stay unknown under not"
+        );
+
+        let command_hit = DslEvalContext {
+            uses_sudo: true,
+            ..DslEvalContext::default()
+        };
+        assert_eq!(
+            evaluate_in_context(&clause, &command_hit, ScanContext::Exec),
+            TruthValue::True,
+            "a true available branch must dominate an unknown branch"
+        );
+
+        let file_hit = DslEvalContext {
+            file_path: Some("/repo/public.txt"),
+            ..DslEvalContext::default()
+        };
+        assert_eq!(
+            evaluate_in_context(&clause, &file_hit, ScanContext::FileScan),
+            TruthValue::True,
+            "the file branch must still work in its legitimate context"
+        );
+    }
+
+    #[test]
+    fn context_evaluation_uses_kleene_combinator_semantics() {
+        let command_false_and_file_unknown = WhenClause::All(vec![
+            WhenClause::CommandUsesSudo(true),
+            WhenClause::FilePathMatches(r"secret".to_string()),
+        ]);
+        assert_eq!(
+            evaluate_in_context(
+                &command_false_and_file_unknown,
+                &DslEvalContext::default(),
+                ScanContext::Exec,
+            ),
+            TruthValue::False,
+            "false must dominate unknown in all"
+        );
+
+        let nested_unknown = WhenClause::Not(Box::new(WhenClause::Not(Box::new(
+            WhenClause::FilePathMatches(r"secret".to_string()),
+        ))));
+        assert_eq!(
+            evaluate_in_context(
+                &nested_unknown,
+                &DslEvalContext::default(),
+                ScanContext::Exec,
+            ),
+            TruthValue::Unknown,
+            "any depth of negation must preserve unknown"
         );
     }
 
