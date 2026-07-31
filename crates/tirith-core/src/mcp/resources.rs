@@ -64,6 +64,8 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                 "panic_files": result.panic_files.iter()
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>(),
+                "analysis_incomplete": !result.coverage_gaps.is_empty(),
+                "coverage_gaps": &result.coverage_gaps,
                 "total_findings": result.total_findings(),
                 "files": result.file_results.iter()
                     .filter(|r| !r.findings.is_empty())
@@ -130,6 +132,8 @@ fn read_project_safety() -> ToolCallResult {
         "panic_files": result.panic_files.iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
+        "analysis_incomplete": !result.coverage_gaps.is_empty(),
+        "coverage_gaps": &result.coverage_gaps,
         "total_findings": total,
         "files": result.file_results.iter()
             .filter(|r| !r.findings.is_empty())
@@ -149,11 +153,26 @@ fn read_project_safety() -> ToolCallResult {
             result.panic_files.len()
         )
     };
-    let text = if total == 0 {
+    let coverage_note = if result.coverage_gaps.is_empty() {
+        String::new()
+    } else {
         format!(
-            "Project safety: {} files scanned, no issues found.{panic_note}",
-            result.scanned_count
+            " WARNING: analysis incomplete due to {} coverage gap(s).",
+            result.coverage_gaps.len()
         )
+    };
+    let text = if total == 0 {
+        if result.coverage_gaps.is_empty() {
+            format!(
+                "Project safety: {} files scanned, no issues found.{panic_note}",
+                result.scanned_count
+            )
+        } else {
+            format!(
+                "Project safety: {} files scanned; analysis incomplete.{coverage_note}{panic_note}",
+                result.scanned_count
+            )
+        }
     } else {
         let files_with = result
             .file_results
@@ -161,8 +180,8 @@ fn read_project_safety() -> ToolCallResult {
             .filter(|r| !r.findings.is_empty())
             .count();
         format!(
-            "Project safety: {} files scanned, {} finding(s) in {} file(s).{panic_note}",
-            result.scanned_count, total, files_with
+            "Project safety: {} files scanned, {} finding(s) in {} file(s).{coverage_note}{panic_note}",
+            result.scanned_count, total, files_with,
         )
     };
 

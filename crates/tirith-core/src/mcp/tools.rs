@@ -492,25 +492,7 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         crate::redact::redact_findings(&mut fr.findings, &policy.dlp_custom_patterns);
     }
 
-    let structured = json!({
-        "scanned_count": result.scanned_count,
-        "skipped_count": result.skipped_count,
-        "truncated": result.truncated,
-        "truncation_reason": result.truncation_reason,
-        "panic_count": result.panic_files.len(),
-        "panic_files": result.panic_files.iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "total_findings": result.total_findings(),
-        "files": result.file_results.iter()
-            .filter(|r| !r.findings.is_empty())
-            .map(|r| json!({
-                "path": r.path.display().to_string(),
-                "is_config_file": r.is_config_file,
-                "findings": r.findings,
-            }))
-            .collect::<Vec<_>>(),
-    });
+    let structured = directory_scan_structured(&result);
 
     let text = format_dir_scan_text(&result);
 
@@ -522,6 +504,30 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         is_error: false,
         structured_content: Some(structured),
     }
+}
+
+fn directory_scan_structured(result: &scan::ScanResult) -> Value {
+    json!({
+        "scanned_count": result.scanned_count,
+        "skipped_count": result.skipped_count,
+        "truncated": result.truncated,
+        "truncation_reason": result.truncation_reason,
+        "panic_count": result.panic_files.len(),
+        "panic_files": result.panic_files.iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "analysis_incomplete": !result.coverage_gaps.is_empty(),
+        "coverage_gaps": &result.coverage_gaps,
+        "total_findings": result.total_findings(),
+        "files": result.file_results.iter()
+            .filter(|r| !r.findings.is_empty())
+            .map(|r| json!({
+                "path": r.path.display().to_string(),
+                "is_config_file": r.is_config_file,
+                "findings": r.findings,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
@@ -707,7 +713,21 @@ fn format_dir_scan_text(result: &scan::ScanResult) -> String {
             result.panic_files.len()
         )
     };
+    let coverage_note = if result.coverage_gaps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n  WARNING: analysis incomplete due to {} coverage gap(s).",
+            result.coverage_gaps.len()
+        )
+    };
     if total == 0 {
+        if !result.coverage_gaps.is_empty() {
+            return format!(
+                "{} files scanned; analysis incomplete.{coverage_note}{panic_note}",
+                result.scanned_count
+            );
+        }
         return format!(
             "{} files scanned, no issues found.{panic_note}",
             result.scanned_count
@@ -739,6 +759,7 @@ fn format_dir_scan_text(result: &scan::ScanResult) -> String {
             out.push_str(&format!("\n  {reason}\n"));
         }
     }
+    out.push_str(&coverage_note);
     out.push_str(&panic_note);
     out
 }
@@ -747,6 +768,35 @@ fn format_dir_scan_text(result: &scan::ScanResult) -> String {
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_scan_text_never_claims_clean_when_coverage_has_gaps() {
+        let missing = PathBuf::from("/project/CLAUDE.md");
+        let result = scan::ScanResult {
+            file_results: Vec::new(),
+            scanned_count: 0,
+            skipped_count: 1,
+            truncated: false,
+            truncation_reason: None,
+            panic_files: Vec::new(),
+            coverage_gaps: vec![scan::CoverageGap {
+                location: crate::location::SubjectLocation::from_path(missing),
+                kind: scan::CoverageGapKind::Unreadable,
+                sha256: None,
+            }],
+        };
+
+        let text = format_dir_scan_text(&result);
+        let structured = directory_scan_structured(&result);
+
+        assert!(text.contains("incomplete"), "gap must be explicit: {text}");
+        assert!(
+            !text.contains("no issues found"),
+            "an incomplete scan must never claim clean: {text}"
+        );
+        assert_eq!(structured["analysis_incomplete"], true);
+        assert_eq!(structured["coverage_gaps"][0]["kind"], "unreadable");
+    }
 
     #[test]
     fn test_cloaking_diff_text_is_dlp_redacted() {

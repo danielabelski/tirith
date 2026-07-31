@@ -213,110 +213,108 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         &config.include_patterns,
         &config.exclude_patterns,
     );
-    let mut files = collected.text_candidates;
-    // B8a — magic-dispatch each artifact candidate (`.whl`/`.so`/...) into the real
-    // artifact scanner instead of recording a blanket `Unsupported` gap. A wheel is
-    // inspected (A4 reader + B5/B6/B7) and its findings become member-qualified
-    // `FileScanResult`s that flow through the existing JSON/SARIF/exit path; an
-    // unsupported/unreadable candidate (an sdist, a bare `.so` with no archive
-    // wrapper, an oversize file) still records a coverage gap so it is never
-    // silently dropped.
-    //
-    // `max_files` bounds this work too (A2 re-review): artifact INSPECTION (open + archive
-    // walk + B5/B6/B7) is even more expensive than the old hash, so an artifact-heavy tree
-    // must not force unbounded inspection before the text-file cap below. Cap the candidates
-    // inspected; any beyond the cap are folded into the skip accounting below, not dropped
-    // silently.
-    let artifact_total = collected.artifact_candidates.len();
-    let mut coverage_gaps: Vec<CoverageGap> = Vec::new();
-    let mut artifact_results: Vec<FileScanResult> = Vec::new();
-    // Distinct artifacts that were actually inspected (NOT the per-finding result
-    // count), so `scanned_count` reflects files scanned, not findings produced.
-    let mut artifacts_inspected = 0usize;
+    let mut candidates = Vec::with_capacity(
+        collected.text_candidates.len()
+            + collected.linked_text_candidates.len()
+            + collected.artifact_candidates.len(),
+    );
+    candidates.extend(
+        collected
+            .text_candidates
+            .into_iter()
+            .map(|path| ScanCandidate::Text {
+                logical_path: path.clone(),
+                read_path: path,
+            }),
+    );
+    candidates.extend(
+        collected
+            .linked_text_candidates
+            .into_iter()
+            .map(|candidate| ScanCandidate::Text {
+                read_path: candidate.read_path,
+                logical_path: candidate.logical_path,
+            }),
+    );
+    candidates.extend(
+        collected
+            .artifact_candidates
+            .into_iter()
+            .map(ScanCandidate::Artifact),
+    );
+    candidates.sort_by(|a, b| {
+        let a_priority = is_priority_file(a.logical_path());
+        let b_priority = is_priority_file(b.logical_path());
+        match (a_priority, b_priority) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.logical_path().cmp(b.logical_path()),
+        }
+    });
+
+    // One global budget covers every analysis attempt, regardless of whether
+    // the candidate is text or an artifact. Collection failures already represent
+    // attempts that could not be made, so they are skips but do not consume this
+    // analysis-attempt budget.
+    let candidate_total = candidates.len();
+    let max_candidates = config.max_files.unwrap_or(usize::MAX);
+    let budget_skipped = candidate_total.saturating_sub(max_candidates);
+    candidates.truncate(max_candidates);
+
+    let mut coverage_gaps = collected.coverage_gaps;
+    let mut file_results = Vec::new();
+    let mut skipped_count = coverage_gaps.len() + budget_skipped;
+    let mut scanned_count = 0usize;
+    let mut panic_files = Vec::new();
+
     // Load the threat DB ONCE for the whole artifact pass (the cache re-checks mtime
     // internally, so this is cheap, but we still hold the Arc rather than re-fetching
     // per artifact) and thread it into the hash-lookup seam. Latent today (the
     // hash-lookup seam returns None until the DB-B methods land), but this is the
     // correct wiring so the artifact path consults the same DB the engine does.
     let artifact_threat_db = crate::threatdb::ThreatDb::cached();
-    for p in collected
-        .artifact_candidates
-        .iter()
-        .take(config.max_files.unwrap_or(usize::MAX))
-    {
-        let (mut results, gap) = inspect_artifact_candidate(p, artifact_threat_db.as_deref());
-        if gap.is_none() {
-            artifacts_inspected += 1;
-        }
-        artifact_results.append(&mut results);
-        if let Some(gap) = gap {
-            coverage_gaps.push(gap);
+    for candidate in candidates {
+        match candidate {
+            ScanCandidate::Artifact(path) => {
+                let (mut results, gap) =
+                    inspect_artifact_candidate(&path, artifact_threat_db.as_deref());
+                if let Some(gap) = gap {
+                    skipped_count += 1;
+                    coverage_gaps.push(gap);
+                } else {
+                    scanned_count += 1;
+                }
+                file_results.append(&mut results);
+            }
+            ScanCandidate::Text {
+                read_path,
+                logical_path,
+            } => match scan_single_file_guarded_at(&read_path, &logical_path) {
+                GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(result)) => {
+                    scanned_count += 1;
+                    file_results.push(result)
+                }
+                GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => {
+                    skipped_count += 1;
+                    coverage_gaps.push(gap);
+                }
+                GuardedScanOutcome::RulePanic(gap) => {
+                    skipped_count += 1;
+                    panic_files.push(logical_path);
+                    coverage_gaps.push(gap);
+                }
+            },
         }
     }
-    // Candidates beyond the cap were neither inspected nor gapped; count them as skipped.
-    let artifact_skipped = artifact_total.saturating_sub(config.max_files.unwrap_or(usize::MAX));
 
-    files.sort_by(|a, b| {
-        let a_priority = is_priority_file(a);
-        let b_priority = is_priority_file(b);
-        match (a_priority, b_priority) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.cmp(b),
-        }
+    let truncated = budget_skipped > 0;
+    let truncation_reason = config.max_files.and_then(|max| {
+        truncated
+            .then(|| format!("Scan capped at {max} files/artifacts ({budget_skipped} skipped)."))
     });
 
-    let mut truncated = artifact_skipped > 0;
-    let mut truncation_reason = None;
-    let mut skipped_count = artifact_skipped;
-
-    if let Some(max) = config.max_files {
-        if files.len() > max {
-            skipped_count += files.len() - max;
-            files.truncate(max);
-            truncated = true;
-        }
-        if skipped_count > 0 {
-            truncation_reason = Some(format!(
-                "Scan capped at {max} files/artifacts ({skipped_count} skipped)."
-            ));
-        }
-    }
-
-    let mut file_results = Vec::new();
-    // Artifact-inspection findings (member-qualified) join the file results so they
-    // flow through the same JSON/SARIF/human emitters and exit-code logic. They are
-    // counted once per artifact (`artifacts_inspected`), not once per result, so a
-    // wheel with several findings still counts as one scanned file.
-    file_results.append(&mut artifact_results);
-    let mut text_files_scanned = 0usize;
-    let mut panic_files = Vec::new();
-    for file_path in &files {
-        // Panic in any rule is bounded to its file; the rest of the walk
-        // continues. A panic is recorded in `panic_files` (not just folded into
-        // `skipped_count`) so callers can tell an incomplete scan from benign
-        // size/IO skips; it is ALSO pushed as a `Panicked` coverage gap.
-        match scan_single_file_guarded(file_path) {
-            GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(result)) => {
-                text_files_scanned += 1;
-                file_results.push(result)
-            }
-            GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => {
-                skipped_count += 1;
-                coverage_gaps.push(gap);
-            }
-            GuardedScanOutcome::RulePanic(gap) => {
-                skipped_count += 1;
-                panic_files.push(file_path.clone());
-                coverage_gaps.push(gap);
-            }
-        }
-    }
-
     ScanResult {
-        // Files scanned = text files + distinct artifacts inspected (a wheel with
-        // multiple findings is one scanned file, not several).
-        scanned_count: text_files_scanned + artifacts_inspected,
+        scanned_count,
         skipped_count,
         truncated,
         truncation_reason,
@@ -528,7 +526,11 @@ fn hash_path_within_budget(path: &Path) -> Option<String> {
 /// `HashBudgetExceeded`, `Unreadable`, `Unsupported`) rather than a silent skip,
 /// so a skip can never be read as "clean".
 pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
-    let location = SubjectLocation::from_path(file_path.to_path_buf());
+    scan_single_file_at(file_path, file_path)
+}
+
+fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome {
+    let location = SubjectLocation::from_path(logical_path.to_path_buf());
 
     // An artifact candidate (`.so`/`.whl`/...) has no analyzer yet, so it is an
     // `Unsupported` coverage gap even on the DIRECT `scan --file`/single-file path.
@@ -536,17 +538,17 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
     // non-UTF-8 filename) and hashed from the SAME open handle below, never a path
     // reopen, so the recorded digest is exactly the inode we opened.
     let is_artifact_candidate =
-        classify_collected_path(file_path) == CollectedFileKind::ArtifactCandidate;
+        classify_collected_path(logical_path) == CollectedFileKind::ArtifactCandidate;
 
     // Open no-follow with NO byte cap so we get the handle even for an oversized
     // file (we want to classify + hash it, not reject it outright). `open` reads
     // nothing, so a multi-terabyte file is fine here; the size gate is below.
-    let file = match crate::util::open_read_no_follow_capped(file_path, u64::MAX) {
+    let file = match crate::util::open_read_no_follow_capped(read_path, u64::MAX) {
         Ok(f) => f,
         Err(crate::util::OpenRegularError::NotFound) => {
             eprintln!(
                 "tirith: scan: cannot read {} (not found)",
-                file_path.display()
+                logical_path.display()
             );
             return ScanFileOutcome::Skipped(CoverageGap {
                 location,
@@ -557,7 +559,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
         Err(crate::util::OpenRegularError::NotRegularFile) => {
             eprintln!(
                 "tirith: scan: skipping {} (symlink or non-regular file)",
-                file_path.display()
+                logical_path.display()
             );
             return ScanFileOutcome::Skipped(CoverageGap {
                 location,
@@ -569,7 +571,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
         // unreadable for totality rather than panicking.
         Err(crate::util::OpenRegularError::TooLarge)
         | Err(crate::util::OpenRegularError::Io(_)) => {
-            eprintln!("tirith: scan: cannot read {}", file_path.display());
+            eprintln!("tirith: scan: cannot read {}", logical_path.display());
             return ScanFileOutcome::Skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
@@ -596,7 +598,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
     let size = match file.metadata() {
         Ok(m) => m.len(),
         Err(e) => {
-            eprintln!("tirith: scan: cannot stat {}: {e}", file_path.display());
+            eprintln!("tirith: scan: cannot stat {}: {e}", logical_path.display());
             return ScanFileOutcome::Skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
@@ -619,7 +621,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
         };
         eprintln!(
             "tirith: scan: skipping {} (exceeds {}B analysis limit: {})",
-            file_path.display(),
+            logical_path.display(),
             MAX_FILE_SIZE,
             kind.as_str()
         );
@@ -668,7 +670,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
                 };
                 eprintln!(
                     "tirith: scan: skipping {} (grew past {}B analysis limit during read)",
-                    file_path.display(),
+                    logical_path.display(),
                     MAX_FILE_SIZE
                 );
                 return ScanFileOutcome::Skipped(CoverageGap {
@@ -679,7 +681,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
             }
             Ok(_) => buf,
             Err(e) => {
-                eprintln!("tirith: scan: cannot read {}: {e}", file_path.display());
+                eprintln!("tirith: scan: cannot read {}: {e}", logical_path.display());
                 return ScanFileOutcome::Skipped(CoverageGap {
                     location,
                     kind: CoverageGapKind::Unreadable,
@@ -690,9 +692,9 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
     };
     let content = String::from_utf8_lossy(&raw_bytes).into_owned();
 
-    let is_config = is_priority_file(file_path);
+    let is_config = is_priority_file(logical_path);
 
-    let cwd = file_path
+    let cwd = logical_path
         .parent()
         .map(|p| p.display().to_string())
         .filter(|s| !s.is_empty());
@@ -703,7 +705,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
         raw_bytes: Some(raw_bytes),
         interactive: false,
         cwd: cwd.clone(),
-        file_path: Some(file_path.to_path_buf()),
+        file_path: Some(logical_path.to_path_buf()),
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
@@ -718,7 +720,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
     engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
 
     ScanFileOutcome::Scanned(FileScanResult {
-        path: file_path.to_path_buf(),
+        path: logical_path.to_path_buf(),
         findings,
         is_config_file: is_config,
     })
@@ -763,10 +765,16 @@ pub struct RulePanic;
 /// directly; the directory walk routes through here so a per-file panic becomes a
 /// recorded gap rather than a process crash.
 pub fn scan_single_file_guarded(file_path: &Path) -> GuardedScanOutcome {
-    match catch_panic_scanning(file_path, || scan_single_file(file_path)) {
+    scan_single_file_guarded_at(file_path, file_path)
+}
+
+fn scan_single_file_guarded_at(read_path: &Path, logical_path: &Path) -> GuardedScanOutcome {
+    match catch_panic_scanning(logical_path, || {
+        scan_single_file_at(read_path, logical_path)
+    }) {
         Some(outcome) => GuardedScanOutcome::Completed(outcome),
         None => GuardedScanOutcome::RulePanic(CoverageGap {
-            location: SubjectLocation::from_path(file_path.to_path_buf()),
+            location: SubjectLocation::from_path(logical_path.to_path_buf()),
             kind: CoverageGapKind::Panicked,
             sha256: None,
         }),
@@ -841,12 +849,37 @@ pub enum CollectedFileKind {
     BinaryIgnored,
 }
 
-/// The result of a collection walk: text files to scan plus artifact candidates
-/// the caller turns into `Unsupported` coverage gaps. Keeping them separate (not
-/// re-deriving from the path list) means the driver never has to re-classify.
+/// The result of a collection walk: ordinary text paths, safe linked-config
+/// paths, artifact candidates, and gaps encountered before analysis.
 struct CollectedFiles {
     text_candidates: Vec<PathBuf>,
+    linked_text_candidates: Vec<LinkedTextCandidate>,
     artifact_candidates: Vec<PathBuf>,
+    coverage_gaps: Vec<CoverageGap>,
+}
+
+struct LinkedTextCandidate {
+    /// The resolved, regular in-root file opened with no-follow semantics.
+    read_path: PathBuf,
+    /// The config symlink path exposed to rules, findings, and callers.
+    logical_path: PathBuf,
+}
+
+enum ScanCandidate {
+    Text {
+        read_path: PathBuf,
+        logical_path: PathBuf,
+    },
+    Artifact(PathBuf),
+}
+
+impl ScanCandidate {
+    fn logical_path(&self) -> &Path {
+        match self {
+            ScanCandidate::Text { logical_path, .. } => logical_path,
+            ScanCandidate::Artifact(path) => path,
+        }
+    }
 }
 
 /// Collect files from a path (directory or single file).
@@ -865,15 +898,21 @@ fn collect_files(
         return match classify_collected_path(path) {
             CollectedFileKind::TextCandidate => CollectedFiles {
                 text_candidates: vec![path.to_path_buf()],
+                linked_text_candidates: Vec::new(),
                 artifact_candidates: Vec::new(),
+                coverage_gaps: Vec::new(),
             },
             CollectedFileKind::ArtifactCandidate => CollectedFiles {
                 text_candidates: Vec::new(),
+                linked_text_candidates: Vec::new(),
                 artifact_candidates: vec![path.to_path_buf()],
+                coverage_gaps: Vec::new(),
             },
             CollectedFileKind::BinaryIgnored => CollectedFiles {
                 text_candidates: Vec::new(),
+                linked_text_candidates: Vec::new(),
                 artifact_candidates: Vec::new(),
+                coverage_gaps: Vec::new(),
             },
         };
     }
@@ -882,13 +921,17 @@ fn collect_files(
         eprintln!("tirith: scan: path does not exist: {}", path.display());
         return CollectedFiles {
             text_candidates: Vec::new(),
+            linked_text_candidates: Vec::new(),
             artifact_candidates: Vec::new(),
+            coverage_gaps: vec![unreadable_gap(path)],
         };
     }
 
     let mut collected = CollectedFiles {
         text_candidates: Vec::new(),
+        linked_text_candidates: Vec::new(),
         artifact_candidates: Vec::new(),
+        coverage_gaps: Vec::new(),
     };
     collect_files_recursive(
         path,
@@ -910,9 +953,16 @@ fn collect_files(
 /// recognises. Always recursive. Returns absolute-or-`root`-relative paths
 /// deduplicated and sorted for stable output (independent of the walk's order).
 /// A single file `root` that is itself an AI-config file yields just that file.
-/// AI-config files are always text, so only `text_candidates` is consulted.
+/// AI-config files are always text, including safe linked text candidates.
 pub fn collect_ai_config_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = collect_files(root, true, &[], &[], &[]).text_candidates;
+    let collected = collect_files(root, true, &[], &[], &[]);
+    let mut files = collected.text_candidates;
+    files.extend(
+        collected
+            .linked_text_candidates
+            .into_iter()
+            .map(|candidate| candidate.logical_path),
+    );
     files.retain(|p| crate::rules::aifile::is_ai_config_file(p));
     files.sort();
     files.dedup();
@@ -932,6 +982,7 @@ fn collect_files_recursive(
         Ok(e) => e,
         Err(e) => {
             eprintln!("tirith: scan: cannot read directory {}: {e}", dir.display());
+            collected.coverage_gaps.push(unreadable_gap(dir));
             return;
         }
     };
@@ -944,6 +995,7 @@ fn collect_files_recursive(
                     "tirith: scan: error reading entry in {}: {e}",
                     dir.display()
                 );
+                collected.coverage_gaps.push(unreadable_gap(dir));
                 continue;
             }
         };
@@ -951,10 +1003,10 @@ fn collect_files_recursive(
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // Classify the entry WITHOUT following symlinks (`entry.file_type()` reports
-        // the link itself, not its target). A symlink — to a directory OR a file —
-        // is skipped outright so traversal can neither recurse through a symlinked
-        // directory out of the tree (e.g. a planted `node_modules -> /`) nor read a
-        // file through a symlink that escapes the scan root.
+        // the link itself, not its target). Generic symlinks are skipped so traversal
+        // cannot escape the tree. Security-config links are handled explicitly below:
+        // safe in-root file targets retain the link's logical identity; every other
+        // config link becomes an unreadable coverage gap.
         let file_type = match entry.file_type() {
             Ok(t) => t,
             Err(e) => {
@@ -962,10 +1014,19 @@ fn collect_files_recursive(
                     "tirith: scan: cannot stat entry {}: {e} (skipped)",
                     path.display()
                 );
+                collected.coverage_gaps.push(unreadable_gap(&path));
                 continue;
             }
         };
         if file_type.is_symlink() {
+            collect_config_symlink(
+                root,
+                &path,
+                ignore_patterns,
+                include_patterns,
+                exclude_patterns,
+                collected,
+            );
             continue;
         }
 
@@ -997,51 +1058,13 @@ fn collect_files_recursive(
             continue;
         }
 
-        let rel_path = path
-            .strip_prefix(root)
-            .ok()
-            .and_then(|p| p.to_str())
-            .unwrap_or(name);
-        if ignore_patterns
-            .iter()
-            .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
-        {
-            continue;
-        }
-
-        // Include patterns with negation support: `!`-prefixed patterns exclude
-        // from the include set. A file passes if it matches a positive include
-        // (or there are none) AND matches no negated pattern.
-        if !include_patterns.is_empty() {
-            let mut included = false;
-            let mut negated = false;
-            let has_positive = include_patterns.iter().any(|p| !p.starts_with('!'));
-
-            for pat in include_patterns {
-                if let Some(stripped) = pat.strip_prefix('!') {
-                    // Negation: exclude from the include set.
-                    if matches_ignore_pattern(name, stripped)
-                        || matches_ignore_pattern(rel_path, stripped)
-                    {
-                        negated = true;
-                    }
-                } else {
-                    // Positive: file must match at least one.
-                    if matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat) {
-                        included = true;
-                    }
-                }
-            }
-
-            if negated || (has_positive && !included) {
-                continue;
-            }
-        }
-
-        if exclude_patterns
-            .iter()
-            .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
-        {
+        if !candidate_matches_patterns(
+            root,
+            &path,
+            ignore_patterns,
+            include_patterns,
+            exclude_patterns,
+        ) {
             continue;
         }
 
@@ -1052,6 +1075,7 @@ fn collect_files_recursive(
         // a regular leaf resolve outside `root`; `canonical_within` (fail-closed)
         // rejects that.
         if !crate::util::canonical_within(&path, root) {
+            collected.coverage_gaps.push(unreadable_gap(&path));
             continue;
         }
 
@@ -1065,6 +1089,121 @@ fn collect_files_recursive(
             CollectedFileKind::BinaryIgnored => {}
         }
     }
+}
+
+fn unreadable_gap(path: &Path) -> CoverageGap {
+    CoverageGap {
+        location: SubjectLocation::from_path(path.to_path_buf()),
+        kind: CoverageGapKind::Unreadable,
+        sha256: None,
+    }
+}
+
+/// Preserve a config symlink's logical identity while opening only its resolved,
+/// regular, in-root target. Other symlinks remain intentional traversal
+/// exclusions; config symlinks are security-relevant and therefore either scan or
+/// produce an explicit gap.
+fn collect_config_symlink(
+    root: &Path,
+    logical_path: &Path,
+    ignore_patterns: &[String],
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    collected: &mut CollectedFiles,
+) {
+    let is_config_link = is_priority_file(logical_path)
+        || crate::rules::aifile::is_ai_config_file(logical_path)
+        || logical_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_known_config_dir);
+    if !is_config_link
+        || !candidate_matches_patterns(
+            root,
+            logical_path,
+            ignore_patterns,
+            include_patterns,
+            exclude_patterns,
+        )
+    {
+        return;
+    }
+
+    let resolved = match std::fs::canonicalize(logical_path) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!(
+                "tirith: scan: cannot resolve config symlink {}: {e}",
+                logical_path.display()
+            );
+            collected.coverage_gaps.push(unreadable_gap(logical_path));
+            return;
+        }
+    };
+    if !crate::util::canonical_within(&resolved, root) {
+        collected.coverage_gaps.push(unreadable_gap(logical_path));
+        return;
+    }
+    match std::fs::metadata(&resolved) {
+        Ok(metadata) if metadata.is_file() => {
+            if classify_collected_path(logical_path) == CollectedFileKind::TextCandidate {
+                collected.linked_text_candidates.push(LinkedTextCandidate {
+                    read_path: resolved,
+                    logical_path: logical_path.to_path_buf(),
+                });
+            } else {
+                collected.coverage_gaps.push(unreadable_gap(logical_path));
+            }
+        }
+        Ok(_) | Err(_) => collected.coverage_gaps.push(unreadable_gap(logical_path)),
+    }
+}
+
+fn candidate_matches_patterns(
+    root: &Path,
+    path: &Path,
+    ignore_patterns: &[String],
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let rel_path = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|p| p.to_str())
+        .unwrap_or(name);
+    if ignore_patterns
+        .iter()
+        .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
+    {
+        return false;
+    }
+
+    if !include_patterns.is_empty() {
+        let mut included = false;
+        let mut negated = false;
+        let has_positive = include_patterns.iter().any(|p| !p.starts_with('!'));
+
+        for pat in include_patterns {
+            if let Some(stripped) = pat.strip_prefix('!') {
+                if matches_ignore_pattern(name, stripped)
+                    || matches_ignore_pattern(rel_path, stripped)
+                {
+                    negated = true;
+                }
+            } else if matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat) {
+                included = true;
+            }
+        }
+
+        if negated || (has_positive && !included) {
+            return false;
+        }
+    }
+
+    !exclude_patterns
+        .iter()
+        .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
 }
 
 /// Directories to skip during scanning. Delegates to the shared built-in
@@ -1414,6 +1553,178 @@ pub fn gap_is_security_relevant(gap: &CoverageGap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_tree(path: &Path, max_files: Option<usize>) -> ScanResult {
+        scan(&ScanConfig {
+            path: path.to_path_buf(),
+            recursive: true,
+            fail_on: Severity::High,
+            ignore_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            max_files,
+        })
+    }
+
+    #[test]
+    fn missing_scan_root_is_an_unreadable_coverage_gap() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let missing = tmp.path().join("missing-security-tree");
+
+        let result = scan_tree(&missing, None);
+
+        assert_eq!(result.scanned_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.coverage_gaps.len(), 1);
+        assert_eq!(result.coverage_gaps[0].kind, CoverageGapKind::Unreadable);
+        assert_eq!(
+            result.coverage_gaps[0].primary_path(),
+            Some(missing.as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subtree_is_recorded_without_hiding_readable_siblings() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("create scan root");
+        let readable = root.path().join("readable");
+        let unreadable = root.path().join("security-config");
+        std::fs::create_dir_all(&readable).unwrap();
+        std::fs::create_dir_all(&unreadable).unwrap();
+        std::fs::write(readable.join("keep.md"), "safe control").unwrap();
+        std::fs::write(unreadable.join("CLAUDE.md"), "hidden instructions").unwrap();
+
+        let original_mode = std::fs::metadata(&unreadable).unwrap().permissions().mode();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = scan_tree(root.path(), None);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+
+        assert!(
+            result
+                .file_results
+                .iter()
+                .any(|r| r.path.ends_with("readable/keep.md")),
+            "a readable sibling must still be scanned"
+        );
+        assert!(
+            result.coverage_gaps.iter().any(|gap| {
+                gap.kind == CoverageGapKind::Unreadable
+                    && gap.primary_path() == Some(unreadable.as_path())
+            }),
+            "the unreadable subtree must be an explicit gap: {:?}",
+            result.coverage_gaps
+        );
+    }
+
+    #[test]
+    fn readable_subtree_remains_a_complete_legitimate_control() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let nested = root.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("keep.md"), "safe control").unwrap();
+
+        let result = scan_tree(root.path(), None);
+
+        assert_eq!(result.scanned_count, 1);
+        assert_eq!(result.skipped_count, 0);
+        assert!(result.coverage_gaps.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_root_config_symlink_is_scanned_under_its_logical_path() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let target = root.path().join("shared-instructions.txt");
+        let logical = root.path().join("CLAUDE.md");
+        std::fs::write(&target, "ordinary instructions").unwrap();
+        std::os::unix::fs::symlink("shared-instructions.txt", &logical).unwrap();
+
+        let result = scan_tree(root.path(), None);
+
+        let logical_result = result
+            .file_results
+            .iter()
+            .find(|r| r.path == logical)
+            .expect("the safe in-root config symlink must be scanned by its logical name");
+        assert!(logical_result.is_config_file);
+        assert!(
+            result
+                .coverage_gaps
+                .iter()
+                .all(|gap| gap.primary_path() != Some(logical.as_path())),
+            "a safe in-root config symlink must not be reported as a gap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_config_symlink_is_an_unreadable_gap_and_is_not_followed() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let outside = tempfile::tempdir().expect("create outside tree");
+        let target = outside.path().join("instructions.txt");
+        let logical = root.path().join("CLAUDE.md");
+        std::fs::write(&target, "outside instructions").unwrap();
+        std::os::unix::fs::symlink(&target, &logical).unwrap();
+
+        let result = scan_tree(root.path(), None);
+
+        assert_eq!(result.scanned_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert!(result.coverage_gaps.iter().any(|gap| {
+            gap.kind == CoverageGapKind::Unreadable && gap.primary_path() == Some(logical.as_path())
+        }));
+        assert!(
+            result.file_results.iter().all(|r| r.path != target),
+            "the external target must never be scanned through the link"
+        );
+    }
+
+    #[test]
+    fn max_files_is_one_priority_aware_budget_across_text_and_artifacts() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let priority = root.path().join("CLAUDE.md");
+        let ordinary = root.path().join("z-last.md");
+        let artifact = root.path().join("middle.so");
+        std::fs::write(&priority, "priority instructions").unwrap();
+        std::fs::write(&ordinary, "ordinary text").unwrap();
+        std::fs::write(&artifact, b"\x7fELF unsupported").unwrap();
+
+        let result = scan_tree(root.path(), Some(2));
+
+        assert_eq!(result.scanned_count, 1, "only the priority text file scans");
+        assert_eq!(
+            result.skipped_count, 2,
+            "one attempted artifact gap plus one out-of-budget file are skipped"
+        );
+        assert!(result.truncated);
+        assert!(result.file_results.iter().any(|r| r.path == priority));
+        assert!(result.file_results.iter().all(|r| r.path != ordinary));
+        assert!(result.coverage_gaps.iter().any(|gap| {
+            gap.kind == CoverageGapKind::Unsupported
+                && gap.primary_path() == Some(artifact.as_path())
+        }));
+    }
+
+    #[test]
+    fn artifact_analysis_gap_counts_as_skipped_and_remains_visible() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let artifact = root.path().join("payload.so");
+        std::fs::write(&artifact, b"\x7fELF unsupported").unwrap();
+
+        let result = scan_tree(root.path(), None);
+
+        assert_eq!(result.scanned_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.coverage_gaps.len(), 1);
+        assert_eq!(result.coverage_gaps[0].kind, CoverageGapKind::Unsupported);
+        assert_eq!(
+            result.coverage_gaps[0].primary_path(),
+            Some(artifact.as_path())
+        );
+    }
 
     #[test]
     fn catch_panic_scanning_returns_some_on_clean_run() {
