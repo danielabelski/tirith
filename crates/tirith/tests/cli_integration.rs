@@ -3716,6 +3716,81 @@ fn commands_init_refuses_without_force_then_replaces_with_force() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn repo_initializers_reject_symlinked_tirith_parent() {
+    use std::os::unix::fs::symlink;
+
+    let repo = tempfile::tempdir().expect("repo");
+    let outside = tempfile::tempdir().expect("outside");
+    symlink(outside.path(), repo.path().join(".tirith")).expect("symlink .tirith");
+
+    for args in [
+        &["policy", "init", "--force"][..],
+        &["commands", "init", "--force"][..],
+    ] {
+        let output = tirith()
+            .args(args)
+            .current_dir(repo.path())
+            .env_remove("TIRITH_POLICY_ROOT")
+            .output()
+            .expect("run repo initializer");
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "repo initializer must refuse an escaping .tirith link: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(!outside.path().join("policy.yaml").exists());
+    assert!(!outside.path().join("commands.yaml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn repo_initializers_refuse_final_symlinks_even_with_force() {
+    use std::os::unix::fs::symlink;
+
+    let repo = tempfile::tempdir().expect("repo");
+    let config = repo.path().join(".tirith");
+    fs::create_dir(&config).expect("create .tirith");
+    let outside = tempfile::tempdir().expect("outside");
+    let outside_policy = outside.path().join("policy.yaml");
+    let outside_commands = outside.path().join("commands.yaml");
+    fs::write(&outside_policy, b"outside policy").unwrap();
+    fs::write(&outside_commands, b"outside commands").unwrap();
+    symlink(&outside_policy, config.join("policy.yaml")).unwrap();
+    symlink(&outside_commands, config.join("commands.yaml")).unwrap();
+
+    for args in [
+        &["policy", "init", "--force"][..],
+        &["commands", "init", "--force"][..],
+    ] {
+        let output = tirith()
+            .args(args)
+            .current_dir(repo.path())
+            .env_remove("TIRITH_POLICY_ROOT")
+            .output()
+            .expect("run repo initializer");
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "repo initializer must refuse a final symlink: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(fs::read(&outside_policy).unwrap(), b"outside policy");
+    assert_eq!(fs::read(&outside_commands).unwrap(), b"outside commands");
+    assert!(fs::symlink_metadata(config.join("policy.yaml"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(fs::symlink_metadata(config.join("commands.yaml"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
 /// #112: `tirith policy validate` (no --file) must locate a present-but-corrupt
 /// policy and report its error, rather than collapsing to "no policy file found"
 /// the way the old parse-aware discovery (`Policy::discover().path`) did.

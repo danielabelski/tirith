@@ -309,8 +309,8 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
     // If we create `.tirith` on a fresh repo, its new entry in `repo_root` must be
     // fsync'd too, or a crash could lose it — `write_file_atomic` only fsyncs
     // `.tirith` (policy.yaml's parent), not `repo_root`. CodeRabbit R13b.
-    let tirith_dir_existed = tirith_dir.exists();
-    if let Err(e) = std::fs::create_dir_all(&tirith_dir) {
+    let tirith_dir_existed = tirith_dir.is_dir();
+    if let Err(e) = tirith_core::util::create_dir_durable(&tirith_dir) {
         eprintln!(
             "tirith policy init: cannot create {}: {e}",
             tirith_dir.display()
@@ -331,7 +331,12 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
     // crash mid-write never loses the prior policy. Without `--force`,
     // `overwrite=false` makes it no-clobber, so a policy created in the race window
     // after the `exists()` check surfaces as a write error instead of being lost.
-    if let Err(e) = super::write_file_atomic(&policy_path, template_body.as_bytes(), force) {
+    if let Err(e) = super::write_file_atomic_contained(
+        &repo_root,
+        &policy_path,
+        template_body.as_bytes(),
+        force,
+    ) {
         eprintln!(
             "tirith policy init: cannot write {}: {e}",
             policy_path.display()

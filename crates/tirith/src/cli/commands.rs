@@ -33,6 +33,16 @@ pub fn init(force: bool, json: bool) -> i32 {
             return 1;
         }
     };
+    let Some(repo_root) = path.parent().and_then(std::path::Path::parent) else {
+        if !emit_error(
+            json,
+            "tirith commands init",
+            "resolved manifest path has no repository root",
+        ) {
+            return 2;
+        }
+        return 1;
+    };
 
     if path.exists() && !force {
         if !emit_error(
@@ -52,8 +62,8 @@ pub fn init(force: bool, json: bool) -> i32 {
         // If `.tirith` is created fresh, fsync its entry in the repo root too:
         // `write_file_atomic` only fsyncs commands.yaml's parent, so a crash could
         // otherwise lose the whole `.tirith` dir despite init succeeding (CodeRabbit R13b).
-        let parent_existed = parent.exists();
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        let parent_existed = parent.is_dir();
+        if let Err(e) = tirith_core::util::create_dir_durable(parent) {
             if !emit_error(
                 json,
                 "tirith commands init",
@@ -71,7 +81,8 @@ pub fn init(force: bool, json: bool) -> i32 {
     // Write ATOMICALLY (temp → fsync → rename → parent fsync), not truncate-in-
     // place, so a crash can't lose or half-write the manifest. No-clobber unless
     // `--force` so a manifest created in the post-`exists()` race window survives.
-    if let Err(e) = super::write_file_atomic(
+    if let Err(e) = super::write_file_atomic_contained(
+        repo_root,
         &path,
         tirith_core::commands_manifest::STARTER_MANIFEST.as_bytes(),
         force,
