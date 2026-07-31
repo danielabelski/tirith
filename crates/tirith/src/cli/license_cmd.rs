@@ -1,5 +1,96 @@
 use tirith_core::license;
 
+#[cfg(unix)]
+struct RefreshCredentials {
+    server_url: String,
+    api_key: String,
+}
+
+/// Resolve refresh credentials as one origin-bound pair.
+///
+/// If either environment variable is present, both values must come from the
+/// environment; an empty or non-Unicode value is still an explicit (invalid)
+/// override and never falls back to policy. With no overrides, `load_local` is
+/// invoked exactly once so the URL and key come from one offline policy
+/// snapshot.
+#[cfg(unix)]
+fn resolve_refresh_credentials_with<F>(
+    env_server_url: Option<std::ffi::OsString>,
+    env_api_key: Option<std::ffi::OsString>,
+    load_local: F,
+) -> Result<RefreshCredentials, String>
+where
+    F: FnOnce() -> tirith_core::policy::Policy,
+{
+    match (env_server_url, env_api_key) {
+        (None, None) => {
+            let policy = load_local();
+            normalize_refresh_pair(
+                policy.policy_server_url,
+                policy.policy_server_api_key,
+                "local policy",
+            )
+        }
+        (Some(server_url), Some(api_key)) => {
+            let server_url = server_url
+                .into_string()
+                .map_err(|_| "TIRITH_SERVER_URL must be valid UTF-8".to_string())?;
+            let api_key = api_key
+                .into_string()
+                .map_err(|_| "TIRITH_API_KEY must be valid UTF-8".to_string())?;
+            normalize_refresh_pair(Some(server_url), Some(api_key), "environment")
+        }
+        _ => Err(
+            "TIRITH_SERVER_URL and TIRITH_API_KEY must be set together; refusing to mix environment and policy credentials"
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn normalize_refresh_pair(
+    server_url: Option<String>,
+    api_key: Option<String>,
+    origin: &str,
+) -> Result<RefreshCredentials, String> {
+    let (server_url, api_key) = match (server_url, api_key) {
+        (Some(server_url), Some(api_key)) => (server_url, api_key),
+        (None, None) => {
+            return Err(format!(
+                "no policy-server credentials configured in the {origin}"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "the {origin} must provide both policy_server_url and policy_server_api_key"
+            ));
+        }
+    };
+
+    let server_url = server_url.trim();
+    if server_url.is_empty() {
+        return Err(format!("the {origin} server URL must not be empty"));
+    }
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(format!("the {origin} API key must not be empty"));
+    }
+
+    Ok(RefreshCredentials {
+        server_url: server_url.to_string(),
+        api_key: api_key.to_string(),
+    })
+}
+
+#[cfg(unix)]
+fn resolve_refresh_credentials() -> Result<RefreshCredentials, String> {
+    resolve_refresh_credentials_with(
+        std::env::var_os("TIRITH_SERVER_URL"),
+        std::env::var_os("TIRITH_API_KEY"),
+        || tirith_core::policy::Policy::discover_local_only(None),
+    )
+}
+
 /// Activate a license by validating and writing the signed token.
 pub fn activate(key: &str) -> i32 {
     if !license::validate_key_structure(key) {
@@ -109,39 +200,18 @@ pub fn refresh() -> i32 {
 
     #[cfg(unix)]
     {
-        let server_url = std::env::var("TIRITH_SERVER_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let policy = tirith_core::policy::Policy::discover(None);
-                policy.policy_server_url
-            });
-        let api_key = std::env::var("TIRITH_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let policy = tirith_core::policy::Policy::discover(None);
-                policy.policy_server_api_key
-            });
-
-        let server_url = match server_url {
-            Some(u) if !u.trim().is_empty() => u.trim().to_string(),
-            _ => {
-                eprintln!("tirith: no policy server configured");
-                eprintln!("  Set TIRITH_SERVER_URL or configure policy_server_url in policy.yaml");
-                return 1;
-            }
-        };
-        let api_key = match api_key {
-            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-            _ => {
-                eprintln!("tirith: no API key configured");
-                eprintln!("  Set TIRITH_API_KEY or configure policy_server_api_key in policy.yaml");
+        let credentials = match resolve_refresh_credentials() {
+            Ok(credentials) => credentials,
+            Err(reason) => {
+                eprintln!("tirith: cannot refresh license: {reason}");
+                eprintln!(
+                    "  Set both TIRITH_SERVER_URL and TIRITH_API_KEY, or configure both fields in one trusted local policy."
+                );
                 return 1;
             }
         };
 
-        match license::refresh_from_server(&server_url, &api_key) {
+        match license::refresh_from_server(&credentials.server_url, &credentials.api_key) {
             Ok(token) => {
                 let info = match license::decode_and_validate_token(&token) {
                     Some(info) => info,
@@ -277,4 +347,102 @@ fn days_remaining(exp: &str) -> Option<i64> {
         return Some((date - today).num_days());
     }
     None
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn environment_credentials_are_an_indivisible_pair() {
+        for (server_url, api_key) in [
+            (Some(OsString::from("https://policy.example")), None),
+            (None, Some(OsString::from("secret"))),
+        ] {
+            let result = resolve_refresh_credentials_with(server_url, api_key, || {
+                panic!("a partial environment override must not load policy")
+            });
+            assert!(result
+                .err()
+                .expect("partial environment pair must fail")
+                .contains("must be set together"));
+        }
+    }
+
+    #[test]
+    fn complete_environment_pair_never_loads_policy() {
+        let credentials = resolve_refresh_credentials_with(
+            Some(OsString::from(" https://policy.example ")),
+            Some(OsString::from(" env-secret ")),
+            || panic!("a complete environment override must not load policy"),
+        )
+        .unwrap();
+
+        assert_eq!(credentials.server_url, "https://policy.example");
+        assert_eq!(credentials.api_key, "env-secret");
+    }
+
+    #[test]
+    fn empty_environment_value_never_falls_back_to_policy() {
+        let result = resolve_refresh_credentials_with(
+            Some(OsString::new()),
+            Some(OsString::from("env-secret")),
+            || panic!("an explicit empty override must not load policy"),
+        );
+
+        assert_eq!(
+            result.err().expect("empty override must fail"),
+            "the environment server URL must not be empty"
+        );
+    }
+
+    #[test]
+    fn local_credentials_come_from_one_snapshot() {
+        let loads = AtomicUsize::new(0);
+        let credentials = resolve_refresh_credentials_with(None, None, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            tirith_core::policy::Policy {
+                policy_server_url: Some("https://local.example".to_string()),
+                policy_server_api_key: Some("local-secret".to_string()),
+                ..tirith_core::policy::Policy::default()
+            }
+        })
+        .unwrap();
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(credentials.server_url, "https://local.example");
+        assert_eq!(credentials.api_key, "local-secret");
+    }
+
+    #[test]
+    fn incomplete_local_pair_is_rejected() {
+        let result = resolve_refresh_credentials_with(None, None, || tirith_core::policy::Policy {
+            policy_server_url: Some("https://local.example".to_string()),
+            policy_server_api_key: None,
+            ..tirith_core::policy::Policy::default()
+        });
+
+        assert!(result
+            .err()
+            .expect("incomplete local pair must fail")
+            .contains("must provide both"));
+    }
+
+    #[test]
+    fn non_unicode_environment_value_is_rejected_without_policy_fallback() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let result = resolve_refresh_credentials_with(
+            Some(OsString::from_vec(vec![0xff])),
+            Some(OsString::from("env-secret")),
+            || panic!("an invalid explicit override must not load policy"),
+        );
+
+        assert_eq!(
+            result.err().expect("non-Unicode override must fail"),
+            "TIRITH_SERVER_URL must be valid UTF-8"
+        );
+    }
 }

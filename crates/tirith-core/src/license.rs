@@ -514,12 +514,11 @@ pub fn refresh_from_server(server_url: &str, api_key: &str) -> Result<String, St
         .map_err(|e| format!("Request failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        return match status.as_u16() {
-            401 | 403 => Err("Authentication failed. Check your API key.".to_string()),
-            402 => Err("Subscription inactive. Renew at https://tirith.dev/account".to_string()),
-            _ => Err(format!("Server returned {status}: {body}")),
-        };
+        // The response body is controlled by the remote server (and by any
+        // compromised intermediary). Never copy it into a terminal-facing
+        // error: it may contain secrets, multiline spoofing, or control
+        // sequences. Status-specific text below is entirely local.
+        return Err(refresh_status_error(status));
     }
     let token = resp
         .text()
@@ -529,6 +528,15 @@ pub fn refresh_from_server(server_url: &str, api_key: &str) -> Result<String, St
         return Err("Server returned empty token".to_string());
     }
     Ok(trimmed)
+}
+
+#[cfg(unix)]
+fn refresh_status_error(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        401 | 403 => "Authentication failed. Check your API key.".to_string(),
+        402 => "Subscription inactive. Renew at https://tirith.dev/account".to_string(),
+        code => format!("Server returned HTTP status {code}"),
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +549,22 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let pk_bytes = sk.verifying_key().to_bytes();
         (sk, pk_bytes)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_errors_never_include_remote_response_content() {
+        // Only the numeric status enters the generic message. A hostile body is
+        // deliberately not an input to this formatter and therefore cannot be
+        // echoed to the terminal by the refresh path.
+        assert_eq!(
+            refresh_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            "Server returned HTTP status 500"
+        );
+        assert_eq!(
+            refresh_status_error(reqwest::StatusCode::UNAUTHORIZED),
+            "Authentication failed. Check your API key."
+        );
     }
 
     fn test_keyring(pk: [u8; 32]) -> Vec<KeyEntry> {
