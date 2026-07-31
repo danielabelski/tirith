@@ -3,9 +3,9 @@
 use std::ffi::{c_void, OsStr};
 use std::fs::File;
 use std::io::Write;
-use std::mem::{size_of, ManuallyDrop};
+use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 use std::ptr::null_mut;
 
@@ -24,7 +24,8 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, CREATE_NEW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, READ_CONTROL,
+    CreateFileW, FileDispositionInfo, SetFileInformationByHandle, CREATE_NEW, DELETE,
+    FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, READ_CONTROL,
 };
 use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -32,13 +33,6 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 const SYSTEM_SID_WORDS: usize = (SECURITY_MAX_SID_SIZE as usize).div_ceil(size_of::<usize>());
 
 struct OwnedHandle(HANDLE);
-
-impl OwnedHandle {
-    fn into_raw(self) -> HANDLE {
-        let this = ManuallyDrop::new(self);
-        this.0
-    }
-}
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
@@ -70,6 +64,21 @@ impl Drop for LocalAllocation {
 /// then durably write the private seed. `CREATE_NEW` preserves no-overwrite
 /// semantics without exposing the file under inherited parent permissions.
 pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    create_and_finish_private_file(path, |file, user_sid| {
+        verify_private_acl(file.as_raw_handle(), user_sid)
+            .map_err(|error| format!("cannot verify private ACL on {}: {error}", path.display()))?;
+        file.write_all(contents)
+            .map_err(|error| format!("write failed: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync failed: {error}"))?;
+        Ok(())
+    })
+}
+
+fn create_and_finish_private_file<F>(path: &Path, finish: F) -> Result<(), String>
+where
+    F: FnOnce(&mut File, PSID) -> Result<(), String>,
+{
     let user_sid = current_user_sid()?;
     let user_sid_text = sid_to_string(user_sid.as_ptr().cast_mut().cast())?;
     let descriptor = private_security_descriptor(&user_sid_text)?;
@@ -85,7 +94,7 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
     let raw = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
-            windows_sys::Win32::Foundation::GENERIC_WRITE | READ_CONTROL,
+            windows_sys::Win32::Foundation::GENERIC_WRITE | READ_CONTROL | DELETE,
             0,
             &attributes,
             CREATE_NEW,
@@ -107,16 +116,44 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
         };
     }
 
-    let handle = OwnedHandle(raw);
-    verify_private_acl(handle.0, user_sid.as_ptr().cast_mut().cast())
-        .map_err(|error| format!("cannot verify private ACL on {}: {error}", path.display()))?;
-
     // SAFETY: ownership of the unique CreateFileW handle moves into File.
-    let mut file = unsafe { File::from_raw_handle(handle.into_raw()) };
-    file.write_all(contents)
-        .map_err(|error| format!("write failed: {error}"))?;
-    file.sync_all()
-        .map_err(|error| format!("sync failed: {error}"))?;
+    let mut file = unsafe { File::from_raw_handle(raw) };
+    match finish(&mut file, user_sid.as_ptr().cast_mut().cast()) {
+        Ok(()) => Ok(()),
+        Err(primary) => {
+            // Mark this exact opened file for deletion before closing it. A
+            // pathname-based cleanup could race a replacement; CREATE_NEW plus
+            // share-mode zero and handle-based disposition bind cleanup to the
+            // same object that failed verification/write/sync.
+            let cleanup = mark_delete_on_close(file.as_raw_handle());
+            drop(file);
+            match cleanup {
+                Ok(()) => Err(primary),
+                Err(cleanup_error) => Err(format!(
+                    "{primary}; additionally failed to delete incomplete private key: {cleanup_error}"
+                )),
+            }
+        }
+    }
+}
+
+fn mark_delete_on_close(handle: HANDLE) -> Result<(), String> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: handle names the newly created file and was opened with DELETE;
+    // disposition is a correctly sized live FILE_DISPOSITION_INFO.
+    if unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            std::ptr::addr_of!(disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "SetFileInformationByHandle(FileDispositionInfo)",
+        ));
+    }
     Ok(())
 }
 
@@ -340,8 +377,9 @@ fn last_error(operation: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::write_private_file;
+    use super::{create_and_finish_private_file, write_private_file};
     use rand_core::{OsRng, RngCore};
+    use std::io::Write as _;
     use std::path::PathBuf;
 
     struct TestDirectory(PathBuf);
@@ -373,5 +411,36 @@ mod tests {
         let error = write_private_file(&path, b"replacement").unwrap_err();
         assert!(error.contains("refusing to overwrite private key"));
         assert_eq!(std::fs::read(&path).unwrap(), b"private-seed");
+    }
+
+    #[test]
+    fn post_creation_failure_deletes_exact_file_and_allows_retry() {
+        let mut nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut nonce);
+        let suffix = nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "tirith-sign-cleanup-{}-{suffix}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&directory.0).expect("create isolated test directory");
+        let path = directory.0.join("signing-seed.key");
+
+        let error = create_and_finish_private_file(&path, |file, _user_sid| {
+            file.write_all(b"partial-seed").unwrap();
+            Err("forced post-creation failure".to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("forced post-creation failure"));
+        assert!(
+            !path.exists(),
+            "the exact partially written file must be deleted on handle close"
+        );
+
+        write_private_file(&path, b"complete-seed")
+            .expect("cleanup must leave the path available for a secure retry");
+        assert_eq!(std::fs::read(path).unwrap(), b"complete-seed");
     }
 }
