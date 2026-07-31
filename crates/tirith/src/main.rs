@@ -2165,7 +2165,7 @@ Examples:
 What this does:
   Simulates the filesystem impact of a destructive command (rm / mv / chmod -R /
   find … -delete / rsync --delete) WITHOUT running it. Walks the target tree
-  (depth <= 5, <= 100k files), expands globs against the current directory, and
+  (depth <= 5, <= 100k charged operations), expands globs against the current directory, and
   reports file / dir / symlink counts, the largest file, whether any target
   escapes the repo, and whether it writes a system path.
 

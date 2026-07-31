@@ -5,7 +5,8 @@
 //!     Fires when a target is dangerous by shape alone (`/`, `/home`, `~`, or a
 //!     `"$VAR/"` glob resolving to empty). The ONLY surface the `engine::analyze`
 //!     exec/paste hot path may call; gated at tier-1 by `destructive_fs_op`.
-//!   * [`simulate`] — full simulator: walks the fs (capped depth 5 / 100k files),
+//!   * [`simulate`] — full simulator: walks the fs (capped depth 5 / 100k charged
+//!     traversal operations),
 //!     expands globs, counts files/dirs/symlinks, decides repo / system-path
 //!     escape. EXPENSIVE; runs ONLY under `tirith preview`, NEVER from the hot path.
 //!
@@ -22,9 +23,14 @@ use std::path::{Path, PathBuf};
 /// Maximum directory-walk depth for [`simulate`].
 pub const MAX_WALK_DEPTH: usize = 5;
 
-/// Max files [`simulate`] counts before stopping (guards pathological trees /
-/// `rm -rf /`).
+/// Legacy public name for the preview work cap. Retained for callers and output
+/// compatibility; the cap now bounds all traversal work, not only regular files.
 pub const MAX_FILE_COUNT: usize = 100_000;
+
+/// Maximum charged traversal operations for [`simulate`]. Every directory-entry
+/// result, glob candidate, metadata attempt, classified file/directory/symlink,
+/// and filesystem error consumes one unit from the same budget.
+pub const MAX_WORK_COUNT: usize = MAX_FILE_COUNT;
 
 /// File-count threshold above which [`RuleId::BlastLargeFileCount`] (Info) fires.
 pub const LARGE_FILE_COUNT_THRESHOLD: u64 = 1000;
@@ -33,7 +39,7 @@ pub const LARGE_FILE_COUNT_THRESHOLD: u64 = 1000;
 /// only under `tirith preview`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct BlastReport {
-    /// Regular files within the resolved targets (capped at [`MAX_FILE_COUNT`]).
+    /// Regular files within the resolved targets (bounded by [`MAX_WORK_COUNT`]).
     pub file_count: u64,
     pub dir_count: u64,
     /// Symlinks encountered (counted, never followed).
@@ -50,12 +56,44 @@ pub struct BlastReport {
     /// A `"$VAR/"`-shaped argument resolved to an empty variable, collapsing to
     /// root (`rm -rf "$EMPTY/"` → `rm -rf "/"`).
     pub unsafe_empty_var_glob: bool,
-    /// Walk hit [`MAX_FILE_COUNT`] / [`MAX_WALK_DEPTH`]; counts are lower bounds.
+    /// Walk hit [`MAX_WORK_COUNT`] / [`MAX_WALK_DEPTH`]; counts are lower bounds.
     pub walk_truncated: bool,
+    /// The traversal stopped because its global operation budget was exhausted.
+    /// `walk_truncated` remains set too for compatibility with existing clients.
+    pub work_cap_reached: bool,
+    /// Successfully charged traversal operations before completion or cutoff.
+    pub work_units_used: u64,
+    /// Operation limit applied to this report.
+    pub work_limit: u64,
     /// Directories/entries the walk could NOT read (perms, I/O, symlink loop).
     /// When `> 0` a subtree was silently skipped, so counts are lower bounds and
     /// a `preview` must not present them as complete.
     pub walk_errors: u64,
+}
+
+#[derive(Debug)]
+struct WorkBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl WorkBudget {
+    fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    /// Charge one traversal operation. Failure marks the report incomplete and
+    /// every caller must propagate it immediately instead of doing more work.
+    fn consume(&mut self, report: &mut BlastReport) -> bool {
+        if self.used >= self.limit {
+            report.work_cap_reached = true;
+            report.walk_truncated = true;
+            return false;
+        }
+        self.used += 1;
+        report.work_units_used = self.used as u64;
+        true
+    }
 }
 
 /// How an empty-`$VAR`-glob target resolved against tirith's own env. Drives the
@@ -220,7 +258,7 @@ pub fn cheap_check(
 }
 
 /// Full filesystem simulation for `tirith preview`: walks cwd-relative targets
-/// (capped at [`MAX_WALK_DEPTH`] / [`MAX_FILE_COUNT`]), expands globs, counts
+/// (capped at [`MAX_WALK_DEPTH`] / [`MAX_WORK_COUNT`]), expands globs, counts
 /// files/dirs/symlinks, finds the largest file, decides repo/system-path escape.
 ///
 /// `cwd` is what globs/relative paths resolve against; `repo_root` (when known)
@@ -233,7 +271,22 @@ pub fn simulate(
     repo_root: Option<&Path>,
     env_map: &HashMap<String, String>,
 ) -> BlastReport {
-    let mut report = BlastReport::default();
+    simulate_with_work_limit(input, shell, cwd, repo_root, env_map, MAX_WORK_COUNT)
+}
+
+fn simulate_with_work_limit(
+    input: &str,
+    shell: ShellType,
+    cwd: &Path,
+    repo_root: Option<&Path>,
+    env_map: &HashMap<String, String>,
+    work_limit: usize,
+) -> BlastReport {
+    let mut report = BlastReport {
+        work_limit: work_limit as u64,
+        ..BlastReport::default()
+    };
+    let mut budget = WorkBudget::new(work_limit);
     let segments = tokenize::tokenize(input, shell);
 
     for seg in &segments {
@@ -255,16 +308,17 @@ pub fn simulate(
             }
 
             // Expand the target (glob against cwd, else literal) to concrete paths.
-            let expanded = expand_target(target, cwd, &mut report);
-            if expanded.len() > 1 || target_is_glob(target) {
-                report.glob_expansion_count += expanded.len() as u64;
-            }
+            let Some(expanded) = expand_target(target, cwd, &mut report, &mut budget) else {
+                return report;
+            };
 
             for path in expanded {
+                if !walk_into(&path, &mut report, &mut budget) {
+                    return report;
+                }
                 if path_escapes_repo(&path, cwd, repo_root) {
                     report.paths_outside_repo = true;
                 }
-                walk_into(&path, cwd, &mut report);
             }
         }
     }
@@ -650,11 +704,16 @@ fn strip_outer_quotes(s: &str) -> &str {
 
 /// Expand a target into concrete paths. Globs (`*`/`?`/`[`) match a single
 /// directory against `cwd` (no recursive `**`); non-globs resolve to one path.
-fn expand_target(target: &str, cwd: &Path, report: &mut BlastReport) -> Vec<PathBuf> {
+fn expand_target(
+    target: &str,
+    cwd: &Path,
+    report: &mut BlastReport,
+    budget: &mut WorkBudget,
+) -> Option<Vec<PathBuf>> {
     if target_is_glob(target) {
-        glob_in_cwd(target, cwd, report)
+        glob_in_cwd(target, cwd, report, budget)
     } else {
-        vec![resolve_relative(target, cwd)]
+        Some(vec![resolve_relative(target, cwd)])
     }
 }
 
@@ -676,7 +735,12 @@ fn resolve_relative(target: &str, cwd: &Path) -> PathBuf {
 /// Single-level glob: split into `<dir>/<basename-pattern>`, read `<dir>`, keep
 /// name-matching entries. Only the basename may have a wildcard — enough for the
 /// common `./dist/*` / `*.log` preview shapes.
-fn glob_in_cwd(pattern: &str, cwd: &Path, report: &mut BlastReport) -> Vec<PathBuf> {
+fn glob_in_cwd(
+    pattern: &str,
+    cwd: &Path,
+    report: &mut BlastReport,
+    budget: &mut WorkBudget,
+) -> Option<Vec<PathBuf>> {
     let (dir_part, name_part) = match pattern.rsplit_once('/') {
         Some((d, n)) => (d.to_string(), n.to_string()),
         None => (String::new(), pattern.to_string()),
@@ -687,22 +751,49 @@ fn glob_in_cwd(pattern: &str, cwd: &Path, report: &mut BlastReport) -> Vec<PathB
         resolve_relative(&dir_part, cwd)
     };
 
+    // Charge the directory operation before opening it. The returned match list
+    // can never grow beyond the shared budget because every candidate is charged.
+    if !budget.consume(report) {
+        return None;
+    }
     let mut out = Vec::new();
     match std::fs::read_dir(&dir) {
         Ok(entries) => {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if glob_match(&name_part, &name) {
-                    out.push(entry.path());
+            for entry in entries {
+                if !budget.consume(report) {
+                    return None;
+                }
+                match entry {
+                    Ok(entry) => {
+                        if !budget.consume(report) {
+                            return None;
+                        }
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if glob_match(&name_part, &name) {
+                            report.glob_expansion_count += 1;
+                            out.push(entry.path());
+                        }
+                    }
+                    Err(_) => {
+                        if !budget.consume(report) {
+                            return None;
+                        }
+                        report.walk_errors += 1;
+                    }
                 }
             }
         }
         // A glob over an unreadable dir expands to nothing; record it so the
         // report flags the walk as incomplete (F3).
-        Err(_) => report.walk_errors += 1,
+        Err(_) => {
+            if !budget.consume(report) {
+                return None;
+            }
+            report.walk_errors += 1;
+        }
     }
-    out
+    Some(out)
 }
 
 /// Minimal glob matcher: `*` (any run), `?` (one char), `[` literal. Enough for
@@ -773,77 +864,119 @@ fn canonicalize_lexical(path: &Path, cwd: &Path) -> PathBuf {
     out
 }
 
-/// Walk `path` into the report, honoring the depth/file-count caps. Symlinks are
+/// Walk `path` into the report, honoring the depth/work caps. Symlinks are
 /// counted, never followed.
-fn walk_into(path: &Path, _cwd: &Path, report: &mut BlastReport) {
+fn walk_into(path: &Path, report: &mut BlastReport, budget: &mut WorkBudget) -> bool {
+    if !budget.consume(report) {
+        return false;
+    }
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) => {
+            if !budget.consume(report) {
+                return false;
+            }
             // NotFound is normal (nothing to count); any other error means we
             // under-counted, so flag it.
             if e.kind() != std::io::ErrorKind::NotFound {
                 report.walk_errors += 1;
             }
-            return;
+            return true;
         }
     };
 
     if meta.file_type().is_symlink() {
+        if !budget.consume(report) {
+            return false;
+        }
         report.symlink_count += 1;
-        return;
+        return true;
     }
     if meta.is_file() {
+        if !budget.consume(report) {
+            return false;
+        }
         count_file(path, meta.len(), report);
-        return;
+        return true;
     }
     if meta.is_dir() {
+        if !budget.consume(report) {
+            return false;
+        }
         report.dir_count += 1;
-        walk_dir(path, 1, report);
+        return walk_dir(path, 1, report, budget);
     }
+    true
 }
 
-fn walk_dir(dir: &Path, depth: usize, report: &mut BlastReport) {
-    if report.file_count >= MAX_FILE_COUNT as u64 {
-        report.walk_truncated = true;
-        return;
-    }
+fn walk_dir(dir: &Path, depth: usize, report: &mut BlastReport, budget: &mut WorkBudget) -> bool {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => {
+            if !budget.consume(report) {
+                return false;
+            }
             // Unreadable dir (perms/I/O): its subtree is silently uncounted.
             // Record it so the report does not present a partial walk as complete (F3).
             report.walk_errors += 1;
-            return;
+            return true;
         }
     };
-    for entry in entries.flatten() {
-        if report.file_count >= MAX_FILE_COUNT as u64 {
-            report.walk_truncated = true;
-            return;
+    for entry in entries {
+        if !budget.consume(report) {
+            return false;
         }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                if !budget.consume(report) {
+                    return false;
+                }
+                report.walk_errors += 1;
+                continue;
+            }
+        };
         let path = entry.path();
+        if !budget.consume(report) {
+            return false;
+        }
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(_) => {
+                if !budget.consume(report) {
+                    return false;
+                }
                 report.walk_errors += 1;
                 continue;
             }
         };
         if meta.file_type().is_symlink() {
+            if !budget.consume(report) {
+                return false;
+            }
             report.symlink_count += 1;
             continue; // never follow
         }
         if meta.is_dir() {
+            if !budget.consume(report) {
+                return false;
+            }
             report.dir_count += 1;
             if depth < MAX_WALK_DEPTH {
-                walk_dir(&path, depth + 1, report);
+                if !walk_dir(&path, depth + 1, report, budget) {
+                    return false;
+                }
             } else {
                 report.walk_truncated = true;
             }
         } else if meta.is_file() {
+            if !budget.consume(report) {
+                return false;
+            }
             count_file(&path, meta.len(), report);
         }
     }
+    true
 }
 
 fn count_file(path: &Path, size: u64, report: &mut BlastReport) {
@@ -897,6 +1030,117 @@ mod tests {
 
     fn empty_env() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    fn simulate_with_tiny_budget(input: &str, cwd: &Path, work_limit: usize) -> BlastReport {
+        simulate_with_work_limit(
+            input,
+            ShellType::Posix,
+            cwd,
+            Some(cwd),
+            &empty_env(),
+            work_limit,
+        )
+    }
+
+    #[test]
+    fn work_budget_caps_directory_only_trees_and_keeps_dir_counts_honest() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        fs::create_dir_all(tree.join("a")).unwrap();
+        fs::create_dir_all(tree.join("b")).unwrap();
+
+        let report = simulate_with_tiny_budget("rm -rf ./tree", root.path(), 4);
+
+        assert!(report.work_cap_reached);
+        assert!(
+            report.walk_truncated,
+            "legacy incomplete marker must remain set"
+        );
+        assert_eq!(report.work_units_used, 4);
+        assert_eq!(report.work_limit, 4);
+        assert_eq!(
+            report.dir_count, 1,
+            "an uncharged directory must not be counted"
+        );
+        assert_eq!(report.file_count, 0);
+        assert_eq!(report.symlink_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_budget_caps_symlink_only_trees_and_exact_budget_is_complete() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        std::os::unix::fs::symlink("missing-target", tree.join("link")).unwrap();
+
+        let capped = simulate_with_tiny_budget("rm -rf ./tree", root.path(), 4);
+        assert!(capped.work_cap_reached);
+        assert_eq!(capped.work_units_used, 4);
+        assert_eq!(
+            capped.symlink_count, 0,
+            "uncharged symlink must not be counted"
+        );
+
+        let complete = simulate_with_tiny_budget("rm -rf ./tree", root.path(), 5);
+        assert!(!complete.work_cap_reached);
+        assert!(!complete.walk_truncated);
+        assert_eq!(complete.work_units_used, 5);
+        assert_eq!(complete.dir_count, 1);
+        assert_eq!(complete.symlink_count, 1);
+    }
+
+    #[test]
+    fn nonmatching_glob_candidates_consume_the_global_work_budget() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"x").unwrap();
+        fs::write(root.path().join("b.txt"), b"x").unwrap();
+
+        let report = simulate_with_tiny_budget("rm -f *.log", root.path(), 4);
+
+        assert!(report.work_cap_reached);
+        assert_eq!(report.work_units_used, 4);
+        assert_eq!(report.glob_expansion_count, 0);
+        assert_eq!(report.file_count, 0);
+    }
+
+    #[test]
+    fn matching_glob_growth_and_followup_walk_share_one_budget() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.log"), b"x").unwrap();
+        fs::write(root.path().join("b.log"), b"x").unwrap();
+
+        let report = simulate_with_tiny_budget("rm -f *.log", root.path(), 7);
+
+        assert!(report.work_cap_reached);
+        assert_eq!(report.work_units_used, 7);
+        assert_eq!(report.glob_expansion_count, 2);
+        assert_eq!(
+            report.file_count, 1,
+            "only the fully charged match is counted"
+        );
+    }
+
+    #[test]
+    fn glob_errors_are_not_flattened_and_consume_budget_before_later_targets() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("later.txt"), b"x").unwrap();
+
+        let report = simulate_with_tiny_budget("rm -f ./missing/*.log ./later.txt", root.path(), 2);
+
+        assert!(report.work_cap_reached);
+        assert_eq!(report.work_units_used, 2);
+        assert_eq!(report.walk_errors, 1);
+        assert_eq!(
+            report.file_count, 0,
+            "work must stop before the later target"
+        );
+    }
+
+    #[test]
+    fn max_file_count_remains_the_compatible_default_work_limit() {
+        assert_eq!(MAX_WORK_COUNT, MAX_FILE_COUNT);
     }
 
     #[test]

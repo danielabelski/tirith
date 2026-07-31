@@ -1,7 +1,7 @@
 //! `tirith preview -- "<cmd>"` — blast-radius simulator for `rm` / `mv` /
 //! `chmod -R` / `find … -delete` / `rsync --delete`.
 //!
-//! Walks the filesystem (capped at depth 5 / 100k files), expands globs against
+//! Walks the filesystem (capped at depth 5 / 100k charged operations), expands globs against
 //! cwd, and reports file/dir/symlink counts, largest file, repo-escape, and
 //! system-path writes.
 //!
@@ -119,13 +119,9 @@ fn print_human(
         }
     );
 
-    if report.walk_truncated {
+    if let Some(note) = walk_incomplete_note(report) {
         println!();
-        println!(
-            "  note: walk stopped at the depth-{}/{}-file cap; counts are lower bounds.",
-            blast_radius::MAX_WALK_DEPTH,
-            blast_radius::MAX_FILE_COUNT
-        );
+        println!("  note: {note}");
     }
 
     if report.walk_errors > 0 {
@@ -158,6 +154,22 @@ fn print_human(
     println!(
         "        command and is NOT a sandbox — it reads the disk to count impact, then exits."
     );
+}
+
+fn walk_incomplete_note(report: &BlastReport) -> Option<String> {
+    if report.work_cap_reached {
+        return Some(format!(
+            "walk stopped at the {}-operation work cap after {} charged operation(s); \
+             counts are lower bounds.",
+            report.work_limit, report.work_units_used
+        ));
+    }
+    report.walk_truncated.then(|| {
+        format!(
+            "walk stopped at the depth-{} cap; counts are lower bounds.",
+            blast_radius::MAX_WALK_DEPTH
+        )
+    })
 }
 
 fn emit_json(
@@ -233,6 +245,27 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn work_cap_is_explicit_in_human_and_json_incomplete_output() {
+        let report = BlastReport {
+            walk_truncated: true,
+            work_cap_reached: true,
+            work_units_used: 3,
+            work_limit: 3,
+            ..BlastReport::default()
+        };
+
+        let note = walk_incomplete_note(&report).expect("work cap needs a human note");
+        assert!(note.contains("work cap"), "unexpected note: {note}");
+        assert!(note.contains("3"), "limit must be visible: {note}");
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["work_cap_reached"], true);
+        assert_eq!(json["work_units_used"], 3);
+        assert_eq!(json["work_limit"], 3);
+        assert_eq!(json["walk_truncated"], true);
     }
 
     #[test]
