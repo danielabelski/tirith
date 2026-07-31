@@ -53,7 +53,9 @@ use tirith_core::receipt::ArtifactScanReceipt;
 use tirith_core::threatdb::ThreatDb;
 
 use crate::cli::capsule::{self, DegradedPolicy};
-use crate::cli::pkg_install::{record_install_receipt, run_contained_install, ResolverProvenance};
+use crate::cli::pkg_install::{
+    record_install_receipt, run_contained_install, EnvironmentCheckpoint, ResolverProvenance,
+};
 
 /// tirith-owned options that no package manager interprets. If one of these appears
 /// AFTER the trailing requirement args it would silently not affect tirith (the same
@@ -602,6 +604,21 @@ fn run_install(
     };
 
     let installed_names = installed_distribution_names(&prepared.resolved);
+    // Snapshot the complete target before pip gets write access. The checkpoint
+    // remains live through RECORD verification and mandatory signed-receipt
+    // recording; every failed gate below restores it.
+    let mut environment_checkpoint = match EnvironmentCheckpoint::begin(
+        &prepared.target.environment,
+    ) {
+        Ok(checkpoint) => checkpoint,
+        Err(e) => {
+            eprintln!(
+                "tirith pkg install: cannot checkpoint target environment {}: {e}; refusing before pip runs",
+                prepared.target.environment.display()
+            );
+            return 1;
+        }
+    };
     let outcome = match run_contained_install_with_policy(
         &prepared.plan,
         prepared.txn.dir(),
@@ -613,6 +630,13 @@ fn run_install(
     ) {
         Ok(o) => o,
         Err(e) => {
+            if let Err(rollback_error) = environment_checkpoint.rollback() {
+                eprintln!(
+                    "tirith pkg install: {e}; CRITICAL: failed to restore target environment {}: {rollback_error}",
+                    prepared.target.environment.display()
+                );
+                return 1;
+            }
             eprintln!("tirith pkg install: {e}");
             return 1;
         }
@@ -636,11 +660,7 @@ fn run_install(
     // The finalised install verdict the receipt attests: the post-install RECORD
     // verdict when the install ran to completion, else a synthesized Block (a failed
     // install did not produce a trustworthy environment).
-    let verdict = outcome
-        .post_install
-        .as_ref()
-        .map(|p| p.verdict.clone())
-        .unwrap_or_else(|| failed_install_verdict(outcome.exit_code));
+    let verdict = enforcing_install_verdict(&outcome);
 
     // D6: record the tamper-evident receipt. Ed25519 is MANDATORY for `pkg install`
     // (require_signature = true): an unsigned audit log fails the record closed.
@@ -652,6 +672,17 @@ fn run_install(
         &verdict,
         true,
     );
+
+    let install_succeeded = InstallReport::from_outcome(&outcome, &recorded).success;
+    if install_succeeded {
+        environment_checkpoint.commit();
+    } else if let Err(rollback_error) = environment_checkpoint.rollback() {
+        eprintln!(
+            "tirith pkg install: CRITICAL: failed to restore target environment {} after a failed enforcing gate: {rollback_error}",
+            prepared.target.environment.display()
+        );
+        return 1;
+    }
 
     report_install_outcome(&prepared.digest, &outcome, recorded, json)
 }
@@ -741,6 +772,23 @@ fn failed_install_verdict(exit_code: i32) -> tirith_core::verdict::Verdict {
     }
 }
 
+/// The receipt must attest the enforcing result, not merely the policy severity of
+/// an individual RECORD finding. Missing distributions, missing RECORD files, hash
+/// mismatches, and zero verified distributions are all incomplete verification and
+/// therefore Block for `pkg install`.
+fn enforcing_install_verdict(
+    outcome: &crate::cli::pkg_install::ContainedInstallOutcome,
+) -> tirith_core::verdict::Verdict {
+    let Some(post) = outcome.post_install.as_ref() else {
+        return failed_install_verdict(outcome.exit_code);
+    };
+    let mut verdict = post.verdict.clone();
+    if outcome.exit_code != 0 || !post.is_complete() || post.hash_mismatches > 0 {
+        verdict.action = tirith_core::verdict::Action::Block;
+    }
+    verdict
+}
+
 /// The honest, redaction-safe projection of an install outcome + receipt status that
 /// both the human banner and the `--json` output are rendered from. Built purely from
 /// the outcome and the receipt record so it is unit-testable without capturing stderr
@@ -756,6 +804,11 @@ struct InstallReport {
     /// `success` install always carries 0 here; the count is still surfaced (in JSON and
     /// on the failure path) for the audit trail.
     hash_mismatches: usize,
+    /// Expected distributions that could not be located at all. Any non-zero value
+    /// means no integrity claim can be made for those packages.
+    distributions_not_found: usize,
+    /// Located distributions whose RECORD was actually checked.
+    distributions_verified: usize,
     /// Located distributions with no RECORD file (a coverage gap).
     records_missing: usize,
     receipt_path: Option<String>,
@@ -780,7 +833,7 @@ impl InstallReport {
         let post_blocked = outcome
             .post_install
             .as_ref()
-            .map(|p| p.is_block())
+            .map(|p| p.is_block() || !p.is_complete() || p.hash_mismatches > 0)
             .unwrap_or(false);
         let hash_mismatches = outcome
             .post_install
@@ -792,14 +845,24 @@ impl InstallReport {
             .as_ref()
             .map(|p| p.records_missing)
             .unwrap_or(0);
-        // IM8: the enforcing `pkg install` fails CLOSED on a post-install RECORD hash
-        // mismatch. A RECORD-listed file whose on-disk bytes differ from the RECORD pip
-        // just wrote is install-time tampering: this is a fresh, contained, wheel-only
-        // --force-reinstall, so a mismatch in that window is not the benign environment
-        // drift that scanning a pre-existing env (`verify-env`) can see. `records_missing`
-        // stays a non-fatal coverage gap (warning), and the finding's Medium severity is
-        // unchanged, so `verify-env` / scan keep warning rather than blocking.
-        let success = install_ok && !post_blocked && recorded.is_ok() && hash_mismatches == 0;
+        let distributions_not_found = outcome
+            .post_install
+            .as_ref()
+            .map(|p| p.distributions_not_found)
+            .unwrap_or(0);
+        let distributions_verified = outcome
+            .post_install
+            .as_ref()
+            .map(|p| p.distributions_verified)
+            .unwrap_or(0);
+        // The enforcing path requires complete proof, not merely the absence of a
+        // policy-level Block. A clean pip exit with zero located distributions is not
+        // verification, and neither is a located distribution whose RECORD is absent.
+        let verification_complete = outcome
+            .post_install
+            .as_ref()
+            .is_some_and(|post| post.is_complete() && post.hash_mismatches == 0);
+        let success = install_ok && !post_blocked && recorded.is_ok() && verification_complete;
         let (receipt_path, signed, anchor_warning, receipt_error) = match recorded {
             Ok(r) => (
                 Some(r.path.display().to_string()),
@@ -814,6 +877,8 @@ impl InstallReport {
             post_blocked,
             success,
             hash_mismatches,
+            distributions_not_found,
+            distributions_verified,
             records_missing,
             receipt_path,
             signed,
@@ -825,7 +890,10 @@ impl InstallReport {
     /// Whether the post-install RECORD check found no tamper signal and no coverage
     /// gap. Only a clean check earns the word "verified" (IM8).
     fn record_integrity_clean(&self) -> bool {
-        self.hash_mismatches == 0 && self.records_missing == 0
+        self.distributions_verified > 0
+            && self.distributions_not_found == 0
+            && self.hash_mismatches == 0
+            && self.records_missing == 0
     }
 
     fn to_json(
@@ -845,6 +913,8 @@ impl InstallReport {
             "receipt_anchor_warning": self.anchor_warning,
             "receipt_error": self.receipt_error,
             "record_hash_mismatches": self.hash_mismatches,
+            "record_distributions_verified": self.distributions_verified,
+            "record_distributions_not_found": self.distributions_not_found,
             "record_records_missing": self.records_missing,
             "success": self.success,
         })
@@ -914,6 +984,23 @@ fn report_install_outcome(
                 report.hash_mismatches
             );
         }
+        if report.distributions_not_found > 0 {
+            eprintln!(
+                "  post-install verification incomplete: {} expected distribution(s) were not found; refusing (fail closed)",
+                report.distributions_not_found
+            );
+        }
+        if report.records_missing > 0 {
+            eprintln!(
+                "  post-install verification incomplete: {} distribution(s) had no RECORD; refusing (fail closed)",
+                report.records_missing
+            );
+        }
+        if report.distributions_verified == 0 {
+            eprintln!(
+                "  post-install verification checked zero distributions; refusing (fail closed)"
+            );
+        }
         if let Some(err) = &report.receipt_error {
             eprintln!("  receipt: {err}");
         }
@@ -951,17 +1038,24 @@ fn run_verify_env(target: &Path, packages: &[String], json: bool) -> i32 {
         .collect();
 
     let result = verify_post_install_record(target, &names, &policy);
-    let blocked = result.is_block();
+    let incomplete = !result.is_complete();
+    let blocked = result.is_block() || incomplete;
+    let effective_action = if incomplete {
+        tirith_core::verdict::Action::Block
+    } else {
+        result.verdict.action
+    };
 
     if json {
         let out = serde_json::json!({
             "target": target.display().to_string(),
             "blocked": blocked,
+            "verification_incomplete": incomplete,
             "distributions_verified": result.distributions_verified,
             "distributions_not_found": result.distributions_not_found,
             "records_missing": result.records_missing,
             "hash_mismatches": result.hash_mismatches,
-            "action": format!("{:?}", result.verdict.action),
+            "action": format!("{effective_action:?}"),
             "rule_ids": result
                 .verdict
                 .findings
@@ -977,9 +1071,9 @@ fn run_verify_env(target: &Path, packages: &[String], json: bool) -> i32 {
         eprintln!("  not found:   {}", result.distributions_not_found);
         eprintln!("  no RECORD:   {}", result.records_missing);
         eprintln!("  mismatches:  {}", result.hash_mismatches);
-        eprintln!("  verdict:     {:?}", result.verdict.action);
+        eprintln!("  verdict:     {effective_action:?}");
         if blocked {
-            eprintln!("  the installed environment FAILED RECORD integrity verification");
+            eprintln!("  the installed environment FAILED complete RECORD integrity verification");
         }
     }
 
@@ -1619,23 +1713,60 @@ mod tests {
     }
 
     #[test]
-    fn install_report_records_missing_only_is_a_warning_not_a_block() {
-        // A missing RECORD with NO hash mismatch is a coverage gap, not a positive tamper
-        // signal, so the install still SUCCEEDS (it is just not called fully "verified").
-        // verify-env / scan keep their Medium-Warn behavior; only a hash mismatch blocks.
+    fn install_report_missing_record_fails_closed() {
+        // A missing RECORD is incomplete verification. The package may have landed,
+        // but an enforcing install must restore the checkpoint rather than call it a
+        // success.
         let outcome = outcome_with_post(0, 0, 1);
         let recorded = Ok(recorded_ok(true, None));
         let report = InstallReport::from_outcome(&outcome, &recorded);
         assert!(
-            report.success,
-            "a coverage gap (missing RECORD) without a hash mismatch is a warning, not a block"
+            !report.success,
+            "a missing RECORD must fail the enforcing install closed"
         );
+        assert!(report.post_blocked);
         assert!(!report.record_integrity_clean());
 
         let digest = digest_with_expiry("");
         let json = report.to_json(&digest, &outcome);
         assert_eq!(json["record_records_missing"], serde_json::json!(1));
-        assert_eq!(json["success"], serde_json::json!(true));
+        assert_eq!(json["success"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn install_report_missing_distribution_fails_closed_and_receipt_verdict_blocks() {
+        let mut outcome = outcome_with_post(0, 0, 0);
+        let post = outcome.post_install.as_mut().unwrap();
+        post.distributions_verified = 0;
+        post.distributions_not_found = 1;
+        let recorded = Ok(recorded_ok(true, None));
+
+        let report = InstallReport::from_outcome(&outcome, &recorded);
+        assert!(!report.success);
+        assert!(report.post_blocked);
+        assert!(!report.record_integrity_clean());
+        assert_eq!(report.distributions_not_found, 1);
+        assert_eq!(
+            enforcing_install_verdict(&outcome).action,
+            tirith_core::verdict::Action::Block,
+            "the signed receipt must attest the enforcing Block, not an empty Allow"
+        );
+
+        let digest = digest_with_expiry("");
+        let json = report.to_json(&digest, &outcome);
+        assert_eq!(json["record_distributions_not_found"], serde_json::json!(1));
+        assert_eq!(json["success"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn verify_env_returns_nonzero_when_expected_distribution_is_absent() {
+        let target = tempfile::tempdir().unwrap();
+        let packages = vec!["definitely-not-installed".to_string()];
+        assert_eq!(
+            run_verify_env(target.path(), &packages, false),
+            1,
+            "an empty Allow verdict must not turn incomplete verification into success"
+        );
     }
 
     #[test]

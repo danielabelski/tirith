@@ -226,7 +226,7 @@ pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i3
     let plan_json: Vec<u8> = if iac_plan::looks_like_json(&bytes) {
         bytes.clone()
     } else {
-        match iac_plan::run_terraform_show_json(plan_path, tool) {
+        match iac_plan::run_terraform_show_json_bytes(&bytes, tool) {
             Ok(out) => out,
             Err(e) => {
                 eprintln!(

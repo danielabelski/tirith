@@ -52,6 +52,194 @@ use crate::cli::capsule::{self, CapsuleRefused, DegradedPolicy};
 /// directory. A single safe component; pip reads it via `-r`.
 const APPROVED_REQUIREMENTS_FILE: &str = "approved.txt";
 
+/// A pre-install checkpoint of the complete target environment. The enforcing
+/// package path keeps this alive until post-install verification and mandatory
+/// receipt recording have both succeeded. Any failed gate restores the old tree;
+/// dropping an active checkpoint is also fail-safe and attempts the restore.
+pub struct EnvironmentCheckpoint {
+    target: PathBuf,
+    workspace: Option<tempfile::TempDir>,
+    snapshot: PathBuf,
+    target_existed: bool,
+    active: bool,
+}
+
+impl EnvironmentCheckpoint {
+    pub fn begin(target: &Path) -> std::io::Result<Self> {
+        let target = std::path::absolute(target)?;
+        let parent = match target.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => std::env::current_dir()?,
+        };
+        if parent == target {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to checkpoint a filesystem root as an install target",
+            ));
+        }
+        tirith_core::util::create_dir_durable(&parent)?;
+
+        let workspace = tempfile::Builder::new()
+            .prefix(".tirith-install-checkpoint-")
+            .tempdir_in(&parent)?;
+        let snapshot = workspace.path().join("environment");
+        let target_existed = match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to checkpoint symlinked install target {}",
+                        target.display()
+                    ),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                copy_environment_tree(&target, &snapshot)?;
+                true
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("install target {} is not a directory", target.display()),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+
+        Ok(Self {
+            target,
+            workspace: Some(workspace),
+            snapshot,
+            target_existed,
+            active: true,
+        })
+    }
+
+    /// Discard the checkpoint after every enforcing gate has succeeded.
+    pub fn commit(mut self) {
+        self.active = false;
+        // TempDir cleanup is best-effort on Drop. It contains only the private
+        // checkpoint, never the live environment.
+    }
+
+    /// Restore the exact pre-install tree (or absence) and remove all partial
+    /// package-manager output.
+    pub fn rollback(&mut self) -> std::io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
+        if !self.target_existed {
+            remove_path_if_present(&self.target)?;
+            tirith_core::util::fsync_parent_dir(&self.target)?;
+            self.active = false;
+            return Ok(());
+        }
+
+        let workspace = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("install checkpoint workspace is unavailable"))?;
+        let failed_tree = workspace.path().join("failed-install");
+        remove_path_if_present(&failed_tree)?;
+
+        let moved_failed_tree = match std::fs::symlink_metadata(&self.target) {
+            Ok(_) => {
+                std::fs::rename(&self.target, &failed_tree)?;
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+
+        if let Err(restore_error) = std::fs::rename(&self.snapshot, &self.target) {
+            if moved_failed_tree {
+                let _ = std::fs::rename(&failed_tree, &self.target);
+            }
+            return Err(restore_error);
+        }
+        tirith_core::util::fsync_parent_dir(&self.target)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for EnvironmentCheckpoint {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.rollback();
+        }
+    }
+}
+
+fn remove_path_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path)
+        }
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn copy_environment_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut directory_permissions = Vec::new();
+    for entry in walkdir::WalkDir::new(source).follow_links(false) {
+        let entry = entry.map_err(std::io::Error::other)?;
+        let relative = entry
+            .path()
+            .strip_prefix(source)
+            .map_err(std::io::Error::other)?;
+        let copied = destination.join(relative);
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+
+        if metadata.is_dir() {
+            std::fs::create_dir_all(&copied)?;
+            directory_permissions.push((copied, metadata.permissions()));
+        } else if metadata.file_type().is_symlink() {
+            copy_symlink(entry.path(), &copied)?;
+        } else if metadata.is_file() {
+            std::fs::copy(entry.path(), &copied)?;
+            std::fs::set_permissions(&copied, metadata.permissions())?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported filesystem entry in install target: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+
+    // Apply directory modes after populating children so a read-only directory
+    // cannot prevent its own snapshot from being completed.
+    for (directory, permissions) in directory_permissions.into_iter().rev() {
+        std::fs::set_permissions(directory, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(std::fs::read_link(source)?, destination)
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let target = std::fs::read_link(source)?;
+    if std::fs::metadata(source)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        std::os::windows::fs::symlink_dir(target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(target, destination)
+    }
+}
+
 /// The outcome of a contained install-from-digest: the child's exit code plus the
 /// honest capsule backend / coverage record, so the D6 receipt (and an audit line)
 /// can state exactly what containment the install ran under.
@@ -377,6 +565,52 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "approved.txt must be 0600");
         }
+    }
+
+    #[test]
+    fn failed_install_checkpoint_restores_the_original_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("venv");
+        std::fs::create_dir_all(target.join("lib/python3.13/site-packages/demo")).unwrap();
+        let original = target.join("lib/python3.13/site-packages/demo/__init__.py");
+        std::fs::write(&original, b"safe = True\n").unwrap();
+
+        let mut checkpoint = EnvironmentCheckpoint::begin(&target).unwrap();
+        std::fs::write(&original, b"raise RuntimeError('partial install')\n").unwrap();
+        let residue = target.join("lib/python3.13/site-packages/evil.pth");
+        std::fs::write(&residue, b"import payload\n").unwrap();
+
+        checkpoint.rollback().unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"safe = True\n");
+        assert!(!residue.exists(), "partial package files must be removed");
+    }
+
+    #[test]
+    fn failed_install_checkpoint_restores_an_absent_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("new-target");
+        let mut checkpoint = EnvironmentCheckpoint::begin(&target).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("evil.pth"), b"import payload\n").unwrap();
+
+        checkpoint.rollback().unwrap();
+        assert!(
+            !target.exists(),
+            "a partial newly-created target must be removed"
+        );
+    }
+
+    #[test]
+    fn successful_install_checkpoint_keeps_the_new_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("venv");
+        std::fs::create_dir_all(&target).unwrap();
+        let installed = target.join("installed.py");
+        let checkpoint = EnvironmentCheckpoint::begin(&target).unwrap();
+        std::fs::write(&installed, b"verified = True\n").unwrap();
+
+        checkpoint.commit();
+        assert_eq!(std::fs::read(installed).unwrap(), b"verified = True\n");
     }
 
     #[test]

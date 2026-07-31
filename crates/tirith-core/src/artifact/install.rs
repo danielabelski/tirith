@@ -550,12 +550,11 @@ pub struct PostInstallIntegrity {
     /// environment and had their RECORD verified.
     pub distributions_verified: usize,
     /// How many named distributions could not be located in the target
-    /// environment's `site-packages` (no matching `.dist-info`). A COVERAGE GAP,
-    /// not a violation: pip may install into a `site-packages` layout this check
-    /// does not enumerate; the receipt records the shortfall rather than failing.
+    /// environment's `site-packages` (no matching `.dist-info`). This is a coverage
+    /// gap rather than proof of tampering, but enforcing callers must fail closed.
     pub distributions_not_found: usize,
-    /// How many located distributions had NO RECORD file (a coverage gap per the
-    /// installed-packages spec, never a violation).
+    /// How many located distributions had NO RECORD file. This is a coverage gap
+    /// rather than proof of tampering, but enforcing callers must fail closed.
     pub records_missing: usize,
     /// How many RECORD-listed files did not match their on-disk bytes across the
     /// verified distributions (the strong tamper signal).
@@ -569,6 +568,15 @@ impl PostInstallIntegrity {
     /// `self.verdict.action`.
     pub fn is_block(&self) -> bool {
         matches!(self.verdict.action, crate::verdict::Action::Block)
+    }
+
+    /// Whether the check established complete integrity coverage for at least one
+    /// expected distribution. Enforcing install/verify surfaces use this in addition
+    /// to the policy-level verdict so an empty Allow cannot mean success.
+    pub fn is_complete(&self) -> bool {
+        self.distributions_verified > 0
+            && self.distributions_not_found == 0
+            && self.records_missing == 0
     }
 }
 
@@ -1687,6 +1695,7 @@ mod tests {
             "a clean install has no finding"
         );
         assert!(!res.is_block());
+        assert!(res.is_complete());
     }
 
     #[test]
@@ -1815,6 +1824,7 @@ mod tests {
             verify_post_install_record(tmp.path(), &["ghost".to_string()], &Policy::default());
         assert_eq!(res.distributions_not_found, 1);
         assert_eq!(res.distributions_verified, 0);
+        assert!(!res.is_complete());
         assert_eq!(
             finding_count(&res.verdict),
             0,
