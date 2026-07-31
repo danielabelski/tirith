@@ -46,19 +46,25 @@
 //!    strips `PIP_*` / `UV_*` / index / token variables, so a `pip.conf`,
 //!    `uv.toml`, `.netrc`, or `PIP_INDEX_URL` planted in the repo or environment
 //!    cannot redirect the resolve.
-//! 5. **Explicit approved index URLs only.** The default index is dropped
-//!    (`--no-index` unless indexes are supplied); any supplied index is the only
-//!    place wheels may come from.
+//! 5. **Explicit approved resolver origins only.** The default index is dropped
+//!    (`--no-index` unless indexes are supplied). Every uv/pip HTTPS connection
+//!    is routed through an authenticated loopback broker that permits only the
+//!    canonical host/port origins explicitly approved by the request. Custom
+//!    artifact/CDN origins are broker-only (never extra indexes); the sole built-in
+//!    compatibility alias is exact PyPI -> exact files.pythonhosted.org.
 //! 6. **Credentials in an index URL refused.** [`validate_index_url`] rejects a
 //!    `user:pass@host` index outright (no secret on a command line / in a lock).
-//! 7. **Indexes pass through tirith's SSRF / domain policy.**
-//!    [`validate_index_url`] runs each index through
-//!    [`crate::url_validate::validate_server_url`] (HTTPS, no private / loopback /
-//!    link-local / cloud-metadata destination).
+//! 7. **Connect-time SSRF and redirect enforcement.** The broker resolves each
+//!    CONNECT host once, rejects non-public/metadata addresses, connects to the
+//!    approved IP directly, and pins TLS SNI. Redirect and artifact hosts create
+//!    fresh CONNECT requests and therefore cannot escape the origin allow-set.
 //! 8. **`uv` / `python` resolved by executable provenance, not blind PATH.**
-//!    [`resolve_tool`] finds the binary on `PATH`, then gathers
-//!    [`crate::exec_provenance::provenance_of`] and refuses a world-writable
-//!    target (anyone could swap it) unless policy permits an untrusted tool.
+//!    [`resolve_tool`] uses [`crate::trusted_child`] to canonicalize, reject
+//!    project/temp and writable/foreign-owned paths, bind file identity, and
+//!    require a root-owned Unix system hierarchy or an explicit owner-only
+//!    canonical path + SHA-256 enrollment. Windows is enrollment-only because
+//!    ambient system-root variables are not proof of installation provenance.
+//!    Identity is revalidated before each spawn.
 //!
 //! npm / cargo resolution is intentionally absent here: the engine is wheel-only,
 //! and the plan keeps `.tgz` / `.crate` / vendored-source behind hidden
@@ -66,21 +72,19 @@
 //! install** until hardened analyzers exist. This module enforces Python.
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::artifact::quarantine::{QuarantineError, QuarantineStore, QuarantineTransaction};
-use crate::exec_provenance::provenance_of;
+use crate::artifact::resolver_broker::{PermittedOrigins, ResolverBroker};
+use crate::trusted_child::{
+    ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable, TrustedExecutableError,
+};
 
 /// Wall-clock ceiling for a single resolver child (`uv` compile or `pip`
 /// download). A resolve that hangs past this is killed; the firewall never waits
 /// unbounded on a network operation.
 pub const RESOLVER_CHILD_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Poll cadence while waiting on a resolver child.
-const RESOLVER_POLL: Duration = Duration::from_millis(50);
 
 /// Hard cap on requirement specs in one request, so a pathological input cannot
 /// turn into an unbounded command line / lock.
@@ -88,6 +92,10 @@ const MAX_REQUIREMENTS: usize = 4096;
 
 /// Hard cap on approved index URLs in one request.
 const MAX_INDEX_URLS: usize = 64;
+
+/// Per-stream diagnostic cap for resolver children. The trusted-child
+/// supervisor kills the process tree if either stream exceeds this bound.
+const RESOLVER_CHILD_OUTPUT_MAX: usize = 4 * 1024 * 1024;
 
 /// What the resolver is permitted to accept beyond the secure default. Every
 /// field defaults to the *refusing* stance, so [`ResolverAllowances::default`] is
@@ -112,9 +120,10 @@ pub struct ResolverAllowances {
     /// Permit a direct-URL requirement (`name @ https://.../x.whl`). Default
     /// `false`. Even when permitted the URL still passes [`validate_index_url`].
     pub allow_direct_url: bool,
-    /// Permit resolving with a tool binary that failed provenance (e.g.
-    /// world-writable). Default `false`: a world-writable `uv` / `python` is
-    /// refused, since anyone could replace it between resolution and exec.
+    /// Legacy compatibility field. Resolver execution now always requires the
+    /// trusted-child canonical ownership/identity contract; an unsafe PATH hit
+    /// cannot bypass that boundary. The field remains so serialized/operator
+    /// policy compiled against the older API does not change shape.
     pub allow_untrusted_tool: bool,
 }
 
@@ -133,8 +142,8 @@ pub enum ResolverError {
     TooManyInputs(String),
     /// A required tool (`uv` or `python`) was not found on `PATH`.
     ToolNotFound(String),
-    /// A tool was found but failed executable-provenance (world-writable) and
-    /// [`ResolverAllowances::allow_untrusted_tool`] was not set.
+    /// A tool was found but failed canonical ownership, path hierarchy, stable
+    /// identity, or trusted installation-root provenance.
     ToolUntrusted { tool: String, reason: String },
     /// `uv pip compile` failed, did not produce a usable lock, or emitted a lock
     /// that was not fully hash-pinned.
@@ -253,16 +262,16 @@ impl ResolverRequest {
 /// absolute paths rather than re-resolving a bare name in the child's `PATH`.
 #[derive(Debug, Clone)]
 pub struct ResolverTools {
-    /// Absolute path to the `uv` binary used for `uv pip compile`.
+    /// Canonical, ownership-validated `uv` used for `uv pip compile`.
     pub uv: PathBuf,
-    /// Absolute path to the `python` interpreter used for `python -m pip`.
+    /// Canonical, ownership-validated interpreter used for `python -m pip`.
     pub python: PathBuf,
 }
 
 impl ResolverTools {
     /// Resolve `uv` and `python` (in that order) from `PATH`, applying executable
-    /// provenance. Honors `allow_untrusted_tool`. The interpreter name tried is
-    /// `python3` then `python`.
+    /// provenance. Unsafe PATH hits cannot bypass this with the legacy allowance.
+    /// The interpreter name tried is `python3` then `python`.
     pub fn discover(allowances: &ResolverAllowances) -> Result<Self, ResolverError> {
         let uv = resolve_tool("uv", &["uv"], allowances)?;
         let python = resolve_tool("python", &["python3", "python"], allowances)?;
@@ -270,38 +279,802 @@ impl ResolverTools {
     }
 }
 
-/// Resolve a tool by trying each candidate name on `PATH`, returning the first
-/// existing executable whose provenance is acceptable. `label` names the tool in
-/// errors. A world-writable binary is refused unless
-/// [`ResolverAllowances::allow_untrusted_tool`] is set, since anyone could swap
-/// it between resolution and exec (plan: resolve by executable provenance, not
-/// blind PATH).
+/// Resolve a tool by trying each candidate name on `PATH`, returning a canonical
+/// trusted-child handle. The first executable hit is fail-closed: a project,
+/// temp, foreign-owned, group/world-writable, or otherwise untrusted shadow is
+/// reported instead of silently falling through to a later system binary.
 pub fn resolve_tool(
     label: &str,
     candidates: &[&str],
-    allowances: &ResolverAllowances,
+    _allowances: &ResolverAllowances,
+) -> Result<PathBuf, ResolverError> {
+    let Some(path_value) = std::env::var_os("PATH") else {
+        return Err(ResolverError::ToolNotFound(label.to_string()));
+    };
+    let denied_roots = crate::trusted_child::ambient_denied_roots();
+    resolve_tool_on_path(label, candidates, &path_value, &denied_roots)
+}
+
+fn resolve_tool_on_path(
+    label: &str,
+    candidates: &[&str],
+    path_value: &std::ffi::OsStr,
+    denied_roots: &[PathBuf],
 ) -> Result<PathBuf, ResolverError> {
     for name in candidates {
-        let Some(path) = find_on_path(name) else {
-            continue;
-        };
-        let prov = provenance_of(&path);
-        if !prov.exists {
-            continue;
+        match TrustedExecutable::resolve_on_path(name, path_value, denied_roots) {
+            Ok(executable) => {
+                validate_resolver_tool_provenance(label, &executable).map_err(|reason| {
+                    ResolverError::ToolUntrusted {
+                        tool: executable.path().display().to_string(),
+                        reason: format!(
+                            "resolved {label} failed installation provenance: {reason}"
+                        ),
+                    }
+                })?;
+                remember_discovered_tool(&executable).map_err(|reason| {
+                    ResolverError::ToolUntrusted {
+                        tool: executable.path().display().to_string(),
+                        reason,
+                    }
+                })?;
+                return Ok(executable.path().to_path_buf());
+            }
+            Err(TrustedExecutableError::NotFound(_)) => continue,
+            Err(error) => {
+                return Err(ResolverError::ToolUntrusted {
+                    tool: name.to_string(),
+                    reason: format!("resolved {label} failed canonical provenance: {error}"),
+                })
+            }
         }
-        if prov.world_writable && !allowances.allow_untrusted_tool {
-            return Err(ResolverError::ToolUntrusted {
-                tool: path.display().to_string(),
-                reason: format!(
-                    "resolved {label} is world-writable (mode {}); anyone could replace it before \
-                     it runs. Set the untrusted-tool allowance to override.",
-                    prov.mode.as_deref().unwrap_or("?")
-                ),
-            });
-        }
-        return Ok(path);
     }
     Err(ResolverError::ToolNotFound(label.to_string()))
+}
+
+#[cfg(unix)]
+fn validate_resolver_tool_provenance(
+    label: &str,
+    executable: &TrustedExecutable,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    validate_resolver_tool_name(label, executable.path())?;
+    let metadata = std::fs::metadata(executable.path())
+        .map_err(|error| format!("cannot stat canonical executable: {error}"))?;
+    if metadata.uid() == 0 && root_owned_hierarchy(executable.path())? {
+        return Ok(());
+    }
+    if resolver_tool_pin_matches(executable.path())? {
+        return Ok(());
+    }
+    Err(
+        "user-writable resolver tools require explicit `tirith pkg trust-tool <absolute-path>` \
+         enrollment; no matching canonical path + SHA-256 pin was found"
+            .to_string(),
+    )
+}
+
+#[cfg(windows)]
+fn validate_resolver_tool_provenance(
+    label: &str,
+    executable: &TrustedExecutable,
+) -> Result<(), String> {
+    validate_resolver_tool_name(label, executable.path())?;
+    let canonical = executable.path();
+    // Do not infer system provenance from ProgramFiles/SystemRoot environment
+    // variables: an invoking process can forge them. Stable std does not expose
+    // the Windows owner/DACL identity needed to prove an arbitrary installation
+    // hierarchy immutable, so Windows is explicit-enrollment-only. The pin file
+    // itself is current-user-owned with a mutation-restricted DACL, and both the
+    // enrolled digest and TrustedExecutable's pre-spawn digest are revalidated.
+    windows_trust_acl::validate_executable_hierarchy(canonical)?;
+    if resolver_tool_pin_matches(canonical)? {
+        Ok(())
+    } else {
+        Err(
+            "Windows resolver tools require explicit `tirith pkg trust-tool <absolute-path>` \
+             enrollment; no matching canonical path + SHA-256 pin was found"
+                .to_string(),
+        )
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_resolver_tool_provenance(
+    _label: &str,
+    _executable: &TrustedExecutable,
+) -> Result<(), String> {
+    Err("this platform has no resolver executable ownership verifier".to_string())
+}
+
+fn validate_resolver_tool_name(label: &str, path: &Path) -> Result<(), String> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err("canonical executable has no UTF-8 file name".to_string());
+    };
+    let name = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    let matches = match label {
+        "uv" => name == "uv",
+        "python" => {
+            name == "python"
+                || name.strip_prefix("python").is_some_and(|suffix| {
+                    !suffix.is_empty()
+                        && suffix
+                            .chars()
+                            .all(|character| character.is_ascii_digit() || character == '.')
+                })
+        }
+        _ => true,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "canonical executable name {name:?} does not identify the requested {label} tool"
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn root_owned_hierarchy(path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for component in path.ancestors() {
+        let metadata = std::fs::metadata(component)
+            .map_err(|error| format!("cannot stat {}: {error}", component.display()))?;
+        if metadata.uid() != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const RESOLVER_TOOL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const RESOLVER_TOOL_TRUST_MAX_BYTES: u64 = 1024 * 1024;
+type DiscoveredResolverTools = std::sync::Mutex<BTreeMap<PathBuf, String>>;
+static DISCOVERED_RESOLVER_TOOLS: std::sync::OnceLock<DiscoveredResolverTools> =
+    std::sync::OnceLock::new();
+
+#[cfg(windows)]
+mod windows_trust_acl {
+    use std::ffi::c_void;
+    use std::mem::{size_of, size_of_val};
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetTokenInformation,
+        IsWellKnownSid, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+        INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const EXISTING_FILE_MUTATION: u32 = 0x0000_0002
+        | 0x0000_0004
+        | 0x0000_0010
+        | 0x0000_0100
+        | 0x0001_0000
+        | 0x0004_0000
+        | 0x0008_0000
+        | 0x1000_0000
+        | 0x4000_0000;
+    // A non-owner with add-file/add-directory rights on the resolver-tools
+    // directory can preplant pins.json, and DELETE_CHILD can replace it.
+    const TRUST_DIRECTORY_MUTATION: u32 = EXISTING_FILE_MUTATION | 0x0000_0040;
+    // On a higher ancestor, add-file/add-directory creates only a sibling and
+    // cannot replace the already-existing next component. Reject authority that
+    // can delete that child or take control of the ancestor, while preserving
+    // normal default C:\ usability for unprivileged Windows users.
+    const ANCESTOR_IDENTITY_MUTATION: u32 =
+        0x0000_0040 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x1000_0000;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_ALLOWED_COMPOUND_ACE_TYPE: u8 = 4;
+    const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
+    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+    const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 11;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ComponentRole {
+        ExistingFile,
+        ExecutableDirectory,
+        TrustDirectory,
+        Ancestor,
+    }
+
+    impl ComponentRole {
+        fn mutation_mask(self) -> u32 {
+            match self {
+                Self::ExistingFile => EXISTING_FILE_MUTATION,
+                Self::ExecutableDirectory | Self::TrustDirectory => TRUST_DIRECTORY_MUTATION,
+                Self::Ancestor => ANCESTOR_IDENTITY_MUTATION,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HierarchyKind {
+        Executable,
+        TrustDirectory,
+    }
+
+    fn component_role(kind: HierarchyKind, index: usize) -> ComponentRole {
+        match (kind, index) {
+            (HierarchyKind::Executable, 0) => ComponentRole::ExistingFile,
+            // The application directory participates in the Windows DLL search
+            // order. Reject untrusted file/subdirectory creation here so an
+            // enrolled uv/python cannot be paired with a planted dependency.
+            (HierarchyKind::Executable, 1) => ComponentRole::ExecutableDirectory,
+            (HierarchyKind::TrustDirectory, 0) => ComponentRole::TrustDirectory,
+            _ => ComponentRole::Ancestor,
+        }
+    }
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper owns the handle returned by OpenProcessToken.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for LocalSecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetNamedSecurityInfoW allocated this descriptor with LocalAlloc.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+            }
+        }
+    }
+
+    struct LocalSid(PSID);
+
+    impl Drop for LocalSid {
+        fn drop(&mut self) {
+            // SAFETY: ConvertStringSidToSidW allocated this SID with LocalAlloc.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+            }
+        }
+    }
+
+    struct SecurityContext {
+        current_user_storage: Vec<usize>,
+        trusted_installer: LocalSid,
+    }
+
+    impl SecurityContext {
+        fn load() -> Result<Self, String> {
+            let current_user_storage = current_user_sid_buffer()?;
+            let sid_text: Vec<u16> =
+                "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+            let mut trusted_installer = PSID::default();
+            // SAFETY: sid_text is NUL-terminated and trusted_installer is a
+            // valid out-pointer. The returned SID is owned by LocalSid.
+            unsafe { ConvertStringSidToSidW(PCWSTR(sid_text.as_ptr()), &mut trusted_installer) }
+                .map_err(|error| format!("cannot initialize TrustedInstaller SID: {error}"))?;
+            Ok(Self {
+                current_user_storage,
+                trusted_installer: LocalSid(trusted_installer),
+            })
+        }
+
+        fn current_user(&self) -> PSID {
+            token_user_sid(&self.current_user_storage)
+        }
+    }
+
+    fn current_user_sid_buffer() -> Result<Vec<usize>, String> {
+        let mut raw_token = HANDLE::default();
+        // SAFETY: raw_token is a valid out-pointer and the pseudo process handle
+        // remains valid for the duration of the call.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) }
+            .map_err(|error| format!("cannot open current process token: {error}"))?;
+        let token = OwnedHandle(raw_token);
+
+        let mut needed = 0_u32;
+        // The sizing call is expected to fail with insufficient buffer; `needed`
+        // is the authoritative allocation size.
+        let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut needed) };
+        if needed < size_of::<TOKEN_USER>() as u32 {
+            return Err("current process token returned no usable user SID".to_string());
+        }
+        let words = (needed as usize).div_ceil(size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        // SAFETY: Vec<usize> provides sufficient alignment and `needed` bytes;
+        // the API initializes a TOKEN_USER whose SID remains inside this buffer.
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast::<c_void>()),
+                needed,
+                &mut needed,
+            )
+        }
+        .map_err(|error| format!("cannot read current process user SID: {error}"))?;
+        Ok(buffer)
+    }
+
+    fn token_user_sid(buffer: &[usize]) -> PSID {
+        // SAFETY: current_user_sid_buffer stores a successfully initialized,
+        // suitably aligned TOKEN_USER at the start of the allocation.
+        unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+    }
+
+    fn sid_is_privileged(sid: PSID, context: &SecurityContext) -> bool {
+        let current_user = context.current_user();
+        // SAFETY: all SID pointers originate from validated token/security
+        // descriptor storage that outlives these calls.
+        unsafe {
+            EqualSid(sid, current_user).is_ok()
+                || IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+                || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
+                || EqualSid(sid, context.trusted_installer.0).is_ok()
+        }
+    }
+
+    fn ace_applies_to_component(flags: u8) -> bool {
+        flags & INHERIT_ONLY_ACE.0 as u8 == 0
+    }
+
+    fn validate_component(
+        path: &Path,
+        context: &SecurityContext,
+        require_current_user_owner: bool,
+        role: ComponentRole,
+    ) -> Result<(), String> {
+        let current_user = context.current_user();
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err("resolver trust path contains an interior NUL".to_string());
+        }
+        wide.push(0);
+
+        let mut owner = PSID::default();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut raw_descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: wide is NUL-terminated and each output pointer is valid.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                Some(&mut dacl),
+                None,
+                &mut raw_descriptor,
+            )
+        };
+        if status.is_err() {
+            return Err(format!(
+                "cannot read resolver trust path owner/DACL for {}: {status:?}",
+                path.display()
+            ));
+        }
+        let _descriptor = LocalSecurityDescriptor(raw_descriptor);
+        let owner_is_current_user =
+            !owner.is_invalid() && unsafe { EqualSid(owner, current_user) }.is_ok();
+        let owner_is_protected = !owner.is_invalid() && sid_is_privileged(owner, context);
+        if !owner_is_current_user && (require_current_user_owner || !owner_is_protected) {
+            return Err(format!(
+                "resolver trust path {} is not owned by the current user or a protected Windows principal",
+                path.display(),
+            ));
+        }
+        if dacl.is_null() {
+            return Err(format!(
+                "resolver trust path {} has an unrestricted null DACL",
+                path.display()
+            ));
+        }
+
+        let mut acl_info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: dacl points into the live security descriptor and acl_info is a
+        // correctly sized output buffer for AclSizeInformation.
+        unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut acl_info as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
+                size_of_val(&acl_info) as u32,
+                AclSizeInformation,
+            )
+        }
+        .map_err(|error| format!("cannot inspect resolver trust DACL: {error}"))?;
+
+        for index in 0..acl_info.AceCount {
+            let mut raw_ace: *mut c_void = std::ptr::null_mut();
+            // SAFETY: index is within the AceCount reported for this live ACL.
+            unsafe { GetAce(dacl, index, &mut raw_ace) }
+                .map_err(|error| format!("cannot inspect resolver trust ACE {index}: {error}"))?;
+            if raw_ace.is_null() {
+                return Err(format!("resolver trust ACE {index} is null"));
+            }
+            // SAFETY: GetAce returned a pointer to at least an ACE_HEADER.
+            let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
+            // An INHERIT_ONLY ACE is a template for descendants and grants no
+            // access to this component. Any effective inherited copy is checked
+            // when the traversal reaches the descendant itself.
+            if !ace_applies_to_component(header.AceFlags) {
+                continue;
+            }
+            match header.AceType {
+                ACCESS_ALLOWED_ACE_TYPE => {
+                    if usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>() {
+                        return Err(format!("resolver trust ACE {index} is truncated"));
+                    }
+                    // SAFETY: the size check covers ACCESS_ALLOWED_ACE, whose
+                    // SidStart is the first byte of the variable-length SID.
+                    let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+                    if ace.Mask & role.mutation_mask() == 0 {
+                        continue;
+                    }
+                    let sid = PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast::<c_void>());
+                    if !sid_is_privileged(sid, context) {
+                        return Err(format!(
+                            "resolver trust path {} grants mutation rights to a non-owner principal",
+                            path.display()
+                        ));
+                    }
+                }
+                ACCESS_ALLOWED_COMPOUND_ACE_TYPE
+                | ACCESS_ALLOWED_OBJECT_ACE_TYPE
+                | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+                | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
+                    // These layouts carry a variable SID offset and conditions.
+                    // Enrollment fails closed instead of guessing whether they
+                    // grant a non-owner mutation authority.
+                    return Err(format!(
+                        "resolver trust path {} uses an unsupported conditional/object allow ACE",
+                        path.display()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_owner_only(path: &Path) -> Result<(), String> {
+        let context = SecurityContext::load()?;
+        validate_component(path, &context, true, ComponentRole::ExistingFile)
+    }
+
+    fn validate_hierarchy(
+        path: &Path,
+        require_current_user_leaf: bool,
+        kind: HierarchyKind,
+    ) -> Result<(), String> {
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("cannot canonicalize Windows trust path: {error}"))?;
+        let context = SecurityContext::load()?;
+        for (index, component) in canonical.ancestors().enumerate() {
+            validate_component(
+                component,
+                &context,
+                require_current_user_leaf && index == 0,
+                component_role(kind, index),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Validate an already-existing enrolled executable and every canonical
+    /// ancestor. Higher ancestors may allow sibling creation, but not deletion
+    /// or security-control of the existing next path component. The immediate
+    /// application directory also rejects child creation because Windows may
+    /// load dependent DLLs from beside the executable.
+    pub(super) fn validate_executable_hierarchy(path: &Path) -> Result<(), String> {
+        validate_hierarchy(path, false, HierarchyKind::Executable)
+    }
+
+    /// Validate the resolver-tools directory and every canonical ancestor. The
+    /// leaf is current-user-owned and rejects untrusted child creation so an
+    /// attacker cannot preplant or replace pins.json.
+    pub(super) fn validate_trust_directory_hierarchy(path: &Path) -> Result<(), String> {
+        validate_hierarchy(path, true, HierarchyKind::TrustDirectory)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn inheritance_only_ace_is_not_effective_on_current_component() {
+            assert!(!ace_applies_to_component(INHERIT_ONLY_ACE.0 as u8));
+            assert!(ace_applies_to_component(0));
+        }
+
+        #[test]
+        fn role_selection_protects_executable_directory_but_not_distant_siblings() {
+            assert_eq!(
+                component_role(HierarchyKind::Executable, 0),
+                ComponentRole::ExistingFile
+            );
+            assert_eq!(
+                component_role(HierarchyKind::Executable, 1),
+                ComponentRole::ExecutableDirectory
+            );
+            assert_eq!(
+                component_role(HierarchyKind::Executable, 2),
+                ComponentRole::Ancestor
+            );
+            assert_ne!(
+                ComponentRole::ExecutableDirectory.mutation_mask() & 0x0000_0002,
+                0
+            );
+            assert_eq!(ComponentRole::Ancestor.mutation_mask() & 0x0000_0002, 0);
+            assert_eq!(
+                component_role(HierarchyKind::TrustDirectory, 0),
+                ComponentRole::TrustDirectory
+            );
+            assert_eq!(
+                component_role(HierarchyKind::TrustDirectory, 1),
+                ComponentRole::Ancestor
+            );
+        }
+
+        #[test]
+        fn normal_windows_test_executable_hierarchy_is_usable() {
+            let executable = std::env::current_exe().unwrap();
+            validate_executable_hierarchy(&executable).unwrap();
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+struct ResolverToolTrustStore {
+    #[serde(default)]
+    pins: BTreeMap<String, String>,
+}
+
+fn resolver_tool_trust_file() -> Result<PathBuf, String> {
+    let base = crate::policy::config_dir()
+        .ok_or_else(|| "cannot determine the operator config directory".to_string())?;
+    Ok(base.join("resolver-tools").join("pins.json"))
+}
+
+fn resolver_tool_digest(path: &Path) -> Result<String, String> {
+    let handle = crate::util::open_read_no_follow_capped(path, RESOLVER_TOOL_MAX_BYTES).map_err(
+        |error| format!("cannot open enrolled resolver tool without following links: {error:?}"),
+    )?;
+    match crate::util::sha256_from_handle(handle, RESOLVER_TOOL_MAX_BYTES)
+        .map_err(|error| format!("cannot hash resolver tool: {error}"))?
+    {
+        crate::util::HashOutcome::Digest(digest) => Ok(digest),
+        crate::util::HashOutcome::BudgetExceeded => Err(format!(
+            "resolver tool exceeds the {} byte enrollment cap",
+            RESOLVER_TOOL_MAX_BYTES
+        )),
+    }
+}
+
+fn remember_discovered_tool(executable: &TrustedExecutable) -> Result<(), String> {
+    let digest = resolver_tool_digest(executable.path())?;
+    executable
+        .revalidate()
+        .map_err(|error| format!("resolver tool changed while binding discovery: {error}"))?;
+    DISCOVERED_RESOLVER_TOOLS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "discovered resolver-tool registry was poisoned".to_string())?
+        .insert(executable.path().to_path_buf(), digest);
+    Ok(())
+}
+
+fn revalidate_discovered_tool(executable: &TrustedExecutable) -> Result<(), String> {
+    let expected = DISCOVERED_RESOLVER_TOOLS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "discovered resolver-tool registry was poisoned".to_string())?
+        .get(executable.path())
+        .cloned();
+    let Some(expected) = expected else {
+        // Public callers may construct ResolverTools directly, so there may be
+        // no process-local discovery digest. Persisted installation provenance
+        // is enforced separately by ValidatedResolverTools::from_public; still
+        // revalidate the freshly captured identity here instead of treating a
+        // missing discovery entry as an operator-trust bypass.
+        return executable
+            .revalidate()
+            .map_err(|error| format!("resolver tool changed during validation: {error}"));
+    };
+    let current = resolver_tool_digest(executable.path())?;
+    executable
+        .revalidate()
+        .map_err(|error| format!("resolver tool changed after discovery: {error}"))?;
+    if constant_time_hex_eq(expected.as_bytes(), current.as_bytes()) {
+        Ok(())
+    } else {
+        Err("resolver tool digest changed after PATH discovery".to_string())
+    }
+}
+
+fn read_resolver_tool_trust_store(
+    trust_file: &Path,
+) -> Result<Option<ResolverToolTrustStore>, String> {
+    let metadata = match std::fs::symlink_metadata(trust_file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect resolver-tool trust store: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("resolver-tool trust store is not a regular non-symlink file".to_string());
+    }
+    validate_resolver_trust_directory(
+        trust_file
+            .parent()
+            .ok_or_else(|| "resolver-tool trust store has no parent".to_string())?,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {
+            return Err(
+                "resolver-tool trust store must be owned by the current user and mode 0600"
+                    .to_string(),
+            );
+        }
+        crate::trusted_child::reject_unix_extended_acl(trust_file, false)?;
+    }
+    #[cfg(windows)]
+    windows_trust_acl::validate_owner_only(trust_file)?;
+    let bytes = crate::util::read_text_no_follow_capped(trust_file, RESOLVER_TOOL_TRUST_MAX_BYTES)
+        .map_err(|error| format!("cannot read resolver-tool trust store: {error:?}"))?;
+    let store: ResolverToolTrustStore = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("resolver-tool trust store is corrupt: {error}"))?;
+    Ok(Some(store))
+}
+
+fn resolver_tool_pin_matches(path: &Path) -> Result<bool, String> {
+    let trust_file = resolver_tool_trust_file()?;
+    let Some(store) = read_resolver_tool_trust_store(&trust_file)? else {
+        return Ok(false);
+    };
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize resolver tool: {error}"))?;
+    #[cfg(windows)]
+    windows_trust_acl::validate_executable_hierarchy(&canonical)?;
+    let key = canonical.display().to_string();
+    let Some(expected) = store.pins.get(&key) else {
+        return Ok(false);
+    };
+    Ok(constant_time_hex_eq(
+        expected.as_bytes(),
+        resolver_tool_digest(&canonical)?.as_bytes(),
+    ))
+}
+
+fn constant_time_hex_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
+}
+
+/// Explicitly enroll a user-writable resolver executable by canonical absolute
+/// path and SHA-256 in Tirith's owner-only operator trust store. PATH discovery
+/// never creates this pin implicitly.
+pub fn enroll_resolver_tool(path: &Path) -> Result<PathBuf, ResolverError> {
+    let executable =
+        TrustedExecutable::from_absolute(path, &crate::trusted_child::ambient_denied_roots())
+            .map_err(|error| ResolverError::ToolUntrusted {
+                tool: path.display().to_string(),
+                reason: error.to_string(),
+            })?;
+    let canonical = executable.path().to_path_buf();
+    #[cfg(windows)]
+    windows_trust_acl::validate_executable_hierarchy(&canonical).map_err(resolver_io_error)?;
+    let digest = resolver_tool_digest(&canonical).map_err(resolver_io_error)?;
+    executable
+        .revalidate()
+        .map_err(|error| ResolverError::ToolUntrusted {
+            tool: canonical.display().to_string(),
+            reason: format!("resolver tool changed during enrollment: {error}"),
+        })?;
+    let trust_file = resolver_tool_trust_file().map_err(resolver_io_error)?;
+    let trust_dir = trust_file
+        .parent()
+        .ok_or_else(|| resolver_io_error("resolver-tool trust file has no parent"))?;
+    crate::util::create_dir_durable(trust_dir).map_err(ResolverError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(trust_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(ResolverError::Io)?;
+    }
+    validate_resolver_trust_directory(trust_dir).map_err(resolver_io_error)?;
+    // Never merge an unvalidated pre-existing file: doing so and then replacing
+    // it with a fresh 0600 file would launder attacker-selected pins into trusted
+    // enrollment state.
+    let mut store = read_resolver_tool_trust_store(&trust_file)
+        .map_err(resolver_io_error)?
+        .unwrap_or_default();
+    store.pins.insert(canonical.display().to_string(), digest);
+    let body = serde_json::to_vec_pretty(&store).map_err(|error| {
+        resolver_io_error(format!(
+            "cannot serialize resolver-tool trust store: {error}"
+        ))
+    })?;
+    crate::util::write_file_atomic_0600(&trust_file, &body).map_err(ResolverError::Io)?;
+    if !resolver_tool_pin_matches(&canonical).map_err(resolver_io_error)? {
+        return Err(ResolverError::ToolUntrusted {
+            tool: canonical.display().to_string(),
+            reason: "resolver tool changed while validating the written enrollment pin".to_string(),
+        });
+    }
+    Ok(canonical)
+}
+
+fn validate_resolver_trust_directory(directory: &Path) -> Result<(), String> {
+    let canonical = directory
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize resolver trust directory: {error}"))?;
+    for denied in crate::trusted_child::ambient_denied_roots() {
+        let denied = denied.canonicalize().unwrap_or(denied);
+        if canonical == denied || canonical.starts_with(&denied) {
+            return Err(format!(
+                "resolver trust directory {} is inside denied project/temp root {}",
+                canonical.display(),
+                denied.display()
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let effective_uid = unsafe { libc::geteuid() };
+        for component in canonical.ancestors() {
+            let metadata = std::fs::metadata(component)
+                .map_err(|error| format!("cannot stat {}: {error}", component.display()))?;
+            if metadata.uid() != 0 && metadata.uid() != effective_uid {
+                return Err(format!(
+                    "resolver trust directory ancestor {} has foreign owner uid {}",
+                    component.display(),
+                    metadata.uid()
+                ));
+            }
+            if metadata.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "resolver trust directory ancestor {} is group/world writable",
+                    component.display()
+                ));
+            }
+            crate::trusted_child::reject_unix_extended_acl(component, true)?;
+        }
+    }
+    #[cfg(windows)]
+    windows_trust_acl::validate_trust_directory_hierarchy(&canonical)?;
+    Ok(())
+}
+
+fn resolver_io_error(reason: impl Into<String>) -> ResolverError {
+    ResolverError::Io(std::io::Error::other(reason.into()))
 }
 
 /// Find `name` on the process `PATH`, returning the first directory entry that is
@@ -309,6 +1082,7 @@ pub fn resolve_tool(
 /// This is the only PATH lookup; the resolved absolute path is what the child
 /// runs, so the child never re-resolves a bare name in an attacker-influenced
 /// `PATH`.
+#[cfg(test)]
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -334,7 +1108,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 
 /// Windows executable extensions from `PATHEXT`, lowercased, falling back to the
 /// usual default set when `PATHEXT` is unset.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn windows_path_exts() -> Vec<String> {
     match std::env::var("PATHEXT") {
         Ok(v) => v
@@ -374,58 +1148,67 @@ pub fn validate_requirement(
     if trimmed.is_empty() {
         return reject("empty requirement");
     }
+    // A control character (newline / CR / NUL / etc.) could smuggle a second
+    // requirement or break the lock file; refuse outright. Horizontal tab is
+    // the sole exception because PEP 508 explicitly includes it in `wsp` and
+    // the lexical parser treats it exactly like a space.
+    if trimmed.chars().any(|c| c != '\t' && c.is_control()) {
+        return reject("requirement contains a control character");
+    }
     // A requirements-file include (`-r other.txt`) or any other dashed option is
     // refused: callers pass concrete specs, and a `-r` could pull an
     // attacker-controlled file of further requirements past these checks.
     if trimmed.starts_with('-') {
-        // `-e` / `--editable` get a precise message; any other option is refused.
         let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("-e") || lower.starts_with("--editable") {
-            if allowances.allow_editable {
-                return Ok(());
+        let editable_target = lower
+            .strip_prefix("--editable")
+            .map(|_| &trimmed["--editable".len()..])
+            .or_else(|| lower.strip_prefix("-e").map(|_| &trimmed["-e".len()..]));
+        if let Some(target) = editable_target {
+            if !allowances.allow_editable {
+                return reject("editable installs (-e/--editable) are not permitted");
             }
-            return reject("editable installs (-e/--editable) are not permitted");
+            let target = target.trim_start_matches('=').trim();
+            if target.is_empty() {
+                return reject("editable requirement has no target");
+            }
+            // An editable allowance does not bypass the independent VCS, direct
+            // URL, and local-path controls.
+            return validate_requirement(target, allowances);
         }
         return reject("option-form requirements (leading '-') are not permitted");
     }
-    // A control character (newline / CR / NUL / etc.) could smuggle a second
-    // requirement or break the lock file; refuse outright.
-    if trimmed.chars().any(|c| c.is_control()) {
-        return reject("requirement contains a control character");
-    }
-    // VCS forms: `git+...`, `hg+`, `svn+`, `bzr+`, or a `name @ git+...` direct
-    // reference.
-    if is_vcs_requirement(trimmed) {
-        if allowances.allow_vcs {
-            return Ok(());
+
+    match classify_requirement_location(trimmed).map_err(|reason| {
+        ResolverError::RejectedRequirement {
+            spec: spec.to_string(),
+            reason,
         }
-        return reject("VCS requirements (git+/hg+/svn+/bzr+) are not permitted");
-    }
-    // Direct URL reference: `name @ https://.../x.whl` or a bare URL.
-    if let Some(url) = direct_url_target(trimmed) {
-        if allowances.allow_direct_url {
-            // Even when permitted, a direct URL must still pass the SSRF / creds
-            // policy applied to indexes.
-            return validate_index_url(url).map_err(|e| match e {
-                ResolverError::RejectedIndexUrl { reason, .. } => {
-                    ResolverError::RejectedRequirement {
-                        spec: spec.to_string(),
-                        reason: format!("direct URL rejected: {reason}"),
-                    }
-                }
-                other => other,
-            });
+    })? {
+        RequirementLocation::Named => {}
+        RequirementLocation::Vcs(target) => {
+            if !allowances.allow_vcs {
+                return reject("VCS requirements (git+/hg+/svn+/bzr+) are not permitted");
+            }
+            parse_vcs_url(target).map_err(|reason| ResolverError::RejectedRequirement {
+                spec: spec.to_string(),
+                reason: format!("VCS URL rejected: {reason}"),
+            })?;
         }
-        return reject("direct-URL requirements (name @ url / bare url) are not permitted");
-    }
-    // Local path: an existing path, an explicit `./` or `../` prefix, an absolute
-    // path, a `file:` scheme, or a Windows drive form. A bare distribution name
-    // never looks like any of these.
-    if is_local_path_requirement(trimmed) {
-        if allowances.allow_local_path {
-            return Ok(());
+        RequirementLocation::Direct(target) => {
+            if !allowances.allow_direct_url {
+                return reject("direct-URL requirements (name @ url / bare url) are not permitted");
+            }
+            parse_network_url(target).map_err(|reason| ResolverError::RejectedRequirement {
+                spec: spec.to_string(),
+                reason: format!("direct URL rejected: {reason}"),
+            })?;
         }
-        return reject("local-path requirements are not permitted");
+        RequirementLocation::Local => {
+            if !allowances.allow_local_path {
+                return reject("local-path requirements are not permitted");
+            }
+        }
     }
     // sdist-only requirements cannot be expressed by name alone (a `.tar.gz`
     // target is caught as a local path or direct URL above); source *building*
@@ -436,43 +1219,156 @@ pub fn validate_requirement(
     Ok(())
 }
 
-/// Whether `spec` is a VCS requirement (`git+`, `hg+`, `svn+`, `bzr+`), either as
-/// a leading scheme or after a `name @ ` direct-reference marker.
-fn is_vcs_requirement(spec: &str) -> bool {
-    let candidate = match spec.split_once(" @ ") {
-        Some((_, rest)) => rest.trim(),
-        None => spec,
-    };
-    let lower = candidate.to_ascii_lowercase();
-    ["git+", "hg+", "svn+", "bzr+"]
-        .iter()
-        .any(|p| lower.starts_with(p))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequirementLocation<'a> {
+    Named,
+    Vcs(&'a str),
+    Direct(&'a str),
+    Local,
 }
 
-/// If `spec` is a direct-URL reference, return the URL. Matches a `name @ url`
-/// direct reference and a bare `http(s)://` / `file://` requirement.
-fn direct_url_target(spec: &str) -> Option<&str> {
-    if let Some((_, rest)) = spec.split_once(" @ ") {
-        let rest = rest.trim();
-        let lower = rest.to_ascii_lowercase();
-        if lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || lower.starts_with("file://")
+/// Canonically classify the PEP 508 location portion of a requirement. The `@`
+/// token has optional surrounding whitespace in PEP 508, so classification is
+/// structural and never relies on the old exact `" @ "` spelling.
+fn classify_requirement_location(spec: &str) -> Result<RequirementLocation<'_>, String> {
+    let trimmed = spec.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    // Packaging tools accept platform path extensions in addition to strict PEP
+    // 508. Classify them before `Url::parse`, which otherwise treats `C:/pkg`
+    // as a URL with scheme `c` and could bypass the local-path allowance.
+    if is_local_path_requirement(trimmed)
+        && (!trimmed.contains("://") || lower.starts_with("file:"))
+    {
+        return Ok(RequirementLocation::Local);
+    }
+    if is_vcs_target(&lower) {
+        return Ok(RequirementLocation::Vcs(trimmed));
+    }
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        return if parsed.scheme().eq_ignore_ascii_case("file") {
+            Ok(RequirementLocation::Local)
+        } else {
+            Ok(RequirementLocation::Direct(trimmed))
+        };
+    }
+
+    let after_name = pep508_after_name_and_extras(trimmed)?;
+    if let Some(raw_target) = after_name.strip_prefix('@') {
+        let raw_target = raw_target.trim();
+        if raw_target.is_empty() {
+            return Err("malformed PEP 508 direct reference".to_string());
+        }
+        let target = strip_pep508_marker(raw_target);
+        if target.is_empty() {
+            return Err("malformed PEP 508 direct reference".to_string());
+        }
+        let target_lower = target.to_ascii_lowercase();
+        if is_vcs_target(&target_lower) {
+            return Ok(RequirementLocation::Vcs(target));
+        }
+        if is_local_path_requirement(target)
+            && (!target.contains("://") || target_lower.starts_with("file:"))
         {
-            return Some(rest);
+            return Ok(RequirementLocation::Local);
+        }
+        if url::Url::parse(target).is_ok() {
+            return Ok(RequirementLocation::Direct(target));
+        }
+        return Err("malformed or unsupported PEP 508 direct reference".to_string());
+    }
+
+    // `@` inside an arbitrary-equality version (`===foo@bar`) or a quoted
+    // environment marker is data, not a direct-reference delimiter. Requiring
+    // the delimiter immediately after the parsed name/extras is the PEP 508
+    // grammar distinction the old substring matcher lacked.
+    let named_tail = after_name.trim_start();
+    if named_tail.is_empty()
+        || named_tail.starts_with(';')
+        || named_tail.starts_with('(')
+        || ["===", "~=", "==", "!=", "<=", ">=", "<", ">"]
+            .iter()
+            .any(|operator| named_tail.starts_with(operator))
+    {
+        Ok(RequirementLocation::Named)
+    } else {
+        Err("malformed or unsupported PEP 508 requirement".to_string())
+    }
+}
+
+/// Return the slice immediately after a syntactically valid PEP 508
+/// distribution name and optional extras list. This is deliberately lexical:
+/// it performs no filesystem or network access and preserves the remaining
+/// version/direct-reference/marker text for policy classification.
+fn pep508_after_name_and_extras(spec: &str) -> Result<&str, String> {
+    let bytes = spec.as_bytes();
+    let Some(first) = bytes.first().copied() else {
+        return Err("empty requirement".to_string());
+    };
+    if !first.is_ascii_alphanumeric() {
+        return Err("requirement has no valid distribution name".to_string());
+    }
+    let mut cursor = 1usize;
+    while cursor < bytes.len()
+        && (bytes[cursor].is_ascii_alphanumeric() || matches!(bytes[cursor], b'-' | b'_' | b'.'))
+    {
+        cursor += 1;
+    }
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if bytes.get(cursor) == Some(&b'[') {
+        cursor += 1;
+        let extras_start = cursor;
+        while cursor < bytes.len() && bytes[cursor] != b']' {
+            let byte = bytes[cursor];
+            if !(byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b',' | b' ' | b'\t'))
+            {
+                return Err("requirement extras contain an invalid character".to_string());
+            }
+            cursor += 1;
+        }
+        if cursor == extras_start || bytes.get(cursor) != Some(&b']') {
+            return Err("requirement has malformed extras".to_string());
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
         }
     }
-    let lower = spec.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        return Some(spec);
-    }
-    None
+    Ok(&spec[cursor..])
+}
+
+fn is_vcs_target(lower: &str) -> bool {
+    ["git+", "hg+", "svn+", "bzr+"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// A PEP 508 marker follows a direct URL after whitespace and `;`. Semicolons
+/// within a URL path remain part of the URL because they are not preceded by
+/// whitespace.
+fn strip_pep508_marker(target: &str) -> &str {
+    target
+        .char_indices()
+        .find_map(|(index, character)| {
+            if character != ';' {
+                return None;
+            }
+            target[..index]
+                .chars()
+                .next_back()
+                .filter(|c| c.is_ascii_whitespace())
+                .map(|_| target[..index].trim_end())
+        })
+        .unwrap_or(target)
 }
 
 /// Whether `spec` denotes a local path rather than a named distribution.
 fn is_local_path_requirement(spec: &str) -> bool {
     let lower = spec.to_ascii_lowercase();
-    if lower.starts_with("file://") {
+    if lower.starts_with("file:") {
         return true;
     }
     // Explicit relative / absolute prefixes.
@@ -480,6 +1376,8 @@ fn is_local_path_requirement(spec: &str) -> bool {
         || spec.starts_with("../")
         || spec.starts_with(".\\")
         || spec.starts_with("..\\")
+        || spec == "."
+        || spec == ".."
         || spec.starts_with('/')
         || spec.starts_with('~')
     {
@@ -496,39 +1394,103 @@ fn is_local_path_requirement(spec: &str) -> bool {
         // colon here is suspicious; the drive form is the concrete local case.)
         return true;
     }
-    // A path that exists on disk as given (a bare directory or archive name the
-    // user dropped in cwd) is treated as a local path. A real distribution name
-    // colliding with a cwd entry is vanishingly rare and erring toward refusal is
-    // the safe default; the operator can pin a version to disambiguate.
-    if Path::new(spec).exists() {
+    // Packaging-tool extensions for bare archives are local even though strict
+    // PEP 508 would require a `file:` URL. Keep this lexical so validation is
+    // effect-free and cannot probe attacker-chosen filesystem names.
+    if [".whl", ".tar.gz", ".zip", ".tar.bz2", ".tgz"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
         return true;
     }
     false
 }
 
-/// Validate an index URL: HTTPS, no embedded credentials, and a public,
-/// non-metadata destination, by delegating to the shared SSRF policy. The HTTP
-/// override env var that [`crate::url_validate::validate_server_url`] honors is
-/// the operator's to set; an attacker controlling the requirement input does not
-/// control it.
+/// Validate and canonicalize an index URL. DNS and address checks intentionally
+/// do not happen here: the resolver broker performs them on the exact socket
+/// destination immediately before connect, which closes validation/connect DNS
+/// rebinding and applies equally to redirects and artifact links.
 pub fn validate_index_url(url: &str) -> Result<(), ResolverError> {
-    // Reject embedded credentials explicitly first, with a precise message
-    // (validate_server_url also rejects them, but the dedicated message makes the
-    // "no secret in a URL" rule unambiguous in receipts / logs).
-    if let Ok(parsed) = url::Url::parse(url) {
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(ResolverError::RejectedIndexUrl {
-                url: url.to_string(),
-                reason: "index URL carries embedded credentials".to_string(),
-            });
-        }
-    }
-    crate::url_validate::validate_server_url(url).map_err(|reason| {
-        ResolverError::RejectedIndexUrl {
+    parse_network_url(url)
+        .map(|_| ())
+        .map_err(|reason| ResolverError::RejectedIndexUrl {
             url: url.to_string(),
             reason,
+        })
+}
+
+fn parse_network_url(raw: &str) -> Result<url::Url, String> {
+    let mut parsed = url::Url::parse(raw).map_err(|e| format!("invalid URL: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("resolver destinations must use HTTPS".to_string());
+    }
+    let Some(host) = parsed.host().map(|host| host.to_owned()) else {
+        return Err("resolver destination must have a host and port".to_string());
+    };
+    let Some(port) = parsed.port_or_known_default() else {
+        return Err("resolver destination must have a host and port".to_string());
+    };
+    match host {
+        url::Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            if domain == "localhost" || domain.ends_with(".localhost") {
+                return Err("resolver destination is local-only".to_string());
+            }
+            parsed
+                .set_host(Some(&domain))
+                .map_err(|_| "resolver destination host could not be canonicalized".to_string())?;
         }
-    })
+        url::Host::Ipv4(address) => {
+            let address = std::net::SocketAddr::new(address.into(), port);
+            if !crate::url_validate::is_public_addr(&address) {
+                return Err("resolver destination is not globally reachable".to_string());
+            }
+        }
+        url::Host::Ipv6(address) => {
+            let socket = std::net::SocketAddr::new(address.into(), port);
+            if !crate::url_validate::is_public_addr(&socket) {
+                return Err("resolver destination is not globally reachable".to_string());
+            }
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("resolver URL carries embedded credentials".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_vcs_url(raw: &str) -> Result<url::Url, String> {
+    let (_, network_url) = raw
+        .split_once('+')
+        .ok_or_else(|| "VCS reference has no transport".to_string())?;
+    parse_network_url(network_url)
+}
+
+#[cfg(windows)]
+fn windows_directory_from_os(getter: unsafe fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    // Windows directory paths are bounded well below the extended-path maximum;
+    // use one fixed buffer and fail closed if the API reports truncation.
+    let mut buffer = vec![0_u16; 32 * 1024];
+    // SAFETY: the Win32 getter writes at most the supplied slice length and
+    // returns the number of UTF-16 code units excluding the terminating NUL.
+    let length = unsafe { getter(Some(&mut buffer)) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_wide(
+        &buffer[..length],
+    )))
+}
+
+#[cfg(windows)]
+fn trusted_windows_directories() -> Option<(PathBuf, PathBuf)> {
+    use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+
+    let windows = windows_directory_from_os(GetWindowsDirectoryW)?;
+    let system = windows_directory_from_os(GetSystemDirectoryW)?;
+    Some((windows, system))
 }
 
 /// Build the scrubbed environment for a resolver child. Returns the
@@ -540,7 +1502,9 @@ pub fn validate_index_url(url: &str) -> Result<(), ResolverError> {
 ///
 /// Concretely it: points `HOME` / `XDG_CONFIG_HOME` / `XDG_DATA_HOME` /
 /// `XDG_CACHE_HOME` / `APPDATA` / `USERPROFILE` at `config_home` (so a discovered
-/// `~/.config/pip/pip.conf` or `~/.netrc` is the empty temp dir's, i.e. absent);
+/// `~/.config/pip/pip.conf` or `~/.netrc` is the empty temp dir's, i.e. absent),
+/// and pins every standard temporary-directory variable to the same private
+/// absolute directory;
 /// sets `PIP_ISOLATED=1`, `PIP_NO_INPUT=1`, `PIP_DISABLE_PIP_VERSION_CHECK=1`,
 /// `PIP_CONFIG_FILE` to an absent file, `UV_NO_CONFIG=1`,
 /// `UV_PYTHON_DOWNLOADS=never`, `UV_NO_PROGRESS=1`; and carries a minimal `PATH`
@@ -548,9 +1512,15 @@ pub fn validate_index_url(url: &str) -> Result<(), ResolverError> {
 /// / `*_API_KEY` / `PIP_*` / `UV_*` / `NETRC` from the parent.
 pub fn isolated_env(config_home: &Path, python: &Path) -> Vec<(String, String)> {
     let home = config_home.display().to_string();
-    // A config file path inside the empty config home that does not exist, so any
-    // tool consulting PIP_CONFIG_FILE finds nothing.
-    let absent_pip_conf = config_home.join("no-such-pip.conf").display().to_string();
+    // pip treats the platform null device as an explicit request to load no
+    // configuration files, including system/global configuration. An absent
+    // custom file is insufficient because pip may still merge global pip.conf.
+    #[cfg(windows)]
+    let disabled_pip_conf = "nul".to_string();
+    #[cfg(not(windows))]
+    let disabled_pip_conf = "/dev/null".to_string();
+    #[cfg(windows)]
+    let windows_directories = trusted_windows_directories();
     // A minimal PATH so the child can still find shared libraries' helpers if it
     // must, but containing only the resolved python's own directory plus the
     // standard system bins. We do NOT forward the parent PATH wholesale.
@@ -560,9 +1530,9 @@ pub fn isolated_env(config_home: &Path, python: &Path) -> Vec<(String, String)> 
     }
     #[cfg(windows)]
     {
-        if let Ok(sysroot) = std::env::var("SystemRoot") {
-            path_dirs.push(format!("{sysroot}\\System32"));
-            path_dirs.push(sysroot);
+        if let Some((windows, system)) = &windows_directories {
+            path_dirs.push(system.display().to_string());
+            path_dirs.push(windows.display().to_string());
         }
     }
     #[cfg(not(windows))]
@@ -587,11 +1557,16 @@ pub fn isolated_env(config_home: &Path, python: &Path) -> Vec<(String, String)> 
         ("APPDATA".to_string(), home.clone()),
         ("LOCALAPPDATA".to_string(), home.clone()),
         ("USERPROFILE".to_string(), home.clone()),
+        // Do not let Python/pip fall back to a shared system temp directory or,
+        // on Windows, the executable directory selected as the safe DLL cwd.
+        ("TEMP".to_string(), home.clone()),
+        ("TMP".to_string(), home.clone()),
+        ("TMPDIR".to_string(), home.clone()),
         // pip isolation.
         ("PIP_ISOLATED".to_string(), "1".to_string()),
         ("PIP_NO_INPUT".to_string(), "1".to_string()),
         ("PIP_DISABLE_PIP_VERSION_CHECK".to_string(), "1".to_string()),
-        ("PIP_CONFIG_FILE".to_string(), absent_pip_conf),
+        ("PIP_CONFIG_FILE".to_string(), disabled_pip_conf),
         ("PIP_NO_CACHE_DIR".to_string(), "1".to_string()),
         // uv isolation.
         ("UV_NO_CONFIG".to_string(), "1".to_string()),
@@ -602,29 +1577,43 @@ pub fn isolated_env(config_home: &Path, python: &Path) -> Vec<(String, String)> 
         ("LANG".to_string(), "C".to_string()),
         ("PATH".to_string(), path_value),
     ];
-    // Keep a system-root variable on Windows so DLL resolution works even though
-    // we scrubbed the rest of the environment.
+    // Keep authentic system-root variables on Windows so DLL resolution works
+    // even though we scrubbed the rest of the environment. Never copy the
+    // forgeable ambient SystemRoot/windir values.
     #[cfg(windows)]
     {
-        if let Ok(sysroot) = std::env::var("SystemRoot") {
-            env.push(("SystemRoot".to_string(), sysroot));
-        }
-        if let Ok(windir) = std::env::var("windir") {
-            env.push(("windir".to_string(), windir));
+        if let Some((windows, _)) = &windows_directories {
+            let windows = windows.display().to_string();
+            env.push(("SystemRoot".to_string(), windows.clone()));
+            env.push(("windir".to_string(), windows));
         }
     }
     env
 }
 
-/// Apply [`isolated_env`] to a [`Command`]: `env_clear` then set exactly the
-/// scrubbed pairs, plus a working directory of `config_home` so a tool that
-/// reads a cwd-relative `pip.conf` / `setup.cfg` sees only the empty temp dir.
-fn apply_isolation(cmd: &mut Command, config_home: &Path, python: &Path) {
-    cmd.env_clear();
-    for (k, v) in isolated_env(config_home, python) {
-        cmd.env(k, v);
+/// Add the enforcing broker as every standard proxy spelling. These values are
+/// generated inside Tirith after input validation; ambient proxy and NO_PROXY
+/// values were discarded by [`isolated_env`]. Empty NO_PROXY prevents a host
+/// alias or inherited bypass from routing around the broker.
+fn isolated_env_with_proxy(
+    config_home: &Path,
+    python: &Path,
+    proxy_url: &str,
+) -> Vec<(String, String)> {
+    let mut env = isolated_env(config_home, python);
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        env.push((key.to_string(), proxy_url.to_string()));
     }
-    cmd.current_dir(config_home);
+    env.push(("NO_PROXY".to_string(), String::new()));
+    env.push(("no_proxy".to_string(), String::new()));
+    env
 }
 
 /// Build the `uv pip compile` argument vector for `requirements_in` ->
@@ -674,7 +1663,12 @@ fn uv_compile_args(
 /// on the pip side) `--require-hashes` (refuse anything not pinned in the lock),
 /// plus `--no-deps` because the lock is already transitively complete,
 /// `--isolated`, `--no-cache-dir`, and the approved indexes (or `--no-index`).
-fn pip_download_args(locked: &Path, dest_dir: &Path, index_urls: &[String]) -> Vec<String> {
+fn pip_download_args(
+    locked: &Path,
+    dest_dir: &Path,
+    index_urls: &[String],
+    proxy_url: &str,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-m".to_string(),
         "pip".to_string(),
@@ -686,6 +1680,10 @@ fn pip_download_args(locked: &Path, dest_dir: &Path, index_urls: &[String]) -> V
         "--isolated".to_string(),
         "--no-cache-dir".to_string(),
         "--disable-pip-version-check".to_string(),
+        // Standard proxy env is set for both tools; pip also gets an explicit
+        // highest-precedence option so no global/config setting can replace it.
+        "--proxy".to_string(),
+        proxy_url.to_string(),
         "--dest".to_string(),
         dest_dir.display().to_string(),
     ];
@@ -807,83 +1805,71 @@ fn line_inline_hash_ok(line: &str) -> bool {
 /// Run a resolver child with a wall-clock deadline, returning its exit status and
 /// captured stdout+stderr (merged for diagnostics). The program is an absolute
 /// path; `args` are passed as an array (no shell). The child's environment and
-/// cwd are already configured by the caller via [`apply_isolation`].
+/// cwd are configured through a [`ChildSpec`] with the broker-only environment.
 fn run_child_capped(
-    program: &Path,
+    program: &TrustedExecutable,
     args: &[String],
     config_home: &Path,
-    python: &Path,
+    python: &TrustedExecutable,
+    proxy_url: &str,
     timeout: Duration,
 ) -> Result<ChildOutput, ResolverError> {
-    let mut cmd = Command::new(program);
-    cmd.args(args.iter().map(OsStr::new))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_isolation(&mut cmd, config_home, python);
-
-    let mut child = cmd.spawn().map_err(ResolverError::Io)?;
-    // Drain both pipes on helper threads so a chatty child cannot deadlock on a
-    // full pipe buffer while we poll.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_handle = stdout.map(|mut s| {
-        std::thread::spawn(move || {
-            use std::io::Read as _;
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let err_handle = stderr.map(|mut s| {
-        std::thread::spawn(move || {
-            use std::io::Read as _;
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-                let stderr = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-                return Ok(ChildOutput {
-                    success: status.success(),
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(h) = out_handle {
-                        let _ = h.join();
-                    }
-                    if let Some(h) = err_handle {
-                        let _ = h.join();
-                    }
-                    return Err(ResolverError::Timeout(format!(
-                        "{} exceeded {}s",
-                        program.display(),
-                        timeout.as_secs()
-                    )));
-                }
-                std::thread::sleep(RESOLVER_POLL);
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ResolverError::Io(e));
-            }
-        }
+    let mut spec = ChildSpec::new(
+        args,
+        ChildLimits::new(
+            timeout,
+            RESOLVER_CHILD_OUTPUT_MAX,
+            RESOLVER_CHILD_OUTPUT_MAX,
+        ),
+    );
+    // The Windows trusted-child launcher deliberately fixes the working
+    // directory to the executable's validated parent. Windows searches cwd
+    // while loading DLLs, so passing the writable resolver config directory
+    // there would undo the executable provenance boundary.
+    #[cfg(not(windows))]
+    {
+        spec = spec.cwd(config_home);
+    }
+    for (key, value) in isolated_env_with_proxy(config_home, python.path(), proxy_url) {
+        spec = spec.env(key, value);
+    }
+    // `uv` consumes this interpreter path through `--python` before Python is
+    // itself the pip-stage program. Bind its identity at the uv boundary too;
+    // validating only `program` would leave an auxiliary-executable swap gap.
+    python.revalidate().map_err(|error| {
+        resolver_io_error(format!(
+            "resolver Python identity changed before {} spawn: {error}",
+            program.path().display()
+        ))
+    })?;
+    match crate::trusted_child::run(program, &spec) {
+        ChildOutcome::Completed {
+            status,
+            stdout,
+            stderr,
+        } => Ok(ChildOutput {
+            success: status.success(),
+            stdout,
+            stderr,
+        }),
+        ChildOutcome::Timeout { .. } => Err(ResolverError::Timeout(format!(
+            "{} exceeded {}s",
+            program.path().display(),
+            timeout.as_secs()
+        ))),
+        ChildOutcome::OutputLimitExceeded { stream, .. } => Err(resolver_io_error(format!(
+            "{} exceeded the {:?} capture limit",
+            program.path().display(),
+            stream
+        ))),
+        ChildOutcome::SpawnError(reason) | ChildOutcome::WaitError(reason) => Err(
+            resolver_io_error(format!("{}: {reason}", program.path().display())),
+        ),
     }
 }
 
 /// Captured output of a resolver child.
+#[derive(Debug)]
 struct ChildOutput {
     success: bool,
     stdout: Vec<u8>,
@@ -902,6 +1888,178 @@ impl ChildOutput {
         }
         crate::util::truncate_bytes(s.trim(), 4000)
     }
+}
+
+struct ValidatedResolverInputs {
+    canonical_index_urls: Vec<String>,
+    permitted_urls: Vec<url::Url>,
+}
+
+/// Validate the complete request without starting a process, binding a socket,
+/// resolving DNS, or writing resolver files. The returned canonical URLs drive
+/// both argv and the broker allow-set, so validation and enforcement cannot
+/// disagree about aliases, case, or default ports.
+fn validate_resolver_inputs(
+    request: &ResolverRequest,
+    artifact_origins: &[String],
+) -> Result<ValidatedResolverInputs, ResolverError> {
+    if request.requirements.len() > MAX_REQUIREMENTS {
+        return Err(ResolverError::TooManyInputs(format!(
+            "{} requirements exceeds the {MAX_REQUIREMENTS} cap",
+            request.requirements.len()
+        )));
+    }
+    if request.index_urls.len() > MAX_INDEX_URLS {
+        return Err(ResolverError::TooManyInputs(format!(
+            "{} index URLs exceeds the {MAX_INDEX_URLS} cap",
+            request.index_urls.len()
+        )));
+    }
+    if artifact_origins.len() > MAX_INDEX_URLS {
+        return Err(ResolverError::TooManyInputs(format!(
+            "{} artifact origins exceeds the {MAX_INDEX_URLS} cap",
+            artifact_origins.len()
+        )));
+    }
+    let mut permitted_urls = Vec::new();
+    for spec in &request.requirements {
+        validate_requirement(spec, &request.allowances)?;
+        if let Some(url) = permitted_requirement_url(spec, &request.allowances)? {
+            permitted_urls.push(url);
+        }
+    }
+
+    let mut canonical_index_urls = Vec::with_capacity(request.index_urls.len());
+    for raw in &request.index_urls {
+        let parsed = parse_network_url(raw).map_err(|reason| ResolverError::RejectedIndexUrl {
+            url: raw.clone(),
+            reason,
+        })?;
+        canonical_index_urls.push(parsed.as_str().to_string());
+        permitted_urls.push(parsed);
+    }
+    // Custom artifact origins are broker policy only: they never become index
+    // argv, so approving a CDN cannot make it a dependency source.
+    for raw in artifact_origins {
+        let parsed = parse_network_url(raw).map_err(|reason| ResolverError::RejectedIndexUrl {
+            url: raw.clone(),
+            reason: format!("artifact origin rejected: {reason}"),
+        })?;
+        permitted_urls.push(parsed);
+    }
+    Ok(ValidatedResolverInputs {
+        canonical_index_urls,
+        permitted_urls,
+    })
+}
+
+/// Validate a resolver request without discovering tools, opening quarantine,
+/// binding sockets, resolving DNS, spawning children, or probing local paths.
+pub fn validate_resolver_request(request: &ResolverRequest) -> Result<(), ResolverError> {
+    validate_resolver_inputs(request, &[]).map(|_| ())
+}
+
+/// Validate a resolver request plus explicit artifact/CDN origins. Artifact
+/// origins authorize broker CONNECT destinations only and are never forwarded
+/// to uv or pip as indexes.
+pub fn validate_resolver_request_with_artifact_origins(
+    request: &ResolverRequest,
+    artifact_origins: &[String],
+) -> Result<(), ResolverError> {
+    validate_resolver_inputs(request, artifact_origins).map(|_| ())
+}
+
+#[derive(Debug)]
+struct ValidatedResolverTools {
+    uv: TrustedExecutable,
+    python: TrustedExecutable,
+}
+
+impl ValidatedResolverTools {
+    fn from_public(tools: &ResolverTools) -> Result<Self, ResolverError> {
+        // Public fields are compatibility surface, not an alternate trust
+        // channel. Reconstruct trusted handles, apply the same installation
+        // provenance policy as PATH discovery, then carry a discovery digest
+        // forward when one exists.
+        let denied_roots = crate::trusted_child::ambient_denied_roots();
+        let uv = TrustedExecutable::from_absolute(&tools.uv, &denied_roots).map_err(|error| {
+            ResolverError::ToolUntrusted {
+                tool: tools.uv.display().to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        validate_resolver_tool_provenance("uv", &uv).map_err(|reason| {
+            ResolverError::ToolUntrusted {
+                tool: tools.uv.display().to_string(),
+                reason,
+            }
+        })?;
+        revalidate_discovered_tool(&uv).map_err(|reason| ResolverError::ToolUntrusted {
+            tool: tools.uv.display().to_string(),
+            reason,
+        })?;
+        let python =
+            TrustedExecutable::from_absolute(&tools.python, &denied_roots).map_err(|error| {
+                ResolverError::ToolUntrusted {
+                    tool: tools.python.display().to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+        validate_resolver_tool_provenance("python", &python).map_err(|reason| {
+            ResolverError::ToolUntrusted {
+                tool: tools.python.display().to_string(),
+                reason,
+            }
+        })?;
+        revalidate_discovered_tool(&python).map_err(|reason| ResolverError::ToolUntrusted {
+            tool: tools.python.display().to_string(),
+            reason,
+        })?;
+        Ok(Self { uv, python })
+    }
+}
+
+fn permitted_requirement_url(
+    spec: &str,
+    allowances: &ResolverAllowances,
+) -> Result<Option<url::Url>, ResolverError> {
+    let trimmed = spec.trim();
+    if trimmed.starts_with('-') && allowances.allow_editable {
+        let lower = trimmed.to_ascii_lowercase();
+        let target = if lower.starts_with("--editable") {
+            &trimmed["--editable".len()..]
+        } else if lower.starts_with("-e") {
+            &trimmed["-e".len()..]
+        } else {
+            return Ok(None);
+        };
+        return permitted_requirement_url(target.trim_start_matches('=').trim(), allowances);
+    }
+
+    let location = classify_requirement_location(trimmed).map_err(|reason| {
+        ResolverError::RejectedRequirement {
+            spec: spec.to_string(),
+            reason,
+        }
+    })?;
+    let parsed = match location {
+        RequirementLocation::Direct(target) if allowances.allow_direct_url => {
+            Some(parse_network_url(target).map_err(|reason| {
+                ResolverError::RejectedRequirement {
+                    spec: spec.to_string(),
+                    reason: format!("direct URL rejected: {reason}"),
+                }
+            })?)
+        }
+        RequirementLocation::Vcs(target) if allowances.allow_vcs => Some(
+            parse_vcs_url(target).map_err(|reason| ResolverError::RejectedRequirement {
+                spec: spec.to_string(),
+                reason: format!("VCS URL rejected: {reason}"),
+            })?,
+        ),
+        _ => None,
+    };
+    Ok(parsed)
 }
 
 /// Resolve `request` end to end into the quarantine `txn`, using `tools`.
@@ -926,25 +2084,25 @@ pub fn resolve_into_quarantine(
     tools: &ResolverTools,
     txn: &QuarantineTransaction,
 ) -> Result<ResolvedSet, ResolverError> {
-    if request.requirements.len() > MAX_REQUIREMENTS {
-        return Err(ResolverError::TooManyInputs(format!(
-            "{} requirements exceeds the {MAX_REQUIREMENTS} cap",
-            request.requirements.len()
-        )));
-    }
-    if request.index_urls.len() > MAX_INDEX_URLS {
-        return Err(ResolverError::TooManyInputs(format!(
-            "{} index URLs exceeds the {MAX_INDEX_URLS} cap",
-            request.index_urls.len()
-        )));
-    }
-    // 1. Pre-flight validation of every input BEFORE any subprocess runs.
-    for spec in &request.requirements {
-        validate_requirement(spec, &request.allowances)?;
-    }
-    for url in &request.index_urls {
-        validate_index_url(url)?;
-    }
+    resolve_into_quarantine_with_artifact_origins(request, tools, txn, &[])
+}
+
+/// Resolve with additional operator-approved artifact/CDN origins. These hosts
+/// are admitted by the enforcing broker but never become package indexes.
+pub fn resolve_into_quarantine_with_artifact_origins(
+    request: &ResolverRequest,
+    tools: &ResolverTools,
+    txn: &QuarantineTransaction,
+    artifact_origins: &[String],
+) -> Result<ResolvedSet, ResolverError> {
+    // 1. Effect-free validation of every attacker-controlled input. Only after
+    // this succeeds do we stat tools, bind the broker, or write temp files.
+    let validated = validate_resolver_inputs(request, artifact_origins)?;
+    let tools = ValidatedResolverTools::from_public(tools)?;
+    let permitted =
+        PermittedOrigins::from_urls(&validated.permitted_urls).map_err(resolver_io_error)?;
+    let broker = ResolverBroker::start(permitted).map_err(resolver_io_error)?;
+    let proxy_url = broker.proxy_url();
 
     // 2. An isolated working tree: a temp dir that is the child's config_home,
     //    holds requirements.in / locked.txt, and a staging subdir for downloads.
@@ -970,8 +2128,8 @@ pub fn resolve_into_quarantine(
     let compile_args = uv_compile_args(
         &requirements_in,
         &lock_path,
-        &tools.python,
-        &request.index_urls,
+        tools.python.path(),
+        &validated.canonical_index_urls,
         &request.allowances,
     );
     let compile = run_child_capped(
@@ -979,6 +2137,7 @@ pub fn resolve_into_quarantine(
         &compile_args,
         &config_home,
         &tools.python,
+        &proxy_url,
         RESOLVER_CHILD_TIMEOUT,
     )?;
     if !compile.success {
@@ -994,12 +2153,18 @@ pub fn resolve_into_quarantine(
     verify_lock_hash_pinned(&locked_requirements)?;
 
     // 4. Download the pinned wheels under --require-hashes.
-    let download_args = pip_download_args(&lock_path, &staging, &request.index_urls);
+    let download_args = pip_download_args(
+        &lock_path,
+        &staging,
+        &validated.canonical_index_urls,
+        &proxy_url,
+    );
     let download = run_child_capped(
         &tools.python,
         &download_args,
         &config_home,
         &tools.python,
+        &proxy_url,
         RESOLVER_CHILD_TIMEOUT,
     )?;
     if !download.success {
@@ -1259,14 +2424,41 @@ mod tests {
         let def = ResolverAllowances::default();
         for spec in [
             "requests @ https://example.invalid/requests-2.31.0-py3-none-any.whl",
+            "requests@https://example.invalid/requests-2.31.0-py3-none-any.whl",
+            "requests @https://example.invalid/requests-2.31.0-py3-none-any.whl",
+            "requests@ https://example.invalid/requests-2.31.0-py3-none-any.whl",
+            "requests\t@\thttps://example.invalid/requests-2.31.0-py3-none-any.whl",
             "https://example.invalid/x-1.0-py3-none-any.whl",
         ] {
+            let error = validate_requirement(spec, &def).unwrap_err();
+            let ResolverError::RejectedRequirement { reason, .. } = error else {
+                panic!("{spec:?} produced the wrong error: {error:?}");
+            };
             assert!(
-                matches!(
-                    validate_requirement(spec, &def),
-                    Err(ResolverError::RejectedRequirement { .. })
-                ),
-                "{spec:?} should be refused"
+                reason.contains("direct-URL requirements"),
+                "{spec:?} must be classified as a direct URL, got: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_at_reference_fails_closed() {
+        let error =
+            validate_requirement("requests@not a url", &ResolverAllowances::default()).unwrap_err();
+        assert!(matches!(error, ResolverError::RejectedRequirement { .. }));
+    }
+
+    #[test]
+    fn pep508_at_inside_version_or_marker_is_not_a_direct_reference() {
+        let allowances = ResolverAllowances::default();
+        for requirement in [
+            "pkg===foo@bar",
+            "pkg; implementation_name == 'a@b'",
+            "pkg[security, socks]>=1.0; python_version >= '3.11'",
+        ] {
+            assert!(
+                validate_requirement(requirement, &allowances).is_ok(),
+                "{requirement:?}"
             );
         }
     }
@@ -1278,15 +2470,15 @@ mod tests {
             ..Default::default()
         };
         // A loopback / private direct URL is rejected even when direct URLs are
-        // allowed, because it still flows through validate_index_url -> SSRF.
+        // allowed. Literal addresses fail preflight; DNS names are rechecked at
+        // the broker's exact connect boundary.
         let err =
             validate_requirement("x @ http://127.0.0.1/x-1.0-py3-none-any.whl", &a).unwrap_err();
         assert!(
             matches!(err, ResolverError::RejectedRequirement { .. }),
             "loopback direct URL must be refused: {err:?}"
         );
-        // A plain-HTTP public URL is rejected (validate_server_url requires HTTPS
-        // unless TIRITH_ALLOW_HTTP is set, which it is not here).
+        // Plain HTTP is always rejected for resolver traffic.
         let err =
             validate_requirement("x @ http://example.com/x-1.0-py3-none-any.whl", &a).unwrap_err();
         assert!(matches!(err, ResolverError::RejectedRequirement { .. }));
@@ -1312,6 +2504,16 @@ mod tests {
                 "{spec:?} should be refused as a local path"
             );
         }
+    }
+
+    #[test]
+    fn windows_local_path_allowance_is_applied_before_url_parsing() {
+        let allowances = ResolverAllowances {
+            allow_local_path: true,
+            ..Default::default()
+        };
+        assert!(validate_requirement("C:/pkg", &allowances).is_ok());
+        assert!(validate_requirement("C:\\pkg", &allowances).is_ok());
     }
 
     #[test]
@@ -1360,20 +2562,9 @@ mod tests {
 
     #[test]
     fn index_url_public_https_accepted() {
-        // A public HTTPS index passes. This resolves a real public host, so on a
-        // fully offline runner DNS fails; that is an environment limitation, not a
-        // policy rejection, so we only assert the *shape* of an offline failure
-        // (a resolution error, never a scheme/creds/SSRF rejection).
-        match validate_index_url("https://pypi.org/simple") {
-            Ok(()) => {}
-            Err(ResolverError::RejectedIndexUrl { reason, .. }) => {
-                assert!(
-                    reason.contains("resolve"),
-                    "a public HTTPS index must only fail on DNS resolution offline, got: {reason}"
-                );
-            }
-            other => panic!("unexpected error for a public HTTPS index: {other:?}"),
-        }
+        // Syntax preflight performs no DNS or network I/O. Connect-time public
+        // address validation belongs exclusively to the broker.
+        assert!(validate_index_url("https://pypi.org/simple").is_ok());
     }
 
     // ---- isolated env ------------------------------------------------------
@@ -1393,6 +2584,13 @@ mod tests {
             map.get("XDG_CONFIG_HOME").copied(),
             Some(dir.path().display().to_string().as_str())
         );
+        for key in ["TEMP", "TMP", "TMPDIR"] {
+            assert_eq!(
+                map.get(key).copied(),
+                Some(dir.path().display().to_string().as_str()),
+                "{key} must remain inside the isolated resolver directory"
+            );
+        }
         // Isolation flags present.
         assert_eq!(map.get("PIP_ISOLATED").copied(), Some("1"));
         assert_eq!(map.get("UV_NO_CONFIG").copied(), Some("1"));
@@ -1413,10 +2611,126 @@ mod tests {
                 "isolated env must not carry {forbidden}"
             );
         }
-        // The pip config file points at a non-existent path inside the temp home.
+        // The pip config file is the platform null device, which suppresses even
+        // system/global configuration rather than merely adding an absent file.
         let cfg = map.get("PIP_CONFIG_FILE").copied().unwrap();
-        assert!(cfg.starts_with(&dir.path().display().to_string()));
-        assert!(!Path::new(cfg).exists());
+        assert_eq!(cfg, if cfg!(windows) { "nul" } else { "/dev/null" });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn isolated_env_ignores_forged_windows_directory_variables() {
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_system_root = std::env::var_os("SystemRoot");
+        let old_windir = std::env::var_os("windir");
+        // SAFETY: TEST_ENV_LOCK serializes process-environment mutation.
+        unsafe {
+            std::env::set_var("SystemRoot", r"C:\attacker-root");
+            std::env::set_var("windir", r"C:\attacker-windir");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let env = isolated_env(directory.path(), Path::new(r"C:\Python\python.exe"));
+        // SAFETY: TEST_ENV_LOCK remains held and both original values are restored.
+        unsafe {
+            match old_system_root {
+                Some(value) => std::env::set_var("SystemRoot", value),
+                None => std::env::remove_var("SystemRoot"),
+            }
+            match old_windir {
+                Some(value) => std::env::set_var("windir", value),
+                None => std::env::remove_var("windir"),
+            }
+        }
+
+        let map: BTreeMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_ne!(map.get("SystemRoot").copied(), Some(r"C:\attacker-root"));
+        assert_ne!(map.get("windir").copied(), Some(r"C:\attacker-windir"));
+        assert!(
+            !map.get("PATH")
+                .copied()
+                .unwrap_or_default()
+                .contains("attacker-"),
+            "resolver PATH must be built from Win32 directory APIs, not ambient variables"
+        );
+    }
+
+    #[test]
+    fn broker_env_replaces_all_proxy_and_bypass_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = "http://tirith:token@127.0.0.1:43123";
+        let env = isolated_env_with_proxy(dir.path(), Path::new("/usr/bin/python3"), proxy);
+        let map: BTreeMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(map.get(key).copied(), Some(proxy), "{key}");
+        }
+        assert_eq!(map.get("NO_PROXY").copied(), Some(""));
+        assert_eq!(map.get("no_proxy").copied(), Some(""));
+        assert!(!map.contains_key("PIP_INDEX_URL"));
+        assert!(!map.contains_key("UV_INDEX_URL"));
+    }
+
+    #[test]
+    fn canonical_index_alias_drives_argv_and_broker_policy() {
+        let request = ResolverRequest {
+            requirements: vec!["example==1.0".to_string()],
+            index_urls: vec!["https://INDEX.Example.:443/simple".to_string()],
+            allowances: ResolverAllowances::default(),
+        };
+        let validated = validate_resolver_inputs(&request, &[]).unwrap();
+        assert_eq!(
+            validated.canonical_index_urls,
+            vec!["https://index.example/simple".to_string()]
+        );
+        let permitted = PermittedOrigins::from_urls(&validated.permitted_urls).unwrap();
+        assert!(permitted.permits("INDEX.EXAMPLE.", 443));
+        assert!(!permitted.permits("redirect.attacker.example", 443));
+    }
+
+    #[test]
+    fn custom_artifact_origin_is_broker_only() {
+        let request = ResolverRequest {
+            requirements: vec!["example==1.0".to_string()],
+            index_urls: vec!["https://index.example/simple".to_string()],
+            allowances: ResolverAllowances::default(),
+        };
+        let artifact_origins = vec!["https://cdn.example/wheels".to_string()];
+        let validated = validate_resolver_inputs(&request, &artifact_origins).unwrap();
+        assert_eq!(
+            validated.canonical_index_urls,
+            vec!["https://index.example/simple".to_string()]
+        );
+        let permitted = PermittedOrigins::from_urls(&validated.permitted_urls).unwrap();
+        assert!(permitted.permits("cdn.example", 443));
+        let args = uv_compile_args(
+            Path::new("/w/in"),
+            Path::new("/w/out"),
+            Path::new("/usr/bin/python3"),
+            &validated.canonical_index_urls,
+            &request.allowances,
+        );
+        assert!(!args.join(" ").contains("cdn.example"));
+    }
+
+    #[test]
+    fn private_ipv6_literal_is_rejected_in_effect_free_preflight() {
+        let request = ResolverRequest {
+            requirements: vec!["example==1.0".to_string()],
+            index_urls: vec!["https://[::1]/simple".to_string()],
+            allowances: ResolverAllowances::default(),
+        };
+        assert!(matches!(
+            validate_resolver_request(&request),
+            Err(ResolverError::RejectedIndexUrl { .. })
+        ));
     }
 
     #[test]
@@ -1486,7 +2800,8 @@ mod tests {
     fn pip_download_args_require_hashes_only_binary() {
         let lock = Path::new("/w/locked.txt");
         let dest = Path::new("/w/staging");
-        let args = pip_download_args(lock, dest, &[]);
+        let proxy = "http://tirith:token@127.0.0.1:43123";
+        let args = pip_download_args(lock, dest, &[], proxy);
         let joined = args.join(" ");
         assert!(joined.starts_with("-m pip download"), "{joined}");
         assert!(joined.contains("--only-binary :all:"), "{joined}");
@@ -1494,6 +2809,7 @@ mod tests {
         assert!(joined.contains("--no-deps"), "{joined}");
         assert!(joined.contains("--isolated"), "{joined}");
         assert!(joined.contains("--no-cache-dir"), "{joined}");
+        assert!(joined.contains(&format!("--proxy {proxy}")), "{joined}");
         assert!(joined.contains("--no-index"), "{joined}");
         assert!(joined.contains("--dest /w/staging"), "{joined}");
     }
@@ -1664,37 +2980,203 @@ certifi==2024.2.2 \\
 
     #[cfg(unix)]
     #[test]
-    fn resolve_tool_refuses_world_writable_by_default() {
+    fn resolve_tool_refuses_untrusted_first_path_hit_even_with_legacy_override() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("uv");
         std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
-        // World-writable + executable.
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o777)).unwrap();
-        // Put the dir on PATH for the lookup.
-        let orig = std::env::var_os("PATH");
-        let new_path = match &orig {
-            Some(p) => {
-                let mut v = std::ffi::OsString::from(dir.path());
-                v.push(":");
-                v.push(p);
-                v
-            }
-            None => std::ffi::OsString::from(dir.path()),
+        // A normal-looking 0755 file still fails because its PATH entry is under
+        // the denied project/temp root. The legacy override is intentionally not
+        // able to bypass canonical trusted-child provenance.
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let allowances = ResolverAllowances {
+            allow_untrusted_tool: true,
+            ..Default::default()
         };
-        // SAFETY: single-threaded test; restored immediately after.
-        std::env::set_var("PATH", &new_path);
-        let def = ResolverAllowances::default();
-        let res = resolve_tool("uv", &["uv"], &def);
-        // Restore PATH before asserting.
-        match orig {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
+        let res = resolve_tool_on_path("uv", &["uv"], &path, &[dir.path().to_path_buf()]);
         assert!(
             matches!(res, Err(ResolverError::ToolUntrusted { .. })),
-            "world-writable tool must be refused by default: {res:?}"
+            "untrusted PATH shadow must be refused: {res:?}; allowances={allowances:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tool_refuses_unowned_install_location_outside_denied_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("uv");
+        write_fake_bin(&bin, "#!/bin/sh\nexit 0\n");
+        let path = std::env::join_paths([dir.path()]).unwrap();
+
+        let result = resolve_tool_on_path("uv", &["uv"], &path, &[]);
+        assert!(
+            matches!(result, Err(ResolverError::ToolUntrusted { .. })),
+            "arbitrary user-owned PATH location must not establish install provenance: {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forged_windows_system_roots_cannot_auto_trust_path_tools() {
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("uv.exe"), b"not a trusted uv").unwrap();
+        std::fs::write(directory.path().join("python.exe"), b"not a trusted python").unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+        let variables = [
+            ("ProgramFiles", std::env::var_os("ProgramFiles")),
+            ("ProgramFiles(x86)", std::env::var_os("ProgramFiles(x86)")),
+            ("SystemRoot", std::env::var_os("SystemRoot")),
+            ("PATHEXT", std::env::var_os("PATHEXT")),
+        ];
+        // SAFETY: TEST_ENV_LOCK serializes process-environment mutation.
+        unsafe {
+            std::env::set_var("ProgramFiles", directory.path());
+            std::env::set_var("ProgramFiles(x86)", directory.path());
+            std::env::set_var("SystemRoot", directory.path());
+            std::env::set_var("PATHEXT", ".EXE");
+        }
+
+        let uv = resolve_tool_on_path("uv", &["uv"], &path, &[]);
+        let python = resolve_tool_on_path("python", &["python3", "python"], &path, &[]);
+
+        // SAFETY: TEST_ENV_LOCK remains held and each original value is restored.
+        unsafe {
+            for (name, value) in variables {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        for result in [uv, python] {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, ResolverError::ToolUntrusted { .. }),
+                "forged Windows system-root variables must not bypass enrollment: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("explicit `tirith pkg trust-tool"),
+                "the refusal must direct the operator to explicit enrollment: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_tool_enrollment_pin_binds_canonical_path_and_digest() {
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let root = tempfile::Builder::new()
+            .prefix("tirith-resolver-enrollment-")
+            .tempdir_in(home::home_dir().expect("test home"))
+            .unwrap();
+        // SAFETY: TEST_ENV_LOCK serializes environment mutation across tests.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", root.path()) };
+
+        let tool_dir = root.path().join("tools");
+        std::fs::create_dir(&tool_dir).unwrap();
+        let tool = tool_dir.join("uv");
+        write_fake_bin(&tool, "#!/bin/sh\nexit 0\n");
+        let canonical = tool.canonicalize().unwrap();
+        let digest = resolver_tool_digest(&canonical).unwrap();
+        let trust_file = resolver_tool_trust_file().unwrap();
+        std::fs::create_dir_all(trust_file.parent().unwrap()).unwrap();
+        let mut store = ResolverToolTrustStore::default();
+        store.pins.insert(canonical.display().to_string(), digest);
+        crate::util::write_file_atomic_0600(&trust_file, &serde_json::to_vec(&store).unwrap())
+            .unwrap();
+
+        assert!(resolver_tool_pin_matches(&canonical).unwrap());
+        write_fake_bin(&canonical, "#!/bin/sh\nexit 7\n");
+        assert!(!resolver_tool_pin_matches(&canonical).unwrap());
+
+        // SAFETY: TEST_ENV_LOCK remains held and the previous value is restored.
+        unsafe {
+            match old_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enrollment_rejects_insecure_existing_store_without_laundering_pins() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let environment = ResolverEnrollmentTestEnv::new();
+        let tool_directory = environment.tool_directory();
+        let tool = tool_directory.join("uv");
+        write_fake_bin(&tool, "#!/bin/sh\nexit 0\n");
+
+        let trust_file = resolver_tool_trust_file().unwrap();
+        std::fs::create_dir_all(trust_file.parent().unwrap()).unwrap();
+        let mut attacker_store = ResolverToolTrustStore::default();
+        attacker_store
+            .pins
+            .insert("/attacker/uv".to_string(), "00".repeat(32));
+        let attacker_bytes = serde_json::to_vec_pretty(&attacker_store).unwrap();
+        std::fs::write(&trust_file, &attacker_bytes).unwrap();
+        std::fs::set_permissions(&trust_file, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let error = enroll_resolver_tool(&tool).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("owned by the current user and mode 0600"),
+            "insecure pre-existing enrollment state must fail closed: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&trust_file).unwrap(),
+            attacker_bytes,
+            "rejected state must not be rewritten into a trusted file"
+        );
+        assert_ne!(
+            std::fs::metadata(&trust_file).unwrap().mode() & 0o077,
+            0,
+            "rejected state must not be laundered to owner-only permissions"
+        );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn resolver_trust_directory_rejects_mutating_macos_acl() {
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-resolver-acl-")
+            .tempdir_in(home::home_dir().expect("test home"))
+            .unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow write"])
+            .arg(directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "test must install a macOS extended ACL");
+
+        let error = validate_resolver_trust_directory(directory.path()).unwrap_err();
+        assert!(error.contains("ACL grants mutation"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_discovery_digest_survives_public_path_shaped_api() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("uv");
+        write_fake_bin(&path, "#!/bin/sh\nexit 0\n");
+        let discovered = TrustedExecutable::from_absolute(&path, &[]).unwrap();
+        remember_discovered_tool(&discovered).unwrap();
+
+        write_fake_bin(&path, "#!/bin/sh\nexit 7\n");
+        let rebound = TrustedExecutable::from_absolute(&path, &[]).unwrap();
+        let error = revalidate_discovered_tool(&rebound).unwrap_err();
+        assert!(error.contains("digest changed"), "{error}");
     }
 
     // ---- full pipeline with fake uv/python (unix) --------------------------
@@ -1708,6 +3190,138 @@ certifi==2024.2.2 \\
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(unix)]
+    struct ResolverEnrollmentTestEnv {
+        previous_xdg_config_home: Option<std::ffi::OsString>,
+        root: tempfile::TempDir,
+        _environment: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl ResolverEnrollmentTestEnv {
+        fn new() -> Self {
+            let environment = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+            let root = tempfile::Builder::new()
+                .prefix("tirith-resolver-public-api-")
+                .tempdir_in(home::home_dir().expect("test home"))
+                .unwrap();
+            // SAFETY: TEST_ENV_LOCK is held until this guard is dropped.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", root.path().join("config")) };
+            Self {
+                previous_xdg_config_home,
+                root,
+                _environment: environment,
+            }
+        }
+
+        fn tool_directory(&self) -> PathBuf {
+            let directory = self.root.path().join("tools");
+            std::fs::create_dir_all(&directory).unwrap();
+            directory
+        }
+
+        fn enroll(&self, path: &Path) {
+            enroll_resolver_tool(path).expect("fake resolver tool enrollment must succeed");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ResolverEnrollmentTestEnv {
+        fn drop(&mut self) {
+            // SAFETY: TEST_ENV_LOCK is still held while the prior process
+            // environment value is restored.
+            unsafe {
+                match self.previous_xdg_config_home.take() {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_resolver_tools_cannot_bypass_persisted_enrollment() {
+        let environment = ResolverEnrollmentTestEnv::new();
+        let bindir = environment.tool_directory();
+        let uv = bindir.join("uv");
+        let python = bindir.join("python3");
+        write_fake_bin(&uv, "#!/bin/sh\nexit 0\n");
+        write_fake_bin(&python, "#!/bin/sh\nexit 0\n");
+
+        let error = ValidatedResolverTools::from_public(&ResolverTools { uv, python }).unwrap_err();
+        assert!(matches!(error, ResolverError::ToolUntrusted { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("explicit `tirith pkg trust-tool"),
+            "public absolute paths must pass the same persisted provenance gate: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whitespace_free_direct_url_is_rejected_before_any_child_io() {
+        let bindir = tempfile::tempdir().unwrap();
+        let marker = bindir.path().join("resolver-ran");
+        let uv = bindir.path().join("uv");
+        let python = bindir.path().join("python3");
+        let body = format!("#!/bin/sh\nprintf ran > '{}'\nexit 99\n", marker.display());
+        write_fake_bin(&uv, &body);
+        write_fake_bin(&python, &body);
+        let tools = ResolverTools { uv, python };
+
+        let qroot = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::with_root(qroot.path().join("q")).unwrap();
+        let txn = store.begin_transaction("d2-preflight").unwrap();
+        let request = ResolverRequest::single(
+            "examplepkg@https://unapproved.example/pkg-1.0-py3-none-any.whl",
+        );
+        let error = resolve_into_quarantine(&request, &tools, &txn).unwrap_err();
+        assert!(
+            matches!(error, ResolverError::RejectedRequirement { .. }),
+            "{error:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "input validation must complete before uv/python can execute"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uv_stage_revalidates_auxiliary_python_before_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("uv-ran");
+        let uv_path = directory.path().join("uv");
+        let python_path = directory.path().join("python3");
+        write_fake_bin(
+            &uv_path,
+            &format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+        );
+        write_fake_bin(&python_path, "#!/bin/sh\nexit 0\n");
+        let uv = TrustedExecutable::from_absolute(&uv_path, &[]).unwrap();
+        let python = TrustedExecutable::from_absolute(&python_path, &[]).unwrap();
+        write_fake_bin(&python_path, "#!/bin/sh\nexit 9\n");
+
+        let result = run_child_capped(
+            &uv,
+            &[],
+            directory.path(),
+            &python,
+            "http://tirith:token@127.0.0.1:9",
+            Duration::from_secs(1),
+        );
+        assert!(matches!(result, Err(ResolverError::Io(_))), "{result:?}");
+        assert!(
+            !marker.exists(),
+            "uv must not run after Python identity drift"
+        );
+    }
+
     /// End to end: a fake `uv` emits a hash-pinned lock for one wheel, a fake
     /// `python -m pip download` drops that exact wheel into `--dest`, and the
     /// resolver ingests it into the quarantine. Proves the compile -> verify ->
@@ -1719,9 +3333,10 @@ certifi==2024.2.2 \\
         let wheel_name = "examplepkg-1.0.0-py3-none-any.whl";
         let digest = sha256_hex(wheel_body);
 
-        let bindir = tempfile::tempdir().unwrap();
-        let uv = bindir.path().join("uv");
-        let python = bindir.path().join("python3");
+        let environment = ResolverEnrollmentTestEnv::new();
+        let bindir = environment.tool_directory();
+        let uv = bindir.join("uv");
+        let python = bindir.join("python3");
 
         // Fake uv: ignores everything except writing the lock to the path that
         // follows --output-file. The lock pins the wheel's known digest.
@@ -1755,15 +3370,14 @@ certifi==2024.2.2 \\
              exit 0\n"
         );
         write_fake_bin(&python, &py_script);
+        environment.enroll(&uv);
+        environment.enroll(&python);
 
         let qroot = tempfile::tempdir().unwrap();
         let store = QuarantineStore::with_root(qroot.path().join("q")).unwrap();
         let txn = store.begin_transaction("d2-pipeline").unwrap();
 
-        let tools = ResolverTools {
-            uv: uv.clone(),
-            python: python.clone(),
-        };
+        let tools = ResolverTools { uv, python };
         let request = ResolverRequest::single("examplepkg==1.0.0");
 
         let resolved = resolve_into_quarantine(&request, &tools, &txn)
@@ -1784,9 +3398,10 @@ certifi==2024.2.2 \\
     #[cfg(unix)]
     #[test]
     fn resolve_into_quarantine_refuses_unpinned_download() {
-        let bindir = tempfile::tempdir().unwrap();
-        let uv = bindir.path().join("uv");
-        let python = bindir.path().join("python3");
+        let environment = ResolverEnrollmentTestEnv::new();
+        let bindir = environment.tool_directory();
+        let uv = bindir.join("uv");
+        let python = bindir.join("python3");
 
         // uv pins a hash for content that the python step will NOT produce.
         let pinned = sha256_hex(b"the content the lock expects");
@@ -1815,6 +3430,8 @@ certifi==2024.2.2 \\
              fi\n\
              exit 0\n";
         write_fake_bin(&python, py_script);
+        environment.enroll(&uv);
+        environment.enroll(&python);
 
         let qroot = tempfile::tempdir().unwrap();
         let store = QuarantineStore::with_root(qroot.path().join("q")).unwrap();
@@ -1834,11 +3451,14 @@ certifi==2024.2.2 \\
     #[cfg(unix)]
     #[test]
     fn resolve_into_quarantine_compile_failure_is_fail_closed() {
-        let bindir = tempfile::tempdir().unwrap();
-        let uv = bindir.path().join("uv");
-        let python = bindir.path().join("python3");
+        let environment = ResolverEnrollmentTestEnv::new();
+        let bindir = environment.tool_directory();
+        let uv = bindir.join("uv");
+        let python = bindir.join("python3");
         write_fake_bin(&uv, "#!/bin/sh\necho 'resolution failed' >&2\nexit 1\n");
         write_fake_bin(&python, "#!/bin/sh\nexit 0\n");
+        environment.enroll(&uv);
+        environment.enroll(&python);
 
         let qroot = tempfile::tempdir().unwrap();
         let store = QuarantineStore::with_root(qroot.path().join("q")).unwrap();

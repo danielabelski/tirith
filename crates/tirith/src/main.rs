@@ -5176,6 +5176,10 @@ Examples:
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
         #[arg(long = "index-url")]
         index_url: Vec<String>,
+        /// An approved artifact/CDN origin (repeatable). This authorizes broker
+        /// egress only and is never treated as a package index.
+        #[arg(long = "artifact-origin")]
+        artifact_origin: Vec<String>,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5204,6 +5208,10 @@ Examples:
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
         #[arg(long = "index-url")]
         index_url: Vec<String>,
+        /// An approved artifact/CDN origin (repeatable). This authorizes broker
+        /// egress only and is never treated as a package index.
+        #[arg(long = "artifact-origin")]
+        artifact_origin: Vec<String>,
         /// Install without a prior `tirith pkg approve` (unattended). The receipt
         /// still attests the install honestly.
         #[arg(long)]
@@ -5231,6 +5239,18 @@ Examples:
         /// The distribution names to verify (PEP 503 normalized internally).
         #[arg(trailing_var_arg = true)]
         packages: Vec<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Enroll a user-writable uv/python executable by canonical path and SHA-256
+    /// in Tirith's owner-only resolver-tool trust store.
+    TrustTool {
+        /// Absolute path to the executable to enroll.
+        path: std::path::PathBuf,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -6969,6 +6989,7 @@ fn run() {
                     requirements,
                     target,
                     index_url,
+                    artifact_origin,
                     format,
                     json,
                 } => {
@@ -6978,6 +6999,7 @@ fn run() {
                         requirements,
                         target,
                         index_url,
+                        artifact_origin,
                         json,
                     }
                 }
@@ -6986,6 +7008,7 @@ fn run() {
                     requirements,
                     target,
                     index_url,
+                    artifact_origin,
                     yes,
                     allow_degraded,
                     format,
@@ -6997,6 +7020,7 @@ fn run() {
                         requirements,
                         target,
                         index_url,
+                        artifact_origin,
                         yes,
                         allow_degraded,
                         json,
@@ -7014,6 +7038,10 @@ fn run() {
                         packages,
                         json,
                     }
+                }
+                PkgAction::TrustTool { path, format, json } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::pkg::PkgAction::TrustTool { path, json }
                 }
                 PkgAction::Receipt { query } => {
                     let (which, json) = match query {

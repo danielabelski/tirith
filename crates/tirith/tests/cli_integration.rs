@@ -17517,6 +17517,39 @@ fn pkg_install_pip_fails_closed_when_toolchain_absent() {
     );
 }
 
+/// Invalid requirement syntax/policy is rejected before PATH discovery or the
+/// real quarantine store is opened. This pins the production ordering, not just
+/// the resolver unit's "no child executed" property.
+#[test]
+fn pkg_install_rejects_direct_url_before_tool_or_quarantine_effects() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let data = home.path().join("must-not-create-data");
+    let out = tirith()
+        .env("PATH", empty_path_dir(home.path()))
+        .env("XDG_DATA_HOME", &data)
+        .env("APPDATA", &data)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args([
+            "pkg",
+            "install",
+            "pip",
+            "examplepkg@https://unapproved.example/pkg-1.0-py3-none-any.whl",
+        ])
+        .output()
+        .expect("failed to run tirith pkg install");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("direct-URL requirements") && !stderr.contains("tool not found"),
+        "input rejection must precede resolver discovery: {stderr}"
+    );
+    assert!(
+        !data.join("tirith/quarantine").exists(),
+        "invalid input must not open or create quarantine state"
+    );
+}
+
 /// `tirith pkg install pip` with the same toolchain absent but `--json` must still
 /// refuse with exit 1 (the JSON surface does not weaken the fail-closed contract).
 #[test]

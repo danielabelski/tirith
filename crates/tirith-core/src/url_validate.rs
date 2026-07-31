@@ -250,36 +250,85 @@ pub(crate) fn is_cloud_metadata_ip(ip: &IpAddr) -> bool {
 fn is_forbidden_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || o[0] == 0
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 169 && o[1] == 254)
-                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
-                || (o[0] == 198 && o[1] == 18)
-                || (o[0] == 198 && o[1] == 19)
-                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
-                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
-                || o[0] >= 240
+            // IANA's IPv4 special-purpose registry marks the whole
+            // 192.0.0.0/24 block non-global except the PCP/TURN anycast
+            // addresses. 192.88.99.0/24 is the deprecated 6to4 relay block and
+            // remains non-global, including the 192.88.99.2 6a44 anycast entry.
+            if matches!(v4.octets(), [192, 0, 0, 9] | [192, 0, 0, 10]) {
+                return false;
+            }
+            ipv4_in_prefix(*v4, [0, 0, 0, 0], 8)
+                || ipv4_in_prefix(*v4, [10, 0, 0, 0], 8)
+                || ipv4_in_prefix(*v4, [100, 64, 0, 0], 10)
+                || ipv4_in_prefix(*v4, [127, 0, 0, 0], 8)
+                || ipv4_in_prefix(*v4, [169, 254, 0, 0], 16)
+                || ipv4_in_prefix(*v4, [172, 16, 0, 0], 12)
+                || ipv4_in_prefix(*v4, [192, 0, 0, 0], 24)
+                || ipv4_in_prefix(*v4, [192, 0, 2, 0], 24)
+                || ipv4_in_prefix(*v4, [192, 88, 99, 0], 24)
+                || ipv4_in_prefix(*v4, [192, 168, 0, 0], 16)
+                || ipv4_in_prefix(*v4, [198, 18, 0, 0], 15)
+                || ipv4_in_prefix(*v4, [198, 51, 100, 0], 24)
+                || ipv4_in_prefix(*v4, [203, 0, 113, 0], 24)
+                || ipv4_in_prefix(*v4, [224, 0, 0, 0], 4)
+                || ipv4_in_prefix(*v4, [240, 0, 0, 0], 4)
         }
         IpAddr::V6(v6) => {
-            if let Some(v4) = embedded_ipv4_in_v6(v6) {
-                return is_forbidden_ip(&IpAddr::V4(v4));
+            // The well-known NAT64 prefix is globally routed when its embedded
+            // IPv4 destination is. Other translated/transition ranges (mapped,
+            // local-use NAT64, 6to4, Teredo) are not accepted as global socket
+            // destinations by this server-side boundary.
+            let octets = v6.octets();
+            const NAT64_WELL_KNOWN_PREFIX: [u8; 12] =
+                [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+            if octets.starts_with(&NAT64_WELL_KNOWN_PREFIX) {
+                let embedded = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return is_forbidden_ip(&IpAddr::V4(embedded));
             }
-            let s = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || ((s[0] & 0xfe00) == 0xfc00)
-                || ((s[0] & 0xffc0) == 0xfe80)
-                || (s[0] == 0x2001 && s[1] == 0x0db8)
+            // IANA globally reachable exceptions inside the otherwise special
+            // 2001::/23 protocol-assignment block.
+            if *v6 == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1)
+                || *v6 == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2)
+                || *v6 == Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 4, 0x0112, 0, 0, 0, 0, 0), 48)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0), 28)
+            {
+                return false;
+            }
+            // Default-deny unallocated/reserved IPv6 space: ordinary global
+            // unicast is 2000::/3. Then subtract every current non-global
+            // special-purpose subrange in that allocation.
+            !ipv6_in_prefix(*v6, Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16)
+                || ipv6_in_prefix(*v6, Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20)
         }
     }
+}
+
+fn ipv4_in_prefix(address: Ipv4Addr, network: [u8; 4], prefix: u32) -> bool {
+    let address = u32::from(address);
+    let network = u32::from_be_bytes(network);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    address & mask == network & mask
+}
+
+fn ipv6_in_prefix(address: Ipv6Addr, network: Ipv6Addr, prefix: u32) -> bool {
+    let address = u128::from(address);
+    let network = u128::from(network);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    address & mask == network & mask
 }
 
 fn embedded_ipv4_in_v6(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
@@ -304,11 +353,9 @@ fn embedded_ipv4_in_v6(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
     }
 
     // 6to4 (`2002::/16`, RFC 3056): the embedded IPv4 is octets [2..6]. A
-    // literal like `2002:7f00:1::` tunnels 127.0.0.1, so without decoding it
-    // would otherwise pass the v6 checks as a "public" address. We decode the
-    // embedded IPv4 (rather than blanket-blocking the whole /16) so a 6to4
-    // address wrapping a genuinely public IPv4 is still allowed. The IPv4
-    // forbidden check is the single source of truth either way.
+    // literal like `2002:7f00:1::` tunnels 127.0.0.1. Decode it so callers that
+    // inspect embedded addresses cannot miss that identity; the global-address
+    // classifier independently blanket-blocks the deprecated 2002::/16 range.
     if octets[0] == 0x20 && octets[1] == 0x02 {
         return Some(Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
     }
@@ -666,9 +713,9 @@ mod tests {
         assert!(result.is_ok(), "Resolved public IPv6 must be allowed");
     }
 
-    // 6to4 (2002::/16) and Teredo (2001:0000::/32) embed an IPv4 the v6 checks
-    // would otherwise miss. The embedded IPv4 is decoded and run through the
-    // IPv4-forbidden check.
+    // 6to4 (2002::/16) and Teredo (2001:0000::/32) are no longer globally
+    // reachable transition ranges. The server boundary rejects the entire
+    // ranges rather than treating a public embedded IPv4 as sufficient.
 
     #[test]
     fn test_rejects_6to4_encoded_loopback() {
@@ -683,14 +730,15 @@ mod tests {
     }
 
     #[test]
-    fn test_allows_6to4_encoded_public_ipv4() {
-        // 2002:0808:0808:: wraps 8.8.8.8 (public) — must stay allowed.
+    fn test_rejects_deprecated_6to4_even_with_public_ipv4() {
+        // 2002:0808:0808:: wraps 8.8.8.8, but RFC 9637 makes 2002::/16
+        // non-global regardless of the embedded address.
         let result = validate_outbound_url_with_resolver(
             "https://[2002:0808:0808::]/",
             UrlValidationMode::Server,
             &|_, _| Err("resolver should not be called".to_string()),
         );
-        assert!(result.is_ok(), "6to4-encoded public IPv4 should be allowed");
+        assert!(result.is_err(), "deprecated 6to4 must be refused");
     }
 
     #[test]
@@ -798,6 +846,37 @@ mod tests {
         assert!(is_public_addr(&sock("93.184.216.34")));
         assert!(is_public_addr(&sock("8.8.8.8")));
         assert!(is_public_addr(&sock("2607:f8b0:4004:800::200e")));
+    }
+
+    #[test]
+    fn test_is_public_addr_tracks_special_purpose_registries() {
+        for address in [
+            "192.0.0.1",
+            "192.88.99.1",
+            "192.88.99.2",
+            "100::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002:0808:0808::1",
+            "3fff::1",
+            "64:ff9b:1::808:808",
+        ] {
+            assert!(!is_public_addr(&sock(address)), "{address}");
+        }
+        for address in [
+            "192.0.0.9",
+            "192.0.0.10",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:30::1",
+            "64:ff9b::808:808",
+        ] {
+            assert!(is_public_addr(&sock(address)), "{address}");
+        }
     }
 
     // is_cloud_metadata_ip: the dedicated metadata-IP classifier the carve-out

@@ -124,6 +124,17 @@ windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_System_Threading",
 ] }
 
+# Resolver-tool enrollment also needs typed owner/DACL and trusted Windows
+# directory APIs. Keep this narrow and cfg-gated; the version is already in the
+# workspace dependency closure.
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 # Linux runtime-containment capsule backend (Stack E2). Landlock = unprivileged
 # filesystem (and, on ABI v4 / Linux 6.7, port-level network) access control;
 # extrasafe = an ergonomic seccomp-BPF policy builder (wraps seccompiler). Both

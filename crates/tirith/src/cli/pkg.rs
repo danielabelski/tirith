@@ -46,7 +46,9 @@ use tirith_core::artifact::install::{
 };
 use tirith_core::artifact::quarantine::{QuarantineError, QuarantineStore, QuarantineTransaction};
 use tirith_core::artifact::resolver::{
-    resolve_into_quarantine, ResolvedSet, ResolverError, ResolverRequest, ResolverTools,
+    enroll_resolver_tool, resolve_into_quarantine_with_artifact_origins,
+    validate_resolver_request_with_artifact_origins, ResolvedSet, ResolverError, ResolverRequest,
+    ResolverTools,
 };
 use tirith_core::policy::Policy;
 use tirith_core::receipt::ArtifactScanReceipt;
@@ -79,6 +81,7 @@ pub enum PkgAction {
         requirements: Vec<String>,
         target: Option<PathBuf>,
         index_url: Vec<String>,
+        artifact_origin: Vec<String>,
         json: bool,
     },
     /// Resolve + firewall + (with a matching approval or `--yes`) contained install.
@@ -87,6 +90,7 @@ pub enum PkgAction {
         requirements: Vec<String>,
         target: Option<PathBuf>,
         index_url: Vec<String>,
+        artifact_origin: Vec<String>,
         yes: bool,
         allow_degraded: bool,
         json: bool,
@@ -97,6 +101,9 @@ pub enum PkgAction {
         packages: Vec<String>,
         json: bool,
     },
+    /// Explicitly pin a user-writable uv/python executable by canonical path and
+    /// SHA-256 in the owner-only operator trust store.
+    TrustTool { path: PathBuf, json: bool },
     /// List / show the D6 tamper-evident receipts.
     Receipt { which: ReceiptQuery, json: bool },
 }
@@ -145,13 +152,22 @@ pub fn run(action: PkgAction) -> i32 {
             requirements,
             target,
             index_url,
+            artifact_origin,
             json,
-        } => run_approve(ecosystem, &requirements, target, &index_url, json),
+        } => run_approve(
+            ecosystem,
+            &requirements,
+            target,
+            &index_url,
+            &artifact_origin,
+            json,
+        ),
         PkgAction::Install {
             ecosystem,
             requirements,
             target,
             index_url,
+            artifact_origin,
             yes,
             allow_degraded,
             json,
@@ -160,6 +176,7 @@ pub fn run(action: PkgAction) -> i32 {
             &requirements,
             target,
             &index_url,
+            &artifact_origin,
             yes,
             allow_degraded,
             json,
@@ -170,6 +187,7 @@ pub fn run(action: PkgAction) -> i32 {
             json,
         } => run_verify_env(&target, &packages, json),
         PkgAction::Receipt { which, json } => run_receipt(which, json),
+        PkgAction::TrustTool { path, json } => run_trust_tool(&path, json),
     }
 }
 
@@ -228,7 +246,10 @@ impl InstallTarget {
     /// parent's parent, the venv root) is used. The interpreter's prefix is always
     /// granted READ so the interpreter can start.
     fn derive(tools: &ResolverTools, target: Option<PathBuf>) -> Self {
-        let interpreter = tools.python.clone();
+        Self::derive_from_interpreter(tools.python.clone(), target)
+    }
+
+    fn derive_from_interpreter(interpreter: PathBuf, target: Option<PathBuf>) -> Self {
         // The interpreter prefix: `<prefix>/bin/python` -> `<prefix>`. Best-effort;
         // a non-standard layout just grants the interpreter's own directory as a read
         // root, which is still correct (it is where the interpreter lives).
@@ -273,6 +294,7 @@ fn prepare_plan(
     requirements: &[String],
     target: Option<PathBuf>,
     index_url: &[String],
+    artifact_origin: &[String],
     policy: &Policy,
     expiry: String,
 ) -> Result<PreparedPlan, PrepareError> {
@@ -283,6 +305,10 @@ fn prepare_plan(
         index_urls: index_url.to_vec(),
         allowances: Default::default(),
     };
+    // Parse and policy-check all attacker-controlled strings before PATH lookup,
+    // quarantine creation, broker binding, DNS, or child execution.
+    validate_resolver_request_with_artifact_origins(&request, artifact_origin)
+        .map_err(PrepareError::Resolver)?;
     let tools = ResolverTools::discover(&request.allowances).map_err(PrepareError::Resolver)?;
     let target = InstallTarget::derive(&tools, target);
 
@@ -296,7 +322,8 @@ fn prepare_plan(
 
     // D2: resolve + download + ingest into the quarantine (re-hashing on the way in).
     let resolved =
-        resolve_into_quarantine(&request, &tools, &txn).map_err(PrepareError::Resolver)?;
+        resolve_into_quarantine_with_artifact_origins(&request, &tools, &txn, artifact_origin)
+            .map_err(PrepareError::Resolver)?;
 
     // The live threat DB sequence the plan binds to. `cached()` is the same DB the
     // rest of tirith consults; `None` is sequence 0.
@@ -454,6 +481,36 @@ impl std::fmt::Display for PrepareError {
 }
 
 // ---------------------------------------------------------------------------
+// resolver tool enrollment
+// ---------------------------------------------------------------------------
+
+fn run_trust_tool(path: &Path, json: bool) -> i32 {
+    match enroll_resolver_tool(path) {
+        Ok(canonical) => {
+            if json {
+                let out = serde_json::json!({
+                    "trusted": true,
+                    "canonical_path": canonical.display().to_string(),
+                    "binding": "sha256",
+                });
+                let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+                println!();
+            } else {
+                eprintln!(
+                    "tirith pkg trust-tool: enrolled canonical path + SHA-256 for {}",
+                    canonical.display()
+                );
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("tirith pkg trust-tool: {error}");
+            1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // pkg approve
 // ---------------------------------------------------------------------------
 
@@ -462,6 +519,7 @@ fn run_approve(
     requirements: &[String],
     target: Option<PathBuf>,
     index_url: &[String],
+    artifact_origin: &[String],
     json: bool,
 ) -> i32 {
     if let Some(code) = precheck(ecosystem, requirements) {
@@ -476,7 +534,14 @@ fn run_approve(
 
     let expiry =
         (chrono::Utc::now() + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS)).to_rfc3339();
-    let prepared = match prepare_plan(requirements, target, index_url, &policy, expiry) {
+    let prepared = match prepare_plan(
+        requirements,
+        target,
+        index_url,
+        artifact_origin,
+        &policy,
+        expiry,
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("tirith pkg approve: {e}");
@@ -541,6 +606,7 @@ fn run_install(
     requirements: &[String],
     target: Option<PathBuf>,
     index_url: &[String],
+    artifact_origin: &[String],
     yes: bool,
     allow_degraded: bool,
     json: bool,
@@ -558,7 +624,14 @@ fn run_install(
     // digest with no expiry and looks for a matching approval (whose own expiry is
     // checked). This keeps "the bytes/situation I am about to install" stable while
     // the approval governs the time window.
-    let prepared = match prepare_plan(requirements, target, index_url, &policy, String::new()) {
+    let prepared = match prepare_plan(
+        requirements,
+        target,
+        index_url,
+        artifact_origin,
+        &policy,
+        String::new(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("tirith pkg install: {e}");
@@ -1560,11 +1633,10 @@ mod tests {
 
     #[test]
     fn install_target_uses_explicit_target_dir() {
-        let tools = ResolverTools {
-            uv: PathBuf::from("/usr/bin/uv"),
-            python: PathBuf::from("/opt/py/bin/python3"),
-        };
-        let t = InstallTarget::derive(&tools, Some(PathBuf::from("/work/.venv")));
+        let t = InstallTarget::derive_from_interpreter(
+            PathBuf::from("/opt/py/bin/python3"),
+            Some(PathBuf::from("/work/.venv")),
+        );
         assert_eq!(t.interpreter, PathBuf::from("/opt/py/bin/python3"));
         assert_eq!(t.environment, PathBuf::from("/work/.venv"));
         // The interpreter prefix is a read root.
@@ -1573,11 +1645,7 @@ mod tests {
 
     #[test]
     fn install_target_defaults_to_interpreter_prefix() {
-        let tools = ResolverTools {
-            uv: PathBuf::from("/usr/bin/uv"),
-            python: PathBuf::from("/opt/py/bin/python3"),
-        };
-        let t = InstallTarget::derive(&tools, None);
+        let t = InstallTarget::derive_from_interpreter(PathBuf::from("/opt/py/bin/python3"), None);
         // No --target: the interpreter prefix is the environment.
         assert_eq!(t.environment, PathBuf::from("/opt/py"));
     }
