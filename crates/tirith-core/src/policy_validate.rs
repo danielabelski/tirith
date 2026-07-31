@@ -34,18 +34,17 @@ impl std::fmt::Display for IssueLevel {
 pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     let mut issues = Vec::new();
 
-    // Structural parse first — fail early if the YAML shape is wrong.
-    let policy: crate::policy::Policy = match serde_yaml::from_str(yaml) {
-        Ok(p) => p,
-        Err(e) => {
-            issues.push(PolicyIssue {
-                level: IssueLevel::Error,
-                message: format!("YAML parse error: {e}"),
-                field: None,
-            });
-            return issues;
-        }
-    };
+    // Use the runtime's parse → migrate/version-gate → deserialize pipeline.
+    // Runtime-only invariants (notably custom-rule shape) remain below so this
+    // validator can emit their focused field diagnostics.
+    let crate::policy::ParsedPolicyDocument { migrated, policy } =
+        match crate::policy::Policy::parse_document(yaml) {
+            Ok(document) => document,
+            Err(error) => {
+                issues.push(policy_document_error_issue(error));
+                return issues;
+            }
+        };
 
     validate_paranoia(&policy, &mut issues);
     validate_severity_overrides(&policy, &mut issues);
@@ -61,10 +60,47 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     validate_agent_rules(&policy, &mut issues);
     validate_package_policy(&policy, &mut issues);
 
-    // Typo guard: flag fields that aren't part of the Policy schema.
-    validate_unknown_fields(yaml, &mut issues);
+    validate_schema_unknown_fields(&migrated, &mut issues);
 
     issues
+}
+
+fn policy_document_error_issue(error: crate::policy::PolicyDocumentError) -> PolicyIssue {
+    match error {
+        crate::policy::PolicyDocumentError::Yaml(error)
+        | crate::policy::PolicyDocumentError::Deserialize(error) => PolicyIssue {
+            level: IssueLevel::Error,
+            message: format!("YAML parse error: {error}"),
+            field: None,
+        },
+        crate::policy::PolicyDocumentError::Migration(error) => PolicyIssue {
+            level: IssueLevel::Error,
+            message: format!("Policy migration error: {error}"),
+            field: Some("schema_version".to_string()),
+        },
+    }
+}
+
+fn validate_schema_unknown_fields(migrated: &serde_yaml::Value, issues: &mut Vec<PolicyIssue>) {
+    let fields = match crate::policy_ignored::collect(migrated.clone()) {
+        Ok(fields) => fields,
+        Err(error) => {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!("policy schema inspection error: {error}"),
+                field: None,
+            });
+            return;
+        }
+    };
+
+    for field in fields {
+        issues.push(PolicyIssue {
+            level: IssueLevel::Warning,
+            message: format!("unknown field '{field}'"),
+            field: Some(field),
+        });
+    }
 }
 
 fn validate_paranoia(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
@@ -780,308 +816,44 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
     }
 }
 
-fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
-    let known_top_level = [
-        "schema_version",
-        "fail_mode",
-        "allow_bypass_env",
-        "allow_bypass_env_noninteractive",
-        "paranoia",
-        "severity_overrides",
-        "additional_known_domains",
-        "allowlist",
-        "blocklist",
-        "approval_rules",
-        "network_deny",
-        "network_allow",
-        "webhooks",
-        "checkpoints",
-        "scan",
-        "allowlist_rules",
-        "custom_rules",
-        "dlp_custom_patterns",
-        "injection_seeds_custom",
-        "mcp_redact_injection",
-        "gateway_profile",
-        "strict_warn",
-        "action_overrides",
-        "escalation",
-        "policy_server_url",
-        "policy_server_api_key",
-        "policy_fetch_fail_mode",
-        "enforce_fail_mode",
-        "threat_intel",
-        "agent_rules",
-        "package_policy",
-    ];
-
-    // A typo here is load-bearing — a misspelled `block_newr_than_days` silently
-    // disables the operator's intent — so flag unknown keys.
-    let known_package_policy_fields = [
-        "block_not_found",
-        "block_newer_than_days",
-        "warn_newer_than_days",
-        "warn_low_downloads_below",
-        "block_install_scripts_for_unknown_packages",
-        "block_typosquat_distance",
-        "block_aggregate_score",
-        "warn_aggregate_score",
-        "block_osv_min_cvss",
-        "block_repo_mismatch",
-        "warn_install_script_network_call",
-        "block_dependency_confusion",
-        "internal_package_names",
-        "repo_mismatch_check_max_packages",
-    ];
-    let known_internal_package_spec_fields = ["ecosystem", "name"];
-
-    let known_scan_fields = [
-        "additional_config_files",
-        "trusted_mcp_servers",
-        "mcp_allowed_tools",
-        "ignore_patterns",
-        "fail_on",
-        "profiles",
-        // A2 coverage keys.
-        "require_complete",
-        "oversized_file_action",
-        "unreadable_file_action",
-        "unsupported_artifact_action",
-    ];
-    // A2 — valid `GapAction` string values for the `scan.*_action` keys.
-    let known_gap_actions = ["ignore", "warn", "fail"];
-    let known_checkpoint_fields = ["max_count", "max_age_hours", "max_storage_bytes"];
-    // PR #121 fix-list item 10 — the `allow`/`deny` children were never
-    // validated, so `agent_rules: { denyy: [...] }` passed silently and the
-    // intended block never fired. Lists mirror `policy.rs` AgentRules/AgentMatcher.
-    let known_agent_rules_fields = ["allow", "deny"];
-    // `kind` + `name` plus the optional semantic predicates.
-    let known_agent_matcher_fields = [
-        "kind",
-        "name",
-        "filesystem_write",
-        "network",
-        "secrets_access",
-    ];
-
-    if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(yaml) {
-        for (key, value) in &map {
-            if let serde_yaml::Value::String(k) = key {
-                if !known_top_level.contains(&k.as_str()) {
-                    issues.push(PolicyIssue {
-                        level: IssueLevel::Warning,
-                        message: format!("unknown field '{k}'"),
-                        field: Some(k.clone()),
-                    });
-                }
-
-                if k == "scan" {
-                    if let serde_yaml::Value::Mapping(sub_map) = value {
-                        let known_profile_fields = ["include", "exclude", "fail_on", "ignore"];
-                        for (sub_key, sub_val) in sub_map {
-                            if let serde_yaml::Value::String(sk) = sub_key {
-                                if !known_scan_fields.contains(&sk.as_str()) {
-                                    issues.push(PolicyIssue {
-                                        level: IssueLevel::Warning,
-                                        message: format!("unknown field 'scan.{sk}'"),
-                                        field: Some(format!("scan.{sk}")),
-                                    });
-                                }
-                                if sk == "profiles" {
-                                    if let serde_yaml::Value::Mapping(profiles) = sub_val {
-                                        for (pname, pval) in profiles {
-                                            let pname_str = match pname {
-                                                serde_yaml::Value::String(s) => s.clone(),
-                                                _ => continue,
-                                            };
-                                            if let serde_yaml::Value::Mapping(pfields) = pval {
-                                                for pkey in pfields.keys() {
-                                                    if let serde_yaml::Value::String(pk) = pkey {
-                                                        if !known_profile_fields
-                                                            .contains(&pk.as_str())
-                                                        {
-                                                            issues.push(PolicyIssue {
-                                                                level: IssueLevel::Warning,
-                                                                message: format!(
-                                                                    "unknown field 'scan.profiles.{pname_str}.{pk}'"
-                                                                ),
-                                                                field: Some(format!(
-                                                                    "scan.profiles.{pname_str}.{pk}"
-                                                                )),
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // A2 — validate the coverage gap-action VALUES so a
-                                // typo (`oversized_file_action: warnn`) is caught
-                                // instead of silently parsing to the serde default.
-                                if matches!(
-                                    sk.as_str(),
-                                    "oversized_file_action"
-                                        | "unreadable_file_action"
-                                        | "unsupported_artifact_action"
-                                ) {
-                                    if let serde_yaml::Value::String(av) = sub_val {
-                                        // Exact-match the lowercase wire contract: the
-                                        // serde layer is `rename_all = "lowercase"`, so
-                                        // `Warn`/`FAIL` would be REJECTED at load. Do not
-                                        // `to_lowercase()` here, or the validator would
-                                        // green-light a value that deserialization refuses.
-                                        if !known_gap_actions.contains(&av.as_str()) {
-                                            issues.push(PolicyIssue {
-                                                level: IssueLevel::Error,
-                                                message: format!(
-                                                    "scan.{sk}: invalid action '{av}' (valid: ignore, warn, fail)"
-                                                ),
-                                                field: Some(format!("scan.{sk}")),
-                                            });
-                                        }
-                                    } else {
-                                        issues.push(PolicyIssue {
-                                            level: IssueLevel::Error,
-                                            message: format!(
-                                                "scan.{sk}: must be a string (ignore, warn, fail)"
-                                            ),
-                                            field: Some(format!("scan.{sk}")),
-                                        });
-                                    }
-                                }
-
-                                // A2 — `require_complete` must be a boolean.
-                                if sk == "require_complete"
-                                    && !matches!(sub_val, serde_yaml::Value::Bool(_))
-                                {
-                                    issues.push(PolicyIssue {
-                                        level: IssueLevel::Error,
-                                        message:
-                                            "scan.require_complete: must be a boolean (true/false)"
-                                                .to_string(),
-                                        field: Some("scan.require_complete".into()),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if k == "checkpoints" {
-                    if let serde_yaml::Value::Mapping(sub_map) = value {
-                        for sub_key in sub_map.keys() {
-                            if let serde_yaml::Value::String(sk) = sub_key {
-                                if !known_checkpoint_fields.contains(&sk.as_str()) {
-                                    issues.push(PolicyIssue {
-                                        level: IssueLevel::Warning,
-                                        message: format!("unknown field 'checkpoints.{sk}'"),
-                                        field: Some(format!("checkpoints.{sk}")),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if k == "package_policy" {
-                    if let serde_yaml::Value::Mapping(sub_map) = value {
-                        for (sub_key, sub_val) in sub_map {
-                            let serde_yaml::Value::String(sk) = sub_key else {
-                                continue;
-                            };
-                            if !known_package_policy_fields.contains(&sk.as_str()) {
-                                issues.push(PolicyIssue {
-                                    level: IssueLevel::Warning,
-                                    message: format!("unknown field 'package_policy.{sk}'"),
-                                    field: Some(format!("package_policy.{sk}")),
-                                });
-                                continue;
-                            }
-                            // Recurse into internal_package_names entries
-                            // ({ecosystem, name}); a typo silently drops the entry.
-                            if sk == "internal_package_names" {
-                                if let serde_yaml::Value::Sequence(seq) = sub_val {
-                                    for (i, item) in seq.iter().enumerate() {
-                                        let serde_yaml::Value::Mapping(spec) = item else {
-                                            continue;
-                                        };
-                                        for skey in spec.keys() {
-                                            let serde_yaml::Value::String(sk2) = skey else {
-                                                continue;
-                                            };
-                                            if !known_internal_package_spec_fields
-                                                .contains(&sk2.as_str())
-                                            {
-                                                issues.push(PolicyIssue {
-                                                    level: IssueLevel::Warning,
-                                                    message: format!(
-                                                        "unknown field 'package_policy.internal_package_names[{i}].{sk2}'"
-                                                    ),
-                                                    field: Some(format!(
-                                                        "package_policy.internal_package_names[{i}].{sk2}"
-                                                    )),
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // PR #121 fix-list item 10 — validate the nested
-                // `agent_rules.{allow,deny}` keys and each matcher's keys; a typo
-                // at either level used to be dropped silently (a no-op rule).
-                if k == "agent_rules" {
-                    if let serde_yaml::Value::Mapping(sub_map) = value {
-                        for (sub_key, sub_val) in sub_map {
-                            let serde_yaml::Value::String(sk) = sub_key else {
-                                continue;
-                            };
-                            if !known_agent_rules_fields.contains(&sk.as_str()) {
-                                issues.push(PolicyIssue {
-                                    level: IssueLevel::Warning,
-                                    message: format!("unknown field 'agent_rules.{sk}'"),
-                                    field: Some(format!("agent_rules.{sk}")),
-                                });
-                                continue;
-                            }
-                            // Recurse into each matcher and flag unknown fields.
-                            if let serde_yaml::Value::Sequence(seq) = sub_val {
-                                for (i, item) in seq.iter().enumerate() {
-                                    let serde_yaml::Value::Mapping(matcher) = item else {
-                                        continue;
-                                    };
-                                    for mkey in matcher.keys() {
-                                        let serde_yaml::Value::String(mk) = mkey else {
-                                            continue;
-                                        };
-                                        if !known_agent_matcher_fields.contains(&mk.as_str()) {
-                                            issues.push(PolicyIssue {
-                                                level: IssueLevel::Warning,
-                                                message: format!(
-                                                    "unknown field 'agent_rules.{sk}[{i}].{mk}'"
-                                                ),
-                                                field: Some(format!("agent_rules.{sk}[{i}].{mk}")),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unknown_fields(yaml: &str) -> Vec<String> {
+        let runtime = crate::policy::Policy::try_parse_yaml(yaml);
+        assert!(
+            runtime.is_ok(),
+            "unknown-field fixture must remain runtime-loadable: {:?}",
+            runtime.err()
+        );
+
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().all(|issue| issue.level != IssueLevel::Error),
+            "unknown-field fixture must remain validator-loadable: {issues:?}"
+        );
+
+        let mut fields: Vec<String> = issues
+            .into_iter()
+            .filter(|issue| {
+                issue.level == IssueLevel::Warning && issue.message.starts_with("unknown field '")
+            })
+            .filter_map(|issue| issue.field)
+            .collect();
+        fields.sort();
+        fields
+    }
+
+    fn assert_runtime_validator_parse_parity(name: &str, yaml: &str) {
+        let runtime_accepts = crate::policy::Policy::try_parse_yaml(yaml).is_ok();
+        let issues = validate(yaml);
+        let validator_accepts = !issues.iter().any(|issue| issue.level == IssueLevel::Error);
+        assert_eq!(
+            validator_accepts, runtime_accepts,
+            "runtime/validator parse parity failed for {name}: {issues:?}"
+        );
+    }
 
     #[test]
     fn test_valid_minimal_policy() {
@@ -1102,12 +874,105 @@ mod tests {
         assert!(issues[0].message.contains("YAML parse error"));
     }
 
+    #[test]
+    fn validator_rejects_future_schema_version_like_runtime() {
+        let yaml = format!(
+            "schema_version: {}\nparanoia: 2\n",
+            crate::policy_migrations::CURRENT_SCHEMA_VERSION + 1
+        );
+        assert!(crate::policy::Policy::try_parse_yaml(&yaml).is_err());
+
+        let issues = validate(&yaml);
+        let issue = issues.iter().find(|issue| {
+            issue.level == IssueLevel::Error
+                && issue.field.as_deref() == Some("schema_version")
+                && issue.message.contains("newer tirith")
+        });
+        assert!(
+            issue.is_some(),
+            "future schema version must fail validation before fields are discarded: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validator_parse_acceptance_matches_runtime_across_document_versions() {
+        let current = crate::policy_migrations::CURRENT_SCHEMA_VERSION;
+        let cases = [
+            ("versionless", "paranoia: 2\n".to_string()),
+            (
+                "explicit-v1",
+                "schema_version: 1\nparanoia: 2\n".to_string(),
+            ),
+            (
+                "v1-legacy",
+                "schema_version: 1\ninternal_package_names: [internal-tool]\nparanoia: 2\n"
+                    .to_string(),
+            ),
+            (
+                "current",
+                format!("schema_version: {current}\nparanoia: 2\n"),
+            ),
+            (
+                "malformed-explicit-version-runtime-compat",
+                "schema_version: not-a-number\nparanoia: 2\n".to_string(),
+            ),
+            ("malformed-field-type", "paranoia: nope\n".to_string()),
+            ("malformed-yaml", "{{invalid yaml".to_string()),
+        ];
+
+        for (name, yaml) in cases {
+            assert_runtime_validator_parse_parity(name, &yaml);
+        }
+    }
+
+    #[test]
+    fn validator_preserves_focused_custom_rule_shape_diagnostics() {
+        let cases = [
+            (
+                "both-shape",
+                r#"
+custom_rules:
+  - id: both-shape
+    pattern: "blocked"
+    when:
+      command.uses_sudo: true
+    title: "both"
+    context: [exec]
+"#,
+                "has both",
+            ),
+            (
+                "neither-shape",
+                r#"
+custom_rules:
+  - id: neither-shape
+    title: "neither"
+    context: [exec]
+"#,
+                "has neither",
+            ),
+        ];
+
+        for (id, yaml, detail) in cases {
+            assert!(
+                crate::policy::Policy::try_parse_yaml(yaml).is_err(),
+                "runtime must keep its strict custom-rule shape gate"
+            );
+            let issues = validate(yaml);
+            assert!(
+                issues.iter().any(|issue| {
+                    issue.level == IssueLevel::Error
+                        && issue.field.as_deref() == Some(&format!("custom_rules.{id}"))
+                        && issue.message.contains(detail)
+                }),
+                "validator must retain the focused {id} diagnostic: {issues:?}"
+            );
+        }
+    }
+
     /// T2.10: the gap-action validator matches the LOWERCASE serde wire contract
     /// exactly (`#[serde(rename_all = "lowercase")]`), so a mixed-case `Warn` /
-    /// `FAIL` is rejected. End-to-end through `validate()` the strict typed parse
-    /// rejects it first; the text field-walker (`validate_unknown_fields`) is the
-    /// belt-and-suspenders that MUST agree, so it is exercised directly here to
-    /// prove the exact-match (no `to_lowercase()`) fix.
+    /// `FAIL` is rejected through the same strict typed parse runtime uses.
     #[test]
     fn gap_action_rejects_mixed_case_in_policy_validate() {
         for v in ["Warn", "FAIL"] {
@@ -1120,23 +985,10 @@ mod tests {
                 issues.iter().any(|i| i.level == IssueLevel::Error),
                 "mixed-case action '{v}' must be rejected by validate(): {issues:?}"
             );
-
-            // The text field-walker, exercised on its own, must ALSO flag the
-            // mixed-case value with the invalid-action error (it no longer
-            // lowercases the value, so it cannot green-light what serde refuses).
-            let mut walker_issues = Vec::new();
-            validate_unknown_fields(&yaml, &mut walker_issues);
-            assert!(
-                walker_issues.iter().any(|i| i.level == IssueLevel::Error
-                    && i.message.contains("invalid action")
-                    && i.message.contains(v)),
-                "the field-walker must flag mixed-case '{v}' as an invalid action: {walker_issues:?}"
-            );
         }
     }
 
-    /// T2.10: a lowercase `warn` / `fail` is accepted by the validator (no error
-    /// from `validate()` and no invalid-action error from the field-walker) AND
+    /// T2.10: a lowercase `warn` / `fail` is accepted by the validator and
     /// round-trips through serde, matching the wire contract.
     #[test]
     fn gap_action_lowercase_validates_and_round_trips() {
@@ -1148,16 +1000,6 @@ mod tests {
             assert!(
                 issues.iter().all(|i| i.level != IssueLevel::Error),
                 "lowercase action '{v}' must validate cleanly: {issues:?}"
-            );
-
-            // The field-walker raises no invalid-action error for the valid value.
-            let mut walker_issues = Vec::new();
-            validate_unknown_fields(&yaml, &mut walker_issues);
-            assert!(
-                !walker_issues
-                    .iter()
-                    .any(|i| i.message.contains("invalid action")),
-                "the field-walker must accept lowercase '{v}': {walker_issues:?}"
             );
 
             // And it round-trips through the strict typed parse (the wire layer).
@@ -1502,6 +1344,182 @@ custom_rules:
         let yaml = "not_a_real_field: true\n";
         let issues = validate(yaml);
         assert!(issues.iter().any(|i| i.message.contains("unknown field")));
+    }
+
+    #[test]
+    fn every_serialized_production_policy_field_is_known() {
+        let yaml = serde_yaml::to_string(&crate::policy::Policy::default())
+            .expect("default policy must serialize");
+        let top_level_count = serde_yaml::from_str::<serde_yaml::Value>(&yaml)
+            .expect("serialized policy must parse")
+            .as_mapping()
+            .expect("policy must serialize as a mapping")
+            .len();
+        assert!(
+            top_level_count >= 35,
+            "test must exercise the complete production Policy surface, got {top_level_count}"
+        );
+        assert_eq!(
+            unknown_fields(&yaml),
+            Vec::<String>::new(),
+            "fields emitted by the production Policy serializer must be recognized"
+        );
+    }
+
+    #[test]
+    fn schema_derived_unknowns_include_nested_structs_and_sequence_elements() {
+        let yaml = r#"
+share:
+  customer_id_patterns: []
+  customer_id_patternz: []
+scan:
+  profiles:
+    release:
+      include: ["src/**"]
+      incldue: ["tests/**"]
+approval_rules:
+  - rule_ids: []
+    timeout_secondz: 30
+webhooks:
+  - url: "https://hooks.example.test/events"
+    payload_temlate: "{}"
+"#;
+
+        assert_eq!(
+            unknown_fields(yaml),
+            vec![
+                "approval_rules[0].timeout_secondz".to_string(),
+                "scan.profiles.release.incldue".to_string(),
+                "share.customer_id_patternz".to_string(),
+                "webhooks[0].payload_temlate".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dynamic_map_keys_and_serde_aliases_are_not_unknown_fields() {
+        let yaml = r#"
+severity_overrides:
+  curl_pipe_shell: HIGH
+action_overrides:
+  curl_pipe_shell: block
+context_destructive_verbs:
+  aws: [delete-stack]
+scan:
+  mcp_allowed_tools:
+    server.alpha: [read_resource]
+  profiles:
+    release:
+      include: ["src/**"]
+webhooks:
+  - url: "https://hooks.example.test/events"
+    headers:
+      X-Custom-Header: value
+custom_rules:
+  - id: alias-title
+    pattern: "safe-pattern"
+    message: "recognized title alias"
+    context: [exec]
+"#;
+
+        assert_eq!(unknown_fields(yaml), Vec::<String>::new());
+    }
+
+    #[test]
+    fn serde_skipped_policy_fields_are_reported_as_unknown() {
+        let yaml = r#"
+path: "/tmp/untrusted-policy.yaml"
+scope: repo
+context_labels:
+  aws:prod: critical
+ssh_host_labels:
+  prod: critical
+neutralized_fields: [allowlist]
+"#;
+
+        assert_eq!(
+            unknown_fields(yaml),
+            vec![
+                "context_labels".to_string(),
+                "neutralized_fields".to_string(),
+                "path".to_string(),
+                "scope".to_string(),
+                "ssh_host_labels".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn migrated_legacy_fields_are_checked_after_migration() {
+        for yaml in [
+            "internal_package_names: [internal-tool]\n",
+            "schema_version: 1\ninternal_package_names: [internal-tool]\n",
+        ] {
+            let policy = crate::policy::Policy::try_parse_yaml(yaml)
+                .expect("v1 legacy field must migrate into a loadable current policy");
+            assert_eq!(policy.package_policy.internal_package_names.len(), 1);
+            assert_eq!(
+                policy.package_policy.internal_package_names[0].name,
+                "internal-tool"
+            );
+            assert_eq!(
+                unknown_fields(yaml),
+                Vec::<String>::new(),
+                "v1 legacy field must be consumed before unknown-field collection"
+            );
+        }
+
+        let yaml = format!(
+            "schema_version: {}\ninternal_package_names: [internal-tool]\n",
+            crate::policy_migrations::CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            unknown_fields(&yaml),
+            vec!["internal_package_names".to_string()],
+            "the legacy key is unknown when a current-version policy bypasses migration"
+        );
+    }
+
+    #[test]
+    fn curated_policy_templates_have_no_unknown_fields() {
+        let templates = [
+            (
+                "individual",
+                include_str!("../../tirith/assets/policy_templates/individual.yaml"),
+            ),
+            (
+                "startup",
+                include_str!("../../tirith/assets/policy_templates/startup.yaml"),
+            ),
+            (
+                "oss-maintainer",
+                include_str!("../../tirith/assets/policy_templates/oss-maintainer.yaml"),
+            ),
+            (
+                "ci-strict",
+                include_str!("../../tirith/assets/policy_templates/ci-strict.yaml"),
+            ),
+            (
+                "enterprise",
+                include_str!("../../tirith/assets/policy_templates/enterprise.yaml"),
+            ),
+            (
+                "ai-agent-heavy",
+                include_str!("../../tirith/assets/policy_templates/ai-agent-heavy.yaml"),
+            ),
+            (
+                "mcp-strict",
+                include_str!("../../tirith/assets/policy_templates/mcp-strict.yaml"),
+            ),
+        ];
+
+        for (name, yaml) in templates {
+            assert_eq!(
+                unknown_fields(yaml),
+                Vec::<String>::new(),
+                "curated template {name} must stay aligned with the production schema"
+            );
+        }
     }
 
     #[test]

@@ -1180,7 +1180,47 @@ impl Default for PackagePolicy {
     }
 }
 
+/// A policy parsed through the runtime's migrate-before-deserialize pipeline.
+pub(crate) struct ParsedPolicyDocument {
+    pub(crate) migrated: serde_yaml::Value,
+    pub(crate) policy: Policy,
+}
+
+/// Failure stage for the shared policy document pipeline.
+#[derive(Debug)]
+pub(crate) enum PolicyDocumentError {
+    Yaml(serde_yaml::Error),
+    Migration(crate::policy_migrations::MigrationError),
+    Deserialize(serde_yaml::Error),
+}
+
+impl std::fmt::Display for PolicyDocumentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Yaml(error) => write!(f, "yaml parse error: {error}"),
+            Self::Migration(error) => write!(f, "migration error: {error}"),
+            Self::Deserialize(error) => write!(f, "deserialize error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PolicyDocumentError {}
+
 impl Policy {
+    /// Parse, migrate, and deserialize one policy document. Runtime loading and
+    /// `policy validate` share this stage so version handling cannot diverge.
+    pub(crate) fn parse_document(
+        content: &str,
+    ) -> Result<ParsedPolicyDocument, PolicyDocumentError> {
+        let mut migrated: serde_yaml::Value =
+            serde_yaml::from_str(content).map_err(PolicyDocumentError::Yaml)?;
+        crate::policy_migrations::migrate_forward(&mut migrated)
+            .map_err(PolicyDocumentError::Migration)?;
+        let policy = serde_yaml::from_value::<Policy>(migrated.clone())
+            .map_err(PolicyDocumentError::Deserialize)?;
+        Ok(ParsedPolicyDocument { migrated, policy })
+    }
+
     /// Discover and load partial policy (bypass + fail_mode), for the tier-2
     /// fast bypass path. Same resolution order as full discovery, and M11 ch5
     /// incident overrides are applied here too so a `TIRITH=0` bypass honors an
@@ -1765,12 +1805,8 @@ impl Policy {
     /// `Err(message)` rather than printing+falling back, for fail-mode-aware
     /// callers (remote fetch); [`Self::load_from_yaml`] wraps it warn-and-default.
     pub fn try_parse_yaml(content: &str) -> Result<Self, String> {
-        let mut value: serde_yaml::Value =
-            serde_yaml::from_str(content).map_err(|e| format!("yaml parse error: {e}"))?;
-        crate::policy_migrations::migrate_forward(&mut value)
-            .map_err(|e| format!("migration error: {e}"))?;
-        let policy = serde_yaml::from_value::<Policy>(value)
-            .map_err(|e| format!("deserialize error: {e}"))?;
+        let ParsedPolicyDocument { policy, .. } =
+            Self::parse_document(content).map_err(|error| error.to_string())?;
 
         // Enforce the pattern-XOR-when invariant at LOAD time (CodeRabbit M13
         // R3): a both/neither rule is a silent no-op, so reject the whole policy
