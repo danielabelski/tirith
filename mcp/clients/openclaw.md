@@ -67,15 +67,37 @@ JSON to stdin. Verification requires running OpenClaw with the plugin installed.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
-| `TIRITH_SHELL` | `posix` | Shell tokenizer: `posix`, `powershell`, `cmd` |
+| `TIRITH_SHELL` | inferred when unambiguous | Explicit executor-shell assertion: `posix`, `powershell`, or `cmd` |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with stderr output, `deny` blocks them |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## Decision logic
 
 The plugin intercepts `before_tool_call` events for `exec` and `bash` tool
-calls. It extracts `event.params.command`, passes it to `tirith check --json`
-via `execFileSync` with the shell set by `TIRITH_SHELL` (default `posix`), and:
+calls. It extracts `event.params.command`, resolves the tokenizer from the tool,
+requested host, elevation flag, and gateway platform, then passes the command to
+`tirith check --json` via `execFileSync`.
+
+OpenClaw does not expose the fully resolved host or a remote node's OS in
+`before_tool_call`. The plugin therefore infers a shell only where execution is
+unambiguous:
+
+- `bash` and explicitly non-elevated `host=sandbox`: `posix`
+- `host=gateway`: `powershell` on Windows, otherwise `posix`
+- elevated `sandbox`/`auto`: the gateway shell above
+- explicit `host=auto` on non-Windows: `posix` (both gateway and sandbox are POSIX)
+- `host=node`: requires `TIRITH_SHELL`, because the node OS is unavailable
+- an omitted host: requires `TIRITH_SHELL`, because trusted configuration can
+  select any target, including a remote node
+- `host=auto`, or `host=sandbox` with an omitted `elevated` flag, on Windows:
+  requires `TIRITH_SHELL`, because sandbox uses POSIX `sh`, the gateway uses
+  PowerShell, and trusted configuration can default elevation on
+
+An invalid value or a value that contradicts a known execution surface blocks
+before Tirith runs. This parser/executor-identity failure is never overridden by
+`TIRITH_FAIL_OPEN`.
+
+After resolving the exact tokenizer:
 
 - Exit 0 from tirith: allow (returns `undefined`)
 - Exit 1: deny (returns `{block: true, blockReason: "..."}`)
@@ -88,8 +110,12 @@ via `execFileSync` with the shell set by `TIRITH_SHELL` (default `posix`), and:
 ## Notes
 
 - The plugin intercepts both `exec` and `bash` tool names.
-- `TIRITH_SHELL` allows overriding the shell tokenizer (useful on Windows
-  where `powershell` or `cmd` may be more appropriate than the default `posix`).
+- Set `TIRITH_SHELL` in the trusted OpenClaw process environment whenever the
+  hook cannot observe the executor (notably omitted hosts, Windows `auto`, and
+  remote nodes).
+  It is an assertion about the shell that will really execute the command, not
+  a preference. Current Windows gateways use `powershell`; use `cmd` only for a
+  node or integration that actually executes through `cmd.exe`.
 - The plugin uses `execFileSync` with a 10-second timeout.
 - Timeout detection checks `err.killed`, `err.signal === "SIGTERM"`, and
   `err.code === "ETIMEDOUT"`.
@@ -97,5 +123,5 @@ via `execFileSync` with the shell set by `TIRITH_SHELL` (default `posix`), and:
   via `execFile`).
 - No `python3` dependency -- the plugin is pure TypeScript.
 - The plugin registers as `id: "tirith-security"`, `name: "tirith Security Scanner"`.
-- The repo has no TS test runner. Automated testing of this plugin is not
-  currently supported; use manual host E2E verification.
+- The pure shell resolver is exercised on Linux, macOS, and Windows CI. Keep the
+  manual host E2E because only OpenClaw can prove its final runtime host choice.

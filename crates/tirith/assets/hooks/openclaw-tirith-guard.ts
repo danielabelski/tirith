@@ -9,14 +9,114 @@
 //
 // Environment:
 //   TIRITH_BIN              -- path to tirith binary (default: "tirith")
-//   TIRITH_SHELL            -- shell tokenizer: posix, powershell, cmd (default: "posix")
+//   TIRITH_SHELL            -- explicit executor-shell assertion: posix, powershell, cmd
 //   TIRITH_HOOK_WARN_ACTION -- "allow" (default) or "deny"
 //   TIRITH_FAIL_OPEN        -- "1" to allow on error (default: deny)
 
 import { execFile, execFileSync } from "node:child_process";
-import type { OpenClawPluginDefinition } from "openclaw/plugin-sdk";
 
-function hookEvent(event: string, detail?: string) {
+const VALID_SHELLS = new Set(["posix", "powershell", "cmd"]);
+const VALID_EXEC_HOSTS = new Set(["auto", "sandbox", "gateway", "node"]);
+
+function resolvedShell(shell) {
+  return { ok: true, shell };
+}
+
+function unresolvedShell(reason) {
+  return { ok: false, reason };
+}
+
+function requireExpectedShell(expected, configuredShell) {
+  if (configuredShell !== undefined && configuredShell !== expected) {
+    return unresolvedShell(
+      `tirith: TIRITH_SHELL does not match OpenClaw's effective ${expected} shell`,
+    );
+  }
+  return resolvedShell(expected);
+}
+
+function requireShellAssertion(configuredShell) {
+  if (configuredShell === undefined) {
+    return unresolvedShell(
+      "tirith: cannot determine OpenClaw's effective shell; set TIRITH_SHELL=posix, powershell, or cmd to match the executor",
+    );
+  }
+  return resolvedShell(configuredShell);
+}
+
+// OpenClaw's before_tool_call context does not expose the fully resolved exec
+// host or remote node OS. Infer only where its public execution contract is
+// unambiguous and otherwise require an explicit operator assertion. A bad or
+// mismatched assertion is a configuration error and always fails closed; it is
+// intentionally not covered by TIRITH_FAIL_OPEN.
+export function resolveShellTokenizer(
+  toolName,
+  params = {},
+  configuredShell = process.env.TIRITH_SHELL,
+  platform = process.platform,
+) {
+  if (configuredShell !== undefined && !VALID_SHELLS.has(configuredShell)) {
+    return unresolvedShell(
+      "tirith: invalid TIRITH_SHELL (expected posix, powershell, or cmd)",
+    );
+  }
+
+  // OpenClaw's legacy `bash` surface is explicitly POSIX regardless of the
+  // gateway platform.
+  if (toolName === "bash") {
+    return requireExpectedShell("posix", configuredShell);
+  }
+
+  const host = params?.host;
+  if (host !== undefined && (typeof host !== "string" || !VALID_EXEC_HOSTS.has(host))) {
+    return unresolvedShell("tirith: invalid OpenClaw exec host; refusing an ambiguous scan");
+  }
+  if (params?.elevated !== undefined && typeof params.elevated !== "boolean") {
+    return unresolvedShell("tirith: invalid OpenClaw elevated flag; refusing an ambiguous scan");
+  }
+
+  // An omitted host can resolve from OpenClaw configuration, including a remote
+  // node whose OS is not in hook context. Never guess from the gateway OS.
+  if (host === undefined) {
+    return requireShellAssertion(configuredShell);
+  }
+
+  if (host === "node") {
+    return requireShellAssertion(configuredShell);
+  }
+
+  // Elevated sandbox/auto calls escape to the gateway (node remains handled
+  // above), so the gateway platform decides the grammar.
+  if (params?.elevated === true) {
+    return requireExpectedShell(platform === "win32" ? "powershell" : "posix", configuredShell);
+  }
+  // `elevated` can default on in trusted OpenClaw configuration even when the
+  // call omits it. That changes sandbox/auto into gateway execution. The two
+  // grammars differ on Windows, so an operator assertion is required there.
+  if (
+    platform === "win32" &&
+    params?.elevated === undefined &&
+    (host === "sandbox" || host === "auto")
+  ) {
+    return requireShellAssertion(configuredShell);
+  }
+  if (host === "sandbox") {
+    return requireExpectedShell("posix", configuredShell);
+  }
+  if (host === "gateway") {
+    return requireExpectedShell(platform === "win32" ? "powershell" : "posix", configuredShell);
+  }
+
+  // host=auto chooses sandbox or gateway. Both are POSIX on non-Windows. On
+  // Windows they differ (sandbox sh vs gateway PowerShell), and hook context
+  // exposes no sandbox-resolution bit, so require an assertion.
+  if (platform === "win32") {
+    return requireShellAssertion(configuredShell);
+  }
+  return requireExpectedShell("posix", configuredShell);
+}
+
+function hookEvent(event, detail) {
   try {
     const tirithBin = process.env.TIRITH_BIN || "tirith";
     execFile(tirithBin, [
@@ -32,13 +132,18 @@ export default {
   name: "tirith Security Scanner",
   description: "Pre-exec command security scanning via tirith",
   register(api) {
-    api.on("before_tool_call", (event, ctx) => {
+    api.on("before_tool_call", (event) => {
       if (event.toolName !== "exec" && event.toolName !== "bash") return;
-      const command = event.params?.command as string | undefined;
+      const command = event.params?.command;
       if (typeof command !== "string" || !command.trim()) return;
 
       const tirithBin = process.env.TIRITH_BIN || "tirith";
-      const shell = process.env.TIRITH_SHELL || "posix";
+      const shellResolution = resolveShellTokenizer(event.toolName, event.params);
+      if (!shellResolution.ok) {
+        hookEvent("shell_resolution_error", shellResolution.reason);
+        return { block: true, blockReason: shellResolution.reason };
+      }
+      const shell = shellResolution.shell;
       try {
         execFileSync(
           tirithBin,
@@ -47,18 +152,19 @@ export default {
         );
         hookEvent("check_ok");
         return; // Exit 0 = allow
-      } catch (err: any) {
-        if (err.code === "ENOENT") {
+      } catch (err) {
+        const execError = /** @type {any} */ (err);
+        if (execError.code === "ENOENT") {
           if (process.env.TIRITH_FAIL_OPEN === "1") return;
           return { block: true, blockReason: `tirith not found -- install or set TIRITH_FAIL_OPEN=1` };
         }
         // Timeout detection: execFileSync sets killed=true and/or signal="SIGTERM".
-        if (err.killed || err.signal === "SIGTERM" || err.code === "ETIMEDOUT") {
+        if (execError.killed || execError.signal === "SIGTERM" || execError.code === "ETIMEDOUT") {
           hookEvent("timeout");
           if (process.env.TIRITH_FAIL_OPEN === "1") return;
           return { block: true, blockReason: "tirith: check timed out" };
         }
-        const exitCode: number | undefined = err.status; // execFileSync uses .status
+        const exitCode = execError.status; // execFileSync uses .status
         if (exitCode == null || (exitCode !== 1 && exitCode !== 2)) {
           hookEvent("unexpected_exit", `exit code ${exitCode}`);
           if (process.env.TIRITH_FAIL_OPEN === "1") return;
@@ -73,13 +179,13 @@ export default {
           if (warnAction !== "deny") {
             // Parse findings from stdout for stderr warning
             let warningText = "Tirith: security warnings detected (non-blocking)";
-            const stdout: string = err.stdout || "";
+            const stdout = execError.stdout || "";
             if (stdout.trim()) {
               try {
                 const verdict = JSON.parse(stdout);
-                const findings: any[] = verdict.findings || [];
+                const findings = verdict.findings || [];
                 if (findings.length > 0) {
-                  warningText = "Tirith warnings (non-blocking): " + findings.map((f: any) => {
+                  warningText = "Tirith warnings (non-blocking): " + findings.map((f) => {
                     const title = f.title || f.rule_id || "unknown";
                     const sev = f.severity || "";
                     return sev ? `[${sev}] ${title}` : title;
@@ -95,13 +201,13 @@ export default {
         hookEvent(exitCode === 1 ? "check_block" : "warn_denied");
         // Parse findings from stdout
         let reason = "tirith security check failed";
-        const stdout: string = err.stdout || "";
+        const stdout = execError.stdout || "";
         if (stdout.trim()) {
           try {
             const verdict = JSON.parse(stdout);
-            const findings: any[] = verdict.findings || [];
+            const findings = verdict.findings || [];
             if (findings.length > 0) {
-              reason = "tirith: " + findings.map((f: any) => {
+              reason = "tirith: " + findings.map((f) => {
                 const title = f.title || f.rule_id || "unknown";
                 const sev = f.severity || "";
                 return sev ? `[${sev}] ${title}` : title;
@@ -113,4 +219,4 @@ export default {
       }
     });
   },
-} satisfies OpenClawPluginDefinition;
+};
