@@ -1,5 +1,6 @@
 use serde::Serialize;
 use tirith_core::session_warnings::{self, HiddenEvent, SessionWarnings, WarningEvent};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// JSON output structure for `tirith warnings --json`.
 #[derive(Serialize)]
@@ -121,7 +122,7 @@ pub fn run(
 fn print_summary(w: &SessionWarnings, top_rules: &[(String, u32)]) {
     let rule_summary: String = top_rules
         .iter()
-        .map(|(rule, count)| format!("{count} {rule}"))
+        .map(|(rule, count)| format!("{count} {}", safe_single_line(rule)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -191,7 +192,8 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
     );
     println!(
         "Started: {} | Total: {} warning(s)\n",
-        w.session_start, w.total_warnings,
+        safe_single_line(&w.session_start),
+        w.total_warnings,
     );
 
     // Table header
@@ -210,26 +212,13 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
     );
 
     for (i, event) in w.events.iter().enumerate() {
-        let time_short = extract_time(&event.timestamp);
-        let cmd_truncated = truncate_str(&event.command_redacted, 40);
-        let title_truncated = truncate_str(&event.title, 28);
-        let rule_truncated = truncate_str(&event.rule_id, 20);
-
-        println!(
-            "  {:<3} \u{2502} {:<8} \u{2502} {:<8} \u{2502} {:<20} \u{2502} {:<28} \u{2502} {}",
-            i + 1,
-            time_short,
-            event.severity,
-            rule_truncated,
-            title_truncated,
-            cmd_truncated,
-        );
+        println!("{}", render_event_row(i + 1, event));
     }
 
     if !top_rules.is_empty() {
         let top_str: String = top_rules
             .iter()
-            .map(|(rule, count)| format!("{rule} ({count})"))
+            .map(|(rule, count)| format!("{} ({count})", safe_single_line(rule)))
             .collect::<Vec<_>>()
             .join(", ");
         println!("\nTop rules: {top_str}");
@@ -239,6 +228,8 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
     let suggestion_threshold = 3;
     for (rule, count) in top_rules {
         if *count >= suggestion_threshold {
+            let safe_rule = safe_single_line(rule);
+            let quoted_rule = tirith_core::safe_command::shell_single_quote(&safe_rule);
             // The domain comes from analyzed (attacker-controlled) command text and this
             // line is copy-paste-ready. Scrub terminal-control bytes (ANSI/OSC/zero-width)
             // first so the target cannot repaint the terminal, then shell-single-quote so
@@ -247,16 +238,16 @@ fn print_table(w: &SessionWarnings, top_rules: &[(String, u32)], paranoia: u8) {
             // --broad, so emit --broad to keep the line runnable. An unquotable target falls
             // back to the <pattern> placeholder.
             let quoted = find_domain_for_rule(w, rule).and_then(|d| {
-                let scrubbed = tirith_core::mcp::output_filter::sanitize_text_str(d);
+                let scrubbed = safe_single_line(d);
                 tirith_core::safe_command::shell_single_quote(&scrubbed)
             });
-            if let Some(d) = quoted {
+            if let (Some(d), Some(rule_arg)) = (quoted, quoted_rule) {
                 println!(
-                    "\nSuggestion: {rule} fired {count} times. Consider: tirith trust add {d} --broad --rule {rule}"
+                    "\nSuggestion: {safe_rule} fired {count} times. Consider: tirith trust add {d} --broad --rule {rule_arg}"
                 );
             } else {
                 println!(
-                    "\nSuggestion: {rule} fired {count} times. Consider: tirith trust add <pattern> --broad --rule {rule}"
+                    "\nSuggestion: {safe_rule} fired {count} times. Consider: tirith trust add <pattern> --broad --rule <rule>"
                 );
             }
         }
@@ -296,20 +287,7 @@ fn print_hidden_table(w: &SessionWarnings) {
     );
 
     for (i, event) in w.hidden_events.iter().rev().take(cap).enumerate() {
-        let time_short = extract_time(&event.timestamp);
-        let cmd_truncated = truncate_str(&event.command_redacted, 40);
-        let title_truncated = truncate_str(&event.title, 28);
-        let rule_truncated = truncate_str(&event.rule_id, 20);
-
-        println!(
-            "  {:<3} \u{2502} {:<8} \u{2502} {:<8} \u{2502} {:<20} \u{2502} {:<28} \u{2502} {}",
-            i + 1,
-            time_short,
-            event.severity,
-            rule_truncated,
-            title_truncated,
-            cmd_truncated,
-        );
+        println!("{}", render_hidden_event_row(i + 1, event));
     }
 
     if total > cap {
@@ -367,37 +345,98 @@ fn next_paranoia_for_hidden(hidden_low: u32, hidden_info: u32) -> Option<u8> {
     }
 }
 
-/// Extract HH:MM:SS from an ISO 8601 timestamp.
-fn extract_time(ts: &str) -> &str {
-    if let Some(t_pos) = ts.find('T') {
-        let after_t = &ts[t_pos + 1..];
-        let end = after_t.len().min(8);
-        &after_t[..end]
-    } else {
-        let end = ts.len().min(8);
-        &ts[..end]
-    }
+fn safe_single_line(value: &str) -> String {
+    super::sanitize_for_human_output(value, false)
 }
 
-/// Truncate a string to `max_len` bytes with "..." suffix if truncated.
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+/// Extract a terminal-safe HH:MM:SS-like prefix. The value is sanitized before
+/// locating/truncating it, so decoded newlines or escape sequences cannot forge
+/// rows and multibyte input can never trigger a byte-boundary panic.
+fn extract_time(ts: &str) -> String {
+    let safe = safe_single_line(ts);
+    let candidate = safe
+        .find('T')
+        .map(|position| &safe[position + 1..])
+        .unwrap_or(&safe);
+    take_display_width(candidate, 8)
+}
+
+fn take_display_width(s: &str, max_width: usize) -> String {
+    let mut width = 0usize;
+    s.chars()
+        .take_while(|ch| {
+            let char_width = UnicodeWidthChar::width(*ch).unwrap_or(0);
+            if width.saturating_add(char_width) > max_width {
+                false
+            } else {
+                width += char_width;
+                true
+            }
+        })
+        .collect()
+}
+
+/// Truncate by terminal display columns, not UTF-8 bytes or scalar count.
+fn truncate_display(s: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_width {
         s.to_string()
-    } else if max_len > 3 {
-        let truncated = tirith_core::util::truncate_bytes(s, max_len - 3);
-        format!("{truncated}...")
+    } else if max_width > 3 {
+        format!("{}...", take_display_width(s, max_width - 3))
     } else {
-        tirith_core::util::truncate_bytes(s, max_len)
+        take_display_width(s, max_width)
     }
 }
 
-/// Show first segment of a UUID-style session ID for compactness.
-fn truncate_session_id(sid: &str) -> &str {
-    if sid.len() > 12 {
-        &sid[..12]
-    } else {
-        sid
-    }
+fn display_cell(value: &str, width: usize) -> String {
+    let safe = safe_single_line(value);
+    let truncated = truncate_display(&safe, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(truncated.as_str()));
+    format!("{truncated}{}", " ".repeat(padding))
+}
+
+fn render_row(
+    index: usize,
+    timestamp: &str,
+    severity: &str,
+    rule_id: &str,
+    title: &str,
+    command_redacted: &str,
+) -> String {
+    let time = display_cell(&extract_time(timestamp), 8);
+    let severity = display_cell(severity, 8);
+    let rule = display_cell(rule_id, 20);
+    let title = display_cell(title, 28);
+    let command = truncate_display(&safe_single_line(command_redacted), 40);
+    format!(
+        "  {index:<3} \u{2502} {time} \u{2502} {severity} \u{2502} {rule} \u{2502} {title} \u{2502} {command}"
+    )
+}
+
+fn render_event_row(index: usize, event: &WarningEvent) -> String {
+    render_row(
+        index,
+        &event.timestamp,
+        &event.severity,
+        &event.rule_id,
+        &event.title,
+        &event.command_redacted,
+    )
+}
+
+fn render_hidden_event_row(index: usize, event: &HiddenEvent) -> String {
+    render_row(
+        index,
+        &event.timestamp,
+        &event.severity,
+        &event.rule_id,
+        &event.title,
+        &event.command_redacted,
+    )
+}
+
+/// Show the first 12 terminal columns of a session ID for compactness.
+fn truncate_session_id(sid: &str) -> String {
+    take_display_width(&safe_single_line(sid), 12)
 }
 
 /// Find the first domain associated with a given rule in the warning events.
@@ -434,18 +473,23 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_str_short() {
-        assert_eq!(truncate_str("hello", 10), "hello");
+    fn test_truncate_display_short() {
+        assert_eq!(truncate_display("hello", 10), "hello");
     }
 
     #[test]
-    fn test_truncate_str_exact() {
-        assert_eq!(truncate_str("hello", 5), "hello");
+    fn test_truncate_display_exact() {
+        assert_eq!(truncate_display("hello", 5), "hello");
     }
 
     #[test]
-    fn test_truncate_str_long() {
-        assert_eq!(truncate_str("hello world", 8), "hello...");
+    fn test_truncate_display_long() {
+        assert_eq!(truncate_display("hello world", 8), "hello...");
+        assert_eq!(truncate_display("包包包", 5), "包...");
+        assert_eq!(
+            UnicodeWidthStr::width(truncate_display("包包包", 5).as_str()),
+            5
+        );
     }
 
     #[test]
@@ -457,6 +501,41 @@ mod tests {
     #[test]
     fn test_truncate_session_id_short() {
         assert_eq!(truncate_session_id("short"), "short");
+    }
+
+    #[test]
+    fn warning_row_sanitizes_before_measuring_and_truncating() {
+        let event = WarningEvent {
+            timestamp: "2026-04-04T10:05:23Z\nFORGED".to_string(),
+            rule_id: "rule\u{1b}]52;c;clipboard\u{7}\nROW".to_string(),
+            severity: "high\u{202e}".to_string(),
+            title: "包包 title\u{200b}\u{1b}[2J\nROW".to_string(),
+            command_redacted: "echo safe\u{1b}[31m\nFORGED".to_string(),
+            domains: vec![],
+        };
+
+        let row = render_event_row(1, &event);
+        for forbidden in ['\u{1b}', '\u{7}', '\u{202e}', '\u{200b}', '\n', '\r'] {
+            assert!(
+                !row.contains(forbidden),
+                "unsafe terminal character survived: {row:?}"
+            );
+        }
+        assert!(!row.contains("clipboard"));
+        assert!(row.contains("包包 title"));
+
+        let cells: Vec<&str> = row.split('\u{2502}').collect();
+        assert_eq!(UnicodeWidthStr::width(cells[1]), 10);
+        assert_eq!(UnicodeWidthStr::width(cells[2]), 10);
+        assert_eq!(UnicodeWidthStr::width(cells[3]), 22);
+        assert_eq!(UnicodeWidthStr::width(cells[4]), 30);
+        assert!(UnicodeWidthStr::width(cells[5]) <= 41);
+    }
+
+    #[test]
+    fn extract_time_handles_hostile_multibyte_input_without_byte_slicing() {
+        assert_eq!(extract_time("包包包包包"), "包包包包");
+        assert_eq!(extract_time("x\nT12:34:56\u{1b}[2J"), "12:34:56");
     }
 
     #[test]
