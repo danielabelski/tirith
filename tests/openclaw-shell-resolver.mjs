@@ -12,14 +12,40 @@ const source = await readFile(assetUrl, "utf8");
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
 const { default: plugin, resolveShellTokenizer } = await import(moduleUrl);
 
-function expectShell(expected, toolName, params, configured, platform) {
-  const result = resolveShellTokenizer(toolName, params, configured, platform);
+function expectShell(
+  expected,
+  toolName,
+  params,
+  configured,
+  platform,
+  gatewayShell = platform === "win32" ? null : "/bin/sh",
+) {
+  const result = resolveShellTokenizer(
+    toolName,
+    params,
+    configured,
+    platform,
+    gatewayShell,
+  );
   assert.equal(result.ok, true, result.reason);
   assert.equal(result.shell, expected);
 }
 
-function expectBlocked(toolName, params, configured, platform, reasonFragment) {
-  const result = resolveShellTokenizer(toolName, params, configured, platform);
+function expectBlocked(
+  toolName,
+  params,
+  configured,
+  platform,
+  reasonFragment,
+  gatewayShell = platform === "win32" ? null : "/bin/sh",
+) {
+  const result = resolveShellTokenizer(
+    toolName,
+    params,
+    configured,
+    platform,
+    gatewayShell,
+  );
   assert.equal(result.ok, false, `unexpectedly resolved ${result.shell}`);
   assert.match(result.reason, reasonFragment);
 }
@@ -32,6 +58,59 @@ expectShell("posix", "exec", { host: "gateway" }, undefined, "linux");
 expectShell("powershell", "exec", { host: "sandbox", elevated: true }, undefined, "win32");
 expectBlocked("exec", { host: "sandbox" }, undefined, "win32", /cannot determine/);
 expectShell("posix", "exec", { host: "sandbox" }, undefined, "linux");
+
+// Non-Windows gateways honor OpenClaw's process SHELL. PowerShell on Linux or
+// macOS must be scanned as PowerShell, and auto/sandbox-with-default-elevation
+// stays ambiguous because it may instead resolve to the POSIX sandbox.
+expectShell("powershell", "exec", { host: "gateway" }, undefined, "linux", "/usr/bin/pwsh");
+expectBlocked(
+  "exec",
+  { host: "gateway" },
+  "posix",
+  "linux",
+  /does not match/,
+  "/usr/bin/pwsh",
+);
+expectShell(
+  "powershell",
+  "exec",
+  { host: "sandbox", elevated: true },
+  undefined,
+  "linux",
+  "/usr/bin/pwsh",
+);
+expectBlocked(
+  "exec",
+  { host: "auto" },
+  undefined,
+  "linux",
+  /cannot determine/,
+  "/usr/bin/pwsh",
+);
+expectShell(
+  "powershell",
+  "exec",
+  { host: "auto" },
+  "powershell",
+  "linux",
+  "/usr/bin/pwsh",
+);
+expectBlocked(
+  "exec",
+  { host: "sandbox" },
+  undefined,
+  "linux",
+  /cannot determine/,
+  "/usr/bin/pwsh",
+);
+expectShell(
+  "posix",
+  "exec",
+  { host: "sandbox", elevated: false },
+  undefined,
+  "linux",
+  "/usr/bin/pwsh",
+);
 
 // auto is equivalent across POSIX hosts, but ambiguous on Windows because the
 // sandbox uses sh and the gateway uses PowerShell.
@@ -49,9 +128,15 @@ expectShell("posix", "exec", {}, "posix", "linux");
 // Remote node OS is not present in before_tool_call context. Exercise every
 // supported asserted grammar, including cmd, and refuse a missing assertion.
 expectBlocked("exec", { host: "node" }, undefined, "linux", /cannot determine/);
-for (const shell of ["posix", "powershell", "cmd"]) {
+for (const shell of ["posix", "fish", "powershell", "cmd"]) {
   expectShell(shell, "exec", { host: "node" }, shell, "linux");
 }
+
+// Fish and unknown custom gateway shells cannot be inferred from SHELL alone:
+// OpenClaw may replace fish with bash/sh depending on PATH.
+expectBlocked("exec", { host: "gateway" }, undefined, "linux", /cannot determine/, "/bin/fish");
+expectShell("fish", "exec", { host: "gateway" }, "fish", "linux", "/bin/fish");
+expectBlocked("exec", { host: "gateway" }, undefined, "linux", /cannot determine/, "/opt/nu");
 
 // Invalid values and contradictions must not fall through to Tirith's POSIX
 // fallback, even when TIRITH_FAIL_OPEN is enabled elsewhere in the plugin.

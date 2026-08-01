@@ -67,7 +67,7 @@ JSON to stdin. Verification requires running OpenClaw with the plugin installed.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
-| `TIRITH_SHELL` | inferred when unambiguous | Explicit executor-shell assertion: `posix`, `powershell`, or `cmd` |
+| `TIRITH_SHELL` | inferred when unambiguous | Explicit executor-shell assertion: `posix`, `fish`, `powershell`, or `cmd` |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with stderr output, `deny` blocks them |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
@@ -75,7 +75,7 @@ JSON to stdin. Verification requires running OpenClaw with the plugin installed.
 
 The plugin intercepts `before_tool_call` events for `exec` and `bash` tool
 calls. It extracts `event.params.command`, resolves the tokenizer from the tool,
-requested host, elevation flag, and gateway platform, then passes the command to
+requested host, elevation flag, gateway platform, and gateway `SHELL`, then passes the command to
 `tirith check --json` via `execFileSync`.
 
 OpenClaw does not expose the fully resolved host or a remote node's OS in
@@ -83,15 +83,19 @@ OpenClaw does not expose the fully resolved host or a remote node's OS in
 unambiguous:
 
 - `bash` and explicitly non-elevated `host=sandbox`: `posix`
-- `host=gateway`: `powershell` on Windows, otherwise `posix`
+- `host=gateway`: `powershell` on Windows; on other platforms, known POSIX
+  shells map to `posix` and `pwsh`/`powershell` maps to `powershell`
 - elevated `sandbox`/`auto`: the gateway shell above
-- explicit `host=auto` on non-Windows: `posix` (both gateway and sandbox are POSIX)
+- explicit `host=auto`: inferred only when both possible targets share POSIX
+  grammar; otherwise requires `TIRITH_SHELL`
 - `host=node`: requires `TIRITH_SHELL`, because the node OS is unavailable
 - an omitted host: requires `TIRITH_SHELL`, because trusted configuration can
   select any target, including a remote node
-- `host=auto`, or `host=sandbox` with an omitted `elevated` flag, on Windows:
-  requires `TIRITH_SHELL`, because sandbox uses POSIX `sh`, the gateway uses
-  PowerShell, and trusted configuration can default elevation on
+- `host=auto`, or `host=sandbox` with an omitted `elevated` flag, when the
+  gateway is non-POSIX or ambiguous: requires `TIRITH_SHELL`, because sandbox
+  uses POSIX `sh` and trusted configuration can default elevation on
+- a Fish or unknown custom gateway `SHELL`: requires `TIRITH_SHELL`; OpenClaw
+  may replace Fish with bash/sh depending on PATH, which the hook cannot observe
 
 An invalid value or a value that contradicts a known execution surface blocks
 before Tirith runs. This parser/executor-identity failure is never overridden by
@@ -111,11 +115,12 @@ After resolving the exact tokenizer:
 
 - The plugin intercepts both `exec` and `bash` tool names.
 - Set `TIRITH_SHELL` in the trusted OpenClaw process environment whenever the
-  hook cannot observe the executor (notably omitted hosts, Windows `auto`, and
-  remote nodes).
+  hook cannot observe the executor (notably omitted hosts, non-POSIX `auto`,
+  ambiguous custom gateway shells, and remote nodes).
   It is an assertion about the shell that will really execute the command, not
-  a preference. Current Windows gateways use `powershell`; use `cmd` only for a
-  node or integration that actually executes through `cmd.exe`.
+  a preference. Current Windows gateways use `powershell`; non-Windows gateways
+  honor OpenClaw's `SHELL`. Use `cmd` only for a node or integration that actually
+  executes through `cmd.exe`.
 - The plugin uses `execFileSync` with a 10-second timeout.
 - Timeout detection checks `err.killed`, `err.signal === "SIGTERM"`, and
   `err.code === "ETIMEDOUT"`.

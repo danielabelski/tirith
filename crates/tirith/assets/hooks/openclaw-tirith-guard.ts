@@ -9,14 +9,24 @@
 //
 // Environment:
 //   TIRITH_BIN              -- path to tirith binary (default: "tirith")
-//   TIRITH_SHELL            -- explicit executor-shell assertion: posix, powershell, cmd
+//   TIRITH_SHELL            -- explicit executor-shell assertion: posix, fish, powershell, cmd
 //   TIRITH_HOOK_WARN_ACTION -- "allow" (default) or "deny"
 //   TIRITH_FAIL_OPEN        -- "1" to allow on error (default: deny)
 
 import { execFile, execFileSync } from "node:child_process";
 
-const VALID_SHELLS = new Set(["posix", "powershell", "cmd"]);
+const VALID_SHELLS = new Set(["posix", "fish", "powershell", "cmd"]);
 const VALID_EXEC_HOSTS = new Set(["auto", "sandbox", "gateway", "node"]);
+const POSIX_GATEWAY_SHELLS = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ash",
+  "ksh",
+  "ksh93",
+  "mksh",
+]);
 
 function resolvedShell(shell) {
   return { ok: true, shell };
@@ -38,10 +48,35 @@ function requireExpectedShell(expected, configuredShell) {
 function requireShellAssertion(configuredShell) {
   if (configuredShell === undefined) {
     return unresolvedShell(
-      "tirith: cannot determine OpenClaw's effective shell; set TIRITH_SHELL=posix, powershell, or cmd to match the executor",
+      "tirith: cannot determine OpenClaw's effective shell; set TIRITH_SHELL=posix, fish, powershell, or cmd to match the executor",
     );
   }
   return resolvedShell(configuredShell);
+}
+
+function gatewayShellForPlatform(platform, shellPath) {
+  if (platform === "win32") return "powershell";
+  const raw = typeof shellPath === "string" ? shellPath.trim() : "";
+  // OpenClaw resolves sh/bash when SHELL is absent or is a non-interactive
+  // placeholder. Both use POSIX grammar.
+  if (!raw) return "posix";
+  const name = raw.replaceAll("\\", "/").split("/").pop().toLowerCase();
+  if (name === "false" || name === "nologin") return "posix";
+  if (name === "pwsh" || name === "pwsh.exe" || name === "powershell" || name === "powershell.exe") {
+    return "powershell";
+  }
+  if (name === "cmd" || name === "cmd.exe") return "cmd";
+  if (POSIX_GATEWAY_SHELLS.has(name)) return "posix";
+  // Fish is deliberately ambiguous: OpenClaw prefers bash/sh when either is on
+  // PATH, but otherwise executes fish. Unknown custom shells are ambiguous too.
+  return undefined;
+}
+
+function requireGatewayShell(configuredShell, platform, shellPath) {
+  const inferred = gatewayShellForPlatform(platform, shellPath);
+  return inferred === undefined
+    ? requireShellAssertion(configuredShell)
+    : requireExpectedShell(inferred, configuredShell);
 }
 
 // OpenClaw's before_tool_call context does not expose the fully resolved exec
@@ -54,10 +89,11 @@ export function resolveShellTokenizer(
   params = {},
   configuredShell = process.env.TIRITH_SHELL,
   platform = process.platform,
+  gatewayShellPath = process.env.SHELL,
 ) {
   if (configuredShell !== undefined && !VALID_SHELLS.has(configuredShell)) {
     return unresolvedShell(
-      "tirith: invalid TIRITH_SHELL (expected posix, powershell, or cmd)",
+      "tirith: invalid TIRITH_SHELL (expected posix, fish, powershell, or cmd)",
     );
   }
 
@@ -85,18 +121,21 @@ export function resolveShellTokenizer(
     return requireShellAssertion(configuredShell);
   }
 
+  const gatewayShell = gatewayShellForPlatform(platform, gatewayShellPath);
+
   // Elevated sandbox/auto calls escape to the gateway (node remains handled
-  // above), so the gateway platform decides the grammar.
+  // above), so the actual gateway shell decides the grammar.
   if (params?.elevated === true) {
-    return requireExpectedShell(platform === "win32" ? "powershell" : "posix", configuredShell);
+    return requireGatewayShell(configuredShell, platform, gatewayShellPath);
   }
   // `elevated` can default on in trusted OpenClaw configuration even when the
   // call omits it. That changes sandbox/auto into gateway execution. The two
-  // grammars differ on Windows, so an operator assertion is required there.
+  // grammars differ whenever the gateway is non-POSIX or cannot be inferred, so
+  // an operator assertion is required in that case.
   if (
-    platform === "win32" &&
     params?.elevated === undefined &&
-    (host === "sandbox" || host === "auto")
+    (host === "sandbox" || host === "auto") &&
+    gatewayShell !== "posix"
   ) {
     return requireShellAssertion(configuredShell);
   }
@@ -104,13 +143,12 @@ export function resolveShellTokenizer(
     return requireExpectedShell("posix", configuredShell);
   }
   if (host === "gateway") {
-    return requireExpectedShell(platform === "win32" ? "powershell" : "posix", configuredShell);
+    return requireGatewayShell(configuredShell, platform, gatewayShellPath);
   }
 
-  // host=auto chooses sandbox or gateway. Both are POSIX on non-Windows. On
-  // Windows they differ (sandbox sh vs gateway PowerShell), and hook context
-  // exposes no sandbox-resolution bit, so require an assertion.
-  if (platform === "win32") {
+  // host=auto chooses sandbox or gateway. They share a grammar only when the
+  // gateway is POSIX; otherwise hook context exposes no sandbox-resolution bit.
+  if (gatewayShell !== "posix") {
     return requireShellAssertion(configuredShell);
   }
   return requireExpectedShell("posix", configuredShell);
