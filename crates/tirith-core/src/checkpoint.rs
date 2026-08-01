@@ -96,6 +96,9 @@ fn default_max_total_bytes() -> u64 {
     500 * 1024 * 1024 // 500 MiB
 }
 
+/// Checkpoint metadata is tiny; cap hostile files before allocating/parsing.
+const CHECKPOINT_META_MAX_BYTES: u64 = 1024 * 1024;
+
 impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
@@ -106,15 +109,79 @@ impl Default for CheckpointConfig {
     }
 }
 
-/// Get the checkpoints directory.
-pub fn checkpoints_dir() -> PathBuf {
-    match crate::policy::state_dir() {
-        Some(d) => d.join("checkpoints"),
-        None => {
-            eprintln!("tirith: WARNING: state dir unavailable, using /tmp/tirith (world-readable)");
-            PathBuf::from("/tmp/tirith").join("checkpoints")
+/// Resolve the per-user checkpoints directory. There is deliberately no shared
+/// `/tmp` fallback: checkpoint blobs can contain secrets, and an unowned fallback
+/// turns metadata tampering into deletion/restore authority. Callers performing
+/// I/O must use [`secure_checkpoints_dir`] so the directory is also created and
+/// ownership/permissions are validated.
+pub fn checkpoints_dir() -> Option<PathBuf> {
+    crate::policy::state_dir().map(|d| d.join("checkpoints"))
+}
+
+/// Resolve and prepare the checkpoint store as a private directory.
+///
+/// On Unix we open the directory itself with `O_NOFOLLOW|O_DIRECTORY`, verify
+/// that the open inode belongs to the effective user, and force mode 0700 via
+/// that handle. This rejects a planted final-component symlink and avoids a
+/// path-based chmod race. Other platforms still reject a final symlink (and a
+/// Windows reparse point) before use. If no per-user state directory can be
+/// resolved, operations fail closed instead of falling back to shared storage.
+fn secure_checkpoints_dir() -> Result<PathBuf, String> {
+    let base = checkpoints_dir().ok_or_else(|| {
+        "cannot resolve a private per-user state directory; refusing checkpoint storage".to_string()
+    })?;
+    fs::create_dir_all(&base).map_err(|e| format!("create checkpoint store: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&base)
+            .map_err(|e| format!("open private checkpoint store: {e}"))?;
+        let metadata = directory
+            .metadata()
+            .map_err(|e| format!("stat private checkpoint store: {e}"))?;
+        if !metadata.is_dir() {
+            return Err("checkpoint store is not a directory".to_string());
+        }
+        // SAFETY: geteuid has no preconditions and does not mutate memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            return Err("checkpoint store is not owned by the current user".to_string());
+        }
+        if metadata.mode() & 0o777 != 0o700 {
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("make checkpoint store private: {e}"))?;
+        }
+        let secured = directory
+            .metadata()
+            .map_err(|e| format!("re-stat private checkpoint store: {e}"))?;
+        if secured.uid() != effective_uid || secured.mode() & 0o777 != 0o700 {
+            return Err("checkpoint store ownership or permissions are insecure".to_string());
         }
     }
+
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(&base)
+            .map_err(|e| format!("stat private checkpoint store: {e}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("checkpoint store is not a real directory".to_string());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("checkpoint store is a reparse point".to_string());
+            }
+        }
+    }
+
+    Ok(base)
 }
 
 /// Persist a checkpoint metadata/manifest file crash-atomically: write to a temp
@@ -152,7 +219,7 @@ fn write_checkpoint_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result
 /// Create a checkpoint of the given paths.
 pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<CheckpointMeta, String> {
     require_pro()?;
-    let base_dir = checkpoints_dir();
+    let base_dir = secure_checkpoints_dir()?;
     let id = uuid::Uuid::new_v4().to_string();
     let cp_dir = base_dir.join(&id);
     let files_dir = cp_dir.join("files");
@@ -256,10 +323,7 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
 
 /// List all checkpoints, newest first.
 pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
-    let base_dir = checkpoints_dir();
-    if !base_dir.exists() {
-        return Ok(Vec::new());
-    }
+    let base_dir = secure_checkpoints_dir()?;
 
     let mut entries = Vec::new();
 
@@ -271,32 +335,34 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
                 continue;
             }
         };
-        let meta_path = entry.path().join("meta.json");
-        if !meta_path.exists() {
+        let is_real_directory = match entry.file_type() {
+            Ok(kind) => kind.is_dir() && !kind.is_symlink(),
+            Err(e) => {
+                eprintln!("tirith: checkpoint list: cannot classify store entry: {e}");
+                false
+            }
+        };
+        if !is_real_directory {
             continue;
         }
-        let meta_str = match fs::read_to_string(&meta_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "tirith: checkpoint list: cannot read {}: {e}",
-                    meta_path.display()
-                );
+
+        let directory_id = match entry.file_name().into_string() {
+            Ok(id) if validate_checkpoint_id(&id).is_ok() => id,
+            _ => {
+                eprintln!("tirith: checkpoint list: ignoring invalid checkpoint directory name");
                 continue;
             }
         };
-        let meta: CheckpointMeta = match serde_json::from_str(&meta_str) {
-            Ok(m) => m,
+        let checkpoint_dir = entry.path();
+        let meta = match load_bound_checkpoint_meta(&checkpoint_dir, &directory_id) {
+            Ok((meta, _)) => meta,
             Err(e) => {
-                eprintln!(
-                    "tirith: checkpoint list: corrupt {}: {e}",
-                    meta_path.display()
-                );
+                eprintln!("tirith: checkpoint list: {e}");
                 continue;
             }
         };
         entries.push(CheckpointListEntry {
-            id: meta.id,
+            id: directory_id,
             created_at: meta.created_at,
             trigger_command: meta.trigger_command,
             file_count: meta.file_count,
@@ -308,15 +374,40 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
     Ok(entries)
 }
 
-/// Validate that a checkpoint id is an INTERNAL, single-component basename (the
-/// UUID `create()` assigns), not an attacker-controlled path. The id comes
-/// straight from the CLI, and `checkpoints_dir().join(id)` would otherwise let an
-/// absolute or traversal-bearing id select state outside the checkpoints store
-/// (e.g. `--id ../../evil` or `--id /tmp/evil`), whose attacker-planted manifest
-/// could then restore a blob to an arbitrary absolute path. We require the id to
-/// be a single `Normal` path component with no separators, no `..`/`.`, not
-/// absolute, and non-empty. Restricting it to one component is what makes the
-/// later containment check exact: a one-component join cannot escape the base.
+/// Read one checkpoint's metadata while binding its declared id to the physical
+/// directory basename. The directory inode is captured before the no-follow,
+/// size-capped metadata read and revalidated afterward.
+fn load_bound_checkpoint_meta(
+    checkpoint_dir: &Path,
+    directory_id: &str,
+) -> Result<(CheckpointMeta, Option<(u64, u64)>), String> {
+    validate_checkpoint_id(directory_id)?;
+    if checkpoint_dir.file_name().and_then(|name| name.to_str()) != Some(directory_id) {
+        return Err("checkpoint directory basename does not match the requested id".to_string());
+    }
+    reject_symlinked_checkpoint_dir(checkpoint_dir)?;
+    let identity = capture_checkpoint_dir_identity(checkpoint_dir)?;
+    verify_checkpoint_dir_identity(checkpoint_dir, identity)?;
+    let meta_bytes = crate::util::read_text_no_follow_capped(
+        &checkpoint_dir.join("meta.json"),
+        CHECKPOINT_META_MAX_BYTES,
+    )
+    .map_err(|e| format!("cannot safely read meta.json: {e:?}"))?;
+    verify_checkpoint_dir_identity(checkpoint_dir, identity)?;
+    let meta_str = String::from_utf8(meta_bytes)
+        .map_err(|_| "checkpoint meta.json is not UTF-8".to_string())?;
+    let meta: CheckpointMeta =
+        serde_json::from_str(&meta_str).map_err(|e| format!("corrupt meta.json: {e}"))?;
+    if meta.id != directory_id {
+        return Err("metadata id does not match its checkpoint directory".to_string());
+    }
+    Ok((meta, identity))
+}
+
+/// Validate that a checkpoint id is the canonical lowercase UUID basename that
+/// [`create`] assigns, not an attacker-controlled path or display string. This
+/// both makes containment exact and gives `list`/`purge` one unambiguous identity
+/// to compare with the physical directory name.
 fn validate_checkpoint_id(id: &str) -> Result<(), String> {
     if id.is_empty() {
         return Err("checkpoint id is empty".to_string());
@@ -329,19 +420,25 @@ fn validate_checkpoint_id(id: &str) -> Result<(), String> {
             "checkpoint id must not contain a path separator: {id}"
         ));
     }
-    let p = Path::new(id);
-    if p.is_absolute() {
-        return Err(format!("checkpoint id must not be absolute: {id}"));
+    let parsed = uuid::Uuid::parse_str(id)
+        .map_err(|_| "checkpoint id must be a canonical UUID".to_string())?;
+    if parsed.hyphenated().to_string() != id {
+        return Err("checkpoint id must use canonical lowercase UUID spelling".to_string());
     }
-    let mut comps = p.components();
-    match (comps.next(), comps.next()) {
-        // Exactly one component, and it must be a plain name (not `.`, `..`,
-        // a root, or a Windows prefix like `C:`).
-        (Some(std::path::Component::Normal(_)), None) => Ok(()),
-        _ => Err(format!(
-            "checkpoint id must be a single path component (no '..', '.', or separators): {id}"
-        )),
+    Ok(())
+}
+
+/// Delete exactly the validated checkpoint directory whose on-disk metadata id
+/// matches its physical basename. No metadata-supplied path is ever joined.
+fn remove_bound_checkpoint_dir(base_dir: &Path, checkpoint_id: &str) -> Result<(), String> {
+    validate_checkpoint_id(checkpoint_id)?;
+    let checkpoint_dir = base_dir.join(checkpoint_id);
+    if checkpoint_dir.parent() != Some(base_dir) {
+        return Err("checkpoint deletion target is not directly beneath the store".to_string());
     }
+    let (_, identity) = load_bound_checkpoint_meta(&checkpoint_dir, checkpoint_id)?;
+    verify_checkpoint_dir_identity(&checkpoint_dir, identity)?;
+    fs::remove_dir_all(&checkpoint_dir).map_err(|e| format!("remove checkpoint directory: {e}"))
 }
 
 /// Validate that a restore path does not contain `..` traversal components.
@@ -642,7 +739,7 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     // an absolute or `..`-bearing id could select an attacker-controlled
     // checkpoint directory whose manifest restores a blob to an arbitrary path.
     validate_checkpoint_id(checkpoint_id)?;
-    let base_dir = checkpoints_dir();
+    let base_dir = secure_checkpoints_dir()?;
     let cp_dir = base_dir.join(checkpoint_id);
     // Defense in depth: even with a validated single-component id, assert the
     // resolved directory is contained under the checkpoints store before trusting
@@ -891,7 +988,7 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     // read a manifest OUTSIDE the store. Validate the single-component basename,
     // assert lexical containment, then reject a symlinked checkpoint dir.
     validate_checkpoint_id(checkpoint_id)?;
-    let base_dir = checkpoints_dir();
+    let base_dir = secure_checkpoints_dir()?;
     let cp_dir = base_dir.join(checkpoint_id);
     if cp_dir.parent() != Some(base_dir.as_path()) {
         return Err(format!(
@@ -1027,16 +1124,10 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
 /// Purge old checkpoints based on configuration limits.
 pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
     require_pro()?;
-    let base_dir = checkpoints_dir();
-    if !base_dir.exists() {
-        return Ok(PurgeResult {
-            removed_count: 0,
-            freed_bytes: 0,
-        });
-    }
+    let base_dir = secure_checkpoints_dir()?;
 
     let mut all = list()?;
-    let mut removed_count = 0;
+    let mut removed_count: usize = 0;
     let mut freed_bytes: u64 = 0;
 
     let now = chrono::Utc::now();
@@ -1045,11 +1136,10 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
         if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&e.created_at) {
             let age = now.signed_duration_since(created);
             if age > max_age {
-                let cp_dir = base_dir.join(&e.id);
-                match fs::remove_dir_all(&cp_dir) {
+                match remove_bound_checkpoint_dir(&base_dir, &e.id) {
                     Ok(()) => {
-                        freed_bytes += e.total_bytes;
-                        removed_count += 1;
+                        freed_bytes = freed_bytes.saturating_add(e.total_bytes);
+                        removed_count = removed_count.saturating_add(1);
                         return false;
                     }
                     Err(err) => {
@@ -1064,11 +1154,10 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
 
     while all.len() > config.max_count {
         if let Some(oldest) = all.pop() {
-            let cp_dir = base_dir.join(&oldest.id);
-            match fs::remove_dir_all(&cp_dir) {
+            match remove_bound_checkpoint_dir(&base_dir, &oldest.id) {
                 Ok(()) => {
-                    freed_bytes += oldest.total_bytes;
-                    removed_count += 1;
+                    freed_bytes = freed_bytes.saturating_add(oldest.total_bytes);
+                    removed_count = removed_count.saturating_add(1);
                 }
                 Err(e) => {
                     eprintln!(
@@ -1083,15 +1172,16 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
         }
     }
 
-    let mut total: u64 = all.iter().map(|e| e.total_bytes).sum();
+    let mut total = all
+        .iter()
+        .fold(0_u64, |sum, entry| sum.saturating_add(entry.total_bytes));
     while config.max_total_bytes > 0 && total > config.max_total_bytes && !all.is_empty() {
         if let Some(oldest) = all.pop() {
-            let cp_dir = base_dir.join(&oldest.id);
-            match fs::remove_dir_all(&cp_dir) {
+            match remove_bound_checkpoint_dir(&base_dir, &oldest.id) {
                 Ok(()) => {
-                    total -= oldest.total_bytes;
-                    freed_bytes += oldest.total_bytes;
-                    removed_count += 1;
+                    total = total.saturating_sub(oldest.total_bytes);
+                    freed_bytes = freed_bytes.saturating_add(oldest.total_bytes);
+                    removed_count = removed_count.saturating_add(1);
                 }
                 Err(e) => {
                     eprintln!(
@@ -1509,6 +1599,119 @@ mod tests {
         assert_eq!(config.max_total_bytes, 500 * 1024 * 1024);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn list_and_purge_bind_metadata_to_private_directory_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_state = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: serialized by the crate-wide test environment lock.
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let outcome = (|| -> Result<(Vec<CheckpointListEntry>, PurgeResult, bool, u32), String> {
+            let base = checkpoints_dir().ok_or("checkpoint dir unavailable")?;
+            fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o777))
+                .map_err(|e| e.to_string())?;
+
+            let directory_id = uuid::Uuid::new_v4().to_string();
+            let mismatched_id = uuid::Uuid::new_v4().to_string();
+            let checkpoint_dir = base.join(&directory_id);
+            fs::create_dir_all(&checkpoint_dir).map_err(|e| e.to_string())?;
+            let meta = CheckpointMeta {
+                id: mismatched_id,
+                created_at: "2000-01-01T00:00:00Z".to_string(),
+                trigger_command: None,
+                paths: Vec::new(),
+                total_bytes: 123,
+                file_count: 0,
+                capture_root: None,
+            };
+            fs::write(
+                checkpoint_dir.join("meta.json"),
+                serde_json::to_vec(&meta).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let listed = list()?;
+            let purged = purge(&CheckpointConfig {
+                max_count: 0,
+                max_age_days: 0,
+                max_total_bytes: 1,
+            })?;
+            let mode = fs::metadata(&base)
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            Ok((listed, purged, checkpoint_dir.exists(), mode))
+        })();
+
+        // SAFETY: restore the process environment before making assertions.
+        unsafe {
+            match previous_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        let (listed, purged, mismatch_survived, mode) = outcome.unwrap();
+        assert!(listed.is_empty(), "mismatched metadata must not be listed");
+        assert_eq!(purged.removed_count, 0);
+        assert!(
+            mismatch_survived,
+            "metadata from one id must never authorize deletion of another directory"
+        );
+        assert_eq!(mode, 0o700, "the checkpoint store must be private");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_ignores_symlinked_checkpoint_entries() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_state = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: serialized by the crate-wide test environment lock.
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let outcome = (|| -> Result<(PurgeResult, bool), String> {
+            let base = secure_checkpoints_dir()?;
+            let id = uuid::Uuid::new_v4().to_string();
+            let outside = tmp.path().join("outside");
+            fs::create_dir_all(&outside).map_err(|e| e.to_string())?;
+            fs::write(outside.join("sentinel"), "keep").map_err(|e| e.to_string())?;
+            std::os::unix::fs::symlink(&outside, base.join(id)).map_err(|e| e.to_string())?;
+
+            let result = purge(&CheckpointConfig {
+                max_count: 0,
+                max_age_days: 0,
+                max_total_bytes: 1,
+            })?;
+            Ok((result, outside.join("sentinel").exists()))
+        })();
+
+        // SAFETY: restore the process environment before making assertions.
+        unsafe {
+            match previous_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        let (purged, sentinel_survived) = outcome.unwrap();
+        assert_eq!(purged.removed_count, 0);
+        assert!(
+            sentinel_survived,
+            "purge must never follow a directory symlink"
+        );
+    }
+
     #[test]
     fn test_backup_and_sha256() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1632,11 +1835,12 @@ mod tests {
 
             let meta = create(&[name_a, name_b], Some("rm -rf project"))?;
 
-            let files_dir = checkpoints_dir().join(&meta.id).join("files");
+            let checkpoint_base = checkpoints_dir().ok_or("checkpoint dir unavailable")?;
+            let files_dir = checkpoint_base.join(&meta.id).join("files");
 
             // Look up each file's backup blob by its manifest SHA.
             let manifest_str =
-                fs::read_to_string(checkpoints_dir().join(&meta.id).join("manifest.json"))
+                fs::read_to_string(checkpoint_base.join(&meta.id).join("manifest.json"))
                     .map_err(|e| format!("read manifest: {e}"))?;
             let manifest: Vec<ManifestEntry> =
                 serde_json::from_str(&manifest_str).map_err(|e| format!("parse: {e}"))?;
@@ -1917,7 +2121,7 @@ mod tests {
         let evil_target = tmpdir.path().join("should-not-be-written");
 
         let outcome = std::panic::catch_unwind(|| {
-            let store = checkpoints_dir();
+            let store = checkpoints_dir().expect("checkpoint dir resolves");
             fs::create_dir_all(&store).expect("create store");
 
             // An attacker-controlled checkpoint OUTSIDE the store, with a manifest
@@ -1935,8 +2139,8 @@ mod tests {
 
             // Plant `cp_dir` as a SYMLINK to the evil directory. Its lexical parent
             // is still the store, so the parent-containment check alone passes.
-            let id = "symlinked-cp";
-            let cp_dir = store.join(id);
+            let id = uuid::Uuid::new_v4().to_string();
+            let cp_dir = store.join(&id);
             std::os::unix::fs::symlink(&evil, &cp_dir).expect("plant symlink cp_dir");
             assert_eq!(
                 cp_dir.parent(),
@@ -1944,7 +2148,7 @@ mod tests {
                 "the symlink's lexical parent is the store"
             );
 
-            let res = restore_reported(id);
+            let res = restore_reported(&id);
             assert!(
                 res.is_err(),
                 "a symlinked checkpoint directory must be refused: {res:?}"
@@ -2598,9 +2802,9 @@ mod tests {
         let run = || -> Result<RestoreReport, String> {
             // Hand-build a pre-F6 checkpoint: meta.json WITHOUT capture_root, a
             // manifest with a RELATIVE original_path, and a matching blob.
-            let cp_base = checkpoints_dir();
-            let id = "legacy-no-root";
-            let cp_dir = cp_base.join(id);
+            let cp_base = checkpoints_dir().ok_or("checkpoint dir unavailable")?;
+            let id = uuid::Uuid::new_v4().to_string();
+            let cp_dir = cp_base.join(&id);
             let files_dir = cp_dir.join("files");
             fs::create_dir_all(&files_dir).map_err(|e| format!("mkdir: {e}"))?;
 
@@ -2636,7 +2840,7 @@ mod tests {
 
             // Restore from a cwd where a leaked write would be observable.
             std::env::set_current_dir(&cwd_dir).map_err(|e| format!("chdir: {e}"))?;
-            restore_reported(id)
+            restore_reported(&id)
         };
 
         let result = run();
@@ -2695,13 +2899,14 @@ mod tests {
 
         // Seed an ancient checkpoint (60 days old, past the 30-day default).
         let cp_base = state_dir.join("tirith/checkpoints");
-        let old_cp = cp_base.join("old-expired");
+        let old_id = uuid::Uuid::new_v4().to_string();
+        let old_cp = cp_base.join(&old_id);
         let old_files = old_cp.join("files");
         fs::create_dir_all(&old_files).unwrap();
 
         let old_time = chrono::Utc::now() - chrono::Duration::days(60);
         let meta_json = serde_json::json!({
-            "id": "old-expired",
+            "id": old_id,
             "created_at": old_time.to_rfc3339(),
             "trigger_command": "rm -rf old",
             "paths": ["/tmp/old"],
@@ -2885,8 +3090,8 @@ mod tests {
             "a UUID basename must be accepted"
         );
         assert!(
-            validate_checkpoint_id("1234-5678").is_ok(),
-            "a plain single-component name must be accepted"
+            validate_checkpoint_id("1234-5678").is_err(),
+            "non-UUID basenames must not become purge authority"
         );
     }
 
@@ -3080,7 +3285,9 @@ mod tests {
             fs::write("a.txt", "alpha").map_err(|e| format!("write a: {e}"))?;
             fs::write("b.txt", "bravo").map_err(|e| format!("write b: {e}"))?;
             let meta = create(&["a.txt", "b.txt"], Some("rm -rf project"))?;
-            let cp_dir = checkpoints_dir().join(&meta.id);
+            let cp_dir = checkpoints_dir()
+                .ok_or("checkpoint dir unavailable")?
+                .join(&meta.id);
             Ok((meta, cp_dir))
         };
         let result = run();

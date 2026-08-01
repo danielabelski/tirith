@@ -800,7 +800,9 @@ mod tests {
 
             // Now delete the backup blob so the next restore buckets into
             // `missing`, which must flip the exit code to non-zero.
-            let cp_dir = checkpoint::checkpoints_dir().join(&meta.id);
+            let cp_dir = checkpoint::checkpoints_dir()
+                .ok_or("checkpoint dir unavailable")?
+                .join(&meta.id);
             let manifest_str = std::fs::read_to_string(cp_dir.join("manifest.json"))
                 .map_err(|e| format!("read manifest: {e}"))?;
             let manifest: Vec<ManifestEntry> =
