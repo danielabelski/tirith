@@ -896,6 +896,18 @@ impl CleanupCapability {
                 "newly-created transaction artifact did not contain the intended bytes{cleanup}"
             ));
         }
+        if generation.reparse_tag.is_some()
+            || !path_rules::attributes_are_safe(generation.attributes, false)
+            || !owner_only_security_descriptor(&generation.security_descriptor)
+        {
+            let cleanup = mark_held_file_for_deletion(&file)
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "newly-created transaction artifact did not retain its intended owner-only non-reparse security state{cleanup}"
+            ));
+        }
         Ok(Self { file, generation })
     }
 
