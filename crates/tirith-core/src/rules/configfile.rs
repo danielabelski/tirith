@@ -504,8 +504,9 @@ static SHELL_METACHAR_RE: Lazy<Regex> =
 ///
 /// `file_path` identifies known config files; `repo_root` normalizes absolute
 /// paths. `trusted_mcp_servers` (`policy.scan.trusted_mcp_servers`): a listed
-/// server name suppresses every per-server MCP finding (transport, raw IP,
-/// args, wildcard tools — but NOT duplicate-name).
+/// source/name/transport policy identity suppresses every per-server MCP finding
+/// for that exact binding (transport, raw IP, args, wildcard tools — but NOT
+/// duplicate-name).
 pub fn check(
     content: &str,
     file_path: Option<&Path>,
@@ -555,7 +556,7 @@ pub fn check(
 
     if is_mcp {
         if let Some(path) = file_path {
-            check_mcp_config(content, path, &mut findings, trusted_mcp_servers);
+            check_mcp_config(content, path, repo_root, &mut findings, trusted_mcp_servers);
         }
     }
 
@@ -1466,6 +1467,7 @@ fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Find
 fn check_mcp_config(
     content: &str,
     path: &Path,
+    repo_root: Option<&Path>,
     findings: &mut Vec<Finding>,
     trusted_servers: &[String],
 ) {
@@ -1477,6 +1479,20 @@ fn check_mcp_config(
         Err(_) => return,
     };
 
+    // Different MCP clients give these top-level roots different precedence.
+    // Choosing one would let the other become an unscanned execution surface,
+    // including when no lockfile exists yet. This structural finding is never
+    // suppressible by server trust.
+    if json.get("mcpServers").is_some() && json.get("servers").is_some() {
+        push_mcp_structural_finding(
+            findings,
+            "Ambiguous MCP server maps",
+            "The configuration declares both mcpServers and servers; Tirith cannot prove which server set the consuming client executes.",
+            "both top-level MCP server maps are present",
+        );
+        return;
+    }
+
     let servers = json
         .get("mcpServers")
         .or_else(|| json.get("servers"))
@@ -1487,11 +1503,47 @@ fn check_mcp_config(
         None => return,
     };
 
+    // Trust is bound to the exact source/name/transport identity produced by
+    // the lock parser. If the path cannot be made repo-relative, or the config
+    // is ambiguous/unsafe and therefore fails strict parsing, no trust entry can
+    // suppress its findings.
+    let parsed_identities = crate::mcp_lock::source_config_identity_path(path, repo_root)
+        .and_then(|source| crate::mcp_lock::parse_mcp_config(content, &source))
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.name.clone(), entry.policy_identity()))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
     for (name, config) in servers {
-        // A trusted MCP server name silences all per-server config findings
-        // (deliberate operator decision). Drift detection (`mcp_server_drift`) is
-        // separate in `mcpdrift.rs`; this only short-circuits the configfile rules.
-        if is_trusted_mcp_server(name, trusted_servers) {
+        let Some(config_object) = config.as_object() else {
+            push_mcp_structural_finding(
+                findings,
+                "Invalid MCP server declaration",
+                "An MCP server entry is not an object, so Tirith cannot inspect its transport or capability surface.",
+                "non-object MCP server entry",
+            );
+            continue;
+        };
+        if config_object.contains_key("url") && config_object.contains_key("command") {
+            push_mcp_structural_finding(
+                findings,
+                "Ambiguous MCP server transport",
+                "An MCP server declares both URL and subprocess transports; Tirith cannot prove which transport the consuming client executes.",
+                "both URL and subprocess transports are present",
+            );
+            continue;
+        }
+
+        // Only the exact source-qualified, transport-bound identity can silence
+        // per-server config findings. A same-named server in another supported
+        // config cannot inherit this decision.
+        if parsed_identities
+            .get(name)
+            .is_some_and(|identity| is_trusted_mcp_server(identity, trusted_servers))
+        {
             continue;
         }
 
@@ -1509,10 +1561,34 @@ fn check_mcp_config(
     }
 }
 
-/// `true` when `name` is in `trusted_mcp_servers`. Exact case-sensitive match —
-/// MCP server names are identifiers, not URLs, so no case folding.
-fn is_trusted_mcp_server(name: &str, trusted: &[String]) -> bool {
-    trusted.iter().any(|t| t == name)
+fn push_mcp_structural_finding(
+    findings: &mut Vec<Finding>,
+    title: &str,
+    description: &str,
+    detail: &str,
+) {
+    findings.push(Finding {
+        rule_id: RuleId::ConfigMalformed,
+        severity: Severity::High,
+        title: title.to_string(),
+        description: description.to_string(),
+        evidence: vec![Evidence::Text {
+            detail: detail.to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    });
+}
+
+/// Exact case-sensitive match on a versioned policy identity. Legacy bare names
+/// intentionally match nothing: they are attacker-controlled and cannot bind a
+/// source or transport.
+fn is_trusted_mcp_server(identity: &str, trusted: &[String]) -> bool {
+    trusted
+        .iter()
+        .any(|trusted_identity| trusted_identity == identity)
 }
 
 /// Detect duplicate server names by raw JSON token scanning (serde_json silently
@@ -1764,6 +1840,17 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
 mod tests {
     use super::*;
 
+    fn exact_mcp_identity(content: &str, path: &Path, name: &str) -> String {
+        let source = crate::mcp_lock::source_config_identity_path(path, None)
+            .expect("fixture path has a stable source identity");
+        crate::mcp_lock::parse_mcp_config(content, &source)
+            .expect("fixture is strict MCP JSON")
+            .into_iter()
+            .find(|server| server.name == name)
+            .expect("fixture server exists")
+            .policy_identity()
+    }
+
     #[test]
     fn test_known_config_detection() {
         assert!(is_known_config_file(Path::new(".cursorrules")));
@@ -1916,6 +2003,37 @@ mod tests {
         assert!(is_mcp_config_file(Path::new(".mcp.json")));
         assert!(is_mcp_config_file(Path::new(".vscode/mcp.json")));
         assert!(!is_mcp_config_file(Path::new("package.json")));
+    }
+
+    #[test]
+    fn test_mcp_dual_roots_and_transport_ambiguity_are_non_suppressible() {
+        let path = Path::new("mcp.json");
+        let trusted = vec!["mcp:v1:attacker-controlled-placeholder".to_string()];
+
+        let dual_roots = r#"{
+            "mcpServers": {},
+            "servers": {"evil": {"command": "node", "args": ["evil.js"]}}
+        }"#;
+        let findings = check(dual_roots, Some(path), None, false, &trusted);
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::ConfigMalformed
+                && finding.severity == Severity::High
+                && finding.title.contains("server maps")
+        }));
+
+        let dual_transport = r#"{
+            "mcpServers": {"evil": {
+                "url": "https://benign.example/mcp",
+                "command": "node",
+                "args": ["evil.js"]
+            }}
+        }"#;
+        let findings = check(dual_transport, Some(path), None, false, &trusted);
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::ConfigMalformed
+                && finding.severity == Severity::High
+                && finding.title.contains("transport")
+        }));
     }
 
     #[test]
@@ -2644,14 +2762,15 @@ mod tests {
         );
     }
 
-    // Chunk 3 — policy-aware MCP suppression: a trusted_mcp_servers name silences
-    // per-server MCP config findings (but not duplicate-name).
+    // Chunk 3 — policy-aware MCP suppression: an exact trusted_mcp_servers
+    // identity silences per-server MCP config findings (but not duplicate-name).
 
     #[test]
     fn test_trusted_mcp_server_suppresses_insecure_url_finding() {
         let content = r#"{"mcpServers":{"evil":{"url":"http://evil.com/mcp"}}}"#;
-        let trusted = vec!["evil".to_string()];
-        let findings = check(content, Some(Path::new("mcp.json")), None, false, &trusted);
+        let path = Path::new("mcp.json");
+        let trusted = vec![exact_mcp_identity(content, path, "evil")];
+        let findings = check(content, Some(path), None, false, &trusted);
         assert!(
             !findings
                 .iter()
@@ -2663,8 +2782,9 @@ mod tests {
     #[test]
     fn test_trusted_mcp_server_suppresses_raw_ip_finding() {
         let content = r#"{"mcpServers":{"local":{"url":"https://192.168.1.1:8080/mcp"}}}"#;
-        let trusted = vec!["local".to_string()];
-        let findings = check(content, Some(Path::new("mcp.json")), None, false, &trusted);
+        let path = Path::new("mcp.json");
+        let trusted = vec![exact_mcp_identity(content, path, "local")];
+        let findings = check(content, Some(path), None, false, &trusted);
         assert!(
             !findings
                 .iter()
@@ -2676,8 +2796,9 @@ mod tests {
     #[test]
     fn test_trusted_mcp_server_suppresses_suspicious_args_finding() {
         let content = r#"{"mcpServers":{"x":{"command":"node","args":["server.js; rm -rf /"]}}}"#;
-        let trusted = vec!["x".to_string()];
-        let findings = check(content, Some(Path::new("mcp.json")), None, false, &trusted);
+        let path = Path::new("mcp.json");
+        let trusted = vec![exact_mcp_identity(content, path, "x")];
+        let findings = check(content, Some(path), None, false, &trusted);
         assert!(
             !findings
                 .iter()
@@ -2689,8 +2810,9 @@ mod tests {
     #[test]
     fn test_trusted_mcp_server_suppresses_wildcard_tools_finding() {
         let content = r#"{"mcpServers":{"x":{"command":"npx","tools":["*"]}}}"#;
-        let trusted = vec!["x".to_string()];
-        let findings = check(content, Some(Path::new("mcp.json")), None, false, &trusted);
+        let path = Path::new("mcp.json");
+        let trusted = vec![exact_mcp_identity(content, path, "x")];
+        let findings = check(content, Some(path), None, false, &trusted);
         assert!(
             !findings
                 .iter()
@@ -2723,8 +2845,9 @@ mod tests {
             "trusted-server":{"url":"http://trusted.example.com/mcp"},
             "evil":{"url":"http://evil.example.com/mcp"}
         }}"#;
-        let trusted = vec!["trusted-server".to_string()];
-        let findings = check(content, Some(Path::new("mcp.json")), None, false, &trusted);
+        let path = Path::new("mcp.json");
+        let trusted = vec![exact_mcp_identity(content, path, "trusted-server")];
+        let findings = check(content, Some(path), None, false, &trusted);
         // Exactly one McpInsecureServer finding — for "evil".
         let insecure: Vec<&Finding> = findings
             .iter()
@@ -2746,18 +2869,47 @@ mod tests {
     }
 
     #[test]
-    fn test_trust_case_sensitive() {
-        // Trust matches are case-sensitive — MCP server names are
-        // identifiers, not URLs/domains. A mismatched case does NOT trust.
+    fn test_legacy_bare_name_never_matches_an_exact_mcp_identity() {
         let content = r#"{"mcpServers":{"Evil":{"url":"http://evil.com/mcp"}}}"#;
-        let trusted = vec!["evil".to_string()];
+        let trusted = vec!["Evil".to_string()];
         let findings = check(content, Some(Path::new("mcp.json")), None, false, &trusted);
         assert!(
             findings
                 .iter()
                 .any(|f| f.rule_id == RuleId::McpInsecureServer),
-            "trust matching must be case-sensitive: {findings:?}",
+            "an attacker-controlled bare name must not suppress exact-identity findings: {findings:?}",
         );
+    }
+
+    #[test]
+    fn test_trust_does_not_cross_source_or_transport_identity() {
+        let reviewed = r#"{"mcpServers":{"same":{"url":"http://reviewed.example/mcp"}}}"#;
+        let reviewed_path = Path::new("mcp.json");
+        let trusted = vec![exact_mcp_identity(reviewed, reviewed_path, "same")];
+
+        let other_source = r#"{"servers":{"same":{"url":"http://reviewed.example/mcp"}}}"#;
+        let findings = check(
+            other_source,
+            Some(Path::new(".vscode/mcp.json")),
+            None,
+            false,
+            &trusted,
+        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::McpInsecureServer));
+
+        let changed_transport = r#"{"mcpServers":{"same":{"url":"http://changed.example/mcp"}}}"#;
+        let findings = check(
+            changed_transport,
+            Some(reviewed_path),
+            None,
+            false,
+            &trusted,
+        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::McpInsecureServer));
     }
 
     // M8 ch5 — devcontainer.json scanning.

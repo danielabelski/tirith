@@ -5585,6 +5585,18 @@ field-tested.")]
         /// containment even without the flag.
         #[arg(long)]
         capsule: bool,
+
+        /// Exact `mcp:v1:...` identity from `tirith mcp policy init` for the
+        /// configured upstream. Required when approving descriptors and when a
+        /// multi-server lock cannot be inferred safely.
+        #[arg(long)]
+        mcp_server_identity: Option<String>,
+
+        /// Capture the first inspected/sanitized live tools/list response as the
+        /// approved descriptor baseline for --mcp-server-identity, then write the
+        /// lock atomically. The live command/args must exactly match that server.
+        #[arg(long, requires = "mcp_server_identity")]
+        approve_descriptors: bool,
     },
     /// Validate gateway config file
     #[command(after_help = "\
@@ -6263,6 +6275,11 @@ Examples:
   tirith mcp lock
   tirith mcp lock --format json")]
     Lock {
+        /// Record malformed/rejected config coverage explicitly. This is an
+        /// audited escape hatch, not trust: verify remains nonzero while any
+        /// coverage gap exists.
+        #[arg(long)]
+        allow_incomplete_configs: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -7201,9 +7218,13 @@ fn run() {
         } => cli::mcp_server::run(sanitize_tool_output),
 
         Commands::Mcp { action } => match action {
-            McpAction::Lock { format, json } => {
+            McpAction::Lock {
+                allow_incomplete_configs,
+                format,
+                json,
+            } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::mcp::lock(json)
+                cli::mcp::lock(json, allow_incomplete_configs)
             }
             McpAction::Verify { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -7294,6 +7315,8 @@ fn run() {
                 config,
                 filter_output,
                 capsule,
+                mcp_server_identity,
+                approve_descriptors,
             } => cli::gateway::run_gateway_with_options(
                 &upstream_bin,
                 &upstream_arg,
@@ -7301,6 +7324,8 @@ fn run() {
                 cli::gateway::GatewayOptions {
                     filter_output,
                     capsule,
+                    mcp_server_identity,
+                    approve_descriptors,
                 },
             ),
             GatewayAction::ValidateConfig { config } => cli::gateway::validate_config(&config),

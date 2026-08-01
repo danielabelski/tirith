@@ -92,14 +92,14 @@ fn looks_like_repo_root(repo_root: &Path) -> bool {
 /// be derived, yields no findings. `content` is the read body (non-UTF8/non-JSON → no
 /// findings).
 ///
-/// `trusted_mcp_servers` (`policy.scan.trusted_mcp_servers`): drift entries whose server
-/// name is trusted are filtered out before a finding is built; only untrusted drift surfaces.
+/// `trusted_mcp_servers` (`policy.scan.trusted_mcp_servers`): drift entries whose exact
+/// source/name/transport identity is trusted are filtered before a finding is built.
 ///
 /// `mcp_allowed_tools` (`policy.scan.mcp_allowed_tools`): per-server tool allow-list with
-/// two effects — (a) lockfile-side: a recorded tool outside the allowed set fires a High
-/// `McpServerDrift` finding; (b) drift-side: an Added/Changed drift introducing a
-/// disallowed tool upgrades the drift finding Medium→High (`Changed` inspects `tools_added`,
-/// `Added` inspects the new server's declared `tools`).
+/// effects — (a) lockfile-side: an explicit entry requires approved live descriptor
+/// coverage and checks the union of declared + descriptor names; (b) drift-side: an
+/// Added/Changed identity introducing an unknown/disallowed live surface upgrades the
+/// drift finding Medium→High.
 pub fn check(
     content: &str,
     file_path: Option<&Path>,
@@ -132,16 +132,35 @@ pub fn check(
     // `build_inventory` is total (a malformed config contributes no entries).
     let current = mcp_lock::build_inventory(repo_root);
 
+    // Coverage is part of the security baseline, not informational metadata.
+    // A current refusal/malformed config always fails, even when an operator
+    // explicitly recorded it, and any change from the recorded coverage also
+    // fails. Otherwise an attacker can replace an accepted config with a
+    // symlink/oversized/ambiguous decoy while leaving the accepted-server hash
+    // unchanged.
+    let coverage_finding = finding_for_incomplete_coverage(&current, &lockfile);
+
     let drifts = mcp_lock::compute_drift(&current, &lockfile);
 
-    // Drop drift on trusted servers (operator accepted that surface). All-trusted → no finding.
-    let drifts_after_trust = drift_filter_trusted(drifts, trusted_mcp_servers);
+    // Evaluate the orthogonal tool allow-list on the UNFILTERED drift. Trust may
+    // suppress ordinary identity drift, but it must never suppress a forbidden
+    // capability introduced by that same trusted identity.
+    let drifts_after_trust = drift_filter_trusted(
+        drifts,
+        trusted_mcp_servers,
+        mcp_allowed_tools,
+        &current,
+        &lockfile,
+    );
 
-    let mut findings: Vec<Finding> = Vec::new();
+    let mut findings: Vec<Finding> = coverage_finding.into_iter().collect();
 
-    // Lockfile-side: a recorded tool outside `mcp_allowed_tools` is its own violation (a tool
-    // "snuck past `tirith mcp lock`"). Trust does NOT apply here — it suppresses drift only,
-    // not the explicit per-tool allow-list (PR #121 item 8); the param is passed but unused.
+    // Lockfile-side: an explicit tool policy requires an operator-approved live
+    // descriptor set, and every name in the union of static declarations and
+    // approved descriptors must be allowed. Trust is orthogonal to both checks.
+    if let Some(finding) = finding_for_missing_descriptor_coverage(&lockfile, mcp_allowed_tools) {
+        findings.push(finding);
+    }
     if let Some(finding) =
         finding_for_disallowed_lockfile_tools(&lockfile, mcp_allowed_tools, trusted_mcp_servers)
     {
@@ -175,11 +194,12 @@ pub fn check(
             .collect();
         if !per_server_drifts.is_empty() {
             // Severity ladder: Medium default, High if any newly-added tool is disallowed.
-            let severity = if any_added_tool_out_of_allowed(&per_server_drifts, mcp_allowed_tools) {
-                Severity::High
-            } else {
-                Severity::Medium
-            };
+            let severity =
+                if any_added_tool_out_of_allowed(&per_server_drifts, mcp_allowed_tools, &current) {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                };
             findings.push(finding_for_drift(&per_server_drifts, severity));
         }
     }
@@ -187,24 +207,129 @@ pub fn check(
     findings
 }
 
-/// Drop drift entries whose server name is in `trusted` — operator-trusted
-/// servers do not raise drift findings.
+fn finding_for_incomplete_coverage(
+    current: &mcp_lock::McpInventory,
+    lockfile: &mcp_lock::McpLockfile,
+) -> Option<Finding> {
+    let current_incomplete =
+        !current.malformed_configs.is_empty() || !current.rejected_configs.is_empty();
+    let coverage_changed = current.malformed_configs != lockfile.malformed_configs
+        || current.rejected_configs != lockfile.rejected_configs;
+    if !current_incomplete && !coverage_changed {
+        return None;
+    }
+
+    let mut lines = vec![format!(
+        "baseline coverage: {} malformed, {} rejected; current coverage: {} malformed, {} rejected",
+        lockfile.malformed_configs.len(),
+        lockfile.rejected_configs.len(),
+        current.malformed_configs.len(),
+        current.rejected_configs.len(),
+    )];
+    for path in current.malformed_configs.iter().take(3) {
+        lines.push(format!("  - malformed: {path:?}"));
+    }
+    for rejected in current.rejected_configs.iter().take(3) {
+        lines.push(format!(
+            "  - rejected: {:?} ({})",
+            rejected.path,
+            rejected_reason_label(&rejected.reason),
+        ));
+    }
+
+    Some(Finding {
+        rule_id: RuleId::McpServerDrift,
+        severity: Severity::High,
+        title: "MCP inventory coverage is incomplete or changed".to_string(),
+        description: "One or more supported MCP configuration paths could not be safely \
+            inventoried, or the structured coverage metadata differs from the committed \
+            baseline. Tirith refuses to treat the accepted-server subset as complete because \
+            an ordinary MCP client may still consume a symlinked, oversized, malformed, \
+            ambiguous, or secret-bearing declaration. Fix every coverage gap before \
+            refreshing the lockfile."
+            .to_string(),
+        evidence: vec![Evidence::Text {
+            detail: lines.join("\n"),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    })
+}
+
+fn rejected_reason_label(reason: &mcp_lock::RejectedReason) -> &'static str {
+    match reason {
+        mcp_lock::RejectedReason::Symlink => "symlink",
+        mcp_lock::RejectedReason::NotRegularFile => "not_regular_file",
+        mcp_lock::RejectedReason::OutsideRepo => "outside_repo",
+        mcp_lock::RejectedReason::Oversize { .. } => "oversize",
+        mcp_lock::RejectedReason::Unreadable { .. } => "unreadable",
+        mcp_lock::RejectedReason::AmbiguousServerObjects => "ambiguous_server_objects",
+        mcp_lock::RejectedReason::AmbiguousTransport => "ambiguous_transport",
+        mcp_lock::RejectedReason::SecretBearingArgument => "secret_bearing_argument",
+        mcp_lock::RejectedReason::SecretBearingUrl => "secret_bearing_url",
+        mcp_lock::RejectedReason::InvalidServerEntry => "invalid_server_entry",
+        mcp_lock::RejectedReason::DuplicateJsonKey => "duplicate_json_key",
+        mcp_lock::RejectedReason::InvalidServerField => "invalid_server_field",
+        mcp_lock::RejectedReason::UnsupportedServerField => "unsupported_server_field",
+    }
+}
+
+/// Drop drift entries whose exact policy identity is in `trusted`.
 fn drift_filter_trusted(
     drifts: Vec<mcp_lock::McpDrift>,
     trusted: &[String],
+    mcp_allowed_tools: &HashMap<String, Vec<String>>,
+    current: &mcp_lock::McpInventory,
+    lockfile: &mcp_lock::McpLockfile,
 ) -> Vec<mcp_lock::McpDrift> {
     if trusted.is_empty() {
         return drifts;
     }
     drifts
         .into_iter()
-        .filter(|d| match d.name() {
-            // Per-server drift: drop if the server name is trusted.
-            Some(n) => !trusted.iter().any(|t| t == n),
-            // Schema-wide signals have no per-server identity — can't be trusted away.
-            None => true,
+        .filter(|drift| {
+            if drift_violates_allowed_tools(drift, mcp_allowed_tools, current) {
+                return true;
+            }
+            let identity = identity_for_drift(drift, current, lockfile);
+            !identity.is_some_and(|identity| trusted.iter().any(|trusted| trusted == &identity))
         })
         .collect()
+}
+
+fn identity_for_drift(
+    drift: &mcp_lock::McpDrift,
+    current: &mcp_lock::McpInventory,
+    lockfile: &mcp_lock::McpLockfile,
+) -> Option<String> {
+    let (name, source_config, use_current) = match drift {
+        mcp_lock::McpDrift::Removed {
+            name,
+            source_config,
+        } => (name, source_config, false),
+        mcp_lock::McpDrift::Added {
+            name,
+            source_config,
+            ..
+        } => (name, source_config, true),
+        mcp_lock::McpDrift::Changed(entry) => (&entry.name, &entry.source_config, true),
+        mcp_lock::McpDrift::SchemaUpgradeRequired { .. } => return None,
+    };
+    if use_current {
+        current
+            .servers
+            .iter()
+            .find(|server| server.name == *name && server.source_config == *source_config)
+            .map(mcp_lock::McpServerEntry::policy_identity)
+    } else {
+        lockfile
+            .servers
+            .iter()
+            .find(|server| server.name == *name && server.source_config == *source_config)
+            .map(mcp_lock::McpLockServer::policy_identity)
+    }
 }
 
 /// `true` when a drift introduces a tool NOT in `mcp_allowed_tools` for that server. Two
@@ -215,42 +340,60 @@ fn drift_filter_trusted(
 fn any_added_tool_out_of_allowed(
     drifts: &[mcp_lock::McpDrift],
     mcp_allowed_tools: &HashMap<String, Vec<String>>,
+    current: &mcp_lock::McpInventory,
 ) -> bool {
     if mcp_allowed_tools.is_empty() {
         return false;
     }
-    for d in drifts {
-        match d {
-            mcp_lock::McpDrift::Changed(entry) => {
-                let Some(allowed) = mcp_allowed_tools.get(&entry.name) else {
-                    continue;
-                };
-                for tool in &entry.tools_added {
-                    if !allowed.iter().any(|a| a == tool) {
-                        return true;
-                    }
-                }
-            }
-            mcp_lock::McpDrift::Added { name, tools, .. } => {
-                // New server: every declared tool is effectively added; same test as `Changed`.
-                let Some(allowed) = mcp_allowed_tools.get(name) else {
-                    continue;
-                };
-                for tool in tools {
-                    if !allowed.iter().any(|a| a == tool) {
-                        return true;
-                    }
-                }
-            }
-            mcp_lock::McpDrift::Removed { .. } => {
-                // The ladder is about NEW exposure, never lost exposure.
-            }
-            mcp_lock::McpDrift::SchemaUpgradeRequired { .. } => {
-                // No per-server payload — the ladder doesn't apply.
-            }
+    drifts
+        .iter()
+        .any(|drift| drift_violates_allowed_tools(drift, mcp_allowed_tools, current))
+}
+
+/// Evaluate one drift against the explicit capability policy before any trust
+/// suppression. A trusted principal is still constrained by its allow-list.
+fn drift_violates_allowed_tools(
+    drift: &mcp_lock::McpDrift,
+    mcp_allowed_tools: &HashMap<String, Vec<String>>,
+    current: &mcp_lock::McpInventory,
+) -> bool {
+    let current_server = |name: &str, source_config: &str| {
+        current
+            .servers
+            .iter()
+            .find(|server| server.name == name && server.source_config == source_config)
+    };
+    match drift {
+        mcp_lock::McpDrift::Changed(entry) => {
+            let Some(server) = current_server(&entry.name, &entry.source_config) else {
+                return false;
+            };
+            let identity = server.policy_identity();
+            let Some(allowed) = mcp_allowed_tools.get(&identity) else {
+                return false;
+            };
+            entry
+                .tools_added
+                .iter()
+                .any(|tool| !allowed.iter().any(|candidate| candidate == tool))
+        }
+        mcp_lock::McpDrift::Added {
+            name,
+            source_config,
+            ..
+        } => {
+            let Some(server) = current_server(name, source_config) else {
+                return false;
+            };
+            // A newly-added server has no approved live descriptor baseline in
+            // the committed lock. Any explicit allow-list therefore requires a
+            // fail-closed High signal until the live set is approved.
+            mcp_allowed_tools.contains_key(&server.policy_identity())
+        }
+        mcp_lock::McpDrift::Removed { .. } | mcp_lock::McpDrift::SchemaUpgradeRequired { .. } => {
+            false
         }
     }
-    false
 }
 
 /// Build a High finding for lockfile-recorded tools outside `mcp_allowed_tools` (`None`
@@ -275,12 +418,19 @@ fn finding_for_disallowed_lockfile_tools(
     // is enforced regardless of trust (PR #121 item 8); a server with no entry is skipped.
     let mut offenders: Vec<(String, Vec<String>)> = Vec::new();
     for server in &lockfile.servers {
-        let Some(allowed) = mcp_allowed_tools.get(&server.name) else {
+        let identity = server.policy_identity();
+        let Some(allowed) = mcp_allowed_tools.get(&identity) else {
             continue;
         };
-        let disallowed: Vec<String> = server
+        let mut exposed: Vec<&String> = server
             .tools
             .iter()
+            .chain(server.descriptors.iter().map(|descriptor| &descriptor.name))
+            .collect();
+        exposed.sort();
+        exposed.dedup();
+        let disallowed: Vec<String> = exposed
+            .into_iter()
             .filter(|t| !allowed.iter().any(|a| a == *t))
             .cloned()
             .collect();
@@ -340,6 +490,54 @@ fn finding_for_disallowed_lockfile_tools(
     })
 }
 
+/// An explicit tool allow-list governs what the live server may expose, not
+/// merely what a config file happens to declare. Without a completed descriptor
+/// approval there is no evidence for that live surface, so fail closed with a
+/// separate High finding. `descriptors_approved` distinguishes an intentionally
+/// approved empty set from the config-only default.
+fn finding_for_missing_descriptor_coverage(
+    lockfile: &mcp_lock::McpLockfile,
+    mcp_allowed_tools: &HashMap<String, Vec<String>>,
+) -> Option<Finding> {
+    let mut missing = Vec::new();
+    for server in &lockfile.servers {
+        if mcp_allowed_tools.contains_key(&server.policy_identity()) && !server.descriptors_approved
+        {
+            missing.push(server.name.clone());
+        }
+    }
+    if missing.is_empty() {
+        return None;
+    }
+
+    let listed = missing
+        .iter()
+        .take(5)
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(Finding {
+        rule_id: RuleId::McpServerDrift,
+        severity: Severity::High,
+        title: "MCP tool allow-list lacks an approved live descriptor baseline".to_string(),
+        description: format!(
+            "`scan.mcp_allowed_tools` constrains {} exact MCP server identity(ies), but their \
+             lock entries do not carry an operator-approved live `tools/list` descriptor set. \
+             Static config declarations cannot prove the tools a server actually exposes. Run \
+             the explicit gateway descriptor-approval flow for each identity before treating \
+             the allow-list as enforced.",
+            missing.len()
+        ),
+        evidence: vec![Evidence::Text {
+            detail: format!("MCP identities missing approved live descriptors: {listed}"),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    })
+}
+
 /// Build the single drift finding, aggregated by kind ("N added, M removed, K changed")
 /// with a few server names for orientation (full detail is `tirith mcp verify`'s domain).
 /// `severity` is Medium by default; the caller passes High via the `mcp_allowed_tools` ladder.
@@ -348,11 +546,26 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
     let mut removed = 0usize;
     let mut changed = 0usize;
     let mut names: Vec<String> = Vec::new();
+    let mut added_tools: Vec<(String, String)> = Vec::new();
     for d in drifts {
         match d {
-            mcp_lock::McpDrift::Added { .. } => added += 1,
+            mcp_lock::McpDrift::Added { name, tools, .. } => {
+                added += 1;
+                for tool in tools {
+                    if added_tools.len() < 5 {
+                        added_tools.push((name.clone(), tool.clone()));
+                    }
+                }
+            }
             mcp_lock::McpDrift::Removed { .. } => removed += 1,
-            mcp_lock::McpDrift::Changed(_) => changed += 1,
+            mcp_lock::McpDrift::Changed(entry) => {
+                changed += 1;
+                for tool in &entry.tools_added {
+                    if added_tools.len() < 5 {
+                        added_tools.push((entry.name.clone(), tool.clone()));
+                    }
+                }
+            }
             mcp_lock::McpDrift::SchemaUpgradeRequired { .. } => {
                 // Routed to `finding_for_schema_upgrade_required`; skip defensively here.
                 continue;
@@ -377,6 +590,13 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
             format!(" servers: {}", listed.join(", "))
         };
         detail.push_str(&suffix);
+    }
+    if !added_tools.is_empty() {
+        let listed: Vec<String> = added_tools
+            .iter()
+            .map(|(server, tool)| format!("{server:?} -> {tool:?}"))
+            .collect();
+        detail.push_str(&format!(" newly exposed tools: {}", listed.join(", ")));
     }
 
     Finding {
@@ -534,11 +754,31 @@ mod tests {
     fn write_lockfile_for(repo: &Path, inv: &McpInventory) {
         let lockdir = repo.join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
-        fs::write(
-            lockdir.join("mcp.lock"),
-            McpLockfile::from_inventory(inv).render(),
-        )
-        .unwrap();
+        let mut lock = McpLockfile::from_inventory(inv);
+        // Most rule tests exercise drift/tool-policy semantics rather than the
+        // separate missing-approval branch. Give each fixture an explicit live
+        // descriptor approval mirroring its declared tools; dedicated tests
+        // below cover config-only and approved-empty baselines.
+        for server in &mut lock.servers {
+            server.descriptors = server
+                .tools
+                .iter()
+                .map(|name| {
+                    mcp_lock::ToolDescriptor::from_tool_entry(&serde_json::json!({"name": name}))
+                })
+                .collect();
+            server.descriptor_hash = mcp_lock::compute_descriptor_hash(&server.descriptors);
+            server.descriptors_approved = true;
+        }
+        fs::write(lockdir.join("mcp.lock"), lock.render()).unwrap();
+    }
+
+    fn server_identity(inv: &McpInventory, name: &str) -> String {
+        inv.servers
+            .iter()
+            .find(|server| server.name == name)
+            .unwrap_or_else(|| panic!("fixture server {name:?} is missing"))
+            .policy_identity()
     }
 
     fn write_config(repo: &Path, name: &str, body: &str) {
@@ -878,6 +1118,7 @@ mod tests {
             r#"{ "mcpServers": { "trusted": { "command": "node" } } }"#,
         );
         let old_inv = mcp_lock::build_inventory(repo.path());
+        let trusted_identity = server_identity(&old_inv, "trusted");
         write_lockfile_for(repo.path(), &old_inv);
 
         // Drop the trusted server — drift would fire, but trust suppresses it.
@@ -885,7 +1126,7 @@ mod tests {
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
-        let trusted = vec!["trusted".to_string()];
+        let trusted = vec![trusted_identity];
         let findings = check(&content, Some(&lock_path), &trusted, &HashMap::new());
         assert!(
             findings.is_empty(),
@@ -906,21 +1147,24 @@ mod tests {
             } }"#,
         );
         let old_inv = mcp_lock::build_inventory(repo.path());
+        let trusted_identity = server_identity(&old_inv, "trusted");
         write_lockfile_for(repo.path(), &old_inv);
 
-        // Both rotate command (both drift).
+        // Trusted server changes only its declared tools (identity excludes the
+        // governed tool surface); untrusted rotates transport. Only the exact
+        // trusted identity's drift is suppressed.
         write_config(
             repo.path(),
             ".mcp.json",
             r#"{ "mcpServers": {
-                "trusted": { "command": "deno" },
+                "trusted": { "command": "node", "tools": ["added"] },
                 "untrusted": { "command": "deno" }
             } }"#,
         );
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
-        let trusted = vec!["trusted".to_string()];
+        let trusted = vec![trusted_identity];
         let findings = check(&content, Some(&lock_path), &trusted, &HashMap::new());
         assert_eq!(
             findings.len(),
@@ -974,11 +1218,12 @@ mod tests {
                 "tools": ["read", "evil_tool"] } } }"#,
         );
         let inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&inv, "s");
         write_lockfile_for(repo.path(), &inv);
 
         // Policy: server "s" is allowed only "read".
         let mut allowed = HashMap::new();
-        allowed.insert("s".to_string(), vec!["read".to_string()]);
+        allowed.insert(identity, vec!["read".to_string()]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1010,13 +1255,11 @@ mod tests {
                 "tools": ["read", "write"] } } }"#,
         );
         let inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&inv, "s");
         write_lockfile_for(repo.path(), &inv);
 
         let mut allowed = HashMap::new();
-        allowed.insert(
-            "s".to_string(),
-            vec!["read".to_string(), "write".to_string()],
-        );
+        allowed.insert(identity, vec!["read".to_string(), "write".to_string()]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1024,6 +1267,89 @@ mod tests {
         assert!(
             findings.is_empty(),
             "every tool in policy's allowed set → no finding: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn explicit_allowlist_fails_when_live_descriptors_were_never_approved() {
+        let repo = tempdir().unwrap();
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "s": { "command": "node", "tools": ["read"] } } }"#,
+        );
+        let inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&inv, "s");
+        let lockdir = repo.path().join(".tirith");
+        fs::create_dir_all(&lockdir).unwrap();
+        fs::write(
+            lockdir.join("mcp.lock"),
+            McpLockfile::from_inventory(&inv).render(),
+        )
+        .unwrap();
+
+        let mut allowed = HashMap::new();
+        allowed.insert(identity, vec!["read".to_string()]);
+        let lock_path = lockdir.join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+        assert!(findings.iter().any(|finding| {
+            finding.severity == Severity::High && finding.title.contains("approved live descriptor")
+        }));
+    }
+
+    #[test]
+    fn allowlist_checks_approved_live_descriptor_names_not_only_static_tools() {
+        let repo = tempdir().unwrap();
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+        );
+        let inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&inv, "s");
+        let mut lock = McpLockfile::from_inventory(&inv);
+        lock.servers[0].descriptors = vec![mcp_lock::ToolDescriptor::from_tool_entry(
+            &serde_json::json!({"name": "live_exec"}),
+        )];
+        lock.servers[0].descriptor_hash =
+            mcp_lock::compute_descriptor_hash(&lock.servers[0].descriptors);
+        lock.servers[0].descriptors_approved = true;
+        let lockdir = repo.path().join(".tirith");
+        fs::create_dir_all(&lockdir).unwrap();
+        let lock_path = lockdir.join("mcp.lock");
+        fs::write(&lock_path, lock.render()).unwrap();
+
+        let mut allowed = HashMap::new();
+        allowed.insert(identity, Vec::new());
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+        let serialized = serde_json::to_string(&findings).unwrap();
+        assert!(serialized.contains("live_exec"), "{serialized}");
+        assert!(findings
+            .iter()
+            .any(|finding| finding.severity == Severity::High));
+    }
+
+    #[test]
+    fn approved_live_empty_set_satisfies_an_explicit_empty_allowlist() {
+        let repo = tempdir().unwrap();
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
+        );
+        let inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&inv, "s");
+        write_lockfile_for(repo.path(), &inv);
+        let mut allowed = HashMap::new();
+        allowed.insert(identity, Vec::new());
+        let lock_path = repo.path().join(".tirith/mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+        assert!(
+            findings.is_empty(),
+            "approved empty set is complete: {findings:?}"
         );
     }
 
@@ -1066,6 +1392,7 @@ mod tests {
                 "tools": ["read"] } } }"#,
         );
         let old_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&old_inv, "s");
         write_lockfile_for(repo.path(), &old_inv);
 
         // Add a disallowed tool to the config.
@@ -1077,7 +1404,7 @@ mod tests {
         );
 
         let mut allowed = HashMap::new();
-        allowed.insert("s".to_string(), vec!["read".to_string()]);
+        allowed.insert(identity, vec!["read".to_string()]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1106,6 +1433,7 @@ mod tests {
                 "tools": ["read"] } } }"#,
         );
         let old_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&old_inv, "s");
         write_lockfile_for(repo.path(), &old_inv);
 
         // Add a tool that IS in the allowed set.
@@ -1117,10 +1445,7 @@ mod tests {
         );
 
         let mut allowed = HashMap::new();
-        allowed.insert(
-            "s".to_string(),
-            vec!["read".to_string(), "write".to_string()],
-        );
+        allowed.insert(identity, vec!["read".to_string(), "write".to_string()]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1147,6 +1472,7 @@ mod tests {
             r#"{ "mcpServers": { "s": { "command": "node" } } }"#,
         );
         let old_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&old_inv, "s");
         write_lockfile_for(repo.path(), &old_inv);
 
         // The config now declares one tool.
@@ -1158,7 +1484,7 @@ mod tests {
         );
 
         let mut allowed = HashMap::new();
-        allowed.insert("s".to_string(), vec![]);
+        allowed.insert(identity, vec![]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1190,8 +1516,10 @@ mod tests {
                 "tools": ["read", "evil_tool"] } } }"#,
         );
 
+        let current_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&current_inv, "newcomer");
         let mut allowed = HashMap::new();
-        allowed.insert("newcomer".to_string(), vec!["read".to_string()]);
+        allowed.insert(identity, vec!["read".to_string()]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1210,8 +1538,9 @@ mod tests {
     }
 
     #[test]
-    fn added_server_with_only_allowed_tools_stays_medium() {
-        // A new server whose every tool is allowed stays Medium (no indiscriminate upgrade).
+    fn added_server_with_only_allowed_static_tools_is_high_without_live_baseline() {
+        // Static declarations cannot prove a newly-added server's live surface;
+        // an explicit allow-list therefore fails closed until approval.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
         let old_inv = mcp_lock::build_inventory(repo.path());
@@ -1224,11 +1553,10 @@ mod tests {
                 "tools": ["read", "write"] } } }"#,
         );
 
+        let current_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&current_inv, "newcomer");
         let mut allowed = HashMap::new();
-        allowed.insert(
-            "newcomer".to_string(),
-            vec!["read".to_string(), "write".to_string()],
-        );
+        allowed.insert(identity, vec!["read".to_string(), "write".to_string()]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1239,8 +1567,8 @@ mod tests {
             .expect("expected a drift finding for the added server");
         assert_eq!(
             drift_finding.severity,
-            Severity::Medium,
-            "an Added server with only allowed tools must stay Medium: {:?}",
+            Severity::High,
+            "an Added server has no approved live descriptor baseline yet: {:?}",
             drift_finding,
         );
     }
@@ -1298,8 +1626,10 @@ mod tests {
                 "tools": ["any_tool"] } } }"#,
         );
 
+        let current_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&current_inv, "newcomer");
         let mut allowed = HashMap::new();
-        allowed.insert("newcomer".to_string(), vec![]);
+        allowed.insert(identity, vec![]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1318,9 +1648,8 @@ mod tests {
     }
 
     #[test]
-    fn added_server_with_no_tools_stays_medium_even_under_empty_allow_list() {
-        // A new server declaring NO tools stays Medium even under `[]` (no tool to flag).
-        // Guards against an over-eager "Added → always High" regression.
+    fn added_server_with_no_static_tools_is_high_until_live_empty_set_is_approved() {
+        // Omitted static tools do not prove that the server exposes none live.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
         let old_inv = mcp_lock::build_inventory(repo.path());
@@ -1332,8 +1661,10 @@ mod tests {
             r#"{ "mcpServers": { "newcomer": { "command": "node" } } }"#,
         );
 
+        let current_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&current_inv, "newcomer");
         let mut allowed = HashMap::new();
-        allowed.insert("newcomer".to_string(), vec![]);
+        allowed.insert(identity, vec![]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1344,10 +1675,8 @@ mod tests {
             .expect("expected a drift finding for the added server");
         assert_eq!(
             drift_finding.severity,
-            Severity::Medium,
-            "an Added server with no declared tools must stay Medium even \
-             under an empty allow-list — there is no tool to violate the \
-             ladder: {:?}",
+            Severity::High,
+            "an Added server still needs an approved live empty set: {:?}",
             drift_finding,
         );
     }
@@ -1520,13 +1849,14 @@ mod tests {
                 "tools": ["read", "evil_tool"] } } }"#,
         );
         let inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&inv, "trusted");
         write_lockfile_for(repo.path(), &inv);
 
         // "trusted" allows only "read", so "evil_tool" must fire regardless of trust.
         let mut allowed = HashMap::new();
-        allowed.insert("trusted".to_string(), vec!["read".to_string()]);
+        allowed.insert(identity.clone(), vec!["read".to_string()]);
 
-        let trusted = vec!["trusted".to_string()];
+        let trusted = vec![identity];
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1549,6 +1879,42 @@ mod tests {
     }
 
     #[test]
+    fn trusted_server_cannot_hide_new_disallowed_tool_drift() {
+        let repo = tempdir().unwrap();
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{"mcpServers":{"trusted":{"command":"node","tools":["read"]}}}"#,
+        );
+        let baseline_inventory = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&baseline_inventory, "trusted");
+        write_lockfile_for(repo.path(), &baseline_inventory);
+
+        // Tool declarations are deliberately outside the principal identity, so
+        // the trusted identity remains stable while the governed capability set
+        // changes. The explicit allow-list must be evaluated before trust drops
+        // ordinary drift.
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{"mcpServers":{"trusted":{"command":"node","tools":["read","exec"]}}}"#,
+        );
+        let mut allowed = HashMap::new();
+        allowed.insert(identity.clone(), vec!["read".to_string()]);
+        let trusted = vec![identity];
+        let lock_path = repo.path().join(".tirith/mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &trusted, &allowed);
+
+        let drift = findings
+            .iter()
+            .find(|finding| finding.title.contains("MCP server inventory has drifted"))
+            .expect("disallowed drift survives trust filtering");
+        assert_eq!(drift.severity, Severity::High);
+        assert!(serde_json::to_string(drift).unwrap().contains("exec"));
+    }
+
+    #[test]
     fn trusted_server_without_mcp_allowed_tools_still_silent() {
         // Trust still suppresses when the server has NO `mcp_allowed_tools` entry — nothing
         // to enforce, so no finding fires.
@@ -1560,11 +1926,12 @@ mod tests {
                 "tools": ["read", "anything"] } } }"#,
         );
         let inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&inv, "trusted");
         write_lockfile_for(repo.path(), &inv);
 
         // No `mcp_allowed_tools` entry for "trusted".
         let allowed = HashMap::new();
-        let trusted = vec!["trusted".to_string()];
+        let trusted = vec![identity];
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1589,13 +1956,15 @@ mod tests {
             } }"#,
         );
         let inv = mcp_lock::build_inventory(repo.path());
+        let trusted_identity = server_identity(&inv, "trusted");
+        let untrusted_identity = server_identity(&inv, "untrusted");
         write_lockfile_for(repo.path(), &inv);
 
         let mut allowed = HashMap::new();
-        allowed.insert("trusted".to_string(), vec![]);
-        allowed.insert("untrusted".to_string(), vec![]);
+        allowed.insert(trusted_identity.clone(), vec![]);
+        allowed.insert(untrusted_identity, vec![]);
 
-        let trusted = vec!["trusted".to_string()];
+        let trusted = vec![trusted_identity];
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1636,6 +2005,7 @@ mod tests {
                 "tools": ["evil"] } } }"#,
         );
         let old_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&old_inv, "s");
         write_lockfile_for(repo.path(), &old_inv);
 
         // ...then remove "s" entirely → one `Removed` drift.
@@ -1643,7 +2013,7 @@ mod tests {
 
         // "s" allows only "read", so the Changed/Added arm would go High; Removed must NOT.
         let mut allowed = HashMap::new();
-        allowed.insert("s".to_string(), vec!["read".to_string()]);
+        allowed.insert(identity, vec!["read".to_string()]);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
@@ -1692,16 +2062,17 @@ mod tests {
                 "tools": ["read"] } } }"#,
         );
         let old_inv = mcp_lock::build_inventory(repo.path());
+        let identity = server_identity(&old_inv, "s");
         write_lockfile_for(repo.path(), &old_inv);
 
         // Doctor the lockfile to ALSO record disallowed tool "evil" (snuck past `mcp lock`).
-        // Use the CURRENT format version (v6) so no schema-migration finding fires — this
+        // Use the CURRENT format version (v7) so no schema-migration finding fires — this
         // test pins the dual-firing of the lockfile-side + per-server drift findings, not the
         // migration prompt (which has its own tests). `hash` is recomputed from data at parse,
         // so the placeholder is discarded but the doctored `tools` still surface.
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let lockfile_doctored = r#"{
-            "format_version": 6,
+            "format_version": 7,
             "inventory_hash": "x",
             "configs": [".mcp.json"],
             "servers": [
@@ -1711,7 +2082,13 @@ mod tests {
                     "tools": ["evil", "read"],
                     "tools_declared": true,
                     "source_config": ".mcp.json",
-                    "hash": "deadbeef"
+                    "hash": "deadbeef",
+                    "descriptors": [
+                        {"name": "evil", "descriptor_hash": "x"},
+                        {"name": "read", "descriptor_hash": "y"}
+                    ],
+                    "descriptors_approved": true,
+                    "descriptor_hash": "z"
                 }
             ]
         }"#;
@@ -1729,7 +2106,7 @@ mod tests {
 
         // "s" allows only "read", so the doctored "evil" fires the lockfile-side finding.
         let mut allowed = HashMap::new();
-        allowed.insert("s".to_string(), vec!["read".to_string()]);
+        allowed.insert(identity, vec!["read".to_string()]);
 
         let content = fs::read_to_string(&lock_path).unwrap();
         let findings = check(&content, Some(&lock_path), &[], &allowed);

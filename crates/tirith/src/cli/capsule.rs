@@ -350,7 +350,7 @@ pub fn run_to_completion_os(
             assert_degraded_run_is_permitted(degraded);
             return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
         }
-        let mut cmd = build_contained_command_os(spec, program, args, &sel)?;
+        let mut cmd = build_contained_command_os(spec, program, args, None, &sel)?;
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -407,19 +407,20 @@ fn build_contained_command_os(
     spec: &CapsuleSpec,
     program: &OsStr,
     args: &[OsString],
+    exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
     #[cfg(target_os = "linux")]
     {
-        linux_contained_command_os(spec, program, args, sel)
+        linux_contained_command_os(spec, program, args, exact_env, sel)
     }
     #[cfg(target_os = "macos")]
     {
-        macos_contained_command_os(spec, program, args, sel)
+        macos_contained_command_os(spec, program, args, exact_env, sel)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (spec, program, args);
+        let _ = (spec, program, args, exact_env);
         Err(CapsuleRefused {
             backend_id: sel.backend_id,
             reason: "no containment backend on this target".to_string(),
@@ -446,6 +447,41 @@ pub fn spawn_piped(
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
 ) -> Result<(Child, SelectedBackend, bool), CapsuleRefused> {
+    spawn_piped_with_binding(spec, program, args, None, None, extra_env, degraded)
+}
+
+/// Piped capsule launch for a security principal whose cwd and complete base
+/// environment were fingerprinted before spawn. The environment is replaced,
+/// not inherited; the capsule's own temporary-HOME rewrite is still applied on
+/// top of this stable base.
+pub fn spawn_piped_exact(
+    spec: &CapsuleSpec,
+    program: &str,
+    args: &[String],
+    cwd: &std::path::Path,
+    environment: &[(String, String)],
+    degraded: DegradedPolicy,
+) -> Result<(Child, SelectedBackend, bool), CapsuleRefused> {
+    spawn_piped_with_binding(
+        spec,
+        program,
+        args,
+        Some(cwd),
+        Some(environment),
+        &[],
+        degraded,
+    )
+}
+
+fn spawn_piped_with_binding(
+    spec: &CapsuleSpec,
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    exact_env: Option<&[(String, String)]>,
+    extra_env: &[(String, String)],
+    degraded: DegradedPolicy,
+) -> Result<(Child, SelectedBackend, bool), CapsuleRefused> {
     let sel = select_backend(spec);
     let is_degraded = sel.is_degraded();
 
@@ -464,7 +500,7 @@ pub fn spawn_piped(
         }
         // Only an AllowDegraded caller reaches here (FailClosed returned above).
         assert_degraded_run_is_permitted(degraded);
-        let child = spawn_uncontained_piped(program, args, extra_env, &sel)?;
+        let child = spawn_uncontained_piped(program, args, cwd, exact_env, extra_env, &sel)?;
         return Ok((child, sel, true));
     }
 
@@ -479,10 +515,13 @@ pub fn spawn_piped(
             }
             // Only an AllowDegraded caller reaches here (FailClosed returned above).
             assert_degraded_run_is_permitted(degraded);
-            let child = spawn_uncontained_piped(program, args, extra_env, &sel)?;
+            let child = spawn_uncontained_piped(program, args, cwd, exact_env, extra_env, &sel)?;
             return Ok((child, sel, true));
         }
-        let mut cmd = build_contained_command(spec, program, args, &sel)?;
+        let mut cmd = build_contained_command(spec, program, args, exact_env, &sel)?;
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -502,10 +541,18 @@ pub fn spawn_piped(
 fn spawn_uncontained_piped(
     program: &str,
     args: &[String],
+    cwd: Option<&std::path::Path>,
+    exact_env: Option<&[(String, String)]>,
     extra_env: &[(String, String)],
     sel: &SelectedBackend,
 ) -> Result<Child, CapsuleRefused> {
     let mut cmd = Command::new(program);
+    if let Some(environment) = exact_env {
+        cmd.env_clear().envs(environment.iter().cloned());
+    }
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -533,10 +580,11 @@ fn build_contained_command(
     spec: &CapsuleSpec,
     program: &str,
     args: &[String],
+    exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
     let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
-    build_contained_command_os(spec, OsStr::new(program), &args_os, sel)
+    build_contained_command_os(spec, OsStr::new(program), &args_os, exact_env, sel)
 }
 
 #[cfg(target_os = "linux")]
@@ -544,6 +592,7 @@ fn linux_contained_command_os(
     spec: &CapsuleSpec,
     program: &OsStr,
     args: &[OsString],
+    exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
     let exe = std::env::current_exe().map_err(|e| CapsuleRefused {
@@ -560,6 +609,9 @@ fn linux_contained_command_os(
         .arg("--")
         .arg(program)
         .args(args);
+    if let Some(environment) = exact_env {
+        cmd.env_clear().envs(environment.iter().cloned());
+    }
     Ok(cmd)
 }
 
@@ -579,6 +631,7 @@ fn macos_contained_command_os(
     spec: &CapsuleSpec,
     program: &OsStr,
     args: &[OsString],
+    exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
 ) -> Result<Command, CapsuleRefused> {
     // Validate the final sandbox argv before spawning. The launcher reconstructs
@@ -613,7 +666,11 @@ fn macos_contained_command_os(
     // temporary HOME cannot be created for a `temporary_home` spec: skipping it
     // would leave the real `$HOME` reachable (env_clear already ran, but
     // `getpwuid()->pw_dir` still resolves it) while `env_isolated` claims true.
-    apply_macos_env(&mut cmd, spec).map_err(|reason| CapsuleRefused {
+    let env_result = match exact_env {
+        Some(environment) => apply_macos_env_from(&mut cmd, spec, Some(environment)),
+        None => apply_macos_env(&mut cmd, spec),
+    };
+    env_result.map_err(|reason| CapsuleRefused {
         backend_id: sel.backend_id,
         reason,
     })?;
@@ -635,7 +692,16 @@ fn macos_contained_command_os(
 /// be a silent over-report (the gap the Linux launcher fails closed on too).
 #[cfg(target_os = "macos")]
 fn apply_macos_env(cmd: &mut Command, spec: &CapsuleSpec) -> Result<(), String> {
-    apply_macos_env_with(cmd, spec, || {
+    apply_macos_env_from(cmd, spec, None)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_env_from(
+    cmd: &mut Command,
+    spec: &CapsuleSpec,
+    exact_env: Option<&[(String, String)]>,
+) -> Result<(), String> {
+    apply_macos_env_with_source(cmd, spec, exact_env, || {
         // Production temp-home factory: a fresh, leaked temp dir. `keep()` detaches
         // it from the guard so it survives for the child's lifetime (the E5 wrapper
         // removes it after the child exits).
@@ -651,7 +717,7 @@ fn apply_macos_env(cmd: &mut Command, spec: &CapsuleSpec) -> Result<(), String> 
 /// (a test can pass a factory that returns `Err` without mutating the process-wide
 /// `TMPDIR`, which would race other tests). Production passes the real tempfile
 /// factory via [`apply_macos_env`].
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn apply_macos_env_with<F>(
     cmd: &mut Command,
     spec: &CapsuleSpec,
@@ -660,10 +726,26 @@ fn apply_macos_env_with<F>(
 where
     F: FnOnce() -> std::io::Result<std::path::PathBuf>,
 {
+    apply_macos_env_with_source(cmd, spec, None, make_temp_home)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_env_with_source<F>(
+    cmd: &mut Command,
+    spec: &CapsuleSpec,
+    exact_env: Option<&[(String, String)]>,
+    make_temp_home: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> std::io::Result<std::path::PathBuf>,
+{
     let policy = &spec.environment;
-    let present: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .collect();
+    let present: Vec<String> = match exact_env {
+        Some(environment) => environment.iter().map(|(name, _)| name.clone()).collect(),
+        None => std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .collect(),
+    };
     // The same pure decision the Linux launcher uses (`EnvironmentPolicy`'s own
     // `surviving_vars`): start from the allow-list (or the parent set when
     // `inherit`), then drop every sensitive name.
@@ -671,8 +753,12 @@ where
 
     cmd.env_clear();
     for name in &survivors {
-        if let Some(val) = std::env::var_os(name) {
-            cmd.env(name, val);
+        if let Some(environment) = exact_env {
+            if let Some((_, value)) = environment.iter().find(|(candidate, _)| candidate == name) {
+                cmd.env(name, value);
+            }
+        } else if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
         }
     }
     if policy.temporary_home {
@@ -1044,6 +1130,7 @@ mod tests {
             &spec,
             OsStr::new("/usr/bin/printf"),
             std::slice::from_ref(&argument),
+            None,
             &selected,
         )
         .expect("build native Seatbelt argv");
@@ -1164,7 +1251,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _secret = EnvGuard::set(secret_name, std::path::Path::new(secret_val));
         let _marker = EnvGuard::set(marker_name, std::path::Path::new(marker_val));
-        let cmd = build_contained_command(&spec, "/usr/bin/printenv", &[], &sel)
+        let cmd = build_contained_command(&spec, "/usr/bin/printenv", &[], None, &sel)
             .expect("build contained command");
         // The env the child WILL receive: the Command's explicit env overrides.
         let child_env: std::collections::BTreeMap<String, Option<String>> = cmd
@@ -1295,7 +1382,7 @@ mod tests {
             std::path::Path::new("/tirith-im5-nonexistent-base-xyz/deeper/still-missing"),
         );
 
-        let result = build_contained_command(&spec, "/usr/bin/true", &[], &sel);
+        let result = build_contained_command(&spec, "/usr/bin/true", &[], None, &sel);
         assert!(
             result.is_err(),
             "macOS contained command must refuse (CapsuleRefused) when the temp HOME \

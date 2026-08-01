@@ -109,13 +109,39 @@ impl Default for CheckpointConfig {
     }
 }
 
+/// Return the configured checkpoint path without creating it.
+///
+/// This preserves the pre-0.3.3 public return type. When no private state root is
+/// available it returns a deliberately unusable sentinel path instead of the old
+/// shared `/tmp/tirith/checkpoints` fallback. New callers that need to distinguish
+/// that state should use [`try_checkpoints_dir`]; all checkpoint I/O uses the
+/// validated private-store path internally.
+pub fn checkpoints_dir() -> PathBuf {
+    try_checkpoints_dir().unwrap_or_else(unavailable_checkpoint_path)
+}
+
 /// Resolve the per-user checkpoints directory. There is deliberately no shared
 /// `/tmp` fallback: checkpoint blobs can contain secrets, and an unowned fallback
-/// turns metadata tampering into deletion/restore authority. Callers performing
-/// I/O must use [`secure_checkpoints_dir`] so the directory is also created and
-/// ownership/permissions are validated.
-pub fn checkpoints_dir() -> Option<PathBuf> {
+/// turns metadata tampering into deletion/restore authority.
+pub fn try_checkpoints_dir() -> Option<PathBuf> {
     crate::policy::state_dir().map(|d| d.join("checkpoints"))
+}
+
+#[cfg(unix)]
+fn unavailable_checkpoint_path() -> PathBuf {
+    // `/dev/null` is a file, so every attempted child operation fails with
+    // ENOTDIR. This is safer than an empty/current-directory sentinel.
+    PathBuf::from("/dev/null/tirith-checkpoints-unavailable")
+}
+
+#[cfg(windows)]
+fn unavailable_checkpoint_path() -> PathBuf {
+    PathBuf::from(r"\\.\NUL\tirith-checkpoints-unavailable")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unavailable_checkpoint_path() -> PathBuf {
+    PathBuf::from("tirith-checkpoints-unavailable.invalid")
 }
 
 /// Resolve and prepare the checkpoint store as a private directory.
@@ -127,7 +153,7 @@ pub fn checkpoints_dir() -> Option<PathBuf> {
 /// Windows reparse point) before use. If no per-user state directory can be
 /// resolved, operations fail closed instead of falling back to shared storage.
 fn secure_checkpoints_dir() -> Result<PathBuf, String> {
-    let base = checkpoints_dir().ok_or_else(|| {
+    let base = try_checkpoints_dir().ok_or_else(|| {
         "cannot resolve a private per-user state directory; refusing checkpoint storage".to_string()
     })?;
     fs::create_dir_all(&base).map_err(|e| format!("create checkpoint store: {e}"))?;
@@ -1613,7 +1639,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
 
         let outcome = (|| -> Result<(Vec<CheckpointListEntry>, PurgeResult, bool, u32), String> {
-            let base = checkpoints_dir().ok_or("checkpoint dir unavailable")?;
+            let base = try_checkpoints_dir().ok_or("checkpoint dir unavailable")?;
             fs::create_dir_all(&base).map_err(|e| e.to_string())?;
             fs::set_permissions(&base, fs::Permissions::from_mode(0o777))
                 .map_err(|e| e.to_string())?;
@@ -1835,7 +1861,7 @@ mod tests {
 
             let meta = create(&[name_a, name_b], Some("rm -rf project"))?;
 
-            let checkpoint_base = checkpoints_dir().ok_or("checkpoint dir unavailable")?;
+            let checkpoint_base = try_checkpoints_dir().ok_or("checkpoint dir unavailable")?;
             let files_dir = checkpoint_base.join(&meta.id).join("files");
 
             // Look up each file's backup blob by its manifest SHA.
@@ -2121,7 +2147,7 @@ mod tests {
         let evil_target = tmpdir.path().join("should-not-be-written");
 
         let outcome = std::panic::catch_unwind(|| {
-            let store = checkpoints_dir().expect("checkpoint dir resolves");
+            let store = try_checkpoints_dir().expect("checkpoint dir resolves");
             fs::create_dir_all(&store).expect("create store");
 
             // An attacker-controlled checkpoint OUTSIDE the store, with a manifest
@@ -2802,7 +2828,7 @@ mod tests {
         let run = || -> Result<RestoreReport, String> {
             // Hand-build a pre-F6 checkpoint: meta.json WITHOUT capture_root, a
             // manifest with a RELATIVE original_path, and a matching blob.
-            let cp_base = checkpoints_dir().ok_or("checkpoint dir unavailable")?;
+            let cp_base = try_checkpoints_dir().ok_or("checkpoint dir unavailable")?;
             let id = uuid::Uuid::new_v4().to_string();
             let cp_dir = cp_base.join(&id);
             let files_dir = cp_dir.join("files");
@@ -3285,7 +3311,7 @@ mod tests {
             fs::write("a.txt", "alpha").map_err(|e| format!("write a: {e}"))?;
             fs::write("b.txt", "bravo").map_err(|e| format!("write b: {e}"))?;
             let meta = create(&["a.txt", "b.txt"], Some("rm -rf project"))?;
-            let cp_dir = checkpoints_dir()
+            let cp_dir = try_checkpoints_dir()
                 .ok_or("checkpoint dir unavailable")?
                 .join(&meta.id);
             Ok((meta, cp_dir))

@@ -109,7 +109,7 @@ everyday subset; this is the complete reference.
 |---------|-------------|
 | `tirith audit {export,stats,report,verify}` | Audit-log management; `verify` checks the tamper-evident hash chain (`--expected-head`) |
 | `tirith incident {start,stop,status,report}` | Declare an "under attack" posture: fail-closed, bypass disabled, key rules elevated |
-| `tirith checkpoint {create,list,restore,diff,purge,watch}` | Snapshot files before risky operations; `restore` sha256-verifies each blob and reports per-file outcomes |
+| `tirith checkpoint {create,list,restore,diff,purge,watch}` | Snapshot files before risky operations in the private per-user state directory; `restore` sha256-verifies each blob and reports per-file outcomes. Releases before 0.3.4 may have left data under `/tmp/tirith/checkpoints`; inspect and remove that legacy directory manually. |
 | `tirith pending {list,resolve,export}` | Pending-decision registry for deferred blocks, suppressed-finding rollups, and restore prompts |
 | `tirith share --target <a>` / `tirith redact --audience <a>` | Audience-aware redaction before sharing (github-issue, slack, llm, public-paste) |
 | `tirith clipboard {copy,scan,guard,watch}` | Clipboard with secret-shape gating and browser source attribution |

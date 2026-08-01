@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use tirith_core::mcp_lock::{
     self, McpDrift, McpEnvChange, McpInventory, McpLockLoadError, McpLockServer, McpLockfile,
     McpServerDriftEntry, McpToolsChangeKind, McpTransport, McpTransportChange, MCP_LOCK_FILENAME,
@@ -22,7 +23,7 @@ use tirith_core::policy;
 /// lockfile is still written so `verify` has a baseline); `1` operational
 /// failure (no repo root, dir create/write failed, or JSON-write failure so a
 /// piped consumer never sees truncated JSON with a success code).
-pub fn lock(json: bool) -> i32 {
+pub fn lock(json: bool, allow_incomplete_configs: bool) -> i32 {
     let repo_root = match resolve_repo_root() {
         Some(r) => r,
         None => {
@@ -35,10 +36,47 @@ pub fn lock(json: bool) -> i32 {
         }
     };
 
-    let inventory = mcp_lock::build_inventory(&repo_root);
-    let lockfile = McpLockfile::from_inventory(&inventory);
+    lock_for_root(&repo_root, json, allow_incomplete_configs)
+}
 
+/// Lock against an explicit repo root. Refuses to publish a trusted baseline
+/// over any unreadable, ambiguous, secret-bearing, or malformed config unless
+/// the operator supplies the explicit audited override.
+pub(crate) fn lock_for_root(repo_root: &Path, json: bool, allow_incomplete_configs: bool) -> i32 {
+    let mutation_guard = match acquire_mutation_lock(repo_root) {
+        Ok(guard) => guard,
+        Err(error) => {
+            report_error(
+                json,
+                &format!("could not lock MCP baseline mutation: {error}"),
+            );
+            return 1;
+        }
+    };
+    let inventory = mcp_lock::build_inventory(repo_root);
+    if inventory_has_coverage_gaps(&inventory) && !allow_incomplete_configs {
+        report_error(
+            json,
+            "refusing to write an incomplete MCP baseline: one or more supported config paths \
+             were malformed or rejected. Fix the paths/declarations first; only use \
+             `--allow-incomplete-configs` to record an explicitly audited gap (verification \
+             will remain nonzero while the gap exists)",
+        );
+        if !json {
+            print_coverage_inventory(&inventory);
+        }
+        return 1;
+    }
     let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let mut lockfile = McpLockfile::from_inventory(&inventory);
+    let preserved_approvals = match mcp_lock::load_lockfile(&lock_path) {
+        Ok(previous) => lockfile.preserve_approved_descriptors_from(&previous),
+        Err(McpLockLoadError::NotFound) => 0,
+        // `mcp lock` remains the repair path for a corrupt/legacy lock. A
+        // baseline that cannot be authenticated by the current parser is not
+        // safe to carry into the replacement.
+        Err(_) => 0,
+    };
     if let Err(e) = write_lockfile(&lock_path, &lockfile) {
         report_error(
             json,
@@ -46,17 +84,99 @@ pub fn lock(json: bool) -> i32 {
         );
         return 1;
     }
+    let expected = lockfile.render();
+    let read_back = tirith_core::util::read_text_no_follow_capped(
+        &lock_path,
+        expected.len().saturating_add(1) as u64,
+    );
+    if !matches!(read_back, Ok(ref bytes) if bytes == expected.as_bytes()) {
+        report_error(
+            json,
+            "written MCP lock failed exact read-back validation; refusing success",
+        );
+        return 1;
+    }
+    drop(mutation_guard);
 
     if json {
-        if !print_json(&repo_root, &lock_path, &inventory, &lockfile) {
+        if !print_json(
+            repo_root,
+            &lock_path,
+            &inventory,
+            &lockfile,
+            allow_incomplete_configs && inventory_has_coverage_gaps(&inventory),
+        ) {
             // Lockfile is on disk, but the caller's JSON output is broken.
             return 1;
         }
     } else {
         print_human(&lock_path, &inventory);
+        if preserved_approvals > 0 {
+            eprintln!(
+                "tirith mcp lock: preserved {preserved_approvals} unchanged live descriptor approval(s)"
+            );
+        }
+        if allow_incomplete_configs && inventory_has_coverage_gaps(&inventory) {
+            eprintln!(
+                "tirith mcp lock: warning: recorded an explicitly incomplete baseline; \
+                 `tirith mcp verify` will fail until every coverage gap is resolved."
+            );
+        }
     }
 
     0
+}
+
+/// Stable-inode interprocess guard for every `.tirith/mcp.lock` mutation. The
+/// data file itself is atomically replaced, so locking it would lock an obsolete
+/// inode after rename; all cooperating writers instead lock this never-renamed
+/// sibling across read/build/recheck/write/readback.
+pub(crate) struct McpMutationGuard {
+    file: std::fs::File,
+}
+
+impl Drop for McpMutationGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+pub(crate) fn acquire_mutation_lock(repo_root: &Path) -> std::io::Result<McpMutationGuard> {
+    let lock_dir = repo_root.join(".tirith");
+    std::fs::create_dir_all(&lock_dir)?;
+    let canonical_root = std::fs::canonicalize(repo_root)?;
+    let canonical_dir = std::fs::canonicalize(&lock_dir)?;
+    if !canonical_dir.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "MCP mutation lock directory escapes repository root",
+        ));
+    }
+    let lock_path = canonical_dir.join(".mcp-lock.mutation.lock");
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(&lock_path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(std::io::Error::other(
+            "refusing symlinked MCP mutation lock",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&lock_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "MCP mutation lock is not a regular file",
+        ));
+    }
+    file.lock_exclusive()?;
+    Ok(McpMutationGuard { file })
 }
 
 /// Resolve the repository root for `mcp lock`: `TIRITH_POLICY_ROOT` (treated as
@@ -84,7 +204,11 @@ fn write_lockfile(lock_path: &Path, lockfile: &McpLockfile) -> std::io::Result<(
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(lock_path, lockfile.render())
+    let repo_root = lock_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| std::io::Error::other("MCP lock path has no repository root"))?;
+    super::write_file_atomic_contained(repo_root, lock_path, lockfile.render().as_bytes(), true)
 }
 
 /// Emit the machine-readable result.
@@ -95,6 +219,7 @@ fn print_json(
     lock_path: &Path,
     inventory: &McpInventory,
     lockfile: &McpLockfile,
+    incomplete_override_used: bool,
 ) -> bool {
     #[derive(serde::Serialize)]
     struct JsonOut<'a> {
@@ -108,6 +233,7 @@ fn print_json(
         /// hiding a misconfigured `.mcp.json` behind an "empty lockfile".
         rejected_configs: &'a [mcp_lock::RejectedConfig],
         servers_locked: usize,
+        incomplete_override_used: bool,
         lockfile: &'a McpLockfile,
     }
 
@@ -119,6 +245,7 @@ fn print_json(
         malformed_configs: &inventory.malformed_configs,
         rejected_configs: &inventory.rejected_configs,
         servers_locked: lockfile.servers.len(),
+        incomplete_override_used,
         lockfile,
     };
 
@@ -188,9 +315,9 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
     if !inventory.malformed_configs.is_empty() {
         eprintln!();
         eprintln!(
-            "  note: {} config file(s) could not be parsed and contributed no servers \
-             (listed above). This is not an error — the lockfile reflects only the \
-             configs tirith could read.",
+            "  warning: {} config file(s) could not be parsed and contributed no servers \
+             (listed above). This baseline is incomplete and verification will remain \
+             nonzero until they are fixed.",
             inventory.malformed_configs.len(),
         );
     }
@@ -198,9 +325,8 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
     if !inventory.rejected_configs.is_empty() {
         eprintln!();
         eprintln!(
-            "  note: {} config path(s) were skipped during discovery and contributed no \
-             servers — review these in case a legitimately-present config was \
-             unintentionally blocked:",
+            "  warning: {} config path(s) were refused and contributed no servers. This \
+             baseline is incomplete and verification will remain nonzero until they are fixed:",
             inventory.rejected_configs.len(),
         );
         for line in format_rejected_config_lines(&inventory.rejected_configs) {
@@ -232,6 +358,25 @@ fn format_rejected_config_lines(rejected: &[mcp_lock::RejectedConfig]) -> Vec<St
             )
         })
         .collect()
+}
+
+fn inventory_has_coverage_gaps(inventory: &McpInventory) -> bool {
+    !inventory.malformed_configs.is_empty() || !inventory.rejected_configs.is_empty()
+}
+
+fn print_coverage_inventory(inventory: &McpInventory) {
+    if !inventory.malformed_configs.is_empty() {
+        eprintln!("  malformed configs:");
+        for path in &inventory.malformed_configs {
+            eprintln!("    - {path:?}");
+        }
+    }
+    if !inventory.rejected_configs.is_empty() {
+        eprintln!("  rejected configs:");
+        for line in format_rejected_config_lines(&inventory.rejected_configs) {
+            eprintln!("{line}");
+        }
+    }
 }
 
 /// Render one inventory server entry under the `servers:` block of `mcp lock`'s
@@ -284,6 +429,32 @@ fn describe_rejection_reason(reason: &mcp_lock::RejectedReason) -> String {
             } else {
                 "could not read (other io error)".to_string()
             }
+        }
+        mcp_lock::RejectedReason::AmbiguousServerObjects => {
+            "declares both mcpServers and servers — client precedence is ambiguous".to_string()
+        }
+        mcp_lock::RejectedReason::AmbiguousTransport => {
+            "declares both url and command — client transport is ambiguous".to_string()
+        }
+        mcp_lock::RejectedReason::SecretBearingArgument => {
+            "stdio arguments contain a credential-shaped value; use an environment reference"
+                .to_string()
+        }
+        mcp_lock::RejectedReason::SecretBearingUrl => {
+            "URL query/fragment contains a credential-shaped value; use a secret reference"
+                .to_string()
+        }
+        mcp_lock::RejectedReason::InvalidServerEntry => {
+            "contains a non-object server declaration that cannot be inventoried safely".to_string()
+        }
+        mcp_lock::RejectedReason::DuplicateJsonKey => {
+            "contains a duplicate JSON object key with ambiguous consumer semantics".to_string()
+        }
+        mcp_lock::RejectedReason::InvalidServerField => {
+            "contains a recognized MCP field with an invalid type or value".to_string()
+        }
+        mcp_lock::RejectedReason::UnsupportedServerField => {
+            "contains an MCP launch field Tirith cannot reproduce exactly".to_string()
         }
     }
 }
@@ -406,6 +577,7 @@ pub(crate) fn verify_for_root(repo_root: &Path, json: bool) -> i32 {
 
     let inventory = mcp_lock::build_inventory(repo_root);
     let drifts = mcp_lock::compute_drift(&inventory, &lockfile);
+    let coverage_ok = coverage_in_sync(&inventory, &lockfile);
 
     if json {
         let write_ok = print_drift_json(
@@ -413,12 +585,13 @@ pub(crate) fn verify_for_root(repo_root: &Path, json: bool) -> i32 {
             repo_root,
             &lock_path,
             &lockfile,
+            &inventory,
             &drifts,
         );
-        return verify_exit_code(drifts.is_empty(), write_ok);
+        return verify_exit_code(drifts.is_empty() && coverage_ok, write_ok);
     }
-    print_verify_human(&lock_path, &drifts);
-    verify_exit_code(drifts.is_empty(), true)
+    print_verify_human(&lock_path, &lockfile, &inventory, &drifts);
+    verify_exit_code(drifts.is_empty() && coverage_ok, true)
 }
 
 /// Decide `tirith mcp verify`'s exit code from `(in_sync, json_write_ok)`. Pure
@@ -438,8 +611,13 @@ pub(crate) fn verify_exit_code(in_sync: bool, json_write_ok: bool) -> i32 {
 
 /// Human-readable summary for `tirith mcp verify` (stderr, one line per drift).
 /// Env values and URL userinfos never appear — only the name that changed.
-fn print_verify_human(lock_path: &Path, drifts: &[McpDrift]) {
-    if drifts.is_empty() {
+fn print_verify_human(
+    lock_path: &Path,
+    lockfile: &McpLockfile,
+    inventory: &McpInventory,
+    drifts: &[McpDrift],
+) {
+    if drifts.is_empty() && coverage_in_sync(inventory, lockfile) {
         eprintln!(
             "tirith mcp verify: inventory matches {} (no drift).",
             lock_path.display()
@@ -456,6 +634,7 @@ fn print_verify_human(lock_path: &Path, drifts: &[McpDrift]) {
         changed,
     );
     print_drift_body(drifts);
+    print_coverage_drift(lockfile, inventory);
     eprintln!();
     eprintln!("  re-run `tirith mcp lock` to refresh the lockfile once the change is intentional.");
 }
@@ -512,19 +691,31 @@ pub(crate) fn diff_for_root(repo_root: &Path, json: bool) -> i32 {
     let drifts = mcp_lock::compute_drift(&inventory, &lockfile);
 
     if json {
-        if !print_drift_json("tirith mcp diff", repo_root, &lock_path, &lockfile, &drifts) {
+        if !print_drift_json(
+            "tirith mcp diff",
+            repo_root,
+            &lock_path,
+            &lockfile,
+            &inventory,
+            &drifts,
+        ) {
             return 2;
         }
     } else {
-        print_diff_human(&lock_path, &drifts);
+        print_diff_human(&lock_path, &lockfile, &inventory, &drifts);
     }
 
     0
 }
 
 /// Human-readable summary for `tirith mcp diff`.
-fn print_diff_human(lock_path: &Path, drifts: &[McpDrift]) {
-    if drifts.is_empty() {
+fn print_diff_human(
+    lock_path: &Path,
+    lockfile: &McpLockfile,
+    inventory: &McpInventory,
+    drifts: &[McpDrift],
+) {
+    if drifts.is_empty() && coverage_in_sync(inventory, lockfile) {
         eprintln!(
             "tirith mcp diff: inventory matches {} (no drift).",
             lock_path.display()
@@ -541,6 +732,36 @@ fn print_diff_human(lock_path: &Path, drifts: &[McpDrift]) {
         changed,
     );
     print_drift_body(drifts);
+    print_coverage_drift(lockfile, inventory);
+}
+
+fn coverage_matches_baseline(inventory: &McpInventory, lockfile: &McpLockfile) -> bool {
+    inventory.malformed_configs == lockfile.malformed_configs
+        && inventory.rejected_configs == lockfile.rejected_configs
+}
+
+/// Verification requires both exact baseline coverage and a currently complete
+/// inventory. An explicit incomplete lock records the gap for audit/diff, but it
+/// never converts that gap into a trusted success.
+fn coverage_in_sync(inventory: &McpInventory, lockfile: &McpLockfile) -> bool {
+    !inventory_has_coverage_gaps(inventory) && coverage_matches_baseline(inventory, lockfile)
+}
+
+fn print_coverage_drift(lockfile: &McpLockfile, inventory: &McpInventory) {
+    if inventory_has_coverage_gaps(inventory) {
+        eprintln!("  ! current MCP coverage is incomplete:");
+        print_coverage_inventory(inventory);
+    }
+    if !coverage_matches_baseline(inventory, lockfile) {
+        eprintln!(
+            "  ! coverage metadata changed since the lock was created \
+             (baseline: {} malformed/{} rejected; current: {} malformed/{} rejected)",
+            lockfile.malformed_configs.len(),
+            lockfile.rejected_configs.len(),
+            inventory.malformed_configs.len(),
+            inventory.rejected_configs.len(),
+        );
+    }
 }
 
 // shared drift presentation helpers (used by verify and diff)
@@ -690,6 +911,7 @@ fn print_drift_json(
     repo_root: &Path,
     lock_path: &Path,
     lockfile: &McpLockfile,
+    inventory: &McpInventory,
     drifts: &[McpDrift],
 ) -> bool {
     let (added, removed, changed) = drift_kind_counts(drifts);
@@ -708,6 +930,10 @@ fn print_drift_json(
         added_count: usize,
         removed_count: usize,
         changed_count: usize,
+        coverage_complete: bool,
+        coverage_matches_baseline: bool,
+        malformed_configs: &'a [String],
+        rejected_configs: &'a [mcp_lock::RejectedConfig],
         in_sync: bool,
         drifts: &'a [McpDrift],
     }
@@ -722,7 +948,11 @@ fn print_drift_json(
         added_count: added,
         removed_count: removed,
         changed_count: changed,
-        in_sync: drifts.is_empty(),
+        coverage_complete: !inventory_has_coverage_gaps(inventory),
+        coverage_matches_baseline: coverage_matches_baseline(inventory, lockfile),
+        malformed_configs: &inventory.malformed_configs,
+        rejected_configs: &inventory.rejected_configs,
+        in_sync: drifts.is_empty() && coverage_in_sync(inventory, lockfile),
         drifts,
     };
 
@@ -847,9 +1077,11 @@ struct PolicyScaffold {
 /// One server entry in the policy scaffold.
 #[derive(Debug, Clone, serde::Serialize)]
 struct PolicyScaffoldServer {
+    identity: String,
     name: String,
     source_config: String,
     tools: Vec<String>,
+    live_descriptors_approved: bool,
 }
 
 /// Build the policy scaffold from a (possibly absent) lockfile. A missing
@@ -863,10 +1095,24 @@ fn build_policy_scaffold(lockfile: Option<&McpLockfile>) -> PolicyScaffold {
             servers: lock
                 .servers
                 .iter()
-                .map(|s| PolicyScaffoldServer {
-                    name: s.name.clone(),
-                    source_config: s.source_config.clone(),
-                    tools: s.tools.clone(),
+                .map(|s| {
+                    let mut tools = s.tools.clone();
+                    if s.descriptors_approved {
+                        tools.extend(
+                            s.descriptors
+                                .iter()
+                                .map(|descriptor| descriptor.name.clone()),
+                        );
+                    }
+                    tools.sort();
+                    tools.dedup();
+                    PolicyScaffoldServer {
+                        identity: s.policy_identity(),
+                        name: s.name.clone(),
+                        source_config: s.source_config.clone(),
+                        tools,
+                        live_descriptors_approved: s.descriptors_approved,
+                    }
                 })
                 .collect(),
         },
@@ -918,29 +1164,30 @@ fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
 
     s.push_str("scan:\n");
 
-    // `trusted_mcp_servers`: dedup by name (the same name can appear in two
-    // different source configs).
-    let mut seen_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    s.push_str("  # Server names that are trusted: every per-server MCP config\n");
+    // Trust keys bind source + name + transport. A same-named declaration in a
+    // different file therefore receives a distinct key and cannot inherit an
+    // earlier review.
+    s.push_str(
+        "  # Source-qualified server identities that are trusted: every per-server MCP config\n",
+    );
     s.push_str("  # finding (insecure URL, raw IP, suspicious args, wildcard tools,\n");
     s.push_str("  # duplicate name) is suppressed for these, and drift on them does\n");
-    s.push_str("  # NOT raise the `mcp_server_drift` finding. Uncomment the names\n");
-    s.push_str("  # whose surface you have reviewed and accepted.\n");
+    s.push_str("  # NOT raise the `mcp_server_drift` finding. Uncomment the identities\n");
+    s.push_str("  # whose exact source/name/transport surface you reviewed and accepted.\n");
     s.push_str("  # trusted_mcp_servers:\n");
     for server in &scaffold.servers {
-        if seen_names.insert(server.name.as_str()) {
-            s.push_str(&format!(
-                "  #   - {}    # from {}\n",
-                yaml_safe_scalar(&server.name),
-                yaml_safe_inline_comment(&server.source_config),
-            ));
-        }
+        s.push_str(&format!(
+            "  #   - {}    # {:?} from {}\n",
+            yaml_safe_scalar(&server.identity),
+            server.name,
+            yaml_safe_inline_comment(&server.source_config),
+        ));
     }
 
-    // `mcp_allowed_tools`: per-server tool allow-list, one entry per name;
-    // when a name repeats with different tool lists, emit the union.
+    // `mcp_allowed_tools`: one allow-list per exact identity. Never union tools
+    // across attacker-controlled same-name declarations.
     s.push('\n');
-    s.push_str("  # Per-server allowed tools. The keys are MCP server names; the\n");
+    s.push_str("  # Per-server allowed tools. Keys are exact MCP policy identities; the\n");
     s.push_str("  # values are the tools the server may expose. A tool the lockfile\n");
     s.push_str("  # records that is NOT in this set surfaces a finding (`mcp_server_drift`,\n");
     s.push_str("  # severity High). Drift that adds a tool outside the set upgrades\n");
@@ -948,34 +1195,32 @@ fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
     s.push_str("  # is unconstrained — the gate is opt-in.\n");
     s.push_str("  # mcp_allowed_tools:\n");
 
-    let mut name_to_tools: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
-        std::collections::BTreeMap::new();
-    let mut name_to_first_source: std::collections::BTreeMap<&str, &str> =
-        std::collections::BTreeMap::new();
     for server in &scaffold.servers {
-        let entry = name_to_tools.entry(server.name.as_str()).or_default();
-        for t in &server.tools {
-            entry.insert(t.as_str());
-        }
-        name_to_first_source
-            .entry(server.name.as_str())
-            .or_insert(server.source_config.as_str());
-    }
-    for (name, tools) in &name_to_tools {
-        let source = name_to_first_source.get(name).copied().unwrap_or("");
-        if tools.is_empty() {
+        if server.tools.is_empty() {
             s.push_str(&format!(
-                "  #   {}: []    # from {} — no tools declared\n",
-                yaml_safe_scalar(name),
-                yaml_safe_inline_comment(source),
+                "  #   {}: []    # {:?} from {} — {}\n",
+                yaml_safe_scalar(&server.identity),
+                server.name,
+                yaml_safe_inline_comment(&server.source_config),
+                if server.live_descriptors_approved {
+                    "approved live set is empty"
+                } else {
+                    "no static tools; live descriptors not approved"
+                },
             ));
         } else {
             s.push_str(&format!(
-                "  #   {}:    # from {}\n",
-                yaml_safe_scalar(name),
-                yaml_safe_inline_comment(source),
+                "  #   {}:    # {:?} from {} — {}\n",
+                yaml_safe_scalar(&server.identity),
+                server.name,
+                yaml_safe_inline_comment(&server.source_config),
+                if server.live_descriptors_approved {
+                    "deduped static + approved live tools"
+                } else {
+                    "static declarations only; live descriptors not approved"
+                },
             ));
-            for tool in tools {
+            for tool in &server.tools {
                 s.push_str(&format!("  #     - {}\n", yaml_safe_scalar(tool)));
             }
         }
@@ -1802,6 +2047,51 @@ mod tests {
         assert_eq!(first, second, "re-writing an unchanged lockfile is stable");
     }
 
+    #[test]
+    fn lock_for_root_preserves_unchanged_descriptor_approval() {
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "s": { "command": "node", "args": ["server.js"] } } }"#,
+        )
+        .unwrap();
+        let inventory = mcp_lock::build_inventory(repo.path());
+        let identity = inventory.servers[0].policy_identity();
+        let mut approved = McpLockfile::from_inventory(&inventory);
+        mcp_lock::approve_live_descriptors(
+            &mut approved,
+            &inventory,
+            &identity,
+            "node",
+            &["server.js".into()],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &serde_json::json!({
+                "tools": [{"name": "read", "inputSchema": {"type": "object"}}]
+            }),
+        )
+        .unwrap();
+        let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
+        write_lockfile(&lock_path, &approved).unwrap();
+
+        assert_eq!(lock_for_root(repo.path(), false, false), 0);
+        let refreshed = mcp_lock::load_lockfile(&lock_path).unwrap();
+        assert!(refreshed.servers[0].descriptors_approved);
+        assert_eq!(
+            refreshed.servers[0].descriptors,
+            approved.servers[0].descriptors
+        );
+
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "s": { "command": "node", "args": ["changed.js"] } } }"#,
+        )
+        .unwrap();
+        assert_eq!(lock_for_root(repo.path(), false, false), 0);
+        let changed = mcp_lock::load_lockfile(&lock_path).unwrap();
+        assert!(!changed.servers[0].descriptors_approved);
+        assert!(changed.servers[0].descriptors.is_empty());
+    }
+
     // `tirith mcp verify` / `diff` integration tests drive the `*_for_root`
     // helpers against tempdirs so each is isolated from env-var-mutating
     // `resolve_repo_root`.
@@ -2139,38 +2429,77 @@ mod tests {
     }
 
     #[test]
-    fn build_policy_scaffold_dedups_repeated_server_names_in_yaml() {
-        // Two lockfile entries for the same name must not produce two `- name`
-        // lines in `trusted_mcp_servers`.
+    fn build_policy_scaffold_keeps_same_named_servers_separate_by_identity() {
+        // Two lockfile entries with the same attacker-controlled name remain
+        // distinct principals and never inherit or union one another's tools.
         let scaffold = PolicyScaffold {
             lockfile_present: true,
             servers: vec![
                 PolicyScaffoldServer {
+                    identity: "mcp:v1:identity-a".to_string(),
                     name: "dup".to_string(),
                     source_config: ".mcp.json".to_string(),
                     tools: vec!["a".to_string()],
+                    live_descriptors_approved: true,
                 },
                 PolicyScaffoldServer {
+                    identity: "mcp:v1:identity-b".to_string(),
                     name: "dup".to_string(),
                     source_config: ".vscode/mcp.json".to_string(),
                     tools: vec!["b".to_string()],
+                    live_descriptors_approved: true,
                 },
             ],
         };
         let yaml = render_policy_scaffold_yaml(&scaffold);
         let trust_lines: Vec<&str> = yaml
             .lines()
-            .filter(|l| l.trim_start().starts_with("#   - dup"))
+            .filter(|line| {
+                line.trim_start().starts_with("#   - ") && line.contains("mcp:v1:identity-")
+            })
             .collect();
         assert_eq!(
             trust_lines.len(),
-            1,
-            "duplicate server name should appear once in trusted_mcp_servers: \
+            2,
+            "same-named servers require distinct trusted identities: \
              got {trust_lines:?}",
         );
-        // mcp_allowed_tools lists the UNION of tools across both entries.
-        assert!(yaml.contains("- a"));
-        assert!(yaml.contains("- b"));
+        assert_eq!(yaml.matches("mcp:v1:identity-a").count(), 2);
+        assert_eq!(yaml.matches("mcp:v1:identity-b").count(), 2);
+    }
+
+    #[test]
+    fn build_policy_scaffold_includes_approved_live_descriptor_names() {
+        let inventory = mcp_lock::McpInventory {
+            servers: vec![mcp_lock::McpServerEntry {
+                name: "dynamic".to_string(),
+                transport: McpTransport::Stdio {
+                    command: "node".to_string(),
+                    args: vec![],
+                    env: vec![],
+                },
+                tools: vec!["static_read".to_string()],
+                tools_declared: true,
+                source_config: ".mcp.json".to_string(),
+            }],
+            configs: vec![".mcp.json".to_string()],
+            malformed_configs: vec![],
+            rejected_configs: vec![],
+        };
+        let mut lock = McpLockfile::from_inventory(&inventory);
+        lock.servers[0].descriptors = vec![
+            mcp_lock::ToolDescriptor::from_tool_entry(&serde_json::json!({"name": "live_exec"})),
+            mcp_lock::ToolDescriptor::from_tool_entry(&serde_json::json!({"name": "static_read"})),
+        ];
+        lock.servers[0].descriptors_approved = true;
+        let scaffold = build_policy_scaffold(Some(&lock));
+        assert_eq!(
+            scaffold.servers[0].tools,
+            vec!["live_exec".to_string(), "static_read".to_string()]
+        );
+        let yaml = render_policy_scaffold_yaml(&scaffold);
+        assert!(yaml.contains("deduped static + approved live tools"));
+        assert!(yaml.contains("live_exec"));
     }
 
     // Finding F2 — `verify`'s JSON-write failure must NOT collapse the drift
@@ -2261,9 +2590,11 @@ mod tests {
         let scaffold = PolicyScaffold {
             lockfile_present: true,
             servers: vec![PolicyScaffoldServer {
+                identity: hostile.to_string(),
                 name: hostile.to_string(),
                 source_config: ".mcp.json".to_string(),
                 tools: vec!["read".to_string()],
+                live_descriptors_approved: true,
             }],
         };
         let body = render_policy_scaffold_yaml(&scaffold);

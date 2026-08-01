@@ -52,21 +52,20 @@ scan:
   # Glob patterns to ignore during scan
   ignore_patterns: []
 
-  # MCP server names you trust. A name listed here suppresses every
-  # per-server MCP config finding (insecure transport, raw IP, suspicious
-  # args, wildcard tools, duplicate name) and exempts the server from
-  # drift detection via `tirith mcp verify` / the `mcp_server_drift` rule.
-  # Run `tirith mcp policy init` to scaffold this list from `.tirith/mcp.lock`.
+  # Exact MCP server identities you trust. Each mcp:v1 key binds source path,
+  # name, and transport; bare names intentionally match nothing. Trust suppresses
+  # per-server config findings and ordinary drift, but never structural ambiguity
+  # or an explicit tool-policy violation. Run `tirith mcp policy init` to scaffold
+  # these keys from `.tirith/mcp.lock`.
   # trusted_mcp_servers:
-  #   - my-trusted-server
+  #   - "mcp:v1:<sha256>"
 
-  # Per-server allowed tools. Keys are MCP server names; values are the
-  # tool names that server may expose. A tool the lockfile records that
-  # is NOT in this set raises a High-severity `mcp_server_drift` finding,
-  # and drift that adds a tool outside the set upgrades the drift finding
-  # from Medium to High. Servers not listed here are unconstrained.
+  # Per-server allowed tools. Keys are the same exact identities; values are the
+  # tool names that server may expose. An explicit entry requires an approved
+  # live descriptor baseline and checks both static and live names. Servers not
+  # listed here are unconstrained.
   # mcp_allowed_tools:
-  #   my-trusted-server:
+  #   "mcp:v1:<sha256>":
   #     - read_only
 
 # Per-agent governance rules — M4 item 8 (enforcement).

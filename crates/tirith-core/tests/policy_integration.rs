@@ -705,36 +705,46 @@ fn scan_config_file(repo: &TempDir, file_path: &str) -> tirith_core::verdict::Ve
     engine::analyze(&ctx)
 }
 
+fn exact_mcp_policy_identity(content: &str, source: &str, name: &str) -> String {
+    tirith_core::mcp_lock::parse_mcp_config(content, source)
+        .expect("strict MCP fixture")
+        .into_iter()
+        .find(|server| server.name == name)
+        .expect("fixture server")
+        .policy_identity()
+}
+
 #[test]
 fn test_policy_round_trip_for_mcp_fields() {
     // A policy with `trusted_mcp_servers` AND `mcp_allowed_tools` must load,
     // validate, and be honored end-to-end through the engine.
-    // F9: `scan.trusted_mcp_servers` is a SUPPRESSION knob (a listed server name
+    // F9: `scan.trusted_mcp_servers` is a SUPPRESSION knob (a listed identity
     // silences `mcp_insecure_server`), so it is neutralized at REPO scope. This
     // test exercises the feature at ORG scope (`TIRITH_POLICY_ROOT`), where
     // operator-managed policy is honored. Repo-scope non-suppression is covered by
     // the F9 tests above.
     let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     clear_policy_env();
-    let policy_yaml = r#"
+    let mcp_config =
+        r#"{"mcpServers":{"my-trusted-server":{"url":"http://insecure.example.com/mcp"}}}"#;
+    let identity = exact_mcp_policy_identity(mcp_config, "mcp.json", "my-trusted-server");
+    let policy_yaml = format!(
+        r#"
 fail_mode: open
 scan:
   trusted_mcp_servers:
-    - my-trusted-server
+    - "{identity}"
   mcp_allowed_tools:
-    my-trusted-server:
+    "{identity}":
       - read_only
-"#;
-    let _org = set_org_policy(policy_yaml);
+"#
+    );
+    let _org = set_org_policy(&policy_yaml);
 
     // Scan target (a separate dir): a config that would normally trigger
     // McpInsecureServer (http://). The org-scoped trusted name suppresses it.
     let repo = make_repo("fail_mode: open\n");
-    fs::write(
-        repo.path().join("mcp.json"),
-        r#"{"mcpServers":{"my-trusted-server":{"url":"http://insecure.example.com/mcp"}}}"#,
-    )
-    .unwrap();
+    fs::write(repo.path().join("mcp.json"), mcp_config).unwrap();
 
     let verdict = scan_config_file(&repo, "mcp.json");
     assert!(
@@ -742,7 +752,7 @@ scan:
             .findings
             .iter()
             .any(|f| f.rule_id == RuleId::McpInsecureServer),
-        "org-scoped trusted server name must suppress mcp_insecure_server: {:?}",
+        "org-scoped trusted server identity must suppress mcp_insecure_server: {:?}",
         verdict
             .findings
             .iter()
@@ -775,7 +785,7 @@ scan:
             .findings
             .iter()
             .any(|f| f.rule_id == RuleId::McpInsecureServer),
-        "untrusted server name must still fire mcp_insecure_server: {:?}",
+        "untrusted server identity must still fire mcp_insecure_server: {:?}",
         verdict
             .findings
             .iter()
@@ -790,21 +800,36 @@ fn test_mcp_allowed_tools_round_trip_through_yaml() {
     // the engine (a rejected field would mean no disallowed-tool finding).
     let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     clear_policy_env();
-    let policy_yaml = r#"
+    let mcp_config =
+        r#"{"mcpServers":{"fs":{"command":"node","tools":["read_file","evil_tool"]}}}"#;
+    let identity = exact_mcp_policy_identity(mcp_config, ".mcp.json", "fs");
+    let policy_yaml = format!(
+        r#"
 fail_mode: open
 scan:
   mcp_allowed_tools:
-    fs:
+    "{identity}":
       - read_file
-"#;
-    let repo = make_repo(policy_yaml);
+"#
+    );
+    let repo = make_repo(&policy_yaml);
     // A lockfile recording a tool outside the allowed set.
-    let mcp_config =
-        r#"{"mcpServers":{"fs":{"command":"node","tools":["read_file","evil_tool"]}}}"#;
     fs::write(repo.path().join(".mcp.json"), mcp_config).unwrap();
 
     let inv = tirith_core::mcp_lock::build_inventory(repo.path());
-    let lock = tirith_core::mcp_lock::McpLockfile::from_inventory(&inv);
+    let mut lock = tirith_core::mcp_lock::McpLockfile::from_inventory(&inv);
+    lock.servers[0].descriptors = lock.servers[0]
+        .tools
+        .iter()
+        .map(|name| {
+            tirith_core::mcp_lock::ToolDescriptor::from_tool_entry(
+                &serde_json::json!({"name": name}),
+            )
+        })
+        .collect();
+    lock.servers[0].descriptor_hash =
+        tirith_core::mcp_lock::compute_descriptor_hash(&lock.servers[0].descriptors);
+    lock.servers[0].descriptors_approved = true;
     let lock_dir = repo.path().join(".tirith");
     // .tirith already exists from make_repo (it holds policy.yaml).
     fs::write(lock_dir.join("mcp.lock"), lock.render()).unwrap();
@@ -818,6 +843,12 @@ scan:
     assert!(
         !drift_findings.is_empty(),
         "expected a McpServerDrift finding for the disallowed lockfile tool: {verdict:?}"
+    );
+    assert!(
+        serde_json::to_string(&drift_findings)
+            .unwrap()
+            .contains("evil_tool"),
+        "the live/static disallowed tool must be the finding cause"
     );
     // The disallowed-tool finding is High (vs the Medium default).
     assert!(

@@ -20,7 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Lockfile format version. Bump only on a breaking schema change.
@@ -54,13 +55,17 @@ use sha2::{Digest, Sha256};
 ///   produces an empty descriptor list — descriptors are populated when the
 ///   gateway observes a `tools/list` response. The descriptor set folds into a
 ///   SEPARATE [`McpLockServer::descriptor_hash`], NOT `content_hash`, so static
-///   config drift is byte-for-byte unchanged from v5. A v5 lockfile under v6 is
+///   config drift is byte-for-byte unchanged from v5. A v5 lockfile under later
 ///   tagged [`LockfileSchema::LegacyV5Migration`]; its on-disk shape is identical
 ///   (the descriptor field serde-defaults to empty), so per-server static drift
 ///   runs normally and [`compute_drift`] adds a single
 ///   [`McpDrift::SchemaUpgradeRequired`] (re-lock once to capture live
 ///   descriptors). See [`ToolDescriptor`] / [`compute_descriptor_drift`].
-pub const MCP_LOCK_FORMAT_VERSION: u32 = 6;
+/// * `7` — expands the exact Tool descriptor hash to include `title`, `execution`,
+///   and `_meta`, and records the effective gateway launch fingerprint used for
+///   descriptor approval. A v6 lock is accepted only as an explicit migration
+///   input; it cannot authorize a live gateway until re-approved under v7.
+pub const MCP_LOCK_FORMAT_VERSION: u32 = 7;
 
 /// Basename of the lockfile, written under `<repo_root>/.tirith/`.
 pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
@@ -249,6 +254,15 @@ impl McpServerEntry {
         hex_lower(&hasher.finalize())
     }
 
+    /// Stable policy identity for this exact configured server. Unlike the
+    /// legacy name-only policy key, this binds the repo-relative source path,
+    /// declared name, and transport (including committed env/userinfo hashes).
+    /// Tool declarations are intentionally excluded so an allow-list continues
+    /// to constrain tool drift without changing its own lookup key.
+    pub fn policy_identity(&self) -> String {
+        policy_identity(&self.source_config, &self.name, &self.transport)
+    }
+
     /// Feed every per-server hash component into `hasher` EXCEPT the trailing
     /// `tools_declared` byte. Shared by [`Self::content_hash`] (v5, appends the
     /// byte) and [`Self::content_hash_v4`] (v4, omits it) so the two never diverge
@@ -256,46 +270,91 @@ impl McpServerEntry {
     fn feed_content_hash_common(&self, hasher: &mut Sha256) {
         hasher.update(b"mcp-server-v2\0");
         hash_field(hasher, self.name.as_bytes());
-        match &self.transport {
-            McpTransport::Url { url, userinfo_hash } => {
-                hasher.update(b"url\0");
-                hash_field(hasher, url.as_bytes());
-                // Fold `userinfo_hash` in so a userinfo change drifts. A leading
-                // 0/1 byte frames presence/absence so a future empty-hash
-                // sentinel can't collide with a no-userinfo URL.
-                match userinfo_hash {
-                    Some(h) => {
-                        hasher.update(b"\x01");
-                        hash_field(hasher, h.as_bytes());
-                    }
-                    None => {
-                        hasher.update(b"\x00");
-                    }
-                }
-            }
-            McpTransport::Stdio { command, args, env } => {
-                hasher.update(b"stdio\0");
-                hash_field(hasher, command.as_bytes());
-                hash_field(hasher, &(args.len() as u64).to_le_bytes());
-                for arg in args {
-                    hash_field(hasher, arg.as_bytes());
-                }
-                hash_field(hasher, &(env.len() as u64).to_le_bytes());
-                for entry in env {
-                    // Feed name + value_hash; the hash already depends on the raw
-                    // value, so a value change still drifts (no raw value here).
-                    hash_field(hasher, entry.name.as_bytes());
-                    hash_field(hasher, entry.value_hash.as_bytes());
-                }
-            }
-            McpTransport::Unknown => {
-                hasher.update(b"unknown\0");
-            }
-        }
+        feed_transport_hash(hasher, &self.transport);
         hash_field(hasher, &(self.tools.len() as u64).to_le_bytes());
         for tool in &self.tools {
             hash_field(hasher, tool.as_bytes());
         }
+    }
+}
+
+/// Feed one canonical transport into a caller-owned hash stream. Shared by the
+/// content hash and the source-qualified policy identity so their transport
+/// semantics cannot drift apart.
+fn feed_transport_hash(hasher: &mut Sha256, transport: &McpTransport) {
+    match transport {
+        McpTransport::Url { url, userinfo_hash } => {
+            hasher.update(b"url\0");
+            hash_field(hasher, url.as_bytes());
+            // Fold `userinfo_hash` in so a userinfo change drifts. A leading
+            // 0/1 byte frames presence/absence so a future empty-hash
+            // sentinel can't collide with a no-userinfo URL.
+            match userinfo_hash {
+                Some(h) => {
+                    hasher.update(b"\x01");
+                    hash_field(hasher, h.as_bytes());
+                }
+                None => {
+                    hasher.update(b"\x00");
+                }
+            }
+        }
+        McpTransport::Stdio { command, args, env } => {
+            hasher.update(b"stdio\0");
+            hash_field(hasher, command.as_bytes());
+            hash_field(hasher, &(args.len() as u64).to_le_bytes());
+            for arg in args {
+                hash_field(hasher, arg.as_bytes());
+            }
+            hash_field(hasher, &(env.len() as u64).to_le_bytes());
+            for entry in env {
+                // Feed name + value_hash; the hash already depends on the raw
+                // value, so a value change still drifts (no raw value here).
+                hash_field(hasher, entry.name.as_bytes());
+                hash_field(hasher, entry.value_hash.as_bytes());
+            }
+        }
+        McpTransport::Unknown => {
+            hasher.update(b"unknown\0");
+        }
+    }
+}
+
+/// Build the opaque, versioned policy key for one exact MCP server binding.
+/// Length framing prevents attacker-controlled names/paths from forging field
+/// boundaries. The readable name/source remain comments in generated policy.
+pub fn policy_identity(source_config: &str, name: &str, transport: &McpTransport) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tirith-mcp-policy-identity-v1\0");
+    hash_field(&mut hasher, source_config.as_bytes());
+    hash_field(&mut hasher, name.as_bytes());
+    feed_transport_hash(&mut hasher, transport);
+    format!("mcp:v1:{}", hex_lower(&hasher.finalize()))
+}
+
+/// Normalize a scanned config path to the same forward-slash repo-relative form
+/// stored in `McpServerEntry::source_config`. Absolute paths require a known
+/// repo root; paths containing parent/prefix components fail closed.
+pub fn source_config_identity_path(path: &Path, repo_root: Option<&Path>) -> Option<String> {
+    let relative = if path.is_absolute() {
+        path.strip_prefix(repo_root?).ok()?
+    } else {
+        path
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => parts.push(value.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
     }
 }
 
@@ -428,20 +487,19 @@ pub struct ToolDescriptor {
     /// identity used to pair descriptors across two locks for drift.
     pub name: String,
     /// Hash over the [`canonical_json`] of the whole captured descriptor
-    /// (`description` + `inputSchema` + `outputSchema` + `annotations` + `icons`,
-    /// each present-or-null), framed with the tool name. The single value drift
-    /// compares.
+    /// (`title` + `description` + `inputSchema` + `outputSchema` + `annotations`
+    /// + `icons` + `execution` + `_meta`, each present-or-null), framed with the
+    /// tool name. The single value drift compares.
     pub descriptor_hash: String,
 }
 
 impl ToolDescriptor {
     /// Build a descriptor from one `tools/list` entry object. Captures the
-    /// security-relevant fields (`description`, `inputSchema`, `outputSchema`,
-    /// `annotations`, `icons`) into a single canonical object and hashes it. A
-    /// missing field is captured as JSON `null` (so "field absent" and "field
-    /// present but null" are distinct: absent → our synthesized `null`; an
-    /// explicit `null` in the source is also `null`, which is acceptable — the
-    /// security signal is the same).
+    /// complete MCP Tool fields (`title`, `description`, `inputSchema`,
+    /// `outputSchema`, `annotations`, `icons`, `execution`, `_meta`) into a
+    /// single canonical object and hashes it. A missing field and an explicit
+    /// JSON `null` both hash as `null`; the validated live approval path rejects
+    /// explicit nulls where the protocol requires a concrete type.
     ///
     /// `name` falls back to the empty string when the entry omits `name` (a
     /// malformed entry the caller still wants captured rather than dropped).
@@ -465,7 +523,7 @@ impl ToolDescriptor {
         let canonical = canonical_json(&serde_json::Value::Object(captured));
         let descriptor_hash = {
             let mut hasher = Sha256::new();
-            hasher.update(b"mcp-tool-descriptor-v6\0");
+            hasher.update(b"mcp-tool-descriptor-v7\0");
             hash_field(&mut hasher, name.as_bytes());
             hash_field(&mut hasher, canonical.as_bytes());
             hex_lower(&hasher.finalize())
@@ -480,15 +538,140 @@ impl ToolDescriptor {
 
 /// The exact field set captured into a [`ToolDescriptor`]'s hash. Fixed and
 /// explicit so adding a field is a deliberate, reviewable change (and a hash
-/// bump). Mirrors the MCP `Tool` shape: `description`, `inputSchema`,
-/// `outputSchema`, `annotations`, `icons`.
+/// bump). Mirrors the MCP `Tool` shape, including UI/execution metadata.
 pub(crate) const DESCRIPTOR_HASHED_FIELDS: &[&str] = &[
+    "title",
     "description",
     "inputSchema",
     "outputSchema",
     "annotations",
     "icons",
+    "execution",
+    "_meta",
 ];
+
+/// Validate the complete MCP Tool shape that v7 hashes and authorizes. Unknown
+/// top-level fields are refused: silently ignoring a future execution-relevant
+/// field would make the stored descriptor less complete than the live tool.
+pub fn validate_tool_descriptor_entry(entry: &serde_json::Value) -> Result<&str, &'static str> {
+    let object = entry.as_object().ok_or("tools_list_invalid_entry")?;
+    if object.keys().any(|field| {
+        !matches!(
+            field.as_str(),
+            "name"
+                | "title"
+                | "description"
+                | "inputSchema"
+                | "outputSchema"
+                | "annotations"
+                | "icons"
+                | "execution"
+                | "_meta"
+        )
+    }) {
+        return Err("tools_list_unknown_descriptor_field");
+    }
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or("tools_list_invalid_name")?;
+    for field in ["title", "description"] {
+        if object.get(field).is_some_and(|value| !value.is_string()) {
+            return Err("tools_list_invalid_text_field");
+        }
+    }
+    let input_schema = object
+        .get("inputSchema")
+        .filter(|schema| schema.is_object())
+        .ok_or("tools_list_invalid_input_schema")?;
+    if input_schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return Err("tools_list_invalid_input_schema");
+    }
+    crate::mcp::content::SchemaValidator::compile(input_schema)
+        .map_err(|_| "tools_list_invalid_input_schema")?;
+    if let Some(output_schema) = object.get("outputSchema") {
+        if !output_schema.is_object()
+            || output_schema
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                != Some("object")
+            || crate::mcp::content::SchemaValidator::compile(output_schema).is_err()
+        {
+            return Err("tools_list_invalid_output_schema");
+        }
+    }
+    if let Some(annotations) = object.get("annotations") {
+        let annotations = annotations
+            .as_object()
+            .ok_or("tools_list_invalid_metadata_field")?;
+        if annotations.keys().any(|field| {
+            !matches!(
+                field.as_str(),
+                "title" | "readOnlyHint" | "destructiveHint" | "idempotentHint" | "openWorldHint"
+            )
+        }) || annotations
+            .get("title")
+            .is_some_and(|value| !value.is_string())
+            || [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ]
+            .iter()
+            .any(|field| {
+                annotations
+                    .get(*field)
+                    .is_some_and(|value| !value.is_boolean())
+            })
+        {
+            return Err("tools_list_invalid_metadata_field");
+        }
+    }
+    if let Some(execution) = object.get("execution") {
+        let execution = execution
+            .as_object()
+            .ok_or("tools_list_invalid_metadata_field")?;
+        if execution.keys().any(|field| field != "taskSupport")
+            || execution.get("taskSupport").is_some_and(|value| {
+                !matches!(value.as_str(), Some("forbidden" | "optional" | "required"))
+            })
+        {
+            return Err("tools_list_invalid_metadata_field");
+        }
+    }
+    if object.get("_meta").is_some_and(|value| !value.is_object()) {
+        return Err("tools_list_invalid_metadata_field");
+    }
+    if let Some(icons) = object.get("icons") {
+        let icons = icons.as_array().ok_or("tools_list_invalid_icons")?;
+        for icon in icons {
+            let icon = icon.as_object().ok_or("tools_list_invalid_icons")?;
+            if icon
+                .keys()
+                .any(|field| !matches!(field.as_str(), "src" | "mimeType" | "sizes" | "theme"))
+                || icon
+                    .get("src")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|src| !src.is_empty())
+                    .is_none()
+                || icon.get("mimeType").is_some_and(|value| !value.is_string())
+                || icon
+                    .get("theme")
+                    .is_some_and(|value| !matches!(value.as_str(), Some("light" | "dark")))
+                || icon.get("sizes").is_some_and(|value| {
+                    value
+                        .as_array()
+                        .is_none_or(|sizes| !sizes.iter().all(serde_json::Value::is_string))
+                })
+            {
+                return Err("tools_list_invalid_icons");
+            }
+        }
+    }
+    Ok(name)
+}
 
 /// Hash an ordered descriptor list into one per-server `descriptor_hash`.
 /// Length-prefixed framing (via [`hash_field`]) so no two distinct lists collide.
@@ -499,7 +682,7 @@ pub fn compute_descriptor_hash(descriptors: &[ToolDescriptor]) -> String {
         return String::new();
     }
     let mut hasher = Sha256::new();
-    hasher.update(b"mcp-descriptor-set-v6\0");
+    hasher.update(b"mcp-descriptor-set-v7\0");
     hash_field(&mut hasher, &(descriptors.len() as u64).to_le_bytes());
     for d in descriptors {
         hash_field(&mut hasher, d.name.as_bytes());
@@ -748,24 +931,194 @@ pub fn descriptor_drift_finding(
 /// captured descriptors (see [`load_gateway_descriptor_baseline`]).
 #[derive(Debug, Clone)]
 pub struct GatewayDescriptorBaseline {
-    /// A short label for the [`descriptor_drift_finding`] (the lockfile's server
-    /// name when exactly one server recorded descriptors, else a generic label).
+    /// A short label for the [`descriptor_drift_finding`] (the exact selected
+    /// lock entry's human-readable server name).
     pub server_label: String,
-    /// The union of every locked server's captured `tools/list` descriptors,
-    /// normalized (sorted + de-duplicated by name) so it pairs cleanly against a
-    /// freshly captured list in [`compute_descriptor_drift`].
+    /// Exact source/name/transport identity this live upstream is bound to.
+    pub server_identity: String,
+    /// Locked transport used to prove the gateway's live upstream invocation is
+    /// the same configured server before enforcing this descriptor set.
+    pub transport: McpTransport,
+    /// Versioned digest of the exact executable, argv, cwd, environment, and
+    /// containment posture used for the operator-approved capture.
+    pub launch_fingerprint: String,
+    /// Only the selected server's captured `tools/list` descriptors, normalized
+    /// so they pair cleanly against a freshly captured list.
     pub descriptors: Vec<ToolDescriptor>,
+}
+
+/// Descriptor-baseline failures that are distinct from a corrupt lockfile.
+#[derive(Debug)]
+pub enum GatewayDescriptorBaselineError {
+    Lock(McpLockLoadError),
+    /// Secure descriptor protection was requested but the exact upstream has no
+    /// explicit operator-approved descriptor set yet.
+    ApprovalRequired,
+    /// More than one approved server exists and the gateway did not select one.
+    IdentityRequired,
+    /// The supplied identity is not present in the current lockfile.
+    UnknownIdentity,
+    /// A lock with incomplete config coverage cannot authorize a live upstream.
+    IncompleteCoverage,
+    /// The current repo-local MCP inventory no longer matches the committed lock.
+    StaticInventoryDrift,
+    /// The selected transport carries launch state the gateway cannot reproduce
+    /// exactly (currently a non-empty configured stdio environment or non-stdio
+    /// transport).
+    UnsupportedLaunchBinding,
+}
+
+impl std::fmt::Display for GatewayDescriptorBaselineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock(error) => write!(f, "{error}"),
+            Self::ApprovalRequired => write!(f, "live MCP descriptors require operator approval"),
+            Self::IdentityRequired => write!(
+                f,
+                "multiple approved MCP servers exist; select one exact policy identity"
+            ),
+            Self::UnknownIdentity => write!(f, "selected MCP server identity is not locked"),
+            Self::IncompleteCoverage => {
+                write!(f, "MCP lock records incomplete configuration coverage")
+            }
+            Self::StaticInventoryDrift => {
+                write!(f, "MCP static inventory drifted from the committed lock")
+            }
+            Self::UnsupportedLaunchBinding => {
+                write!(
+                    f,
+                    "selected MCP transport cannot be launched with an exact binding"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for GatewayDescriptorBaselineError {}
+
+impl From<McpLockLoadError> for GatewayDescriptorBaselineError {
+    fn from(value: McpLockLoadError) -> Self {
+        Self::Lock(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorApprovalError {
+    IncompleteCoverage,
+    StaticInventoryDrift,
+    UnknownIdentity,
+    UnsupportedTransport,
+    UpstreamMismatch,
+    InvalidLaunchFingerprint,
+    InvalidToolsList,
+}
+
+impl std::fmt::Display for DescriptorApprovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::IncompleteCoverage => "MCP configuration coverage is incomplete",
+            Self::StaticInventoryDrift => "MCP static inventory drifted from the lock",
+            Self::UnknownIdentity => "selected MCP server identity is not locked",
+            Self::UnsupportedTransport => "descriptor approval requires a stdio server",
+            Self::UpstreamMismatch => "live upstream command does not match the selected server",
+            Self::InvalidLaunchFingerprint => {
+                "live upstream launch fingerprint is missing or invalid"
+            }
+            Self::InvalidToolsList => "live tools/list result is malformed or ambiguous",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for DescriptorApprovalError {}
+
+/// Bind a sanitized live `tools/list` result to one exact configured stdio
+/// server and update the in-memory lock. The caller is responsible for an
+/// atomic contained write after rechecking that its on-disk inputs did not
+/// change. Raw descriptions/schemas never enter the lock: only name + canonical
+/// descriptor hash are retained.
+pub fn approve_live_descriptors(
+    lock: &mut McpLockfile,
+    current: &McpInventory,
+    server_identity: &str,
+    upstream_bin: &str,
+    upstream_args: &[String],
+    launch_fingerprint: &str,
+    tools_list_result: &serde_json::Value,
+) -> Result<usize, DescriptorApprovalError> {
+    if launch_fingerprint.is_empty()
+        || launch_fingerprint.len() != 64
+        || !launch_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(DescriptorApprovalError::InvalidLaunchFingerprint);
+    }
+    if !current.malformed_configs.is_empty()
+        || !current.rejected_configs.is_empty()
+        || !lock.malformed_configs.is_empty()
+        || !lock.rejected_configs.is_empty()
+    {
+        return Err(DescriptorApprovalError::IncompleteCoverage);
+    }
+    if !compute_drift(current, lock).is_empty()
+        || current.malformed_configs != lock.malformed_configs
+        || current.rejected_configs != lock.rejected_configs
+    {
+        return Err(DescriptorApprovalError::StaticInventoryDrift);
+    }
+
+    let current_server = current
+        .servers
+        .iter()
+        .find(|server| server.policy_identity() == server_identity)
+        .ok_or(DescriptorApprovalError::UnknownIdentity)?;
+    let locked_server = lock
+        .servers
+        .iter_mut()
+        .find(|server| server.policy_identity() == server_identity)
+        .ok_or(DescriptorApprovalError::UnknownIdentity)?;
+
+    match &current_server.transport {
+        McpTransport::Stdio { env, .. } if !env.is_empty() => {
+            return Err(DescriptorApprovalError::UnsupportedTransport);
+        }
+        McpTransport::Stdio { command, args, .. }
+            if command == upstream_bin && args == upstream_args => {}
+        McpTransport::Stdio { .. } => return Err(DescriptorApprovalError::UpstreamMismatch),
+        _ => return Err(DescriptorApprovalError::UnsupportedTransport),
+    }
+
+    let tools = tools_list_result
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(DescriptorApprovalError::InvalidToolsList)?;
+    let mut names = std::collections::BTreeSet::new();
+    for tool in tools {
+        let name = validate_tool_descriptor_entry(tool)
+            .map_err(|_| DescriptorApprovalError::InvalidToolsList)?;
+        if !names.insert(name) {
+            return Err(DescriptorApprovalError::InvalidToolsList);
+        }
+    }
+
+    let descriptors = descriptors_from_tools_list(tools_list_result);
+    let count = descriptors.len();
+    locked_server.descriptor_hash = compute_descriptor_hash(&descriptors);
+    locked_server.descriptors = descriptors;
+    locked_server.descriptors_approved = true;
+    locked_server.launch_fingerprint = launch_fingerprint.to_ascii_lowercase();
+    Ok(count)
 }
 
 /// Load the descriptor-lock baseline for a live gateway from
 /// `<repo_root>/.tirith/mcp.lock`.
 ///
-/// A gateway fronts a single upstream MCP server but is not told the server's
-/// lockfile NAME, so this unions the captured `descriptors` of EVERY locked
-/// server into one baseline. [`compute_descriptor_drift`] pairs descriptors by
-/// tool name, so a tool keeps its identity regardless of which server record it
-/// came from; the union is the right baseline for "has any approved tool
-/// descriptor changed / has an unapproved tool appeared".
+/// A gateway fronts exactly one upstream MCP server. The selected policy
+/// identity binds its source/name/transport, and this loader returns only that
+/// principal's approved descriptor baseline. When no identity is supplied, a
+/// single approved entry may be selected; multiple entries are an ambiguity
+/// error rather than a cross-server union.
 ///
 /// Returns `Ok(None)` (skip drift detection, run normally) when:
 /// * `repo_root` is `None` (not inside a repo), or
@@ -787,50 +1140,98 @@ pub struct GatewayDescriptorBaseline {
 /// ([`parse_lockfile`]), so a hand-edited `descriptor_hash` cannot silence drift.
 pub fn load_gateway_descriptor_baseline(
     repo_root: Option<&Path>,
-) -> Result<Option<GatewayDescriptorBaseline>, McpLockLoadError> {
+) -> Result<Option<GatewayDescriptorBaseline>, GatewayDescriptorBaselineError> {
+    load_gateway_descriptor_baseline_for(repo_root, None, false)
+}
+
+/// Load an exact server-bound descriptor baseline. `server_identity` is the
+/// versioned key printed by `tirith mcp policy init`. When `require_approved` is
+/// true (secure gateway profile), absence is an approval-required error rather
+/// than silently disabling the rug-pull defense.
+pub fn load_gateway_descriptor_baseline_for(
+    repo_root: Option<&Path>,
+    server_identity: Option<&str>,
+    require_approved: bool,
+) -> Result<Option<GatewayDescriptorBaseline>, GatewayDescriptorBaselineError> {
     let Some(repo_root) = repo_root else {
-        return Ok(None);
+        return if require_approved {
+            Err(GatewayDescriptorBaselineError::ApprovalRequired)
+        } else {
+            Ok(None)
+        };
     };
     let path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
     let lock = match load_lockfile(&path) {
         Ok(lock) => lock,
         // No committed lock: nothing to enforce, run normally.
-        Err(McpLockLoadError::NotFound) => return Ok(None),
+        Err(McpLockLoadError::NotFound) => {
+            return if require_approved {
+                Err(GatewayDescriptorBaselineError::ApprovalRequired)
+            } else {
+                Ok(None)
+            };
+        }
         // A PRESENT lock that won't load is a fail-closed signal, not a silent
         // "no baseline", surface it so the gateway can refuse/suspend under
         // closed mode (IM2).
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
 
-    // Servers that actually captured a live-descriptor set (v6 `descriptors`).
-    let with_descriptors: Vec<&McpLockServer> = lock
+    if !lock.malformed_configs.is_empty() || !lock.rejected_configs.is_empty() {
+        return Err(GatewayDescriptorBaselineError::IncompleteCoverage);
+    }
+
+    let approved: Vec<&McpLockServer> = lock
         .servers
         .iter()
-        .filter(|s| !s.descriptors.is_empty())
+        .filter(|server| server.descriptors_approved)
         .collect();
-    if with_descriptors.is_empty() {
-        return Ok(None);
-    }
-
-    // A single recording server names the finding; otherwise a generic label so a
-    // multi-server repo still gets drift detection without misattributing.
-    let server_label = if with_descriptors.len() == 1 {
-        with_descriptors[0].name.clone()
-    } else {
-        "gateway upstream".to_string()
+    let selected = match server_identity {
+        Some(identity) => {
+            let server = lock
+                .servers
+                .iter()
+                .find(|server| server.policy_identity() == identity)
+                .ok_or(GatewayDescriptorBaselineError::UnknownIdentity)?;
+            if !server.descriptors_approved {
+                return Err(GatewayDescriptorBaselineError::ApprovalRequired);
+            }
+            server
+        }
+        None => match approved.as_slice() {
+            [] if require_approved => return Err(GatewayDescriptorBaselineError::ApprovalRequired),
+            [] => return Ok(None),
+            [server] => *server,
+            _ => return Err(GatewayDescriptorBaselineError::IdentityRequired),
+        },
     };
 
-    let mut all: Vec<ToolDescriptor> = Vec::new();
-    for server in with_descriptors {
-        all.extend(server.descriptors.iter().cloned());
+    // A legacy descriptor record, an empty v7 launch fingerprint, or a current
+    // config that no longer matches the committed static inventory cannot
+    // authorize execution. Descriptor approval is an execution grant, so these
+    // are checked at the load boundary rather than left to a best-effort caller.
+    if lock.schema_state != LockfileSchema::Current || selected.launch_fingerprint.is_empty() {
+        return Err(GatewayDescriptorBaselineError::ApprovalRequired);
     }
-    let descriptors = normalize_descriptors(all);
-    if descriptors.is_empty() {
-        return Ok(None);
+    let current = build_inventory(repo_root);
+    if !current.malformed_configs.is_empty() || !current.rejected_configs.is_empty() {
+        return Err(GatewayDescriptorBaselineError::IncompleteCoverage);
+    }
+    if !compute_drift(&current, &lock).is_empty() {
+        return Err(GatewayDescriptorBaselineError::StaticInventoryDrift);
+    }
+    match &selected.transport {
+        McpTransport::Stdio { env, .. } if env.is_empty() => {}
+        _ => return Err(GatewayDescriptorBaselineError::UnsupportedLaunchBinding),
     }
 
+    let descriptors = normalize_descriptors(selected.descriptors.clone());
+
     Ok(Some(GatewayDescriptorBaseline {
-        server_label,
+        server_label: selected.name.clone(),
+        server_identity: selected.policy_identity(),
+        transport: selected.transport.clone(),
+        launch_fingerprint: selected.launch_fingerprint.clone(),
         descriptors,
     }))
 }
@@ -867,6 +1268,33 @@ pub enum RejectedReason {
         /// io errors fold into `false` (the inner string is not surfaced).
         permission_denied: bool,
     },
+    /// Both supported top-level server maps were present. Different MCP clients
+    /// choose different keys, so accepting either would let the other act as a
+    /// hidden execution surface.
+    AmbiguousServerObjects,
+    /// A server declared both a URL and a subprocess command. Tirith cannot
+    /// safely guess which transport the consuming client will execute.
+    AmbiguousTransport,
+    /// A stdio argument contained a high-confidence credential form (for
+    /// example `--api-key VALUE`, `--token=VALUE`, or a known token prefix).
+    /// No argument bytes are retained in this reason.
+    SecretBearingArgument,
+    /// A URL query/fragment carried a credential-shaped component that cannot
+    /// be committed safely without changing the server endpoint semantics.
+    /// No URL bytes are retained in this reason.
+    SecretBearingUrl,
+    /// At least one declared server value was not an object. Skipping it would
+    /// make the lock inventory differ from clients with more permissive parsers.
+    InvalidServerEntry,
+    /// The JSON document contained two members with the same key in one object.
+    /// Different consumers choose first-wins or last-wins semantics, so no exact
+    /// launch inventory can be derived from it.
+    DuplicateJsonKey,
+    /// A recognized server field had the wrong JSON type or an invalid value.
+    InvalidServerField,
+    /// The server object contained a field Tirith does not model. Refusing the
+    /// whole config is safer than locking a partial launch description.
+    UnsupportedServerField,
 }
 
 /// One rejected config path with the reason it was refused.
@@ -890,11 +1318,10 @@ pub struct McpInventory {
     /// Repo-relative paths discovered but unparseable (non-JSON, or no MCP-server
     /// object). Informational, not an error — they contribute no entries.
     pub malformed_configs: Vec<String>,
-    /// Physically-present config paths the discovery walk REFUSED (symlinked, not
-    /// regular, escaped the repo, oversized, or unreadable), each with a
-    /// structured reason. Distinct from `malformed_configs` (read but didn't
-    /// parse): a rejected config was never read. In-process discovery field only,
-    /// not part of the on-disk lockfile shape (no schema bump).
+    /// Physically-present config paths Tirith refused, either at the filesystem
+    /// boundary (symlinked, non-regular, escaped, oversized, unreadable) or at the
+    /// semantic boundary (ambiguous/secret-bearing declarations). Distinct from
+    /// `malformed_configs`, which could not be interpreted as MCP JSON at all.
     pub rejected_configs: Vec<RejectedConfig>,
 }
 
@@ -930,14 +1357,20 @@ pub struct McpLockServer {
     /// Per-server content hash (see [`McpServerEntry::content_hash`]).
     pub hash: String,
     /// The live `tools/list` descriptors this server advertises, captured at
-    /// runtime (v6). Sorted by tool name, de-duplicated by name (last write
+    /// runtime (introduced in v6 and expanded in v7). Sorted by tool name,
+    /// de-duplicated by name (last write
     /// wins). Empty for a config-only `tirith mcp lock` (the static config files
-    /// do not carry descriptors) and for a v5 lockfile loaded under v6. Excluded
+    /// do not carry descriptors) and for a v5 lockfile loaded under v7. Excluded
     /// from [`Self::hash`] so static config drift is unchanged from v5; folded
     /// instead into [`Self::descriptor_hash`]. Serde-defaults to empty, so a v5
     /// lockfile (no field) deserializes cleanly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub descriptors: Vec<ToolDescriptor>,
+    /// Whether an operator explicitly approved the live descriptor set. This is
+    /// separate from `descriptors.is_empty()`: a legitimate server may advertise
+    /// zero tools, and that empty set must still be enforceable as a baseline.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub descriptors_approved: bool,
     /// Hash over the ordered descriptor list (see [`compute_descriptor_hash`]).
     /// Empty when [`Self::descriptors`] is empty. Lets a caller compare the
     /// live-descriptor surface of two locks cheaply, independent of the static
@@ -945,6 +1378,22 @@ pub struct McpLockServer {
     /// cannot silence descriptor drift.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub descriptor_hash: String,
+    /// Hash of the exact executable bytes/path, argv, effective cwd, environment,
+    /// and containment mode used when live descriptors were approved. Empty for
+    /// config-only and pre-v7 locks; an empty value can never authorize a gateway.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub launch_fingerprint: String,
+}
+
+impl McpLockServer {
+    /// Source-qualified, transport-bound policy key for this locked server.
+    pub fn policy_identity(&self) -> String {
+        policy_identity(&self.source_config, &self.name, &self.transport)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// In-memory schema-state tag on a parsed lockfile. Never serialized; carried
@@ -968,6 +1417,9 @@ pub enum LockfileSchema {
     /// adds a single [`McpDrift::SchemaUpgradeRequired`] (re-lock once to record
     /// descriptors) on top of any real static drift.
     LegacyV5Migration,
+    /// `format_version: 6`: static inventory semantics match v7, but descriptor
+    /// hashes omit v7 Tool fields and no exact launch fingerprint was recorded.
+    LegacyV6Migration,
 }
 
 /// The `.tirith/mcp.lock` document. JSON, deterministically ordered (servers by
@@ -983,6 +1435,16 @@ pub struct McpLockfile {
     pub inventory_hash: String,
     /// Repo-relative paths of the MCP config files captured, sorted.
     pub configs: Vec<String>,
+    /// Configs that were present but could not be interpreted as MCP JSON when
+    /// the baseline was created. Persisted so verification can compare coverage
+    /// rather than silently trusting only the accepted subset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub malformed_configs: Vec<String>,
+    /// Structured filesystem/semantic refusals captured with the baseline.
+    /// Verification always fails while a current rejection exists, even if an
+    /// operator explicitly recorded it with the audited override.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_configs: Vec<RejectedConfig>,
     /// Every locked MCP server, sorted by `(name, source_config)`.
     pub servers: Vec<McpLockServer>,
     /// In-memory schema-state tag: `LegacyV4Migration` for a v4 file,
@@ -1011,7 +1473,9 @@ impl McpLockfile {
                 // Descriptors are captured at runtime from a live `tools/list`,
                 // not from the static config an inventory reads — empty here.
                 descriptors: Vec::new(),
+                descriptors_approved: false,
                 descriptor_hash: String::new(),
+                launch_fingerprint: String::new(),
             })
             .collect();
 
@@ -1029,13 +1493,56 @@ impl McpLockfile {
         configs.sort();
         configs.dedup();
 
+        let mut malformed_configs = inventory.malformed_configs.clone();
+        malformed_configs.sort();
+        malformed_configs.dedup();
+
+        let mut rejected_configs = inventory.rejected_configs.clone();
+        rejected_configs.sort_by(|a, b| a.path.cmp(&b.path));
+        rejected_configs.dedup();
+
         McpLockfile {
             format_version: MCP_LOCK_FORMAT_VERSION,
             inventory_hash,
             configs,
+            malformed_configs,
+            rejected_configs,
             servers,
             schema_state: LockfileSchema::Current,
         }
+    }
+
+    /// Carry forward an operator-approved live descriptor baseline when a
+    /// normal static `mcp lock` refresh proves that the exact server record is
+    /// unchanged. Approval is deliberately invalidated when the source,
+    /// transport, declared tools, or any other content-hashed field changes.
+    ///
+    /// Legacy locks are never a source of approval: v4/v5 did not encode the
+    /// explicit approval bit, while v6 did not bind approval to the complete v7
+    /// descriptor and launch surface. All need fresh live approval.
+    pub fn preserve_approved_descriptors_from(&mut self, previous: &Self) -> usize {
+        if previous.schema_state != LockfileSchema::Current {
+            return 0;
+        }
+
+        let mut preserved = 0;
+        for server in &mut self.servers {
+            let identity = server.policy_identity();
+            let Some(old) = previous.servers.iter().find(|candidate| {
+                candidate.policy_identity() == identity
+                    && candidate.hash == server.hash
+                    && candidate.descriptors_approved
+            }) else {
+                continue;
+            };
+
+            server.descriptors = old.descriptors.clone();
+            server.descriptor_hash = compute_descriptor_hash(&server.descriptors);
+            server.descriptors_approved = true;
+            server.launch_fingerprint = old.launch_fingerprint.clone();
+            preserved += 1;
+        }
+        preserved
     }
 
     /// Render to the on-disk form: pretty JSON with a trailing newline.
@@ -1053,13 +1560,19 @@ impl McpLockfile {
     }
 }
 
-/// Hash the ordered list of per-server content hashes into one inventory hash.
+/// Hash the ordered source-qualified server identities and content hashes into
+/// one inventory hash.
 fn compute_inventory_hash(servers: &[McpLockServer]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"mcp-inventory-v1\0");
+    hasher.update(b"mcp-inventory-v2\0");
+    hash_field(&mut hasher, &(servers.len() as u64).to_le_bytes());
     for server in servers {
-        hasher.update(server.hash.as_bytes());
-        hasher.update(b"\0");
+        // Source is part of the policy principal even though it remains outside
+        // the transport/content hash. The fast equality gate must not collapse
+        // a move between client config files into "no drift".
+        hash_field(&mut hasher, server.name.as_bytes());
+        hash_field(&mut hasher, server.source_config.as_bytes());
+        hash_field(&mut hasher, server.hash.as_bytes());
     }
     hex_lower(&hasher.finalize())
 }
@@ -1304,17 +1817,27 @@ pub fn build_inventory(repo_root: &Path) -> McpInventory {
             }
         };
 
-        match parse_mcp_config(&content, &rel_path) {
-            Some(mut servers) => {
+        match parse_mcp_config_detailed(&content, &rel_path) {
+            Ok(mut servers) => {
                 if servers.is_empty() {
                     // Valid but empty config — not malformed, still a discovered config.
                 } else {
                     inventory.servers.append(&mut servers);
                 }
             }
-            None => {
+            Err(McpConfigParseError::Malformed) => {
                 // Not valid JSON, or no MCP-server object.
                 inventory.malformed_configs.push(rel_path);
+            }
+            Err(McpConfigParseError::Rejected(reason)) => {
+                // A semantic refusal is a coverage gap, not an ignorable parse
+                // error. Remove it from the accepted-config set and retain only
+                // the structured, non-secret reason.
+                inventory.configs.pop();
+                inventory.rejected_configs.push(RejectedConfig {
+                    path: rel_path,
+                    reason,
+                });
             }
         }
     }
@@ -1343,25 +1866,209 @@ pub fn build_inventory(repo_root: &Path) -> McpInventory {
 /// non-object server value is skipped silently — one bad entry must not discard
 /// the rest.
 pub fn parse_mcp_config(content: &str, source_config: &str) -> Option<Vec<McpServerEntry>> {
-    let json: serde_json::Value = serde_json::from_str(content).ok()?;
+    parse_mcp_config_detailed(content, source_config).ok()
+}
 
-    // Canonical `mcpServers` and the `servers` alias — the pair
-    // `configfile::check_mcp_config` accepts.
-    let servers_obj = json
-        .get("mcpServers")
-        .or_else(|| json.get("servers"))
-        .and_then(|v| v.as_object())?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum McpConfigParseError {
+    /// Invalid JSON or no recognized server-map object.
+    Malformed,
+    /// Valid MCP-shaped JSON that must be refused as a security boundary.
+    Rejected(RejectedReason),
+}
+
+/// JSON value deserializer that rejects duplicate object members recursively.
+/// `serde_json::Value` alone is last-wins and therefore cannot prove that Tirith
+/// and an MCP client interpreted the same launch document.
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object members")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(
+            value.to_string(),
+        )))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_unit()
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(UniqueJsonValue(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            let UniqueJsonValue(value) = object.next_value()?;
+            values.insert(key, value);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Object(values)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictJsonError {
+    Malformed,
+    DuplicateObjectKey,
+}
+
+/// Parse JSON without serde_json's last-wins duplicate-member collapse. This is
+/// shared with the MCP gateway so the exact bytes analyzed are never semantically
+/// different from the object forwarded upstream.
+pub fn parse_json_no_duplicates(content: &str) -> Result<serde_json::Value, StrictJsonError> {
+    let mut deserializer = serde_json::Deserializer::from_str(content);
+    let parsed = UniqueJsonValue::deserialize(&mut deserializer).map_err(|error| {
+        if error.to_string().contains("duplicate JSON object key") {
+            StrictJsonError::DuplicateObjectKey
+        } else {
+            StrictJsonError::Malformed
+        }
+    })?;
+    deserializer.end().map_err(|_| StrictJsonError::Malformed)?;
+    Ok(parsed.0)
+}
+
+/// Strict parser used by inventory construction. The public compatibility
+/// wrapper above retains the historical `Option` surface, while this path keeps
+/// semantic security refusals distinct from ordinary malformed JSON so lock and
+/// verify can report/persist coverage honestly.
+fn parse_mcp_config_detailed(
+    content: &str,
+    source_config: &str,
+) -> Result<Vec<McpServerEntry>, McpConfigParseError> {
+    let json = parse_json_no_duplicates(content).map_err(|error| match error {
+        StrictJsonError::Malformed => McpConfigParseError::Malformed,
+        StrictJsonError::DuplicateObjectKey => {
+            McpConfigParseError::Rejected(RejectedReason::DuplicateJsonKey)
+        }
+    })?;
+
+    let has_canonical = json.get("mcpServers").is_some();
+    let has_alias = json.get("servers").is_some();
+    if has_canonical && has_alias {
+        return Err(McpConfigParseError::Rejected(
+            RejectedReason::AmbiguousServerObjects,
+        ));
+    }
+    let top = json.as_object().ok_or(McpConfigParseError::Malformed)?;
+    if top
+        .keys()
+        .any(|field| !matches!(field.as_str(), "mcpServers" | "servers" | "$schema"))
+    {
+        return Err(McpConfigParseError::Rejected(
+            RejectedReason::UnsupportedServerField,
+        ));
+    }
+    if top.get("$schema").is_some_and(|schema| !schema.is_string()) {
+        return Err(McpConfigParseError::Rejected(
+            RejectedReason::InvalidServerField,
+        ));
+    }
+
+    // Canonical `mcpServers` and the `servers` alias are both supported, but
+    // never simultaneously: clients disagree on precedence, so a dual-root
+    // document cannot have one trustworthy inventory.
+    let servers_obj = if has_canonical {
+        json.get("mcpServers")
+    } else {
+        json.get("servers")
+    }
+    .and_then(|v| v.as_object())
+    .ok_or(McpConfigParseError::Malformed)?;
 
     let mut entries = Vec::with_capacity(servers_obj.len());
     for (name, config) in servers_obj {
-        // Skip a non-object server value, keep the rest.
-        let obj = match config.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
+        let obj = config
+            .as_object()
+            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerEntry))?;
 
-        let transport = parse_transport(name, obj);
-        let declared = parse_tools(obj);
+        // Exact-lock mode recognizes a deliberately small launch schema. An
+        // ignored header/env-file/cwd/enable flag can change what another client
+        // launches while leaving Tirith's fingerprint untouched, so any
+        // unmodeled member is a structured coverage refusal.
+        const SUPPORTED_SERVER_FIELDS: &[&str] = &["url", "command", "args", "env", "tools"];
+        if obj
+            .keys()
+            .any(|field| !SUPPORTED_SERVER_FIELDS.contains(&field.as_str()))
+        {
+            return Err(McpConfigParseError::Rejected(
+                RejectedReason::UnsupportedServerField,
+            ));
+        }
+
+        let transport = parse_transport(name, obj)?;
+        let declared = parse_tools_strict(obj)?;
         let tools_declared = declared.was_declared();
         let tools = declared.into_canonical();
 
@@ -1374,43 +2081,383 @@ pub fn parse_mcp_config(content: &str, source_config: &str) -> Option<Vec<McpSer
         });
     }
 
-    Some(entries)
+    Ok(entries)
 }
 
-/// Derive the transport descriptor from a server object. `url` wins over
-/// `command` if both are declared (the higher-risk surface). `server_name` is the
-/// per-entry salt for the URL `userinfo_hash` (see [`redact_url_userinfo`]).
+/// Derive one unambiguous, commit-safe transport descriptor. `server_name` is
+/// the per-entry salt for the URL `userinfo_hash` (see
+/// [`redact_url_userinfo`]).
 fn parse_transport(
     server_name: &str,
     obj: &serde_json::Map<String, serde_json::Value>,
-) -> McpTransport {
-    if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
-        let (redacted_url, userinfo_hash) = redact_url_userinfo(server_name, url);
-        return McpTransport::Url {
-            url: redacted_url,
-            userinfo_hash,
-        };
+) -> Result<McpTransport, McpConfigParseError> {
+    if obj.contains_key("url") && obj.contains_key("command") {
+        return Err(McpConfigParseError::Rejected(
+            RejectedReason::AmbiguousTransport,
+        ));
     }
 
-    if let Some(command) = obj.get("command").and_then(|v| v.as_str()) {
-        let args = obj
-            .get("args")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|a| a.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let env = parse_env(obj);
-        return McpTransport::Stdio {
+    if let Some(url_value) = obj.get("url") {
+        let url = url_value
+            .as_str()
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+        if url_has_secret_bearing_components(url, false) {
+            return Err(McpConfigParseError::Rejected(
+                RejectedReason::SecretBearingUrl,
+            ));
+        }
+        let (redacted_url, userinfo_hash) = redact_url_userinfo(server_name, url);
+        return Ok(McpTransport::Url {
+            url: redacted_url,
+            userinfo_hash,
+        });
+    }
+
+    if let Some(command_value) = obj.get("command") {
+        let command = command_value
+            .as_str()
+            .filter(|command| !command.is_empty())
+            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+        let args: Vec<String> = match obj.get("args") {
+            None => Vec::new(),
+            Some(value) => value
+                .as_array()
+                .filter(|args| args.iter().all(|arg| arg.is_string()))
+                .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?
+                .iter()
+                .map(|arg| arg.as_str().expect("validated string").to_string())
+                .collect(),
+        };
+        if args_have_secret_bearing_value(&args) {
+            return Err(McpConfigParseError::Rejected(
+                RejectedReason::SecretBearingArgument,
+            ));
+        }
+        let env = parse_env_strict(obj)?;
+        return Ok(McpTransport::Stdio {
             command: command.to_string(),
             args,
             env,
-        };
+        });
     }
 
-    McpTransport::Unknown
+    Err(McpConfigParseError::Rejected(
+        RejectedReason::InvalidServerField,
+    ))
+}
+
+/// High-confidence credential classifier for commit-bound stdio arguments. It
+/// deliberately accepts explicit environment references; the reference is safe
+/// to commit and the resolved value stays outside the lockfile.
+fn args_have_secret_bearing_value(args: &[String]) -> bool {
+    for (index, arg) in args.iter().enumerate() {
+        if url_has_secret_bearing_components(arg, true)
+            || value_has_secret_literal(arg)
+            || credential_header_has_literal(arg)
+        {
+            return true;
+        }
+
+        if header_flag_name(arg) {
+            if args
+                .get(index + 1)
+                .is_some_and(|value| credential_header_has_literal(value))
+            {
+                return true;
+            }
+        }
+        if let Some(header) = arg
+            .strip_prefix("--header=")
+            .or_else(|| arg.strip_prefix("-H="))
+            .or_else(|| arg.strip_prefix("-H").filter(|value| !value.is_empty()))
+        {
+            if credential_header_has_literal(header) {
+                return true;
+            }
+        }
+
+        if let Some((key, value)) = split_assignment(arg) {
+            if credential_header_has_literal(value) {
+                return true;
+            }
+            // An arbitrary option name does not make a credential-safe sink.
+            // Reject known literal token shapes on every attached RHS, not just
+            // values attached to a curated list of secret-looking option names.
+            if !is_env_reference(value) && value_has_secret_literal(value) {
+                return true;
+            }
+            if secret_key_name(key) && !value.is_empty() && !is_env_reference(value) {
+                return true;
+            }
+        }
+
+        if secret_flag_name(arg) {
+            if let Some(value) = args.get(index + 1) {
+                if !is_env_reference(value) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn split_assignment(value: &str) -> Option<(&str, &str)> {
+    value
+        .split_once('=')
+        .or_else(|| value.strip_prefix('/').and_then(|v| v.split_once(':')))
+}
+
+fn secret_flag_name(value: &str) -> bool {
+    let trimmed = value.trim_start_matches('-').trim_start_matches('/');
+    !trimmed.is_empty() && !trimmed.contains(['=', ':']) && secret_key_name(trimmed)
+}
+
+fn header_flag_name(value: &str) -> bool {
+    let normalized: String = value
+        .trim_start_matches('-')
+        .trim_start_matches('/')
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "h" | "header" | "headers" | "httpheader" | "httpheaders" | "requestheader"
+    )
+}
+
+fn secret_key_name(value: &str) -> bool {
+    let normalized: String = value
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "apikey"
+            | "auth"
+            | "key"
+            | "accesstoken"
+            | "accesskey"
+            | "awsaccesskeyid"
+            | "awssecretaccesskey"
+            | "authtoken"
+            | "bearertoken"
+            | "token"
+            | "sessiontoken"
+            | "securitytoken"
+            | "refreshtoken"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "secretkey"
+            | "clientsecret"
+            | "credential"
+            | "credentials"
+            | "authorization"
+            | "privatekey"
+            | "signature"
+            | "sig"
+            | "xamzsignature"
+            | "xamzcredential"
+            | "xamzsecuritytoken"
+    )
+}
+
+/// Recognize credential-bearing HTTP header syntax without retaining or
+/// returning the value. Benign headers such as Accept/Content-Type remain
+/// lockable; authorization, cookie, and common API-key headers must be an
+/// explicit environment reference (optionally following an auth scheme).
+fn credential_header_has_literal(raw: &str) -> bool {
+    let Some((name, value)) = raw.split_once(':') else {
+        return false;
+    };
+    let normalized: String = name
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | '.' | ' ' | '\t'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    let sensitive = matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxyauthorization"
+            | "cookie"
+            | "setcookie"
+            | "xapikey"
+            | "xauthtoken"
+            | "xaccesstoken"
+            | "xawssecuritytoken"
+    );
+    if !sensitive {
+        return false;
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if is_env_reference(value) {
+        return false;
+    }
+    let after_scheme = value
+        .split_once(char::is_whitespace)
+        .map(|(_, credential)| credential.trim());
+    !after_scheme.is_some_and(is_env_reference)
+}
+
+fn is_env_reference(value: &str) -> bool {
+    let trimmed = value.trim();
+    let identifier = if let Some(body) = trimmed
+        .strip_prefix("${")
+        .and_then(|body| body.strip_suffix('}'))
+    {
+        body.strip_prefix("env:").unwrap_or(body)
+    } else if let Some(body) = trimmed.strip_prefix("$env:") {
+        body
+    } else if let Some(body) = trimmed.strip_prefix('$') {
+        body
+    } else if let Some(body) = trimmed
+        .strip_prefix('%')
+        .and_then(|body| body.strip_suffix('%'))
+    {
+        body
+    } else {
+        return false;
+    };
+
+    // Accept only an actual environment-variable identifier. In particular,
+    // `${anything at all}` is not proof of indirection: a credential-shaped
+    // body can itself be a syntactically valid identifier, so reject known
+    // literal token shapes before applying the identifier grammar.
+    !looks_like_secret_literal(identifier) && valid_env_identifier(identifier)
+}
+
+fn valid_env_identifier(identifier: &str) -> bool {
+    let mut chars = identifier.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn value_has_secret_literal(value: &str) -> bool {
+    bounded_percent_decode(value)
+        .as_deref()
+        .is_none_or(looks_like_secret_literal)
+}
+
+fn looks_like_secret_literal(value: &str) -> bool {
+    let value = value.trim();
+    let known_prefix = [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "npm_",
+        "sk-proj-",
+        "sk_live_",
+        "rk_live_",
+        "xoxb-",
+        "xoxp-",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix) && value.len() >= prefix.len() + 12);
+    if known_prefix {
+        return true;
+    }
+    if value.starts_with("AKIA")
+        && value.len() == 20
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return true;
+    }
+    let jwt_parts: Vec<&str> = value.split('.').collect();
+    jwt_parts.len() == 3
+        && jwt_parts.iter().all(|part| {
+            part.len() >= 8
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+}
+
+/// Detect credential-bearing URL components without returning/logging them.
+/// `reject_userinfo` is true for URLs embedded in stdio arguments (which would
+/// otherwise be serialized verbatim); the top-level URL transport instead
+/// hashes and strips userinfo via `redact_url_userinfo`.
+fn url_has_secret_bearing_components(raw: &str, reject_userinfo: bool) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        let fragment_present = raw
+            .split_once('#')
+            .is_some_and(|(_, fragment)| !fragment.is_empty());
+        if fragment_present {
+            return true;
+        }
+        let query = raw
+            .split_once('?')
+            .map(|(_, tail)| tail.split('#').next().unwrap_or(""));
+        return query.is_some_and(query_has_secret_parameter);
+    };
+
+    if reject_userinfo && (!parsed.username().is_empty() || parsed.password().is_some()) {
+        return true;
+    }
+    if parsed
+        .fragment()
+        .is_some_and(|fragment| !fragment.is_empty())
+    {
+        return true;
+    }
+    parsed
+        .query_pairs()
+        .any(|(key, value)| query_pair_has_secret(&key, &value))
+}
+
+fn query_has_secret_parameter(query: &str) -> bool {
+    url::form_urlencoded::parse(query.as_bytes())
+        .any(|(key, value)| query_pair_has_secret(&key, &value))
+}
+
+fn query_pair_has_secret(key: &str, value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let Some(decoded_key) = bounded_percent_decode(key) else {
+        return true;
+    };
+    let Some(decoded_value) = bounded_percent_decode(value) else {
+        return true;
+    };
+    !is_env_reference(&decoded_value)
+        && (secret_key_name(&decoded_key) || looks_like_secret_literal(&decoded_value))
+}
+
+/// Decode nested percent escapes to a fixed point with a small work bound. A
+/// component that still changes after the bound (or decodes to invalid UTF-8)
+/// is rejected by callers rather than treated as a clean opaque value.
+fn bounded_percent_decode(value: &str) -> Option<String> {
+    const MAX_DECODE_PASSES: usize = 4;
+    let mut current = value.to_string();
+    for _ in 0..MAX_DECODE_PASSES {
+        let decoded = percent_encoding::percent_decode_str(&current)
+            .decode_utf8()
+            .ok()?
+            .into_owned();
+        if decoded == current {
+            return Some(current);
+        }
+        current = decoded;
+    }
+    let next = percent_encoding::percent_decode_str(&current)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    (next == current).then_some(current)
 }
 
 /// Strip any HTTP Basic Auth userinfo from a URL, returning the redacted URL and
@@ -1551,60 +2598,62 @@ fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<S
 }
 
 /// Extract a stdio server's `env` as `(name, value_hash)` entries, sorted by name
-/// for a stable hash. A non-string value is hashed by its compact JSON form (not
-/// dropped); a missing/non-object `env` yields an empty vec.
+/// for a stable hash. Every value must be a string; accepting a different type
+/// and stringifying it would not prove that another client launches the same env.
 ///
 /// `env` is security-relevant (what the config injects into the subprocess), so
 /// capturing it surfaces a swapped credential as drift. **The raw value never
 /// leaves this function** (v3 invariant): consumed by [`McpEnvEntry::from_raw`]
 /// and dropped, never reaching a struct/serializer/log.
-fn parse_env(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<McpEnvEntry> {
-    let mut env: Vec<McpEnvEntry> = obj
-        .get("env")
-        .and_then(|v| v.as_object())
-        .map(|map| {
-            map.iter()
-                .map(|(k, v)| {
-                    // String value hashed verbatim; any other JSON value by its
-                    // compact form. The raw value lives only long enough for
-                    // `from_raw` to consume it.
-                    let raw_value: String = match v.as_str() {
-                        Some(s) => s.to_string(),
-                        None => v.to_string(),
-                    };
-                    McpEnvEntry::from_raw(k, &raw_value)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+fn parse_env_strict(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<McpEnvEntry>, McpConfigParseError> {
+    let Some(value) = obj.get("env") else {
+        return Ok(Vec::new());
+    };
+    let map = value
+        .as_object()
+        .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+    if !map.values().all(serde_json::Value::is_string) {
+        return Err(McpConfigParseError::Rejected(
+            RejectedReason::InvalidServerField,
+        ));
+    }
+    let mut env: Vec<McpEnvEntry> = map
+        .iter()
+        .map(|(name, value)| McpEnvEntry::from_raw(name, value.as_str().expect("validated string")))
+        .collect();
     env.sort_by(|a, b| a.name.cmp(&b.name));
-    env
+    Ok(env)
 }
 
 /// Extract the declared tool list, distinguishing the four on-wire states:
 /// `Omitted` (no key), `EmptyDeclared` (`"tools": []`), `Declared` (a string
-/// array, sorted/de-duplicated, non-strings dropped), and `Invalid` (a `tools`
-/// value that isn't an array). The lockfile collapses Omitted/EmptyDeclared,
+/// array, sorted/de-duplicated). A wrong type or non-string element is a coverage
+/// refusal rather than being silently dropped. The lockfile collapses Omitted/EmptyDeclared,
 /// preserving the distinction via `tools_declared` (PR121_FIX_LIST_TRIAGE item 7).
-fn parse_tools(obj: &serde_json::Map<String, serde_json::Value>) -> DeclaredTools {
+fn parse_tools_strict(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<DeclaredTools, McpConfigParseError> {
     let Some(value) = obj.get("tools") else {
-        return DeclaredTools::Omitted;
+        return Ok(DeclaredTools::Omitted);
     };
-    let Some(arr) = value.as_array() else {
-        return DeclaredTools::Invalid(Vec::new());
-    };
+    let arr = value
+        .as_array()
+        .filter(|tools| tools.iter().all(serde_json::Value::is_string))
+        .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
     let mut tools: Vec<String> = arr
         .iter()
-        .filter_map(|t| t.as_str().map(str::to_string))
+        .map(|tool| tool.as_str().expect("validated string").to_string())
         .collect();
     tools.sort();
     tools.dedup();
     if tools.is_empty() {
         // Empty array, or all elements non-string — both equivalent to "no
         // declarable tools".
-        DeclaredTools::EmptyDeclared
+        Ok(DeclaredTools::EmptyDeclared)
     } else {
-        DeclaredTools::Declared(tools)
+        Ok(DeclaredTools::Declared(tools))
     }
 }
 
@@ -1827,7 +2876,10 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
     // `tools/list` descriptor capture is new — re-locking records it — so the
     // `SchemaUpgradeRequired` prompt rides on top of whatever static drift the
     // normal walk below finds.
-    if matches!(lock.schema_state, LockfileSchema::LegacyV5Migration) {
+    if matches!(
+        lock.schema_state,
+        LockfileSchema::LegacyV5Migration | LockfileSchema::LegacyV6Migration
+    ) {
         let mut drifts = compute_drift_static(current, lock);
         drifts.push(McpDrift::SchemaUpgradeRequired {
             from_version: lock.format_version,
@@ -2242,11 +3294,10 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
 /// offer a precise re-lock/upgrade message. A legacy v3-shape file (missing
 /// fields default) is still caught here via its preserved `format_version: 3`.
 ///
-/// **v4 / v5 → v6 migration:** a `format_version: 4` or `5` lockfile (an on-disk
-/// shape the v6 struct deserializes — the v6 descriptor field serde-defaults to
-/// empty) is ACCEPTED and tagged [`LockfileSchema::LegacyV4Migration`] /
-/// [`LockfileSchema::LegacyV5Migration`]; the recompute-on-parse pass below makes
-/// it v6-coherent internally, and [`compute_drift`] returns a single
+/// **v4 / v5 / v6 → v7 migration:** a `format_version: 4`, `5`, or `6` lockfile
+/// is ACCEPTED and tagged with its corresponding legacy migration state; fields
+/// introduced later serde-default safely. The recompute-on-parse pass below makes
+/// the static inventory coherent internally, and [`compute_drift`] returns a single
 /// [`McpDrift::SchemaUpgradeRequired`] (re-lock once) on top of any real static
 /// drift.
 ///
@@ -2279,6 +3330,7 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
         v if v == MCP_LOCK_FORMAT_VERSION => LockfileSchema::Current,
         4 => LockfileSchema::LegacyV4Migration,
         5 => LockfileSchema::LegacyV5Migration,
+        6 => LockfileSchema::LegacyV6Migration,
         _ => {
             return Err(McpLockLoadError::UnsupportedVersion {
                 found: probe.format_version,
@@ -2303,6 +3355,12 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
             .cmp(&b.name)
             .then_with(|| a.source_config.cmp(&b.source_config))
     });
+    lock.configs.sort();
+    lock.configs.dedup();
+    lock.malformed_configs.sort();
+    lock.malformed_configs.dedup();
+    lock.rejected_configs.sort_by(|a, b| a.path.cmp(&b.path));
+    lock.rejected_configs.dedup();
 
     // Recompute every hash from the lockfile's DATA — the deserialized
     // `hash`/`inventory_hash`/`descriptor_hash` are discarded, so a hand-edited
@@ -2323,6 +3381,12 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
         // the descriptor hash from the data, so a forged or mis-ordered
         // `descriptor_hash` cannot silence descriptor drift either.
         server.descriptors = normalize_descriptors(std::mem::take(&mut server.descriptors));
+        // Pre-approval-bit v6 lockfiles represented approval solely by a
+        // non-empty descriptor vector. Preserve that safe existing baseline;
+        // the explicit bit additionally lets a newly approved empty set exist.
+        if !server.descriptors.is_empty() {
+            server.descriptors_approved = true;
+        }
         server.descriptor_hash = compute_descriptor_hash(&server.descriptors);
     }
     lock.inventory_hash = compute_inventory_hash(&lock.servers);
@@ -2465,32 +3529,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_server_with_no_transport_is_unknown() {
-        // A server object declaring neither `url` nor `command` is captured
-        // with an Unknown transport rather than dropped.
+    fn parse_server_with_no_transport_is_rejected() {
+        // A server with no launch transport cannot be bound exactly.
         let content = r#"{ "mcpServers": { "weird": { "tools": ["x"] } } }"#;
-        let entries = parse_mcp_config(content, ".mcp.json").expect("valid config");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].transport, McpTransport::Unknown);
-        assert_eq!(entries[0].tools, vec!["x"]);
+        assert_eq!(
+            parse_mcp_config_detailed(content, ".mcp.json"),
+            Err(McpConfigParseError::Rejected(
+                RejectedReason::InvalidServerField
+            ))
+        );
     }
 
     #[test]
-    fn parse_url_wins_when_both_declared() {
-        // A malformed config declaring both `url` and `command`: the URL (the
-        // higher-risk surface) is the one recorded. The bare-host URL is
-        // canonicalized to its trailing-`/` form (the same shape it would
-        // take after userinfo stripping, so removing a credential never
-        // surfaces as a spurious `UrlChanged`).
+    fn parse_rejects_url_and_command_ambiguity() {
+        // Clients disagree on precedence; choosing either would let the other
+        // transport become a hidden execution surface.
         let content =
             r#"{ "mcpServers": { "both": { "url": "https://x.example", "command": "node" } } }"#;
-        let entries = parse_mcp_config(content, ".mcp.json").unwrap();
         assert_eq!(
-            entries[0].transport,
-            McpTransport::Url {
-                url: "https://x.example/".to_string(),
-                userinfo_hash: None,
-            }
+            parse_mcp_config_detailed(content, ".mcp.json"),
+            Err(McpConfigParseError::Rejected(
+                RejectedReason::AmbiguousTransport
+            ))
         );
     }
 
@@ -2528,22 +3588,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_skips_non_object_server_keeps_others() {
-        // One server value is a string (malformed); the other is valid. The
-        // good one survives.
+    fn parse_rejects_non_object_server_instead_of_locking_subset() {
+        // Skipping a client-visible declaration would make the accepted subset
+        // look complete, so the entire config becomes a coverage refusal.
         let content = r#"{ "mcpServers": { "bad": "oops", "good": { "command": "node" } } }"#;
-        let entries = parse_mcp_config(content, ".mcp.json").unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "good");
+        assert_eq!(
+            parse_mcp_config_detailed(content, ".mcp.json"),
+            Err(McpConfigParseError::Rejected(
+                RejectedReason::InvalidServerEntry
+            ))
+        );
     }
 
     #[test]
-    fn parse_tools_drops_non_string_entries() {
+    fn parse_tools_rejects_non_string_entries() {
         let content =
             r#"{ "mcpServers": { "s": { "command": "n", "tools": ["ok", 42, null, "ok"] } } }"#;
-        let entries = parse_mcp_config(content, "mcp.json").unwrap();
-        // 42 and null dropped; the duplicate "ok" de-duplicated.
-        assert_eq!(entries[0].tools, vec!["ok"]);
+        assert_eq!(
+            parse_mcp_config_detailed(content, "mcp.json"),
+            Err(McpConfigParseError::Rejected(
+                RejectedReason::InvalidServerField
+            ))
+        );
     }
 
     #[test]
@@ -2996,28 +4062,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_is_sorted_and_handles_non_string_values() {
-        // Keys come back sorted regardless of JSON order; a non-string value is
-        // captured by its JSON rendering and then hashed rather than dropped.
+    fn parse_env_rejects_non_string_values() {
+        // Stringifying a non-string env value would not prove another client's
+        // effective child environment, so the whole config is refused.
         let content = r#"{
             "mcpServers": {
                 "s": { "command": "n", "env": { "ZED": "z", "ABLE": 7 } }
             }
         }"#;
-        let entries = parse_mcp_config(content, ".mcp.json").unwrap();
-        match &entries[0].transport {
-            McpTransport::Stdio { env, .. } => {
-                // `7` becomes the compact JSON form `"7"` before hashing.
-                assert_eq!(
-                    env,
-                    &vec![
-                        McpEnvEntry::from_raw("ABLE", "7"),
-                        McpEnvEntry::from_raw("ZED", "z"),
-                    ]
-                );
-            }
-            other => panic!("expected stdio transport, got {other:?}"),
-        }
+        assert_eq!(
+            parse_mcp_config_detailed(content, ".mcp.json"),
+            Err(McpConfigParseError::Rejected(
+                RejectedReason::InvalidServerField
+            ))
+        );
     }
 
     #[test]
@@ -3087,18 +4145,18 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_format_version_is_6() {
-        // v6 captures the live `tools/list` descriptor surface (description /
-        // inputSchema / outputSchema / annotations / icons), each hashed via
+    fn lockfile_format_version_is_7() {
+        // v7 captures the complete live `tools/list` descriptor surface, each hashed via
         // `canonical_json`, into a separate `descriptor_hash` (NOT folded into
-        // `content_hash`, so static config drift is unchanged from v5). v4 and v5
+        // `content_hash`, so static config drift is unchanged from v5), and binds
+        // approvals to an exact launch fingerprint. v4, v5, and v6
         // lockfiles are accepted at parse time and tagged
-        // `LockfileSchema::LegacyV4Migration` / `LegacyV5Migration` so
+        // with their migration schema states so
         // `compute_drift` surfaces a one-time migration prompt on top of any real
         // static drift.
-        assert_eq!(MCP_LOCK_FORMAT_VERSION, 6);
+        assert_eq!(MCP_LOCK_FORMAT_VERSION, 7);
         let lock = McpLockfile::from_inventory(&McpInventory::default());
-        assert_eq!(lock.format_version, 6);
+        assert_eq!(lock.format_version, 7);
     }
 
     #[test]
@@ -4627,14 +5685,11 @@ mod tests {
     }
 
     #[test]
-    fn drift_silent_when_unchanged_server_moves_between_configs() {
-        // `content_hash` deliberately excludes `source_config` — chunk 1's
-        // documented invariant — and `inventory_hash` is the ordered
-        // concatenation of `content_hash`es. So moving an unchanged server
-        // from one config file to another does NOT register as drift: the
-        // *content* is the same, only the location changed, and the chunk-1
-        // schema treated that as a non-event. The fast-path inventory_hash
-        // comparison cleanly catches this and short-circuits to no drift.
+    fn drift_detects_unchanged_server_moving_between_config_principals() {
+        // The transport content is unchanged, but source_config is part of the
+        // policy principal. The inventory fast hash must therefore admit the
+        // merge walk, which reports the old principal removed and the new one
+        // added instead of incorrectly returning clean.
         let prev = mk_inventory(vec![McpServerEntry {
             tools_declared: true,
             source_config: ".mcp.json".into(),
@@ -4649,8 +5704,18 @@ mod tests {
         }]);
         let drifts = compute_drift(&cur, &lock);
         assert!(
-            drifts.is_empty(),
-            "moving an unchanged server between configs must be silent: {drifts:?}"
+            drifts.iter().any(|drift| matches!(
+                drift,
+                McpDrift::Removed { source_config, .. } if source_config == ".mcp.json"
+            )),
+            "old source-qualified principal must be removed: {drifts:?}"
+        );
+        assert!(
+            drifts.iter().any(|drift| matches!(
+                drift,
+                McpDrift::Added { source_config, .. } if source_config == ".vscode/mcp.json"
+            )),
+            "new source-qualified principal must be added: {drifts:?}"
         );
     }
 
@@ -5709,20 +6774,23 @@ mod tests {
         // Omitted: no `tools` key on the server object.
         let obj_omitted: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{ "command": "node" }"#).unwrap();
-        assert_eq!(parse_tools(&obj_omitted), DeclaredTools::Omitted);
+        assert_eq!(parse_tools_strict(&obj_omitted), Ok(DeclaredTools::Omitted));
         assert!(!DeclaredTools::Omitted.was_declared());
 
         // Empty-declared: `"tools": []`.
         let obj_empty: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{ "command": "node", "tools": [] }"#).unwrap();
-        assert_eq!(parse_tools(&obj_empty), DeclaredTools::EmptyDeclared);
+        assert_eq!(
+            parse_tools_strict(&obj_empty),
+            Ok(DeclaredTools::EmptyDeclared)
+        );
         assert!(DeclaredTools::EmptyDeclared.was_declared());
 
         // Declared with a non-empty list.
         let obj_declared: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{ "command": "node", "tools": ["read", "write"] }"#).unwrap();
-        match parse_tools(&obj_declared) {
-            DeclaredTools::Declared(v) => {
+        match parse_tools_strict(&obj_declared) {
+            Ok(DeclaredTools::Declared(v)) => {
                 assert_eq!(v, vec!["read".to_string(), "write".to_string()]);
             }
             other => panic!("expected Declared, got {other:?}"),
@@ -5732,8 +6800,10 @@ mod tests {
         let obj_invalid: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{ "command": "node", "tools": "oops" }"#).unwrap();
         assert_eq!(
-            parse_tools(&obj_invalid),
-            DeclaredTools::Invalid(Vec::new())
+            parse_tools_strict(&obj_invalid),
+            Err(McpConfigParseError::Rejected(
+                RejectedReason::InvalidServerField
+            ))
         );
     }
 
@@ -5944,6 +7014,44 @@ mod tests {
             base_hash,
             ToolDescriptor::from_tool_entry(&icon).descriptor_hash
         );
+
+        for changed in [
+            serde_json::json!({"name":"run","title":"Run","description":"safe","inputSchema":{"type":"object"}}),
+            serde_json::json!({"name":"run","description":"safe","inputSchema":{"type":"object"},"outputSchema":{"type":"object"}}),
+            serde_json::json!({"name":"run","description":"safe","inputSchema":{"type":"object"},"execution":{"taskSupport":"required"}}),
+            serde_json::json!({"name":"run","description":"safe","inputSchema":{"type":"object"},"_meta":{"vendor/guard":"strict"}}),
+        ] {
+            assert_ne!(
+                base_hash,
+                ToolDescriptor::from_tool_entry(&changed).descriptor_hash,
+                "every v7 Tool field must participate in descriptor drift"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_tool_descriptor_validation_rejects_unknown_or_malformed_fields() {
+        let valid = serde_json::json!({
+            "name": "run",
+            "title": "Run",
+            "inputSchema": {"type": "object"},
+            "icons": [{"src": "data:image/png;base64,AA==", "theme": "light"}],
+            "execution": {"taskSupport": "optional"},
+            "_meta": {"vendor/key": true}
+        });
+        assert_eq!(validate_tool_descriptor_entry(&valid), Ok("run"));
+        for invalid in [
+            serde_json::json!({"name":"run","inputSchema":{"type":"object"},"futureExec":true}),
+            serde_json::json!({"name":"run","title":1,"inputSchema":{"type":"object"}}),
+            serde_json::json!({"name":"run","inputSchema":true}),
+            serde_json::json!({"name":"run","inputSchema":{"type":"object"},"icons":[{"theme":"dark"}]}),
+            serde_json::json!({"name":"run","inputSchema":{"type":"object"},"_meta":[]}),
+        ] {
+            assert!(
+                validate_tool_descriptor_entry(&invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -6114,7 +7222,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_descriptors_excluded_from_content_hash() {
+    fn v7_descriptors_excluded_from_content_hash() {
         // The static `content_hash` must NOT depend on descriptors — adding live
         // descriptors to a server cannot change its static config hash (so static
         // config drift is byte-for-byte unchanged from v5).
@@ -6130,7 +7238,9 @@ mod tests {
             source_config: ".mcp.json".into(),
             hash: String::new(),
             descriptors: vec![],
+            descriptors_approved: false,
             descriptor_hash: String::new(),
+            launch_fingerprint: String::new(),
         };
         let entry = McpServerEntry {
             name: base.name.clone(),
@@ -6154,8 +7264,8 @@ mod tests {
     }
 
     #[test]
-    fn v6_lockfile_with_descriptors_round_trips() {
-        // A v6 lockfile carrying captured descriptors serializes and parses back
+    fn v7_lockfile_with_descriptors_round_trips() {
+        // A v7 lockfile carrying captured descriptors serializes and parses back
         // identically; the descriptor hash is recomputed at parse from the data.
         let descs = descriptors_from_tools_list(
             &serde_json::from_str(
@@ -6173,25 +7283,33 @@ mod tests {
         assert!(rendered.contains("\"descriptors\""));
         assert!(rendered.contains("\"descriptor_hash\""));
 
-        let parsed = parse_lockfile(&rendered).expect("v6 lockfile with descriptors must parse");
-        assert_eq!(parsed.format_version, 6);
+        let parsed = parse_lockfile(&rendered).expect("v7 lockfile with descriptors must parse");
+        assert_eq!(parsed.format_version, 7);
         assert_eq!(parsed.schema_state, LockfileSchema::Current);
         assert_eq!(parsed.servers[0].descriptors, descs);
         assert_eq!(parsed.servers[0].descriptor_hash, dh);
     }
 
-    /// Build a v6 lockfile carrying captured descriptors for `server`, and write
+    /// Build a v7 lockfile carrying captured descriptors for `server`, and write
     /// it to `<repo>/.tirith/mcp.lock`. Returns the descriptor list for assertions.
     fn write_lock_with_descriptors(
         repo: &Path,
         server: &str,
         tools_list_json: &str,
     ) -> Vec<ToolDescriptor> {
+        std::fs::write(
+            repo.join(".mcp.json"),
+            format!(r#"{{"mcpServers":{{"{server}":{{"command":"node"}}}}}}"#),
+        )
+        .unwrap();
         let descs = descriptors_from_tools_list(&serde_json::from_str(tools_list_json).unwrap());
-        let mut lock =
-            McpLockfile::from_inventory(&mk_inventory(vec![stdio_server(server, "node")]));
+        let inventory = build_inventory(repo);
+        let mut lock = McpLockfile::from_inventory(&inventory);
         lock.servers[0].descriptors = descs.clone();
         lock.servers[0].descriptor_hash = compute_descriptor_hash(&descs);
+        lock.servers[0].descriptors_approved = true;
+        lock.servers[0].launch_fingerprint =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let dir = repo.join(".tirith");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
@@ -6274,7 +7392,10 @@ mod tests {
         let err = load_gateway_descriptor_baseline(Some(repo.path()))
             .expect_err("a present corrupt lock must be a load error, not Ok(None)");
         assert!(
-            matches!(err, McpLockLoadError::Parse { .. }),
+            matches!(
+                err,
+                GatewayDescriptorBaselineError::Lock(McpLockLoadError::Parse { .. })
+            ),
             "corrupt JSON must be a Parse error: {err:?}"
         );
     }
@@ -6300,6 +7421,7 @@ mod tests {
             ]
         }"#;
         let parsed = parse_lockfile(body).expect("v6 lockfile must parse");
+        assert_eq!(parsed.schema_state, LockfileSchema::LegacyV6Migration);
         let recomputed = compute_descriptor_hash(&parsed.servers[0].descriptors);
         assert_eq!(
             parsed.servers[0].descriptor_hash, recomputed,
@@ -6309,10 +7431,10 @@ mod tests {
     }
 
     #[test]
-    fn v5_lockfile_triggers_v6_migration_message() {
-        // A `format_version: 5` lockfile parses cleanly (the v6 descriptor field
+    fn v5_lockfile_triggers_v7_migration_message() {
+        // A `format_version: 5` lockfile parses cleanly (the descriptor field
         // serde-defaults to empty) and `compute_drift` emits a single
-        // `SchemaUpgradeRequired (5 -> 6)` entry when the static inventory matches.
+        // `SchemaUpgradeRequired (5 -> 7)` entry when the static inventory matches.
         let body = r#"{
             "format_version": 5,
             "inventory_hash": "abc",
@@ -6328,7 +7450,7 @@ mod tests {
                 }
             ]
         }"#;
-        let parsed = parse_lockfile(body).expect("v5 lockfile must parse under v6");
+        let parsed = parse_lockfile(body).expect("v5 lockfile must parse under v7");
         assert_eq!(parsed.schema_state, LockfileSchema::LegacyV5Migration);
         assert_eq!(parsed.format_version, 5);
         // No descriptors yet.
@@ -6336,7 +7458,7 @@ mod tests {
 
         let inv = mk_inventory(vec![stdio_server("s", "node")]);
         let drifts = compute_drift(&inv, &parsed);
-        // Exactly the migration prompt (5 -> 6), nothing else (static side matches).
+        // Exactly the migration prompt (5 -> 7), nothing else (static side matches).
         assert_eq!(drifts.len(), 1, "{drifts:?}");
         match &drifts[0] {
             McpDrift::SchemaUpgradeRequired {
@@ -6378,7 +7500,7 @@ mod tests {
             drifts
                 .iter()
                 .any(|d| matches!(d, McpDrift::SchemaUpgradeRequired { from_version, .. } if *from_version == 5)),
-            "expected the v5->v6 migration prompt: {drifts:?}",
+            "expected the v5->v7 migration prompt: {drifts:?}",
         );
         let changed = drifts.iter().find_map(|d| match d {
             McpDrift::Changed(entry) if entry.name == "s" => Some(entry),
@@ -6393,5 +7515,318 @@ mod tests {
             "expected CommandChanged: {:?}",
             entry.transport_changes,
         );
+    }
+
+    #[test]
+    fn strict_parser_rejects_dual_server_roots_and_secret_transports() {
+        let dual = r#"{"mcpServers":{},"servers":{}}"#;
+        assert_eq!(
+            parse_mcp_config_detailed(dual, ".mcp.json"),
+            Err(McpConfigParseError::Rejected(
+                RejectedReason::AmbiguousServerObjects
+            ))
+        );
+
+        for args in [
+            r#"["--api-key","ghp_12345678901234567890"]"#,
+            r#"["--token=literal-secret"]"#,
+            r#"["--foo=ghp_12345678901234567890"]"#,
+            r#"["--mode=AKIA1234567890123456"]"#,
+            r#"["--foo=%2567%2568%2570%255f12345678901234567890"]"#,
+            r#"["--token","${ghp_12345678901234567890}"]"#,
+            r#"["--token","${Authorization: Bearer literal-secret}"]"#,
+            r#"["https://host.test/path?access_token=literal"]"#,
+            r#"["-H","Authorization: Bearer literal-secret"]"#,
+            r#"["--header=Cookie: session=literal-secret"]"#,
+            r#"["--headers=Authorization: Bearer literal-secret"]"#,
+            r#"["--http-header","X-Api-Key: literal-secret"]"#,
+            r#"["https://host.test/path?opaque=ghp_12345678901234567890"]"#,
+            r#"["https://host.test/path?opaque=%2567%2568%2570%255f12345678901234567890"]"#,
+        ] {
+            let body = format!(r#"{{"mcpServers":{{"s":{{"command":"node","args":{args}}}}}}}"#);
+            assert_eq!(
+                parse_mcp_config_detailed(&body, ".mcp.json"),
+                Err(McpConfigParseError::Rejected(
+                    RejectedReason::SecretBearingArgument
+                )),
+                "secret args must be rejected: {args}"
+            );
+        }
+
+        for url in [
+            "https://host.test/mcp?access_token=literal",
+            "https://host.test/mcp#bearer-token",
+        ] {
+            let body = format!(r#"{{"mcpServers":{{"s":{{"url":"{url}"}}}}}}"#);
+            assert_eq!(
+                parse_mcp_config_detailed(&body, ".mcp.json"),
+                Err(McpConfigParseError::Rejected(
+                    RejectedReason::SecretBearingUrl
+                ))
+            );
+        }
+
+        // Explicit environment references and non-secret routing queries remain
+        // lockable; the raw credential stays outside the committed document.
+        let safe = r#"{"mcpServers":{"s":{"command":"node","args":["--token","${env:MCP_TOKEN}","--header","Authorization: Bearer ${MCP_TOKEN}","--header=Accept: application/json","--mode=$MODE","--profile=%PROFILE%","--shell=$env:MCP_TOKEN","https://host.test/mcp?region=us"]}}}"#;
+        assert!(parse_mcp_config(safe, ".mcp.json").is_some());
+    }
+
+    #[test]
+    fn strict_parser_rejects_duplicate_unknown_and_ill_typed_launch_fields() {
+        for duplicate in [
+            r#"{"mcpServers":{"s":{"command":"node","command":"deno"}}}"#,
+            r#"{"mcpServers":{"s":{"command":"node","env":{"MODE":"a","MODE":"b"}}}}"#,
+        ] {
+            assert_eq!(
+                parse_mcp_config_detailed(duplicate, ".mcp.json"),
+                Err(McpConfigParseError::Rejected(
+                    RejectedReason::DuplicateJsonKey
+                ))
+            );
+        }
+
+        for unsupported in [
+            r#"{"mcpServers":{"s":{"command":"node","type":"stdio"}}}"#,
+            r#"{"mcpServers":{"s":{"command":"node","cwd":"/tmp"}}}"#,
+            r#"{"mcpServers":{"s":{"command":"node"}},"inputs":[]}"#,
+        ] {
+            assert_eq!(
+                parse_mcp_config_detailed(unsupported, ".mcp.json"),
+                Err(McpConfigParseError::Rejected(
+                    RejectedReason::UnsupportedServerField
+                ))
+            );
+        }
+
+        for invalid in [
+            r#"{"mcpServers":{"s":{}}}"#,
+            r#"{"mcpServers":{"s":{"command":1}}}"#,
+            r#"{"mcpServers":{"s":{"command":""}}}"#,
+            r#"{"mcpServers":{"s":{"command":"node","args":"--stdio"}}}"#,
+            r#"{"mcpServers":{"s":{"command":"node","env":{"MODE":1}}}}"#,
+            r#"{"mcpServers":{"s":{"url":""}}}"#,
+            r#"{"$schema":1,"mcpServers":{}}"#,
+        ] {
+            assert_eq!(
+                parse_mcp_config_detailed(invalid, ".mcp.json"),
+                Err(McpConfigParseError::Rejected(
+                    RejectedReason::InvalidServerField
+                )),
+                "invalid launch document was accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_refusal_is_structured_coverage_and_round_trips_in_lock() {
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{"mcpServers":{"s":{"command":"node","args":["--token=plaintext"]}}}"#,
+        )
+        .unwrap();
+        let inventory = build_inventory(repo.path());
+        assert!(inventory.servers.is_empty());
+        assert!(inventory.configs.is_empty());
+        assert_eq!(inventory.rejected_configs.len(), 1);
+        assert_eq!(
+            inventory.rejected_configs[0].reason,
+            RejectedReason::SecretBearingArgument
+        );
+
+        let rendered = McpLockfile::from_inventory(&inventory).render();
+        assert!(!rendered.contains("plaintext"));
+        let parsed = parse_lockfile(&rendered).unwrap();
+        assert_eq!(parsed.rejected_configs, inventory.rejected_configs);
+    }
+
+    #[test]
+    fn policy_identity_binds_source_and_transport_but_not_tools() {
+        let base = McpServerEntry {
+            name: "same".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["server.js".into()],
+                env: vec![],
+            },
+            tools: vec!["read".into()],
+            tools_declared: true,
+            source_config: ".mcp.json".into(),
+        };
+        let different_tools = McpServerEntry {
+            tools: vec!["write".into()],
+            ..base.clone()
+        };
+        assert_eq!(base.policy_identity(), different_tools.policy_identity());
+
+        let different_source = McpServerEntry {
+            source_config: ".vscode/mcp.json".into(),
+            ..base.clone()
+        };
+        let different_transport = McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "deno".into(),
+                args: vec!["server.js".into()],
+                env: vec![],
+            },
+            ..base.clone()
+        };
+        assert_ne!(base.policy_identity(), different_source.policy_identity());
+        assert_ne!(
+            base.policy_identity(),
+            different_transport.policy_identity()
+        );
+        assert!(base.policy_identity().starts_with("mcp:v1:"));
+    }
+
+    #[test]
+    fn live_descriptor_approval_is_exact_server_bound_and_supports_empty_set() {
+        let current = mk_inventory(vec![stdio_server("s", "node")]);
+        let identity = current.servers[0].policy_identity();
+        let mut lock = McpLockfile::from_inventory(&current);
+        let empty = serde_json::json!({"tools": []});
+        assert_eq!(
+            approve_live_descriptors(
+                &mut lock,
+                &current,
+                &identity,
+                "node",
+                &[],
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &empty,
+            ),
+            Ok(0)
+        );
+        assert!(lock.servers[0].descriptors_approved);
+        assert!(lock.servers[0].descriptors.is_empty());
+        assert_eq!(
+            lock.servers[0].launch_fingerprint,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let mut mismatch = McpLockfile::from_inventory(&current);
+        assert_eq!(
+            approve_live_descriptors(
+                &mut mismatch,
+                &current,
+                &identity,
+                "deno",
+                &[],
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &empty,
+            ),
+            Err(DescriptorApprovalError::UpstreamMismatch)
+        );
+
+        let configured_env = mk_inventory(vec![McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![McpEnvEntry {
+                    name: "NODE_OPTIONS".into(),
+                    value_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .into(),
+                }],
+            },
+            tools: vec![],
+            tools_declared: false,
+            source_config: ".mcp.json".into(),
+        }]);
+        let configured_env_identity = configured_env.servers[0].policy_identity();
+        let mut configured_env_lock = McpLockfile::from_inventory(&configured_env);
+        assert_eq!(
+            approve_live_descriptors(
+                &mut configured_env_lock,
+                &configured_env,
+                &configured_env_identity,
+                "node",
+                &[],
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &empty,
+            ),
+            Err(DescriptorApprovalError::UnsupportedTransport),
+            "configured launch environment is unsupported, not a command mismatch"
+        );
+
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{"mcpServers":{"s":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        let lock_dir = repo.path().join(".tirith");
+        fs::create_dir_all(&lock_dir).unwrap();
+        fs::write(lock_dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
+        let baseline =
+            load_gateway_descriptor_baseline_for(Some(repo.path()), Some(&identity), true)
+                .unwrap()
+                .expect("an explicitly approved empty set is still a baseline");
+        assert_eq!(baseline.server_identity, identity);
+        assert!(baseline.descriptors.is_empty());
+    }
+
+    #[test]
+    fn static_relock_preserves_only_unchanged_exact_descriptor_approval() {
+        let initial = mk_inventory(vec![McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["server.js".into()],
+                env: vec![],
+            },
+            tools: vec!["read".into()],
+            tools_declared: true,
+            source_config: ".mcp.json".into(),
+        }]);
+        let identity = initial.servers[0].policy_identity();
+        let mut approved = McpLockfile::from_inventory(&initial);
+        approve_live_descriptors(
+            &mut approved,
+            &initial,
+            &identity,
+            "node",
+            &["server.js".into()],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &serde_json::json!({"tools": [{"name": "read", "inputSchema": {"type": "object"}}]}),
+        )
+        .unwrap();
+
+        let mut unchanged = McpLockfile::from_inventory(&initial);
+        assert_eq!(unchanged.preserve_approved_descriptors_from(&approved), 1);
+        assert!(unchanged.servers[0].descriptors_approved);
+        assert_eq!(
+            unchanged.servers[0].descriptors,
+            approved.servers[0].descriptors
+        );
+
+        // The policy identity intentionally excludes static tool declarations,
+        // so the per-server content hash is the additional revocation guard.
+        let tools_changed = mk_inventory(vec![McpServerEntry {
+            tools: vec!["write".into()],
+            ..initial.servers[0].clone()
+        }]);
+        let mut refreshed = McpLockfile::from_inventory(&tools_changed);
+        assert_eq!(refreshed.preserve_approved_descriptors_from(&approved), 0);
+        assert!(!refreshed.servers[0].descriptors_approved);
+
+        let transport_changed = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "deno".into(),
+                args: vec!["server.js".into()],
+                env: vec![],
+            },
+            ..initial.servers[0].clone()
+        }]);
+        let mut refreshed = McpLockfile::from_inventory(&transport_changed);
+        assert_eq!(refreshed.preserve_approved_descriptors_from(&approved), 0);
+        assert!(!refreshed.servers[0].descriptors_approved);
+
+        let mut legacy = approved.clone();
+        legacy.schema_state = LockfileSchema::LegacyV5Migration;
+        let mut refreshed = McpLockfile::from_inventory(&initial);
+        assert_eq!(refreshed.preserve_approved_descriptors_from(&legacy), 0);
+        assert!(!refreshed.servers[0].descriptors_approved);
     }
 }

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Private checkpoint storage:** checkpoint operations no longer fall back to the shared legacy `/tmp/tirith/checkpoints` path; they require a user-owned private state directory and validate its identity and permissions. `checkpoints_dir()` keeps its public `PathBuf` return type for source compatibility, while new code can use `try_checkpoints_dir()` for an explicit unavailable state. Existing legacy files are not migrated automatically: inspect and remove `/tmp/tirith/checkpoints` manually if an older release created it.
+
 ## [0.3.3] - 2026-06-19
 
 ### Added
