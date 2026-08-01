@@ -890,6 +890,51 @@ pub fn ambient_denied_roots() -> Vec<PathBuf> {
         roots.push(repository_root.unwrap_or(cwd));
     }
     roots.push(std::env::temp_dir());
+    // `std::env::temp_dir()` follows TMPDIR/TMP/TEMP and is therefore only an
+    // additional denial hint, never the complete transient-root boundary. A
+    // hostile environment could otherwise point TMPDIR at /tmp/A and PATH at
+    // a distinct /tmp/B executable. Deny conventional OS transient roots
+    // independently of the environment used to select the primary child.
+    #[cfg(unix)]
+    roots.extend(
+        ["/tmp", "/var/tmp", "/dev/shm", "/run/user", "/var/folders"]
+            .into_iter()
+            .map(PathBuf::from),
+    );
+    #[cfg(windows)]
+    roots.extend(trusted_windows_temp_roots());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg(windows)]
+fn trusted_windows_temp_roots() -> Vec<PathBuf> {
+    use ::windows::Win32::System::Com::CoTaskMemFree;
+    use ::windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
+    use ::windows::Win32::UI::Shell::{
+        FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    };
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let mut roots = Vec::new();
+    // SAFETY: the fixed folder ID is valid and Windows owns the returned
+    // NUL-terminated allocation until CoTaskMemFree below.
+    if let Ok(raw) = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None) }
+    {
+        // SAFETY: a successful call returned a valid NUL-terminated allocation.
+        let local = std::ffi::OsString::from_wide(unsafe { raw.as_wide() });
+        // SAFETY: SHGetKnownFolderPath transfers one COM task allocation.
+        unsafe { CoTaskMemFree(Some(raw.as_ptr().cast())) };
+        roots.push(PathBuf::from(local).join("Temp"));
+    }
+
+    let mut buffer = vec![0_u16; 32 * 1024];
+    // SAFETY: GetWindowsDirectoryW writes at most the supplied slice length.
+    let length = unsafe { GetWindowsDirectoryW(Some(&mut buffer)) } as usize;
+    if length > 0 && length < buffer.len() {
+        roots.push(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join("Temp"));
+    }
     roots
 }
 

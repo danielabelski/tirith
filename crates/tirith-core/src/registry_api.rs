@@ -719,6 +719,11 @@ struct NpmVersion {
     deprecated: Option<serde_json::Value>,
     #[serde(default)]
     scripts: std::collections::BTreeMap<String, String>,
+    /// npm's normalized manifest marks packages that carry a root
+    /// `binding.gyp`. Unless the package defines its own `install` or
+    /// `preinstall`, npm synthesizes `node-gyp rebuild` at install time.
+    #[serde(default)]
+    gypfile: Option<bool>,
 }
 
 impl NpmVersion {
@@ -741,6 +746,20 @@ impl NpmVersion {
                     script_text.push('\n');
                 }
             }
+        }
+        let overrides_implicit_gyp = ["preinstall", "install"].iter().any(|hook| {
+            self.scripts
+                .get(*hook)
+                // npm's defaulting logic uses JavaScript truthiness, so a
+                // whitespace-only string suppresses the implicit hook while
+                // an empty string does not.
+                .is_some_and(|body| !body.is_empty())
+        });
+        if self.gypfile == Some(true) && !overrides_implicit_gyp {
+            // This is executable lifecycle behavior even though the packument's
+            // `scripts` map is empty. Record it explicitly instead of returning
+            // `Some(clean)` for native-addon releases such as heapdump@0.3.8.
+            script_text.push_str("node-gyp rebuild\n");
         }
         crate::install_script_analysis::analyze_script_text(&script_text)
     }
@@ -1542,6 +1561,63 @@ mod tests {
         let v = doc.versions.get("2.0.0").unwrap();
         assert!(v.deprecated_present());
         assert!(!doc.versions.get("1.0.0").unwrap().deprecated_present());
+    }
+
+    #[test]
+    fn npm_gypfile_without_install_override_records_implicit_node_gyp() {
+        let version: NpmVersion = serde_json::from_value(serde_json::json!({
+            "gypfile": true,
+            "scripts": {}
+        }))
+        .unwrap();
+        let signals = version.install_script_signals();
+        assert!(signals.has_shell_spawn);
+        assert!(signals
+            .suspicious_patterns
+            .iter()
+            .any(|pattern| pattern.contains("node-gyp rebuild")));
+    }
+
+    #[test]
+    fn npm_explicit_install_suppresses_implicit_node_gyp_default() {
+        let version: NpmVersion = serde_json::from_value(serde_json::json!({
+            "gypfile": true,
+            "scripts": { "install": "echo prebuilt" }
+        }))
+        .unwrap();
+        let signals = version.install_script_signals();
+        assert!(!signals.fires());
+        assert!(signals.suspicious_patterns.is_empty());
+    }
+
+    #[test]
+    fn npm_whitespace_install_suppresses_implicit_node_gyp_default() {
+        let version: NpmVersion = serde_json::from_value(serde_json::json!({
+            "gypfile": true,
+            "scripts": { "install": " " }
+        }))
+        .unwrap();
+        assert!(!version.install_script_signals().fires());
+    }
+
+    #[test]
+    fn npm_empty_install_keeps_implicit_node_gyp_default() {
+        let version: NpmVersion = serde_json::from_value(serde_json::json!({
+            "gypfile": true,
+            "scripts": { "install": "" }
+        }))
+        .unwrap();
+        assert!(version.install_script_signals().has_shell_spawn);
+    }
+
+    #[test]
+    fn npm_gypfile_false_without_scripts_is_a_clean_control() {
+        let version: NpmVersion = serde_json::from_value(serde_json::json!({
+            "gypfile": false,
+            "scripts": {}
+        }))
+        .unwrap();
+        assert!(!version.install_script_signals().fires());
     }
 
     #[test]

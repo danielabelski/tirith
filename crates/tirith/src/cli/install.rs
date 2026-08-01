@@ -146,11 +146,6 @@ impl InstallRunner for ProcessInstallRunner<'_> {
         let mut command = Command::new(self.executable.path());
         command.args(args);
         self.source_binding.configure_command(&mut command);
-        if let Some(path) = tirith_core::trusted_child::sanitized_ambient_path() {
-            // Keep project/tmp candidates out of `#!/usr/bin/env ...`
-            // interpreter resolution and helper-child lookup as well.
-            command.env("PATH", path);
-        }
         // Keep both identity checks as close to the actual spawn as the
         // process API permits, after all command configuration is complete.
         self.executable.verify_program(program)?;
@@ -400,6 +395,451 @@ fn hash_and_read_source_config(path: &Path) -> std::io::Result<([u8; 32], String
     Ok((Sha256::digest(&bytes).into(), content))
 }
 
+/// OS-derived process state for one approved install transaction.
+///
+/// Repository-controlled environment variables must not select a user profile,
+/// temporary directory, Windows shell, or Windows system directory for the
+/// package manager. Capture those paths from the operating system before the
+/// plan is approved, keep the private temporary directory alive through child
+/// exit, and apply this exact snapshot immediately before spawn.
+#[derive(Debug)]
+struct TrustedInstallEnvironment {
+    account_home: PathBuf,
+    private_temp: tempfile::TempDir,
+    presentation: Vec<(OsString, OsString)>,
+    sanitized_path: Option<OsString>,
+    #[cfg(windows)]
+    roaming_app_data: PathBuf,
+    #[cfg(windows)]
+    local_app_data: PathBuf,
+    #[cfg(windows)]
+    windows_directory: PathBuf,
+    #[cfg(windows)]
+    command_processor: PathBuf,
+}
+
+impl TrustedInstallEnvironment {
+    fn capture(executable: Option<&InstallExecutableBinding>) -> std::io::Result<Self> {
+        const PRESENTATION_NAMES: &[&str] = &[
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "COLORTERM",
+            "NO_COLOR",
+        ];
+
+        let account_home = trusted_account_home()?;
+        let presentation = PRESENTATION_NAMES
+            .iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+            .collect();
+
+        #[cfg(unix)]
+        let private_temp = trusted_install_tempdir(Path::new("/tmp"))?;
+
+        #[cfg(unix)]
+        let sanitized_path = trusted_install_child_path(
+            executable,
+            &[
+                Path::new("/usr/bin"),
+                Path::new("/bin"),
+                Path::new("/usr/sbin"),
+                Path::new("/sbin"),
+            ],
+            &[],
+        );
+
+        #[cfg(windows)]
+        {
+            let roaming_app_data = trusted_known_folder(
+                &windows::Win32::UI::Shell::FOLDERID_RoamingAppData,
+                "roaming application-data directory",
+            )?;
+            let local_app_data = trusted_known_folder(
+                &windows::Win32::UI::Shell::FOLDERID_LocalAppData,
+                "local application-data directory",
+            )?;
+            let (windows_directory, system_directory) = trusted_windows_directories()?;
+            let transient_roots = [local_app_data.join("Temp")];
+            ensure_trusted_install_directory(
+                &account_home,
+                "user profile directory",
+                &transient_roots,
+            )?;
+            ensure_trusted_install_directory(
+                &roaming_app_data,
+                "roaming application-data directory",
+                &transient_roots,
+            )?;
+            ensure_trusted_install_directory(
+                &local_app_data,
+                "local application-data directory",
+                &transient_roots,
+            )?;
+            ensure_trusted_install_directory(
+                &windows_directory,
+                "Windows directory",
+                &transient_roots,
+            )?;
+            ensure_trusted_install_directory(
+                &system_directory,
+                "system directory",
+                &transient_roots,
+            )?;
+            let command_processor = system_directory.join("cmd.exe");
+            let command_metadata = std::fs::metadata(&command_processor).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot validate the OS command processor {}: {error}",
+                        command_processor.display()
+                    ),
+                )
+            })?;
+            if !command_metadata.is_file() {
+                return Err(std::io::Error::other(format!(
+                    "OS command processor {} is not a regular file",
+                    command_processor.display()
+                )));
+            }
+            let sanitized_path = trusted_install_child_path(
+                executable,
+                &[system_directory.as_path(), windows_directory.as_path()],
+                &transient_roots,
+            );
+            let private_temp = trusted_install_tempdir(&local_app_data)?;
+            return Ok(Self {
+                account_home,
+                private_temp,
+                presentation,
+                sanitized_path,
+                roaming_app_data,
+                local_app_data,
+                windows_directory,
+                command_processor,
+            });
+        }
+
+        #[cfg(unix)]
+        {
+            return Ok(Self {
+                account_home,
+                private_temp,
+                presentation,
+                sanitized_path,
+            });
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "install execution environment isolation is unsupported on this platform",
+            ))
+        }
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command
+            .env_clear()
+            .envs(self.presentation.iter().cloned())
+            .env("HOME", &self.account_home);
+        for name in ["TMPDIR", "TMP", "TEMP", "TEMPDIR"] {
+            command.env(name, self.private_temp.path());
+        }
+        if let Some(path) = &self.sanitized_path {
+            command.env("PATH", path);
+        }
+
+        #[cfg(windows)]
+        command
+            .env("USERPROFILE", &self.account_home)
+            .env("APPDATA", &self.roaming_app_data)
+            .env("LOCALAPPDATA", &self.local_app_data)
+            .env("SystemRoot", &self.windows_directory)
+            .env("WINDIR", &self.windows_directory)
+            .env("COMSPEC", &self.command_processor)
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+            // Windows command resolution otherwise checks the untrusted
+            // current working directory before this bound PATH for bare names.
+            .env("NoDefaultCurrentDirectoryInExePath", "1");
+    }
+}
+
+fn trusted_install_child_path(
+    executable: Option<&InstallExecutableBinding>,
+    system_directories: &[&Path],
+    additional_denied_roots: &[PathBuf],
+) -> Option<OsString> {
+    let mut directories = Vec::new();
+    if let Some(executable) = executable {
+        if let Some(parent) = executable.invocation_path.parent() {
+            directories.push(parent.to_path_buf());
+        }
+        if let Some(parent) = executable.canonical_path.parent() {
+            if !directories.iter().any(|existing| existing == parent) {
+                directories.push(parent.to_path_buf());
+            }
+        }
+    }
+    for directory in system_directories {
+        if !directories.iter().any(|existing| existing == directory) {
+            directories.push((*directory).to_path_buf());
+        }
+    }
+    let joined = std::env::join_paths(&directories).ok()?;
+    let denied_roots = trusted_install_denied_roots(additional_denied_roots);
+    let path = tirith_core::trusted_child::sanitized_path(&joined, &denied_roots);
+    (!path.is_empty()).then_some(path)
+}
+
+fn trusted_install_denied_roots(additional: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = tirith_core::trusted_child::ambient_denied_roots();
+    #[cfg(unix)]
+    roots.extend(
+        ["/tmp", "/var/tmp", "/dev/shm", "/run/user", "/var/folders"]
+            .into_iter()
+            .map(PathBuf::from),
+    );
+    roots.extend(additional.iter().cloned());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn ensure_trusted_install_directory(
+    path: &Path,
+    label: &str,
+    additional_denied_roots: &[PathBuf],
+) -> std::io::Result<()> {
+    let joined = std::env::join_paths([path]).map_err(|error| {
+        std::io::Error::other(format!("cannot validate OS-derived {label}: {error}"))
+    })?;
+    let sanitized = tirith_core::trusted_child::sanitized_path(
+        &joined,
+        &trusted_install_denied_roots(additional_denied_roots),
+    );
+    if sanitized.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "OS-derived {label} {} is inside an untrusted root or has an unsafe ownership hierarchy",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn trusted_account_home() -> std::io::Result<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const FALLBACK_BUFFER_BYTES: usize = 16 * 1024;
+    const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+
+    // SAFETY: sysconf and geteuid take no pointers and have no preconditions.
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut capacity = if suggested > 0 {
+        usize::try_from(suggested)
+            .unwrap_or(FALLBACK_BUFFER_BYTES)
+            .clamp(FALLBACK_BUFFER_BYTES, MAX_BUFFER_BYTES)
+    } else {
+        FALLBACK_BUFFER_BYTES
+    };
+    // SAFETY: geteuid has no preconditions and returns the process effective UID.
+    let effective_uid = unsafe { libc::geteuid() };
+
+    loop {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; capacity];
+        // SAFETY: `record`, `result`, and the writable buffer live for the call;
+        // getpwuid_r writes at most `buffer.len()` bytes and initializes record
+        // on success when it returns a non-null result pointer.
+        let status = unsafe {
+            libc::getpwuid_r(
+                effective_uid,
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && capacity < MAX_BUFFER_BYTES {
+            capacity = capacity.saturating_mul(2).min(MAX_BUFFER_BYTES);
+            continue;
+        }
+        if status != 0 {
+            return Err(std::io::Error::new(
+                std::io::Error::from_raw_os_error(status).kind(),
+                format!("cannot resolve the effective user's home directory: OS error {status}"),
+            ));
+        }
+        if result.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the effective user has no account database entry",
+            ));
+        }
+        // SAFETY: a successful non-null getpwuid_r result initializes record,
+        // and pw_dir points into `buffer`, which is still alive here.
+        let record = unsafe { record.assume_init() };
+        if record.pw_dir.is_null() {
+            return Err(std::io::Error::other(
+                "the effective user's account entry has no home directory",
+            ));
+        }
+        // SAFETY: POSIX guarantees pw_dir is NUL-terminated on successful lookup.
+        let home_bytes = unsafe { CStr::from_ptr(record.pw_dir) }.to_bytes();
+        if home_bytes.is_empty() {
+            return Err(std::io::Error::other(
+                "the effective user's account entry has an empty home directory",
+            ));
+        }
+        return canonical_trusted_account_path(Path::new(OsStr::from_bytes(home_bytes)), "home");
+    }
+}
+
+#[cfg(windows)]
+fn trusted_account_home() -> std::io::Result<PathBuf> {
+    trusted_known_folder(
+        &windows::Win32::UI::Shell::FOLDERID_Profile,
+        "user profile directory",
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn trusted_account_home() -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "OS account-home lookup is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn canonical_trusted_account_path(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    validate_absolute_directory(path, label)?;
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "cannot canonicalize OS-derived {label} path {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    validate_absolute_directory(&canonical, label)?;
+    ensure_trusted_install_directory(&canonical, label, &[])?;
+    Ok(canonical)
+}
+
+fn validate_absolute_directory(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "OS-derived {label} path is empty or relative"
+        )));
+    }
+    if !std::fs::metadata(path)?.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "OS-derived {label} path {} is not a directory",
+            path.display()
+        )));
+    }
+    Ok(path.to_path_buf())
+}
+
+#[cfg(unix)]
+fn trusted_install_tempdir(base: &Path) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let base = std::fs::canonicalize(base)?;
+    let metadata = std::fs::metadata(&base)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "trusted install temporary base {} is not a directory",
+            base.display()
+        )));
+    }
+    // SAFETY: geteuid has no preconditions and returns the process effective UID.
+    let effective_uid = unsafe { libc::geteuid() };
+    let mode = metadata.mode();
+    let writable_by_others = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if metadata.uid() != 0 && metadata.uid() != effective_uid {
+        return Err(std::io::Error::other(format!(
+            "trusted install temporary base {} has an unexpected owner",
+            base.display()
+        )));
+    }
+    if writable_by_others && !sticky {
+        return Err(std::io::Error::other(format!(
+            "trusted install temporary base {} is writable without the sticky bit",
+            base.display()
+        )));
+    }
+    tempfile::Builder::new()
+        .prefix("tirith-install-runtime-")
+        .tempdir_in(base)
+}
+
+#[cfg(windows)]
+fn trusted_install_tempdir(base: &Path) -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("tirith-install-runtime-")
+        .tempdir_in(base)
+}
+
+#[cfg(windows)]
+fn trusted_known_folder(folder: &windows::core::GUID, label: &str) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+
+    // SAFETY: the folder ID is valid, the current-process token is requested,
+    // and Windows owns the returned NUL-terminated allocation until it is freed.
+    let raw = unsafe { SHGetKnownFolderPath(folder, KF_FLAG_DEFAULT, None) }
+        .map_err(|error| std::io::Error::other(format!("cannot resolve {label}: {error}")))?;
+    // SAFETY: SHGetKnownFolderPath returned a valid NUL-terminated allocation.
+    let value = std::ffi::OsString::from_wide(unsafe { raw.as_wide() });
+    // SAFETY: SHGetKnownFolderPath allocates with the COM task allocator and
+    // transfers exactly one ownership reference to the caller.
+    unsafe { CoTaskMemFree(Some(raw.as_ptr().cast())) };
+    // Preserve the exact Win32 path spelling returned by the Known Folder API;
+    // `std::fs::canonicalize` would add a `\\?\` prefix that some package
+    // managers do not accept in HOME/APPDATA-style environment variables.
+    validate_absolute_directory(Path::new(&value), label)
+}
+
+#[cfg(windows)]
+fn trusted_windows_directories() -> std::io::Result<(PathBuf, PathBuf)> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+
+    fn resolve(
+        getter: unsafe fn(Option<&mut [u16]>) -> u32,
+        label: &str,
+    ) -> std::io::Result<PathBuf> {
+        let mut buffer = vec![0_u16; 32 * 1024];
+        // SAFETY: the Win32 getter writes no more than the provided slice and
+        // returns the number of UTF-16 code units excluding the trailing NUL.
+        let length = unsafe { getter(Some(&mut buffer)) } as usize;
+        if length == 0 || length >= buffer.len() {
+            return Err(std::io::Error::other(format!(
+                "cannot resolve the OS {label} directory"
+            )));
+        }
+        validate_absolute_directory(
+            Path::new(&std::ffi::OsString::from_wide(&buffer[..length])),
+            label,
+        )
+    }
+
+    Ok((
+        resolve(GetWindowsDirectoryW, "Windows")?,
+        resolve(GetSystemDirectoryW, "system")?,
+    ))
+}
+
 /// Source-selection state approved together with one install plan. npm and pip
 /// receive explicit official-registry configuration and disposable caches;
 /// cargo registry installs additionally run outside the project configuration
@@ -410,6 +850,9 @@ struct InstallSourceBinding {
     manager: PackageManager,
     source_configs: Vec<CapturedSourceConfig>,
     isolated: Option<tempfile::TempDir>,
+    // Declared after `isolated` so the nested source directory is removed
+    // before its parent private runtime directory during normal field drop.
+    execution_environment: Option<TrustedInstallEnvironment>,
     configuration_issue: Option<String>,
     npm_project_manifest_gap: Option<InstallCoverageGap>,
     npm_scopes: Vec<String>,
@@ -418,11 +861,42 @@ struct InstallSourceBinding {
 }
 
 impl InstallSourceBinding {
+    #[cfg(test)]
     fn capture(
         manager: PackageManager,
         cwd: Option<&Path>,
         args: &[String],
     ) -> std::io::Result<Self> {
+        Self::capture_inner(manager, cwd, args, true, None)
+    }
+
+    fn capture_for_execution(
+        manager: PackageManager,
+        cwd: Option<&Path>,
+        args: &[String],
+        executable: &InstallExecutableBinding,
+    ) -> std::io::Result<Self> {
+        Self::capture_inner(manager, cwd, args, true, Some(executable))
+    }
+
+    fn capture_analysis_only(
+        manager: PackageManager,
+        cwd: Option<&Path>,
+        args: &[String],
+    ) -> std::io::Result<Self> {
+        Self::capture_inner(manager, cwd, args, false, None)
+    }
+
+    fn capture_inner(
+        manager: PackageManager,
+        cwd: Option<&Path>,
+        args: &[String],
+        bind_execution: bool,
+        executable: Option<&InstallExecutableBinding>,
+    ) -> std::io::Result<Self> {
+        let execution_environment = bind_execution
+            .then(|| TrustedInstallEnvironment::capture(executable))
+            .transpose()?;
         let mut candidate_paths = match manager {
             PackageManager::Npm => {
                 let mut paths = configuration_candidates(cwd, Path::new(".npmrc"));
@@ -488,11 +962,11 @@ impl InstallSourceBinding {
             source_configs.push(snapshot);
         }
 
-        let isolated = match manager {
-            PackageManager::Npm | PackageManager::Cargo => {
+        let isolated = match (manager, execution_environment.as_ref()) {
+            (PackageManager::Npm | PackageManager::Cargo, Some(environment)) => {
                 let directory = tempfile::Builder::new()
                     .prefix("tirith-install-source-")
-                    .tempdir()?;
+                    .tempdir_in(environment.private_temp.path())?;
                 if manager == PackageManager::Npm {
                     std::fs::write(
                         directory.path().join("npm-user.npmrc"),
@@ -527,16 +1001,20 @@ impl InstallSourceBinding {
         npm_scopes.sort();
         npm_scopes.dedup();
 
-        let cargo_isolated_cwd =
-            manager == PackageManager::Cargo && !cargo_args_require_original_cwd(args);
+        let cargo_isolated_cwd = bind_execution
+            && manager == PackageManager::Cargo
+            && !cargo_args_require_original_cwd(args);
         let cargo_install_root = if manager == PackageManager::Cargo {
-            cargo_install_root(cwd)
+            execution_environment
+                .as_ref()
+                .map(|environment| environment.account_home.join(".cargo").into_os_string())
         } else {
             None
         };
 
         Ok(Self {
             manager,
+            execution_environment,
             source_configs,
             isolated,
             configuration_issue,
@@ -563,6 +1041,16 @@ impl InstallSourceBinding {
     }
 
     fn configure_command(&self, command: &mut Command) {
+        // The package-manager executable is content-bound immediately before
+        // spawn, but loaders, interpreters, and build tools inspect arbitrary
+        // environment variables before or during an install. Start empty and
+        // re-add only operational values whose semantics are intentionally
+        // supported; a denylist cannot enumerate future build-tool hooks.
+        let trusted = self
+            .execution_environment
+            .as_ref()
+            .expect("a real install runner must own a bound execution environment");
+        configure_minimal_execution_environment(command, trusted);
         if matches!(
             self.manager,
             PackageManager::Npm | PackageManager::Pip | PackageManager::Cargo
@@ -645,6 +1133,23 @@ impl InstallSourceBinding {
     }
 }
 
+fn configure_minimal_execution_environment(
+    command: &mut Command,
+    trusted: &TrustedInstallEnvironment,
+) {
+    // The exact environment snapshot was captured before approval. Do not
+    // reread PATH, locale, profile, temp, or Windows selector variables here:
+    // all command configuration after this point uses the bound snapshot.
+    trusted.apply(command);
+
+    // CPython can otherwise import a user-site `sitecustomize.py` before pip's
+    // own configuration is evaluated. Unknown PYTHON* switches are ignored by
+    // older interpreters, so these are safe defense-in-depth across versions.
+    command
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONSAFEPATH", "1");
+}
+
 fn remove_matching_environment(command: &mut Command, predicate: impl Fn(&OsStr) -> bool) {
     let explicit_names = command
         .get_envs()
@@ -652,11 +1157,6 @@ fn remove_matching_environment(command: &mut Command, predicate: impl Fn(&OsStr)
         .collect::<Vec<_>>();
     for name in explicit_names {
         command.env_remove(name);
-    }
-    for (name, _) in std::env::vars_os() {
-        if predicate(&name) {
-            command.env_remove(name);
-        }
     }
 }
 
@@ -866,20 +1366,6 @@ fn bind_cargo_output_path_value(flag: &str, value: &str, cwd: &Path) -> Result<S
     })
 }
 
-fn cargo_install_root(cwd: Option<&Path>) -> Option<OsString> {
-    let configured = std::env::var_os("CARGO_INSTALL_ROOT")
-        .or_else(|| std::env::var_os("CARGO_HOME"))
-        .or_else(|| home::home_dir().map(|home| home.join(".cargo").into_os_string()))?;
-    let path = PathBuf::from(&configured);
-    if path.is_absolute() {
-        return Some(configured);
-    }
-    let base = cwd
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok())?;
-    Some(base.join(path).into_os_string())
-}
-
 /// Entry point for `tirith install`. `source` selects the install kind; `args`
 /// are the package list / flags (or the URL for the `url` form).
 #[allow(clippy::too_many_arguments)]
@@ -996,7 +1482,13 @@ fn run_package_manager(
     };
     let args = effective_args.as_slice();
     let policy = Policy::discover(cwd.as_deref());
-    let source_binding = match InstallSourceBinding::capture(manager, Some(&cwd_path), args) {
+    let source_binding_result = match executable_binding.as_ref() {
+        Some(executable) => {
+            InstallSourceBinding::capture_for_execution(manager, Some(&cwd_path), args, executable)
+        }
+        None => InstallSourceBinding::capture_analysis_only(manager, Some(&cwd_path), args),
+    };
+    let source_binding = match source_binding_result {
         Ok(binding) => binding,
         Err(error) => {
             eprintln!(
@@ -3041,12 +3533,6 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
     }
 
-    fn command_env_is_removed(command: &Command, name: &str) -> bool {
-        command
-            .get_envs()
-            .any(|(key, value)| key == OsStr::new(name) && value.is_none())
-    }
-
     #[test]
     fn source_binding_pins_npm_and_pip_to_official_sources() {
         let directory = tempfile::tempdir().unwrap();
@@ -3170,8 +3656,8 @@ mod tests {
         cargo.configure_command(&mut command);
         for name in hostile_names {
             assert!(
-                command_env_is_removed(&command, name),
-                "{name} must be explicitly removed before Cargo executes"
+                command_env(&command, name).is_none(),
+                "{name} must be absent from Cargo's cleared environment"
             );
         }
 
@@ -3196,6 +3682,319 @@ mod tests {
             "CARGO_TERM_COLOR"
         )));
         assert!(!is_cargo_runtime_override_environment(OsStr::new("LANG")));
+    }
+
+    #[test]
+    fn every_install_manager_uses_a_minimal_execution_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        const HOSTILE_SELECTOR: &str = "/tmp/attacker-controlled-selector";
+        let hostile_names = [
+            "LD_PRELOAD",
+            "ld_library_path",
+            "DYLD_INSERT_LIBRARIES",
+            "LIBPATH",
+            "PYTHONPATH",
+            "pythonhome",
+            "NODE_OPTIONS",
+            "RUBYOPT",
+            "PERL5OPT",
+            "JAVA_TOOL_OPTIONS",
+            "BASH_ENV",
+            "ENV",
+            "GIT_EXEC_PATH",
+            "GIT_SSH_COMMAND",
+            "GIT_CONFIG_KEY_0",
+            "SSH_ASKPASS",
+            "MAKEFLAGS",
+            "CC",
+            "CXX",
+            "CMAKE_PROJECT_INCLUDE",
+            "CMAKE_TOOLCHAIN_FILE",
+            "MAVEN_OPTS",
+            "GRADLE_OPTS",
+            // Proves a future/unmodeled hook is absent without extending a
+            // denylist: only the explicit allowlist survives `env_clear`.
+            "UNMODELED_BUILD_TOOL_HOOK",
+        ];
+        let hostile_selectors = [
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "TEMPDIR",
+            "SystemRoot",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "NoDefaultCurrentDirectoryInExePath",
+            "PATH",
+        ];
+        let managers = [
+            PackageManager::Npm,
+            PackageManager::Pip,
+            PackageManager::Cargo,
+            PackageManager::Apt,
+            PackageManager::Brew,
+            PackageManager::Dnf,
+            PackageManager::Yum,
+            PackageManager::Pacman,
+            PackageManager::Scoop,
+            PackageManager::Docker,
+            PackageManager::Go,
+        ];
+
+        for manager in managers {
+            let binding = InstallSourceBinding::capture(
+                manager,
+                Some(directory.path()),
+                &["demo@1.0.0".to_string()],
+            )
+            .unwrap();
+            let environment = binding.execution_environment.as_ref().unwrap();
+            let mut command = Command::new(manager.program());
+            for name in hostile_names {
+                command.env(name, "/tmp/attacker-controlled-loader");
+            }
+            for name in hostile_selectors {
+                command.env(name, HOSTILE_SELECTOR);
+            }
+            command.env("LANG", "attacker-mutated-after-approval");
+
+            binding.configure_command(&mut command);
+
+            for name in hostile_names {
+                assert!(
+                    command_env(&command, name).is_none(),
+                    "{manager:?} must not expose {name} to the spawned install"
+                );
+            }
+            for name in hostile_selectors {
+                assert_ne!(
+                    command_env(&command, name).as_deref(),
+                    Some(HOSTILE_SELECTOR),
+                    "{manager:?} must not inherit attacker-selected {name}"
+                );
+            }
+            assert_eq!(
+                command_env(&command, "PYTHONNOUSERSITE").as_deref(),
+                Some("1"),
+                "{manager:?} must disable Python user-site startup imports"
+            );
+            assert_eq!(
+                command_env(&command, "PYTHONSAFEPATH").as_deref(),
+                Some("1"),
+                "{manager:?} must disable unsafe Python path prepending"
+            );
+            assert_eq!(
+                command_env(&command, "LANG").as_deref(),
+                environment
+                    .presentation
+                    .iter()
+                    .find(|(name, _)| name == "LANG")
+                    .map(|(_, value)| value.to_string_lossy())
+                    .as_deref(),
+                "{manager:?} must apply the locale captured before approval"
+            );
+            assert_eq!(
+                command_env(&command, "HOME").as_deref(),
+                Some(environment.account_home.to_string_lossy().as_ref()),
+                "{manager:?} must use the OS account home"
+            );
+            for name in ["TMPDIR", "TMP", "TEMP", "TEMPDIR"] {
+                assert_eq!(
+                    command_env(&command, name).as_deref(),
+                    Some(environment.private_temp.path().to_string_lossy().as_ref()),
+                    "{manager:?} must use the transaction-owned private temp for {name}"
+                );
+            }
+            assert_eq!(
+                command_env(&command, "PATH").as_deref(),
+                environment
+                    .sanitized_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy())
+                    .as_deref(),
+                "{manager:?} must apply the PATH captured before approval"
+            );
+            #[cfg(windows)]
+            {
+                assert_eq!(
+                    command_env(&command, "COMSPEC").as_deref(),
+                    Some(environment.command_processor.to_string_lossy().as_ref())
+                );
+                assert_eq!(
+                    command_env(&command, "PATHEXT").as_deref(),
+                    Some(".COM;.EXE;.BAT;.CMD")
+                );
+                assert_eq!(
+                    command_env(&command, "NoDefaultCurrentDirectoryInExePath").as_deref(),
+                    Some("1")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_rustup_state_uses_os_home_not_environment_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let cargo = InstallSourceBinding::capture(
+            PackageManager::Cargo,
+            Some(directory.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        let environment = cargo.execution_environment.as_ref().unwrap();
+        let mut command = Command::new("cargo");
+        for name in [
+            "HOME",
+            "USERPROFILE",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "CARGO_INSTALL_ROOT",
+        ] {
+            command.env(name, "/tmp/repository-selected-rustup-state");
+        }
+
+        cargo.configure_command(&mut command);
+
+        assert_eq!(
+            command_env(&command, "HOME").as_deref(),
+            Some(environment.account_home.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            command_env(&command, "CARGO_HOME").as_deref(),
+            Some(
+                cargo
+                    .isolated
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .join("cargo-home")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(command_env(&command, "RUSTUP_HOME").is_none());
+        assert_ne!(
+            command_env(&command, "CARGO_INSTALL_ROOT").as_deref(),
+            Some("/tmp/repository-selected-rustup-state")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_ignores_hostile_ambient_path_and_profile_selectors() {
+        const CHILD_MARKER: &str = "TIRITH_INSTALL_ENV_CAPTURE_CHILD";
+        const ATTACKER_PATH_ROOT: &str = "TIRITH_INSTALL_ENV_ATTACKER_PATH_ROOT";
+        const ATTACKER_TEMP_ROOT: &str = "TIRITH_INSTALL_ENV_ATTACKER_TEMP_ROOT";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let attacker_path = PathBuf::from(std::env::var_os(ATTACKER_PATH_ROOT).unwrap());
+            let attacker_temp = PathBuf::from(std::env::var_os(ATTACKER_TEMP_ROOT).unwrap());
+            let primary_error = InstallExecutableBinding::resolve("cargo")
+                .expect_err("a split-root temporary PATH executable must be rejected");
+            assert!(primary_error.to_string().contains("untrusted executable"));
+            let binding = InstallSourceBinding::capture(
+                PackageManager::Cargo,
+                Some(&attacker_path),
+                &["demo@1.0.0".to_string()],
+            )
+            .unwrap();
+            let environment = binding.execution_environment.as_ref().unwrap();
+            assert_ne!(environment.account_home, attacker_path);
+            assert!(!environment.private_temp.path().starts_with(&attacker_path));
+            assert!(!environment.private_temp.path().starts_with(&attacker_temp));
+            assert!(!environment.sanitized_path.as_ref().is_some_and(|path| {
+                std::env::split_paths(path).any(|component| {
+                    component == attacker_path.join("bin") || component.starts_with(&attacker_path)
+                })
+            }));
+
+            let mut command = Command::new("cargo");
+            binding.configure_command(&mut command);
+            assert_eq!(
+                command_env(&command, "HOME").as_deref(),
+                Some(environment.account_home.to_string_lossy().as_ref())
+            );
+            for name in ["TMPDIR", "TMP", "TEMP", "TEMPDIR"] {
+                assert_eq!(
+                    command_env(&command, name).as_deref(),
+                    Some(environment.private_temp.path().to_string_lossy().as_ref())
+                );
+            }
+            for name in [
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "SystemRoot",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "NoDefaultCurrentDirectoryInExePath",
+            ] {
+                assert!(command_env(&command, name).is_none());
+            }
+            return;
+        }
+
+        // A subprocess supplies a genuinely hostile ambient environment before
+        // capture without mutating this parallel test process. This is stronger
+        // isolation than a process-global ENV_LOCK and cannot race other tests.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let attacker_path = tempfile::tempdir().unwrap();
+        let attacker_temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(attacker_path.path().join("bin")).unwrap();
+        let fake_cargo = attacker_path.path().join("bin/cargo");
+        std::fs::write(&fake_cargo, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let test_name = std::thread::current().name().unwrap().to_string();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(ATTACKER_PATH_ROOT, attacker_path.path())
+            .env(ATTACKER_TEMP_ROOT, attacker_temp.path())
+            .env("HOME", attacker_path.path())
+            .env("USERPROFILE", attacker_path.path())
+            .env("APPDATA", attacker_path.path())
+            .env("LOCALAPPDATA", attacker_path.path())
+            .env("TMPDIR", attacker_temp.path())
+            .env("TMP", attacker_temp.path())
+            .env("TEMP", attacker_temp.path())
+            .env("TEMPDIR", attacker_temp.path())
+            .env("SystemRoot", attacker_path.path())
+            .env("WINDIR", attacker_path.path())
+            .env("COMSPEC", attacker_path.path().join("evil-shell"))
+            .env("PATHEXT", ".EVIL")
+            .env("PATH", attacker_path.path().join("bin"));
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "hostile-environment child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn analysis_only_source_binding_does_not_require_runtime_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let binding = InstallSourceBinding::capture_analysis_only(
+            PackageManager::Cargo,
+            Some(directory.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        assert!(binding.execution_environment.is_none());
+        assert!(binding.isolated.is_none());
+        assert!(binding.cargo_install_root.is_none());
+        assert!(!binding.cargo_isolated_cwd);
     }
 
     #[test]

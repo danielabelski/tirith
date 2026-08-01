@@ -1233,6 +1233,40 @@ mod tests {
     }
 
     #[test]
+    fn detect_npm_install_script_finds_implicit_binding_gyp_build() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"native","gypfile":true,"scripts":{}}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("binding.gyp"), "{'targets': []}").unwrap();
+
+        let (found, detail, signals) = detect_npm_install_script(dir.path());
+        assert!(found);
+        assert!(detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("implicit binding.gyp")));
+        assert!(signals.is_some_and(|signals| signals.has_shell_spawn));
+    }
+
+    #[test]
+    fn detect_npm_install_script_honors_gypfile_false() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"prebuilt","gypfile":false,"scripts":{}}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("binding.gyp"), "{'targets': []}").unwrap();
+
+        let (found, detail, signals) = detect_npm_install_script(dir.path());
+        assert!(!found);
+        assert!(detail.is_none());
+        assert!(signals.is_none());
+    }
+
+    #[test]
     fn detect_npm_install_script_handles_missing_or_bad_manifest() {
         let dir = tempdir().unwrap();
         // No package.json at all.

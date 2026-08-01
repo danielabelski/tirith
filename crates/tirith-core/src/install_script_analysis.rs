@@ -100,6 +100,7 @@ const SHELL_SPAWN_PATTERNS: &[&str] = &[
     "subprocess.popen",
     "subprocess.call",
     "process.spawn",
+    "node-gyp",
 ];
 
 /// `true` when `haystack` contains `needle` at a token boundary, so "curl" does
@@ -185,20 +186,55 @@ pub fn npm_lifecycle_scripts_from_disk(
         .map_err(|error| format!("package.json is not valid UTF-8: {error}"))?;
     let package_json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|error| format!("package.json is not valid JSON: {error}"))?;
-    let Some(scripts) = package_json
+    let scripts = package_json
         .get("scripts")
-        .and_then(|value| value.as_object())
-    else {
-        return Ok(None);
-    };
+        .and_then(|value| value.as_object());
     let mut hook_names = Vec::new();
     let mut script_text = String::new();
     for hook in NPM_INSTALL_HOOKS {
-        if let Some(body) = scripts.get(*hook).and_then(serde_json::Value::as_str) {
+        if let Some(body) = scripts
+            .and_then(|scripts| scripts.get(*hook))
+            .and_then(serde_json::Value::as_str)
+        {
             if !body.trim().is_empty() {
                 hook_names.push((*hook).to_string());
                 script_text.push_str(body);
                 script_text.push('\n');
+            }
+        }
+    }
+
+    let overrides_implicit_gyp = ["preinstall", "install"].iter().any(|hook| {
+        scripts
+            .and_then(|scripts| scripts.get(*hook))
+            .and_then(serde_json::Value::as_str)
+            // npm uses JavaScript truthiness here: whitespace suppresses the
+            // default, while the empty string still permits node-gyp rebuild.
+            .is_some_and(|body| !body.is_empty())
+    });
+    let gypfile_enabled = package_json
+        .get("gypfile")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false);
+    if gypfile_enabled && !overrides_implicit_gyp {
+        let binding_gyp = package_json_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("binding.gyp");
+        match crate::util::open_read_no_follow_capped(&binding_gyp, u64::MAX) {
+            Ok(_) => {
+                hook_names.push("implicit binding.gyp install".to_string());
+                script_text.push_str("node-gyp rebuild\n");
+            }
+            Err(crate::util::OpenRegularError::NotFound) => {}
+            Err(crate::util::OpenRegularError::NotRegularFile) => {
+                return Err("binding.gyp exists but is not a regular no-follow file".to_string());
+            }
+            Err(crate::util::OpenRegularError::TooLarge) => {
+                return Err("binding.gyp could not be bounded for inspection".to_string());
+            }
+            Err(crate::util::OpenRegularError::Io(error)) => {
+                return Err(format!("cannot inspect binding.gyp: {error}"));
             }
         }
     }
@@ -320,6 +356,100 @@ mod tests {
             "scripts": { "postinstall": "   " }
         });
         assert!(npm_script_text(&pkg).is_none());
+    }
+
+    #[test]
+    fn npm_disk_snapshot_models_implicit_binding_gyp_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            r#"{"name":"native","gypfile":true,"scripts":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("binding.gyp"), "{'targets': []}").unwrap();
+
+        let scripts = npm_lifecycle_scripts_from_disk(&manifest)
+            .unwrap()
+            .expect("binding.gyp implies an install lifecycle");
+        assert!(scripts
+            .hook_names
+            .iter()
+            .any(|hook| hook.contains("implicit binding.gyp")));
+        let signals = analyze_script_text(&scripts.script_text);
+        assert!(signals.has_shell_spawn);
+        assert!(signals
+            .suspicious_patterns
+            .iter()
+            .any(|pattern| pattern.contains("node-gyp rebuild")));
+    }
+
+    #[test]
+    fn npm_disk_snapshot_honors_gypfile_false_control() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            r#"{"name":"prebuilt","gypfile":false,"scripts":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("binding.gyp"), "{'targets': []}").unwrap();
+
+        assert!(npm_lifecycle_scripts_from_disk(&manifest)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn npm_disk_snapshot_whitespace_install_suppresses_implicit_binding_gyp() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("package.json");
+        std::fs::write(&manifest, r#"{"name":"native","scripts":{"install":" "}}"#).unwrap();
+        std::fs::write(directory.path().join("binding.gyp"), "{'targets': []}").unwrap();
+
+        assert!(npm_lifecycle_scripts_from_disk(&manifest)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn npm_disk_snapshot_empty_install_keeps_implicit_binding_gyp() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("package.json");
+        std::fs::write(&manifest, r#"{"name":"native","scripts":{"install":""}}"#).unwrap();
+        std::fs::write(directory.path().join("binding.gyp"), "{'targets': []}").unwrap();
+
+        let scripts = npm_lifecycle_scripts_from_disk(&manifest)
+            .unwrap()
+            .expect("empty install does not suppress npm's implicit binding.gyp hook");
+        assert!(scripts.script_text.contains("node-gyp rebuild"));
+    }
+
+    #[test]
+    fn npm_disk_snapshot_defaults_binding_gyp_to_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("package.json");
+        std::fs::write(&manifest, r#"{"name":"native","scripts":{}}"#).unwrap();
+        std::fs::write(directory.path().join("binding.gyp"), "{'targets': []}").unwrap();
+
+        assert!(npm_lifecycle_scripts_from_disk(&manifest)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn npm_disk_snapshot_refuses_symlinked_binding_gyp() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("package.json");
+        std::fs::write(&manifest, r#"{"name":"native","scripts":{}}"#).unwrap();
+        let target = directory.path().join("outside.gyp");
+        std::fs::write(&target, "{'targets': []}").unwrap();
+        std::os::unix::fs::symlink(&target, directory.path().join("binding.gyp")).unwrap();
+
+        let error = npm_lifecycle_scripts_from_disk(&manifest)
+            .expect_err("a symlinked binding.gyp must make analysis unavailable");
+        assert!(error.contains("not a regular no-follow file"));
     }
 
     #[test]
