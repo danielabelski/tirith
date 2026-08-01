@@ -31,8 +31,8 @@
 //! - [`run_to_completion`]: build the contained child, inherit stdio, wait, return
 //!   its exit code. Used by `tirith run`, `temp-run --capsule`, and D4's install.
 //! - [`spawn_piped`]: build the contained child with piped stdin/stdout/stderr and
-//!   hand back a [`std::process::Child`] the caller bridges (the MCP gateway needs
-//!   to sit between the client and the upstream server). Linux and macOS support
+//!   hand back a [`ManagedChild`] the caller bridges (the MCP gateway needs to sit
+//!   between the client and the upstream server). Linux and macOS support
 //!   this directly (both are `Command`-shaped); Windows piped-stdio containment is
 //!   not wired yet, so on Windows `spawn_piped` fails closed.
 //!
@@ -220,6 +220,108 @@ pub struct CapsuleRefused {
     pub reason: String,
 }
 
+#[cfg(not(target_os = "windows"))]
+struct PreparedContainedCommand {
+    command: Command,
+    temp_home: Option<tempfile::TempDir>,
+    #[cfg(target_os = "linux")]
+    owns_process_group: bool,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl std::ops::Deref for PreparedContainedCommand {
+    type Target = Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl std::ops::DerefMut for PreparedContainedCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+/// A spawned capsule child plus parent-owned launch resources that must outlive
+/// the whole process tree. Dereferences to [`Child`] so existing bridge code can
+/// use stdio/wait methods without exposing the cleanup guard.
+pub struct ManagedChild {
+    child: Child,
+    _temp_home: Option<tempfile::TempDir>,
+    #[cfg(target_os = "linux")]
+    process_group: Option<u32>,
+}
+
+impl ManagedChild {
+    pub(crate) fn unmanaged(child: Child) -> Self {
+        Self {
+            child,
+            _temp_home: None,
+            #[cfg(target_os = "linux")]
+            process_group: None,
+        }
+    }
+}
+
+impl std::ops::Deref for ManagedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ManagedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = self.process_group {
+            let group = -(pid as libc::pid_t);
+            // The hidden launcher creates this group before containment; seccomp
+            // denies the target's attempts to leave it. Kill the group even when
+            // the direct child was already reaped so detached descendants cannot
+            // outlive the temp-home guard.
+            unsafe {
+                libc::kill(group, libc::SIGKILL);
+            }
+            match self.child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    // The group signal is the complete-tree boundary. The
+                    // direct-child kill is a best-effort fallback if group
+                    // signalling raced setup or wait-state observation failed;
+                    // always wait so the temp-home guard below cannot be dropped
+                    // while the direct child still runs.
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl PreparedContainedCommand {
+    fn spawn_managed(mut self) -> std::io::Result<ManagedChild> {
+        let child = self.command.spawn()?;
+        #[cfg(target_os = "linux")]
+        let process_group = self.owns_process_group.then_some(child.id());
+        Ok(ManagedChild {
+            child,
+            _temp_home: self.temp_home,
+            #[cfg(target_os = "linux")]
+            process_group,
+        })
+    }
+}
+
 impl std::fmt::Display for CapsuleRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Name the backend so an audited refusal records which backend fell short.
@@ -365,28 +467,40 @@ pub fn run_to_completion(
 pub fn run_to_completion_with_stdin(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
+    target_argv0: tirith_core::runner::PipeInterpreter,
     args: &[String],
     input: &[u8],
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
-    let captured =
-        run_to_completion_with_stdin_captured(spec, program, args, input, cwd, extra_env)?;
+    let captured = run_to_completion_with_stdin_captured(
+        spec,
+        program,
+        target_argv0,
+        args,
+        input,
+        cwd,
+        extra_env,
+    )?;
+    let forwardable = sanitize_and_analyze_captured_output(&captured.stdout, &captured.stderr);
     std::io::stdout()
         .lock()
-        .write_all(&captured.stdout)
+        .write_all(&forwardable.stdout)
         .map_err(|error| CapsuleRefused {
             backend_id: captured.outcome.backend_id,
             reason: format!("forward contained child stdout: {error}"),
         })?;
     std::io::stderr()
         .lock()
-        .write_all(&captured.stderr)
+        .write_all(&forwardable.stderr)
         .map_err(|error| CapsuleRefused {
             backend_id: captured.outcome.backend_id,
             reason: format!("forward contained child stderr: {error}"),
         })?;
-    Ok(captured.outcome)
+    Ok(apply_captured_output_action(
+        captured.outcome,
+        forwardable.blocked,
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -413,6 +527,73 @@ struct CapturedCapsuleOutcome {
     outcome: CapsuleOutcome,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ForwardableCapturedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    blocked: bool,
+}
+
+/// Convert arbitrary child bytes into terminal-safe UTF-8 and apply Tirith's
+/// output-direction analyzer before forwarding. A blocking output finding
+/// withholds both untrusted streams and substitutes a fixed diagnostic; Warn
+/// findings preserve the sanitized output with a fixed warning. JSON execution
+/// is rejected separately, so these bytes can never share a structured stdout
+/// envelope.
+fn sanitize_and_analyze_captured_output(stdout: &[u8], stderr: &[u8]) -> ForwardableCapturedOutput {
+    use tirith_core::verdict::Action;
+
+    let stdout_text = String::from_utf8_lossy(stdout);
+    let stderr_text = String::from_utf8_lossy(stderr);
+    let mut joined = String::with_capacity(stdout_text.len() + stderr_text.len() + 1);
+    joined.push_str(&stdout_text);
+    joined.push('\n');
+    joined.push_str(&stderr_text);
+    let verdict =
+        tirith_core::engine::analyze_output(&joined, tirith_core::engine::OutputContext::default());
+    let rule_ids = verdict
+        .findings
+        .iter()
+        .map(|finding| finding.rule_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if verdict.action == Action::Block {
+        return ForwardableCapturedOutput {
+            stdout: Vec::new(),
+            stderr: format!(
+                "tirith run: contained child output withheld by output policy ({rule_ids})\n"
+            )
+            .into_bytes(),
+            blocked: true,
+        };
+    }
+
+    let stdout = tirith_core::mcp::output_filter::sanitize_for_display(&stdout_text).into_bytes();
+    let mut stderr =
+        tirith_core::mcp::output_filter::sanitize_for_display(&stderr_text).into_bytes();
+    if matches!(verdict.action, Action::Warn | Action::WarnAck) {
+        let mut prefixed = format!(
+            "tirith run: warning: contained child output triggered output policy ({rule_ids})\n"
+        )
+        .into_bytes();
+        prefixed.extend_from_slice(&stderr);
+        stderr = prefixed;
+    }
+    ForwardableCapturedOutput {
+        stdout,
+        stderr,
+        blocked: false,
+    }
+}
+
+fn apply_captured_output_action(mut outcome: CapsuleOutcome, blocked: bool) -> CapsuleOutcome {
+    if blocked {
+        outcome.exit_code = tirith_core::verdict::Action::Block.exit_code();
+    }
+    outcome
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,19 +716,97 @@ fn supervised_stdin_plan(
     })
 }
 
+/// Create a Linux capsule launch's HOME under the fixed sticky `/tmp` root,
+/// verify its ownership/mode, and add that exact canonical directory to the
+/// finalized Landlock read/write policy before coverage is probed or a child is
+/// spawned. The returned guard is deliberately owned by the parent wrapper;
+/// dropping it after success, refusal, timeout, or managed-child cleanup removes
+/// the directory without relying on the untrusted child.
+#[cfg(target_os = "linux")]
+fn create_parent_owned_temp_home(
+    spec: &mut CapsuleSpec,
+) -> Result<Option<tempfile::TempDir>, CapsuleRefused> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if !spec.environment.temporary_home {
+        return Ok(None);
+    }
+    let backend_id = select_backend(spec).backend_id;
+    let base = std::path::Path::new("/tmp")
+        .canonicalize()
+        .map_err(|error| CapsuleRefused {
+            backend_id,
+            reason: format!("resolve fixed capsule temp-home root /tmp: {error}"),
+        })?;
+    let directory = tempfile::Builder::new()
+        .prefix("tirith-capsule-")
+        .tempdir_in(&base)
+        .map_err(|error| CapsuleRefused {
+            backend_id,
+            reason: format!("create parent-owned capsule temporary HOME: {error}"),
+        })?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).map_err(
+        |error| CapsuleRefused {
+            backend_id,
+            reason: format!("secure parent-owned capsule temporary HOME: {error}"),
+        },
+    )?;
+    let canonical = directory
+        .path()
+        .canonicalize()
+        .map_err(|error| CapsuleRefused {
+            backend_id,
+            reason: format!("resolve parent-owned capsule temporary HOME: {error}"),
+        })?;
+    if canonical != directory.path() {
+        return Err(CapsuleRefused {
+            backend_id,
+            reason: format!(
+                "parent-owned capsule temporary HOME is not canonical: {} -> {}",
+                directory.path().display(),
+                canonical.display()
+            ),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| CapsuleRefused {
+        backend_id,
+        reason: format!("inspect parent-owned capsule temporary HOME: {error}"),
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(CapsuleRefused {
+            backend_id,
+            reason: "parent-owned capsule temporary HOME failed directory/uid/mode validation"
+                .to_string(),
+        });
+    }
+    if !spec.filesystem.read_roots.contains(&canonical) {
+        spec.filesystem.read_roots.push(canonical.clone());
+    }
+    if !spec.filesystem.write_roots.contains(&canonical) {
+        spec.filesystem.write_roots.push(canonical);
+    }
+    Ok(Some(directory))
+}
+
 fn run_to_completion_with_stdin_captured(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
+    target_argv0: tirith_core::runner::PipeInterpreter,
     args: &[String],
     input: &[u8],
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
 ) -> Result<CapturedCapsuleOutcome, CapsuleRefused> {
+    #[cfg(not(target_os = "linux"))]
     let plan = supervised_stdin_plan(spec, input.len())?;
 
     #[cfg(target_os = "macos")]
     {
-        let _ = (program, args, input, cwd, extra_env);
+        let _ = (program, target_argv0, args, input, cwd, extra_env);
         Err(CapsuleRefused {
             backend_id: plan.reported_selected.backend_id,
             reason: "supervised stdin execution is unavailable on macOS: a descendant can \
@@ -559,7 +818,7 @@ fn run_to_completion_with_stdin_captured(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (program, args, input, cwd, extra_env, &plan);
+        let _ = (program, target_argv0, args, input, cwd, extra_env, &plan);
         Err(CapsuleRefused {
             backend_id: plan.reported_selected.backend_id,
             reason: "contained supervised stdin launch is not available on Windows yet; refusing to run uncontained"
@@ -569,7 +828,7 @@ fn run_to_completion_with_stdin_captured(
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = (program, args, input, cwd, extra_env, &plan);
+        let _ = (program, target_argv0, args, input, cwd, extra_env, &plan);
         Err(CapsuleRefused {
             backend_id: plan.reported_selected.backend_id,
             reason: "contained supervised stdin launch is supported only on Linux; refusing to run uncontained"
@@ -579,12 +838,18 @@ fn run_to_completion_with_stdin_captured(
 
     #[cfg(target_os = "linux")]
     {
+        let mut launch_spec = spec.clone();
+        let temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
+        let plan = supervised_stdin_plan(&launch_spec, input.len())?;
         let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
-        let mut command = build_contained_command_os(
+        let mut command = linux_contained_command_os_with_options(
             &plan.backend_spec,
             program.launch_path().as_os_str(),
             &args_os,
+            None,
             &plan.backend_selected,
+            Some(OsStr::new(target_argv0.as_str())),
+            temp_home.as_ref().map(|directory| directory.path()),
         )?;
         if let Some(directory) = cwd {
             command.current_dir(directory);
@@ -596,20 +861,6 @@ fn run_to_completion_with_stdin_captured(
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        use std::os::unix::process::CommandExt as _;
-        // SAFETY: setpgid is async-signal-safe and makes the wrapper plus all
-        // descendants one killable group. Linux's seccomp policy denies setsid
-        // and setpgid, so the contained tree cannot escape it after launch.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
 
         // Revalidate the exact canonical identity immediately before spawning;
         // PATH is never consulted again by this launch path.
@@ -1002,9 +1253,13 @@ pub fn run_to_completion_os(
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        let status = cmd.status().map_err(|e| CapsuleRefused {
+        let mut child = cmd.spawn_managed().map_err(|e| CapsuleRefused {
             backend_id: sel.backend_id,
             reason: format!("capsule launch failed: {e}"),
+        })?;
+        let status = child.wait().map_err(|e| CapsuleRefused {
+            backend_id: sel.backend_id,
+            reason: format!("waiting for contained child failed: {e}"),
         })?;
         Ok(CapsuleOutcome {
             exit_code: status.code().unwrap_or(128),
@@ -1054,7 +1309,7 @@ fn build_contained_command_os(
     args: &[OsString],
     exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
-) -> Result<Command, CapsuleRefused> {
+) -> Result<PreparedContainedCommand, CapsuleRefused> {
     #[cfg(target_os = "linux")]
     {
         linux_contained_command_os(spec, program, args, exact_env, sel)
@@ -1074,8 +1329,8 @@ fn build_contained_command_os(
 }
 
 /// Spawn `program` + `args` inside a capsule with **piped** stdin/stdout/stderr and
-/// return the live [`Child`] for the caller to bridge. Used by the MCP gateway,
-/// which must read/write the child's stdio to proxy the protocol.
+/// return the live [`ManagedChild`] for the caller to bridge. Used by the MCP
+/// gateway, which must read/write the child's stdio to proxy the protocol.
 ///
 /// Fail-closed semantics match [`run_to_completion`]: a degraded/NoOp backend
 /// under [`DegradedPolicy::FailClosed`] returns `Err` before spawning. Windows
@@ -1091,7 +1346,7 @@ pub fn spawn_piped(
     args: &[String],
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
-) -> Result<(Child, SelectedBackend, bool), CapsuleRefused> {
+) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleRefused> {
     spawn_piped_with_binding(spec, program, args, None, None, extra_env, degraded)
 }
 
@@ -1106,7 +1361,7 @@ pub fn spawn_piped_exact(
     cwd: &std::path::Path,
     environment: &[(String, String)],
     degraded: DegradedPolicy,
-) -> Result<(Child, SelectedBackend, bool), CapsuleRefused> {
+) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleRefused> {
     spawn_piped_with_binding(
         spec,
         program,
@@ -1126,7 +1381,7 @@ fn spawn_piped_with_binding(
     exact_env: Option<&[(String, String)]>,
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
-) -> Result<(Child, SelectedBackend, bool), CapsuleRefused> {
+) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleRefused> {
     let sel = select_backend(spec);
     let is_degraded = sel.is_degraded();
 
@@ -1146,7 +1401,7 @@ fn spawn_piped_with_binding(
         // Only an AllowDegraded caller reaches here (FailClosed returned above).
         assert_degraded_run_is_permitted(degraded);
         let child = spawn_uncontained_piped(program, args, cwd, exact_env, extra_env, &sel)?;
-        return Ok((child, sel, true));
+        return Ok((ManagedChild::unmanaged(child), sel, true));
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1161,7 +1416,7 @@ fn spawn_piped_with_binding(
             // Only an AllowDegraded caller reaches here (FailClosed returned above).
             assert_degraded_run_is_permitted(degraded);
             let child = spawn_uncontained_piped(program, args, cwd, exact_env, extra_env, &sel)?;
-            return Ok((child, sel, true));
+            return Ok((ManagedChild::unmanaged(child), sel, true));
         }
         let mut cmd = build_contained_command(spec, program, args, exact_env, &sel)?;
         if let Some(cwd) = cwd {
@@ -1173,7 +1428,7 @@ fn spawn_piped_with_binding(
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = cmd.spawn().map_err(|e| CapsuleRefused {
+        let child = cmd.spawn_managed().map_err(|e| CapsuleRefused {
             backend_id: sel.backend_id,
             reason: format!("capsule launch failed: {e}"),
         })?;
@@ -1227,7 +1482,7 @@ fn build_contained_command(
     args: &[String],
     exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
-) -> Result<Command, CapsuleRefused> {
+) -> Result<PreparedContainedCommand, CapsuleRefused> {
     let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
     build_contained_command_os(spec, OsStr::new(program), &args_os, exact_env, sel)
 }
@@ -1239,7 +1494,40 @@ fn linux_contained_command_os(
     args: &[OsString],
     exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
-) -> Result<Command, CapsuleRefused> {
+) -> Result<PreparedContainedCommand, CapsuleRefused> {
+    let mut effective_spec = spec.clone();
+    let temp_home = create_parent_owned_temp_home(&mut effective_spec)?;
+    let mut prepared = linux_contained_command_os_with_options(
+        &effective_spec,
+        program,
+        args,
+        exact_env,
+        sel,
+        None,
+        temp_home.as_ref().map(|directory| directory.path()),
+    )?;
+    prepared.temp_home = temp_home;
+    Ok(prepared)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_contained_command_os_with_options(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    exact_env: Option<&[(String, String)]>,
+    sel: &SelectedBackend,
+    target_argv0: Option<&OsStr>,
+    temp_home: Option<&std::path::Path>,
+) -> Result<PreparedContainedCommand, CapsuleRefused> {
+    if spec.environment.temporary_home != temp_home.is_some() {
+        return Err(CapsuleRefused {
+            backend_id: sel.backend_id,
+            reason:
+                "Linux capsule temporary_home requires one parent-owned, policy-granted directory"
+                    .to_string(),
+        });
+    }
     let exe = std::env::current_exe().map_err(|e| CapsuleRefused {
         backend_id: sel.backend_id,
         reason: format!("cannot resolve current executable for capsule re-exec: {e}"),
@@ -1250,14 +1538,35 @@ fn linux_contained_command_os(
     })?;
     let mut cmd = Command::new(exe);
     cmd.arg(crate::cli::capsule_child::SUBCOMMAND)
-        .arg(spec_json)
-        .arg("--")
-        .arg(program)
-        .args(args);
+        .arg(spec_json);
+    if let Some(argv0) = target_argv0 {
+        cmd.arg("--target-argv0").arg(argv0);
+    }
+    if let Some(home) = temp_home {
+        cmd.arg("--temp-home").arg(home);
+    }
+    cmd.arg("--").arg(program).args(args);
     if let Some(environment) = exact_env {
         cmd.env_clear().envs(environment.iter().cloned());
     }
-    Ok(cmd)
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: setpgid is async-signal-safe. The target inherits this owned group,
+    // and the seccomp policy denies setsid/setpgid after containment, allowing the
+    // parent wrapper to terminate every descendant before dropping temp HOME.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    Ok(PreparedContainedCommand {
+        command: cmd,
+        temp_home: None,
+        owns_process_group: true,
+    })
 }
 
 /// macOS: re-exec the internal capsule launcher, which closes inherited handles,
@@ -1278,7 +1587,7 @@ fn macos_contained_command_os(
     args: &[OsString],
     exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
-) -> Result<Command, CapsuleRefused> {
+) -> Result<PreparedContainedCommand, CapsuleRefused> {
     // Validate the final sandbox argv before spawning. The launcher reconstructs
     // it after the first exec so a direct invocation of the hidden subcommand
     // cannot substitute an uncontained program for sandbox-exec.
@@ -1319,7 +1628,10 @@ fn macos_contained_command_os(
         backend_id: sel.backend_id,
         reason,
     })?;
-    Ok(cmd)
+    Ok(PreparedContainedCommand {
+        command: cmd,
+        temp_home: None,
+    })
 }
 
 /// Apply the env policy to a macOS `Command`: clear the environment, re-add the
@@ -1693,6 +2005,131 @@ mod tests {
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use tirith_core::capsule::NetworkPolicy;
 
+    #[test]
+    fn captured_terminal_control_is_withheld_and_forces_nonzero_outcome() {
+        let forwardable = sanitize_and_analyze_captured_output(
+            b"safe\x1b]52;c;Zm9yZ2Vk\x07tail",
+            b"\x1b[2Jfake prompt",
+        );
+        assert!(forwardable.blocked);
+        assert!(forwardable.stdout.is_empty());
+        assert!(!forwardable.stderr.contains(&0x1b));
+        assert!(String::from_utf8_lossy(&forwardable.stderr).contains("output withheld"));
+
+        let outcome = apply_captured_output_action(
+            CapsuleOutcome {
+                exit_code: 0,
+                backend_id: "test",
+                coverage: CapsuleCoverage::NONE,
+                degraded: false,
+            },
+            forwardable.blocked,
+        );
+        assert_ne!(
+            outcome.exit_code, 0,
+            "a child that exits zero cannot turn blocked output into overall success"
+        );
+    }
+
+    #[test]
+    fn captured_benign_output_is_utf8_and_display_safe() {
+        let forwardable = sanitize_and_analyze_captured_output(b"hello\xff\n", b"plain\n");
+        assert!(!forwardable.blocked);
+        assert!(std::str::from_utf8(&forwardable.stdout).is_ok());
+        assert!(!forwardable.stdout.contains(&0x1b));
+        assert_eq!(forwardable.stderr, b"plain\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_builder_serializes_and_owns_the_exact_policy_granted_temp_home() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let spec = CapsuleSpec::locked_down();
+        let required = spec.required_coverage();
+        let selected = SelectedBackend {
+            backend_id: "landlock-seccomp",
+            coverage: required,
+            required,
+        };
+        let prepared = linux_contained_command_os(&spec, OsStr::new("/bin/true"), &[], &selected)
+            .expect("prepare Linux capsule command");
+        let temp_home = prepared
+            .temp_home
+            .as_ref()
+            .expect("parent-owned temp HOME")
+            .path()
+            .to_path_buf();
+        let metadata = std::fs::symlink_metadata(&temp_home).expect("temp HOME metadata");
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+
+        let argv: Vec<OsString> = prepared.get_args().map(OsStr::to_os_string).collect();
+        assert_eq!(
+            argv.first().map(OsString::as_os_str),
+            Some(OsStr::new(crate::cli::capsule_child::SUBCOMMAND))
+        );
+        let serialized: CapsuleSpec = serde_json::from_str(
+            argv[1]
+                .to_str()
+                .expect("serialized capsule policy is UTF-8 JSON"),
+        )
+        .expect("launcher receives the finalized serialized policy");
+        let option = argv
+            .iter()
+            .position(|arg| arg == "--temp-home")
+            .expect("launcher receives --temp-home");
+        assert_eq!(argv[option + 1].as_os_str(), temp_home.as_os_str());
+        assert!(serialized.filesystem.read_roots.contains(&temp_home));
+        assert!(serialized.filesystem.write_roots.contains(&temp_home));
+
+        drop(prepared);
+        assert!(
+            !temp_home.exists(),
+            "dropping an unspawned prepared command must remove its temp HOME"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_child_kills_its_group_before_removing_temp_home() {
+        use std::os::unix::process::CommandExt as _;
+
+        let temp_home = tempfile::Builder::new()
+            .prefix("tirith-managed-child-")
+            .tempdir_in("/tmp")
+            .expect("managed child temp HOME");
+        let temp_path = temp_home.path().to_path_buf();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        // SAFETY: setpgid is async-signal-safe and captures no nontrivial state.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let child = command.spawn().expect("spawn managed child fixture");
+        let pid = child.id();
+        let managed = ManagedChild {
+            child,
+            _temp_home: Some(temp_home),
+            process_group: Some(pid),
+        };
+        drop(managed);
+
+        assert!(!temp_path.exists(), "managed temp HOME leaked after Drop");
+        assert_ne!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "managed child survived wrapper Drop"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     fn supervised_shell_spec() -> CapsuleSpec {
         let mut spec = supervised_stdin_spec();
@@ -1949,6 +2386,7 @@ mod tests {
         let refusal = run_to_completion_with_stdin_captured(
             &supervised_stdin_spec(),
             &program,
+            tirith_core::runner::PipeInterpreter::Sh,
             &[],
             b"printf remote-bytes\n",
             Some(std::path::Path::new("/")),

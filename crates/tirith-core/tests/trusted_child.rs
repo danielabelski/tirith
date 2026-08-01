@@ -247,7 +247,7 @@ fn trusted_lookup_rejects_a_proxy_link_inside_a_denied_root() {
 }
 
 #[test]
-fn trusted_lookup_supports_homebrew_style_versioned_paths() {
+fn generic_trusted_lookup_preserves_versioned_absolute_paths() {
     let temp = tempfile::tempdir().unwrap();
     let bin = temp
         .path()
@@ -262,6 +262,68 @@ fn trusted_lookup_supports_homebrew_style_versioned_paths() {
 
     let selected = TrustedExecutable::resolve_on_path("bash", &path, &[]).unwrap();
     assert_eq!(selected.path(), bash.canonicalize().unwrap());
+}
+
+#[test]
+fn forced_interpreter_rejects_a_same_uid_cellar_shaped_install() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp
+        .path()
+        .join("Cellar")
+        .join("bash")
+        .join("5.3.3")
+        .join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let bash = bin.join("bash");
+    make_executable(&bash, "#!/bin/sh\nexit 0\n");
+    let path = std::env::join_paths([&bin]).unwrap();
+
+    let selected = TrustedExecutable::resolve_on_path("bash", &path, &[]).unwrap();
+    let error = selected
+        .require_forced_interpreter_provenance()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("root-owned")
+            && error.to_string().contains("non-group/world-writable"),
+        "same-UID Cellar-shaped installs must not become trusted remote interpreters: {error}"
+    );
+}
+
+#[test]
+fn forced_interpreter_accepts_the_canonical_system_shell() {
+    let shell = TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
+        .unwrap()
+        .require_forced_interpreter_provenance()
+        .unwrap();
+    assert!(shell.path().is_absolute());
+}
+
+#[test]
+fn delayed_reinvocation_rejects_a_replaceable_user_owned_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let candidate = temp.path().join("tirith");
+    make_executable(&candidate, "#!/bin/sh\nexit 0\n");
+
+    let error = TrustedExecutable::from_absolute(&candidate, &[])
+        .unwrap()
+        .require_safe_reinvocation_provenance()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("delayed safe-command reinvocation")
+            && error.to_string().contains("root-owned"),
+        "a same-UID path could be replaced after suggestion generation: {error}"
+    );
+}
+
+#[test]
+fn delayed_reinvocation_accepts_a_root_managed_system_path() {
+    let candidate = TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
+        .unwrap()
+        .require_safe_reinvocation_provenance()
+        .unwrap();
+    assert!(candidate.path().is_absolute());
 }
 
 #[test]
@@ -463,11 +525,14 @@ fn supervisor_deadline_is_not_defeated_by_a_descendant_holding_stdout() {
     let pid_file = temp.path().join("grandchild.pid");
     let body = format!("sleep 30 & printf '%s' $! > '{}'", pid_file.display());
     let args = [OsStr::new("-c"), OsStr::new(&body)];
-    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_millis(300), 64, 64));
+    // Leave enough startup budget for heavily loaded CI to execute the shell
+    // and publish the descendant PID before the deadline. The long-lived
+    // `sleep` still guarantees the timeout path rather than normal completion.
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 64, 64));
 
     let started = Instant::now();
     let outcome = run(&shell(), &spec);
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < Duration::from_secs(4));
     assert!(matches!(outcome, ChildOutcome::Timeout { .. }));
 
     let pid: libc::pid_t = std::fs::read_to_string(pid_file)

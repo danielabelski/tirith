@@ -146,22 +146,31 @@ When tirith blocks a `curl | bash` pattern, the safest alternatives are:
 exact command you ran:
 
 ```bash
-tirith check --suggest-safe-command -- 'curl https://example.com/install.sh | bash'
+tirith check --suggest-safe-command -- 'curl -fsSL https://example.com/install.sh | bash'
 # tirith: safer alternative
 #   curl_pipe_shell
-#     try: tirith run --capsule --script-stdin --interpreter bash \
+#     try: '/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash \
 #          'https://example.com/install.sh'
 ```
 
-For this proven shape, the runner bounds and analyzes the downloaded bytes,
-asks for confirmation, then feeds a hash-verified private copy to the selected
-`bash` over stdin inside a fail-closed capsule. It ignores a conflicting remote
-shebang. Literal no-argument `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, and
+On x86_64 Linux, a fixed root-managed current Tirith binary may emit this
+rewrite. The generated command uses Tirith's absolute path so a later `PATH`
+shadow cannot replace it. At execution, the runner requires the selected
+interpreter's first `PATH` hit to be root-managed, binds its bytes before the
+download, bounds and analyzes the downloaded bytes, asks for confirmation, then
+feeds the hash-verified private interpreter copy over stdin inside a fail-closed
+capsule. It also ignores a conflicting remote shebang. Other architectures,
+platforms, and user-owned Tirith installations show guidance instead of an
+executable rewrite. Curl rewrites require both `-f`/`--fail` and
+`-L`/`--location` semantics;
+plain curl, `-f` alone, or `-L` alone stays guidance-only.
+Literal no-argument `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, and
 `ash` are supported, as is the narrow POSIX-shell `-s -- <literal operands...>`
-form. Dynamic or malformed URL tokens, controls, Cmd, `|&`, and unsupported
-downloader/interpreter arguments produce guidance rather than an executable
-rewrite. Suggestions also drop insecure-TLS flags and upgrade `http://` to
-`https://`. The flag is advisory — it never changes the verdict or exit code.
+form. Dynamic or malformed URL tokens, controls, PowerShell, Cmd, `|&`, and
+unsupported downloader/interpreter arguments produce guidance rather than an
+executable rewrite. Suggestions also drop insecure-TLS flags and upgrade
+`http://` to `https://`. The flag is advisory — it never changes the verdict or
+exit code.
 
 ### Using tirith run (built-in, Unix only)
 

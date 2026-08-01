@@ -257,20 +257,13 @@ fn archive_list_first_negative_non_archive_leader_no_rewrite() {
 // are single-quoted; the dotfile redirect target is refused when it carries shell
 // metacharacters (it must stay unquoted for `~`/`$HOME` expansion).
 
-/// End-to-end: run `suggest` on `cmd`, return the `curl_pipe_shell` rewrite.
-#[cfg(unix)]
-fn pipe_safe_command(cmd: &str) -> String {
-    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-    let s = suggest(cmd, ShellType::Posix, &v);
-    find_by_rule(&s, "curl_pipe_shell")
-        .and_then(|e| e.safe_command.clone())
-        .unwrap_or_else(|| panic!("expected a pipe-to-shell rewrite for {cmd:?}"))
-}
-
-#[cfg(not(unix))]
 #[test]
-fn pipe_to_shell_public_contract_is_guidance_only_without_runner() {
-    let cmd = "curl https://example.com/install.sh | bash";
+fn pipe_to_shell_public_contract_is_guidance_only_for_a_replaceable_test_binary() {
+    // Public suggestion generation may emit an executable command only when the
+    // currently-running Tirith is itself a fixed root-managed x86_64 Linux
+    // installation. Cargo's integration-test binary lives in a user-writable
+    // target directory, so it must remain guidance-only on every CI platform.
+    let cmd = "curl -fsSL https://example.com/install.sh | bash";
     let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
     let suggestions = suggest(cmd, ShellType::Posix, &v);
     let entry = find_by_rule(&suggestions, "curl_pipe_shell").expect("rule entry");
@@ -278,42 +271,28 @@ fn pipe_to_shell_public_contract_is_guidance_only_without_runner() {
     assert!(entry.rationale.contains("No safe executable rewrite"));
 }
 
-#[cfg(unix)]
 #[test]
-fn pipe_to_shell_public_contract_is_one_capsule_runner_invocation() {
-    let sc = pipe_safe_command("curl https://example.com/install.sh | bash");
-    assert_eq!(
-        sc,
-        "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
-    );
-    for forbidden in ["/tmp/", "curl ", "wget ", "less ", " && ", " | "] {
+fn pipe_to_shell_public_contract_requires_curl_fail_and_redirect_semantics() {
+    for command in [
+        "curl https://example.com/install.sh | bash",
+        "curl -f https://example.com/install.sh | bash",
+        "curl -L https://example.com/install.sh | bash",
+    ] {
+        let verdict = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let suggestions = suggest(command, ShellType::Posix, &verdict);
+        let entry = find_by_rule(&suggestions, "curl_pipe_shell").expect("rule entry");
         assert!(
-            !sc.contains(forbidden),
-            "runner rewrite must not expose historical stage {forbidden:?}: {sc}"
+            entry.safe_command.is_none(),
+            "curl semantics that differ from the bounded fetcher must be guidance-only: {command}"
         );
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn pipe_to_shell_command_substitution_url_is_quoted_not_executed() {
-    // Within the original single quotes, `$(id)` is literal URL data. The
-    // decoder proves that fact and the encoder keeps it literal.
-    let sc = pipe_safe_command("curl 'https://example.com/$(id)' | bash");
-    assert!(sc.contains("'https://example.com/$(id)'"), "{sc}");
-    assert!(
-        !sc.replace("'https://example.com/$(id)'", "")
-            .contains("$(id)"),
-        "no bare $(id) may survive outside the quoted token: {sc}"
-    );
-}
-
-#[cfg(unix)]
 #[test]
 fn malformed_space_bearing_url_is_guidance_only() {
     let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
     let suggestions = suggest(
-        "curl 'https://example.com/a;rm -rf ~' | bash",
+        "curl -fsSL 'https://example.com/a;rm -rf ~' | bash",
         ShellType::Posix,
         &v,
     );
@@ -323,12 +302,11 @@ fn malformed_space_bearing_url_is_guidance_only() {
         .is_none());
 }
 
-#[cfg(unix)]
 #[test]
 fn normalizing_backtick_url_is_guidance_only() {
     let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
     let suggestions = suggest(
-        "curl 'https://example.com/`id`' | bash",
+        "curl -fsSL 'https://example.com/`id`' | bash",
         ShellType::Posix,
         &v,
     );
@@ -338,27 +316,17 @@ fn normalizing_backtick_url_is_guidance_only() {
         .is_none());
 }
 
-#[cfg(unix)]
 #[test]
-fn pipe_to_shell_wget_command_substitution_url_is_quoted() {
-    // The original downloader is discarded; the runner quotes the URL itself.
+fn pipe_to_shell_wget_is_guidance_only_for_a_replaceable_test_binary() {
     let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
     let s = suggest(
         "wget -qO- 'https://example.com/$(id)' | sh",
         ShellType::Posix,
         &v,
     );
-    let sc = find_by_rule(&s, "wget_pipe_shell")
-        .and_then(|e| e.safe_command.clone())
-        .expect("wget pipe-to-shell rewrite expected");
-    assert!(sc.contains("--script-stdin --interpreter sh"), "{sc}");
-    assert!(!sc.contains("wget "), "{sc}");
-    assert!(sc.contains("'https://example.com/$(id)'"), "{sc}");
-    assert!(
-        !sc.replace("'https://example.com/$(id)'", "")
-            .contains("$(id)"),
-        "no bare $(id) outside the quoted token: {sc}"
-    );
+    let entry = find_by_rule(&s, "wget_pipe_shell").expect("wget guidance expected");
+    assert!(entry.safe_command.is_none());
+    assert!(entry.rationale.contains("No safe executable rewrite"));
 }
 
 #[test]

@@ -672,17 +672,26 @@ additionally prints a concrete safer rewrite of the *actual* command, but only
 where a transformation is genuinely safer and correct:
 
 ```bash
-tirith check --suggest -- 'curl https://example-cli.dev/i.sh | bash'
-# → try: tirith run --capsule --script-stdin --interpreter bash \
+tirith check --suggest -- 'curl -fsSL https://example-cli.dev/i.sh | bash'
+# → try: '/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash \
 #          'https://example-cli.dev/i.sh'
 ```
 
-For command shapes whose URL, shell, arguments, and stdin behavior can be
-decoded exactly, it routes pipe-to-shell through Tirith's bounded, reviewed,
-hash-verified, fail-closed capsule runner while preserving the selected shell
-instead of trusting the remote shebang. Dynamic or malformed URL tokens,
-unsupported interpreter arguments, Cmd, and ambiguous pipelines remain
-guidance-only. Suggestions also drop insecure-TLS flags (`-k` / `--insecure` /
+On x86_64 Linux, when Tirith is installed at a fixed root-managed system path
+and the command's URL, shell, arguments, and stdin behavior can be decoded
+exactly, the rewrite routes pipe-to-shell through Tirith's bounded, reviewed,
+hash-verified, fail-closed capsule runner. The absolute Tirith path prevents a
+later `PATH` shadow from changing what runs. At execution, the runner also
+requires the selected interpreter's first `PATH` hit to be root-managed, binds
+its bytes before downloading, and preserves that shell instead of trusting the
+remote shebang. Other architectures, platforms, and user-owned Tirith
+installations keep this remediation as guidance. For curl, executable rewrites
+additionally require both
+fail-on-HTTP-error and redirect-following semantics (`-f` and `-L`, including a
+bundle such as `-fsSL`). Dynamic or malformed URL tokens, unsupported
+interpreter arguments, PowerShell, Cmd, and ambiguous pipelines remain
+guidance-only.
+Suggestions also drop insecure-TLS flags (`-k` / `--insecure` /
 `--no-check-certificate`) and switch plain `http://` to `https://`. For
 findings with no safe mechanical rewrite (homograph
 hostnames, archive-extract targets, …) it says so plainly and shows the

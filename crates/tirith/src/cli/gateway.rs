@@ -1181,7 +1181,7 @@ fn spawn_upstream_capsuled(
     upstream_bin: &str,
     upstream_args: &[String],
     depth_env: &str,
-) -> Result<Child, String> {
+) -> Result<crate::cli::capsule::ManagedChild, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot resolve gateway working directory: {error}"))?;
     let spec = mcp_server_capsule_spec(&cwd);
@@ -1414,7 +1414,9 @@ impl GatewayLaunchBinding {
     }
 }
 
-fn spawn_bound_upstream(binding: &GatewayLaunchBinding) -> Result<Child, String> {
+fn spawn_bound_upstream(
+    binding: &GatewayLaunchBinding,
+) -> Result<crate::cli::capsule::ManagedChild, String> {
     binding.revalidate()?;
     let program = binding
         .executable
@@ -1449,6 +1451,7 @@ fn spawn_bound_upstream(binding: &GatewayLaunchBinding) -> Result<Child, String>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+        .map(crate::cli::capsule::ManagedChild::unmanaged)
         .map_err(|error| format!("failed to spawn exact-bound upstream: {error}"))
 }
 
@@ -1770,7 +1773,7 @@ pub fn run_gateway_with_options(
             .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(c) => c,
+            Ok(c) => crate::cli::capsule::ManagedChild::unmanaged(c),
             Err(e) => {
                 eprintln!("tirith gateway: failed to spawn upstream '{upstream_bin}': {e}");
                 return 1;

@@ -717,13 +717,14 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
                 requested.interpreter
             ));
         }
-        let executable = crate::trusted_child::resolve_ambient(requested.interpreter.as_str())
-            .map_err(|error| {
-                format!(
-                    "cannot select trusted stdin interpreter '{}': {error}",
-                    requested.interpreter
-                )
-            })?;
+        let executable =
+            crate::trusted_child::resolve_forced_interpreter(requested.interpreter.as_str())
+                .map_err(|error| {
+                    format!(
+                        "cannot select trusted stdin interpreter '{}': {error}",
+                        requested.interpreter
+                    )
+                })?;
         Some(executable.bind_content().map_err(|error| {
             format!(
                 "cannot bind trusted stdin interpreter '{}' before download: {error}",

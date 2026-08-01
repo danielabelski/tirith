@@ -12,11 +12,11 @@
 //!
 //! This process then:
 //! 1. Parses its own simple argv (the spec JSON, then everything after `--`).
-//! 2. On Linux, creates the temporary HOME the env policy points at, applies the
+//! 2. On Linux, validates the parent-owned, policy-granted temporary HOME and applies the
 //!    full containment sequence via [`tirith_core::capsule::linux::apply_containment`]
-//!    (rlimits -> no-new-privs -> Landlock -> seccomp -> env cleanup), verifies the
-//!    achieved coverage is not degraded against the spec's requirement, and only
-//!    then `execve`s the target.
+//!    (inherited-FD closure -> rlimits -> no-new-privs -> Landlock -> seccomp ->
+//!    env cleanup), verifies the achieved coverage is not degraded against the
+//!    spec's requirement, and only then `execve`s the target.
 //! 3. On macOS, builds the native `sandbox-exec` argv, closes unrelated inherited
 //!    descriptors, applies supported rlimits, and `execve`s `sandbox-exec`. This
 //!    second exec occurs only after Rust's private parent/child exec-status pipe
@@ -55,16 +55,25 @@ pub fn is_invocation(args: &[OsString]) -> bool {
 pub struct ParsedArgs {
     /// The serialized [`CapsuleSpec`] JSON.
     pub spec_json: String,
-    /// The target program (argv[0] of the contained child).
+    /// The executable path/name passed to `execvp`.
     pub program: OsString,
+    /// Optional explicit `argv[0]` for alias-sensitive or multicall targets.
+    /// When absent, [`Self::program`] is used, preserving the legacy launcher
+    /// contract.
+    pub target_argv0: Option<OsString>,
+    /// Optional parent-owned temporary HOME. The parent keeps the directory
+    /// guard alive until the complete child tree has exited and grants this
+    /// exact path in the finalized filesystem policy before launch.
+    pub temp_home: Option<OsString>,
     /// The target program's arguments.
     pub program_args: Vec<OsString>,
 }
 
-/// Parse `tirith __capsule-child <spec-json> -- <prog> <arg>...` from the full
-/// process argv. Requires the subcommand token, then exactly one spec-JSON
-/// argument, then a literal `--`, then a non-empty program. Pure and
-/// platform-independent, so the argv grammar is unit-testable everywhere.
+/// Parse `tirith __capsule-child <spec-json> [internal options] -- <prog>
+/// <arg>...` from the full process argv. Internal options are closed and may
+/// appear at most once: `--target-argv0 <value>` and `--temp-home <absolute>`.
+/// Pure and platform-independent, so the argv grammar is unit-testable
+/// everywhere.
 pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     // args[0] = "tirith", args[1] = SUBCOMMAND.
     if args.get(1).map(OsString::as_os_str) != Some(OsStr::new(SUBCOMMAND)) {
@@ -85,6 +94,29 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     if sep < 3 {
         return Err("the `--` separator must follow the spec JSON".to_string());
     }
+    let mut target_argv0 = None;
+    let mut temp_home = None;
+    let mut option_index = 3usize;
+    while option_index < sep {
+        let option = &args[option_index];
+        let value = args
+            .get(option_index + 1)
+            .filter(|_| option_index + 1 < sep)
+            .ok_or_else(|| format!("missing value for internal launcher option {option:?}"))?
+            .clone();
+        if option == "--target-argv0" {
+            if target_argv0.replace(value).is_some() {
+                return Err("duplicate `--target-argv0` launcher option".to_string());
+            }
+        } else if option == "--temp-home" {
+            if temp_home.replace(value).is_some() {
+                return Err("duplicate `--temp-home` launcher option".to_string());
+            }
+        } else {
+            return Err(format!("unknown internal launcher option {option:?}"));
+        }
+        option_index += 2;
+    }
     let rest = &args[sep + 1..];
     let program = rest
         .first()
@@ -94,6 +126,8 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     Ok(ParsedArgs {
         spec_json,
         program,
+        target_argv0,
+        temp_home,
         program_args,
     })
 }
@@ -206,13 +240,14 @@ fn macos_launch(parsed: &ParsedArgs) -> ! {
     std::process::exit(127);
 }
 
-/// Linux launch path: deserialize the spec, create the temporary HOME, apply
-/// containment, verify coverage is not degraded against the spec's requirement,
-/// then `execve` the target. Diverges (never returns): `execvp` replaces the
-/// image on success and every failure path exits non-zero.
+/// Linux launch path: deserialize the spec, validate any parent-owned temporary
+/// HOME, apply containment, verify coverage is not degraded against the spec's
+/// requirement, then `execve` the target. Diverges (never returns): `execvp`
+/// replaces the image on success and every failure path exits non-zero.
 #[cfg(target_os = "linux")]
 fn linux_launch(parsed: &ParsedArgs) -> ! {
     use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
     use tirith_core::capsule::linux::{apply_containment, exec_cstrings};
     use tirith_core::capsule::CapsuleSpec;
 
@@ -251,8 +286,19 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         }
     }
 
-    // Build the argv for execve BEFORE we lock down, so a bad arg fails early.
-    let argv: Vec<CString> = match exec_cstrings(&parsed.program, &parsed.program_args) {
+    // Build both the executable C string and argv BEFORE we lock down, so an
+    // interior NUL fails early. The executable path is intentionally independent
+    // from argv[0]: a bound snapshot of bash/BusyBox must still observe the closed
+    // requested name (`sh`/`ash`) to preserve alias and multicall semantics.
+    let prog_c = match CString::new(parsed.program.as_os_str().as_bytes()) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("tirith __capsule-child: program path contains NUL");
+            std::process::exit(2);
+        }
+    };
+    let target_argv0 = parsed.target_argv0.as_deref().unwrap_or(&parsed.program);
+    let argv: Vec<CString> = match exec_cstrings(target_argv0, &parsed.program_args) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("tirith __capsule-child: {e}");
@@ -260,23 +306,32 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         }
     };
 
-    // Create the temporary HOME the env policy will point at (when temporary_home).
-    // Held in a guard so it is cleaned up if we exit before execve; on a successful
-    // execve the directory leaks intentionally (the contained child owns it for its
-    // lifetime, and the parent's wrapper removes it after the child exits in E5).
-    let temp_home = if spec.environment.temporary_home {
-        match tempfile::Builder::new().prefix("tirith-capsule-").tempdir() {
-            Ok(dir) => Some(dir),
-            Err(e) => {
-                eprintln!("tirith __capsule-child: could not create temporary HOME: {e}");
+    // Every temporary-HOME launch supplies a parent-owned directory that was
+    // added to the finalized Landlock read/write policy. The parent keeps its
+    // TempDir guard alive through complete-tree cleanup. Creating it here would
+    // be too late for the serialized policy and would leak it across execvp.
+    let temp_home_path = match (spec.environment.temporary_home, parsed.temp_home.as_deref()) {
+        (false, Some(_)) => {
+            eprintln!(
+                "tirith __capsule-child: --temp-home supplied while temporary_home is disabled"
+            );
+            std::process::exit(2);
+        }
+        (true, Some(path)) => match validate_parent_temp_home(&spec, path) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("tirith __capsule-child: invalid parent-owned temporary HOME: {error}");
                 std::process::exit(2);
             }
+        },
+        (true, None) => {
+            eprintln!(
+                "tirith __capsule-child: temporary_home requires a parent-owned, policy-granted --temp-home"
+            );
+            std::process::exit(2);
         }
-    } else {
-        None
+        (false, None) => None,
     };
-    let temp_home_path: Option<std::path::PathBuf> =
-        temp_home.as_ref().map(|d| d.path().to_path_buf());
 
     // Apply the full containment sequence. On ANY error we exit non-zero and never
     // exec the target (fail-closed).
@@ -310,13 +365,8 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         std::process::exit(13);
     }
 
-    // We must NOT drop the tempdir here: execvp replaces the process image, so the
-    // child needs HOME to keep existing. Leak the guard intentionally.
-    std::mem::forget(temp_home);
-
     // execvp searches PATH for a bare program name, matching how a user would run
     // it; an absolute/relative path is used as-is. On success this never returns.
-    let prog_c = argv[0].clone();
     let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     // SAFETY: `prog_c` and every pointer in `ptrs` are valid, NUL-terminated C
@@ -332,6 +382,50 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         parsed.program
     );
     std::process::exit(127);
+}
+
+#[cfg(target_os = "linux")]
+fn validate_parent_temp_home(
+    spec: &tirith_core::capsule::CapsuleSpec,
+    raw: &std::ffi::OsStr,
+) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let requested = std::path::PathBuf::from(raw);
+    if !requested.is_absolute() {
+        return Err("path is not absolute".to_string());
+    }
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| format!("canonicalize {}: {error}", requested.display()))?;
+    if canonical != requested {
+        return Err(format!(
+            "path is not canonical ({} resolves to {})",
+            requested.display(),
+            canonical.display()
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&canonical)
+        .map_err(|error| format!("inspect {}: {error}", canonical.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("path is not a real directory".to_string());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700 {
+        return Err("directory is not owned by the launcher uid with mode 0700".to_string());
+    }
+    let granted_exactly = |roots: &[std::path::PathBuf]| {
+        roots
+            .iter()
+            .any(|root| root.canonicalize().is_ok_and(|root| root == canonical))
+    };
+    if !granted_exactly(&spec.filesystem.read_roots)
+        || !granted_exactly(&spec.filesystem.write_roots)
+    {
+        return Err(
+            "directory is not an exact finalized read/write filesystem-policy root".to_string(),
+        );
+    }
+    Ok(canonical)
 }
 
 /// The number of threads in the current process, read from `/proc/self/stat`
@@ -447,6 +541,58 @@ mod tests {
         let p = parse_args(&a).expect("parse");
         assert_eq!(p.program, "ls");
         assert!(p.program_args.is_empty());
+    }
+
+    #[test]
+    fn parse_args_preserves_internal_argv0_and_parent_temp_home() {
+        let a = argv(&[
+            "tirith",
+            "__capsule-child",
+            "{}",
+            "--target-argv0",
+            "sh",
+            "--temp-home",
+            "/tmp/tirith-capsule-fixed",
+            "--",
+            "/tmp/bound/busybox",
+            "-s",
+        ]);
+        let parsed = parse_args(&a).expect("parse internal launch options");
+        assert_eq!(parsed.target_argv0.as_deref(), Some(OsStr::new("sh")));
+        assert_eq!(
+            parsed.temp_home.as_deref(),
+            Some(OsStr::new("/tmp/tirith-capsule-fixed"))
+        );
+        assert_eq!(parsed.program, "/tmp/bound/busybox");
+        assert_eq!(parsed.program_args, vec![OsString::from("-s")]);
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_or_duplicate_internal_options() {
+        for a in [
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--unknown",
+                "x",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--target-argv0",
+                "sh",
+                "--target-argv0",
+                "bash",
+                "--",
+                "ls",
+            ]),
+        ] {
+            assert!(parse_args(&a).is_err());
+        }
     }
 
     #[test]

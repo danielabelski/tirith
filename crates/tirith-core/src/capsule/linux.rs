@@ -23,22 +23,23 @@
 //!
 //! [`apply_containment`] applies, in this exact order:
 //!
-//! 1. **Resource limits** ([`libc::setrlimit`]): `RLIMIT_CPU`, `RLIMIT_AS`,
-//!    `RLIMIT_NPROC`, `RLIMIT_NOFILE` from [`ResourceLimits`]. Done first so even a
-//!    failure later cannot leave an unbounded process.
-//! 2. **`PR_SET_NO_NEW_PRIVS`** ([`libc::prctl`]): no `execve` can ever gain
+//! 1. **Inherited-handle closure**: enumerate `/proc/self/fd` before lowering the
+//!    descriptor ceiling and close every descriptor outside [`HandlePolicy`].
+//! 2. **Resource limits** ([`libc::setrlimit`]): `RLIMIT_CPU`, `RLIMIT_AS`,
+//!    `RLIMIT_NPROC`, `RLIMIT_NOFILE` from [`ResourceLimits`].
+//! 3. **`PR_SET_NO_NEW_PRIVS`** ([`libc::prctl`]): no `execve` can ever gain
 //!    privileges (defeats setuid escalation) and it is a precondition for an
 //!    unprivileged seccomp filter. Set explicitly even though seccompiler also sets
 //!    it, so that the guarantee holds on a kernel/arch where the seccomp layer is
 //!    unavailable.
-//! 3. **Landlock** (filesystem confinement): grant only the spec's read/write
+//! 4. **Landlock** (filesystem confinement): grant only the spec's read/write
 //!    roots; everything else (including the sensitive subtrees in
 //!    [`crate::capsule::deny_default_paths`] that are not under a grant) is denied
 //!    by Landlock's default-deny model.
-//! 4. **seccomp** (`extrasafe`): a default-deny syscall policy that allows the
+//! 5. **seccomp** (`extrasafe`): a default-deny syscall policy that allows the
 //!    basics + file I/O + thread creation + fork/exec, but grants **no
 //!    socket-creation syscalls**, so the child cannot open a raw outbound socket.
-//! 5. **Environment cleanup**: drop every variable except the policy's survivors,
+//! 6. **Environment cleanup**: drop every variable except the policy's survivors,
 //!    strip the known sensitive set, and point HOME/TMPDIR/XDG_* at a temporary
 //!    directory so the child cannot read or poison the real user config.
 //!
@@ -61,7 +62,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::{
-    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, EnvironmentPolicy,
+    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, EnvironmentPolicy, HandlePolicy,
     ResourceLimitSupport, ResourceLimits,
 };
 
@@ -197,6 +198,8 @@ pub fn derive_coverage(spec: &CapsuleSpec, fs: &LandlockProbe, seccomp: bool) ->
 /// through to running the target uncontained.
 #[derive(Debug)]
 pub enum ContainError {
+    /// Inherited descriptors could not be reduced to the policy allow-list.
+    Handles(String),
     /// A resource limit could not be set.
     Rlimit(String),
     /// `PR_SET_NO_NEW_PRIVS` failed.
@@ -213,6 +216,7 @@ pub enum ContainError {
 impl std::fmt::Display for ContainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ContainError::Handles(m) => write!(f, "handle isolation: {m}"),
             ContainError::Rlimit(m) => write!(f, "resource limit: {m}"),
             ContainError::NoNewPrivs(m) => write!(f, "no-new-privs: {m}"),
             ContainError::Landlock(m) => write!(f, "landlock: {m}"),
@@ -224,6 +228,54 @@ impl std::fmt::Display for ContainError {
 
 impl std::error::Error for ContainError {}
 
+/// Close every inherited descriptor except the policy's explicit Unix
+/// allow-list. This runs while the launcher is confirmed single-threaded and
+/// before lowering `RLIMIT_NOFILE`, so enumerating `/proc/self/fd` sees the
+/// complete inherited set. Failure is fatal: an already-open file bypasses
+/// Landlock and an already-connected socket bypasses syscall-level socket
+/// creation denial.
+pub fn close_unexpected_fds(policy: &HandlePolicy) -> Result<(), ContainError> {
+    let allowed = policy.allowed_unix_fds();
+    if let Some(fd) = allowed.iter().find(|fd| **fd < 0) {
+        return Err(ContainError::Handles(format!(
+            "allowed descriptor must be non-negative: {fd}"
+        )));
+    }
+
+    let entries = std::fs::read_dir("/proc/self/fd")
+        .map_err(|error| ContainError::Handles(format!("enumerate /proc/self/fd: {error}")))?;
+    let mut inherited = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| ContainError::Handles(format!("read /proc/self/fd entry: {error}")))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(ContainError::Handles(
+                "non-UTF-8 descriptor name in /proc/self/fd".to_string(),
+            ));
+        };
+        let fd = name.parse::<i32>().map_err(|error| {
+            ContainError::Handles(format!("invalid descriptor entry {name:?}: {error}"))
+        })?;
+        if !allowed.contains(&fd) {
+            inherited.push(fd);
+        }
+    }
+    // Drop ReadDir before closing: its own descriptor appeared in the snapshot
+    // and is already closed by this point. A later close on that number may
+    // therefore report EBADF, which is the desired end state.
+    for fd in inherited {
+        if unsafe { libc::close(fd) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EBADF) {
+                return Err(ContainError::Handles(format!(
+                    "close inherited descriptor {fd}: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply the full containment sequence to the **current** process, then return the
 /// coverage actually achieved. Call this from the single-threaded launcher child
 /// immediately before `execve`. On `Err`, the caller must abort (exit non-zero)
@@ -231,7 +283,8 @@ impl std::error::Error for ContainError {}
 ///
 /// `temp_home` is a pre-created temporary directory the launcher owns; the env
 /// step points HOME/TMPDIR/XDG_* at it when [`EnvironmentPolicy::temporary_home`]
-/// is set. (The launcher creates and later cleans it up; this primitive only reads
+/// is set. (The parent creates it before serializing the policy, retains the
+/// cleanup guard through complete-tree shutdown, and this primitive only reads
 /// the path.)
 ///
 /// This refuses an [`CapabilityLevel::AllowListedDomains`] spec with
@@ -248,14 +301,23 @@ pub fn apply_containment(
                 .to_string(),
         ));
     }
+    if spec.environment.temporary_home != temp_home.is_some() {
+        return Err(ContainError::Unsupported(
+            "temporary_home requires exactly one prevalidated parent-owned directory".to_string(),
+        ));
+    }
 
-    // 1. Resource limits.
+    // 1. Handle isolation. This must precede RLIMIT_NOFILE so the enumeration
+    // sees every inherited descriptor, including descriptors above the new cap.
+    close_unexpected_fds(&spec.handles)?;
+
+    // 2. Resource limits.
     apply_rlimits(&spec.resources)?;
 
-    // 2. No new privileges.
+    // 3. No new privileges.
     set_no_new_privs()?;
 
-    // 3. Landlock filesystem confinement.
+    // 4. Landlock filesystem confinement.
     let fs_outcome = apply_landlock(spec)?;
     if fs_outcome == LandlockOutcome::Partially {
         // Honest signal: FS is still confined to the grants (default-deny holds in
@@ -270,10 +332,10 @@ pub fn apply_containment(
         );
     }
 
-    // 4. seccomp (default-deny syscall policy, no socket creation).
+    // 5. seccomp (default-deny syscall policy, no socket creation).
     let seccomp_applied = apply_seccomp()?;
 
-    // 5. Environment scrubbing.
+    // 6. Environment scrubbing.
     apply_env(&spec.environment, temp_home);
 
     Ok(CapsuleCoverage {
@@ -296,34 +358,41 @@ pub fn apply_containment(
 /// are ignored here.
 fn apply_rlimits(limits: &ResourceLimits) -> Result<(), ContainError> {
     if let Some(cpu) = limits.cpu_seconds {
-        set_one_rlimit(libc::RLIMIT_CPU, cpu, "RLIMIT_CPU")?;
+        set_one_rlimit(libc::RLIMIT_CPU as libc::c_uint, cpu, "RLIMIT_CPU")?;
     }
     if let Some(mem) = limits.memory_bytes {
-        set_one_rlimit(libc::RLIMIT_AS, mem, "RLIMIT_AS")?;
+        set_one_rlimit(libc::RLIMIT_AS as libc::c_uint, mem, "RLIMIT_AS")?;
     }
     if let Some(nproc) = limits.max_processes {
-        set_one_rlimit(libc::RLIMIT_NPROC, u64::from(nproc), "RLIMIT_NPROC")?;
+        set_one_rlimit(
+            libc::RLIMIT_NPROC as libc::c_uint,
+            u64::from(nproc),
+            "RLIMIT_NPROC",
+        )?;
     }
     if let Some(nofile) = limits.max_open_files {
-        set_one_rlimit(libc::RLIMIT_NOFILE, u64::from(nofile), "RLIMIT_NOFILE")?;
+        set_one_rlimit(
+            libc::RLIMIT_NOFILE as libc::c_uint,
+            u64::from(nofile),
+            "RLIMIT_NOFILE",
+        )?;
     }
     Ok(())
 }
 
 /// Set one `setrlimit` resource to `value` (soft == hard). `RLIMIT_NOFILE` is a
 /// fd *count* and the rest are their natural units; all fit `rlim_t`.
-fn set_one_rlimit(
-    resource: libc::__rlimit_resource_t,
-    value: u64,
-    name: &str,
-) -> Result<(), ContainError> {
+fn set_one_rlimit(resource: libc::c_uint, value: u64, name: &str) -> Result<(), ContainError> {
     let rl = libc::rlimit {
         rlim_cur: value as libc::rlim_t,
         rlim_max: value as libc::rlim_t,
     };
     // SAFETY: `rl` is a valid, fully-initialized rlimit for the duration of the
     // call; `setrlimit` does not retain the pointer.
-    let rc = unsafe { libc::setrlimit(resource, &rl) };
+    // libc exposes the resource argument as an unsigned enum on glibc and as
+    // `c_int` on musl. Keep our portable boundary unsigned, then cast to the
+    // target-specific signature selected by this build.
+    let rc = unsafe { libc::setrlimit(resource as _, &rl) };
     if rc != 0 {
         return Err(ContainError::Rlimit(format!(
             "{name}={value}: {}",
@@ -431,9 +500,11 @@ fn apply_landlock(spec: &CapsuleSpec) -> Result<LandlockOutcome, ContainError> {
     })
 }
 
-/// Add one path-beneath rule to the ruleset, ignoring a non-existent path (a grant
-/// for a path that is not present is simply skipped; it grants nothing and must
-/// not abort the whole lockdown).
+/// Add one path-beneath rule to the ruleset, ignoring only a path that is already
+/// absent. Any other inspection/open failure is fatal: silently dropping an
+/// existing temporary-HOME or runtime grant would make the reported filesystem
+/// coverage inaccurate. A removal between the metadata check and `PathFd::new`
+/// likewise fails closed.
 fn add_path_rule<R>(
     ruleset: R,
     path: &Path,
@@ -444,11 +515,19 @@ where
 {
     use landlock::{PathBeneath, PathFd};
 
-    let fd = match PathFd::new(path) {
-        Ok(fd) => fd,
-        // A missing grant path is not fatal; it just grants nothing.
-        Err(_) => return Ok(ruleset),
-    };
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ruleset),
+        Err(error) => {
+            return Err(ContainError::Landlock(format!(
+                "inspect grant {}: {error}",
+                path.display()
+            )))
+        }
+    }
+    let fd = PathFd::new(path).map_err(|error| {
+        ContainError::Landlock(format!("open grant {}: {error}", path.display()))
+    })?;
     ruleset
         .add_rule(PathBeneath::new(fd, access))
         .map_err(|e| ContainError::Landlock(format!("add_rule {}: {e}", path.display())))
@@ -465,6 +544,152 @@ where
 /// socket-creation syscalls, so the child cannot open a raw outbound socket: the
 /// foundation of `network_raw_denied` for a `DenyAll` capsule.
 #[cfg(target_arch = "x86_64")]
+struct SafeDescriptorControls;
+
+/// Small, non-network process/runtime operations observed while starting a
+/// dynamically linked POSIX shell and a child utility. Keep this separate from
+/// the broad extrasafe capability sets so additions require an explicit review:
+/// in particular, this deliberately excludes socket creation and process-group
+/// operations (`setsid`, `setpgid`) that could weaken the supervisor boundary.
+#[cfg(target_arch = "x86_64")]
+struct PostExecRuntime;
+
+#[cfg(target_arch = "x86_64")]
+const SAFE_TERMINAL_IOCTL_REQUESTS: &[u64] = &[
+    libc::TCGETS as u64,
+    libc::TIOCGWINSZ as u64,
+    libc::TIOCGPGRP as u64,
+    libc::FIONREAD as u64,
+];
+
+#[cfg(target_arch = "x86_64")]
+const SAFE_FCNTL_COMMANDS: &[u32] = &[
+    libc::F_GETFD as u32,
+    libc::F_SETFD as u32,
+    libc::F_GETFL as u32,
+    libc::F_DUPFD as u32,
+    libc::F_DUPFD_CLOEXEC as u32,
+];
+
+#[cfg(target_arch = "x86_64")]
+impl extrasafe::RuleSet for PostExecRuntime {
+    fn simple_rules(&self) -> Vec<extrasafe::syscalls::Sysno> {
+        use extrasafe::syscalls::Sysno;
+
+        vec![
+            // Required by the x86_64 dynamic loader and libc startup.
+            Sysno::arch_prctl,
+            Sysno::set_tid_address,
+            // Loader access probes and harmless process-identity discovery.
+            Sysno::access,
+            Sysno::faccessat,
+            Sysno::faccessat2,
+            Sysno::getuid,
+            Sysno::geteuid,
+            Sysno::getgid,
+            Sysno::getegid,
+            Sysno::getppid,
+            Sysno::getpgrp,
+            Sysno::getrlimit,
+            Sysno::sysinfo,
+            // POSIX-shell redirection and in-script pipelines. Every inherited
+            // descriptor was closed before this filter is installed, and newly
+            // opened paths remain constrained by Landlock.
+            Sysno::dup,
+            Sysno::dup2,
+            Sysno::dup3,
+            Sysno::pipe,
+            Sysno::pipe2,
+        ]
+    }
+
+    fn conditional_rules(
+        &self,
+    ) -> std::collections::HashMap<extrasafe::syscalls::Sysno, Vec<extrasafe::SeccompRule>> {
+        use extrasafe::syscalls::Sysno;
+        use extrasafe::{SeccompArgumentFilter, SeccompRule, SeccompilerComparator};
+
+        // glibc queries this process's stack limit during startup. Do not grant
+        // arbitrary prlimit64: a same-UID target could otherwise alter another
+        // process's limits. pid=0 binds the call to self and new_limit=NULL makes
+        // it read-only.
+        let prlimit = SeccompRule::new(Sysno::prlimit64)
+            .and_condition(SeccompArgumentFilter::new64(
+                0,
+                SeccompilerComparator::Eq,
+                0,
+            ))
+            .and_condition(SeccompArgumentFilter::new64(
+                2,
+                SeccompilerComparator::Eq,
+                0,
+            ));
+        // Bash queries only its own group while deciding whether job control is
+        // available. Keep this read-only lookup self-scoped too.
+        let getpgid = SeccompRule::new(Sysno::getpgid).and_condition(SeccompArgumentFilter::new64(
+            0,
+            SeccompilerComparator::Eq,
+            0,
+        ));
+        [
+            (Sysno::prlimit64, vec![prlimit]),
+            (Sysno::getpgid, vec![getpgid]),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn name(&self) -> &'static str {
+        "PostExecRuntime"
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl extrasafe::RuleSet for SafeDescriptorControls {
+    fn simple_rules(&self) -> Vec<extrasafe::syscalls::Sysno> {
+        Vec::new()
+    }
+
+    fn conditional_rules(
+        &self,
+    ) -> std::collections::HashMap<extrasafe::syscalls::Sysno, Vec<extrasafe::SeccompRule>> {
+        use extrasafe::syscalls::Sysno;
+        use extrasafe::{SeccompArgumentFilter, SeccompRule, SeccompilerComparator};
+
+        let mut rules = std::collections::HashMap::new();
+        for request in SAFE_TERMINAL_IOCTL_REQUESTS {
+            rules.entry(Sysno::ioctl).or_insert_with(Vec::new).push(
+                SeccompRule::new(Sysno::ioctl)
+                    .and_condition(SeccompArgumentFilter::new32(
+                        0,
+                        SeccompilerComparator::Le,
+                        libc::STDERR_FILENO as u32,
+                    ))
+                    .and_condition(SeccompArgumentFilter::new64(
+                        1,
+                        SeccompilerComparator::Eq,
+                        *request,
+                    )),
+            );
+        }
+        for command in SAFE_FCNTL_COMMANDS {
+            rules.entry(Sysno::fcntl).or_insert_with(Vec::new).push(
+                SeccompRule::new(Sysno::fcntl).and_condition(SeccompArgumentFilter::new32(
+                    1,
+                    SeccompilerComparator::Eq,
+                    *command,
+                )),
+            );
+        }
+        rules
+    }
+
+    fn name(&self) -> &'static str {
+        "SafeDescriptorControls"
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn apply_seccomp() -> Result<bool, ContainError> {
     use extrasafe::builtins::danger_zone::{ForkAndExec, Threads};
     use extrasafe::builtins::{BasicCapabilities, SystemIO};
@@ -480,13 +705,17 @@ fn apply_seccomp() -> Result<bool, ContainError> {
                     .allow_open()
                     .yes_really()
                     .allow_metadata()
-                    .allow_close()
-                    .allow_ioctl()
-                    .allow_stdin()
-                    .allow_stdout()
-                    .allow_stderr(),
+                    .allow_close(),
             )
         })
+        // Never use SystemIO::allow_ioctl(): it also grants unrestricted ioctl
+        // and fcntl. Read-only terminal discovery stays limited to standard
+        // streams. Only a reviewed set of descriptor-local fcntl commands is allowed
+        // on descriptors the process already holds; TIOCSTI, TIOCLINUX,
+        // ownership changes, and arbitrary device controls remain denied with
+        // EPERM by the default action.
+        .and_then(|ctx| ctx.enable(SafeDescriptorControls))
+        .and_then(|ctx| ctx.enable(PostExecRuntime))
         .and_then(|ctx| ctx.enable(Threads::nothing().allow_create()))
         .and_then(|ctx| ctx.enable(ForkAndExec))
         .map_err(|e| ContainError::Seccomp(e.to_string()))?
@@ -725,6 +954,103 @@ mod tests {
         assert_eq!(seccomp_supported(), cfg!(target_arch = "x86_64"));
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn descriptor_control_policy_never_grants_unrestricted_or_injecting_ioctl() {
+        use extrasafe::syscalls::Sysno;
+        use extrasafe::RuleSet as _;
+
+        assert!(SafeDescriptorControls.simple_rules().is_empty());
+        let rules = SafeDescriptorControls.conditional_rules();
+        let ioctl_rules = rules.get(&Sysno::ioctl).expect("conditional ioctl rules");
+        assert_eq!(ioctl_rules.len(), SAFE_TERMINAL_IOCTL_REQUESTS.len());
+        assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&(libc::TIOCSTI as u64)));
+        assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&(libc::TIOCLINUX as u64)));
+        for rule in ioctl_rules {
+            assert_eq!(rule.argument_filters.len(), 2);
+            assert!(rule
+                .argument_filters
+                .iter()
+                .any(|filter| filter.arg_idx == 0 && filter.value == libc::STDERR_FILENO as u64));
+            let request = rule
+                .argument_filters
+                .iter()
+                .find(|filter| filter.arg_idx == 1)
+                .expect("ioctl request filter")
+                .value;
+            assert!(SAFE_TERMINAL_IOCTL_REQUESTS.contains(&request));
+        }
+
+        let fcntl_rules = rules.get(&Sysno::fcntl).expect("conditional fcntl rules");
+        assert_eq!(fcntl_rules.len(), SAFE_FCNTL_COMMANDS.len());
+        for rule in fcntl_rules {
+            assert_eq!(rule.argument_filters.len(), 1);
+            let command = rule
+                .argument_filters
+                .iter()
+                .find(|filter| filter.arg_idx == 1)
+                .expect("fcntl command filter")
+                .value as u32;
+            assert!(SAFE_FCNTL_COMMANDS.contains(&command));
+        }
+        assert!(!SAFE_FCNTL_COMMANDS.contains(&(libc::F_SETOWN as u32)));
+        assert!(!SAFE_FCNTL_COMMANDS.contains(&(libc::F_SETLK as u32)));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn post_exec_runtime_excludes_network_and_supervisor_escape_syscalls() {
+        use extrasafe::syscalls::Sysno;
+        use extrasafe::RuleSet as _;
+
+        let rules = PostExecRuntime.simple_rules();
+        for denied in [
+            Sysno::socket,
+            Sysno::socketpair,
+            Sysno::connect,
+            Sysno::setsid,
+            Sysno::setpgid,
+        ] {
+            assert!(
+                !rules.contains(&denied),
+                "post-exec runtime must not grant {denied:?}"
+            );
+        }
+        let conditional = PostExecRuntime.conditional_rules();
+        for denied in [
+            Sysno::socket,
+            Sysno::socketpair,
+            Sysno::connect,
+            Sysno::setsid,
+            Sysno::setpgid,
+        ] {
+            assert!(
+                !conditional.contains_key(&denied),
+                "conditional post-exec runtime must not grant {denied:?}"
+            );
+        }
+        let prlimit = conditional
+            .get(&Sysno::prlimit64)
+            .expect("self-query-only prlimit64 rule");
+        assert_eq!(prlimit.len(), 1);
+        assert_eq!(prlimit[0].argument_filters.len(), 2);
+        assert!(prlimit[0]
+            .argument_filters
+            .iter()
+            .any(|filter| filter.arg_idx == 0 && filter.value == 0));
+        assert!(prlimit[0]
+            .argument_filters
+            .iter()
+            .any(|filter| filter.arg_idx == 2 && filter.value == 0));
+        let getpgid = conditional
+            .get(&Sysno::getpgid)
+            .expect("self-query-only getpgid rule");
+        assert_eq!(getpgid.len(), 1);
+        assert_eq!(getpgid[0].argument_filters.len(), 1);
+        assert_eq!(getpgid[0].argument_filters[0].arg_idx, 0);
+        assert_eq!(getpgid[0].argument_filters[0].value, 0);
+    }
+
     #[test]
     fn apply_containment_refuses_allowlisted_domains() {
         // E2 has no verified raw-socket-blocking egress backend, so an allow-list
@@ -738,6 +1064,18 @@ mod tests {
         let err = apply_containment(&spec, None).expect_err("must refuse allow-listed egress");
         match err {
             ContainError::Unsupported(m) => assert!(m.contains("raw-socket")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_containment_refuses_missing_parent_temp_home_before_mutation() {
+        let spec = CapsuleSpec::locked_down();
+        let err = apply_containment(&spec, None).expect_err("missing temp HOME must fail closed");
+        match err {
+            ContainError::Unsupported(message) => {
+                assert!(message.contains("prevalidated parent-owned"))
+            }
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }

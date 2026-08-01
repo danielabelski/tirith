@@ -789,13 +789,45 @@ impl TrustedExecutable {
     pub fn verify_identity(&self) -> Result<(), TrustedExecutableError> {
         self.revalidate()
     }
+
+    /// Require this already-canonical executable to have an approved provenance
+    /// for remote-script interpreter use. General trusted-child callers may use
+    /// explicitly configured tools; forced interpreters have the narrower
+    /// root-managed system contract documented by [`resolve_forced_interpreter`].
+    pub fn require_forced_interpreter_provenance(self) -> Result<Self, TrustedExecutableError> {
+        if root_managed_system_provenance_is_approved(self.path()) {
+            Ok(self)
+        } else {
+            Err(TrustedExecutableError::InvalidPath {
+                path: self.path().to_path_buf(),
+                reason: "forced interpreters must come from a root-owned, non-group/world-writable system bin directory"
+                    .to_string(),
+            })
+        }
+    }
+
+    /// Require provenance strong enough to print this executable path into a
+    /// command that will be evaluated after the current process exits. An
+    /// absolute path closes ambient PATH lookup, but a same-UID owner could still
+    /// replace a user-owned file between generation and evaluation. Only fixed,
+    /// root-owned system-bin paths whose complete ancestor chain is not
+    /// group/world-writable cross this delayed-reinvocation boundary.
+    pub fn require_safe_reinvocation_provenance(self) -> Result<Self, TrustedExecutableError> {
+        if root_managed_system_provenance_is_approved(self.path()) {
+            Ok(self)
+        } else {
+            Err(TrustedExecutableError::InvalidPath {
+                path: self.path().to_path_buf(),
+                reason: "delayed safe-command reinvocation requires a root-owned, non-group/world-writable system-bin path and ancestor chain"
+                    .to_string(),
+            })
+        }
+    }
 }
 
+#[cfg(unix)]
 fn trusted_snapshot_temp_root() -> Result<PathBuf, TrustedExecutableError> {
-    #[cfg(unix)]
     let root = PathBuf::from("/tmp");
-    #[cfg(not(unix))]
-    let root = std::env::temp_dir();
     root.canonicalize()
         .map_err(|error| TrustedExecutableError::InvalidPath {
             path: root,
@@ -803,6 +835,7 @@ fn trusted_snapshot_temp_root() -> Result<PathBuf, TrustedExecutableError> {
         })
 }
 
+#[cfg(unix)]
 fn copy_and_hash(
     source: &mut File,
     target: &mut File,
@@ -1158,6 +1191,74 @@ pub fn resolve_ambient(name: &str) -> Result<TrustedExecutable, TrustedExecutabl
     let path = std::env::var_os("PATH")
         .ok_or_else(|| TrustedExecutableError::NotFound(format!("{name} (PATH is unset)")))?;
     TrustedExecutable::resolve_on_path(name, &path, &ambient_denied_roots())
+}
+
+/// Resolve a forced remote-script interpreter from ambient `PATH`, but accept
+/// the first hit only when its canonical executable has an approved installed
+/// provenance. Project/temp checks alone are insufficient: a user-owned
+/// `~/bin/bash` outside the current repository is still attacker-selectable.
+///
+/// Approved locations are fixed root-managed system binary directories. The
+/// first executable hit is authoritative: an unapproved shadow fails closed
+/// rather than falling through to a later system shell. User-owned package
+/// manager trees are deliberately excluded because pathname shape and mode bits
+/// do not prove provenance against a same-UID writer.
+pub fn resolve_forced_interpreter(name: &str) -> Result<TrustedExecutable, TrustedExecutableError> {
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| TrustedExecutableError::NotFound(format!("{name} (PATH is unset)")))?;
+    resolve_forced_interpreter_on_path(name, &path)
+}
+
+/// Explicit-PATH variant of [`resolve_forced_interpreter`] for deterministic
+/// callers and regression tests.
+pub fn resolve_forced_interpreter_on_path(
+    name: &str,
+    path_value: &OsStr,
+) -> Result<TrustedExecutable, TrustedExecutableError> {
+    TrustedExecutable::resolve_on_path(name, path_value, &ambient_denied_roots())?
+        .require_forced_interpreter_provenance()
+}
+
+#[cfg(unix)]
+fn root_managed_system_provenance_is_approved(path: &Path) -> bool {
+    for configured in [
+        "/bin",
+        "/usr/bin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/opt/local/bin",
+    ] {
+        let Ok(root) = Path::new(configured).canonicalize() else {
+            continue;
+        };
+        if path.parent() == Some(root.as_path())
+            && root_managed_chain_is_secure(&root)
+            && root_managed_path_is_secure(path)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(not(unix))]
+fn root_managed_system_provenance_is_approved(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn root_managed_path_is_secure(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn root_managed_chain_is_secure(path: &Path) -> bool {
+    path.ancestors().all(root_managed_path_is_secure)
 }
 
 /// Construct the PATH value a trusted child may inherit. Relative, denied, and
