@@ -510,11 +510,7 @@ fn render_long_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Local serialization lock for env-var-mutating tests here (touch only
-    /// `TIRITH_STATUS`; `tirith_core::TEST_ENV_LOCK` isn't reachable).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
     #[test]
     fn short_form_matches_spec_example() {
@@ -569,20 +565,15 @@ mod tests {
     #[test]
     fn protection_mode_maps_known_values() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _isolate = EnvGuard::remove("TIRITH_STATUS");
         for (input, expected) in [
             ("blocks", "guarded"),
             ("warn-only", "warn-only"),
             ("degraded", "degraded"),
             ("off", "off"),
         ] {
-            // SAFETY: serialized via ENV_LOCK above.
-            unsafe {
-                std::env::set_var("TIRITH_STATUS", input);
-            }
+            let _value = EnvGuard::set("TIRITH_STATUS", std::path::Path::new(input));
             assert_eq!(detect_protection_mode(), expected);
-        }
-        unsafe {
-            std::env::remove_var("TIRITH_STATUS");
         }
         assert_eq!(detect_protection_mode(), "off");
     }
@@ -590,14 +581,9 @@ mod tests {
     #[test]
     fn protection_mode_unknown_value_passes_through() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized via ENV_LOCK above.
-        unsafe {
-            std::env::set_var("TIRITH_STATUS", "futureValue");
-        }
+        let _isolate = EnvGuard::remove("TIRITH_STATUS");
+        let _value = EnvGuard::set("TIRITH_STATUS", std::path::Path::new("futureValue"));
         assert_eq!(detect_protection_mode(), "futureValue");
-        unsafe {
-            std::env::remove_var("TIRITH_STATUS");
-        }
     }
 
     #[test]
