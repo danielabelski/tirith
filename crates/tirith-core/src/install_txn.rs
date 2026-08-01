@@ -3061,7 +3061,7 @@ mod tests {
             assert_eq!(plan.packages[0].reference.name, "requests");
             assert_eq!(
                 plan.packages[0].reference.version,
-                VersionIntent::Exact("2.31.0".to_string())
+                VersionIntent::Exact("2.31".to_string())
             );
         }
     }

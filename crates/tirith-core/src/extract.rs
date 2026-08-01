@@ -1759,6 +1759,10 @@ fn resolve_segment_command(segment: &Segment) -> Option<ResolvedCommand<'_>> {
     resolve_named_command(command, &segment.args)
 }
 
+/// Bound recursive wrapper peeling independently of attacker-controlled argv
+/// length. Exhaustion is unresolved, never a partially trusted inner command.
+const MAX_WRAPPED_COMMAND_DEPTH: usize = 64;
+
 /// Resolve a segment's command through wrappers (`env`, `command`, `time`,
 /// `sudo`/`doas`, `tirith`) and return the resolved name and the wrapped
 /// command's args. Callers outside the extractor (e.g. `check_network_policy`)
@@ -1773,12 +1777,23 @@ pub fn resolve_wrapped_command(segment: &Segment) -> Option<(String, Vec<String>
 }
 
 fn resolve_named_command<'a>(command: &str, args: &'a [String]) -> Option<ResolvedCommand<'a>> {
+    resolve_named_command_depth(command, args, MAX_WRAPPED_COMMAND_DEPTH)
+}
+
+fn resolve_named_command_depth<'a>(
+    command: &str,
+    args: &'a [String],
+    depth: usize,
+) -> Option<ResolvedCommand<'a>> {
+    if depth == 0 {
+        return None;
+    }
     let name = command_base_name(command);
     match name.as_str() {
-        "env" => resolve_env_command(args),
-        "command" => resolve_command_wrapper(args),
-        "time" => resolve_time_wrapper(args),
-        "sudo" | "doas" => resolve_sudo_wrapper(args),
+        "env" => resolve_env_command(args, depth - 1),
+        "command" => resolve_command_wrapper(args, depth - 1),
+        "time" => resolve_time_wrapper(args, depth - 1),
+        "sudo" | "doas" => resolve_sudo_wrapper(args, depth - 1),
         "tirith" => resolve_tirith_command(args),
         _ => Some(ResolvedCommand { name, args }),
     }
@@ -1788,7 +1803,7 @@ fn resolve_named_command<'a>(command: &str, args: &'a [String]) -> Option<Resolv
 /// common flag shapes (`-u user`, `--user=user`, `-E -H`, leading `VAR=val`).
 /// Conservative: returns None when the command can't be unambiguously resolved,
 /// so the caller falls back to the literal first token.
-fn resolve_sudo_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
+fn resolve_sudo_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
     // Short sudo(8) flags that take a VALUE. Boolean-only flags (-S -A -B -E -H
     // -K -L -l -n -P -s -V -v, and -h=--help not --host) must NOT be here —
     // treating them as value-taking would eat the next token.
@@ -1838,12 +1853,12 @@ fn resolve_sudo_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
             continue;
         }
         // First non-flag, non-assignment argument is the wrapped command.
-        return resolve_named_command(&clean, &args[i + 1..]);
+        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
     }
     None
 }
 
-fn resolve_env_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
+fn resolve_env_command(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
     let mut i = 0;
     while i < args.len() {
         let clean = strip_quotes(&args[i]);
@@ -1871,7 +1886,7 @@ fn resolve_env_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
             i += 1;
             continue;
         }
-        return resolve_named_command(&clean, &args[i + 1..]);
+        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
     }
 
     while i < args.len() {
@@ -1880,13 +1895,13 @@ fn resolve_env_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
             i += 1;
             continue;
         }
-        return resolve_named_command(&clean, &args[i + 1..]);
+        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
     }
 
     None
 }
 
-fn resolve_command_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
+fn resolve_command_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
     let mut i = 0;
     while i < args.len() {
         let clean = strip_quotes(&args[i]);
@@ -1901,10 +1916,10 @@ fn resolve_command_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
         break;
     }
     args.get(i)
-        .and_then(|arg| resolve_named_command(arg, &args[i + 1..]))
+        .and_then(|arg| resolve_named_command_depth(arg, &args[i + 1..], depth))
 }
 
-fn resolve_time_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
+fn resolve_time_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
     let mut i = 0;
     while i < args.len() {
         let clean = strip_quotes(&args[i]);
@@ -1923,7 +1938,7 @@ fn resolve_time_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
         break;
     }
     args.get(i)
-        .and_then(|arg| resolve_named_command(arg, &args[i + 1..]))
+        .and_then(|arg| resolve_named_command_depth(arg, &args[i + 1..], depth))
 }
 
 fn resolve_tirith_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
@@ -2794,6 +2809,22 @@ mod tests {
                 .any(|u| u.raw == "http://example.com" && u.in_sink_context),
             "time wrapper should preserve tirith run sink context"
         );
+    }
+
+    #[test]
+    fn wrapped_command_depth_exhaustion_is_bounded_and_unresolved() {
+        let input = "command ".repeat(MAX_WRAPPED_COMMAND_DEPTH + 8) + "curl https://example.com";
+        let segments = tokenize::tokenize(&input, ShellType::Posix);
+        assert_eq!(segments.len(), 1);
+        assert!(
+            resolve_wrapped_command(&segments[0]).is_none(),
+            "an over-deep wrapper chain must be unresolved instead of recursing without bound"
+        );
+
+        let shallow = tokenize::tokenize("command env curl https://example.com", ShellType::Posix);
+        let resolved = resolve_wrapped_command(&shallow[0]).expect("shallow wrappers resolve");
+        assert_eq!(resolved.0, "curl");
+        assert_eq!(resolved.1, vec!["https://example.com".to_string()]);
     }
 
     #[test]
