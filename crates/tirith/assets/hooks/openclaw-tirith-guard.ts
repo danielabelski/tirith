@@ -9,7 +9,8 @@
 //
 // Environment:
 //   TIRITH_BIN              -- path to tirith binary (default: "tirith")
-//   TIRITH_SHELL            -- explicit executor-shell assertion: posix, fish, powershell, cmd
+//   TIRITH_SHELL            -- explicit exec-tool shell assertion: posix, fish, powershell, cmd
+//   TIRITH_BASH_SHELL       -- explicit legacy Bash-tool shell assertion (same values)
 //   TIRITH_HOOK_WARN_ACTION -- "allow" (default) or "deny"
 //   TIRITH_FAIL_OPEN        -- "1" to allow on error (default: deny)
 
@@ -36,19 +37,16 @@ function unresolvedShell(reason) {
   return { ok: false, reason };
 }
 
-function requireExpectedShell(expected, configuredShell) {
-  if (configuredShell !== undefined && configuredShell !== expected) {
-    return unresolvedShell(
-      `tirith: TIRITH_SHELL does not match OpenClaw's effective ${expected} shell`,
-    );
-  }
-  return resolvedShell(expected);
+function invalidShellAssertion(name) {
+  return unresolvedShell(
+    `tirith: invalid ${name} (expected posix, fish, powershell, or cmd)`,
+  );
 }
 
-function requireShellAssertion(configuredShell) {
+function requireShellAssertion(configuredShell, assertionName = "TIRITH_SHELL") {
   if (configuredShell === undefined) {
     return unresolvedShell(
-      "tirith: cannot determine OpenClaw's effective shell; set TIRITH_SHELL=posix, fish, powershell, or cmd to match the executor",
+      `tirith: cannot determine OpenClaw's effective shell; set ${assertionName}=posix, fish, powershell, or cmd to match the executor`,
     );
   }
   return resolvedShell(configuredShell);
@@ -72,11 +70,201 @@ function gatewayShellForPlatform(platform, shellPath) {
   return undefined;
 }
 
-function requireGatewayShell(configuredShell, platform, shellPath) {
-  const inferred = gatewayShellForPlatform(platform, shellPath);
-  return inferred === undefined
-    ? requireShellAssertion(configuredShell)
-    : requireExpectedShell(inferred, configuredShell);
+function normalizeExecHost(value) {
+  if (typeof value !== "string" || !VALID_EXEC_HOSTS.has(value)) return undefined;
+  return value;
+}
+
+function findAgentEntry(config, agentId) {
+  if (!agentId || !config || typeof config !== "object") return undefined;
+  const agents = config.agents;
+  if (!agents || typeof agents !== "object" || Array.isArray(agents)) return undefined;
+  const normalizedId = String(agentId).trim().toLowerCase();
+  if (agents.entries && typeof agents.entries === "object" && !Array.isArray(agents.entries)) {
+    const key = Object.keys(agents.entries).find(
+      (candidate) => candidate.trim().toLowerCase() === normalizedId,
+    );
+    return key === undefined ? undefined : agents.entries[key];
+  }
+  if (Array.isArray(agents.list)) {
+    return agents.list.find(
+      (entry) =>
+        entry &&
+        typeof entry === "object" &&
+        typeof entry.id === "string" &&
+        entry.id.trim().toLowerCase() === normalizedId,
+    );
+  }
+  return undefined;
+}
+
+function hasAgentExecHostOverride(config) {
+  const agents = config?.agents;
+  if (!agents || typeof agents !== "object" || Array.isArray(agents)) return false;
+  const entries =
+    agents.entries && typeof agents.entries === "object" && !Array.isArray(agents.entries)
+      ? Object.values(agents.entries)
+      : Array.isArray(agents.list)
+        ? agents.list
+        : [];
+  return entries.some((entry) => entry?.tools?.exec?.host !== undefined);
+}
+
+function readConfiguredExecHost(config, agentId, sessionState) {
+  if (!sessionState.known) return { known: false };
+  const sessionHost = sessionState.entry?.execHost;
+  if (sessionHost !== undefined) {
+    const host = normalizeExecHost(sessionHost);
+    return host === undefined
+      ? { known: false, invalid: "tirith: invalid OpenClaw session exec host" }
+      : { known: true, host };
+  }
+
+  if (!agentId && hasAgentExecHostOverride(config)) {
+    return { known: false };
+  }
+
+  const agentEntry = findAgentEntry(config, agentId);
+  const agentHost = agentEntry?.tools?.exec?.host;
+  if (agentHost !== undefined) {
+    const host = normalizeExecHost(agentHost);
+    return host === undefined
+      ? { known: false, invalid: "tirith: invalid OpenClaw agent exec host" }
+      : { known: true, host };
+  }
+
+  const globalHost = config?.tools?.exec?.host;
+  if (globalHost !== undefined) {
+    const host = normalizeExecHost(globalHost);
+    return host === undefined
+      ? { known: false, invalid: "tirith: invalid OpenClaw configured exec host" }
+      : { known: true, host };
+  }
+  return { known: true, host: "auto" };
+}
+
+function readSessionState(api, context) {
+  if (!context?.sessionKey) return { known: false };
+  const getSessionEntry = api?.runtime?.agent?.session?.getSessionEntry;
+  if (typeof getSessionEntry !== "function") return { known: false };
+  try {
+    return {
+      known: true,
+      entry: getSessionEntry({
+        sessionKey: context.sessionKey,
+        ...(context.agentId ? { agentId: context.agentId } : {}),
+        readConsistency: "latest",
+      }),
+    };
+  } catch {
+    return { known: false };
+  }
+}
+
+function readSandboxAvailability(api, config, context) {
+  if (!context?.sessionKey) return undefined;
+  const resolveWorkspaceAuthority = api?.runtime?.sandbox?.resolveWorkspaceAuthority;
+  if (typeof resolveWorkspaceAuthority !== "function") return undefined;
+  try {
+    const authority = resolveWorkspaceAuthority({
+      config,
+      ...(context.agentId ? { agentId: context.agentId } : {}),
+      sessionKey: context.sessionKey,
+      requiredToolNames: ["exec"],
+    });
+    return typeof authority?.sandboxed === "boolean" ? authority.sandboxed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function deriveExecContext(api, context) {
+  const config = api?.config && typeof api.config === "object" ? api.config : {};
+  const sessionState = readSessionState(api, context);
+  const sessionAgentId =
+    typeof sessionState.entry?.agentId === "string" ? sessionState.entry.agentId : undefined;
+  const agentId = context?.agentId ?? sessionAgentId;
+  const configured = readConfiguredExecHost(config, agentId, sessionState);
+  return {
+    configuredHost: configured.host,
+    configuredHostKnown: configured.known,
+    // Omitted per-call elevation resolves from an inline message directive,
+    // then the session override, then agents.defaults.elevatedDefault, and is
+    // finally gated by provider/agent allow policy. before_tool_call exposes
+    // none of that effective turn-level state. Even an absent or "off" session
+    // value can be overridden inline, so both elevated outcomes must remain
+    // candidates until their grammars agree or TIRITH_SHELL binds the executor.
+    elevatedDefaultKnown: false,
+    sandboxAvailable: readSandboxAvailability(api, config, context),
+    invalid: configured.invalid,
+  };
+}
+
+function candidateEffectiveHosts(params, execContext) {
+  const requestedHost = params?.host;
+  const selectedHosts = requestedHost !== undefined
+    ? [requestedHost]
+    : execContext?.configuredHostKnown
+      ? [execContext.configuredHost]
+      : ["auto", "sandbox", "gateway", "node"];
+  const elevatedStates = params?.elevated !== undefined
+    ? [params.elevated]
+    : execContext?.elevatedDefaultKnown
+      ? [execContext.elevatedDefault]
+      : [false, true];
+  const effectiveHosts = new Set();
+
+  for (const selectedHost of selectedHosts) {
+    for (const elevated of elevatedStates) {
+      const target = elevated
+        ? selectedHost === "node" ? "node" : "gateway"
+        : selectedHost;
+      if (target === "auto") {
+        if (execContext?.sandboxAvailable === true) effectiveHosts.add("sandbox");
+        else if (execContext?.sandboxAvailable === false) effectiveHosts.add("gateway");
+        else {
+          effectiveHosts.add("sandbox");
+          effectiveHosts.add("gateway");
+        }
+      } else {
+        effectiveHosts.add(target);
+      }
+    }
+  }
+  return effectiveHosts;
+}
+
+function resolveExecShell(configuredShell, platform, gatewayShellPath, params, execContext) {
+  if (execContext?.invalid) return unresolvedShell(execContext.invalid);
+  const candidates = new Set();
+  let hasUnknown = false;
+  for (const host of candidateEffectiveHosts(params, execContext)) {
+    if (host === "sandbox") {
+      candidates.add("posix");
+    } else if (host === "gateway") {
+      const gatewayShell = gatewayShellForPlatform(platform, gatewayShellPath);
+      if (gatewayShell === undefined) hasUnknown = true;
+      else candidates.add(gatewayShell);
+    } else if (host === "node") {
+      hasUnknown = true;
+    } else {
+      return unresolvedShell("tirith: invalid OpenClaw effective exec host");
+    }
+  }
+
+  if (configuredShell !== undefined) {
+    if (!hasUnknown && !candidates.has(configuredShell)) {
+      const expected = Array.from(candidates).join(" or ");
+      return unresolvedShell(
+        `tirith: TIRITH_SHELL does not match OpenClaw's effective ${expected} shell`,
+      );
+    }
+    return resolvedShell(configuredShell);
+  }
+  if (!hasUnknown && candidates.size === 1) {
+    return resolvedShell(candidates.values().next().value);
+  }
+  return requireShellAssertion(configuredShell);
 }
 
 // OpenClaw's before_tool_call context does not expose the fully resolved exec
@@ -90,17 +278,26 @@ export function resolveShellTokenizer(
   configuredShell = process.env.TIRITH_SHELL,
   platform = process.platform,
   gatewayShellPath = process.env.SHELL,
+  configuredBashShell = process.env.TIRITH_BASH_SHELL,
+  execContext = {
+    configuredHost: "auto",
+    configuredHostKnown: true,
+    elevatedDefaultKnown: false,
+  },
 ) {
-  if (configuredShell !== undefined && !VALID_SHELLS.has(configuredShell)) {
-    return unresolvedShell(
-      "tirith: invalid TIRITH_SHELL (expected posix, fish, powershell, or cmd)",
-    );
+  if (toolName === "bash") {
+    if (configuredBashShell !== undefined && !VALID_SHELLS.has(configuredBashShell)) {
+      return invalidShellAssertion("TIRITH_BASH_SHELL");
+    }
+    // before_tool_call does not expose the Bash surface's settings.shellPath
+    // or custom operations. Even its default shell differs from
+    // exec on Windows. A separate trusted assertion is therefore mandatory and
+    // deliberately independent from TIRITH_SHELL.
+    return requireShellAssertion(configuredBashShell, "TIRITH_BASH_SHELL");
   }
 
-  // OpenClaw's legacy `bash` surface is explicitly POSIX regardless of the
-  // gateway platform.
-  if (toolName === "bash") {
-    return requireExpectedShell("posix", configuredShell);
+  if (configuredShell !== undefined && !VALID_SHELLS.has(configuredShell)) {
+    return invalidShellAssertion("TIRITH_SHELL");
   }
 
   const host = params?.host;
@@ -111,47 +308,7 @@ export function resolveShellTokenizer(
     return unresolvedShell("tirith: invalid OpenClaw elevated flag; refusing an ambiguous scan");
   }
 
-  // An omitted host can resolve from OpenClaw configuration, including a remote
-  // node whose OS is not in hook context. Never guess from the gateway OS.
-  if (host === undefined) {
-    return requireShellAssertion(configuredShell);
-  }
-
-  if (host === "node") {
-    return requireShellAssertion(configuredShell);
-  }
-
-  const gatewayShell = gatewayShellForPlatform(platform, gatewayShellPath);
-
-  // Elevated sandbox/auto calls escape to the gateway (node remains handled
-  // above), so the actual gateway shell decides the grammar.
-  if (params?.elevated === true) {
-    return requireGatewayShell(configuredShell, platform, gatewayShellPath);
-  }
-  // `elevated` can default on in trusted OpenClaw configuration even when the
-  // call omits it. That changes sandbox/auto into gateway execution. The two
-  // grammars differ whenever the gateway is non-POSIX or cannot be inferred, so
-  // an operator assertion is required in that case.
-  if (
-    params?.elevated === undefined &&
-    (host === "sandbox" || host === "auto") &&
-    gatewayShell !== "posix"
-  ) {
-    return requireShellAssertion(configuredShell);
-  }
-  if (host === "sandbox") {
-    return requireExpectedShell("posix", configuredShell);
-  }
-  if (host === "gateway") {
-    return requireGatewayShell(configuredShell, platform, gatewayShellPath);
-  }
-
-  // host=auto chooses sandbox or gateway. They share a grammar only when the
-  // gateway is POSIX; otherwise hook context exposes no sandbox-resolution bit.
-  if (gatewayShell !== "posix") {
-    return requireShellAssertion(configuredShell);
-  }
-  return requireExpectedShell("posix", configuredShell);
+  return resolveExecShell(configuredShell, platform, gatewayShellPath, params, execContext);
 }
 
 function hookEvent(event, detail) {
@@ -170,13 +327,21 @@ export default {
   name: "tirith Security Scanner",
   description: "Pre-exec command security scanning via tirith",
   register(api) {
-    api.on("before_tool_call", (event) => {
+    api.on("before_tool_call", (event, context) => {
       if (event.toolName !== "exec" && event.toolName !== "bash") return;
       const command = event.params?.command;
       if (typeof command !== "string" || !command.trim()) return;
 
       const tirithBin = process.env.TIRITH_BIN || "tirith";
-      const shellResolution = resolveShellTokenizer(event.toolName, event.params);
+      const shellResolution = resolveShellTokenizer(
+        event.toolName,
+        event.params,
+        process.env.TIRITH_SHELL,
+        process.platform,
+        process.env.SHELL,
+        process.env.TIRITH_BASH_SHELL,
+        deriveExecContext(api, context),
+      );
       if (!shellResolution.ok) {
         hookEvent("shell_resolution_error", shellResolution.reason);
         return { block: true, blockReason: shellResolution.reason };
