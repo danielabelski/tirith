@@ -204,7 +204,7 @@ type CleanupFailures = Rc<RefCell<Vec<String>>>;
 #[cfg(test)]
 thread_local! {
     static SCRUB_FAILURE_TEST_HOOK: RefCell<Option<&'static str>> = const { RefCell::new(None) };
-    static BACKUP_ROTATION_TEST_HOOK: RefCell<Option<Box<dyn FnMut(&Path)>>> = RefCell::new(None);
+    static BACKUP_RETIREMENT_TEST_HOOK: RefCell<Option<Box<dyn FnMut(&Path)>>> = RefCell::new(None);
 }
 
 fn inject_scrub_failure(_label: &str) -> Result<(), String> {
@@ -455,9 +455,12 @@ fn backup_binding(name: &CStr, state: &StableFileState) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"tirith-setup-backup-v2\0");
     hasher.update(name.to_bytes());
+    hasher.update(state.identity.device.to_le_bytes());
+    hasher.update(state.identity.inode.to_le_bytes());
     hasher.update(state.size.to_le_bytes());
     hasher.update(state.mode.to_le_bytes());
     hasher.update(state.owner.to_le_bytes());
+    hasher.update(state.links.to_le_bytes());
     hasher.update(state.digest);
     hex_bytes(&hasher.finalize())
 }
@@ -503,6 +506,7 @@ fn backup_name_matches(candidate: &CStr, destination: &CStr, state: &StableFileS
         && nonce.len() == 32
         && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
         && state.owner == unsafe { libc::geteuid() }
+        && state.mode == 0o600
         && state.links == 1
 }
 
@@ -996,10 +1000,10 @@ impl PlatformTransaction {
 
     /// Acquire one empty, provenance-bound artifact. Backups are created from
     /// this same bounded pool instead of allocating an independent file on
-    /// every write. When the backup set is full, the subsequent temp
-    /// acquisition rotates the oldest exact backup back into the pool, so the
-    /// backup and tombstone caps remain stable together over an unbounded
-    /// sequence of backup-enabled transactions.
+    /// every write. Backup and temp guards consume distinct slots, so an abort
+    /// returns those same slots without growing the pool. After a durable
+    /// publication, retention rotates an old exact backup into the slot that
+    /// the committed backup consumed.
     fn acquire_empty_artifact(&self) -> Result<(CString, fs::File), String> {
         let mut tombstones = Vec::new();
         for name in directory_names(&self.parent.dir)? {
@@ -1028,65 +1032,7 @@ impl PlatformTransaction {
         self.create_empty_artifact()
     }
 
-    fn acquire_temp_artifact(
-        &self,
-        keep_backup: Option<&BackupGuard>,
-    ) -> Result<(CString, fs::File), String> {
-        let keep_name = keep_backup.map(|guard| guard.name.as_bytes().to_vec());
-        let mut backups = Vec::new();
-        for name in directory_names(&self.parent.dir)? {
-            if !name.to_bytes().starts_with(BACKUP_MARKER.as_bytes()) {
-                continue;
-            }
-            let Ok(Some((file, state))) =
-                open_stable_file_at_with_access(&self.parent.dir, &name, libc::O_RDWR)
-            else {
-                continue;
-            };
-            if backup_name_matches(&name, &self.parent.name, &state) {
-                backups.push((name, file, state));
-            }
-        }
-        backups.sort_by(|left, right| left.0.to_bytes().cmp(right.0.to_bytes()));
-
-        if backups.len() > ARTIFACT_RETENTION_LIMIT {
-            // A freshly-created backup consumed one tombstone (or a new empty
-            // artifact). Rotate the oldest *other* exact backup into the temp
-            // role. Publication then leaves the displaced destination in this
-            // same slot, keeping both retention sets bounded without a
-            // pathname-only unlink.
-            let Some((mut name, mut file, state)) = backups
-                .into_iter()
-                .find(|(name, _, _)| keep_name.as_deref() != Some(name.to_bytes()))
-            else {
-                return Err("backup retention exceeded but no prior exact backup was eligible for safe rotation".into());
-            };
-            #[cfg(test)]
-            BACKUP_ROTATION_TEST_HOOK.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().as_mut() {
-                    let path = self
-                        .path
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .join(OsStr::from_bytes(name.to_bytes()));
-                    hook(&path);
-                }
-            });
-            if stable_state_at(&self.parent.dir, &name)?.as_ref() != Some(&state) {
-                return Err(format!(
-                    "provenance-bound backup {} changed before temp rotation",
-                    name.to_string_lossy()
-                ));
-            }
-            scrub_guard_file(&mut file, "retired transaction backup")?;
-            normalize_tombstone_name(&self.parent.dir, &mut name, &file)?;
-            self.parent
-                .dir
-                .sync_all()
-                .map_err(|error| format!("sync rotated backup tombstone: {error}"))?;
-            return Ok((name, file));
-        }
-
+    fn acquire_temp_artifact(&self) -> Result<(CString, fs::File), String> {
         self.acquire_empty_artifact()
     }
 
@@ -1096,14 +1042,14 @@ impl PlatformTransaction {
         requested_mode: u32,
         preserve_existing_mode: bool,
         snapshot: &PlatformSnapshot,
-        keep_backup: Option<&BackupGuard>,
+        _keep_backup: Option<&BackupGuard>,
     ) -> Result<TempGuard<'a>, String> {
         let effective_mode = if preserve_existing_mode {
             snapshot.mode.unwrap_or(requested_mode)
         } else {
             requested_mode
         } & 0o7777;
-        let (name, file) = self.acquire_temp_artifact(keep_backup)?;
+        let (name, file) = self.acquire_temp_artifact()?;
         let mut guard = TempGuard {
             parent: &self.parent.dir,
             name,
@@ -1416,10 +1362,9 @@ impl PlatformTransaction {
             digest: Sha256::digest(bytes).into(),
         };
         // Consume one provenance-bound tombstone (or create one bounded empty
-        // artifact) for the new backup. If the backup set is already full,
-        // `prepare_temp` rotates the oldest prior backup into the temp role.
-        // This pairing avoids accumulating one extra tombstone per retained
-        // backup while never deleting by pathname.
+        // artifact) for the new backup. A committed update retires one old
+        // exact backup after durable publication, restoring this pool slot.
+        // An aborted update scrubs this guard back into the same slot.
         let (artifact_name, created_file) = self.acquire_empty_artifact()?;
         let parent = match self.parent.dir.try_clone() {
             Ok(parent) => parent,
@@ -1497,17 +1442,20 @@ impl PlatformTransaction {
         Ok(guard)
     }
 
-    pub(crate) fn cleanup_old_backups(&self, _keep: Option<&BackupGuard>) -> Result<(), String> {
+    pub(crate) fn cleanup_old_backups(&self, keep: Option<&BackupGuard>) -> Result<(), String> {
         inject_scrub_failure("retention inventory")?;
-        let mut backup_count = 0usize;
+        let keep_name = keep.map(|guard| guard.name.as_bytes().to_vec());
+        let mut backups = Vec::new();
         let mut tombstone_count = 0usize;
         for name in directory_names(&self.parent.dir)? {
             if name.to_bytes().starts_with(BACKUP_MARKER.as_bytes()) {
-                let Ok(Some((_, state))) = open_stable_file_at(&self.parent.dir, &name) else {
+                let Ok(Some((file, state))) =
+                    open_stable_file_at_with_access(&self.parent.dir, &name, libc::O_RDWR)
+                else {
                     continue;
                 };
                 if backup_name_matches(&name, &self.parent.name, &state) {
-                    backup_count += 1;
+                    backups.push((name, file, state));
                 }
             } else if name.to_bytes().starts_with(TOMBSTONE_MARKER.as_bytes()) {
                 let Ok(Some((_, state))) = open_stable_file_at(&self.parent.dir, &name) else {
@@ -1518,20 +1466,70 @@ impl PlatformTransaction {
                 }
             }
         }
-
-        let mut exceeded = Vec::new();
-        if backup_count > ARTIFACT_RETENTION_LIMIT {
-            exceeded.push(format!(
-                "{backup_count} exact backups remain (limit {ARTIFACT_RETENTION_LIMIT})"
-            ));
-        }
         if tombstone_count > ARTIFACT_RETENTION_LIMIT {
-            exceeded.push(format!(
+            return Err(format!(
                 "{tombstone_count} exact temp tombstones remain (limit {ARTIFACT_RETENTION_LIMIT})"
             ));
         }
-        if !exceeded.is_empty() {
-            return Err(exceeded.join("; "));
+
+        backups.sort_by(|left, right| left.0.to_bytes().cmp(right.0.to_bytes()));
+        let remove_count = backups.len().saturating_sub(ARTIFACT_RETENTION_LIMIT);
+        let retirement_capacity = ARTIFACT_RETENTION_LIMIT - tombstone_count;
+        let retirement_goal = remove_count.min(retirement_capacity);
+        let mut removed = 0usize;
+        for (mut name, mut file, state) in backups {
+            if removed == retirement_goal {
+                break;
+            }
+            if keep_name.as_deref() == Some(name.to_bytes()) {
+                continue;
+            }
+            #[cfg(test)]
+            BACKUP_RETIREMENT_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    let path = self
+                        .path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(OsStr::from_bytes(name.to_bytes()));
+                    hook(&path);
+                }
+            });
+            if stable_state_at(&self.parent.dir, &name)?.as_ref() != Some(&state) {
+                return Err(format!(
+                    "provenance-bound backup {} changed before retirement",
+                    name.to_string_lossy()
+                ));
+            }
+            let retired_name = tombstone_name(&state);
+            move_no_replace(&self.parent.dir, &name, &retired_name).map_err(|error| {
+                format!(
+                    "retire provenance-bound backup {}: {error}",
+                    name.to_string_lossy()
+                )
+            })?;
+            if stable_state_at(&self.parent.dir, &retired_name)?.as_ref() != Some(&state)
+                || stable_state_at(&self.parent.dir, &name)?.is_some()
+            {
+                let _ = move_no_replace(&self.parent.dir, &retired_name, &name);
+                return Err(format!(
+                    "could not prove identity while retiring backup {}",
+                    name.to_string_lossy()
+                ));
+            }
+            name = retired_name;
+            scrub_guard_file(&mut file, "retired transaction backup")?;
+            normalize_tombstone_name(&self.parent.dir, &mut name, &file)?;
+            self.parent
+                .dir
+                .sync_all()
+                .map_err(|error| format!("sync retired backup tombstone: {error}"))?;
+            removed += 1;
+        }
+        if removed != remove_count {
+            return Err(format!(
+                "could retire only {removed} of {remove_count} provenance-bound backups without exceeding the tombstone limit"
+            ));
         }
         Ok(())
     }
@@ -2442,7 +2440,54 @@ mod tests {
     }
 
     #[test]
-    fn backup_rotation_never_scrubs_a_pathname_swap() {
+    fn failed_backup_transactions_return_their_slots_without_exceeding_the_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "zero").unwrap();
+        for index in 0..10 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
+        }
+
+        for index in 0..20 {
+            let error = transactional_update_with_hook(
+                &path,
+                root.path(),
+                |_| {
+                    Ok(
+                        FileUpdate::write_text(format!("must-not-publish-{index}"), 0o600)
+                            .with_backup(true),
+                    )
+                },
+                |stage| {
+                    if stage == TestStage::TempSynced {
+                        return Err("injected failure after both guards were armed".into());
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("both guards were armed"));
+        }
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "value-9");
+        assert_eq!(backup_paths(root.path()).len(), ARTIFACT_RETENTION_LIMIT);
+        let tombstone_count = fs::read_dir(root.path())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TOMBSTONE_MARKER)
+            })
+            .count();
+        assert!(tombstone_count <= ARTIFACT_RETENTION_LIMIT);
+    }
+
+    #[test]
+    fn backup_retirement_never_scrubs_a_pathname_swap() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2452,18 +2497,19 @@ mod tests {
 
         let moved = root.path().join("attacker-moved-exact-backup");
         let moved_for_hook = moved.clone();
-        BACKUP_ROTATION_TEST_HOOK.with(|slot| {
+        BACKUP_RETIREMENT_TEST_HOOK.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move |candidate| {
                 fs::rename(candidate, &moved_for_hook).unwrap();
                 fs::write(candidate, "attacker-pathname-replacement").unwrap();
             }));
         });
-        let result = update_with_backup(&path, root.path(), "must-not-publish");
-        BACKUP_ROTATION_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        let result = transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text("published".into(), 0o600).with_backup(true))
+        });
+        BACKUP_RETIREMENT_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
 
-        let error = result.unwrap_err();
-        assert!(error.contains("changed before temp rotation"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "value-4");
+        assert_eq!(result.unwrap(), TransactionOutcome::WrittenWithRecovery);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "published");
         assert!(backup_paths(root.path()).into_iter().any(|candidate| {
             fs::read_to_string(candidate)
                 .is_ok_and(|bytes| bytes == "attacker-pathname-replacement")
@@ -2492,6 +2538,39 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&forged).unwrap(),
             "attacker-owned-lookalike"
+        );
+        assert_eq!(backup_paths(root.path()).len(), 6);
+    }
+
+    #[test]
+    fn backup_retention_rejects_a_fully_bound_file_without_creation_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "zero").unwrap();
+        let staging = root.path().join("attacker-staging");
+        fs::write(&staging, "attacker-owned-bound-lookalike").unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (_, state) = stable_state_from_open_file(fs::File::open(&staging).unwrap()).unwrap();
+        assert_eq!(state.mode, 0o644);
+        let destination = CString::new("config.json").unwrap();
+        let forged_name = backup_name(&destination, &state);
+        assert_eq!(backup_binding(&destination, &state).len(), 64);
+        assert!(!backup_name_matches(&forged_name, &destination, &state));
+        let forged = root.path().join(OsStr::from_bytes(forged_name.to_bytes()));
+        fs::rename(staging, &forged).unwrap();
+
+        for index in 0..8 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
+        }
+
+        assert_eq!(
+            fs::read_to_string(&forged).unwrap(),
+            "attacker-owned-bound-lookalike"
+        );
+        assert_eq!(
+            fs::metadata(&forged).unwrap().permissions().mode() & 0o777,
+            0o644
         );
         assert_eq!(backup_paths(root.path()).len(), 6);
     }
