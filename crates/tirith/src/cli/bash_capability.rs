@@ -908,9 +908,9 @@ mod tests {
     }
 
     // `XDG_STATE_HOME` is process-global and cargo runs tests in parallel, so
-    // this mutex serialises the tests that repoint it; `StateHomeGuard` restores
-    // it (RAII) so a panicking test still cleans up.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // use the crate-wide mutex shared by every CLI test that repoints process
+    // environment; `StateHomeGuard` restores it (RAII) on every exit path.
+    use crate::cli::test_harness::ENV_LOCK;
 
     struct StateHomeGuard {
         prev: Option<std::ffi::OsString>,

@@ -706,12 +706,8 @@ fn emit_watch_json(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
+    use crate::cli::test_harness::ENV_LOCK;
     use tirith_core::checkpoint::{self, ManifestEntry};
-
-    // Local env lock (tirith_core::TEST_ENV_LOCK is pub(crate), unreachable here).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
     #[test]
