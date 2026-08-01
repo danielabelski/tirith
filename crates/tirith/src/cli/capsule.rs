@@ -44,13 +44,61 @@
 //! caller that did not permit degradation never reaches a spawn at all.
 
 use std::ffi::{OsStr, OsString};
+#[cfg(target_os = "linux")]
+use std::io::Read;
+use std::io::Write as _;
 use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{mpsc, Arc};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 #[cfg_attr(
     any(target_os = "linux", target_os = "macos", target_os = "windows"),
     allow(unused_imports)
 )]
 use tirith_core::capsule::{Capsule, CapsuleCoverage, CapsuleSpec, NoOpCapsule};
+use tirith_core::trusted_child::TrustedExecutable;
+
+/// The download path already caps remote scripts at 10 MiB. Enforce the same
+/// bound again at the stdin launch boundary so no other caller can make the
+/// writer retain or block on an unbounded payload.
+pub const SCRIPT_STDIN_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// Resource contract for the supervised stdin execution surface. Linux is the
+/// only platform that currently executes this contract: the OS backend owns CPU,
+/// memory, process-count, and open-file ceilings while the parent supervisor owns
+/// combined output and wall time. macOS constructs the same request only so the
+/// API can return a deterministic fail-closed platform refusal before launch.
+///
+/// macOS does not request `RLIMIT_NPROC`: it is per-user there and would not bound
+/// this child tree. A caller that explicitly supplies a process limit still fails
+/// closed; the planner never erases it to make a launch pass.
+pub fn supervised_stdin_spec() -> CapsuleSpec {
+    let mut spec = CapsuleSpec::locked_down();
+    spec.resources = tirith_core::capsule::ResourceLimits {
+        cpu_seconds: Some(120),
+        #[cfg(target_os = "macos")]
+        // Darwin has no enforceable per-process memory rlimit. RLIMIT_AS is
+        // rejected with EINVAL and RLIMIT_RSS is advisory, so requesting either
+        // would make this enforcing surface correctly degrade before launch.
+        memory_bytes: None,
+        #[cfg(not(target_os = "macos"))]
+        memory_bytes: Some(2 * 1024 * 1024 * 1024),
+        #[cfg(target_os = "linux")]
+        max_processes: Some(256),
+        #[cfg(not(target_os = "linux"))]
+        max_processes: None,
+        max_open_files: Some(256),
+        max_output_bytes: Some(16 * 1024 * 1024),
+        wall_clock_seconds: Some(300),
+    };
+    spec
+}
 
 /// The backend selected for this host, with the coverage it can deliver for a
 /// given spec. Returned by [`select_backend`] so a caller can decide (before
@@ -310,87 +358,600 @@ pub fn run_to_completion(
 }
 
 /// Run a contained process with exact caller-supplied bytes on stdin while
-/// forwarding its stdout and stderr to the current process. This is the
-/// pipe-preserving execution shape used by safe rewrites of
-/// `<fetch> | <interpreter>`.
-///
-/// The launch uses the same fail-closed backend selection as
-/// [`run_to_completion`]. Program and argv stay typed; no shell joins or
-/// reparses them.
+/// forwarding bounded stdout/stderr to the current process. This enforcing
+/// surface accepts only an already-validated absolute executable and has no
+/// degraded mode: any containment or supervision shortfall refuses before the
+/// target is launched.
 pub fn run_to_completion_with_stdin(
     spec: &CapsuleSpec,
-    program: &str,
+    program: &TrustedExecutable,
     args: &[String],
     input: &[u8],
+    cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
-    degraded: DegradedPolicy,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
-    use std::io::Write as _;
+    let captured =
+        run_to_completion_with_stdin_captured(spec, program, args, input, cwd, extra_env)?;
+    std::io::stdout()
+        .lock()
+        .write_all(&captured.stdout)
+        .map_err(|error| CapsuleRefused {
+            backend_id: captured.outcome.backend_id,
+            reason: format!("forward contained child stdout: {error}"),
+        })?;
+    std::io::stderr()
+        .lock()
+        .write_all(&captured.stderr)
+        .map_err(|error| CapsuleRefused {
+            backend_id: captured.outcome.backend_id,
+            reason: format!("forward contained child stderr: {error}"),
+        })?;
+    Ok(captured.outcome)
+}
 
-    let (mut child, selected, ran_degraded) =
-        spawn_piped(spec, program, args, extra_env, degraded)?;
-    let mut child_stdout = child.stdout.take().ok_or_else(|| CapsuleRefused {
-        backend_id: selected.backend_id,
-        reason: "contained child stdout was not piped".to_string(),
-    })?;
-    let mut child_stderr = child.stderr.take().ok_or_else(|| CapsuleRefused {
-        backend_id: selected.backend_id,
-        reason: "contained child stderr was not piped".to_string(),
-    })?;
-    let stdout_thread = std::thread::spawn(move || {
-        let mut output = std::io::stdout().lock();
-        std::io::copy(&mut child_stdout, &mut output)
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut output = std::io::stderr().lock();
-        std::io::copy(&mut child_stderr, &mut output)
-    });
+#[derive(Debug, Clone, Copy)]
+#[cfg(target_os = "linux")]
+struct SupervisedLimits {
+    timeout: Duration,
+    stdin_bytes: usize,
+    combined_output_bytes: usize,
+}
 
-    let write_result = child
-        .stdin
-        .take()
+#[derive(Debug)]
+struct SupervisedPlan {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    backend_spec: CapsuleSpec,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    backend_selected: SelectedBackend,
+    reported_selected: SelectedBackend,
+    #[cfg(target_os = "linux")]
+    limits: SupervisedLimits,
+}
+
+#[derive(Debug)]
+struct CapturedCapsuleOutcome {
+    outcome: CapsuleOutcome,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+enum SupervisedStream {
+    Stdout,
+    Stderr,
+}
+
+#[cfg(target_os = "linux")]
+enum SupervisedMessage {
+    OutputComplete(SupervisedStream, Vec<u8>),
+    OutputLimit,
+    OutputError(SupervisedStream, String),
+    InputComplete,
+    InputError(String),
+}
+
+/// Split only the two dimensions implemented by the parent supervisor from the
+/// backend spec. Every other requested limit remains present and must pass the
+/// backend's ordinary fail-closed gate. The original spec remains unchanged and
+/// is used for the final aggregate coverage assertion.
+fn supervised_stdin_plan(
+    spec: &CapsuleSpec,
+    input_len: usize,
+) -> Result<SupervisedPlan, CapsuleRefused> {
+    let backend_id = select_backend(spec).backend_id;
+    if input_len > SCRIPT_STDIN_MAX_BYTES {
+        return Err(CapsuleRefused {
+            backend_id,
+            reason: format!(
+                "script stdin is {input_len} bytes, exceeding the {SCRIPT_STDIN_MAX_BYTES}-byte limit"
+            ),
+        });
+    }
+
+    let output_u64 = spec
+        .resources
+        .max_output_bytes
+        .filter(|limit| *limit > 0)
         .ok_or_else(|| CapsuleRefused {
-            backend_id: selected.backend_id,
-            reason: "contained child stdin was not piped".to_string(),
-        })?
-        .write_all(input);
-    let status = child.wait().map_err(|error| CapsuleRefused {
-        backend_id: selected.backend_id,
-        reason: format!("capsule wait failed: {error}"),
+            backend_id,
+            reason: "supervised stdin execution requires a non-zero combined-output limit"
+                .to_string(),
+        })?;
+    let combined_output_bytes = usize::try_from(output_u64).map_err(|_| CapsuleRefused {
+        backend_id,
+        reason: format!("combined-output limit {output_u64} does not fit this platform"),
     })?;
+    let wall_seconds = spec
+        .resources
+        .wall_clock_seconds
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| CapsuleRefused {
+            backend_id,
+            reason: "supervised stdin execution requires a non-zero wall-clock limit".to_string(),
+        })?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = (combined_output_bytes, wall_seconds);
 
-    for (stream, thread) in [("stdout", stdout_thread), ("stderr", stderr_thread)] {
-        match thread.join() {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                return Err(CapsuleRefused {
-                    backend_id: selected.backend_id,
-                    reason: format!("forward child {stream}: {error}"),
-                })
-            }
-            Err(_) => {
-                return Err(CapsuleRefused {
-                    backend_id: selected.backend_id,
-                    reason: format!("forward child {stream}: worker panicked"),
-                })
-            }
+    let mut backend_spec = spec.clone();
+    backend_spec.resources.max_output_bytes = None;
+    backend_spec.resources.wall_clock_seconds = None;
+    debug_assert_eq!(
+        backend_spec.resources.cpu_seconds,
+        spec.resources.cpu_seconds
+    );
+    debug_assert_eq!(
+        backend_spec.resources.memory_bytes,
+        spec.resources.memory_bytes
+    );
+    debug_assert_eq!(
+        backend_spec.resources.max_processes,
+        spec.resources.max_processes
+    );
+    debug_assert_eq!(
+        backend_spec.resources.max_open_files,
+        spec.resources.max_open_files
+    );
+
+    let backend_selected = select_backend(&backend_spec);
+    if backend_selected.is_degraded() {
+        return Err(CapsuleRefused {
+            backend_id: backend_selected.backend_id,
+            reason: shortfall_reason(backend_selected.backend_id, &backend_selected),
+        });
+    }
+
+    let mut combined_coverage = backend_selected.coverage;
+    // The two removed dimensions are enforced below by the bounded readers and
+    // monotonic deadline. All remaining populated dimensions passed the backend
+    // gate above, so the original aggregate resource contract is now complete.
+    combined_coverage.resource_limits_enforced = true;
+    let reported_selected = SelectedBackend {
+        backend_id: backend_selected.backend_id,
+        coverage: combined_coverage,
+        required: spec.required_coverage(),
+    };
+    if reported_selected.is_degraded() {
+        return Err(CapsuleRefused {
+            backend_id: reported_selected.backend_id,
+            reason: shortfall_reason(reported_selected.backend_id, &reported_selected),
+        });
+    }
+    debug_assert!(
+        !reported_selected.is_degraded(),
+        "supervised stdin launch must prove non-degraded aggregate coverage before spawn"
+    );
+
+    Ok(SupervisedPlan {
+        backend_spec,
+        backend_selected,
+        reported_selected,
+        #[cfg(target_os = "linux")]
+        limits: SupervisedLimits {
+            timeout: Duration::from_secs(wall_seconds),
+            stdin_bytes: SCRIPT_STDIN_MAX_BYTES,
+            combined_output_bytes,
+        },
+    })
+}
+
+fn run_to_completion_with_stdin_captured(
+    spec: &CapsuleSpec,
+    program: &TrustedExecutable,
+    args: &[String],
+    input: &[u8],
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+) -> Result<CapturedCapsuleOutcome, CapsuleRefused> {
+    let plan = supervised_stdin_plan(spec, input.len())?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (program, args, input, cwd, extra_env);
+        Err(CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: "supervised stdin execution is unavailable on macOS: a descendant can \
+                     leave the owned process group with setsid(), and macOS exposes no \
+                     unprivileged complete-tree termination primitive; refusing before launch"
+                .to_string(),
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (program, args, input, cwd, extra_env, &plan);
+        Err(CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: "contained supervised stdin launch is not available on Windows yet; refusing to run uncontained"
+                .to_string(),
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (program, args, input, cwd, extra_env, &plan);
+        Err(CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: "contained supervised stdin launch is supported only on Linux; refusing to run uncontained"
+                .to_string(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut command = build_contained_command_os(
+            &plan.backend_spec,
+            program.launch_path().as_os_str(),
+            &args_os,
+            &plan.backend_selected,
+        )?;
+        if let Some(directory) = cwd {
+            command.current_dir(directory);
+        }
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: setpgid is async-signal-safe and makes the wrapper plus all
+        // descendants one killable group. Linux's seccomp policy denies setsid
+        // and setpgid, so the contained tree cannot escape it after launch.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+
+        // Revalidate the exact canonical identity immediately before spawning;
+        // PATH is never consulted again by this launch path.
+        program.verify_identity().map_err(|error| CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: format!("trusted interpreter changed before capsule launch: {error}"),
+        })?;
+        debug_assert!(!plan.reported_selected.is_degraded());
+        let child = command.spawn().map_err(|error| CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: format!("capsule launch failed: {error}"),
+        })?;
+        let supervised =
+            supervise_piped_child(child, input, plan.limits).map_err(|reason| CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason,
+            })?;
+        Ok(CapturedCapsuleOutcome {
+            outcome: CapsuleOutcome {
+                exit_code: supervised.status.code().unwrap_or(128),
+                backend_id: plan.reported_selected.backend_id,
+                coverage: plan.reported_selected.coverage,
+                degraded: false,
+            },
+            stdout: supervised.stdout,
+            stderr: supervised.stderr,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SupervisedChildOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_combined_output(total: &AtomicUsize, count: usize, cap: usize) -> bool {
+    let mut current = total.load(Ordering::Acquire);
+    loop {
+        if count > cap.saturating_sub(current) {
+            return false;
+        }
+        match total.compare_exchange_weak(
+            current,
+            current + count,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
         }
     }
-    if let Err(error) = write_result {
-        if error.kind() != std::io::ErrorKind::BrokenPipe {
-            return Err(CapsuleRefused {
-                backend_id: selected.backend_id,
-                reason: format!("write contained child stdin: {error}"),
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_supervised_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    stream: SupervisedStream,
+    cap: usize,
+    total: Arc<AtomicUsize>,
+    sender: mpsc::Sender<SupervisedMessage>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut output = Vec::with_capacity(cap.min(64 * 1024));
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    let _ = sender.send(SupervisedMessage::OutputComplete(stream, output));
+                    return;
+                }
+                Ok(count) if reserve_combined_output(&total, count, cap) => {
+                    output.extend_from_slice(&chunk[..count]);
+                }
+                Ok(_) => {
+                    let _ = sender.send(SupervisedMessage::OutputLimit);
+                    // Keep the pipe open while the supervisor terminates the
+                    // process group so worker teardown cannot race a producer's
+                    // SIGPIPE exit. Bytes after the cap are discarded, never
+                    // accumulated.
+                    while reader.read(&mut chunk).is_ok_and(|count| count != 0) {}
+                    return;
+                }
+                Err(error) => {
+                    let _ = sender.send(SupervisedMessage::OutputError(stream, error.to_string()));
+                    return;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_supervised_tree(child: &mut Child, child_pid: u32, already_reaped: bool) -> bool {
+    let mut succeeded = true;
+    let mut reaped = already_reaped;
+
+    // Reap an already-finished direct child before signalling so any surviving
+    // descendants are the remaining process-group members.
+    if !reaped {
+        match child.try_wait() {
+            Ok(Some(_)) => reaped = true,
+            Ok(None) => {}
+            Err(_) => succeeded = false,
+        }
+    }
+
+    let process_group = -(child_pid as libc::pid_t);
+    if signal_supervised_group(process_group).is_err() {
+        succeeded = false;
+    }
+
+    if !reaped && child.wait().is_err() {
+        succeeded = false;
+    }
+    succeeded
+}
+
+#[cfg(target_os = "linux")]
+fn signal_supervised_group(process_group: libc::pid_t) -> std::io::Result<()> {
+    if unsafe { libc::kill(process_group, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_supervised_child(
+    child: &mut Child,
+    child_pid: u32,
+    already_reaped: bool,
+    workers: Vec<std::thread::JoinHandle<()>>,
+) -> bool {
+    let mut succeeded = terminate_supervised_tree(child, child_pid, already_reaped);
+    for worker in workers {
+        if worker.join().is_err() {
+            succeeded = false;
+        }
+    }
+    succeeded
+}
+
+#[cfg(target_os = "linux")]
+fn supervise_piped_child(
+    mut child: Child,
+    input: &[u8],
+    limits: SupervisedLimits,
+) -> Result<SupervisedChildOutput, String> {
+    if input.len() > limits.stdin_bytes {
+        let child_pid = child.id();
+        let cleanup = terminate_supervised_tree(&mut child, child_pid, false);
+        return Err(format!(
+            "script stdin exceeds the {}-byte limit; child-tree cleanup succeeded={cleanup}",
+            limits.stdin_bytes
+        ));
+    }
+    let child_pid = child.id();
+    let Some(deadline) = Instant::now().checked_add(limits.timeout) else {
+        let cleanup = terminate_supervised_tree(&mut child, child_pid, false);
+        return Err(format!(
+            "wall-clock deadline is outside the platform range; child-tree cleanup succeeded={cleanup}"
+        ));
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let cleanup = terminate_supervised_tree(&mut child, child_pid, false);
+        return Err(format!(
+            "contained child stdout was not piped; child-tree cleanup succeeded={cleanup}"
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let cleanup = terminate_supervised_tree(&mut child, child_pid, false);
+        return Err(format!(
+            "contained child stderr was not piped; child-tree cleanup succeeded={cleanup}"
+        ));
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let cleanup = terminate_supervised_tree(&mut child, child_pid, false);
+        return Err(format!(
+            "contained child stdin was not piped; child-tree cleanup succeeded={cleanup}"
+        ));
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    let total = Arc::new(AtomicUsize::new(0));
+    let stdout_worker = spawn_supervised_reader(
+        stdout,
+        SupervisedStream::Stdout,
+        limits.combined_output_bytes,
+        Arc::clone(&total),
+        sender.clone(),
+    );
+    let stderr_worker = spawn_supervised_reader(
+        stderr,
+        SupervisedStream::Stderr,
+        limits.combined_output_bytes,
+        total,
+        sender.clone(),
+    );
+    let owned_input = input.to_vec();
+    let input_sender = sender.clone();
+    let stdin_worker = std::thread::spawn(move || match stdin.write_all(&owned_input) {
+        Ok(()) => {
+            let _ = input_sender.send(SupervisedMessage::InputComplete);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            let _ = input_sender.send(SupervisedMessage::InputComplete);
+        }
+        Err(error) => {
+            let _ = input_sender.send(SupervisedMessage::InputError(error.to_string()));
+        }
+    });
+    drop(sender);
+    let mut workers = Some(vec![stdout_worker, stderr_worker, stdin_worker]);
+
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
+    let mut input_complete = false;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            let cleanup = cleanup_supervised_child(
+                &mut child,
+                child_pid,
+                status.is_some(),
+                workers.take().expect("workers available until return"),
+            );
+            return Err(format!(
+                "contained child exceeded the {}s wall-clock limit; child-tree cleanup succeeded={cleanup}",
+                limits.timeout.as_secs()
+            ));
+        }
+
+        match receiver.recv_timeout((deadline - now).min(Duration::from_millis(10))) {
+            Ok(SupervisedMessage::OutputComplete(SupervisedStream::Stdout, bytes)) => {
+                stdout = Some(bytes);
+            }
+            Ok(SupervisedMessage::OutputComplete(SupervisedStream::Stderr, bytes)) => {
+                stderr = Some(bytes);
+            }
+            Ok(SupervisedMessage::InputComplete) => input_complete = true,
+            Ok(SupervisedMessage::OutputLimit) => {
+                let cleanup = cleanup_supervised_child(
+                    &mut child,
+                    child_pid,
+                    status.is_some(),
+                    workers.take().expect("workers available until return"),
+                );
+                return Err(format!(
+                    "contained child exceeded the {}-byte combined-output limit; child-tree cleanup succeeded={cleanup}",
+                    limits.combined_output_bytes
+                ));
+            }
+            Ok(SupervisedMessage::OutputError(stream, reason)) => {
+                let cleanup = cleanup_supervised_child(
+                    &mut child,
+                    child_pid,
+                    status.is_some(),
+                    workers.take().expect("workers available until return"),
+                );
+                return Err(format!(
+                    "read contained child {stream:?}: {reason}; child-tree cleanup succeeded={cleanup}"
+                ));
+            }
+            Ok(SupervisedMessage::InputError(reason)) => {
+                let cleanup = cleanup_supervised_child(
+                    &mut child,
+                    child_pid,
+                    status.is_some(),
+                    workers.take().expect("workers available until return"),
+                );
+                return Err(format!(
+                    "write contained child stdin: {reason}; child-tree cleanup succeeded={cleanup}"
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if !(input_complete && stdout.is_some() && stderr.is_some()) {
+                    let cleanup = cleanup_supervised_child(
+                        &mut child,
+                        child_pid,
+                        status.is_some(),
+                        workers.take().expect("workers available until return"),
+                    );
+                    return Err(format!(
+                        "contained child I/O supervisor disconnected early; child-tree cleanup succeeded={cleanup}"
+                    ));
+                }
+            }
+        }
+
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => status = Some(exit),
+                Ok(None) => {}
+                Err(error) => {
+                    let cleanup = cleanup_supervised_child(
+                        &mut child,
+                        child_pid,
+                        false,
+                        workers.take().expect("workers available until return"),
+                    );
+                    return Err(format!(
+                        "capsule wait failed: {error}; child-tree cleanup succeeded={cleanup}"
+                    ));
+                }
+            }
+        }
+
+        if status.is_some() && input_complete && stdout.is_some() && stderr.is_some() {
+            let (exit_status, stdout_bytes, stderr_bytes) =
+                match (status.take(), stdout.take(), stderr.take()) {
+                    (Some(exit_status), Some(stdout_bytes), Some(stderr_bytes)) => {
+                        (exit_status, stdout_bytes, stderr_bytes)
+                    }
+                    _ => unreachable!("completion fields checked immediately above"),
+                };
+            // Kill any surviving descendant even when it deliberately closed all
+            // inherited pipes before the direct child exited.
+            let cleanup = cleanup_supervised_child(
+                &mut child,
+                child_pid,
+                true,
+                workers.take().expect("workers available until return"),
+            );
+            if !cleanup {
+                return Err("contained child exited but descendant cleanup failed".to_string());
+            }
+            return Ok(SupervisedChildOutput {
+                status: exit_status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
             });
         }
     }
-
-    Ok(CapsuleOutcome {
-        exit_code: status.code().unwrap_or(128),
-        backend_id: selected.backend_id,
-        coverage: selected.coverage,
-        degraded: ran_degraded,
-    })
 }
 
 /// OS-native variant of [`run_to_completion`]. This is the authoritative launch
@@ -889,8 +1450,11 @@ pub(crate) fn apply_macos_rlimits(
     if let Some(cpu) = limits.cpu_seconds {
         set_one(libc::RLIMIT_CPU, cpu)?;
     }
-    if let Some(mem) = limits.memory_bytes {
-        set_one(libc::RLIMIT_AS, mem)?;
+    if limits.memory_bytes.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "macOS has no enforceable per-process memory rlimit",
+        ));
     }
     if let Some(nofile) = limits.max_open_files {
         set_one(libc::RLIMIT_NOFILE, u64::from(nofile))?;
@@ -1128,6 +1692,275 @@ mod tests {
     #[cfg(target_os = "macos")]
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use tirith_core::capsule::NetworkPolicy;
+
+    #[cfg(target_os = "linux")]
+    fn supervised_shell_spec() -> CapsuleSpec {
+        let mut spec = supervised_stdin_spec();
+        spec.environment.allow = vec!["PATH".to_string()];
+        for root in [
+            "/bin",
+            "/usr/bin",
+            "/usr/lib",
+            "/usr/share",
+            "/lib",
+            "/lib64",
+            "/System/Library",
+            "/Library/Frameworks",
+        ] {
+            let path = std::path::Path::new(root);
+            if let Ok(canonical) = path.canonicalize() {
+                if !spec.filesystem.read_roots.contains(&canonical) {
+                    spec.filesystem.read_roots.push(canonical);
+                }
+            }
+        }
+        spec
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_shell() -> TrustedExecutable {
+        TrustedExecutable::from_absolute(std::path::Path::new("/bin/bash"), &[])
+            .or_else(|_| TrustedExecutable::from_absolute(std::path::Path::new("/bin/sh"), &[]))
+            .expect("system shell")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supervised_shell_run(
+        spec: &CapsuleSpec,
+        args: &[String],
+        input: &[u8],
+    ) -> Result<CapturedCapsuleOutcome, CapsuleRefused> {
+        // Unit-test the production planner + supervisor without recursively
+        // exec'ing this libtest harness as `__capsule-child` (libtest would parse
+        // the hidden launcher argv as a test-name filter).
+        use std::os::unix::process::CommandExt as _;
+
+        let plan = supervised_stdin_plan(spec, input.len())?;
+        let program = trusted_shell();
+        program.verify_identity().map_err(|error| CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: error.to_string(),
+        })?;
+        let mut command = Command::new(program.path());
+        command
+            .args(args)
+            .env_clear()
+            .env("PATH", "/bin:/usr/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: async-signal-safe process-group setup, identical to production.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let child = command.spawn().map_err(|error| CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: error.to_string(),
+        })?;
+        let output =
+            supervise_piped_child(child, input, plan.limits).map_err(|reason| CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason,
+            })?;
+        Ok(CapturedCapsuleOutcome {
+            outcome: CapsuleOutcome {
+                exit_code: output.status.code().unwrap_or(128),
+                backend_id: plan.reported_selected.backend_id,
+                coverage: plan.reported_selected.coverage,
+                degraded: false,
+            },
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_stdin_preserves_exact_bytes_and_argv() {
+        let spec = supervised_shell_spec();
+        let args = vec![
+            "-s".to_string(),
+            "--".to_string(),
+            "feature value".to_string(),
+        ];
+        let captured =
+            supervised_shell_run(&spec, &args, b"printf '<%s>' \"$1\"\nprintf 'err' >&2\n")
+                .expect("harmless production stdin launch");
+        assert_eq!(captured.outcome.exit_code, 0);
+        assert!(!captured.outcome.degraded);
+        assert!(captured.outcome.coverage.resource_limits_enforced);
+        assert_eq!(captured.stdout, b"<feature value>");
+        assert_eq!(captured.stderr, b"err");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_stdin_enforces_wall_clock_and_unblocks_a_stalled_writer() {
+        let mut spec = supervised_shell_spec();
+        spec.resources.wall_clock_seconds = Some(1);
+        let args = vec!["-c".to_string(), "/bin/sleep 30".to_string()];
+        let input = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        let refused = supervised_shell_run(&spec, &args, &input)
+            .expect_err("non-reading child must hit the real wall deadline");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(refused.reason.contains("wall-clock limit"), "{refused}");
+        assert!(
+            refused.reason.contains("cleanup succeeded=true"),
+            "{refused}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_stdin_enforces_one_combined_output_limit() {
+        let mut spec = supervised_shell_spec();
+        spec.resources.max_output_bytes = Some(1024);
+        spec.resources.wall_clock_seconds = Some(5);
+        let args = vec![
+            "-c".to_string(),
+            "while :; do printf 1234567890; printf abcdefghij >&2; done".to_string(),
+        ];
+        let refused = supervised_shell_run(&spec, &args, b"")
+            .expect_err("combined stdout/stderr flood must be cut off");
+        assert!(
+            refused.reason.contains("combined-output limit"),
+            "{refused}"
+        );
+        assert!(
+            refused.reason.contains("cleanup succeeded=true"),
+            "{refused}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_stdin_deadline_kills_descendant_holding_pipes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("descendant.pid");
+        let mut spec = supervised_shell_spec();
+        spec.resources.wall_clock_seconds = Some(1);
+        spec.filesystem.write_roots.push(temp.path().to_path_buf());
+        let body = format!("/bin/sleep 30 & printf '%s' $! > '{}'", pid_file.display());
+        let args = vec!["-c".to_string(), body];
+        let refused = supervised_shell_run(&spec, &args, b"")
+            .expect_err("descendant-retained pipe must not defeat the deadline");
+        assert!(refused.reason.contains("wall-clock limit"), "{refused}");
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        let mut alive = true;
+        for _ in 0..100 {
+            alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive, "descendant {pid} survived process-group cleanup");
+    }
+
+    #[test]
+    fn supervised_stdin_keeps_unsupported_limits_fail_closed() {
+        let spec = supervised_stdin_spec();
+        let refusal = supervised_stdin_plan(&spec, SCRIPT_STDIN_MAX_BYTES + 1)
+            .expect_err("oversized stdin must fail before launch");
+        assert!(refusal.reason.contains("script stdin"));
+
+        let mut spec = supervised_stdin_spec();
+        spec.resources.max_output_bytes = None;
+        let refusal = supervised_stdin_plan(&spec, 0)
+            .expect_err("missing supervisor limit must fail before launch");
+        assert!(refusal.reason.contains("combined-output limit"));
+
+        let mut spec = supervised_stdin_spec();
+        spec.resources.wall_clock_seconds = None;
+        let refusal = supervised_stdin_plan(&spec, 0)
+            .expect_err("missing supervisor deadline must fail before launch");
+        assert!(refusal.reason.contains("wall-clock limit"));
+    }
+
+    #[test]
+    fn supervised_stdin_delegates_only_output_and_wall_limits() {
+        let spec = supervised_stdin_spec();
+        let plan = supervised_stdin_plan(&spec, 0).expect("platform stdin plan");
+        assert_eq!(
+            plan.backend_spec.resources.cpu_seconds,
+            spec.resources.cpu_seconds
+        );
+        assert_eq!(
+            plan.backend_spec.resources.memory_bytes,
+            spec.resources.memory_bytes
+        );
+        assert_eq!(
+            plan.backend_spec.resources.max_processes,
+            spec.resources.max_processes
+        );
+        assert_eq!(
+            plan.backend_spec.resources.max_open_files,
+            spec.resources.max_open_files
+        );
+        assert_eq!(plan.backend_spec.resources.max_output_bytes, None);
+        assert_eq!(plan.backend_spec.resources.wall_clock_seconds, None);
+        assert!(!plan.reported_selected.is_degraded());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn supervised_stdin_does_not_erase_an_explicit_process_limit() {
+        let mut spec = supervised_stdin_spec();
+        spec.resources.max_processes = Some(32);
+        let refusal = supervised_stdin_plan(&spec, 0)
+            .expect_err("macOS cannot honestly enforce a per-child process count");
+        assert!(
+            refusal.reason.contains("resource_limits"),
+            "explicit unsupported dimension must reach fail-closed coverage: {refusal}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn supervised_stdin_refuses_before_launch_when_complete_tree_ownership_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("executed");
+        let interpreter = temp.path().join("interpreter");
+        std::fs::write(
+            &interpreter,
+            format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display()),
+        )
+        .expect("write inert interpreter probe");
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod inert interpreter probe");
+        let program = TrustedExecutable::from_absolute(&interpreter, &[])
+            .expect("trusted inert interpreter")
+            .bind_content()
+            .expect("content-bound inert interpreter");
+
+        let refusal = run_to_completion_with_stdin_captured(
+            &supervised_stdin_spec(),
+            &program,
+            &[],
+            b"printf remote-bytes\n",
+            Some(std::path::Path::new("/")),
+            &[],
+        )
+        .expect_err("macOS must refuse before target launch");
+        assert!(refusal.reason.contains("setsid()"), "{refusal}");
+        assert!(
+            !marker.exists(),
+            "refused macOS stdin execution must not launch any remote interpreter bytes"
+        );
+    }
 
     #[test]
     fn select_backend_reports_a_stable_id() {

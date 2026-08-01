@@ -576,6 +576,74 @@ fn run_rejects_unsupported_forced_argv_before_url_or_network() {
 
 #[cfg(unix)]
 #[test]
+fn run_resolves_forced_interpreter_before_url_or_network() {
+    let out = tirith()
+        .args([
+            "run",
+            "--capsule",
+            "--script-stdin",
+            "--interpreter",
+            "bash",
+            "--no-exec",
+            "not-a-url",
+        ])
+        .env_remove("PATH")
+        .output()
+        .expect("run with PATH removed");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot select trusted stdin interpreter 'bash'")
+            && stderr.contains("PATH is unset"),
+        "interpreter selection must fail before URL/network handling: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid URL"),
+        "ordering regressed: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_rejects_a_path_shadow_before_url_or_network() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let shadow = temp.path().join("bash");
+    std::fs::write(&shadow, "#!/bin/sh\nexit 0\n").expect("write shadow");
+    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod shadow");
+    let path =
+        std::env::join_paths([temp.path(), std::path::Path::new("/bin")]).expect("construct PATH");
+
+    let out = tirith()
+        .args([
+            "run",
+            "--capsule",
+            "--script-stdin",
+            "--interpreter",
+            "bash",
+            "--no-exec",
+            "not-a-url",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run with PATH shadow");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot select trusted stdin interpreter 'bash'")
+            && stderr.contains("untrusted executable"),
+        "first PATH shadow must fail closed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid URL"),
+        "ordering regressed: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn check_suggestions_never_mix_daemon_verdict_with_local_policy() {
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;

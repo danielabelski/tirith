@@ -106,6 +106,10 @@ pub enum ScriptInputMode {
 pub struct ScriptInvocation {
     /// Closed interpreter program name (never an arbitrary generated path).
     pub interpreter: String,
+    /// Interpreter identity resolved and validated before the network request.
+    /// Forced stdin invocations always carry this; manual file-mode runs retain
+    /// their legacy shebang-driven resolution path.
+    pub resolved_executable: Option<crate::trusted_child::TrustedExecutable>,
     /// Exact argument boundaries passed without a shell.
     pub args: Vec<String>,
     /// Whether bytes arrive by private path or stdin.
@@ -699,7 +703,8 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     if !opts.no_exec && !opts.interactive {
         return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
     }
-    if let Some(requested) = opts.requested_pipe_invocation.as_ref() {
+    let resolved_pipe_executable = if let Some(requested) = opts.requested_pipe_invocation.as_ref()
+    {
         if opts.exec_fn.is_none() {
             return Err(
                 "a forced stdin interpreter is accepted only with fail-closed capsule execution"
@@ -712,6 +717,30 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
                 requested.interpreter
             ));
         }
+        let executable = crate::trusted_child::resolve_ambient(requested.interpreter.as_str())
+            .map_err(|error| {
+                format!(
+                    "cannot select trusted stdin interpreter '{}': {error}",
+                    requested.interpreter
+                )
+            })?;
+        Some(executable.bind_content().map_err(|error| {
+            format!(
+                "cannot bind trusted stdin interpreter '{}' before download: {error}",
+                requested.interpreter
+            )
+        })?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    if resolved_pipe_executable.is_some() && !opts.no_exec {
+        return Err(
+            "contained stdin execution is unavailable on macOS: process groups do not own \
+             descendants that call setsid(), and macOS exposes no unprivileged complete-tree \
+             termination primitive; refusing before download or interpreter launch"
+                .to_string(),
+        );
     }
     let purpose = if opts.no_exec {
         DownloadPurpose::SaveOnly
@@ -744,12 +773,14 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     let invocation = if let Some(requested) = opts.requested_pipe_invocation.as_ref() {
         ScriptInvocation {
             interpreter: requested.interpreter.as_str().to_string(),
+            resolved_executable: resolved_pipe_executable.clone(),
             args: requested.args.clone(),
             input_mode: ScriptInputMode::Stdin,
         }
     } else {
         ScriptInvocation {
             interpreter: review.interpreter.clone(),
+            resolved_executable: None,
             args: Vec::new(),
             input_mode: ScriptInputMode::File,
         }
@@ -1161,6 +1192,35 @@ mod tests {
             PipeInterpreter::Bash,
             &["-s".into(), "--".into(), "bad\rarg".into()]
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_forced_stdin_refuses_before_network_or_executor() {
+        let options = RunOptions {
+            url: "not-a-url".to_string(),
+            no_exec: false,
+            interactive: true,
+            expected_sha256: None,
+            requested_pipe_invocation: Some(RequestedPipeInvocation {
+                interpreter: PipeInterpreter::Sh,
+                args: Vec::new(),
+            }),
+            exec_fn: Some(Box::new(|_, _, _| {
+                panic!("macOS refusal must happen before interpreter execution")
+            })),
+        };
+
+        let error = match run(options) {
+            Ok(_) => panic!("macOS stdin execution must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("setsid()"), "{error}");
+        assert!(error.contains("before download"), "{error}");
+        assert!(
+            !error.contains("invalid URL"),
+            "network validation ran: {error}"
+        );
     }
 
     #[cfg(unix)]

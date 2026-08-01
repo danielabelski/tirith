@@ -90,34 +90,30 @@ fn capsuled_exec(
 ) -> Result<i32, String> {
     use tirith_core::capsule::CapsuleSpec;
 
-    let mut spec = CapsuleSpec::locked_down();
-    // The interpreter needs to read the private script and the system roots that
-    // hold the interpreter + its runtime. Retain the locked-down spec and let
-    // the backend coverage gate decide whether it can be enforced.
-    if let Some(parent) = path.parent() {
-        spec.filesystem.read_roots.push(parent.to_path_buf());
-    }
-    for root in [
-        "/bin",
-        "/usr",
-        "/lib",
-        "/lib64",
-        "/etc",
-        "/System",
-        "/private/var/select",
-    ] {
-        let p = std::path::PathBuf::from(root);
-        if p.exists() {
-            spec.filesystem.read_roots.push(p);
-        }
-    }
-    spec.environment.allow = ["PATH", "LANG", "TERM"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
     let outcome = match invocation.input_mode {
         ScriptInputMode::File => {
+            let mut spec = CapsuleSpec::locked_down();
+            if let Some(parent) = path.parent() {
+                spec.filesystem.read_roots.push(parent.to_path_buf());
+            }
+            for root in [
+                "/bin",
+                "/usr",
+                "/lib",
+                "/lib64",
+                "/etc",
+                "/System",
+                "/private/var/select",
+            ] {
+                let root = std::path::PathBuf::from(root);
+                if root.exists() {
+                    spec.filesystem.read_roots.push(root);
+                }
+            }
+            spec.environment.allow = ["PATH", "LANG", "TERM"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
             let mut args = invocation.args.clone();
             args.push(path.to_string_lossy().into_owned());
             crate::cli::capsule::run_to_completion(
@@ -129,14 +125,32 @@ fn capsuled_exec(
                 crate::cli::capsule::DegradedPolicy::FailClosed,
             )
         }
-        ScriptInputMode::Stdin => crate::cli::capsule::run_to_completion_with_stdin(
-            &spec,
-            &invocation.interpreter,
-            &invocation.args,
-            reviewed_bytes,
-            &[],
-            crate::cli::capsule::DegradedPolicy::FailClosed,
-        ),
+        ScriptInputMode::Stdin => {
+            let program = invocation.resolved_executable.as_ref().ok_or_else(|| {
+                "forced stdin execution reached the capsule without a trusted interpreter identity"
+                    .to_string()
+            })?;
+            let mut spec = crate::cli::capsule::supervised_stdin_spec();
+            let (read_roots, runtime_path) = validated_stdin_runtime(program)?;
+            spec.filesystem.read_roots = read_roots;
+            // PATH is supplied as explicit, validated child data. It is not
+            // inherited from the ambient lookup that selected the interpreter.
+            spec.environment.allow = ["PATH", "LANG", "TERM"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            crate::cli::capsule::run_to_completion_with_stdin(
+                &spec,
+                program,
+                &invocation.args,
+                reviewed_bytes,
+                // Stdin mode never needs the downloaded file path. A fixed
+                // system-owned cwd avoids inheriting an inaccessible or
+                // attacker-influenced caller directory into the capsule.
+                Some(std::path::Path::new("/")),
+                &[("PATH".to_string(), runtime_path)],
+            )
+        }
     };
     match outcome {
         Ok(outcome) => {
@@ -152,4 +166,134 @@ fn capsuled_exec(
             refused.reason
         )),
     }
+}
+
+/// Canonicalize and validate the narrow read/runtime roots for a forced stdin
+/// interpreter. This deliberately avoids the former broad `/usr`, `/etc`, and
+/// `/System` grants. System loader roots, standard executable directories, the
+/// exact interpreter directory, and a Homebrew Cellar (only when the selected
+/// executable lives there) are the only additions.
+fn validated_stdin_runtime(
+    program: &tirith_core::trusted_child::TrustedExecutable,
+) -> Result<(Vec<std::path::PathBuf>, String), String> {
+    let mut read_roots = Vec::new();
+    let mut path_dirs = Vec::new();
+
+    let program_dir = program
+        .path()
+        .parent()
+        .ok_or_else(|| "trusted interpreter has no parent directory".to_string())?;
+    push_validated_root(&mut read_roots, program_dir)?;
+    push_validated_root(&mut path_dirs, program_dir)?;
+    if program.launch_path() != program.path() {
+        let snapshot_dir = program.launch_path().parent().ok_or_else(|| {
+            "bound trusted interpreter snapshot has no parent directory".to_string()
+        })?;
+        // The snapshot is executable content fixed before network I/O. It is a
+        // read root only; it never broadens PATH resolution for child commands.
+        push_validated_root(&mut read_roots, snapshot_dir)?;
+    }
+
+    for directory in ["/bin", "/usr/bin"] {
+        push_existing_validated_root(&mut read_roots, directory)?;
+        push_existing_validated_root(&mut path_dirs, directory)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    for root in [
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/share",
+        "/etc/ld.so.cache",
+    ] {
+        push_existing_validated_root(&mut read_roots, root)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    for root in [
+        "/usr/lib",
+        "/usr/share",
+        "/System/Library",
+        "/Library/Frameworks",
+    ] {
+        push_existing_validated_root(&mut read_roots, root)?;
+    }
+
+    for (cellar, bin) in [
+        ("/opt/homebrew/Cellar", "/opt/homebrew/bin"),
+        ("/usr/local/Cellar", "/usr/local/bin"),
+        (
+            "/home/linuxbrew/.linuxbrew/Cellar",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ),
+    ] {
+        let cellar_path = std::path::Path::new(cellar);
+        let canonical_cellar = cellar_path
+            .canonicalize()
+            .unwrap_or_else(|_| cellar_path.to_path_buf());
+        if program.path().starts_with(&canonical_cellar) {
+            push_validated_root(&mut read_roots, cellar_path)?;
+            push_existing_validated_root(&mut read_roots, bin)?;
+            push_existing_validated_root(&mut path_dirs, bin)?;
+        }
+    }
+
+    let runtime_path = std::env::join_paths(path_dirs.iter()).map_err(|error| {
+        format!("cannot construct validated runtime PATH for the interpreter: {error}")
+    })?;
+    let runtime_path = runtime_path.into_string().map_err(|_| {
+        "validated runtime PATH is not valid UTF-8 and cannot enter the capsule environment"
+            .to_string()
+    })?;
+    Ok((read_roots, runtime_path))
+}
+
+fn push_existing_validated_root(
+    roots: &mut Vec<std::path::PathBuf>,
+    candidate: &str,
+) -> Result<(), String> {
+    let path = std::path::Path::new(candidate);
+    if path.exists() {
+        push_validated_root(roots, path)?;
+    }
+    Ok(())
+}
+
+fn push_validated_root(
+    roots: &mut Vec<std::path::PathBuf>,
+    candidate: &std::path::Path,
+) -> Result<(), String> {
+    if !candidate.is_absolute() {
+        return Err(format!(
+            "capsule runtime root is not absolute: {}",
+            candidate.display()
+        ));
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("validate runtime root {}: {error}", candidate.display()))?;
+    let metadata = std::fs::metadata(&canonical)
+        .map_err(|error| format!("stat runtime root {}: {error}", canonical.display()))?;
+    if !(metadata.is_dir() || metadata.is_file()) {
+        return Err(format!(
+            "capsule runtime root is neither a file nor directory: {}",
+            canonical.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o002 != 0 {
+            return Err(format!(
+                "capsule runtime root is world-writable: {}",
+                canonical.display()
+            ));
+        }
+    }
+    if !roots.contains(&canonical) {
+        roots.push(canonical);
+    }
+    Ok(())
 }

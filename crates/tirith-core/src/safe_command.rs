@@ -612,10 +612,13 @@ fn decode_fish_literal(word: &str) -> Option<String> {
             Quote::Bare => match ch {
                 '\'' => quote = Quote::Single,
                 '"' => quote = Quote::Double,
-                '\\' => {
-                    i += 1;
-                    push_literal(&mut out, *chars.get(i)?)?;
-                }
+                // Fish's unquoted backslash grammar includes semantic escapes
+                // (`\\xNN`, octal, `\\uNNNN`, `\\UNNNNNNNN`, `\\e`, and
+                // control-producing forms). A one-character POSIX-style decoder
+                // cannot preserve those bytes. Refuse every bare backslash and
+                // keep the finding guidance-only rather than emit a rewrite whose
+                // URL or argv differs from what Fish would execute.
+                '\\' => return None,
                 '$' | '*' | '?' | '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '|' | '&'
                 | ';' => return None,
                 '~' if out.is_empty() => return None,
@@ -2230,6 +2233,73 @@ mod tests {
             );
             assert!(rewrite.contains("--script-stdin"), "{sink}: {rewrite}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fish_bare_backslash_escapes_are_always_guidance_only() {
+        // Fish gives bare backslashes semantic escape behavior (including
+        // control-producing forms). The safe rewriter deliberately declines the
+        // entire class instead of maintaining a second, partial Fish parser.
+        for word in [
+            r"https://example.com/\x61",
+            r"https://example.com/\141",
+            r"https://example.com/\u0061",
+            r"https://example.com/\U00000061",
+            r"https://example.com/\e",
+            r"https://example.com/\n",
+            r"https://example.com/\r",
+            r"https://example.com/\0",
+            r"https://example.com/\x",
+            r"https://example.com/\u12",
+            r"https://example.com/\U0000",
+            "https://example.com/trailing\\",
+            "https://example.com/line\\\ncontinuation",
+        ] {
+            assert!(
+                decode_fish_literal(word).is_none(),
+                "Fish bare escape must be refused: {word:?}"
+            );
+        }
+        for word in [
+            "https://example.com/\u{1b}",
+            "https://example.com/\n",
+            "https://example.com/\r",
+            "https://example.com/\0",
+            "https://example.com/\u{7f}",
+        ] {
+            assert!(
+                decode_fish_literal(word).is_none(),
+                "decoded control must be refused: {word:?}"
+            );
+        }
+
+        assert!(
+            pipe_suggestion(r"curl https://example.com/\x61 | fish", ShellType::Fish).is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fish_generated_literal_matches_runtime_argv_when_fish_is_installed() {
+        let Ok(fish) = crate::trusted_child::resolve_ambient("fish") else {
+            eprintln!("skipping: Fish is not installed as a trusted executable");
+            return;
+        };
+        let value = "https://example.com/a b/$(printf nope)?x=*&y=1";
+        let encoded = encode_shell_literal(value, ShellType::Fish)
+            .expect("single-quoted Fish literal should be representable");
+        let script = format!("printf '%s' {encoded}");
+        let output = std::process::Command::new(fish.path())
+            .args(["-c", &script])
+            .output()
+            .expect("run Fish argv capture");
+        assert!(
+            output.status.success(),
+            "Fish capture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, value.as_bytes());
     }
 
     #[cfg(unix)]

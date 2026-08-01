@@ -72,7 +72,10 @@ pub const BACKEND_ID: &str = "seatbelt";
 /// Resource dimensions applied by the mandatory macOS launch wrapper.
 const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
     cpu_seconds: true,
-    memory_bytes: true,
+    // Darwin exposes RLIMIT_AS in headers, but setrlimit(RLIMIT_AS, ...) returns
+    // EINVAL in production and RLIMIT_RSS is only an advisory reclamation hint.
+    // Neither is an enforceable per-process memory ceiling.
+    memory_bytes: false,
     max_processes: false,
     max_open_files: true,
     max_output_bytes: false,
@@ -172,10 +175,10 @@ fn path_is_executable_file(path: &Path) -> bool {
 ///     domain enforcement (invariant 3). An allow-list spec is therefore degraded
 ///     on this flag and the enforcing surface fails closed.
 ///   - `resource_limits_enforced`: the SBPL profile alone imposes no rlimit, but
-///     the mandatory E5 re-exec launcher applies CPU/memory/open-files rlimits
+///     the mandatory E5 re-exec launcher applies CPU/open-files rlimits
 ///     before it execs `sandbox-exec`. The aggregate bit is true only when at least
 ///     one limit was requested and **every** requested dimension is one of those
-///     three.
+///     two.
 ///
 ///     **macOS gap (do NOT over-report): `max_processes` is not enforced.** Unlike
 ///     Linux (`RLIMIT_NPROC`) and Windows (Job Object `ActiveProcessLimit`), macOS
@@ -184,9 +187,11 @@ fn path_is_executable_file(path: &Path) -> bool {
 ///     shell out of forking) without bounding the contained child's subtree, a
 ///     false fork-bomb cap, not a real one. The wrapper therefore does NOT apply it
 ///     (see `apply_macos_rlimits`). Wall-clock and output caps are likewise not
-///     applied by that wrapper. Any one of these unsupported dimensions keeps the
-///     aggregate bit false even when CPU or memory is also present, so an enforcing
-///     surface fails closed instead of accepting partial coverage.
+///     applied by that wrapper. macOS also has no enforceable address-space or RSS
+///     rlimit: `RLIMIT_AS` is rejected by the kernel and `RLIMIT_RSS` is advisory.
+///     Any one of these unsupported dimensions keeps the aggregate bit false even
+///     when CPU is also present, so an enforcing surface fails closed instead of
+///     accepting partial coverage.
 ///   - `env_isolated` / `handles_isolated`: likewise applied by the E5 wrapper,
 ///     not the SBPL profile. The wrapper `env_clear`s and re-adds only the
 ///     surviving (sensitive-stripped) variables, points HOME/TMPDIR/XDG_* at a
@@ -315,6 +320,7 @@ const SANDBOX_BASE_EXEC_ALLOW: &str = "\
 (allow process-exec*)
 (allow sysctl-read)
 (allow mach-lookup)
+(allow file-read* (literal \"/\"))
 (allow file-read* (subpath \"/usr/lib\"))
 (allow file-read* (subpath \"/usr/share\"))
 (allow file-read* (subpath \"/System/Library\"))
@@ -529,7 +535,7 @@ mod tests {
     #[test]
     fn derive_coverage_resource_flag_tracks_rlimitable_dimensions() {
         // Honesty: the resource flag follows the dimensions the wrapper enforces
-        // (CPU/mem/open-files), not a blanket true.
+        // (CPU/open-files), not a blanket true.
         let probe = SeatbeltProbe {
             sandbox_exec_usable: true,
         };
@@ -579,6 +585,9 @@ mod tests {
         let profile = sandbox_profile(&spec).expect("profile");
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(deny network*)"));
+        // Current dyld opens the root directory while locating its shared cache.
+        // This literal grants that directory only, not any descendant contents.
+        assert!(profile.contains("(allow file-read* (literal \"/\"))"));
         // No localhost carve-out for a deny-all spec.
         assert!(!profile.contains("network-outbound"));
     }
@@ -745,6 +754,22 @@ mod tests {
     }
 
     #[test]
+    fn memory_limit_is_not_reported_enforced_on_macos() {
+        let probe = SeatbeltProbe {
+            sandbox_exec_usable: true,
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            memory_bytes: Some(512 * 1024 * 1024),
+            ..ResourceLimits::default()
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(!coverage.resource_limits_enforced);
+        assert!(coverage.is_degraded_against(&spec.required_coverage()));
+    }
+
+    #[test]
     fn macos_supported_only_resource_limits_are_reported_enforced() {
         let probe = SeatbeltProbe {
             sandbox_exec_usable: true,
@@ -752,7 +777,6 @@ mod tests {
         let mut spec = CapsuleSpec::locked_down();
         spec.resources = ResourceLimits {
             cpu_seconds: Some(30),
-            memory_bytes: Some(512 * 1024 * 1024),
             max_open_files: Some(64),
             ..ResourceLimits::default()
         };

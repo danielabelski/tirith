@@ -247,6 +247,184 @@ fn trusted_lookup_rejects_a_proxy_link_inside_a_denied_root() {
 }
 
 #[test]
+fn trusted_lookup_supports_homebrew_style_versioned_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp
+        .path()
+        .join("Cellar")
+        .join("bash")
+        .join("5.3.3")
+        .join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let bash = bin.join("bash");
+    make_executable(&bash, "#!/bin/sh\nexit 0\n");
+    let path = std::env::join_paths([&bin]).unwrap();
+
+    let selected = TrustedExecutable::resolve_on_path("bash", &path, &[]).unwrap();
+    assert_eq!(selected.path(), bash.canonicalize().unwrap());
+}
+
+#[test]
+fn trusted_lookup_rejects_missing_and_world_writable_tools() {
+    let temp = tempfile::tempdir().unwrap();
+    let installed = temp.path().join("installed-bin");
+    std::fs::create_dir(&installed).unwrap();
+    let path = std::env::join_paths([&installed]).unwrap();
+    assert!(TrustedExecutable::resolve_on_path("missing", &path, &[])
+        .unwrap_err()
+        .to_string()
+        .contains("not found"));
+
+    let executable = installed.join("world-writable");
+    make_executable(&executable, "#!/bin/sh\nexit 0\n");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o707)).unwrap();
+    let error = TrustedExecutable::from_absolute(&executable, &[]).unwrap_err();
+    assert!(
+        error.to_string().contains("writable by an untrusted group")
+            || error.to_string().contains("by everyone"),
+        "{error}"
+    );
+}
+
+#[test]
+fn resolved_path_symlink_swap_cannot_change_launched_identity() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let original = temp.path().join("original");
+    let replacement = temp.path().join("replacement");
+    make_executable(&original, "#!/bin/sh\nprintf original\n");
+    make_executable(&replacement, "#!/bin/sh\nprintf replacement\n");
+    let selected_name = bin.join("probe");
+    symlink(&original, &selected_name).unwrap();
+    let path = std::env::join_paths([&bin]).unwrap();
+
+    let selected = TrustedExecutable::resolve_on_path("probe", &path, &[]).unwrap();
+    assert_eq!(selected.path(), original.canonicalize().unwrap());
+    std::fs::remove_file(&selected_name).unwrap();
+    symlink(&replacement, &selected_name).unwrap();
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::Completed { stdout, .. } => assert_eq!(stdout, b"original"),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn replacing_the_canonical_target_is_detected_before_spawn() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[]).unwrap();
+
+    std::fs::remove_file(&executable).unwrap();
+    make_executable(&executable, "#!/bin/sh\nprintf replacement\n");
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::SpawnError(reason) => assert!(reason.contains("identity changed")),
+        other => panic!("replacement must be refused before spawn: {other:?}"),
+    }
+}
+
+#[test]
+fn content_binding_survives_same_inode_source_mutation() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+    let inode = std::fs::metadata(&executable).unwrap().ino();
+
+    // Truncating and rewriting preserves the source inode, defeating a pure
+    // dev/inode re-stat. A content-bound launch must still execute the bytes that
+    // were fixed before the mutation.
+    make_executable(&executable, "#!/bin/sh\nprintf replacement\n");
+    assert_eq!(std::fs::metadata(&executable).unwrap().ino(), inode);
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::Completed { stdout, .. } => assert_eq!(stdout, b"original"),
+        other => panic!("content-bound source mutation changed the launch: {other:?}"),
+    }
+}
+
+#[test]
+fn content_binding_survives_canonical_path_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+    assert_ne!(selected.launch_path(), selected.path());
+
+    std::fs::remove_file(&executable).unwrap();
+    make_executable(&executable, "#!/bin/sh\nprintf replacement\n");
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::Completed { stdout, .. } => assert_eq!(stdout, b"original"),
+        other => panic!("content-bound path replacement changed the launch: {other:?}"),
+    }
+}
+
+#[test]
+fn content_binding_detects_snapshot_tampering_before_spawn() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = CString::new(selected.launch_path().as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chflags(path.as_ptr(), 0) }, 0);
+    }
+    std::fs::set_permissions(
+        selected.launch_path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::write(selected.launch_path(), "#!/bin/sh\nprintf replacement\n").unwrap();
+
+    let spec = ChildSpec::new(
+        std::iter::empty::<&OsStr>(),
+        ChildLimits::new(Duration::from_secs(2), 64, 64),
+    );
+    match run(&selected, &spec) {
+        ChildOutcome::SpawnError(reason) => assert!(reason.contains("content changed"), "{reason}"),
+        other => panic!("tampered bound snapshot must be refused before spawn: {other:?}"),
+    }
+}
+
+#[test]
 fn supervisor_preserves_short_legitimate_output_and_status() {
     let args = [OsStr::new("-c"), OsStr::new("printf legitimate")];
     let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 64, 64));

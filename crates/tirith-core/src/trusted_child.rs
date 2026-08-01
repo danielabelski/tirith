@@ -9,17 +9,48 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 #[cfg(not(windows))]
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
 
 #[cfg(windows)]
 mod windows;
+
+use sha2::{Digest as _, Sha256};
+
+/// A resolved executable can be copied into a private, read-only snapshot before
+/// a security-sensitive caller performs network I/O. The snapshot, its open
+/// handle, and its temporary directory stay alive together until every clone of
+/// [`TrustedExecutable`] is dropped.
+#[derive(Debug)]
+struct BoundExecutable {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    _file: File,
+    sha256: [u8; 32],
+    #[cfg(unix)]
+    identity: UnixExecutableIdentity,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for BoundExecutable {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+
+        // The owner immutable flag is defense in depth during launch. Clear it
+        // through the already-open descriptor so TempDir can remove the snapshot.
+        unsafe {
+            libc::fchflags(self._file.as_raw_fd(), 0);
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TrustedExecutable {
@@ -31,7 +62,35 @@ pub struct TrustedExecutable {
     digest: [u8; 32],
     #[cfg(windows)]
     source: WindowsExecutableSource,
+    bound: Option<Arc<BoundExecutable>>,
 }
+
+impl PartialEq for TrustedExecutable {
+    fn eq(&self, other: &Self) -> bool {
+        if self.invocation_path != other.invocation_path || self.path != other.path {
+            return false;
+        }
+        #[cfg(unix)]
+        if self.identity != other.identity {
+            return false;
+        }
+        #[cfg(not(unix))]
+        if self.digest != other.digest {
+            return false;
+        }
+        #[cfg(windows)]
+        if self.source != other.source {
+            return false;
+        }
+        match (&self.bound, &other.bound) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.path == right.path && left.sha256 == right.sha256,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TrustedExecutable {}
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +434,7 @@ impl TrustedExecutable {
                 invocation_path: path.to_path_buf(),
                 path: canonical,
                 identity,
+                bound: None,
             })
         }
         #[cfg(windows)]
@@ -391,6 +451,7 @@ impl TrustedExecutable {
                 path: canonical,
                 digest,
                 source: _source,
+                bound: None,
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -400,6 +461,7 @@ impl TrustedExecutable {
                 invocation_path: path.to_path_buf(),
                 path: canonical,
                 digest,
+                bound: None,
             })
         }
     }
@@ -493,6 +555,19 @@ impl TrustedExecutable {
     /// spawn. This detects replacement, permission/owner drift, and symlink
     /// retargeting between discovery and execution.
     pub fn revalidate(&self) -> Result<(), TrustedExecutableError> {
+        if let Some(bound) = &self.bound {
+            let mut snapshot = open_snapshot_for_verification(&bound.path)?;
+            #[cfg(unix)]
+            verify_open_identity(&snapshot, bound.identity, &bound.path)?;
+            let digest = hash_open_file(&mut snapshot, &bound.path)?;
+            if digest != bound.sha256 {
+                return Err(TrustedExecutableError::InvalidPath {
+                    path: bound.path.clone(),
+                    reason: "bound executable content changed before launch".to_string(),
+                });
+            }
+            return Ok(());
+        }
         let canonical =
             self.path
                 .canonicalize()
@@ -544,20 +619,224 @@ impl TrustedExecutable {
     pub fn invocation_path(&self) -> &Path {
         &self.invocation_path
     }
+
+    /// Return the path that must be passed to the OS. For an ordinary trusted
+    /// child this is the validated canonical path. After [`Self::bind_content`]
+    /// it is a private snapshot whose bytes were fixed before external I/O.
+    pub fn launch_path(&self) -> &Path {
+        self.bound
+            .as_ref()
+            .map_or(self.path.as_path(), |bound| bound.path.as_path())
+    }
+
+    /// Copy the selected executable into a private read-only snapshot and bind
+    /// future launches to those exact bytes. The source is opened without
+    /// following links and its device/inode is checked against resolution before
+    /// any byte is accepted, closing the resolve-to-copy replacement window.
+    ///
+    /// This is intentionally opt-in: callers that resolve an interpreter before
+    /// a network request use it, while ordinary short-lived trusted-child calls
+    /// retain their canonical-path behavior and avoid an unnecessary file copy.
+    #[cfg(unix)]
+    pub fn bind_content(&self) -> Result<Self, TrustedExecutableError> {
+        if self.bound.is_some() {
+            return Ok(self.clone());
+        }
+
+        let mut source_options = OpenOptions::new();
+        source_options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            source_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut source = source_options.open(&self.path).map_err(|error| {
+            TrustedExecutableError::InvalidPath {
+                path: self.path.clone(),
+                reason: format!("open executable for content binding: {error}"),
+            }
+        })?;
+        #[cfg(unix)]
+        verify_open_identity(&source, self.identity, &self.path)?;
+
+        let temp_root = trusted_snapshot_temp_root()?;
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-exec-")
+            .tempdir_in(&temp_root)
+            .map_err(|error| TrustedExecutableError::InvalidPath {
+                path: temp_root.clone(),
+                reason: format!("create private executable snapshot: {error}"),
+            })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            directory.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .map_err(|error| TrustedExecutableError::InvalidPath {
+            path: directory.path().to_path_buf(),
+            reason: format!("secure executable snapshot directory: {error}"),
+        })?;
+
+        let file_name =
+            self.path
+                .file_name()
+                .ok_or_else(|| TrustedExecutableError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "executable has no file name".to_string(),
+                })?;
+        let snapshot_path = directory.path().join(file_name);
+        let mut target_options = OpenOptions::new();
+        target_options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            target_options.mode(0o700).custom_flags(libc::O_CLOEXEC);
+        }
+        let mut target = target_options.open(&snapshot_path).map_err(|error| {
+            TrustedExecutableError::InvalidPath {
+                path: snapshot_path.clone(),
+                reason: format!("create executable content snapshot: {error}"),
+            }
+        })?;
+
+        let sha256 = copy_and_hash(&mut source, &mut target, &self.path)?;
+        target
+            .sync_all()
+            .map_err(|error| TrustedExecutableError::InvalidPath {
+                path: snapshot_path.clone(),
+                reason: format!("sync executable content snapshot: {error}"),
+            })?;
+        #[cfg(unix)]
+        target
+            .set_permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o500),
+            )
+            .map_err(|error| TrustedExecutableError::InvalidPath {
+                path: snapshot_path.clone(),
+                reason: format!("make executable content snapshot read-only: {error}"),
+            })?;
+
+        // Re-read both handles. A concurrent in-place source mutation must not be
+        // accepted as a coherent binding, and the durable snapshot must contain
+        // exactly the digest we recorded while copying.
+        let source_sha256 = hash_open_file(&mut source, &self.path)?;
+        if source_sha256 != sha256 {
+            return Err(TrustedExecutableError::InvalidPath {
+                path: self.path.clone(),
+                reason: "executable content changed while it was being bound".to_string(),
+            });
+        }
+        let snapshot_sha256 = hash_open_file(&mut target, &snapshot_path)?;
+        if snapshot_sha256 != sha256 {
+            return Err(TrustedExecutableError::InvalidPath {
+                path: snapshot_path,
+                reason: "executable snapshot digest changed before launch".to_string(),
+            });
+        }
+        #[cfg(unix)]
+        verify_open_identity(&source, self.identity, &self.path)?;
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd as _;
+            if unsafe { libc::fchflags(target.as_raw_fd(), libc::UF_IMMUTABLE) } != 0 {
+                return Err(TrustedExecutableError::InvalidPath {
+                    path: snapshot_path,
+                    reason: format!(
+                        "make executable content snapshot immutable: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                });
+            }
+        }
+
+        #[cfg(unix)]
+        let identity =
+            executable_identity(&target).map_err(|error| TrustedExecutableError::InvalidPath {
+                path: snapshot_path.clone(),
+                reason: format!("identify executable content snapshot: {error}"),
+            })?;
+        let bound = BoundExecutable {
+            _directory: directory,
+            path: snapshot_path,
+            _file: target,
+            sha256,
+            #[cfg(unix)]
+            identity,
+        };
+        Ok(Self {
+            invocation_path: self.invocation_path.clone(),
+            path: self.path.clone(),
+            identity: self.identity,
+            bound: Some(Arc::new(bound)),
+        })
+    }
+
+    /// Content-bound execution is not exposed on platforms whose native
+    /// supervisor cannot launch the held snapshot without losing its security
+    /// guarantees (notably the Windows Job Object and explicit handle policy).
+    #[cfg(not(unix))]
+    pub fn bind_content(&self) -> Result<Self, TrustedExecutableError> {
+        Err(TrustedExecutableError::InvalidPath {
+            path: self.path.clone(),
+            reason: "content-bound execution is unsupported on this platform".to_string(),
+        })
+    }
+
+    /// Revalidate that the canonical executable still names the same file that
+    /// was selected. Callers perform this immediately before spawn so replacing
+    /// a PATH symlink or its target cannot silently change the chosen program.
+    pub fn verify_identity(&self) -> Result<(), TrustedExecutableError> {
+        self.revalidate()
+    }
 }
 
-/// Windows does not expose the Unix `(dev, ino, ctime, mode, owner)` identity
-/// used above through stable `std` APIs. Bind the canonical file's bytes instead
-/// so replacement or in-place modification is still detected before spawn.
-#[cfg(not(unix))]
-fn executable_digest(path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
-    use sha2::{Digest as _, Sha256};
-    use std::io::Read as _;
+fn trusted_snapshot_temp_root() -> Result<PathBuf, TrustedExecutableError> {
+    #[cfg(unix)]
+    let root = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let root = std::env::temp_dir();
+    root.canonicalize()
+        .map_err(|error| TrustedExecutableError::InvalidPath {
+            path: root,
+            reason: format!("resolve executable snapshot root: {error}"),
+        })
+}
 
-    let mut file =
-        std::fs::File::open(path).map_err(|error| TrustedExecutableError::InvalidPath {
+fn copy_and_hash(
+    source: &mut File,
+    target: &mut File,
+    source_path: &Path,
+) -> Result<[u8; 32], TrustedExecutableError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count =
+            source
+                .read(&mut buffer)
+                .map_err(|error| TrustedExecutableError::InvalidPath {
+                    path: source_path.to_path_buf(),
+                    reason: format!("read executable while binding content: {error}"),
+                })?;
+        if count == 0 {
+            break;
+        }
+        target.write_all(&buffer[..count]).map_err(|error| {
+            TrustedExecutableError::InvalidPath {
+                path: source_path.to_path_buf(),
+                reason: format!("write executable content snapshot: {error}"),
+            }
+        })?;
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn hash_open_file(file: &mut File, path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
+    file.rewind()
+        .map_err(|error| TrustedExecutableError::InvalidPath {
             path: path.to_path_buf(),
-            reason: error.to_string(),
+            reason: format!("rewind executable for content verification: {error}"),
         })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -566,7 +845,7 @@ fn executable_digest(path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
             file.read(&mut buffer)
                 .map_err(|error| TrustedExecutableError::InvalidPath {
                     path: path.to_path_buf(),
-                    reason: error.to_string(),
+                    reason: format!("read executable for content verification: {error}"),
                 })?;
         if count == 0 {
             break;
@@ -574,6 +853,18 @@ fn executable_digest(path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
         hasher.update(&buffer[..count]);
     }
     Ok(hasher.finalize().into())
+}
+
+/// Windows and other non-Unix hosts do not expose the Unix identity tuple used
+/// below through stable `std` APIs. Bind the canonical file's bytes instead so
+/// replacement or in-place modification is still detected before spawn.
+#[cfg(not(unix))]
+fn executable_digest(path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
+    let mut file = File::open(path).map_err(|error| TrustedExecutableError::InvalidPath {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    hash_open_file(&mut file, path)
 }
 
 #[cfg(unix)]
@@ -605,6 +896,47 @@ fn validate_unix_executable(
         validate_unix_owner_and_mode(parent, &parent_metadata, effective_uid, true)?;
     }
 
+    Ok(UnixExecutableIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode(),
+        len: metadata.len(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+fn open_snapshot_for_verification(path: &Path) -> Result<File, TrustedExecutableError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .map_err(|error| TrustedExecutableError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: format!("open bound executable for verification: {error}"),
+        })
+}
+
+#[cfg(unix)]
+fn executable_identity(file: &File) -> std::io::Result<UnixExecutableIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "not an executable regular file",
+        ));
+    }
     Ok(UnixExecutableIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -798,6 +1130,26 @@ pub(crate) fn reject_unix_extended_acl(path: &Path, _directory: bool) -> Result<
 ))]
 pub(crate) fn reject_unix_extended_acl(_path: &Path, _directory: bool) -> Result<(), String> {
     Err("this Unix platform has no extended-ACL verifier; refusing trusted path".to_string())
+}
+
+#[cfg(unix)]
+fn verify_open_identity(
+    file: &File,
+    expected: UnixExecutableIdentity,
+    path: &Path,
+) -> Result<(), TrustedExecutableError> {
+    let observed =
+        executable_identity(file).map_err(|error| TrustedExecutableError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: format!("identify open executable: {error}"),
+        })?;
+    if observed != expected {
+        return Err(TrustedExecutableError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "executable identity changed before content binding".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve a named installed tool without ever passing its bare name to the OS.
@@ -1078,12 +1430,10 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
 /// bounded output, and a wall-clock deadline.
 #[cfg(not(windows))]
 pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
-    if let Err(error) = executable.revalidate() {
-        return ChildOutcome::SpawnError(format!(
-            "trusted executable failed pre-spawn revalidation: {error}"
-        ));
+    if let Err(error) = executable.verify_identity() {
+        return ChildOutcome::SpawnError(error.to_string());
     }
-    let mut command = Command::new(executable.path());
+    let mut command = Command::new(executable.launch_path());
     command
         .args(&spec.args)
         .env_clear()

@@ -293,8 +293,9 @@ Examples:
         #[arg(long, requires = "capsule", requires = "script_stdin")]
         interpreter: Option<tirith_core::runner::PipeInterpreter>,
 
-        /// Feed the reviewed bytes to the selected interpreter over stdin,
-        /// preserving `<fetch> | <shell>` semantics.
+        /// Feed reviewed bytes to the selected interpreter over stdin (Linux
+        /// only). macOS refuses because it cannot guarantee complete descendant
+        /// cleanup after setsid(); no fallback runs uncontained.
         #[arg(long, requires = "capsule", requires = "interpreter")]
         script_stdin: bool,
 
