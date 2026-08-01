@@ -343,10 +343,10 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
         },
         || revalidate_profile_selection(shell, &home, &profile_path),
     )?;
-    if outcome.was_written() {
+    if let Some(annotation) = outcome.completion_annotation() {
         eprintln!(
-            "tirith: {completed_verb} shell hook in {}",
-            profile_path.display()
+            "tirith: {completed_verb} shell hook in {}{annotation}",
+            profile_path.display(),
         );
     }
 

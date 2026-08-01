@@ -103,8 +103,15 @@ pub(crate) enum TransactionOutcome {
 }
 
 impl TransactionOutcome {
-    pub(crate) fn was_written(self) -> bool {
-        matches!(self, Self::Written | Self::WrittenWithRecovery)
+    /// Caller-visible completion annotation. A retained recovery is a
+    /// successful publication, but never presented as indistinguishable from
+    /// a clean transaction.
+    pub(crate) fn completion_annotation(self) -> Option<&'static str> {
+        match self {
+            Self::Written => Some(""),
+            Self::WrittenWithRecovery => Some(" [recovery retained]"),
+            Self::Unchanged | Self::DryRunWouldWrite => None,
+        }
     }
 }
 
@@ -237,83 +244,128 @@ where
     // the cap. The transient lock is transferred into the transaction and
     // remains held through publication, durability, backup, and retention.
     let transaction = PlatformTransaction::begin(path, scope_root, transaction_lock)?;
-    transaction.validate_snapshot(&snapshot.inner)?;
+    let transaction_result = (|| -> Result<TransactionOutcome, String> {
+        transaction.validate_snapshot(&snapshot.inner)?;
 
-    let mut backup_guard = if backup && snapshot.exists() {
-        Some(transaction.create_backup(&snapshot.inner)?)
-    } else {
-        None
-    };
+        let mut backup_guard = if backup && snapshot.exists() {
+            Some(transaction.create_backup(&snapshot.inner)?)
+        } else {
+            None
+        };
 
-    // `TempGuard` is armed before any bytes are written. Every error from this
-    // point until publication neutralizes the exact temporary identity through
-    // a held capability; no cleanup re-selects a possibly swapped pathname.
-    let temp = transaction.prepare_temp(&bytes, mode, preserve_existing_mode, &snapshot.inner)?;
-    #[cfg(test)]
-    test_hook(TestStage::TempSynced)?;
-
-    revalidate_selection()?;
-    transaction.validate_snapshot(&snapshot.inner)?;
-    #[cfg(test)]
-    test_hook(TestStage::SnapshotValidated)?;
-
-    let mut publication = transaction.publish(
-        temp,
-        &snapshot.inner,
+        // `TempGuard` is armed before any bytes are written. Every error from this
+        // point until publication neutralizes the exact temporary identity through
+        // a held capability; no cleanup re-selects a possibly swapped pathname.
+        let temp = transaction.prepare_temp(
+            &bytes,
+            mode,
+            preserve_existing_mode,
+            &snapshot.inner,
+            backup_guard.as_ref(),
+        )?;
         #[cfg(test)]
-        &mut test_hook,
-    )?;
+        test_hook(TestStage::TempSynced)?;
 
-    // Publication completed. If a later durability gate fails, retain the
-    // exact backup and name it in the returned recovery message. A normal
-    // "backup at" announcement is emitted only after the durable commit.
-    #[cfg(test)]
-    let post_publication = test_hook(TestStage::Published).and_then(|()| transaction.sync_parent());
-    #[cfg(not(test))]
-    let post_publication = transaction.sync_parent();
-    if let Err(error) = post_publication {
-        let recovery_context = publication.retain_for_recovery();
-        if let Some(backup) = backup_guard.as_mut() {
-            let recovery = backup.retain_for_recovery();
-            return Err(format!(
+        revalidate_selection()?;
+        transaction.validate_snapshot(&snapshot.inner)?;
+        #[cfg(test)]
+        test_hook(TestStage::SnapshotValidated)?;
+
+        let mut publication = transaction.publish(
+            temp,
+            &snapshot.inner,
+            #[cfg(test)]
+            &mut test_hook,
+        )?;
+
+        // Publication completed. If a later durability gate fails, retain the
+        // exact backup and name it in the returned recovery message. A normal
+        // "backup at" announcement is emitted only after the durable commit.
+        #[cfg(test)]
+        let post_publication =
+            test_hook(TestStage::Published).and_then(|()| transaction.sync_parent());
+        #[cfg(not(test))]
+        let post_publication = transaction.sync_parent();
+        if let Err(error) = post_publication {
+            let recovery_context = publication.retain_for_recovery();
+            if let Some(backup) = backup_guard.as_mut() {
+                let recovery = backup.retain_for_recovery().map_err(|backup_error| {
+                format!(
+                    "{error}; publication completed but durability was not confirmed; {recovery_context}; recovery-backup validation failed: {backup_error}"
+                )
+            })?;
+                return Err(format!(
                 "{error}; publication completed but durability was not confirmed; {recovery_context}; retained recovery backup at {}",
                 recovery.display()
             ));
-        }
-        return Err(format!(
+            }
+            return Err(format!(
             "{error}; publication completed but durability was not confirmed; {recovery_context}"
         ));
-    }
+        }
 
-    let publication_outcome = match publication.finish_after_durability() {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            if let Some(backup) = backup_guard.as_mut() {
-                let recovery = backup.retain_for_recovery();
-                return Err(format!(
-                    "{error}; retained recovery backup at {}",
-                    recovery.display()
-                ));
+        let publication_outcome = match publication.finish_after_durability() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(backup) = backup_guard.as_mut() {
+                    let recovery = backup.retain_for_recovery().map_err(|backup_error| {
+                        format!("{error}; recovery-backup validation failed: {backup_error}")
+                    })?;
+                    return Err(format!(
+                        "{error}; retained recovery backup at {}",
+                        recovery.display()
+                    ));
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        if let Some(backup) = backup_guard.as_mut() {
+            backup
+                .commit()
+                .map_err(|error| format!("update committed, but {error}"))?;
         }
-    };
-    if let Some(backup) = backup_guard.as_mut() {
-        backup.commit();
-    }
 
-    if backup_guard.is_some() {
-        if let Err(error) = transaction.cleanup_old_backups(backup_guard.as_ref()) {
-            eprintln!("tirith: could not clean old backups: {error}");
+        let retention_warning = transaction
+            .cleanup_old_backups(backup_guard.as_ref())
+            .err()
+            .map(|error| format!("could not enforce transaction-artifact retention: {error}"));
+
+        match (publication_outcome, retention_warning) {
+            (PublicationOutcome::Clean, None) => Ok(TransactionOutcome::Written),
+            (PublicationOutcome::Clean, Some(message))
+            | (PublicationOutcome::RecoveryRetained(message), None) => {
+                eprintln!("tirith: WARNING: {message}");
+                Ok(TransactionOutcome::WrittenWithRecovery)
+            }
+            (PublicationOutcome::RecoveryRetained(publication), Some(retention)) => {
+                eprintln!("tirith: WARNING: {publication}; {retention}");
+                Ok(TransactionOutcome::WrittenWithRecovery)
+            }
         }
-    }
+    })();
 
-    match publication_outcome {
-        PublicationOutcome::Clean => Ok(TransactionOutcome::Written),
-        PublicationOutcome::RecoveryRetained(message) => {
-            eprintln!("tirith: WARNING: {message}");
+    let cleanup_failures = transaction.take_cleanup_failures();
+    if cleanup_failures.is_empty() {
+        return transaction_result;
+    }
+    let cleanup = cleanup_failures.join("; ");
+    match transaction_result {
+        Err(error) => Err(format!(
+            "{error}; transaction-artifact cleanup also failed: {cleanup}"
+        )),
+        Ok(TransactionOutcome::Written) => {
+            eprintln!(
+                "tirith: WARNING: update completed but transaction-artifact cleanup failed: {cleanup}"
+            );
             Ok(TransactionOutcome::WrittenWithRecovery)
         }
+        Ok(TransactionOutcome::WrittenWithRecovery) => {
+            eprintln!("tirith: WARNING: transaction-artifact cleanup also failed: {cleanup}");
+            Ok(TransactionOutcome::WrittenWithRecovery)
+        }
+        Ok(other) => Err(format!(
+            "transaction-artifact cleanup failed before completion: {cleanup}; outcome was {other:?}"
+        )),
     }
 }
 
@@ -329,4 +381,26 @@ where
     H: FnMut(TestStage) -> Result<(), String>,
 {
     transactional_update_impl(path, scope_root, false, transform, || Ok(()), hook)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransactionOutcome;
+
+    #[test]
+    fn recovery_retention_has_a_distinct_caller_visible_completion_annotation() {
+        assert_eq!(
+            TransactionOutcome::Written.completion_annotation(),
+            Some("")
+        );
+        assert_eq!(
+            TransactionOutcome::WrittenWithRecovery.completion_annotation(),
+            Some(" [recovery retained]")
+        );
+        assert_eq!(TransactionOutcome::Unchanged.completion_annotation(), None);
+        assert_eq!(
+            TransactionOutcome::DryRunWouldWrite.completion_annotation(),
+            None
+        );
+    }
 }

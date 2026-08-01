@@ -2,12 +2,14 @@
 //! directory validation, CLI subprocess runner, and backup management.
 
 use std::ffi::{CStr, CString, OsStr};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::{cell::RefCell, rc::Rc};
 
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -192,7 +194,52 @@ struct StableFileState {
     identity: FileIdentity,
     size: u64,
     mode: u32,
+    owner: u32,
+    links: u64,
     digest: [u8; 32],
+}
+
+type CleanupFailures = Rc<RefCell<Vec<String>>>;
+
+#[cfg(test)]
+thread_local! {
+    static SCRUB_FAILURE_TEST_HOOK: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+    static BACKUP_ROTATION_TEST_HOOK: RefCell<Option<Box<dyn FnMut(&Path)>>> = RefCell::new(None);
+}
+
+fn inject_scrub_failure(_label: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if SCRUB_FAILURE_TEST_HOOK
+        .with(|slot| slot.borrow().is_some_and(|target| _label.contains(target)))
+    {
+        return Err(format!("injected {_label} cleanup failure"));
+    }
+    Ok(())
+}
+
+fn scrub_guard_file(file: &mut fs::File, label: &str) -> Result<(), String> {
+    inject_scrub_failure(label)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect {label} before cleanup: {error}"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(format!(
+            "refuse to scrub {label}: expected one regular-file link, observed {}",
+            metadata.nlink()
+        ));
+    }
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } < 0 {
+        return Err(format!(
+            "restrict {label} before cleanup: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    file.sync_all()
+        .map_err(|error| format!("sync restricted {label}: {error}"))?;
+    file.set_len(0)
+        .map_err(|error| format!("scrub {label}: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync scrubbed {label}: {error}"))
 }
 
 fn open_stable_file_at(
@@ -223,7 +270,12 @@ fn open_stable_file_at_with_access(
             "open publication identity without following links: {error}"
         ));
     }
-    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    stable_state_from_open_file(unsafe { fs::File::from_raw_fd(fd) }).map(Some)
+}
+
+fn stable_state_from_open_file(mut file: fs::File) -> Result<(fs::File, StableFileState), String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek publication identity: {error}"))?;
     let before = file
         .metadata()
         .map_err(|error| format!("inspect publication identity: {error}"))?;
@@ -238,9 +290,7 @@ fn open_stable_file_at_with_access(
     let after = file
         .metadata()
         .map_err(|error| format!("reinspect publication identity: {error}"))?;
-    if before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
+    if FileGeneration::from_metadata(&before) != FileGeneration::from_metadata(&after)
         || bytes.len() as u64 != after.len()
     {
         return Err("publication identity changed while it was inspected".into());
@@ -249,9 +299,11 @@ fn open_stable_file_at_with_access(
         identity: FileIdentity::from_metadata(&after),
         size: after.len(),
         mode: after.mode() & 0o7777,
+        owner: after.uid(),
+        links: after.nlink(),
         digest: Sha256::digest(&bytes).into(),
     };
-    Ok(Some((file, state)))
+    Ok((file, state))
 }
 
 fn stable_state_at(parent: &fs::File, name: &CStr) -> Result<Option<StableFileState>, String> {
@@ -270,6 +322,8 @@ fn stable_state_from_snapshot(snapshot: &PlatformSnapshot) -> Option<StableFileS
         },
         size: bytes.len() as u64,
         mode: snapshot.mode.unwrap_or(0) & 0o7777,
+        owner: generation.owner,
+        links: generation.links,
         digest: Sha256::digest(bytes).into(),
     })
 }
@@ -288,6 +342,8 @@ struct FileGeneration {
     device: u64,
     inode: u64,
     size: u64,
+    owner: u32,
+    links: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
     changed_seconds: i64,
@@ -378,12 +434,248 @@ fn move_no_replace(parent: &fs::File, source: &CStr, destination: &CStr) -> Resu
     }
 }
 
+const BACKUP_MARKER: &str = ".tirith-backup-v2-";
+const TOMBSTONE_MARKER: &str = ".tirith-setup-v2-";
+const ARTIFACT_RETENTION_LIMIT: usize = 5;
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn destination_tag(name: &CStr) -> String {
+    let digest = Sha256::digest(name.to_bytes());
+    hex_bytes(&digest[..16])
+}
+
+fn backup_binding(name: &CStr, state: &StableFileState) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tirith-setup-backup-v2\0");
+    hasher.update(name.to_bytes());
+    hasher.update(state.size.to_le_bytes());
+    hasher.update(state.mode.to_le_bytes());
+    hasher.update(state.owner.to_le_bytes());
+    hasher.update(state.digest);
+    hex_bytes(&hasher.finalize())
+}
+
+fn backup_name(name: &CStr, state: &StableFileState) -> CString {
+    CString::new(format!(
+        "{BACKUP_MARKER}{}-{}_{}_{}",
+        destination_tag(name),
+        chrono::Local::now().format("%Y%m%d-%H%M%S-%9f"),
+        backup_binding(name, state),
+        uuid::Uuid::new_v4().simple()
+    ))
+    .expect("generated backup name contains no NUL")
+}
+
+fn backup_name_matches(candidate: &CStr, destination: &CStr, state: &StableFileState) -> bool {
+    let Ok(candidate) = candidate.to_str() else {
+        return false;
+    };
+    let prefix = format!("{BACKUP_MARKER}{}-", destination_tag(destination));
+    let Some(rest) = candidate.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut fields = rest.split('_');
+    let Some(timestamp) = fields.next() else {
+        return false;
+    };
+    let Some(binding) = fields.next() else {
+        return false;
+    };
+    let Some(nonce) = fields.next() else {
+        return false;
+    };
+    fields.next().is_none()
+        && timestamp.len() == 25
+        && timestamp.as_bytes()[8] == b'-'
+        && timestamp.as_bytes()[15] == b'-'
+        && timestamp
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| index == 8 || index == 15 || byte.is_ascii_digit())
+        && binding == backup_binding(destination, state)
+        && nonce.len() == 32
+        && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && state.owner == unsafe { libc::geteuid() }
+        && state.links == 1
+}
+
+fn tombstone_name(state: &StableFileState) -> CString {
+    CString::new(format!(
+        "{TOMBSTONE_MARKER}{:x}-{:x}-{}.tmp",
+        state.identity.device,
+        state.identity.inode,
+        uuid::Uuid::new_v4().simple()
+    ))
+    .expect("generated tombstone name contains no NUL")
+}
+
+fn tombstone_name_matches(candidate: &CStr, state: &StableFileState) -> bool {
+    let Ok(candidate) = candidate.to_str() else {
+        return false;
+    };
+    let Some(rest) = candidate
+        .strip_prefix(TOMBSTONE_MARKER)
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut fields = rest.split('-');
+    let parsed_device = fields
+        .next()
+        .and_then(|value| u64::from_str_radix(value, 16).ok());
+    let parsed_inode = fields
+        .next()
+        .and_then(|value| u64::from_str_radix(value, 16).ok());
+    let nonce = fields.next();
+    let empty_digest: [u8; 32] = Sha256::digest([]).into();
+    fields.next().is_none()
+        && parsed_device == Some(state.identity.device)
+        && parsed_inode == Some(state.identity.inode)
+        && nonce.is_some_and(|value| {
+            value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        && state.size == 0
+        && state.mode == 0o600
+        && state.owner == unsafe { libc::geteuid() }
+        && state.links == 1
+        && state.digest == empty_digest
+}
+
+#[cfg(target_os = "linux")]
+fn errno_slot() -> Option<*mut libc::c_int> {
+    Some(unsafe { libc::__errno_location() })
+}
+
+#[cfg(target_os = "android")]
+fn errno_slot() -> Option<*mut libc::c_int> {
+    Some(unsafe { libc::__errno() })
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn errno_slot() -> Option<*mut libc::c_int> {
+    Some(unsafe { libc::__error() })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn errno_slot() -> Option<*mut libc::c_int> {
+    None
+}
+
+fn directory_names(directory: &fs::File) -> Result<Vec<CString>, String> {
+    let dot = c".";
+    // `dup` would share the directory-stream offset with the long-lived
+    // capability. Re-open `.` relative to that capability so every scan gets
+    // an independent file description without re-resolving an external path.
+    let duplicate = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if duplicate < 0 {
+        return Err(format!(
+            "duplicate transaction directory for enumeration: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(format!("enumerate transaction directory: {error}"));
+    }
+    let mut names = Vec::new();
+    loop {
+        // POSIX distinguishes end-of-directory from an enumeration failure by
+        // errno. Clear it immediately before `readdir` so a partial scan can
+        // never be mistaken for a complete retention inventory.
+        let errno = errno_slot();
+        if let Some(errno) = errno {
+            unsafe {
+                *errno = 0;
+            }
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let readdir_errno = errno.map(|errno| unsafe { *errno }).unwrap_or_default();
+            if unsafe { libc::closedir(stream) } < 0 {
+                return Err(format!(
+                    "close transaction-directory enumeration: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if readdir_errno != 0 {
+                return Err(format!(
+                    "enumerate transaction directory: {}",
+                    std::io::Error::from_raw_os_error(readdir_errno)
+                ));
+            }
+            return Ok(names);
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+}
+
+fn normalize_tombstone_name(
+    parent: &fs::File,
+    current_name: &mut CString,
+    file: &fs::File,
+) -> Result<(), String> {
+    let (_, state) = stable_state_from_open_file(
+        file.try_clone()
+            .map_err(|error| format!("clone scrubbed artifact handle: {error}"))?,
+    )?;
+    if tombstone_name_matches(current_name, &state) {
+        return Ok(());
+    }
+    if state.size != 0 || state.mode != 0o600 || state.links != 1 {
+        return Err("scrubbed artifact is not a reusable single-link tombstone".into());
+    }
+    if stable_state_at(parent, current_name)?.as_ref() != Some(&state) {
+        return Err("scrubbed artifact pathname changed before tombstone normalization".into());
+    }
+    let normalized = tombstone_name(&state);
+    move_no_replace(parent, current_name, &normalized)
+        .map_err(|error| format!("normalize scrubbed artifact name: {error}"))?;
+    if stable_state_at(parent, &normalized)?.as_ref() != Some(&state)
+        || stable_state_at(parent, current_name)?.is_some()
+    {
+        let _ = move_no_replace(parent, &normalized, current_name);
+        return Err("could not prove normalized tombstone identity".into());
+    }
+    parent
+        .sync_all()
+        .map_err(|error| format!("sync normalized tombstone name: {error}"))?;
+    *current_name = normalized;
+    Ok(())
+}
+
 impl FileGeneration {
     fn from_metadata(metadata: &fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.size(),
+            owner: metadata.uid(),
+            links: metadata.nlink(),
             modified_seconds: metadata.mtime(),
             modified_nanoseconds: metadata.mtime_nsec(),
             changed_seconds: metadata.ctime(),
@@ -458,6 +750,13 @@ fn snapshot_from_parent(
             return Err(format!(
                 "{} is not a regular file — refusing for safety",
                 display_path.display()
+            ));
+        }
+        if before.nlink() != 1 {
+            return Err(format!(
+                "{} has {} hard links; refusing to replace a shared inode for safety",
+                display_path.display(),
+                before.nlink()
             ));
         }
         if before.len() > super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 {
@@ -557,20 +856,14 @@ pub fn atomic_write(
     Ok(())
 }
 
-fn open_lock_anchor(scope_root: &Path) -> Result<fs::File, String> {
-    let mut anchor = absolute(scope_root)?;
-    while !anchor.exists() {
-        if !anchor.pop() {
-            return Err(format!(
-                "cannot find existing setup lock anchor for {}",
-                scope_root.display()
-            ));
-        }
-    }
-    let canonical = anchor
-        .canonicalize()
-        .map_err(|error| format!("canonicalize setup lock anchor: {error}"))?;
-    open_dir(&canonical)
+fn open_lock_anchor(_scope_root: &Path) -> Result<fs::File, String> {
+    // The scope root may be created by the first writer. Locking the nearest
+    // existing ancestor is therefore unstable: a contender that starts after
+    // that mkdir can select the new root while the first writer still locks
+    // its former ancestor. The filesystem root is an immutable identity for
+    // every absolute setup path, so first-run and steady-state writers always
+    // rendezvous on the same kernel lock without creating a lock artifact.
+    open_dir(Path::new("/"))
 }
 
 pub(crate) struct PlatformLock {
@@ -581,6 +874,7 @@ pub(crate) struct PlatformTransaction {
     parent: ScopedParent,
     path: PathBuf,
     _lock: PlatformLock,
+    cleanup_failures: CleanupFailures,
 }
 
 impl PlatformTransaction {
@@ -603,6 +897,7 @@ impl PlatformTransaction {
             parent,
             path: path.to_path_buf(),
             _lock: lock,
+            cleanup_failures: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -623,6 +918,10 @@ impl PlatformTransaction {
         snapshot_from_parent(&self.parent, &self.path)
     }
 
+    pub(crate) fn take_cleanup_failures(&self) -> Vec<String> {
+        std::mem::take(&mut *self.cleanup_failures.borrow_mut())
+    }
+
     pub(crate) fn validate_snapshot(&self, expected: &PlatformSnapshot) -> Result<(), String> {
         let live = self.read_snapshot()?;
         if &live != expected {
@@ -634,45 +933,190 @@ impl PlatformTransaction {
         Ok(())
     }
 
-    pub(crate) fn prepare_temp<'a>(
-        &'a self,
-        bytes: &[u8],
-        requested_mode: u32,
-        preserve_existing_mode: bool,
-        snapshot: &PlatformSnapshot,
-    ) -> Result<TempGuard<'a>, String> {
-        let effective_mode = if preserve_existing_mode {
-            snapshot.mode.unwrap_or(requested_mode)
-        } else {
-            requested_mode
-        } & 0o7777;
-        let name = CString::new(format!(
-            ".tirith-setup-{}.tmp",
+    fn create_empty_artifact(&self) -> Result<(CString, fs::File), String> {
+        let provisional = CString::new(format!(
+            ".tirith-setup-new-{}.tmp",
             uuid::Uuid::new_v4().simple()
         ))
-        .expect("UUID temp name contains no NUL");
+        .expect("UUID provisional temp name contains no NUL");
         let fd = unsafe {
             libc::openat(
                 self.parent.dir.as_raw_fd(),
-                name.as_ptr(),
+                provisional.as_ptr(),
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o600,
             )
         };
         if fd < 0 {
             return Err(format!(
-                "create exclusive temporary file below destination: {}",
+                "create exclusive temporary artifact below destination: {}",
                 std::io::Error::last_os_error()
             ));
         }
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        let captured = file
+            .try_clone()
+            .map_err(|error| format!("clone provisional temp handle: {error}"))
+            .and_then(stable_state_from_open_file);
+        let (_, state) = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                let cleanup = scrub_guard_file(&mut file, "unvalidated temporary artifact")
+                    .err()
+                    .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "validate newly-created temporary artifact: {error}{cleanup}"
+                ));
+            }
+        };
+        let name = tombstone_name(&state);
+        let establish = (|| {
+            move_no_replace(&self.parent.dir, &provisional, &name)
+                .map_err(|error| format!("establish provenance-bound temp name: {error}"))?;
+            if stable_state_at(&self.parent.dir, &name)?.as_ref() != Some(&state)
+                || stable_state_at(&self.parent.dir, &provisional)?.is_some()
+            {
+                return Err("could not prove newly-created temp provenance identity".into());
+            }
+            self.parent
+                .dir
+                .sync_all()
+                .map_err(|error| format!("sync provenance-bound temp name: {error}"))
+        })();
+        if let Err(error) = establish {
+            let cleanup = scrub_guard_file(&mut file, "uncommitted temporary artifact")
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(format!("{error}{cleanup}"));
+        }
+        Ok((name, file))
+    }
+
+    /// Acquire one empty, provenance-bound artifact. Backups are created from
+    /// this same bounded pool instead of allocating an independent file on
+    /// every write. When the backup set is full, the subsequent temp
+    /// acquisition rotates the oldest exact backup back into the pool, so the
+    /// backup and tombstone caps remain stable together over an unbounded
+    /// sequence of backup-enabled transactions.
+    fn acquire_empty_artifact(&self) -> Result<(CString, fs::File), String> {
+        let mut tombstones = Vec::new();
+        for name in directory_names(&self.parent.dir)? {
+            if !name.to_bytes().starts_with(TOMBSTONE_MARKER.as_bytes()) {
+                continue;
+            }
+            let Ok(Some((file, state))) =
+                open_stable_file_at_with_access(&self.parent.dir, &name, libc::O_RDWR)
+            else {
+                // A prefix alone is not provenance and never grants reuse or
+                // cleanup authority.
+                continue;
+            };
+            if tombstone_name_matches(&name, &state) {
+                tombstones.push((name, file));
+            }
+        }
+        if tombstones.len() > ARTIFACT_RETENTION_LIMIT {
+            return Err(format!(
+                "provenance-bound setup tombstone limit ({ARTIFACT_RETENTION_LIMIT}) exceeded; refusing to continue until stale artifacts are reviewed"
+            ));
+        }
+        if let Some(reusable) = tombstones.pop() {
+            return Ok(reusable);
+        }
+        self.create_empty_artifact()
+    }
+
+    fn acquire_temp_artifact(
+        &self,
+        keep_backup: Option<&BackupGuard>,
+    ) -> Result<(CString, fs::File), String> {
+        let keep_name = keep_backup.map(|guard| guard.name.as_bytes().to_vec());
+        let mut backups = Vec::new();
+        for name in directory_names(&self.parent.dir)? {
+            if !name.to_bytes().starts_with(BACKUP_MARKER.as_bytes()) {
+                continue;
+            }
+            let Ok(Some((file, state))) =
+                open_stable_file_at_with_access(&self.parent.dir, &name, libc::O_RDWR)
+            else {
+                continue;
+            };
+            if backup_name_matches(&name, &self.parent.name, &state) {
+                backups.push((name, file, state));
+            }
+        }
+        backups.sort_by(|left, right| left.0.to_bytes().cmp(right.0.to_bytes()));
+
+        if backups.len() > ARTIFACT_RETENTION_LIMIT {
+            // A freshly-created backup consumed one tombstone (or a new empty
+            // artifact). Rotate the oldest *other* exact backup into the temp
+            // role. Publication then leaves the displaced destination in this
+            // same slot, keeping both retention sets bounded without a
+            // pathname-only unlink.
+            let Some((mut name, mut file, state)) = backups
+                .into_iter()
+                .find(|(name, _, _)| keep_name.as_deref() != Some(name.to_bytes()))
+            else {
+                return Err("backup retention exceeded but no prior exact backup was eligible for safe rotation".into());
+            };
+            #[cfg(test)]
+            BACKUP_ROTATION_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    let path = self
+                        .path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(OsStr::from_bytes(name.to_bytes()));
+                    hook(&path);
+                }
+            });
+            if stable_state_at(&self.parent.dir, &name)?.as_ref() != Some(&state) {
+                return Err(format!(
+                    "provenance-bound backup {} changed before temp rotation",
+                    name.to_string_lossy()
+                ));
+            }
+            scrub_guard_file(&mut file, "retired transaction backup")?;
+            normalize_tombstone_name(&self.parent.dir, &mut name, &file)?;
+            self.parent
+                .dir
+                .sync_all()
+                .map_err(|error| format!("sync rotated backup tombstone: {error}"))?;
+            return Ok((name, file));
+        }
+
+        self.acquire_empty_artifact()
+    }
+
+    pub(crate) fn prepare_temp<'a>(
+        &'a self,
+        bytes: &[u8],
+        requested_mode: u32,
+        preserve_existing_mode: bool,
+        snapshot: &PlatformSnapshot,
+        keep_backup: Option<&BackupGuard>,
+    ) -> Result<TempGuard<'a>, String> {
+        let effective_mode = if preserve_existing_mode {
+            snapshot.mode.unwrap_or(requested_mode)
+        } else {
+            requested_mode
+        } & 0o7777;
+        let (name, file) = self.acquire_temp_artifact(keep_backup)?;
         let mut guard = TempGuard {
             parent: &self.parent.dir,
             name,
-            file: Some(unsafe { fs::File::from_raw_fd(fd) }),
+            file: Some(file),
             state: None,
             armed: true,
+            cleanup_failures: Rc::clone(&self.cleanup_failures),
         };
         let file = guard.file.as_mut().expect("new temp owns file");
+        file.set_len(0)
+            .map_err(|error| format!("reset reusable temporary file: {error}"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind reusable temporary file: {error}"))?;
         file.write_all(bytes)
             .map_err(|error| format!("write temporary file: {error}"))?;
         if unsafe { libc::fchmod(file.as_raw_fd(), effective_mode as libc::mode_t) } < 0 {
@@ -690,6 +1134,8 @@ impl PlatformTransaction {
             identity: FileIdentity::from_metadata(&synced_metadata),
             size: synced_metadata.len(),
             mode: synced_metadata.mode() & 0o7777,
+            owner: synced_metadata.uid(),
+            links: synced_metadata.nlink(),
             digest: Sha256::digest(bytes).into(),
         });
         Ok(guard)
@@ -955,50 +1401,55 @@ impl PlatformTransaction {
             .bytes
             .as_deref()
             .ok_or_else(|| "cannot back up an absent destination".to_string())?;
-        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let mut name = self.parent.name.to_bytes().to_vec();
-        name.extend_from_slice(
-            format!(
-                ".tirith-backup-{timestamp}-{}",
-                uuid::Uuid::new_v4().simple()
-            )
-            .as_bytes(),
-        );
-        let name = CString::new(name).map_err(|_| "backup name contains NUL".to_string())?;
-        let fd = unsafe {
-            libc::openat(
-                self.parent.dir.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
+        let intended_state = StableFileState {
+            identity: FileIdentity {
+                device: 0,
+                inode: 0,
+            },
+            size: bytes.len() as u64,
+            // Backups may contain credentials even when the source file was
+            // accidentally broad. Never carry source write/read exposure into
+            // the recovery artifact.
+            mode: 0o600,
+            owner: unsafe { libc::geteuid() },
+            links: 1,
+            digest: Sha256::digest(bytes).into(),
         };
-        if fd < 0 {
-            return Err(format!(
-                "create exclusive backup: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let display_path = self
+        // Consume one provenance-bound tombstone (or create one bounded empty
+        // artifact) for the new backup. If the backup set is already full,
+        // `prepare_temp` rotates the oldest prior backup into the temp role.
+        // This pairing avoids accumulating one extra tombstone per retained
+        // backup while never deleting by pathname.
+        let (artifact_name, created_file) = self.acquire_empty_artifact()?;
+        let parent = match self.parent.dir.try_clone() {
+            Ok(parent) => parent,
+            Err(error) => {
+                let mut created_file = created_file;
+                let cleanup = scrub_guard_file(&mut created_file, "unowned transaction backup")
+                    .err()
+                    .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(format!("retain backup parent capability: {error}{cleanup}"));
+            }
+        };
+        let artifact_path = self
             .path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(OsStr::from_bytes(name.to_bytes()));
+            .join(OsStr::from_bytes(artifact_name.to_bytes()));
         let mut guard = BackupGuard {
-            display_path,
-            file: Some(unsafe { fs::File::from_raw_fd(fd) }),
+            display_path: artifact_path,
+            parent,
+            name: artifact_name,
+            file: Some(created_file),
+            state: None,
             armed: true,
+            cleanup_failures: Rc::clone(&self.cleanup_failures),
         };
         let file = guard.file.as_mut().expect("new backup owns file");
         file.write_all(bytes)
             .map_err(|error| format!("write backup from locked snapshot: {error}"))?;
-        if unsafe {
-            libc::fchmod(
-                file.as_raw_fd(),
-                snapshot.mode.unwrap_or(0o600) as libc::mode_t,
-            )
-        } < 0
-        {
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } < 0 {
             return Err(format!(
                 "set backup permissions: {}",
                 std::io::Error::last_os_error()
@@ -1010,14 +1461,78 @@ impl PlatformTransaction {
             .dir
             .sync_all()
             .map_err(|error| format!("sync backup directory: {error}"))?;
+        let (_, state) = stable_state_from_open_file(
+            file.try_clone()
+                .map_err(|error| format!("clone backup validation handle: {error}"))?,
+        )?;
+        let name = backup_name(&self.parent.name, &state);
+        let intended_digest: [u8; 32] = Sha256::digest(bytes).into();
+        if state.size != bytes.len() as u64
+            || state.digest != intended_digest
+            || state.mode != intended_state.mode
+            || state.links != 1
+            || state.owner != unsafe { libc::geteuid() }
+        {
+            return Err("new backup did not retain its exact intended generation".into());
+        }
+
+        move_no_replace(&self.parent.dir, &guard.name, &name)
+            .map_err(|error| format!("establish provenance-bound backup name: {error}"))?;
+        guard.name = name;
+        guard.display_path = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(OsStr::from_bytes(guard.name.to_bytes()));
+        if stable_state_at(&self.parent.dir, &guard.name)?.as_ref() != Some(&state)
+            || !backup_name_matches(&guard.name, &self.parent.name, &state)
+        {
+            return Err("new backup did not retain its exact provenance-bound generation".into());
+        }
+        self.parent
+            .dir
+            .sync_all()
+            .map_err(|error| format!("sync provenance-bound backup name: {error}"))?;
+        guard.state = Some(state);
         Ok(guard)
     }
 
     pub(crate) fn cleanup_old_backups(&self, _keep: Option<&BackupGuard>) -> Result<(), String> {
-        // A previous-run backup pathname has no live capability tying it to
-        // the file Tirith originally created. Never turn a pathname check into
-        // a later unlink: cleanup is restricted to guards that still hold the
-        // exact file handle, and those guards scrub through that handle.
+        inject_scrub_failure("retention inventory")?;
+        let mut backup_count = 0usize;
+        let mut tombstone_count = 0usize;
+        for name in directory_names(&self.parent.dir)? {
+            if name.to_bytes().starts_with(BACKUP_MARKER.as_bytes()) {
+                let Ok(Some((_, state))) = open_stable_file_at(&self.parent.dir, &name) else {
+                    continue;
+                };
+                if backup_name_matches(&name, &self.parent.name, &state) {
+                    backup_count += 1;
+                }
+            } else if name.to_bytes().starts_with(TOMBSTONE_MARKER.as_bytes()) {
+                let Ok(Some((_, state))) = open_stable_file_at(&self.parent.dir, &name) else {
+                    continue;
+                };
+                if tombstone_name_matches(&name, &state) {
+                    tombstone_count += 1;
+                }
+            }
+        }
+
+        let mut exceeded = Vec::new();
+        if backup_count > ARTIFACT_RETENTION_LIMIT {
+            exceeded.push(format!(
+                "{backup_count} exact backups remain (limit {ARTIFACT_RETENTION_LIMIT})"
+            ));
+        }
+        if tombstone_count > ARTIFACT_RETENTION_LIMIT {
+            exceeded.push(format!(
+                "{tombstone_count} exact temp tombstones remain (limit {ARTIFACT_RETENTION_LIMIT})"
+            ));
+        }
+        if !exceeded.is_empty() {
+            return Err(exceeded.join("; "));
+        }
         Ok(())
     }
 }
@@ -1032,18 +1547,42 @@ struct RecoveryIdentity<'a> {
 
 impl RecoveryIdentity<'_> {
     fn scrub_exact(&mut self) -> Result<(), String> {
+        inject_scrub_failure("displaced identity")?;
+        let (_, current) = stable_state_from_open_file(
+            self.file
+                .try_clone()
+                .map_err(|error| format!("clone exact displaced identity: {error}"))?,
+        )?;
+        if current != self.state {
+            return Err("exact displaced identity changed before scrub".into());
+        }
+        if current.links != 1 {
+            return Err(format!(
+                "exact displaced identity acquired {} hard links before scrub",
+                current.links
+            ));
+        }
+        if unsafe { libc::fchmod(self.file.as_raw_fd(), 0o600) } < 0 {
+            return Err(format!(
+                "restrict exact displaced identity before scrub: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        self.file
+            .sync_all()
+            .map_err(|error| format!("sync restricted displaced identity: {error}"))?;
         self.file
             .set_len(0)
             .map_err(|error| format!("scrub exact displaced identity: {error}"))?;
-        if unsafe { libc::fchmod(self.file.as_raw_fd(), 0o600) } < 0 {
-            eprintln!(
-                "tirith: could not restrict scrubbed displaced identity: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        if let Err(error) = self.file.sync_all() {
-            eprintln!("tirith: could not sync scrubbed displaced identity: {error}");
-        }
+        self.file
+            .sync_all()
+            .map_err(|error| format!("sync scrubbed displaced identity: {error}"))?;
+        normalize_tombstone_name(self.parent, &mut self.name, &self.file)?;
+        self.display_path = self
+            .display_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(OsStr::from_bytes(self.name.to_bytes()));
         Ok(())
     }
 
@@ -1097,9 +1636,11 @@ impl RecoveryIdentity<'_> {
                 .map_err(|error| format!("sync exact recovery-copy directory entry: {error}"))
         })();
         if let Err(error) = write_result {
-            let _ = copy.set_len(0);
-            let _ = copy.sync_all();
-            return Err(error);
+            let cleanup = scrub_guard_file(&mut copy, "partial recovery copy")
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(format!("{error}{cleanup}"));
         }
         Ok(self
             .display_path
@@ -1223,14 +1764,18 @@ impl<'a> PublicationGuard<'a> {
         let Some(recovery) = self.recovery.as_mut() else {
             return Ok(PublicationOutcome::Clean);
         };
-        if recovery.scrub_exact().is_ok() {
-            return Ok(PublicationOutcome::Clean);
+        if let Err(scrub_error) = recovery.scrub_exact() {
+            let path = recovery.ensure_recovery_path().map_err(|recovery_error| {
+                format!(
+                    "durable update could not safely scrub its displaced original ({scrub_error}) and could not retain an exact recovery copy ({recovery_error})"
+                )
+            })?;
+            return Ok(PublicationOutcome::RecoveryRetained(format!(
+                "durable update retained the exact displaced original at {} because cleanup failed: {scrub_error}",
+                path.display()
+            )));
         }
-        let path = recovery.ensure_recovery_path()?;
-        Ok(PublicationOutcome::RecoveryRetained(format!(
-            "durable update retained the exact displaced original at {} because Unix has no identity-bound pathname deletion primitive",
-            path.display()
-        )))
+        Ok(PublicationOutcome::Clean)
     }
 }
 
@@ -1240,6 +1785,7 @@ pub(crate) struct TempGuard<'a> {
     file: Option<fs::File>,
     state: Option<StableFileState>,
     armed: bool,
+    cleanup_failures: CleanupFailures,
 }
 
 impl TempGuard<'_> {
@@ -1265,9 +1811,11 @@ impl Drop for TempGuard<'_> {
             // attacker swaps the pathname, their file is never selected for
             // cleanup. The zero-length tombstone is intentionally retained.
             if let Some(file) = self.file.as_mut() {
-                let _ = file.set_len(0);
-                let _ = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
-                let _ = file.sync_all();
+                let cleanup = scrub_guard_file(file, "temporary setup identity")
+                    .and_then(|()| normalize_tombstone_name(self.parent, &mut self.name, file));
+                if let Err(error) = cleanup {
+                    self.cleanup_failures.borrow_mut().push(error);
+                }
             }
         }
     }
@@ -1275,19 +1823,58 @@ impl Drop for TempGuard<'_> {
 
 pub(crate) struct BackupGuard {
     display_path: PathBuf,
+    parent: fs::File,
+    name: CString,
     file: Option<fs::File>,
+    state: Option<StableFileState>,
     armed: bool,
+    cleanup_failures: CleanupFailures,
 }
 
 impl BackupGuard {
-    pub(crate) fn commit(&mut self) {
-        self.armed = false;
-        eprintln!("tirith: backup at {}", self.path().display());
+    fn validate(&self) -> Result<(), String> {
+        let expected = self
+            .state
+            .as_ref()
+            .ok_or_else(|| "backup has no captured stable generation".to_string())?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| "backup validation handle is unavailable".to_string())?;
+        let (_, held) = stable_state_from_open_file(
+            file.try_clone()
+                .map_err(|error| format!("clone held backup handle: {error}"))?,
+        )?;
+        if &held != expected {
+            return Err("backup bytes or metadata changed through its held handle".into());
+        }
+        if stable_state_at(&self.parent, &self.name)?.as_ref() != Some(expected) {
+            return Err("backup pathname no longer identifies the exact created generation".into());
+        }
+        Ok(())
     }
 
-    pub(crate) fn retain_for_recovery(&mut self) -> PathBuf {
+    pub(crate) fn commit(&mut self) -> Result<(), String> {
+        self.validate().map_err(|error| {
+            format!(
+                "backup {} changed before commit/announcement: {error}",
+                self.display_path.display()
+            )
+        })?;
         self.armed = false;
-        self.path()
+        eprintln!("tirith: backup at {}", self.path().display());
+        Ok(())
+    }
+
+    pub(crate) fn retain_for_recovery(&mut self) -> Result<PathBuf, String> {
+        self.validate().map_err(|error| {
+            format!(
+                "backup {} cannot be announced as recovery: {error}",
+                self.display_path.display()
+            )
+        })?;
+        self.armed = false;
+        Ok(self.path())
     }
 
     fn path(&self) -> PathBuf {
@@ -1301,9 +1888,11 @@ impl Drop for BackupGuard {
             // As with temporary cleanup, scrub the exact held inode rather
             // than deleting whichever object later occupies the pathname.
             if let Some(file) = self.file.as_mut() {
-                let _ = file.set_len(0);
-                let _ = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
-                let _ = file.sync_all();
+                let cleanup = scrub_guard_file(file, "transaction backup identity")
+                    .and_then(|()| normalize_tombstone_name(&self.parent, &mut self.name, file));
+                if let Err(error) = cleanup {
+                    self.cleanup_failures.borrow_mut().push(error);
+                }
             }
         }
     }
@@ -1356,6 +1945,7 @@ pub fn write_hook_script(
         Ok(FileUpdate::write_text(content.to_string(), 0o755).with_exact_mode())
     })?;
 
+    let completion = outcome.completion_annotation();
     match (action, outcome) {
         (Action::UpToDate, _) if dry_run => eprintln!(
             "[dry-run] would skip {} (already up to date)",
@@ -1368,9 +1958,10 @@ pub fn write_hook_script(
             "[dry-run] would correct {} permissions to mode 0755",
             path.display()
         ),
-        (Action::FixMode, outcome) if outcome.was_written() => eprintln!(
-            "tirith: {} already configured, fixed permissions",
-            path.display()
+        (Action::FixMode, _) if completion.is_some() => eprintln!(
+            "tirith: {} already configured, fixed permissions{}",
+            path.display(),
+            completion.unwrap_or_default()
         ),
         (Action::WouldError, _) => eprintln!(
             "[dry-run] would error: {} exists but content differs — use --force to update",
@@ -1381,8 +1972,12 @@ pub fn write_hook_script(
             path.display(),
             content.len()
         ),
-        (Action::Write, outcome) if outcome.was_written() => {
-            eprintln!("tirith: wrote {}", path.display())
+        (Action::Write, _) if completion.is_some() => {
+            eprintln!(
+                "tirith: wrote {}{}",
+                path.display(),
+                completion.unwrap_or_default()
+            )
         }
         _ => {}
     }
@@ -1679,6 +2274,36 @@ mod tests {
     }
 
     #[test]
+    fn write_hook_script_rejects_hardlinked_destination_without_touching_external_link() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_path = external.path().join("shared-hook.sh");
+        let setup_path = root.path().join("hook.sh");
+        fs::write(&external_path, "external-original").unwrap();
+        fs::set_permissions(&external_path, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::hard_link(&external_path, &setup_path).unwrap();
+
+        let error =
+            write_hook_script(&setup_path, root.path(), "tirith-update", true, false).unwrap_err();
+
+        assert!(error.contains("hard links"));
+        assert_eq!(
+            fs::read_to_string(&external_path).unwrap(),
+            "external-original"
+        );
+        assert_eq!(
+            fs::read_to_string(&setup_path).unwrap(),
+            "external-original"
+        );
+        assert_eq!(
+            fs::metadata(&external_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(temporary_setup_paths(root.path()).is_empty());
+        assert!(backup_paths(root.path()).is_empty());
+    }
+
+    #[test]
     fn write_hook_script_refuses_symlinked_parent_even_when_content_matches() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -1766,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn same_second_backups_are_unique_without_unsafe_path_pruning() {
+    fn provenance_bound_backup_retention_keeps_exactly_five() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -1777,10 +2402,144 @@ mod tests {
             update_with_backup(&path, dir.path(), &format!("value-{index}")).unwrap();
         }
         let retained = backup_paths(dir.path());
-        assert_eq!(retained.len(), 8);
+        assert_eq!(retained.len(), 5);
         assert!(retained
             .iter()
             .any(|backup| fs::read_to_string(backup).unwrap() == "value-4"));
+    }
+
+    #[test]
+    fn backup_and_temp_retention_remain_bounded_over_the_same_lifecycle() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "zero").unwrap();
+
+        for index in 0..30 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
+        }
+
+        assert_eq!(backup_paths(root.path()).len(), ARTIFACT_RETENTION_LIMIT);
+        let tombstones = fs::read_dir(root.path())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TOMBSTONE_MARKER)
+            })
+            .collect::<Vec<_>>();
+        assert!(tombstones.len() <= ARTIFACT_RETENTION_LIMIT);
+        assert!(tombstones.iter().all(|entry| {
+            let metadata = entry.metadata().unwrap();
+            metadata.len() == 0
+                && metadata.permissions().mode() & 0o777 == 0o600
+                && metadata.nlink() == 1
+        }));
+        assert_eq!(fs::read_to_string(path).unwrap(), "value-29");
+    }
+
+    #[test]
+    fn backup_rotation_never_scrubs_a_pathname_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "zero").unwrap();
+        for index in 0..5 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
+        }
+
+        let moved = root.path().join("attacker-moved-exact-backup");
+        let moved_for_hook = moved.clone();
+        BACKUP_ROTATION_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |candidate| {
+                fs::rename(candidate, &moved_for_hook).unwrap();
+                fs::write(candidate, "attacker-pathname-replacement").unwrap();
+            }));
+        });
+        let result = update_with_backup(&path, root.path(), "must-not-publish");
+        BACKUP_ROTATION_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+
+        let error = result.unwrap_err();
+        assert!(error.contains("changed before temp rotation"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "value-4");
+        assert!(backup_paths(root.path()).into_iter().any(|candidate| {
+            fs::read_to_string(candidate)
+                .is_ok_and(|bytes| bytes == "attacker-pathname-replacement")
+        }));
+        assert!(!fs::read_to_string(moved).unwrap().is_empty());
+    }
+
+    #[test]
+    fn backup_retention_never_touches_unproven_prefix_lookalikes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "zero").unwrap();
+        let destination = CString::new("config.json").unwrap();
+        let forged = root.path().join(format!(
+            "{BACKUP_MARKER}{}-20260101-000000-000000000_{}_{}",
+            destination_tag(&destination),
+            "0".repeat(64),
+            "a".repeat(32)
+        ));
+        fs::write(&forged, "attacker-owned-lookalike").unwrap();
+
+        for index in 0..8 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
+        }
+
+        assert_eq!(
+            fs::read_to_string(&forged).unwrap(),
+            "attacker-owned-lookalike"
+        );
+        assert_eq!(backup_paths(root.path()).len(), 6);
+    }
+
+    #[test]
+    fn successful_updates_reuse_unix_tombstones_with_a_bound_of_five() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        for index in 0..20 {
+            atomic_write(&path, root.path(), &format!("value-{index}"), 0o600).unwrap();
+        }
+        let tombstones = fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TOMBSTONE_MARKER)
+            })
+            .collect::<Vec<_>>();
+        assert!(tombstones.len() <= ARTIFACT_RETENTION_LIMIT);
+        assert!(tombstones.iter().all(|entry| {
+            let metadata = entry.metadata().unwrap();
+            metadata.len() == 0
+                && metadata.permissions().mode() & 0o777 == 0o600
+                && metadata.nlink() == 1
+        }));
+    }
+
+    #[test]
+    fn temp_retention_never_reuses_or_scrubs_prefix_only_lookalikes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let forged = root
+            .path()
+            .join(".tirith-setup-v2-dead-beef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tmp");
+        fs::write(&forged, "attacker-owned-lookalike").unwrap();
+
+        for index in 0..10 {
+            atomic_write(&path, root.path(), &format!("value-{index}"), 0o600).unwrap();
+        }
+
+        assert_eq!(
+            fs::read_to_string(&forged).unwrap(),
+            "attacker-owned-lookalike"
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "value-9");
     }
 
     #[test]
@@ -1796,6 +2555,30 @@ mod tests {
             fs::metadata(backup).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn backup_generation_is_revalidated_before_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        let result = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o600).with_backup(true)),
+            |stage| {
+                if stage == TestStage::TempSynced {
+                    let backup = backup_paths(root.path()).pop().unwrap();
+                    fs::write(backup, "tampered-backup").unwrap();
+                }
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.contains("backup") && error.contains("commit/announcement"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "after");
+        assert!(backup_paths(root.path()).is_empty());
     }
 
     #[test]
@@ -2174,6 +2957,65 @@ mod tests {
     }
 
     #[test]
+    fn guard_cleanup_failure_is_propagated_with_the_primary_error() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        SCRUB_FAILURE_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some("temporary"));
+        let result = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o600).with_backup(true)),
+            |stage| {
+                if stage == TestStage::TempSynced {
+                    return Err("injected pre-publication failure".into());
+                }
+                Ok(())
+            },
+        );
+        SCRUB_FAILURE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+
+        let error = result.unwrap_err();
+        assert!(error.contains("injected pre-publication failure"));
+        assert!(error.contains("cleanup also failed"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[test]
+    fn displaced_scrub_failure_returns_written_with_recovery_never_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        SCRUB_FAILURE_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some("displaced"));
+        let result = transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text("after".into(), 0o600))
+        });
+        SCRUB_FAILURE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+
+        assert_eq!(result.unwrap(), TransactionOutcome::WrittenWithRecovery);
+        assert_eq!(fs::read_to_string(path).unwrap(), "after");
+        assert_eq!(nonempty(temporary_setup_paths(root.path())).len(), 1);
+    }
+
+    #[test]
+    fn retention_cleanup_failure_returns_written_with_recovery_never_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "zero").unwrap();
+        for index in 0..5 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
+        }
+        SCRUB_FAILURE_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some("retention inventory"));
+        let result = transactional_update(&path, root.path(), false, |_| {
+            Ok(FileUpdate::write_text("value-5".into(), 0o600).with_backup(true))
+        });
+        SCRUB_FAILURE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+
+        assert_eq!(result.unwrap(), TransactionOutcome::WrittenWithRecovery);
+        assert_eq!(fs::read_to_string(path).unwrap(), "value-5");
+    }
+
+    #[test]
     fn swapped_backup_cleanup_scrubs_only_the_held_identity() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
@@ -2273,16 +3115,19 @@ mod tests {
             return;
         };
         let root = PathBuf::from(std::env::var_os("TIRITH_SETUP_LOCK_ROOT").unwrap());
+        let control = std::env::var_os("TIRITH_SETUP_LOCK_CONTROL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.clone());
         let path = root.join("config.txt");
         match role.to_string_lossy().as_ref() {
             "holder" => {
-                let entered = root.join("holder-entered");
-                let release = root.join("release-holder");
+                let entered = control.join("holder-entered");
+                let release = control.join("release-holder");
                 transactional_update_with_hook(
                     &path,
                     &root,
                     |snapshot| {
-                        let mut content = snapshot.text(&path)?.unwrap().to_string();
+                        let mut content = snapshot.text(&path)?.unwrap_or("base").to_string();
                         content.push_str("-holder");
                         Ok(FileUpdate::write_text(content, 0o644))
                     },
@@ -2298,9 +3143,9 @@ mod tests {
             }
             "contender" => {
                 assert!(PlatformTransaction::lock_is_contended(&path, &root).unwrap());
-                fs::write(root.join("contender-observed-lock"), b"contended").unwrap();
+                fs::write(control.join("contender-observed-lock"), b"contended").unwrap();
                 transactional_update(&path, &root, false, |snapshot| {
-                    let mut content = snapshot.text(&path)?.unwrap().to_string();
+                    let mut content = snapshot.text(&path)?.unwrap_or("base").to_string();
                     content.push_str("-contender");
                     Ok(FileUpdate::write_text(content, 0o644))
                 })
@@ -2343,6 +3188,45 @@ mod tests {
         );
 
         fs::write(root.path().join("release-holder"), b"release").unwrap();
+        assert!(holder.wait().unwrap().success());
+        assert!(contender.wait().unwrap().success());
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("-holder") && content.contains("-contender"));
+    }
+
+    #[test]
+    fn first_run_transactions_use_one_lock_identity_when_scope_starts_absent() {
+        let control = tempfile::tempdir().unwrap();
+        let root = control.path().join("missing").join("scope");
+        let path = root.join("config.txt");
+        let test_binary = std::env::current_exe().unwrap();
+        let test_name = "cli::setup::fs_helpers::tests::subprocess_lock_child";
+
+        let mut holder = std::process::Command::new(&test_binary)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("TIRITH_SETUP_LOCK_CHILD_ROLE", "holder")
+            .env("TIRITH_SETUP_LOCK_ROOT", &root)
+            .env("TIRITH_SETUP_LOCK_CONTROL", control.path())
+            .spawn()
+            .unwrap();
+        wait_for_marker(&control.path().join("holder-entered"));
+        assert!(
+            root.exists(),
+            "holder must create the formerly missing scope"
+        );
+
+        let mut contender = std::process::Command::new(&test_binary)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("TIRITH_SETUP_LOCK_CHILD_ROLE", "contender")
+            .env("TIRITH_SETUP_LOCK_ROOT", &root)
+            .env("TIRITH_SETUP_LOCK_CONTROL", control.path())
+            .spawn()
+            .unwrap();
+        wait_for_marker(&control.path().join("contender-observed-lock"));
+        assert!(holder.try_wait().unwrap().is_none());
+        assert!(contender.try_wait().unwrap().is_none());
+
+        fs::write(control.path().join("release-holder"), b"release").unwrap();
         assert!(holder.wait().unwrap().success());
         assert!(contender.wait().unwrap().success());
         let content = fs::read_to_string(path).unwrap();

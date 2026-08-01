@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
+use std::{cell::RefCell, rc::Rc};
 
 use sha2::{Digest, Sha256};
 
@@ -19,32 +20,35 @@ pub(crate) use super::fs_transaction::{
 #[path = "fs_helpers_windows_path.rs"]
 mod path_rules;
 
-use windows::core::{BOOL, HRESULT, PCWSTR};
+use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
     ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, HANDLE, HLOCAL,
     WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetSecurityDescriptorOwner,
+    GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FlushFileBuffers,
     GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
     MoveFileExW, ReplaceFileW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW,
-    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
-    READ_CONTROL,
+    DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_WRITE_THROUGH,
+    OPEN_EXISTING, READ_CONTROL,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
+    CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject, INFINITE,
 };
 
 struct OwnedHandle(HANDLE);
@@ -93,6 +97,10 @@ thread_local! {
     static OLD_BACKUP_CLEANUP_TEST_HOOK: std::cell::RefCell<
         Option<Box<dyn FnMut(&Path)>>,
     > = std::cell::RefCell::new(None);
+    static CREATED_ARTIFACT_CAPTURE_TEST_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnMut(&Path)>>,
+    > = std::cell::RefCell::new(None);
+    static DELETE_FAILURE_TEST_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn replace_file_call(
@@ -125,18 +133,231 @@ fn replace_file_call(
     }
 }
 
-fn new_displaced_path(destination: &Path) -> Result<PathBuf, String> {
+const BACKUP_MARKER: &str = ".tirith-backup-v2-";
+const DISPLACED_MARKER: &str = ".tirith-displaced-v2-";
+const ARTIFACT_RETENTION_LIMIT: usize = 5;
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn destination_tag(destination: &Path) -> String {
+    let mut hasher = Sha256::new();
+    for unit in destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase()
+        .encode_utf16()
+    {
+        hasher.update(unit.to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    hex_bytes(&digest[..16])
+}
+
+fn content_binding(destination: &Path, size: u64, digest: &[u8; 32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tirith-setup-backup-v2\0");
+    hasher.update(destination_tag(destination).as_bytes());
+    hasher.update(size.to_le_bytes());
+    hasher.update(digest);
+    hex_bytes(&hasher.finalize())
+}
+
+fn recovery_binding(destination: &Path, generation: &FileGeneration) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tirith-setup-displaced-v2\0");
+    hasher.update(destination_tag(destination).as_bytes());
+    hasher.update(generation.volume_serial.to_le_bytes());
+    hasher.update(generation.file_index.to_le_bytes());
+    hasher.update(generation.size.to_le_bytes());
+    hasher.update(generation.attributes.to_le_bytes());
+    hasher.update(generation.reparse_tag.unwrap_or_default().to_le_bytes());
+    hasher.update(generation.digest);
+    hasher.update(&generation.security_descriptor);
+    hex_bytes(&hasher.finalize())
+}
+
+fn timestamp_is_valid(timestamp: &str) -> bool {
+    timestamp.len() == 25
+        && timestamp.as_bytes()[8] == b'-'
+        && timestamp.as_bytes()[15] == b'-'
+        && timestamp
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| index == 8 || index == 15 || byte.is_ascii_digit())
+}
+
+fn with_current_user_sid<T>(use_sid: impl FnOnce(PSID) -> T) -> Result<T, String> {
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|error| format!("open current process token: {error}"))?;
+    let token = OwnedHandle(token);
+
+    let mut required = 0u32;
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut required) };
+    if required < std::mem::size_of::<TOKEN_USER>() as u32 {
+        return Err("query current-user SID size returned an invalid length".into());
+    }
+    let word = std::mem::size_of::<usize>();
+    let mut storage = vec![0usize; (required as usize + word - 1) / word];
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(storage.as_mut_ptr().cast()),
+            required,
+            &mut required,
+        )
+    }
+    .map_err(|error| format!("read current-user SID: {error}"))?;
+    let token_user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+    if token_user.User.Sid.0.is_null() {
+        return Err("current process token returned a null user SID".into());
+    }
+    Ok(use_sid(token_user.User.Sid))
+}
+
+fn current_user_sid_string() -> Result<String, String> {
+    with_current_user_sid(|sid| {
+        let mut encoded = PWSTR::null();
+        unsafe { ConvertSidToStringSidW(sid, &mut encoded) }
+            .map_err(|error| format!("format current-user SID: {error}"))?;
+        let decoded = unsafe { encoded.to_string() }
+            .map_err(|error| format!("decode current-user SID: {error}"));
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(encoded.0.cast())));
+        }
+        decoded
+    })?
+}
+
+fn owner_is_current_user(owner: PSID) -> bool {
+    with_current_user_sid(|current| unsafe { EqualSid(owner, current) }.is_ok()).unwrap_or(false)
+}
+
+fn owner_only_security_descriptor(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut descriptor_bytes = bytes.to_vec();
+    let descriptor = PSECURITY_DESCRIPTOR(descriptor_bytes.as_mut_ptr().cast());
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.is_err()
+        || control & SE_DACL_PROTECTED.0 == 0
+    {
+        return false;
+    }
+    let mut present = BOOL(0);
+    let mut defaulted = BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+        .is_err()
+        || !present.as_bool()
+        || dacl.is_null()
+    {
+        return false;
+    }
+    let mut size = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .is_err()
+        || size.AceCount != 1
+    {
+        return false;
+    }
+    let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+    if unsafe { GetAce(dacl, 0, &mut ace) }.is_err() || ace.is_null() {
+        return false;
+    }
+    let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+    if unsafe { (*ace).Header.AceType != 0 || (*ace).Mask != FILE_ALL_ACCESS.0 } {
+        return false;
+    }
+    let mut owner = PSID::default();
+    if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) }.is_err()
+        || owner.0.is_null()
+    {
+        return false;
+    }
+    let ace_sid = unsafe { PSID((&mut (*ace).SidStart as *mut u32).cast()) };
+    owner_is_current_user(owner) && unsafe { EqualSid(owner, ace_sid) }.is_ok()
+}
+
+fn backup_name(destination: &Path, bytes: &[u8]) -> String {
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    format!(
+        "{BACKUP_MARKER}{}-{}_{}_{}",
+        destination_tag(destination),
+        chrono::Local::now().format("%Y%m%d-%H%M%S-%9f"),
+        content_binding(destination, bytes.len() as u64, &digest),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn backup_name_matches(path: &Path, destination: &Path, generation: &FileGeneration) -> bool {
+    let candidate = path.file_name().unwrap_or_default().to_string_lossy();
+    let prefix = format!("{BACKUP_MARKER}{}-", destination_tag(destination));
+    let Some(rest) = candidate.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut fields = rest.split('_');
+    let timestamp = fields.next();
+    let binding = fields.next();
+    let nonce = fields.next();
+    fields.next().is_none()
+        && timestamp.is_some_and(timestamp_is_valid)
+        && binding
+            == Some(content_binding(destination, generation.size, &generation.digest).as_str())
+        && nonce.is_some_and(|value| {
+            value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        && generation.reparse_tag.is_none()
+        && path_rules::attributes_are_safe(generation.attributes, false)
+        && owner_only_security_descriptor(&generation.security_descriptor)
+}
+
+fn displaced_name_matches(path: &Path, destination: &Path, generation: &FileGeneration) -> bool {
+    let candidate = path.file_name().unwrap_or_default().to_string_lossy();
+    let prefix = format!("{DISPLACED_MARKER}{}-", destination_tag(destination));
+    let Some(rest) = candidate.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut fields = rest.split('_');
+    let timestamp = fields.next();
+    let binding = fields.next();
+    let nonce = fields.next();
+    fields.next().is_none()
+        && timestamp.is_some_and(timestamp_is_valid)
+        && binding == Some(recovery_binding(destination, generation).as_str())
+        && nonce.is_some_and(|value| {
+            value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn new_displaced_path(destination: &Path, expected: &FileGeneration) -> Result<PathBuf, String> {
     let parent = destination
         .parent()
         .ok_or_else(|| format!("no parent for {}", destination.display()))?;
-    let stem = destination
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
     // The UUID is passed directly to ReplaceFileW. A preflight existence
     // check would merely create a check/use race and is deliberately absent.
     Ok(parent.join(format!(
-        ".{stem}.tirith-displaced-{}",
+        "{DISPLACED_MARKER}{}-{}_{}_{}",
+        destination_tag(destination),
+        chrono::Local::now().format("%Y%m%d-%H%M%S-%9f"),
+        recovery_binding(destination, expected),
         uuid::Uuid::new_v4().simple()
     )))
 }
@@ -572,7 +793,10 @@ fn open_cleanup_handle(path: &Path) -> Result<Option<OwnedHandle>, String> {
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
             (FILE_GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | DELETE).0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            // Cleanup and recovery artifacts must never grant write sharing.
+            // The held DELETE-capable handle therefore blocks both pathname
+            // replacement and non-cooperating writers until commit/release.
+            FILE_SHARE_READ,
             None,
             OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT,
@@ -605,6 +829,10 @@ fn open_cleanup_handle(path: &Path) -> Result<Option<OwnedHandle>, String> {
 }
 
 fn mark_held_file_for_deletion(file: &fs::File) -> Result<(), String> {
+    #[cfg(test)]
+    if DELETE_FAILURE_TEST_HOOK.with(std::cell::Cell::get) {
+        return Err("injected exact-handle deletion failure".into());
+    }
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     unsafe {
         SetFileInformationByHandle(
@@ -623,6 +851,54 @@ struct CleanupCapability {
 }
 
 impl CleanupCapability {
+    fn from_created(file: fs::File, path: &Path, intended: &[u8]) -> Result<Self, String> {
+        #[cfg(test)]
+        CREATED_ARTIFACT_CAPTURE_TEST_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(path);
+            }
+        });
+
+        // Capture through a duplicate while retaining the original creation
+        // handle. There is no close/reopen interval in which the pathname can
+        // be swapped and subsequently trusted as Tirith's artifact.
+        let duplicate = match file.try_clone() {
+            Ok(duplicate) => duplicate,
+            Err(error) => {
+                let cleanup = mark_held_file_for_deletion(&file)
+                    .err()
+                    .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "clone newly-created artifact handle: {error}{cleanup}"
+                ));
+            }
+        };
+        let captured = capture_stable_file(duplicate, path);
+        let (_, bytes, generation) = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                let cleanup = mark_held_file_for_deletion(&file)
+                    .err()
+                    .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "validate newly-created transaction artifact: {error}{cleanup}"
+                ));
+            }
+        };
+        if bytes != intended {
+            let cleanup = mark_held_file_for_deletion(&file)
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "newly-created transaction artifact did not contain the intended bytes{cleanup}"
+            ));
+        }
+        Ok(Self { file, generation })
+    }
+
     fn open(path: &Path) -> Result<Self, String> {
         let handle = open_cleanup_handle(path)?
             .ok_or_else(|| format!("transaction artifact disappeared at {}", path.display()))?;
@@ -754,10 +1030,13 @@ pub fn parent_exists_scoped(path: &Path, scope_root: &Path) -> Result<bool, Stri
 }
 
 fn owner_only_descriptor() -> Result<LocalSecurityDescriptor, String> {
+    let sid = current_user_sid_string()?;
+    let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})");
+    let sddl_wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            windows::core::w!("D:P(A;;FA;;;OW)"),
+            PCWSTR(sddl_wide.as_ptr()),
             SDDL_REVISION_1,
             &mut descriptor,
             None,
@@ -836,6 +1115,8 @@ pub(crate) struct PlatformTransaction {
     display_path: PathBuf,
     _lock: PlatformLock,
     published_generation: std::cell::RefCell<Option<FileGeneration>>,
+    published_recovery: RefCell<Option<PathBuf>>,
+    cleanup_failures: Rc<RefCell<Vec<String>>>,
 }
 
 impl PlatformTransaction {
@@ -868,6 +1149,8 @@ impl PlatformTransaction {
             display_path: path.to_path_buf(),
             _lock: lock,
             published_generation: std::cell::RefCell::new(None),
+            published_recovery: RefCell::new(None),
+            cleanup_failures: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -888,6 +1171,10 @@ impl PlatformTransaction {
 
     pub(crate) fn read_snapshot(&self) -> Result<PlatformSnapshot, String> {
         snapshot_destination(&self.destination, &self.display_path)
+    }
+
+    pub(crate) fn take_cleanup_failures(&self) -> Vec<String> {
+        std::mem::take(&mut *self.cleanup_failures.borrow_mut())
     }
 
     pub(crate) fn validate_snapshot(&self, expected: &PlatformSnapshot) -> Result<(), String> {
@@ -917,6 +1204,7 @@ impl PlatformTransaction {
         _mode: u32,
         _preserve_existing_mode: bool,
         _snapshot: &PlatformSnapshot,
+        _keep_backup: Option<&BackupGuard>,
     ) -> Result<TempGuard<'a>, String> {
         let path = self.parent.path.join(format!(
             ".tirith-setup-{}.tmp",
@@ -932,7 +1220,12 @@ impl PlatformTransaction {
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(path_wide.as_ptr()),
-                FILE_GENERIC_WRITE.0,
+                (FILE_GENERIC_READ
+                    | FILE_GENERIC_WRITE
+                    | READ_CONTROL
+                    | FILE_READ_ATTRIBUTES
+                    | DELETE)
+                    .0,
                 FILE_SHARE_READ,
                 Some(&security_attributes),
                 CREATE_NEW,
@@ -941,19 +1234,24 @@ impl PlatformTransaction {
             )
         }
         .map_err(|error| format!("create exclusive owner-only temporary file: {error}"))?;
-        {
-            let mut file = OwnedHandle(handle).into_file();
-            file.write_all(bytes)
-                .map_err(|error| format!("write temporary file: {error}"))?;
-            unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) }
-                .map_err(|error| format!("flush temporary file before publication: {error}"))?;
+        let mut file = OwnedHandle(handle).into_file();
+        if let Err(error) = file.write_all(bytes) {
+            let cleanup = mark_held_file_for_deletion(&file)
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(format!("write temporary file: {error}{cleanup}"));
         }
-
-        // Generation is captured only after the write handle has closed. The
-        // cleanup handle requests DELETE without FILE_SHARE_DELETE, so every
-        // pre-publication failure can delete the exact verified identity and
-        // cannot be redirected to an attacker-swapped pathname.
-        let cleanup = CleanupCapability::open(&path)?;
+        if let Err(error) = unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) } {
+            let cleanup = mark_held_file_for_deletion(&file)
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "flush temporary file before publication: {error}{cleanup}"
+            ));
+        }
+        let cleanup = CleanupCapability::from_created(file, &path, bytes)?;
         let generation = cleanup.generation.clone();
         Ok(TempGuard {
             _transaction: self,
@@ -961,6 +1259,7 @@ impl PlatformTransaction {
             cleanup: Some(cleanup),
             generation,
             armed: true,
+            cleanup_failures: Rc::clone(&self.cleanup_failures),
         })
     }
 
@@ -997,7 +1296,7 @@ impl PlatformTransaction {
                 let SnapshotGeneration::Present(expected_generation) = &expected.generation else {
                     unreachable!("existing snapshot has a generation")
                 };
-                let displaced_path = new_displaced_path(&self.destination)?;
+                let displaced_path = new_displaced_path(&self.destination, expected_generation)?;
                 if let Err(error) =
                     replace_file_call(&self.destination, &temp.path, &displaced_path)
                 {
@@ -1005,11 +1304,6 @@ impl PlatformTransaction {
                         is_win32(&error, ERROR_UNABLE_TO_MOVE_REPLACEMENT.0)
                             || is_win32(&error, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2.0);
                     if names_may_have_changed {
-                        let recovery_path = recovery
-                            .as_ref()
-                            .expect("existing replacement has a recovery snapshot")
-                            .path
-                            .clone();
                         let destination_generation = generation_at(&self.destination);
                         let replacement_generation = generation_at(&temp.path);
                         let displaced_generation = generation_at(&displaced_path);
@@ -1033,10 +1327,16 @@ impl PlatformTransaction {
                             ));
                         }
 
-                        let _ = recovery
+                        let recovery_path = recovery
                             .as_mut()
                             .expect("existing replacement has a recovery snapshot")
-                            .retain_for_recovery();
+                            .retain_for_recovery()
+                            .map_err(|validation| {
+                                format!(
+                                    "replace {} entered a partial Windows failure state ({error}); recovery snapshot validation failed: {validation}",
+                                    self.destination.display()
+                                )
+                            })?;
                         temp.armed = false;
                         return Err(format!(
                             "replace {} entered a partial Windows failure state ({error}); retained the locked original snapshot at {}, destination identity {:?}, replacement identity {:?} at {}, and displaced identity {:?} at {}",
@@ -1061,7 +1361,10 @@ impl PlatformTransaction {
                         let recovery_path = recovery
                             .as_mut()
                             .expect("existing replacement has a recovery snapshot")
-                            .retain_for_recovery();
+                            .retain_for_recovery()
+                            .map_err(|validation| {
+                                format!("published identity inspection failed and recovery snapshot validation failed: {validation}")
+                            })?;
                         temp.armed = false;
                         return Err(format!(
                             "published {} but could not inspect the installed identity ({observation_error}); retained recovery snapshot {}, replacement {}, and displaced path {}",
@@ -1078,7 +1381,10 @@ impl PlatformTransaction {
                         let recovery_path = recovery
                             .as_mut()
                             .expect("existing replacement has a recovery snapshot")
-                            .retain_for_recovery();
+                            .retain_for_recovery()
+                            .map_err(|validation| {
+                                format!("displaced identity inspection failed and recovery snapshot validation failed: {validation}")
+                            })?;
                         temp.armed = false;
                         return Err(format!(
                             "published {} but could not inspect its displaced identity ({observation_error}); retained recovery snapshot {}, replacement {}, and displaced path {}",
@@ -1119,7 +1425,10 @@ impl PlatformTransaction {
                     let recovery_path = recovery
                         .as_mut()
                         .expect("existing replacement has a recovery snapshot")
-                        .retain_for_recovery();
+                        .retain_for_recovery()
+                        .map_err(|validation| {
+                            format!("rollback was uncertain and recovery snapshot validation failed: {validation}")
+                        })?;
                     temp.armed = false;
                     return Err(format!(
                         "{} or its prepared replacement changed at publication and rollback could not be proven; retained recovery snapshot {}, replacement {}, and displaced identity {}",
@@ -1141,7 +1450,10 @@ impl PlatformTransaction {
                         let recovery_path = recovery
                             .as_mut()
                             .expect("existing replacement has a recovery snapshot")
-                            .retain_for_recovery();
+                            .retain_for_recovery()
+                            .map_err(|validation| {
+                                format!("installed identity hold failed and recovery snapshot validation failed: {validation}")
+                            })?;
                         temp.armed = false;
                         return Err(format!(
                             "published {} but could not hold its exact installed identity ({hold_error}); retained recovery snapshot {} and displaced path {}",
@@ -1160,7 +1472,10 @@ impl PlatformTransaction {
                         let recovery_path = recovery
                             .as_mut()
                             .expect("existing replacement has a recovery snapshot")
-                            .retain_for_recovery();
+                            .retain_for_recovery()
+                            .map_err(|validation| {
+                                format!("displaced identity hold failed and recovery snapshot validation failed: {validation}")
+                            })?;
                         temp.armed = false;
                         return Err(format!(
                             "published {} but could not hold its exact displaced identity ({hold_error}); retained recovery snapshot {} and displaced path {}",
@@ -1170,6 +1485,8 @@ impl PlatformTransaction {
                         ));
                     }
                 };
+                self.published_recovery
+                    .replace(Some(displaced_path.clone()));
                 temp.armed = false;
                 return Ok(PublicationGuard::replacement(
                     held_installed,
@@ -1307,15 +1624,7 @@ impl PlatformTransaction {
             .bytes
             .as_deref()
             .ok_or_else(|| "cannot back up an absent destination".to_string())?;
-        let name = format!(
-            "{}.tirith-backup-{}-{}",
-            self.destination
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
-            chrono::Local::now().format("%Y%m%d-%H%M%S"),
-            uuid::Uuid::new_v4().simple()
-        );
+        let name = backup_name(&self.destination, bytes);
         let path = self.parent.path.join(name);
         let path_wide = wide(&path);
         let owner_only = owner_only_descriptor()?;
@@ -1327,7 +1636,12 @@ impl PlatformTransaction {
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(path_wide.as_ptr()),
-                FILE_GENERIC_WRITE.0,
+                (FILE_GENERIC_READ
+                    | FILE_GENERIC_WRITE
+                    | READ_CONTROL
+                    | FILE_READ_ATTRIBUTES
+                    | DELETE)
+                    .0,
                 FILE_SHARE_READ,
                 Some(&security_attributes),
                 CREATE_NEW,
@@ -1336,72 +1650,122 @@ impl PlatformTransaction {
             )
         }
         .map_err(|error| format!("create exclusive owner-only backup: {error}"))?;
-        {
-            let mut file = OwnedHandle(handle).into_file();
-            file.write_all(bytes)
-                .map_err(|error| format!("write backup from locked snapshot: {error}"))?;
-            unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) }
-                .map_err(|error| format!("flush backup before update: {error}"))?;
+        let mut file = OwnedHandle(handle).into_file();
+        if let Err(error) = file.write_all(bytes) {
+            let cleanup = mark_held_file_for_deletion(&file)
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "write backup from locked snapshot: {error}{cleanup}"
+            ));
         }
-        let cleanup = CleanupCapability::open(&path)?;
+        if let Err(error) = unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) } {
+            let cleanup = mark_held_file_for_deletion(&file)
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(format!("flush backup before update: {error}{cleanup}"));
+        }
+        let cleanup = CleanupCapability::from_created(file, &path, bytes)?;
+        if !backup_name_matches(&path, &self.destination, &cleanup.generation) {
+            let cleanup_error = cleanup
+                .delete()
+                .err()
+                .map(|error| format!("; cleanup also failed: {error}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "new backup did not satisfy its provenance or owner-only security binding{cleanup_error}"
+            ));
+        }
         Ok(BackupGuard {
             path,
+            destination: self.destination.clone(),
             cleanup: Some(cleanup),
             armed: true,
             announce_on_commit: announce,
+            cleanup_failures: Rc::clone(&self.cleanup_failures),
         })
     }
 
     pub(crate) fn cleanup_old_backups(&self, keep: Option<&BackupGuard>) -> Result<(), String> {
-        let stem = self
-            .destination
-            .file_name()
-            .ok_or_else(|| format!("no file name for {}", self.destination.display()))?
-            .to_string_lossy();
-        let prefix = format!("{stem}.tirith-backup-");
-        let mut backups = fs::read_dir(&self.parent.path)
-            .map_err(|error| format!("enumerate backup directory: {error}"))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .starts_with(&prefix)
-                    && keep.is_none_or(|guard| path != &guard.path)
-            })
-            .collect::<Vec<_>>();
-        backups.sort();
-        let remove_count = backups
-            .len()
-            .saturating_sub(5 - usize::from(keep.is_some()));
-        for old in &backups[..remove_count] {
-            // Selection, full-state validation, and deletion are all bound to
-            // the same DELETE-capable, no-share-delete handle. A pathname swap
-            // before open selects and validates the new occupant; a swap after
-            // open is blocked; deletion never re-selects the pathname.
-            match CleanupCapability::open(old) {
-                Ok(cleanup) => {
-                    #[cfg(test)]
-                    OLD_BACKUP_CLEANUP_TEST_HOOK.with(|slot| {
-                        if let Some(hook) = slot.borrow_mut().as_mut() {
-                            hook(old);
-                        }
-                    });
-                    if let Err(error) = cleanup.delete() {
-                        eprintln!(
-                            "tirith: could not delete exact old-backup identity {}: {error}",
-                            old.display()
-                        );
-                    }
-                }
-                Err(error) => eprintln!(
-                    "tirith: could not validate old backup {} for handle-bound cleanup: {error}",
-                    old.display()
-                ),
+        let entries = fs::read_dir(&self.parent.path)
+            .map_err(|error| format!("enumerate transaction artifact directory: {error}"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("enumerate transaction artifact entry: {error}"))?;
+        let mut failures = Vec::new();
+
+        let keep_backup = keep.map(|guard| guard.path.clone());
+        let mut backups = Vec::new();
+        for path in entries.iter().filter(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with(BACKUP_MARKER)
+                && keep_backup.as_ref() != Some(*path)
+        }) {
+            // A filename prefix is never deletion authority. The same
+            // no-share-write DELETE handle must validate the complete content
+            // binding, safe attributes, and protected owner-only DACL.
+            let Ok(cleanup) = CleanupCapability::open(path) else {
+                continue;
+            };
+            if backup_name_matches(path, &self.destination, &cleanup.generation) {
+                backups.push((path.clone(), cleanup));
             }
         }
-        Ok(())
+        backups.sort_by(|left, right| left.0.cmp(&right.0));
+        let remove_backups = (backups.len() + usize::from(keep_backup.is_some()))
+            .saturating_sub(ARTIFACT_RETENTION_LIMIT);
+        for (old, cleanup) in backups.into_iter().take(remove_backups) {
+            #[cfg(test)]
+            OLD_BACKUP_CLEANUP_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(&old);
+                }
+            });
+            if let Err(error) = cleanup.delete() {
+                failures.push(format!(
+                    "delete provenance-bound old backup {}: {error}",
+                    old.display()
+                ));
+            }
+        }
+
+        let keep_recovery = self.published_recovery.borrow().clone();
+        let mut recoveries = Vec::new();
+        for path in entries.iter().filter(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with(DISPLACED_MARKER)
+                && keep_recovery.as_ref() != Some(*path)
+        }) {
+            let Ok(cleanup) = CleanupCapability::open(path) else {
+                continue;
+            };
+            if displaced_name_matches(path, &self.destination, &cleanup.generation) {
+                recoveries.push((path.clone(), cleanup));
+            }
+        }
+        recoveries.sort_by(|left, right| left.0.cmp(&right.0));
+        let remove_recoveries = (recoveries.len() + usize::from(keep_recovery.is_some()))
+            .saturating_sub(ARTIFACT_RETENTION_LIMIT);
+        for (old, cleanup) in recoveries.into_iter().take(remove_recoveries) {
+            if let Err(error) = cleanup.delete() {
+                failures.push(format!(
+                    "delete provenance-bound displaced recovery {}: {error}",
+                    old.display()
+                ));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 }
 
@@ -1411,6 +1775,7 @@ pub(crate) struct TempGuard<'a> {
     cleanup: Option<CleanupCapability>,
     generation: FileGeneration,
     armed: bool,
+    cleanup_failures: Rc<RefCell<Vec<String>>>,
 }
 
 impl TempGuard<'_> {
@@ -1443,17 +1808,32 @@ impl Drop for TempGuard<'_> {
         if !self.armed {
             return;
         }
-        let cleanup = self.cleanup.take().or_else(|| {
-            CleanupCapability::open_exact(&self.path, &self.generation)
-                .ok()
-                .flatten()
-        });
+        let cleanup = match self.cleanup.take() {
+            Some(cleanup) => Some(cleanup),
+            None => match CleanupCapability::open_exact(&self.path, &self.generation) {
+                Ok(Some(cleanup)) => Some(cleanup),
+                Ok(None) => {
+                    self.cleanup_failures.borrow_mut().push(format!(
+                        "could not reacquire exact temporary identity {} for cleanup",
+                        self.path.display()
+                    ));
+                    None
+                }
+                Err(error) => {
+                    self.cleanup_failures.borrow_mut().push(format!(
+                        "could not validate temporary identity {} for cleanup: {error}",
+                        self.path.display()
+                    ));
+                    None
+                }
+            },
+        };
         if let Some(cleanup) = cleanup {
             if let Err(error) = cleanup.delete() {
-                eprintln!(
-                    "tirith: could not scrub exact temporary identity {}: {error}",
+                self.cleanup_failures.borrow_mut().push(format!(
+                    "could not scrub exact temporary identity {}: {error}",
                     self.path.display()
-                );
+                ));
             }
         }
     }
@@ -1461,24 +1841,47 @@ impl Drop for TempGuard<'_> {
 
 pub(crate) struct BackupGuard {
     path: PathBuf,
+    destination: PathBuf,
     cleanup: Option<CleanupCapability>,
     armed: bool,
     announce_on_commit: bool,
+    cleanup_failures: Rc<RefCell<Vec<String>>>,
 }
 
 impl BackupGuard {
-    pub(crate) fn commit(&mut self) {
+    fn validate(&mut self, purpose: &str) -> Result<(), String> {
+        let cleanup = self
+            .cleanup
+            .as_mut()
+            .ok_or_else(|| "backup cleanup capability is unavailable before commit".to_string())?;
+        cleanup.validate(&self.path).map_err(|error| {
+            format!(
+                "backup {} changed before {purpose}: {error}",
+                self.path.display(),
+            )
+        })?;
+        if !backup_name_matches(&self.path, &self.destination, &cleanup.generation) {
+            return Err(format!(
+                "backup {} lost its provenance/security binding before {purpose}",
+                self.path.display(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit(&mut self) -> Result<(), String> {
+        self.validate("commit/announcement")?;
         self.armed = false;
-        self.cleanup.take();
         if self.announce_on_commit {
             eprintln!("tirith: backup at {}", self.path.display());
         }
+        Ok(())
     }
 
-    pub(crate) fn retain_for_recovery(&mut self) -> PathBuf {
+    pub(crate) fn retain_for_recovery(&mut self) -> Result<PathBuf, String> {
+        self.validate("recovery announcement")?;
         self.armed = false;
-        self.cleanup.take();
-        self.path.clone()
+        Ok(self.path.clone())
     }
 }
 
@@ -1487,10 +1890,10 @@ impl Drop for BackupGuard {
         if self.armed {
             if let Some(cleanup) = self.cleanup.take() {
                 if let Err(error) = cleanup.delete() {
-                    eprintln!(
-                        "tirith: could not scrub exact backup identity {}: {error}",
+                    self.cleanup_failures.borrow_mut().push(format!(
+                        "could not scrub exact backup identity {}: {error}",
                         self.path.display()
-                    );
+                    ));
                 }
             }
         }
@@ -1542,8 +1945,10 @@ impl PublicationGuard {
                 .unwrap_or_else(|error| format!("displaced original validation failed: {error}"))
         });
         let snapshot = self.recovery.as_mut().map(|backup| {
-            let path = backup.retain_for_recovery();
-            format!("locked recovery snapshot at {}", path.display())
+            backup
+                .retain_for_recovery()
+                .map(|path| format!("locked recovery snapshot at {}", path.display()))
+                .unwrap_or_else(|error| format!("recovery snapshot validation failed: {error}"))
         });
         match (displaced, snapshot) {
             (Some(displaced), Some(snapshot)) => {
@@ -1571,7 +1976,12 @@ impl PublicationGuard {
                 .recovery
                 .as_mut()
                 .map(BackupGuard::retain_for_recovery)
-                .map(|path| format!("; retained exact recovery snapshot at {}", path.display()))
+                .map(|result| match result {
+                    Ok(path) => {
+                        format!("; retained exact recovery snapshot at {}", path.display())
+                    }
+                    Err(error) => format!("; recovery snapshot validation failed: {error}"),
+                })
                 .unwrap_or_default();
             return Err(format!(
                 "installed destination identity changed before transaction completion ({error}){displaced}{recovery}"
@@ -1585,7 +1995,12 @@ impl PublicationGuard {
                 .recovery
                 .as_mut()
                 .map(BackupGuard::retain_for_recovery)
-                .map(|path| format!("; retained exact recovery snapshot at {}", path.display()))
+                .map(|result| match result {
+                    Ok(path) => {
+                        format!("; retained exact recovery snapshot at {}", path.display())
+                    }
+                    Err(error) => format!("; recovery snapshot validation failed: {error}"),
+                })
                 .unwrap_or_default();
             return Ok(PublicationOutcome::RecoveryRetained(format!(
                 "Windows replacement file flush completed, but the displaced identity could not be revalidated ({error}){recovery}"
@@ -1646,8 +2061,8 @@ pub fn write_hook_script(
         }
         Ok(FileUpdate::write_text(content.to_string(), 0o644))
     })?;
-    if outcome.was_written() {
-        eprintln!("tirith: wrote {}", path.display());
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
     Ok(())
 }
@@ -1774,7 +2189,9 @@ fn run_cli_with(
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::super::fs_transaction::{transactional_update_with_hook, FileUpdate, TestStage};
+    use super::super::fs_transaction::{
+        transactional_update_with_hook, FileUpdate, TestStage, TransactionOutcome,
+    };
     use super::*;
 
     fn symlink_directory_or_explicitly_skip(target: &Path, link: &Path) -> bool {
@@ -1859,6 +2276,14 @@ mod tests {
         }
     }
 
+    struct ArtifactCaptureHookReset;
+
+    impl Drop for ArtifactCaptureHookReset {
+        fn drop(&mut self) {
+            CREATED_ARTIFACT_CAPTURE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
     fn with_replace_hook<T>(
         hook: impl FnMut(&Path, &Path, &Path) -> Result<(), u32> + 'static,
         run: impl FnOnce() -> T,
@@ -1877,6 +2302,18 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(hook));
         });
         let _reset = CleanupHookReset;
+        run()
+    }
+
+    fn with_artifact_capture_hook<T>(
+        hook: impl FnMut(&Path) + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        CREATED_ARTIFACT_CAPTURE_TEST_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        let _reset = ArtifactCaptureHookReset;
         run()
     }
 
@@ -2038,6 +2475,24 @@ mod tests {
     }
 
     #[test]
+    fn backup_full_generation_is_revalidated_before_commit_announcement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        let lock = PlatformTransaction::lock(&path, root.path()).unwrap();
+        let transaction = PlatformTransaction::begin(&path, root.path(), lock).unwrap();
+        let snapshot = transaction.read_snapshot().unwrap();
+        let mut backup = transaction.create_backup(&snapshot).unwrap();
+        let capability = backup.cleanup.as_mut().unwrap();
+        capability.file.seek(SeekFrom::Start(0)).unwrap();
+        capability.file.write_all(b"tamper").unwrap();
+        unsafe { FlushFileBuffers(HANDLE(capability.file.as_raw_handle())) }.unwrap();
+
+        let error = backup.commit().unwrap_err();
+        assert!(error.contains("commit/announcement"));
+    }
+
+    #[test]
     fn old_backup_cleanup_handle_blocks_swap_before_deletion() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -2045,13 +2500,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "original").unwrap();
-        for index in 0..6 {
-            fs::write(
-                root.path()
-                    .join(format!("config.json.tirith-backup-20260101-00000{index}")),
-                format!("old-{index}"),
-            )
-            .unwrap();
+        for index in 0..5 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
         }
         let swap_was_blocked = Arc::new(AtomicBool::new(false));
         let observed = swap_was_blocked.clone();
@@ -2068,6 +2518,32 @@ mod tests {
         assert!(swap_was_blocked.load(Ordering::SeqCst));
         assert!(!root.path().join("attacker-moved-old-backup").exists());
         assert_eq!(backup_paths(root.path()).len(), 5);
+    }
+
+    #[test]
+    fn creation_handles_close_the_temp_and_backup_reopen_race() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let observed = blocked.clone();
+        let moved_root = root.path().to_path_buf();
+        with_artifact_capture_hook(
+            move |artifact| {
+                let moved =
+                    moved_root.join(format!("attacker-swap-{}", uuid::Uuid::new_v4().simple()));
+                if fs::rename(artifact, moved).is_err() {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+            || update_with_backup(&path, root.path(), "after").unwrap(),
+        );
+
+        assert_eq!(blocked.load(Ordering::SeqCst), 3);
+        assert_eq!(fs::read_to_string(path).unwrap(), "after");
     }
 
     #[test]
@@ -2090,6 +2566,57 @@ mod tests {
         update_with_backup(&path, root.path(), "updated").unwrap();
         assert_eq!(fs::read_to_string(regular).unwrap(), "attacker-regular");
         assert_eq!(fs::read_to_string(target).unwrap(), "attacker-target");
+    }
+
+    #[test]
+    fn retention_does_not_delete_unproven_backup_prefix_lookalikes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "zero").unwrap();
+        let forged = root.path().join(format!(
+            "{BACKUP_MARKER}{}-20260101-000000-000000000_{}_{}",
+            destination_tag(&path),
+            "0".repeat(64),
+            "a".repeat(32)
+        ));
+        fs::write(&forged, "attacker-lookalike").unwrap();
+        for index in 0..8 {
+            update_with_backup(&path, root.path(), &format!("value-{index}")).unwrap();
+        }
+        assert_eq!(fs::read_to_string(forged).unwrap(), "attacker-lookalike");
+        assert_eq!(backup_paths(root.path()).len(), 6);
+    }
+
+    #[test]
+    fn displaced_recovery_retention_is_provenance_bound_and_capped_at_five() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "zero").unwrap();
+        let forged = root.path().join(format!(
+            "{DISPLACED_MARKER}{}-20260101-000000-000000000_{}_{}",
+            destination_tag(&path),
+            "0".repeat(64),
+            "b".repeat(32)
+        ));
+        fs::write(&forged, "attacker-recovery-lookalike").unwrap();
+
+        for index in 0..8 {
+            let outcome = transactional_update(&path, root.path(), false, |_| {
+                Ok(FileUpdate::write_text(format!("value-{index}"), 0o600))
+            })
+            .unwrap();
+            assert_eq!(outcome, TransactionOutcome::WrittenWithRecovery);
+        }
+
+        assert_eq!(
+            fs::read_to_string(&forged).unwrap(),
+            "attacker-recovery-lookalike"
+        );
+        let recoveries = displaced_paths(root.path());
+        assert_eq!(recoveries.len(), 6);
+        assert!(recoveries
+            .iter()
+            .any(|recovery| fs::read_to_string(recovery).unwrap() == "value-6"));
     }
 
     #[test]
@@ -2179,6 +2706,30 @@ mod tests {
         assert!(swap_was_blocked);
         assert!(backup_paths(root.path()).is_empty());
         assert_eq!(fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[test]
+    fn prepared_backup_never_grants_write_sharing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        let mut write_was_blocked = false;
+        let error = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o644).with_backup(true)),
+            |stage| {
+                if stage == TestStage::TempSynced {
+                    let backup = backup_paths(root.path()).pop().unwrap();
+                    write_was_blocked = fs::OpenOptions::new().write(true).open(backup).is_err();
+                    return Err("stop after write-sharing proof".into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("write-sharing proof"));
+        assert!(write_was_blocked);
     }
 
     #[test]
@@ -2399,6 +2950,31 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(".tirith-setup-")
             }));
+    }
+
+    #[test]
+    fn exact_handle_cleanup_failure_is_propagated_with_primary_error() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, "before").unwrap();
+        DELETE_FAILURE_TEST_HOOK.with(|slot| slot.set(true));
+        let result = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o644).with_backup(true)),
+            |stage| {
+                if stage == TestStage::TempSynced {
+                    return Err("injected pre-publication failure".into());
+                }
+                Ok(())
+            },
+        );
+        DELETE_FAILURE_TEST_HOOK.with(|slot| slot.set(false));
+
+        let error = result.unwrap_err();
+        assert!(error.contains("injected pre-publication failure"));
+        assert!(error.contains("cleanup also failed"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "before");
     }
 
     #[test]

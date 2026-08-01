@@ -84,8 +84,8 @@ pub fn merge_mcp_json_with_key(
         }
         Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644).with_backup(backup))
     })?;
-    if outcome.was_written() {
-        eprintln!("tirith: wrote {}", path.display());
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
     Ok(())
 }
@@ -197,8 +197,8 @@ pub fn merge_hooks_json(
         }
         Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644).with_backup(backup))
     })?;
-    if outcome.was_written() {
-        eprintln!("tirith: wrote {}", path.display());
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
     Ok(())
 }
@@ -264,10 +264,10 @@ pub fn merge_claude_mcp_server(
         }
         Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644).with_backup(backup))
     })?;
-    if outcome.was_written() {
+    if let Some(annotation) = outcome.completion_annotation() {
         eprintln!(
-            "tirith: registered {server_name} MCP server in {}",
-            path.display()
+            "tirith: registered {server_name} MCP server in {}{annotation}",
+            path.display(),
         );
     }
     Ok(())
@@ -460,8 +460,8 @@ fn merge_hook_settings_inner(
 
         Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644).with_backup(backup))
     })?;
-    if outcome.was_written() {
-        eprintln!("tirith: wrote {}", path.display());
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
     Ok(())
 }
@@ -660,8 +660,8 @@ pub fn merge_vscode_settings(
         // an existing file gets one snapshot-consistent transaction backup.
         Ok(super::fs_helpers::FileUpdate::write_text(result, 0o644).with_backup(path_existed))
     })?;
-    if outcome.was_written() {
-        eprintln!("tirith: wrote {}", path.display());
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
     Ok(())
 }

@@ -907,8 +907,8 @@ fn write_owned_json(
         }
         Ok(fs_helpers::FileUpdate::write_text(content.to_string(), 0o644).with_backup(backup))
     })?;
-    if outcome.was_written() {
-        eprintln!("tirith: wrote {}", path.display());
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
     }
     Ok(())
 }

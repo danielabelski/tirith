@@ -103,10 +103,10 @@ pub fn offer_zshenv_guard(
             Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644))
         },
     )?;
-    if outcome.was_written() {
+    if let Some(annotation) = outcome.completion_annotation() {
         eprintln!(
-            "tirith: {completed_verb} tirith-guard block in {}",
-            zshenv_path.display()
+            "tirith: {completed_verb} tirith-guard block in {}{annotation}",
+            zshenv_path.display(),
         );
     }
 

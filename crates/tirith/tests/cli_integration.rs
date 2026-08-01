@@ -74,6 +74,55 @@ fn tirith() -> Command {
     cmd
 }
 
+#[cfg(unix)]
+#[test]
+fn setup_cursor_force_rejects_hardlinked_hook_without_mutating_external_inode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let hooks = project.path().join(".cursor/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let external_hook = external.path().join("shared-hook.sh");
+    let setup_hook = hooks.join("tirith-hook.sh");
+    fs::write(&external_hook, "external-original").unwrap();
+    fs::set_permissions(&external_hook, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::hard_link(&external_hook, &setup_hook).unwrap();
+
+    let output = tirith()
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["setup", "cursor", "--scope", "project", "--force"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("hard links"));
+    assert_eq!(
+        fs::read_to_string(&external_hook).unwrap(),
+        "external-original"
+    );
+    assert_eq!(
+        fs::read_to_string(&setup_hook).unwrap(),
+        "external-original"
+    );
+    assert_eq!(
+        fs::metadata(&external_hook).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert!(fs::read_dir(&hooks)
+        .unwrap()
+        .filter_map(Result::ok)
+        .all(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == "tirith-hook.sh"
+                || (!name.contains("tirith-backup") && !name.starts_with(".tirith-setup-"))
+        }));
+}
+
 /// Regression for the macOS capsule launcher's two-exec descriptor design. The
 /// test passes a deliberately inheritable high-numbered fd into the real Tirith
 /// binary, which must successfully exec native `sandbox-exec` and `/bin/sh` while

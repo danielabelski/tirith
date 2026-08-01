@@ -441,8 +441,8 @@ mod run_impl {
                 ))
             },
         )?;
-        if outcome.was_written() {
-            eprintln!("tirith: wrote {}", gateway_path.display());
+        if let Some(annotation) = outcome.completion_annotation() {
+            eprintln!("tirith: wrote {}{annotation}", gateway_path.display());
         }
         Ok(gateway_path)
     }
