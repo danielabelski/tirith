@@ -585,26 +585,22 @@ const PDF_NESTING_DEPTH_CAP: usize = 256;
 /// parser recurses on, so it lets us reject a stack-overflow bomb (RUSTSEC-2026-0187)
 /// before `load_mem` is ever called.
 ///
-/// It is a lexer, not a parser, so it skips the two byte ranges where stray
+/// It is a lexer, not a parser, so it skips byte ranges where stray
 /// brackets are NOT structural and would otherwise inflate the count. PDF literal
 /// strings `( ... )` are skipped as balanced nested parens, with `\` escaping the
 /// next byte (so `\(`, `\)`, `\\` do not open or close the string). `%` comments
-/// are skipped to the end of the line. A hex string `< ... >` (single `<`) needs
-/// no special case: its body is only hex digits and whitespace, so scanning
-/// through it counts nothing.
-///
-/// Known limitation (acceptable for this guard): bytes inside a binary `stream`
-/// are scanned too, and could in theory contain enough unbalanced `[`/`<<` to
-/// register depth. In practice the literal-string skip swallows most binary runs
-/// (a stray `(` starts a skip to the next `)`), and a depth that climbs past 256
-/// without ever unwinding is itself anomalous. A compressed object stream can hide
-/// nested objects from this byte scan entirely; defending that needs the deferred
-/// child-process isolation, out of scope for this preflight.
+/// are skipped to the end of the line, and bytes between a lexical `stream` /
+/// `endstream` pair are skipped completely. A hex string `< ... >` (single `<`)
+/// needs no special case: its body is only hex digits and whitespace, so scanning
+/// through it counts nothing. Compressed object streams remain the parser's job;
+/// this preflight only prevents unsafe raw object nesting from reaching lopdf.
 fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
     let mut depth: usize = 0;
     let mut max_depth: usize = 0;
     let n = raw.len();
     let mut i = 0;
+    let mut dictionary_starts: Vec<usize> = Vec::new();
+    let mut last_closed_dictionary: Option<(usize, usize)> = None;
 
     while i < n {
         match raw[i] {
@@ -633,6 +629,34 @@ fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
                     i += 1;
                 }
             }
+            // Stream data is arbitrary binary and brackets in it are not PDF
+            // object nesting. Per the grammar, `stream` is a standalone token
+            // followed by an end-of-line marker. Skip to a standalone
+            // `endstream`; a missing terminator consumes the remainder, which
+            // the real parser will reject and report as AnalysisIncomplete.
+            b's' if pdf_stream_keyword_at(raw, i, last_closed_dictionary) => {
+                let mut data_start = i + b"stream".len();
+                while data_start < n && matches!(raw[data_start], b' ' | b'\t') {
+                    data_start += 1;
+                }
+                if data_start < n && matches!(raw[data_start], b'\n' | b'\r') {
+                    if raw[data_start] == b'\r'
+                        && data_start + 1 < n
+                        && raw[data_start + 1] == b'\n'
+                    {
+                        data_start += 2;
+                    } else {
+                        data_start += 1;
+                    }
+                    if let Some(end) = find_pdf_keyword(raw, data_start, b"endstream") {
+                        i = end + b"endstream".len();
+                    } else {
+                        i = n;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
             // Array open.
             b'[' => {
                 depth += 1;
@@ -646,6 +670,7 @@ fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
             }
             // Dictionary open `<<`.
             b'<' if i + 1 < n && raw[i + 1] == b'<' => {
+                dictionary_starts.push(i);
                 depth += 1;
                 max_depth = max_depth.max(depth);
                 i += 2;
@@ -653,6 +678,9 @@ fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
             // Dictionary close `>>`.
             b'>' if i + 1 < n && raw[i + 1] == b'>' => {
                 depth = depth.saturating_sub(1);
+                if let Some(start) = dictionary_starts.pop() {
+                    last_closed_dictionary = Some((start, i + 2));
+                }
                 i += 2;
             }
             _ => i += 1,
@@ -660,6 +688,975 @@ fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
     }
 
     max_depth
+}
+
+fn pdf_token_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+}
+
+fn pdf_keyword_at(raw: &[u8], start: usize, keyword: &[u8]) -> bool {
+    let Some(end) = start.checked_add(keyword.len()) else {
+        return false;
+    };
+    end <= raw.len()
+        && &raw[start..end] == keyword
+        && (start == 0 || pdf_token_boundary(raw[start - 1]))
+        && (end == raw.len() || pdf_token_boundary(raw[end]))
+}
+
+/// A real stream keyword must immediately follow its stream dictionary (apart
+/// from whitespace). Requiring the preceding `>>` prevents an attacker from
+/// placing a standalone `stream` token before deeply nested objects merely to
+/// make the safety preflight skip them.
+fn pdf_stream_keyword_at(
+    raw: &[u8],
+    start: usize,
+    last_closed_dictionary: Option<(usize, usize)>,
+) -> bool {
+    if !pdf_keyword_at(raw, start, b"stream") {
+        return false;
+    }
+    let Some((dictionary_start, dictionary_end)) = last_closed_dictionary else {
+        return false;
+    };
+    dictionary_end <= start
+        && raw[dictionary_end..start]
+            .iter()
+            .all(|byte| byte.is_ascii_whitespace())
+        && pdf_dictionary_follows_indirect_object_header(raw, dictionary_start)
+}
+
+/// A lexical `<< >> stream` sequence is not necessarily a PDF stream. Require
+/// the dictionary to be the value of an indirect `object generation obj`
+/// header before skipping any following bytes; otherwise an attacker could put
+/// a fake standalone dictionary/stream token before deep structural input and
+/// blind the stack-safety preflight.
+fn pdf_dictionary_follows_indirect_object_header(raw: &[u8], dictionary_start: usize) -> bool {
+    fn previous_token(raw: &[u8], mut end: usize) -> Option<(usize, usize)> {
+        while end > 0 && raw[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            return None;
+        }
+        let mut start = end;
+        while start > 0 && !pdf_token_boundary(raw[start - 1]) {
+            start -= 1;
+        }
+        (start < end).then_some((start, end))
+    }
+
+    let Some((obj_start, obj_end)) = previous_token(raw, dictionary_start) else {
+        return false;
+    };
+    if &raw[obj_start..obj_end] != b"obj" {
+        return false;
+    }
+    let Some((generation_start, generation_end)) = previous_token(raw, obj_start) else {
+        return false;
+    };
+    let Some((object_start, object_end)) = previous_token(raw, generation_start) else {
+        return false;
+    };
+    raw[generation_start..generation_end]
+        .iter()
+        .all(u8::is_ascii_digit)
+        && raw[object_start..object_end].iter().all(u8::is_ascii_digit)
+}
+
+fn find_pdf_keyword(raw: &[u8], mut start: usize, keyword: &[u8]) -> Option<usize> {
+    while start + keyword.len() <= raw.len() {
+        if pdf_keyword_at(raw, start, keyword) {
+            return Some(start);
+        }
+        start += 1;
+    }
+    None
+}
+
+fn pdf_analysis_incomplete(reasons: &[String]) -> Finding {
+    Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "PDF analysis was incomplete".to_string(),
+        description: format!(
+            "Tirith could not safely inspect all PDF rendering content ({} issue{}). The file is blocked instead of treating skipped or unsupported content as clean.",
+            reasons.len(),
+            if reasons.len() == 1 { "" } else { "s" }
+        ),
+        evidence: reasons
+            .iter()
+            .take(5)
+            .map(|reason| Evidence::Text {
+                detail: truncate_str(reason, 180),
+            })
+            .collect(),
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
+fn push_pdf_incomplete_reason(reasons: &mut Vec<String>, reason: String) {
+    if reasons.len() < 32 && !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+/// Read page content without lopdf's silent missing-object and decompression
+/// fallbacks. A blank page (missing/null/empty Contents) is valid; malformed
+/// references, wrong object types, and undecodable filters are coverage gaps.
+fn strict_page_content(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Result<Vec<u8>, String> {
+    use lopdf::Object;
+
+    let page = doc
+        .get_dictionary(page_id)
+        .map_err(|err| format!("page dictionary unavailable: {err}"))?;
+    let contents = match page.get(b"Contents") {
+        Ok(contents) => contents,
+        Err(lopdf::Error::DictKey) => return Ok(Vec::new()),
+        Err(err) => return Err(format!("page Contents unavailable: {err}")),
+    };
+
+    let (_, contents) = doc
+        .dereference(contents)
+        .map_err(|err| format!("page Contents dereference failed: {err}"))?;
+    let mut content = Vec::new();
+    match contents {
+        Object::Null => return Ok(content),
+        Object::Stream(stream) => {
+            return decode_pdf_stream_strict(stream)
+                .map_err(|err| format!("page content stream decode failed: {err}"));
+        }
+        Object::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let (_, resolved) = doc.dereference(item).map_err(|err| {
+                    format!("page content item {index} dereference failed: {err}")
+                })?;
+                let stream = resolved
+                    .as_stream()
+                    .map_err(|err| format!("page content item {index} is not a stream: {err}"))?;
+                let decoded = decode_pdf_stream_strict(stream)
+                    .map_err(|err| format!("page content item {index} decode failed: {err}"))?;
+                content.extend_from_slice(&decoded);
+                content.push(b'\n');
+            }
+        }
+        _ => return Err("page Contents has an unsupported object type".to_string()),
+    }
+    Ok(content)
+}
+
+/// Traverse the page tree without lopdf's intentionally lossy `page_iter`,
+/// which skips malformed references, missing dictionaries, unknown node types,
+/// excessive depth, and iteration exhaustion. A security scan must distinguish
+/// those cases from a valid document with zero pages.
+fn strict_pdf_pages(doc: &lopdf::Document) -> Result<Vec<(u32, lopdf::ObjectId)>, String> {
+    use lopdf::Object;
+    use std::collections::{HashMap, HashSet};
+
+    enum Work {
+        Enter(lopdf::ObjectId, usize),
+        Exit {
+            id: lopdf::ObjectId,
+            children: Vec<lopdf::ObjectId>,
+            declared_count: usize,
+        },
+    }
+
+    fn dictionary_name(
+        doc: &lopdf::Document,
+        dictionary: &lopdf::Dictionary,
+        key: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let object = dictionary
+            .get(key)
+            .map_err(|err| format!("missing {} entry: {err}", String::from_utf8_lossy(key)))?;
+        let (_, object) = doc.dereference(object).map_err(|err| {
+            format!(
+                "{} entry dereference failed: {err}",
+                String::from_utf8_lossy(key)
+            )
+        })?;
+        object.as_name().map(Vec::from).map_err(|err| {
+            format!(
+                "{} entry is not a name: {err}",
+                String::from_utf8_lossy(key)
+            )
+        })
+    }
+
+    fn declared_page_count(
+        doc: &lopdf::Document,
+        dictionary: &lopdf::Dictionary,
+    ) -> Result<usize, String> {
+        let object = dictionary
+            .get(b"Count")
+            .map_err(|err| format!("Pages node Count unavailable: {err}"))?;
+        let (_, object) = doc
+            .dereference(object)
+            .map_err(|err| format!("Pages node Count dereference failed: {err}"))?;
+        let count = object
+            .as_i64()
+            .map_err(|err| format!("Pages node Count is not an integer: {err}"))?;
+        usize::try_from(count).map_err(|_| "Pages node Count is negative or too large".to_string())
+    }
+
+    let catalog = doc
+        .catalog()
+        .map_err(|err| format!("document catalog unavailable: {err}"))?;
+    let root_id = catalog
+        .get(b"Pages")
+        .and_then(Object::as_reference)
+        .map_err(|err| format!("catalog Pages reference unavailable: {err}"))?;
+
+    let mut work = vec![Work::Enter(root_id, 0)];
+    let mut visited = HashSet::new();
+    let mut subtree_counts: HashMap<lopdf::ObjectId, usize> = HashMap::new();
+    let mut pages = Vec::new();
+
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(id, depth) => {
+                if !visited.insert(id) {
+                    return Err(format!(
+                        "page tree contains a cycle or duplicate reference at {id:?}"
+                    ));
+                }
+                if visited.len() > doc.objects.len() {
+                    return Err("page tree traversal exceeds the document object count".to_string());
+                }
+                let dictionary = doc
+                    .get_dictionary(id)
+                    .map_err(|err| format!("page-tree node {id:?} unavailable: {err}"))?;
+                let node_type = dictionary_name(doc, dictionary, b"Type")?;
+                if node_type.eq_ignore_ascii_case(b"Page") {
+                    subtree_counts.insert(id, 1);
+                    pages.push(id);
+                    continue;
+                }
+                if !node_type.eq_ignore_ascii_case(b"Pages") {
+                    return Err(format!(
+                        "page-tree node {id:?} has unsupported Type {}",
+                        String::from_utf8_lossy(&node_type)
+                    ));
+                }
+                if depth >= PDF_NESTING_DEPTH_CAP {
+                    return Err(format!(
+                        "page tree exceeds the safe depth limit of {PDF_NESTING_DEPTH_CAP}"
+                    ));
+                }
+
+                let declared_count = declared_page_count(doc, dictionary)?;
+                let kids = dictionary
+                    .get(b"Kids")
+                    .map_err(|err| format!("Pages node Kids unavailable: {err}"))?;
+                let (_, kids) = doc
+                    .dereference(kids)
+                    .map_err(|err| format!("Pages node Kids dereference failed: {err}"))?;
+                let kids = kids
+                    .as_array()
+                    .map_err(|err| format!("Pages node Kids is not an array: {err}"))?;
+                let children = kids
+                    .iter()
+                    .map(|kid| {
+                        kid.as_reference()
+                            .map_err(|err| format!("Pages node Kid is not a reference: {err}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                work.push(Work::Exit {
+                    id,
+                    children: children.clone(),
+                    declared_count,
+                });
+                for child in children.into_iter().rev() {
+                    work.push(Work::Enter(child, depth + 1));
+                }
+            }
+            Work::Exit {
+                id,
+                children,
+                declared_count,
+            } => {
+                let actual_count = children.iter().try_fold(0usize, |total, child| {
+                    let count = subtree_counts.get(child).copied().ok_or_else(|| {
+                        format!("page-tree child {child:?} was not traversed completely")
+                    })?;
+                    total
+                        .checked_add(count)
+                        .ok_or_else(|| "page tree count overflow".to_string())
+                })?;
+                if actual_count != declared_count {
+                    return Err(format!(
+                        "Pages node {id:?} declares {declared_count} page(s) but contains {actual_count}"
+                    ));
+                }
+                subtree_counts.insert(id, actual_count);
+            }
+        }
+    }
+
+    Ok(pages
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| ((index + 1) as u32, id))
+        .collect())
+}
+
+fn decode_pdf_stream_strict(stream: &lopdf::Stream) -> Result<Vec<u8>, lopdf::Error> {
+    // lopdf reports a missing /Filter as DictKey even though it means the stream
+    // is legitimately uncompressed. Preserve that supported case; when a Filter
+    // is declared, require it to decode successfully instead of falling back to
+    // the encoded bytes.
+    if stream.dict.get(b"Filter").is_err() {
+        Ok(stream.content.clone())
+    } else {
+        stream.decompressed_content()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PdfMatrix {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+}
+
+impl PdfMatrix {
+    const IDENTITY: Self = Self {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+    };
+
+    fn from_operands(operands: &[lopdf::Object]) -> Option<Self> {
+        if operands.len() != 6 {
+            return None;
+        }
+        let values: Vec<f64> = operands
+            .iter()
+            .map(pdf_operand_to_f64)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        values
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(Self {
+                a: values[0],
+                b: values[1],
+                c: values[2],
+                d: values[3],
+            })
+    }
+
+    fn then(self, next: Self) -> Self {
+        Self {
+            a: self.a * next.a + self.b * next.c,
+            b: self.a * next.b + self.b * next.d,
+            c: self.c * next.a + self.d * next.c,
+            d: self.c * next.b + self.d * next.d,
+        }
+    }
+
+    /// Minimum singular value of the complete linear transform. Column norms
+    /// alone miss degenerate and strongly sheared matrices (for example a rank-1
+    /// matrix whose two columns both have unit length). `|det| / sigma_max` is a
+    /// stable way to recover sigma_min without cancellation.
+    fn minimum_scale(self) -> Option<f64> {
+        if ![self.a, self.b, self.c, self.d]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return None;
+        }
+        let trace = self.a * self.a + self.b * self.b + self.c * self.c + self.d * self.d;
+        let determinant = self.a * self.d - self.b * self.c;
+        let discriminant = (trace * trace - 4.0 * determinant * determinant).max(0.0);
+        let sigma_max = ((trace + discriminant.sqrt()) / 2.0).sqrt();
+        if !sigma_max.is_finite() {
+            None
+        } else if sigma_max == 0.0 {
+            Some(0.0)
+        } else {
+            Some(determinant.abs() / sigma_max)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PdfGraphicsState {
+    font_size: f64,
+    horizontal_scale: f64,
+    ctm: PdfMatrix,
+    text_matrix: PdfMatrix,
+    render_mode: i64,
+    fill_alpha: f64,
+    stroke_alpha: f64,
+}
+
+impl Default for PdfGraphicsState {
+    fn default() -> Self {
+        Self {
+            font_size: 12.0,
+            horizontal_scale: 1.0,
+            ctm: PdfMatrix::IDENTITY,
+            text_matrix: PdfMatrix::IDENTITY,
+            render_mode: 0,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+        }
+    }
+}
+
+impl PdfGraphicsState {
+    fn effective_text_scale(&self) -> Option<f64> {
+        let glyph = PdfMatrix {
+            a: self.font_size * self.horizontal_scale,
+            b: 0.0,
+            c: 0.0,
+            d: self.font_size,
+        };
+        glyph.then(self.text_matrix).then(self.ctm).minimum_scale()
+    }
+
+    fn alpha_hides_current_mode(&self) -> bool {
+        let uses_fill = matches!(self.render_mode, 0 | 2 | 4 | 6);
+        let uses_stroke = matches!(self.render_mode, 1 | 2 | 5 | 6);
+        (!uses_fill || self.fill_alpha <= 0.0) && (!uses_stroke || self.stroke_alpha <= 0.0)
+    }
+}
+
+fn pdf_render_mode(operand: Option<&lopdf::Object>) -> Option<i64> {
+    let value = pdf_operand_to_f64(operand?).ok()?;
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    let mode = value as i64;
+    (0..=7).contains(&mode).then_some(mode)
+}
+
+fn pdf_optional_content_operator(op: &lopdf::content::Operation) -> bool {
+    if !matches!(op.operator.as_str(), "BMC" | "BDC" | "MP" | "DP") {
+        return false;
+    }
+    matches!(op.operands.first(), Some(lopdf::Object::Name(name)) if name.eq_ignore_ascii_case(b"OC"))
+}
+
+fn pdf_page_resources(
+    doc: &lopdf::Document,
+    page_id: lopdf::ObjectId,
+) -> Result<Vec<&lopdf::Dictionary>, String> {
+    let (direct, inherited_ids) = doc
+        .get_page_resources(page_id)
+        .map_err(|err| format!("page resources unavailable: {err}"))?;
+    let mut resources = Vec::new();
+    if let Some(direct) = direct {
+        resources.push(direct);
+    }
+    for id in inherited_ids {
+        let dictionary = doc
+            .get_dictionary(id)
+            .map_err(|err| format!("resource dictionary {id:?} unavailable: {err}"))?;
+        if !resources
+            .iter()
+            .any(|existing| std::ptr::eq(*existing, dictionary))
+        {
+            resources.push(dictionary);
+        }
+    }
+    Ok(resources)
+}
+
+fn pdf_named_resource<'a>(
+    doc: &'a lopdf::Document,
+    resources: &[&'a lopdf::Dictionary],
+    category: &[u8],
+    name: &[u8],
+) -> Result<Option<(Option<lopdf::ObjectId>, &'a lopdf::Object)>, String> {
+    for resources in resources {
+        let category_object = match resources.get(category) {
+            Ok(object) => object,
+            Err(lopdf::Error::DictKey) => continue,
+            Err(err) => return Err(format!("resource category unavailable: {err}")),
+        };
+        let (_, category_object) = doc
+            .dereference(category_object)
+            .map_err(|err| format!("resource category dereference failed: {err}"))?;
+        let category_dictionary = category_object
+            .as_dict()
+            .map_err(|err| format!("resource category is not a dictionary: {err}"))?;
+        let object = match category_dictionary.get(name) {
+            Ok(object) => object,
+            Err(lopdf::Error::DictKey) => continue,
+            Err(err) => return Err(format!("named resource unavailable: {err}")),
+        };
+        let (id, object) = doc
+            .dereference(object)
+            .map_err(|err| format!("named resource dereference failed: {err}"))?;
+        return Ok(Some((id, object)));
+    }
+    Ok(None)
+}
+
+fn pdf_form_resources<'a>(
+    doc: &'a lopdf::Document,
+    stream: &'a lopdf::Stream,
+    inherited: &[&'a lopdf::Dictionary],
+) -> Result<Vec<&'a lopdf::Dictionary>, String> {
+    let object = match stream.dict.get(b"Resources") {
+        Ok(object) => object,
+        Err(lopdf::Error::DictKey) => return Ok(inherited.to_vec()),
+        Err(err) => return Err(format!("Form Resources unavailable: {err}")),
+    };
+    let (_, object) = doc
+        .dereference(object)
+        .map_err(|err| format!("Form Resources dereference failed: {err}"))?;
+    let dictionary = object
+        .as_dict()
+        .map_err(|err| format!("Form Resources is not a dictionary: {err}"))?;
+    Ok(vec![dictionary])
+}
+
+fn pdf_form_matrix(doc: &lopdf::Document, stream: &lopdf::Stream) -> Result<PdfMatrix, String> {
+    let object = match stream.dict.get(b"Matrix") {
+        Ok(object) => object,
+        Err(lopdf::Error::DictKey) => return Ok(PdfMatrix::IDENTITY),
+        Err(err) => return Err(format!("Form Matrix unavailable: {err}")),
+    };
+    let (_, object) = doc
+        .dereference(object)
+        .map_err(|err| format!("Form Matrix dereference failed: {err}"))?;
+    let operands = object
+        .as_array()
+        .map_err(|err| format!("Form Matrix is not an array: {err}"))?;
+    PdfMatrix::from_operands(operands).ok_or_else(|| "Form Matrix is malformed".to_string())
+}
+
+fn pdf_alpha_value(
+    doc: &lopdf::Document,
+    dictionary: &lopdf::Dictionary,
+    key: &[u8],
+) -> Result<Option<f64>, String> {
+    let object = match dictionary.get(key) {
+        Ok(object) => object,
+        Err(lopdf::Error::DictKey) => return Ok(None),
+        Err(err) => return Err(format!("alpha entry unavailable: {err}")),
+    };
+    let (_, object) = doc
+        .dereference(object)
+        .map_err(|err| format!("alpha entry dereference failed: {err}"))?;
+    let value = pdf_operand_to_f64(object).map_err(|_| "alpha entry is not numeric".to_string())?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(Some(value))
+    } else {
+        Err("alpha entry is outside the supported 0..=1 range".to_string())
+    }
+}
+
+fn pdf_apply_ext_gstate(
+    doc: &lopdf::Document,
+    resources: &[&lopdf::Dictionary],
+    name: &[u8],
+    state: &mut PdfGraphicsState,
+) -> Result<(), String> {
+    let Some((_, object)) = pdf_named_resource(doc, resources, b"ExtGState", name)? else {
+        return Err("ExtGState name is missing from resources".to_string());
+    };
+    let dictionary = object
+        .as_dict()
+        .map_err(|err| format!("ExtGState is not a dictionary: {err}"))?;
+    if let Some(alpha) = pdf_alpha_value(doc, dictionary, b"ca")? {
+        state.fill_alpha = alpha;
+    }
+    if let Some(alpha) = pdf_alpha_value(doc, dictionary, b"CA")? {
+        state.stroke_alpha = alpha;
+    }
+
+    match dictionary.get(b"SMask") {
+        Err(lopdf::Error::DictKey) => {}
+        Err(err) => return Err(format!("ExtGState soft-mask entry is unavailable: {err}")),
+        Ok(mask) => {
+            let (_, mask) = doc
+                .dereference(mask)
+                .map_err(|err| format!("ExtGState soft-mask dereference failed: {err}"))?;
+            if !matches!(mask, lopdf::Object::Name(name) if name.eq_ignore_ascii_case(b"None")) {
+                return Err("ExtGState soft-mask visibility is unsupported".to_string());
+            }
+        }
+    }
+    match dictionary.get(b"BM") {
+        Err(lopdf::Error::DictKey) => {}
+        Err(err) => return Err(format!("ExtGState blend-mode entry is unavailable: {err}")),
+        Ok(blend_mode) => {
+            let (_, blend_mode) = doc
+                .dereference(blend_mode)
+                .map_err(|err| format!("ExtGState blend-mode dereference failed: {err}"))?;
+            let ordinary = matches!(blend_mode, lopdf::Object::Name(name)
+                if name.eq_ignore_ascii_case(b"Normal") || name.eq_ignore_ascii_case(b"Compatible"));
+            if !ordinary {
+                return Err("ExtGState blend-mode visibility is unsupported".to_string());
+            }
+        }
+    }
+    for key in [
+        b"TR".as_slice(),
+        b"TR2".as_slice(),
+        b"HT".as_slice(),
+        b"AIS".as_slice(),
+        b"TK".as_slice(),
+    ] {
+        if dictionary.has(key) {
+            return Err(format!(
+                "ExtGState {} visibility is unsupported",
+                String::from_utf8_lossy(key)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pdf_text_operands_valid(operator: &str, operands: &[lopdf::Object]) -> bool {
+    use lopdf::Object;
+    match operator {
+        "Tj" | "'" => matches!(operands, [Object::String(_, _)]),
+        "\"" => matches!(
+            operands,
+            [
+                Object::Integer(_) | Object::Real(_),
+                Object::Integer(_) | Object::Real(_),
+                Object::String(_, _)
+            ]
+        ),
+        "TJ" => {
+            matches!(operands, [Object::Array(items)] if items.iter().all(|item| matches!(item, Object::String(_, _) | Object::Integer(_) | Object::Real(_))))
+        }
+        _ => false,
+    }
+}
+
+const PDF_FORM_RECURSION_CAP: usize = 64;
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_pdf_operations<'a>(
+    doc: &'a lopdf::Document,
+    operations: &[lopdf::content::Operation],
+    resources: &[&'a lopdf::Dictionary],
+    page_num: u32,
+    mut state: PdfGraphicsState,
+    hidden_texts: &mut Vec<(u32, String, &'static str)>,
+    incomplete_reasons: &mut Vec<String>,
+    active_forms: &mut std::collections::HashSet<lopdf::ObjectId>,
+    recursion_depth: usize,
+) {
+    let mut graphics_stack: Vec<PdfGraphicsState> = Vec::new();
+    let mut in_text_block = false;
+
+    for op in operations {
+        match op.operator.as_str() {
+            "BT" => {
+                if in_text_block {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: nested BT text object"),
+                    );
+                }
+                in_text_block = true;
+                state.text_matrix = PdfMatrix::IDENTITY;
+            }
+            "ET" => {
+                if !in_text_block {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: ET without an active text object"),
+                    );
+                }
+                in_text_block = false;
+            }
+            "Tf" if in_text_block => match op
+                .operands
+                .get(1)
+                .and_then(|object| pdf_operand_to_f64(object).ok())
+            {
+                Some(size) if size.is_finite() => state.font_size = size.abs(),
+                _ => push_pdf_incomplete_reason(
+                    incomplete_reasons,
+                    format!("page {page_num}: malformed Tf font-size operand"),
+                ),
+            },
+            "Tf" => push_pdf_incomplete_reason(
+                incomplete_reasons,
+                format!("page {page_num}: Tf operator outside a text object"),
+            ),
+            "Tz" if in_text_block => match op
+                .operands
+                .first()
+                .and_then(|object| pdf_operand_to_f64(object).ok())
+            {
+                Some(percent) if percent.is_finite() => {
+                    state.horizontal_scale = percent.abs() / 100.0
+                }
+                _ => push_pdf_incomplete_reason(
+                    incomplete_reasons,
+                    format!("page {page_num}: malformed Tz horizontal scaling operand"),
+                ),
+            },
+            "Tz" => push_pdf_incomplete_reason(
+                incomplete_reasons,
+                format!("page {page_num}: Tz operator outside a text object"),
+            ),
+            "Tm" if in_text_block => match PdfMatrix::from_operands(&op.operands) {
+                Some(matrix) => state.text_matrix = matrix,
+                None => push_pdf_incomplete_reason(
+                    incomplete_reasons,
+                    format!("page {page_num}: malformed Tm text matrix"),
+                ),
+            },
+            "Tm" => push_pdf_incomplete_reason(
+                incomplete_reasons,
+                format!("page {page_num}: Tm operator outside a text object"),
+            ),
+            "cm" => match PdfMatrix::from_operands(&op.operands) {
+                Some(matrix) => state.ctm = matrix.then(state.ctm),
+                None => push_pdf_incomplete_reason(
+                    incomplete_reasons,
+                    format!("page {page_num}: malformed cm graphics matrix"),
+                ),
+            },
+            "q" => {
+                if graphics_stack.len() < PDF_NESTING_DEPTH_CAP {
+                    graphics_stack.push(state.clone());
+                } else {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: graphics-state stack exceeds safe limit"),
+                    );
+                }
+            }
+            "Q" => match graphics_stack.pop() {
+                Some(saved) => {
+                    // q/Q restores the PDF graphics state (including CTM and
+                    // text-state parameters such as Tr/Tz/Tf), but the text
+                    // matrix itself belongs to the active text object and is
+                    // not part of the saved graphics state. Preserve the
+                    // current Tm value across Q so a collapsed matrix cannot be
+                    // hidden behind a save/restore pair.
+                    let text_matrix = state.text_matrix;
+                    state = saved;
+                    state.text_matrix = text_matrix;
+                }
+                None => push_pdf_incomplete_reason(
+                    incomplete_reasons,
+                    format!("page {page_num}: unbalanced Q graphics-state restore"),
+                ),
+            },
+            "Tr" if in_text_block => match pdf_render_mode(op.operands.first()) {
+                Some(mode) => state.render_mode = mode,
+                None => push_pdf_incomplete_reason(
+                    incomplete_reasons,
+                    format!("page {page_num}: invalid Tr text-rendering mode"),
+                ),
+            },
+            "Tr" => push_pdf_incomplete_reason(
+                incomplete_reasons,
+                format!("page {page_num}: Tr text-rendering mode outside a text object"),
+            ),
+            "gs" => match op.operands.as_slice() {
+                [lopdf::Object::Name(name)] => {
+                    if let Err(reason) = pdf_apply_ext_gstate(doc, resources, name, &mut state) {
+                        push_pdf_incomplete_reason(
+                            incomplete_reasons,
+                            format!("page {page_num}: {reason}"),
+                        );
+                    }
+                }
+                _ => push_pdf_incomplete_reason(
+                    incomplete_reasons,
+                    format!("page {page_num}: malformed gs ExtGState operand"),
+                ),
+            },
+            "Do" => {
+                if recursion_depth >= PDF_FORM_RECURSION_CAP {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: Form XObject recursion exceeds safe limit"),
+                    );
+                    continue;
+                }
+                let [lopdf::Object::Name(name)] = op.operands.as_slice() else {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: malformed Do XObject operand"),
+                    );
+                    continue;
+                };
+                let resolved = match pdf_named_resource(doc, resources, b"XObject", name) {
+                    Ok(Some(resource)) => resource,
+                    Ok(None) => {
+                        push_pdf_incomplete_reason(
+                            incomplete_reasons,
+                            format!("page {page_num}: Do XObject is missing from resources"),
+                        );
+                        continue;
+                    }
+                    Err(reason) => {
+                        push_pdf_incomplete_reason(
+                            incomplete_reasons,
+                            format!("page {page_num}: {reason}"),
+                        );
+                        continue;
+                    }
+                };
+                let (form_id, object) = resolved;
+                let stream = match object.as_stream() {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        push_pdf_incomplete_reason(
+                            incomplete_reasons,
+                            format!("page {page_num}: XObject is not a stream: {err}"),
+                        );
+                        continue;
+                    }
+                };
+                // Optional-content membership can be attached directly to an
+                // XObject stream. Its effective visibility depends on the
+                // document's OCG/OCMD configuration, which is not modeled here;
+                // never recurse into (or skip) such an object as if visibility
+                // had been proved.
+                if stream.dict.has(b"OC") {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!(
+                            "page {page_num}: XObject optional-content visibility is unsupported"
+                        ),
+                    );
+                    continue;
+                }
+                let subtype = stream.dict.get(b"Subtype").and_then(lopdf::Object::as_name);
+                match subtype {
+                    Ok(name) if name.eq_ignore_ascii_case(b"Image") => continue,
+                    Ok(name) if name.eq_ignore_ascii_case(b"Form") => {}
+                    Ok(_) => {
+                        push_pdf_incomplete_reason(
+                            incomplete_reasons,
+                            format!("page {page_num}: unsupported XObject subtype"),
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        push_pdf_incomplete_reason(
+                            incomplete_reasons,
+                            format!("page {page_num}: XObject subtype unavailable: {err}"),
+                        );
+                        continue;
+                    }
+                }
+                if form_id.is_some_and(|id| !active_forms.insert(id)) {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: cyclic Form XObject reference"),
+                    );
+                    continue;
+                }
+                let result = (|| -> Result<(), String> {
+                    let content = decode_pdf_stream_strict(stream)
+                        .map_err(|err| format!("Form XObject decode failed: {err}"))?;
+                    let operations = lopdf::content::Content::decode(&content)
+                        .map_err(|err| format!("Form XObject operation decode failed: {err}"))?
+                        .operations;
+                    let form_resources = pdf_form_resources(doc, stream, resources)?;
+                    let form_matrix = pdf_form_matrix(doc, stream)?;
+                    let mut form_state = state.clone();
+                    form_state.ctm = form_matrix.then(form_state.ctm);
+                    analyze_pdf_operations(
+                        doc,
+                        &operations,
+                        &form_resources,
+                        page_num,
+                        form_state,
+                        hidden_texts,
+                        incomplete_reasons,
+                        active_forms,
+                        recursion_depth + 1,
+                    );
+                    Ok(())
+                })();
+                if let Some(id) = form_id {
+                    active_forms.remove(&id);
+                }
+                if let Err(reason) = result {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: {reason}"),
+                    );
+                }
+            }
+            "Tj" | "TJ" | "'" | "\"" if in_text_block => {
+                if !pdf_text_operands_valid(&op.operator, &op.operands) {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: malformed {} text operands", op.operator),
+                    );
+                    continue;
+                }
+                let effective_scale = state.effective_text_scale();
+                let hidden_reason = if matches!(state.render_mode, 3 | 7) {
+                    Some(if state.render_mode == 3 {
+                        "invisible text-rendering mode 3"
+                    } else {
+                        "clipping-only text-rendering mode 7"
+                    })
+                } else if state.alpha_hides_current_mode() {
+                    Some("zero-alpha graphics state")
+                } else if effective_scale.is_some_and(|scale| scale < 1.0) {
+                    Some("sub-pixel rendering")
+                } else {
+                    None
+                };
+                if effective_scale.is_none() {
+                    push_pdf_incomplete_reason(
+                        incomplete_reasons,
+                        format!("page {page_num}: text transform could not be evaluated"),
+                    );
+                }
+                if let Some(reason) = hidden_reason {
+                    let text = extract_text_from_operands(&op.operands);
+                    if !text.trim().is_empty() {
+                        hidden_texts.push((page_num, text, reason));
+                    }
+                }
+            }
+            "Tj" | "TJ" | "'" | "\"" => push_pdf_incomplete_reason(
+                incomplete_reasons,
+                format!("page {page_num}: text-showing operator outside a text object"),
+            ),
+            _ if pdf_optional_content_operator(op) => push_pdf_incomplete_reason(
+                incomplete_reasons,
+                format!("page {page_num}: optional-content visibility is unsupported"),
+            ),
+            _ => {}
+        }
+    }
+
+    if !graphics_stack.is_empty() {
+        push_pdf_incomplete_reason(
+            incomplete_reasons,
+            format!("page {page_num}: unbalanced q graphics-state save"),
+        );
+    }
+    if in_text_block {
+        push_pdf_incomplete_reason(
+            incomplete_reasons,
+            format!("page {page_num}: unterminated PDF text object"),
+        );
+    }
 }
 
 /// Check PDF bytes for hidden text via sub-pixel scale transforms: font-size 0
@@ -675,6 +1672,9 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
         eprintln!(
             "tirith: scan: PDF rejected: object nesting exceeds safe limit (possible RUSTSEC-2026-0187 DoS)"
         );
+        findings.push(pdf_analysis_incomplete(&[format!(
+            "PDF object nesting exceeds the safe depth limit of {PDF_NESTING_DEPTH_CAP}"
+        )]));
         return findings;
     }
 
@@ -682,80 +1682,74 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
         Ok(d) => d,
         Err(e) => {
             eprintln!("tirith: scan: PDF parse failed: {e}");
+            findings.push(pdf_analysis_incomplete(&[format!("PDF parse failed: {e}")]));
             return findings;
         }
     };
 
-    let mut hidden_texts: Vec<(u32, String)> = Vec::new();
+    let mut hidden_texts: Vec<(u32, String, &'static str)> = Vec::new();
+    let mut incomplete_reasons: Vec<String> = Vec::new();
 
-    for (page_num, page_id) in doc.get_pages() {
-        let content = match doc.get_page_content(page_id) {
+    let pages = match strict_pdf_pages(&doc) {
+        Ok(pages) => pages,
+        Err(err) => {
+            findings.push(pdf_analysis_incomplete(&[format!(
+                "PDF page tree could not be analyzed: {err}"
+            )]));
+            return findings;
+        }
+    };
+
+    for (page_num, page_id) in pages {
+        let content = match strict_page_content(&doc, page_id) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(err) => {
+                push_pdf_incomplete_reason(
+                    &mut incomplete_reasons,
+                    format!("page {page_num}: {err}"),
+                );
+                continue;
+            }
         };
 
         let ops = match lopdf::content::Content::decode(&content) {
             Ok(c) => c.operations,
-            Err(_) => continue,
+            Err(err) => {
+                push_pdf_incomplete_reason(
+                    &mut incomplete_reasons,
+                    format!("page {page_num}: content operation decode failed: {err}"),
+                );
+                continue;
+            }
         };
 
-        // PDF default font size when `Tf` is never seen.
-        let mut current_font_size: f64 = 12.0;
-        let mut current_scale: f64 = 1.0;
-        let mut in_text_block = false;
-
-        for op in &ops {
-            match op.operator.as_str() {
-                "BT" => {
-                    in_text_block = true;
-                    current_font_size = 12.0;
-                    current_scale = 1.0;
-                }
-                "ET" => {
-                    in_text_block = false;
-                }
-                // `Tf <font> <size>` — operand 1 is the size.
-                "Tf" if in_text_block => {
-                    if let Some(size) = op.operands.get(1) {
-                        if let Ok(s) = pdf_operand_to_f64(size) {
-                            current_font_size = s;
-                        }
-                    }
-                }
-                // Text matrix `Tm a b c d e f` — `a` and `d` are x/y scale factors.
-                "Tm" if in_text_block && op.operands.len() >= 4 => {
-                    let a = pdf_operand_to_f64(&op.operands[0]).unwrap_or(1.0);
-                    let d = pdf_operand_to_f64(&op.operands[3]).unwrap_or(1.0);
-                    current_scale = a.abs().min(d.abs());
-                }
-                // CTM `cm a b c d e f` — only adopt sub-1.0 scales (avoid clobbering normal layout).
-                "cm" if op.operands.len() >= 4 => {
-                    let a = pdf_operand_to_f64(&op.operands[0]).unwrap_or(1.0);
-                    let d = pdf_operand_to_f64(&op.operands[3]).unwrap_or(1.0);
-                    let scale = a.abs().min(d.abs());
-                    if (0.0..1.0).contains(&scale) {
-                        current_scale = scale;
-                    }
-                }
-                "Tj" | "TJ" | "'" | "\"" if in_text_block => {
-                    let effective_size = current_font_size * current_scale;
-                    if effective_size < 1.0 {
-                        // Below 1px: invisible to humans, still extracted by AI tools.
-                        let text = extract_text_from_operands(&op.operands);
-                        if !text.trim().is_empty() {
-                            hidden_texts.push((page_num, text));
-                        }
-                    }
-                }
-                _ => {}
+        let resources = match pdf_page_resources(&doc, page_id) {
+            Ok(resources) => resources,
+            Err(err) => {
+                push_pdf_incomplete_reason(
+                    &mut incomplete_reasons,
+                    format!("page {page_num}: {err}"),
+                );
+                continue;
             }
-        }
+        };
+        let mut active_forms = std::collections::HashSet::new();
+        analyze_pdf_operations(
+            &doc,
+            &ops,
+            &resources,
+            page_num,
+            PdfGraphicsState::default(),
+            &mut hidden_texts,
+            &mut incomplete_reasons,
+            &mut active_forms,
+            0,
+        );
     }
-
     if !hidden_texts.is_empty() {
         let page_list: Vec<String> = hidden_texts
             .iter()
-            .map(|(p, _)| p.to_string())
+            .map(|(p, _, _)| p.to_string())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -763,9 +1757,9 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
         findings.push(Finding {
             rule_id: RuleId::PdfHiddenText,
             severity: Severity::High,
-            title: "Hidden text in PDF via sub-pixel rendering".to_string(),
+            title: "Hidden text in PDF rendering state".to_string(),
             description: format!(
-                "PDF contains {} text fragment(s) rendered at sub-pixel size (invisible to humans) \
+                "PDF contains {} text fragment(s) rendered invisibly or at sub-pixel size \
                  on page(s): {}",
                 hidden_texts.len(),
                 page_list.join(", ")
@@ -773,8 +1767,8 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
             evidence: hidden_texts
                 .iter()
                 .take(5)
-                .map(|(page, text)| Evidence::Text {
-                    detail: format!("page {page}: hidden text: \"{}\"", truncate_str(text, 100)),
+                .map(|(page, text, reason)| Evidence::Text {
+                    detail: format!("page {page}: {reason}: \"{}\"", truncate_str(text, 100)),
                 })
                 .collect(),
             human_view: None,
@@ -782,6 +1776,10 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
             mitre_id: None,
             custom_rule_id: None,
         });
+    }
+
+    if !incomplete_reasons.is_empty() {
+        findings.push(pdf_analysis_incomplete(&incomplete_reasons));
     }
 
     findings
@@ -1119,11 +2117,13 @@ mod tests {
 
     #[test]
     fn test_pdf_invalid_bytes_no_panic() {
-        // Garbage in → empty findings, never a panic.
+        // Garbage never panics and cannot be reported as a clean analysis.
         let findings = check_pdf(b"not a pdf");
         assert!(
-            findings.is_empty(),
-            "invalid PDF should produce no findings"
+            findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }),
+            "invalid PDF must fail closed: {findings:?}"
         );
     }
 
@@ -1132,7 +2132,24 @@ mod tests {
     /// `font_size = 0` the text renders sub-pixel, which `check_pdf` flags as
     /// hidden text, proving the full parse+analyze path runs after the preflight.
     fn build_pdf(font_size: i32, text: &str) -> Vec<u8> {
-        use lopdf::content::{Content, Operation};
+        use lopdf::content::Operation;
+
+        build_pdf_with_operations(vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), font_size.into()]),
+            Operation::new("Td", vec![100.into(), 600.into()]),
+            Operation::new("Tj", vec![lopdf::Object::string_literal(text)]),
+            Operation::new("ET", vec![]),
+        ])
+    }
+
+    fn build_pdf_with_operations(operations: Vec<lopdf::content::Operation>) -> Vec<u8> {
+        use lopdf::content::Content;
+        let content = Content { operations }.encode().unwrap();
+        build_pdf_with_raw_content(content, None)
+    }
+
+    fn build_pdf_with_raw_content(content: Vec<u8>, filter: Option<&str>) -> Vec<u8> {
         use lopdf::{Dictionary, Document, Object, Stream};
 
         let mut doc = Document::with_version("1.5");
@@ -1150,16 +2167,11 @@ mod tests {
         resources.set("Font", font_dict);
         let resources_id = doc.add_object(resources);
 
-        let content = Content {
-            operations: vec![
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec!["F1".into(), font_size.into()]),
-                Operation::new("Td", vec![100.into(), 600.into()]),
-                Operation::new("Tj", vec![Object::string_literal(text)]),
-                Operation::new("ET", vec![]),
-            ],
-        };
-        let content_id = doc.add_object(Stream::new(Dictionary::new(), content.encode().unwrap()));
+        let mut stream_dict = Dictionary::new();
+        if let Some(filter) = filter {
+            stream_dict.set("Filter", filter);
+        }
+        let content_id = doc.add_object(Stream::new(stream_dict, content));
 
         let mut page = Dictionary::new();
         page.set("Type", "Page");
@@ -1186,6 +2198,196 @@ mod tests {
         buf
     }
 
+    fn build_pdf_with_form_operations(
+        operations: Vec<lopdf::content::Operation>,
+        matrix: Option<[i64; 6]>,
+        optional_content_hidden: bool,
+    ) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+
+        let mut font = Dictionary::new();
+        font.set("Type", "Font");
+        font.set("Subtype", "Type1");
+        font.set("BaseFont", "Helvetica");
+        let font_id = doc.add_object(font);
+
+        let optional_group_id = optional_content_hidden.then(|| {
+            let mut group = Dictionary::new();
+            group.set("Type", "OCG");
+            group.set("Name", Object::string_literal("hidden form layer"));
+            doc.add_object(group)
+        });
+
+        let mut form_dict = Dictionary::new();
+        form_dict.set("Type", "XObject");
+        form_dict.set("Subtype", "Form");
+        form_dict.set("BBox", vec![0.into(), 0.into(), 100.into(), 100.into()]);
+        if let Some(group_id) = optional_group_id {
+            form_dict.set("OC", group_id);
+        }
+        if let Some(matrix) = matrix {
+            form_dict.set(
+                "Matrix",
+                matrix.into_iter().map(Object::Integer).collect::<Vec<_>>(),
+            );
+        }
+        let form_content = Content { operations }.encode().unwrap();
+        let form_id = doc.add_object(Stream::new(form_dict, form_content));
+
+        let mut font_dict = Dictionary::new();
+        font_dict.set("F1", font_id);
+        let mut xobjects = Dictionary::new();
+        xobjects.set("Fm1", form_id);
+        let mut resources = Dictionary::new();
+        resources.set("Font", font_dict);
+        resources.set("XObject", xobjects);
+        let resources_id = doc.add_object(resources);
+
+        let page_content = Content {
+            operations: vec![Operation::new("Do", vec!["Fm1".into()])],
+        }
+        .encode()
+        .unwrap();
+        let page_content_id = doc.add_object(Stream::new(Dictionary::new(), page_content));
+
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", pages_id);
+        page.set("Contents", page_content_id);
+        let page_id = doc.add_object(page);
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", vec![Object::Reference(page_id)]);
+        pages.set("Count", 1);
+        pages.set("Resources", resources_id);
+        pages.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        if let Some(group_id) = optional_group_id {
+            let mut default_config = Dictionary::new();
+            default_config.set("OFF", vec![Object::Reference(group_id)]);
+            let mut optional_content = Dictionary::new();
+            optional_content.set("OCGs", vec![Object::Reference(group_id)]);
+            optional_content.set("D", default_config);
+            catalog.set("OCProperties", optional_content);
+        }
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    fn build_pdf_with_alpha(alpha: f64) -> Vec<u8> {
+        use lopdf::Dictionary;
+
+        let mut gs = Dictionary::new();
+        gs.set("Type", "ExtGState");
+        gs.set("ca", alpha);
+        gs.set("CA", alpha);
+        build_pdf_with_ext_gstate(gs)
+    }
+
+    fn build_pdf_with_ext_gstate(gs: lopdf::Dictionary) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let gs_id = doc.add_object(gs);
+        let mut ext_states = Dictionary::new();
+        ext_states.set("GS0", gs_id);
+        let mut resources = Dictionary::new();
+        resources.set("ExtGState", ext_states);
+        let resources_id = doc.add_object(resources);
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("gs", vec!["GS0".into()]),
+                Operation::new(
+                    "Tj",
+                    vec![Object::string_literal("alpha hidden instruction")],
+                ),
+                Operation::new("ET", vec![]),
+            ],
+        }
+        .encode()
+        .unwrap();
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), content));
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", pages_id);
+        page.set("Contents", content_id);
+        let page_id = doc.add_object(page);
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", vec![Object::Reference(page_id)]);
+        pages.set("Count", 1);
+        pages.set("Resources", resources_id);
+        pages.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    fn build_pdf_with_page_tree_only(kids: Vec<lopdf::Object>, count: i64) -> Vec<u8> {
+        use lopdf::{Dictionary, Document, Object};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", kids);
+        pages.set("Count", count);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    fn build_pdf_with_missing_content_reference() -> Vec<u8> {
+        use lopdf::{Dictionary, Document, Object};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", pages_id);
+        page.set("Contents", Object::Reference((9_999, 0)));
+        let page_id = doc.add_object(page);
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", vec![Object::Reference(page_id)]);
+        pages.set("Count", 1);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
     #[test]
     fn test_pdf_preflight_rejects_deep_nesting() {
         // Advisory-style RUSTSEC-2026-0187 payload: thousands of unclosed array
@@ -1206,9 +2408,407 @@ mod tests {
         // safe: it returns early via the guard and never reaches `load_mem`.
         let findings = check_pdf(&deep);
         assert!(
-            findings.is_empty(),
-            "rejected PDF yields no findings (guard short-circuits before parse)"
+            findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }),
+            "preflight rejection must be an explicit blocking coverage gap: {findings:?}"
         );
+    }
+
+    #[test]
+    fn test_pdf_preflight_ignores_stream_payload_brackets() {
+        let mut raw = b"%PDF-1.7\n1 0 obj\n<< /Length 600 >>\nstream\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'[', PDF_NESTING_DEPTH_CAP + 50));
+        raw.extend_from_slice(b"\nendstream\nendobj\n");
+        assert!(
+            pdf_max_nesting_depth(&raw) <= 1,
+            "binary stream bytes must not affect structural nesting depth"
+        );
+    }
+
+    #[test]
+    fn test_pdf_preflight_does_not_trust_standalone_stream_keyword() {
+        for prefix in [
+            b"%PDF-1.7\nstream\n".as_slice(),
+            b"%PDF-1.7\n<< >> stream\n",
+        ] {
+            let mut raw = prefix.to_vec();
+            raw.extend(std::iter::repeat_n(b'[', PDF_NESTING_DEPTH_CAP + 50));
+            raw.extend_from_slice(b"\nendstream\n");
+            assert!(
+                pdf_max_nesting_depth(&raw) > PDF_NESTING_DEPTH_CAP,
+                "a standalone or fake-dictionary stream token must not hide structural nesting from preflight"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pdf_missing_page_content_reference_fails_closed() {
+        let findings = check_pdf(&build_pdf_with_missing_content_reference());
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+        }));
+    }
+
+    #[test]
+    fn test_pdf_malformed_page_tree_fails_closed_but_zero_pages_is_valid() {
+        use lopdf::Object;
+
+        for pdf in [
+            build_pdf_with_page_tree_only(vec![Object::Reference((999, 0))], 1),
+            build_pdf_with_page_tree_only(Vec::new(), 1),
+        ] {
+            let findings = check_pdf(&pdf);
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::AnalysisIncomplete
+                        && finding.severity == Severity::High
+                        && finding.evidence.iter().any(|evidence| {
+                            matches!(evidence, Evidence::Text { detail } if detail.contains("page tree"))
+                        })
+                }),
+                "malformed page tree must be a visible coverage failure: {findings:?}"
+            );
+        }
+
+        let zero_page = check_pdf(&build_pdf_with_page_tree_only(Vec::new(), 0));
+        assert!(
+            zero_page.is_empty(),
+            "a structurally valid zero-page PDF is a legitimate clean control: {zero_page:?}"
+        );
+    }
+
+    #[test]
+    fn test_pdf_content_and_filter_decode_failures_fail_closed() {
+        for pdf in [
+            build_pdf_with_raw_content(b"BT\n[".to_vec(), None),
+            build_pdf_with_raw_content(b"BT ET".to_vec(), Some("UnsupportedDecode")),
+        ] {
+            let findings = check_pdf(&pdf);
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }));
+        }
+    }
+
+    #[test]
+    fn test_pdf_invisible_and_clipping_only_render_modes_are_hidden() {
+        use lopdf::content::Operation;
+        use lopdf::Object;
+
+        for mode in [3, 7] {
+            let pdf = build_pdf_with_operations(vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Tr", vec![mode.into()]),
+                Operation::new("Tj", vec![Object::string_literal("hidden instruction")]),
+                Operation::new("ET", vec![]),
+            ]);
+            let findings = check_pdf(&pdf);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::PdfHiddenText),
+                "Tr mode {mode} must flag hidden text: {findings:?}"
+            );
+        }
+
+        // Mode 4 paints and clips; the text itself remains visible.
+        let visible_clip = build_pdf_with_operations(vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tr", vec![4.into()]),
+            Operation::new("Tj", vec![Object::string_literal("visible text")]),
+            Operation::new("ET", vec![]),
+        ]);
+        assert!(!check_pdf(&visible_clip)
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+    }
+
+    #[test]
+    fn test_pdf_tz_zero_and_sheared_or_degenerate_matrices_are_hidden() {
+        use lopdf::content::Operation;
+        use lopdf::Object;
+
+        let cases = [
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Tz", vec![0.into()]),
+                Operation::new("Tj", vec![Object::string_literal("hidden by Tz")]),
+                Operation::new("ET", vec![]),
+            ],
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new(
+                    "Tm",
+                    vec![1.into(), 0.into(), 100.into(), 1.into(), 0.into(), 0.into()],
+                ),
+                Operation::new("Tj", vec![Object::string_literal("hidden by shear")]),
+                Operation::new("ET", vec![]),
+            ],
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new(
+                    "Tm",
+                    vec![1.into(), 0.into(), 1.into(), 0.into(), 0.into(), 0.into()],
+                ),
+                Operation::new("Tj", vec![Object::string_literal("hidden by collapse")]),
+                Operation::new("ET", vec![]),
+            ],
+        ];
+        for operations in cases {
+            let findings = check_pdf(&build_pdf_with_operations(operations));
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::PdfHiddenText),
+                "complete transform must expose hidden text: {findings:?}"
+            );
+        }
+
+        let rotated = build_pdf_with_operations(vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new(
+                "Tm",
+                vec![
+                    0.into(),
+                    1.into(),
+                    (-1).into(),
+                    0.into(),
+                    0.into(),
+                    0.into(),
+                ],
+            ),
+            Operation::new("Tj", vec![Object::string_literal("visible rotation")]),
+            Operation::new("ET", vec![]),
+        ]);
+        assert!(!check_pdf(&rotated)
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+    }
+
+    #[test]
+    fn test_pdf_form_xobject_do_is_recursively_analyzed() {
+        use lopdf::content::Operation;
+        use lopdf::Object;
+
+        let hidden_mode = build_pdf_with_form_operations(
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Tr", vec![3.into()]),
+                Operation::new("Tj", vec![Object::string_literal("hidden in form")]),
+                Operation::new("ET", vec![]),
+            ],
+            None,
+            false,
+        );
+        assert!(check_pdf(&hidden_mode)
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+
+        let degenerate_form = build_pdf_with_form_operations(
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Tj", vec![Object::string_literal("collapsed form")]),
+                Operation::new("ET", vec![]),
+            ],
+            Some([1, 0, 1, 0, 0, 0]),
+            false,
+        );
+        assert!(check_pdf(&degenerate_form)
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+
+        let visible = build_pdf_with_form_operations(
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Tj", vec![Object::string_literal("visible in form")]),
+                Operation::new("ET", vec![]),
+            ],
+            None,
+            false,
+        );
+        let findings = check_pdf(&visible);
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "supported Form XObject should be fully analyzed: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_pdf_form_xobject_optional_content_fails_closed() {
+        use lopdf::content::Operation;
+        use lopdf::Object;
+
+        let form_text = || {
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new(
+                    "Tj",
+                    vec![Object::string_literal("hidden optional-content form")],
+                ),
+                Operation::new("ET", vec![]),
+            ]
+        };
+
+        let hidden = check_pdf(&build_pdf_with_form_operations(form_text(), None, true));
+        assert!(
+            hidden.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }),
+            "a Form-level /OC membership must not be assumed visible: {hidden:?}"
+        );
+
+        let visible = check_pdf(&build_pdf_with_form_operations(form_text(), None, false));
+        assert!(!visible
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+        assert!(
+            !visible
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "the same Form without /OC is a supported clean control: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn test_pdf_ext_gstate_zero_alpha_is_hidden_and_opaque_is_clean() {
+        assert!(check_pdf(&build_pdf_with_alpha(0.0))
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+        let opaque = check_pdf(&build_pdf_with_alpha(1.0));
+        assert!(!opaque
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+        assert!(!opaque
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn test_pdf_ext_gstate_unsupported_or_unresolved_visibility_fails_closed() {
+        use lopdf::{Dictionary, Object};
+
+        for (key, value) in [
+            ("SMask", Object::Name(b"Alpha".to_vec())),
+            ("BM", Object::Name(b"Multiply".to_vec())),
+            ("AIS", Object::Boolean(true)),
+            ("TK", Object::Boolean(true)),
+            ("SMask", Object::Reference((999, 0))),
+        ] {
+            let mut gs = Dictionary::new();
+            gs.set("Type", "ExtGState");
+            gs.set(key, value);
+            let findings = check_pdf(&build_pdf_with_ext_gstate(gs));
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::AnalysisIncomplete
+                        && finding.severity == Severity::High
+                }),
+                "unsupported or unresolved {key} must fail closed: {findings:?}"
+            );
+        }
+
+        let mut supported = Dictionary::new();
+        supported.set("Type", "ExtGState");
+        supported.set("ca", 1.0);
+        supported.set("CA", 1.0);
+        supported.set("SMask", Object::Name(b"None".to_vec()));
+        supported.set("BM", Object::Name(b"Normal".to_vec()));
+        let findings = check_pdf(&build_pdf_with_ext_gstate(supported));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PdfHiddenText));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn test_pdf_q_q_restores_rendering_state() {
+        use lopdf::content::Operation;
+        use lopdf::Object;
+
+        let pdf = build_pdf_with_operations(vec![
+            Operation::new("q", vec![]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tr", vec![3.into()]),
+            Operation::new("ET", vec![]),
+            Operation::new("Q", vec![]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tj", vec![Object::string_literal("visible after restore")]),
+            Operation::new("ET", vec![]),
+        ]);
+        let findings = check_pdf(&pdf);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::PdfHiddenText),
+            "Q must restore the pre-save rendering mode: {findings:?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "balanced q/Q is fully modeled: {findings:?}"
+        );
+
+        let text_matrix_is_not_graphics_state = build_pdf_with_operations(vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("q", vec![]),
+            Operation::new(
+                "Tm",
+                vec![0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+            ),
+            Operation::new("Q", vec![]),
+            Operation::new(
+                "Tj",
+                vec![Object::string_literal("collapsed matrix survives Q")],
+            ),
+            Operation::new("ET", vec![]),
+        ]);
+        let findings = check_pdf(&text_matrix_is_not_graphics_state);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::PdfHiddenText),
+            "Q must not restore the text matrix: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_pdf_unsupported_visibility_state_fails_closed() {
+        use lopdf::content::Operation;
+        use lopdf::Object;
+
+        for operations in [
+            vec![Operation::new("gs", vec!["GS1".into()])],
+            vec![
+                Operation::new("BMC", vec![Object::Name(b"OC".to_vec())]),
+                Operation::new("EMC", vec![]),
+            ],
+        ] {
+            let findings = check_pdf(&build_pdf_with_operations(operations));
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }));
+        }
     }
 
     #[test]

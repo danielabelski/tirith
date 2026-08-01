@@ -2477,23 +2477,17 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
 
 /// Extract a host/IP from a URL-like command argument.
 fn extract_host_from_arg(arg: &str) -> Option<String> {
-    if let Some(scheme_end) = arg.find("://") {
-        let after_scheme = &arg[scheme_end + 3..];
-        let after_userinfo = if let Some(at_idx) = after_scheme.find('@') {
-            &after_scheme[at_idx + 1..]
-        } else {
-            after_scheme
-        };
-        let host_port = after_userinfo.split('/').next().unwrap_or(after_userinfo);
-        let host = strip_port(host_port);
-        if host.is_empty() || host.contains('/') || host.contains('[') {
-            return None;
-        }
-        return Some(host);
+    if arg.contains("://") {
+        let parsed = url::Url::parse(arg).ok()?;
+        return parsed.host().map(|host| match host {
+            url::Host::Domain(domain) => domain.trim_end_matches('.').to_ascii_lowercase(),
+            url::Host::Ipv4(address) => address.to_string(),
+            url::Host::Ipv6(address) => address.to_string(),
+        });
     }
 
     // Bare host/IP like `curl 169.254.169.254/path`.
-    let host_part = arg.split('/').next().unwrap_or(arg);
+    let host_part = arg.split(['/', '?', '#']).next().unwrap_or(arg);
     let host = strip_port(host_part);
 
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
@@ -2730,9 +2724,13 @@ pub fn check_network_policy(
 /// Whether `host` matches any list entry: exact, suffix (`.example.com` matches
 /// `sub.example.com`), or IPv4 CIDR.
 fn matches_network_list(host: &str, list: &[String]) -> bool {
+    let Some(canonical_host) = canonical_network_host(host) else {
+        return false;
+    };
     for entry in list {
+        let entry = entry.trim();
         if entry.contains('/') {
-            if let Some(matched) = cidr_contains(host, entry) {
+            if let Some(matched) = cidr_contains(&canonical_host, entry) {
                 if matched {
                     return true;
                 }
@@ -2740,19 +2738,40 @@ fn matches_network_list(host: &str, list: &[String]) -> bool {
             }
         }
 
-        if host.eq_ignore_ascii_case(entry) {
+        // A leading dot is accepted as an explicit suffix-policy spelling, but
+        // matching still requires a DNS label boundary below.
+        let Some(canonical_entry) = canonical_network_host(entry.trim_start_matches('.')) else {
+            continue;
+        };
+        if canonical_host == canonical_entry {
             return true;
         }
 
         // Suffix match: "example.com" matches "sub.example.com".
-        if host.len() > entry.len()
-            && host.ends_with(entry.as_str())
-            && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
+        if canonical_host
+            .strip_suffix(&canonical_entry)
+            .is_some_and(|prefix| prefix.ends_with('.'))
         {
             return true;
         }
     }
     false
+}
+
+/// Canonicalize a policy or extracted host through the URL crate's WHATWG host
+/// parser. This lowercases/IDNA-normalizes domains and canonicalizes IPs; a
+/// terminal DNS root dot is removed so equivalent FQDN spellings compare equal.
+fn canonical_network_host(host: &str) -> Option<String> {
+    let trimmed = host.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = url::Host::parse(trimmed).ok()?;
+    Some(match parsed {
+        url::Host::Domain(domain) => domain.trim_end_matches('.').to_ascii_lowercase(),
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(address) => address.to_string(),
+    })
 }
 
 /// Check if an IPv4 address is within a CIDR range.
@@ -4818,6 +4837,14 @@ mod tests {
         );
         assert_eq!(extract_host_from_arg("-H"), None);
         assert_eq!(extract_host_from_arg("output.txt"), None);
+        assert_eq!(
+            extract_host_from_arg("https://denied.example/path@allowed.example"),
+            Some("denied.example".to_string())
+        );
+        assert_eq!(
+            extract_host_from_arg("https://denied.example?next=@allowed.example"),
+            Some("denied.example".to_string())
+        );
     }
 
     #[test]
@@ -4846,6 +4873,59 @@ mod tests {
         );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn network_policy_uses_authoritative_url_authority() {
+        let deny = vec!["denied.example".to_string()];
+        for command in [
+            "curl https://denied.example/path@allowed.example",
+            "curl 'https://denied.example?next=@allowed.example'",
+        ] {
+            let findings = check_network_policy(command, ShellType::Posix, &deny, &[]);
+            assert!(findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::CommandNetworkDeny),
+                "authoritative denied host must not be replaced by path/query text: {command} -> {findings:?}");
+        }
+    }
+
+    #[test]
+    fn network_policy_canonicalizes_dns_case_root_dot_and_idna() {
+        for (command, denied) in [
+            ("curl https://Sub.EVIL.Example/data", "evil.example"),
+            ("curl https://evil.example./data", "EVIL.EXAMPLE"),
+            ("curl https://bücher.example/data", "xn--bcher-kva.example"),
+        ] {
+            let findings =
+                check_network_policy(command, ShellType::Posix, &[denied.to_string()], &[]);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::CommandNetworkDeny),
+                "equivalent canonical host must block: {command} / {denied} -> {findings:?}"
+            );
+        }
+
+        assert!(!matches_network_list(
+            "notexample.com",
+            &["example.com".to_string()]
+        ));
+        assert!(matches_network_list(
+            "Safe.Evil.Example.",
+            &[".evil.example".to_string()]
+        ));
+    }
+
+    #[test]
+    fn network_policy_canonicalized_allow_still_precedes_deny() {
+        let findings = check_network_policy(
+            "curl https://SAFE.EVIL.EXAMPLE./data",
+            ShellType::Posix,
+            &["evil.example".to_string()],
+            &["safe.evil.example".to_string()],
+        );
+        assert!(findings.is_empty());
     }
 
     #[test]

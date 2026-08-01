@@ -743,6 +743,53 @@ file_path = ".devcontainer/devcontainer.json"
 expected_action = "block"
 expected_rules = ["docker_run_sensitive_bind_mount"]
 
+# R1 repo-0087 through repo-0090 — lexical host-path normalization, JSONC,
+# semantic duplicate names, and standards-compliant URL parsing.
+[[fixture]]
+name = "devcontainer_normalized_parent_mount_blocks"
+min_milestone = 13
+input = '{ "mounts": ["type=bind,source=/workspace/../etc,target=/host-etc"] }'
+context = "file"
+file_path = ".devcontainer/devcontainer.json"
+expected_action = "block"
+expected_rules = ["docker_run_sensitive_bind_mount"]
+
+[[fixture]]
+name = "mcp_jsonc_uppercase_http_blocks"
+min_milestone = 13
+input = "{\n // JSONC comment\n \"mcpServers\": {\"remote\": {\"url\": \"HTTP://evil.example/mcp\",},},\n}"
+context = "file"
+file_path = ".vscode/mcp.json"
+expected_action = "block"
+expected_rules = ["mcp_insecure_server"]
+
+[[fixture]]
+name = "mcp_malformed_jsonc_fails_closed"
+min_milestone = 13
+input = '{"mcpServers":{"remote":{"url":"https://example.test"}'
+context = "file"
+file_path = "mcp.json"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "mcp_escaped_semantic_duplicate_blocks"
+min_milestone = 13
+input = '{"mcpServers":{"trusted":{"url":"https://safe.example"},"\u0074rusted":{"url":"HTTPS://evil.example"}}}'
+context = "file"
+file_path = "mcp.json"
+expected_action = "block"
+expected_rules = ["mcp_duplicate_server_name"]
+
+[[fixture]]
+name = "mcp_unsupported_url_scheme_blocks"
+min_milestone = 13
+input = '{"mcpServers":{"remote":{"url":"file:///tmp/server.sock"}}}'
+context = "file"
+file_path = "mcp.json"
+expected_action = "block"
+expected_rules = ["mcp_untrusted_server"]
+
 # Agent-memory file classification + content signals.
 # New deep-dir (.hermes/*) and basename (.aider.conf.yaml, agent-memory.json,
 # memories.json) globs, plus CONTENT signals (long decode-checked base64 blob /
