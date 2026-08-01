@@ -123,6 +123,7 @@ pub fn scan(
             ApiSignals::Unavailable { .. } if matches!(existence, PackageExistence::NotFound) => {
                 let mut prov = ApiProvenance {
                     source: eco.to_string(),
+                    package_name: Some(name.to_string()),
                     package_existence: PackageExistence::NotFound,
                     ..Default::default()
                 };

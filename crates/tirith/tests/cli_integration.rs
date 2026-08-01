@@ -17964,6 +17964,63 @@ fn assert_attack_codepoints_stripped(human: &[u8]) {
     );
 }
 
+#[test]
+fn install_human_output_neutralizes_hostile_command_and_package_name() {
+    let out = tirith_install()
+        .args(["install", "--no-exec", "npm", ATTACK_PAYLOAD])
+        .output()
+        .expect("failed to run tirith install with hostile package text");
+
+    assert_attack_codepoints_stripped(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.lines().any(|line| line.starts_with("ENDvis")),
+        "an install argument newline must not forge a terminal row: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("analysis only") && stderr.contains("NOT run"),
+        "the no-exec outcome should remain readable: {stderr:?}"
+    );
+}
+
+#[test]
+fn install_machine_json_preserves_raw_structured_command_text() {
+    let out = tirith_install()
+        .args([
+            "install",
+            "--no-exec",
+            "--format",
+            "json",
+            "npm",
+            ATTACK_PAYLOAD,
+        ])
+        .output()
+        .expect("failed to run JSON install analysis with hostile package text");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("install machine output must remain valid JSON");
+    assert_eq!(parsed["analysis"]["argv"]["program"], "npm");
+    assert_eq!(
+        parsed["analysis"]["argv"]["args"],
+        serde_json::json!(["install", ATTACK_PAYLOAD]),
+        "structured JSON argv must preserve exact argument identity"
+    );
+    let command = parsed["analysis"]["command"]
+        .as_str()
+        .expect("analysis command must be a JSON string");
+    assert!(
+        command.contains('\x1b'),
+        "raw ESC must survive in JSON data"
+    );
+    assert!(
+        command.contains('\u{202e}'),
+        "raw bidi codepoint must survive in JSON data"
+    );
+    assert!(
+        command.contains('\n'),
+        "raw argument newline must survive in JSON data"
+    );
+}
+
 /// Build a `.mcp.json` under `dir` whose single server NAME is `ATTACK_PAYLOAD`
 /// and whose URL is plain HTTP, so a scan fires `McpInsecureServer` with the name
 /// echoed verbatim into the finding DESCRIPTION. serde_json escapes every control

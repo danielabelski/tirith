@@ -23,6 +23,7 @@ mod windows;
 
 #[derive(Debug, Clone)]
 pub struct TrustedExecutable {
+    invocation_path: PathBuf,
     path: PathBuf,
     #[cfg(unix)]
     identity: UnixExecutableIdentity,
@@ -306,7 +307,9 @@ fn denied_selection_origin(path: &Path, denied_roots: &[PathBuf]) -> Option<Path
 
 impl TrustedExecutable {
     /// Validate an explicitly selected absolute executable. Symlinks are
-    /// canonicalized before the denied-root check and before execution.
+    /// canonicalized for trust and content checks, while the selected absolute
+    /// invocation path is retained separately for callers that must preserve
+    /// multicall argv[0] semantics (for example `cargo -> rustup`).
     pub fn from_absolute(
         path: &Path,
         denied_roots: &[PathBuf],
@@ -345,11 +348,22 @@ impl TrustedExecutable {
         if !crate::path_audit::is_executable_file(&canonical) {
             return Err(TrustedExecutableError::NotExecutable(canonical));
         }
+        let invocation_location = path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf());
         for root in denied_roots {
             let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if path_is_within(&canonical, &canonical_root) {
+            let target_is_denied = path_is_within(&canonical, &canonical_root);
+            let invocation_is_denied = path_is_within(&invocation_location, &canonical_root);
+            if target_is_denied || invocation_is_denied {
                 return Err(TrustedExecutableError::Untrusted {
-                    path: canonical,
+                    path: if target_is_denied {
+                        canonical
+                    } else {
+                        invocation_location
+                    },
                     root: canonical_root,
                 });
             }
@@ -358,6 +372,7 @@ impl TrustedExecutable {
         {
             let identity = validate_unix_executable(&canonical)?;
             Ok(Self {
+                invocation_path: path.to_path_buf(),
                 path: canonical,
                 identity,
             })
@@ -372,6 +387,7 @@ impl TrustedExecutable {
             })?;
             let digest = executable_digest(&canonical)?;
             Ok(Self {
+                invocation_path: path.to_path_buf(),
                 path: canonical,
                 digest,
                 source: _source,
@@ -381,6 +397,7 @@ impl TrustedExecutable {
         {
             let digest = executable_digest(&canonical)?;
             Ok(Self {
+                invocation_path: path.to_path_buf(),
                 path: canonical,
                 digest,
             })
@@ -519,6 +536,13 @@ impl TrustedExecutable {
             }
         }
         Ok(())
+    }
+
+    /// Absolute path selected by the caller/PATH lookup before target
+    /// canonicalization. Multicall tools may execute this path to preserve
+    /// argv[0] semantics after separately binding it to [`Self::path`].
+    pub fn invocation_path(&self) -> &Path {
+        &self.invocation_path
     }
 }
 

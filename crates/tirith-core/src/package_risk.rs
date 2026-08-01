@@ -164,6 +164,12 @@ pub enum ContentSignals {
         has_install_script: bool,
         /// Plain-language note on what install indicator matched, if any.
         install_script_detail: Option<String>,
+        /// Suspicious behavior found by analyzing the locally inspected npm
+        /// lifecycle bodies. `None` means this content type did not expose
+        /// analyzable script text; `Some(default)` means it was analyzed and no
+        /// network/shell behavior matched.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        install_script_signals: Option<InstallScriptSignals>,
         /// Compiled / native binary artifacts were found bundled in the
         /// package directory.
         has_binary_blob: bool,
@@ -363,6 +369,12 @@ pub struct ApiProvenance {
     /// Which registry API the data came from (`"npm"`, `"pypi"`,
     /// `"crates.io"`), for transparency in the explanation.
     pub source: String,
+    /// Canonical package identity returned by the registry. Exact-install
+    /// enforcement binds this to the requested package name in addition to
+    /// source and version, so a same-origin response for another package can
+    /// never authorize the transaction.
+    #[serde(default)]
+    pub package_name: Option<String>,
     /// Age of the package's *first* publication, in whole days, when the
     /// registry reported a creation timestamp.
     pub package_age_days: Option<u64>,
@@ -618,6 +630,7 @@ fn is_version_shaped(s: &str) -> bool {
 /// number. The returned breakdown always satisfies `breakdown.verify()`.
 pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
     let mut factors: Vec<RiskFactor> = Vec::new();
+    let mut local_install_script_signal_fired = false;
 
     // Factor 1 — name vs. popular packages. The dominant term.
     let (name_points, name_label, name_detail) = match &signals.name_vs_popular {
@@ -682,7 +695,7 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
         });
     }
 
-    // Factors 3 & 4 — content signals, only when local content was inspected.
+    // Content factors — only when local content was inspected.
     match &signals.content_signals {
         ContentSignals::NotInspected => {
             // No content factors; recorded via `content_signals`, not a zero factor.
@@ -690,6 +703,7 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
         ContentSignals::Inspected {
             has_install_script,
             install_script_detail,
+            install_script_signals,
             has_binary_blob,
             binary_blob_detail,
             ..
@@ -707,6 +721,24 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
                          malware-delivery vector, contributing {INSTALL_SCRIPT_WEIGHT} points."
                     ),
                 });
+            }
+            if let Some(script_signals) = install_script_signals {
+                if script_signals.fires() {
+                    local_install_script_signal_fired = true;
+                    factors.push(RiskFactor {
+                        id: "content_install_script_network",
+                        label: "Inspected install script makes a network or shell call".to_string(),
+                        points: INSTALL_SCRIPT_NETWORK_WEIGHT as i32,
+                        detail: format!(
+                            "Local install-script analysis matched: net={} shell={} ({} \
+                             pattern(s)). Contributing {} points.",
+                            script_signals.has_network_call,
+                            script_signals.has_shell_spawn,
+                            script_signals.suspicious_patterns.len(),
+                            INSTALL_SCRIPT_NETWORK_WEIGHT,
+                        ),
+                    });
+                }
             }
             if *has_binary_blob {
                 let what = binary_blob_detail
@@ -730,7 +762,14 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
     // registry. Offline / degraded runs add no API factors (state still
     // recorded in `api_signals`).
     if let ApiSignals::Available { provenance } = &signals.api {
-        factors.extend(api_factors(provenance));
+        let mut api = api_factors(provenance);
+        // The same npm hook may be visible both in installed content and in the
+        // exact registry record. Score the behavior once while retaining the
+        // stronger local-content evidence in the serialized breakdown.
+        if local_install_script_signal_fired {
+            api.retain(|factor| factor.id != "api_install_script_network");
+        }
+        factors.extend(api);
     }
 
     // Sum and clamp. An over-100 sum is reported as an explicit negative
@@ -1139,6 +1178,7 @@ mod tests {
             path: "/tmp/node_modules/test-pkg".to_string(),
             has_install_script: true,
             install_script_detail: Some("a postinstall lifecycle script".to_string()),
+            install_script_signals: None,
             has_binary_blob: true,
             binary_blob_detail: Some("a bundled .node native addon".to_string()),
         };
@@ -1152,6 +1192,44 @@ mod tests {
         assert!(b.verify());
         assert!(b.factors.iter().any(|f| f.id == "install_script_present"));
         assert!(b.factors.iter().any(|f| f.id == "binary_blob_present"));
+    }
+
+    #[test]
+    fn local_and_registry_views_of_the_same_script_behavior_score_once() {
+        let script_signals = InstallScriptSignals {
+            has_network_call: true,
+            has_shell_spawn: true,
+            suspicious_patterns: vec!["curl | sh".to_string()],
+        };
+        let mut s = signals(NameVsPopular::KnownPopular);
+        s.content_signals = ContentSignals::Inspected {
+            path: "/tmp/node_modules/test-pkg".to_string(),
+            has_install_script: true,
+            install_script_detail: Some("postinstall".to_string()),
+            install_script_signals: Some(script_signals.clone()),
+            has_binary_blob: false,
+            binary_blob_detail: None,
+        };
+        s.api = ApiSignals::Available {
+            provenance: ApiProvenance {
+                source: "npm".to_string(),
+                install_script_signals: Some(script_signals),
+                ..Default::default()
+            },
+        };
+        let b = score_package(&s);
+        assert_eq!(
+            b.factors
+                .iter()
+                .filter(|factor| factor.id.ends_with("install_script_network"))
+                .count(),
+            1,
+            "the same lifecycle body must not be counted twice"
+        );
+        assert!(b
+            .factors
+            .iter()
+            .any(|factor| factor.id == "content_install_script_network"));
     }
 
     #[test]
@@ -1177,6 +1255,7 @@ mod tests {
             path: "/tmp/p".to_string(),
             has_install_script: true,
             install_script_detail: None,
+            install_script_signals: None,
             has_binary_blob: true,
             binary_blob_detail: None,
         };
@@ -1427,6 +1506,7 @@ mod tests {
                                     path: "/tmp/p".to_string(),
                                     has_install_script: install,
                                     install_script_detail: None,
+                                    install_script_signals: None,
                                     has_binary_blob: blob,
                                     binary_blob_detail: None,
                                 }

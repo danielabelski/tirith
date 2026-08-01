@@ -20,7 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
-use crate::package_risk::{ApiProvenance, ApiSignals, PackageExistence, VERY_NEW_PACKAGE_DAYS};
+use crate::package_risk::{
+    ApiProvenance, ApiSignals, InstallScriptSignals, PackageExistence, VERY_NEW_PACKAGE_DAYS,
+};
 use crate::policy;
 use crate::threatdb::Ecosystem;
 
@@ -40,12 +42,25 @@ const SECONDS_PER_DAY: u64 = 86_400;
 pub struct RegistryMetadata {
     /// Which registry the data came from (`"npm"`, `"pypi"`, `"crates.io"`).
     pub source: String,
+    /// Canonical package identity claimed by the native registry document.
+    /// Older cache entries deserialize as `None` and are deliberately ignored:
+    /// they predate package-name binding and therefore cannot prove identity.
+    #[serde(default)]
+    pub package_name: Option<String>,
     /// Unix epoch seconds of the package's *first* publication, when known.
     pub created_unix: Option<u64>,
     /// Unix epoch seconds of the *latest version*'s publication, when known.
     pub latest_version_unix: Option<u64>,
     /// The latest (most recent) version string, when known.
     pub latest_version: Option<String>,
+    /// The exact version this metadata was requested for. `None` on legacy,
+    /// unbound lookups. Install enforcement only accepts a response when this
+    /// equals the version that the package manager will receive.
+    #[serde(default)]
+    pub selected_version: Option<String>,
+    /// Publication time of [`Self::selected_version`], when known.
+    #[serde(default)]
+    pub selected_version_unix: Option<u64>,
     /// Version before `latest_version` (for the version-jump signal). `None`
     /// when fewer than two versions exist.
     pub previous_version: Option<String>,
@@ -58,8 +73,14 @@ pub struct RegistryMetadata {
     pub recent_downloads: Option<u64>,
     /// A source-repository URL the registry lists for the package, when any.
     pub repository_url: Option<String>,
-    /// `true` when the registry marks the latest version yanked / deprecated.
+    /// `true` when the registry marks the selected version (or latest on an
+    /// unbound lookup) yanked / deprecated.
     pub yanked_or_deprecated: bool,
+    /// Read-only lifecycle-script analysis for the selected npm version.
+    /// `Some(default)` means the exact version was inspected and has no
+    /// suspicious lifecycle hook; `None` means the registry cannot provide it.
+    #[serde(default)]
+    pub install_script_signals: Option<InstallScriptSignals>,
 }
 
 /// Why a registry fetch could not produce usable metadata. Every variant is a
@@ -78,6 +99,8 @@ pub enum FetchError {
     HttpStatus(u16),
     /// The package was not found (HTTP 404).
     NotFound,
+    /// The package exists, but the exact requested version was absent.
+    VersionNotFound(String),
     /// The body could not be parsed as the expected JSON shape.
     BadResponse(String),
     /// The response exceeded [`MAX_RESPONSE_BYTES`].
@@ -108,6 +131,9 @@ impl FetchError {
             FetchError::NotFound => {
                 "the registry has no such package — scored with offline signals only".to_string()
             }
+            FetchError::VersionNotFound(version) => format!(
+                "the registry has no exact version '{version}' — provenance was not reused from a different release"
+            ),
             FetchError::BadResponse(e) => {
                 format!(
                     "the registry response could not be parsed ({e}) — scored with offline \
@@ -127,8 +153,34 @@ impl FetchError {
 /// package-risk reaches (or does not reach) the network. Production uses
 /// [`HttpRegistryClient`]; tests inject a fixture fake.
 pub trait RegistryClient {
-    /// Fetch metadata for `name` in `ecosystem`, or a [`FetchError`].
+    /// Fetch metadata for `name` in `ecosystem`, or a [`FetchError`]. A
+    /// successful result must carry [`RegistryMetadata::package_name`] bound
+    /// to the native registry response; gatherers reject missing/mismatched
+    /// identities, including from test or third-party implementations.
     fn fetch(&self, ecosystem: Ecosystem, name: &str) -> Result<RegistryMetadata, FetchError>;
+
+    /// Fetch metadata bound to one exact version. Implementations that do not
+    /// provide a version-aware endpoint may use the default, which accepts the
+    /// legacy response only when it explicitly names the requested release.
+    fn fetch_exact(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<RegistryMetadata, FetchError> {
+        let mut metadata = self.fetch(ecosystem, name)?;
+        if metadata.selected_version.as_deref() == Some(version)
+            || metadata.latest_version.as_deref() == Some(version)
+        {
+            metadata.selected_version = Some(version.to_string());
+            if metadata.selected_version_unix.is_none() {
+                metadata.selected_version_unix = metadata.latest_version_unix;
+            }
+            Ok(metadata)
+        } else {
+            Err(FetchError::VersionNotFound(version.to_string()))
+        }
+    }
 }
 
 /// Gather registry-API provenance, returning [`ApiSignals`] AND
@@ -141,7 +193,43 @@ pub fn gather_api_signals(
     ecosystem: Ecosystem,
     name: &str,
 ) -> (ApiSignals, PackageExistence) {
-    match client.fetch(ecosystem, name) {
+    gather_api_signals_result(client.fetch(ecosystem, name), ecosystem, name, true)
+}
+
+/// Version-bound registry provenance for an install. A successful result is
+/// accepted only for `version`; metadata for latest or another release is never
+/// substituted. The package existence remains `Exists` when only the requested
+/// version is absent.
+pub fn gather_api_signals_exact(
+    client: &dyn RegistryClient,
+    ecosystem: Ecosystem,
+    name: &str,
+    version: &str,
+) -> (ApiSignals, PackageExistence) {
+    gather_api_signals_result(
+        client.fetch_exact(ecosystem, name, version),
+        ecosystem,
+        name,
+        false,
+    )
+}
+
+fn gather_api_signals_result(
+    result: Result<RegistryMetadata, FetchError>,
+    ecosystem: Ecosystem,
+    name: &str,
+    record_history: bool,
+) -> (ApiSignals, PackageExistence) {
+    match result {
+        Ok(meta) if !metadata_identity_matches(&meta, ecosystem, name) => (
+            ApiSignals::unavailable(
+                FetchError::BadResponse(
+                    "registry response package identity did not match the request".to_string(),
+                )
+                .reason(),
+            ),
+            PackageExistence::Unknown,
+        ),
         Ok(meta) => {
             // M6 ch6 — record a snapshot from this response (no extra request).
             let maintainers: Vec<crate::package_risk::MaintainerRef> = meta
@@ -155,13 +243,15 @@ pub fn gather_api_signals(
                         .collect()
                 })
                 .unwrap_or_default();
-            let _ = crate::registry_history::record_snapshot_with_maintainers(
-                ecosystem,
-                name,
-                maintainers,
-                meta.latest_version.clone(),
-                meta.repository_url.clone(),
-            );
+            if record_history {
+                let _ = crate::registry_history::record_snapshot_with_maintainers(
+                    ecosystem,
+                    name,
+                    maintainers,
+                    meta.latest_version.clone(),
+                    meta.repository_url.clone(),
+                );
+            }
 
             let mut provenance = provenance_from_metadata(&meta);
             provenance.package_existence = PackageExistence::Exists;
@@ -173,6 +263,10 @@ pub fn gather_api_signals(
         Err(FetchError::NotFound) => (
             ApiSignals::unavailable(FetchError::NotFound.reason()),
             PackageExistence::NotFound,
+        ),
+        Err(error @ FetchError::VersionNotFound(_)) => (
+            ApiSignals::unavailable(error.reason()),
+            PackageExistence::Exists,
         ),
         Err(e) => (
             ApiSignals::unavailable(e.reason()),
@@ -190,7 +284,8 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
         .created_unix
         .map(|t| now.saturating_sub(t) / SECONDS_PER_DAY);
     let latest_version_age_days = meta
-        .latest_version_unix
+        .selected_version_unix
+        .or(meta.latest_version_unix)
         .map(|t| now.saturating_sub(t) / SECONDS_PER_DAY);
 
     // Ownership signal — assessed only when the registry exposes maintainers
@@ -208,7 +303,11 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
         },
     };
 
-    let version_spike = match (&meta.latest_version, &meta.previous_version) {
+    let selected_or_latest = meta
+        .selected_version
+        .as_ref()
+        .or(meta.latest_version.as_ref());
+    let version_spike = match (selected_or_latest, &meta.previous_version) {
         (Some(latest), Some(prev)) => Some(is_version_spike(prev, latest)),
         _ => None,
     };
@@ -228,6 +327,7 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
     #[allow(deprecated)] // M6 ch6 grace period
     ApiProvenance {
         source: meta.source.clone(),
+        package_name: meta.package_name.clone(),
         package_age_days,
         latest_version_age_days,
         ownership_transferred,
@@ -235,7 +335,11 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
         recent_downloads: meta.recent_downloads,
         has_source_repo,
         yanked_or_deprecated: meta.yanked_or_deprecated,
-        latest_version: meta.latest_version.clone(),
+        latest_version: meta
+            .selected_version
+            .clone()
+            .or_else(|| meta.latest_version.clone()),
+        install_script_signals: meta.install_script_signals.clone(),
         repository_url,
         ..Default::default()
     }
@@ -343,26 +447,31 @@ impl HttpRegistryClient {
             npm_base: base.to_string(),
             pypi_base: base.to_string(),
             crates_base: base.to_string(),
-            enforce_destination_guard: false,
+            // The private-destination bypass exists only in debug/test builds;
+            // release artifacts keep the production SSRF boundary even if a
+            // downstream caller reaches this test-oriented constructor.
+            enforce_destination_guard: !cfg!(debug_assertions),
             ..Self::default()
         }
     }
 
     /// GET `url` and return the body, capped at [`MAX_RESPONSE_BYTES`].
     fn get_json_bytes(&self, url: &str) -> Result<Vec<u8>, FetchError> {
-        let builder = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .timeout(self.timeout);
-        let builder = if self.enforce_destination_guard {
+        let parsed = url::Url::parse(url).map_err(|e| FetchError::Network(e.to_string()))?;
+        if self.enforce_destination_guard {
             crate::url_validate::validate_server_url(url).map_err(FetchError::Network)?;
-            builder
-                .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
-                .redirect(crate::ssrf_guard::server_redirect_policy())
-        } else {
-            // Local mock transport only. Refuse redirects so the explicit test
-            // seam cannot unexpectedly contact a second destination.
-            builder.redirect(reqwest::redirect::Policy::none())
-        };
+        }
+
+        let mut builder = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(self.timeout)
+            .redirect(registry_redirect_policy(
+                &parsed,
+                !self.enforce_destination_guard,
+            ));
+        if self.enforce_destination_guard {
+            builder = builder.dns_resolver(crate::ssrf_guard::ssrf_guard_resolver());
+        }
         let client = builder
             .build()
             .map_err(|e| FetchError::Network(e.to_string()))?;
@@ -405,8 +514,73 @@ impl HttpRegistryClient {
     }
 }
 
+/// Registry metadata redirects are stricter than general server redirects:
+/// every target must remain on the exact validated origin. This prevents a
+/// public registry (or an open redirect on it) from changing the provenance
+/// authority even when the destination itself is public.
+fn registry_redirect_policy(
+    initial: &url::Url,
+    allow_private_test_base: bool,
+) -> reqwest::redirect::Policy {
+    let initial = initial.clone();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        match registry_redirect_decision(
+            &initial,
+            attempt.url(),
+            attempt.previous().len(),
+            allow_private_test_base,
+        ) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
+        }
+    })
+}
+
+fn registry_redirect_decision(
+    initial: &url::Url,
+    target: &url::Url,
+    prior_hops: usize,
+    allow_private_test_base: bool,
+) -> Result<(), String> {
+    const MAX_REDIRECTS: usize = 5;
+    if prior_hops >= MAX_REDIRECTS {
+        return Err("too many registry redirects".to_string());
+    }
+    if !allow_private_test_base {
+        crate::ssrf_guard::server_redirect_decision(target.as_str(), prior_hops)?;
+    }
+    let same_origin = initial.scheme() == target.scheme()
+        && initial.host_str().map(str::to_ascii_lowercase)
+            == target.host_str().map(str::to_ascii_lowercase)
+        && initial.port_or_known_default() == target.port_or_known_default();
+    if !same_origin {
+        return Err("registry redirect changed the validated origin".to_string());
+    }
+    Ok(())
+}
+
 impl RegistryClient for HttpRegistryClient {
     fn fetch(&self, ecosystem: Ecosystem, name: &str) -> Result<RegistryMetadata, FetchError> {
+        self.fetch_version(ecosystem, name, None)
+    }
+
+    fn fetch_exact(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<RegistryMetadata, FetchError> {
+        self.fetch_version(ecosystem, name, Some(version))
+    }
+}
+
+impl HttpRegistryClient {
+    fn fetch_version(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        exact_version: Option<&str>,
+    ) -> Result<RegistryMetadata, FetchError> {
         // Reject an unsafe name BEFORE any URL is built. `name` can come from
         // untrusted manifest content (`ecosystem scan --online`), and a `..`
         // segment would be normalized into a GET against an arbitrary same-host
@@ -416,20 +590,25 @@ impl RegistryClient for HttpRegistryClient {
         }
 
         if self.use_cache {
-            if let Some(cached) = load_cache(ecosystem, name) {
-                return Ok(cached);
+            if let Some(cached) = load_cache(ecosystem, name, exact_version) {
+                // Cache entries written before package-identity binding have no
+                // native name. Ignore them and refresh instead of treating a
+                // path-key match as proof about the cached response body.
+                if metadata_identity_matches(&cached, ecosystem, name) {
+                    return Ok(cached);
+                }
             }
         }
 
         let meta = match ecosystem {
-            Ecosystem::Npm => fetch_npm(self, name)?,
-            Ecosystem::PyPI => fetch_pypi(self, name)?,
-            Ecosystem::Crates => fetch_crates(self, name)?,
+            Ecosystem::Npm => fetch_npm(self, name, exact_version)?,
+            Ecosystem::PyPI => fetch_pypi(self, name, exact_version)?,
+            Ecosystem::Crates => fetch_crates(self, name, exact_version)?,
             other => return Err(FetchError::UnsupportedEcosystem(other)),
         };
 
         if self.use_cache {
-            store_cache(ecosystem, name, &meta);
+            store_cache(ecosystem, name, exact_version, &meta);
         }
         Ok(meta)
     }
@@ -439,11 +618,21 @@ impl RegistryClient for HttpRegistryClient {
 
 /// Fetch and normalize an npm "full" package document (`time`, `versions`,
 /// `maintainers`, `dist-tags.latest`, per-version `deprecated`).
-fn fetch_npm(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata, FetchError> {
+fn fetch_npm(
+    client: &HttpRegistryClient,
+    name: &str,
+    exact_version: Option<&str>,
+) -> Result<RegistryMetadata, FetchError> {
     let url = format!("{}/{}", client.npm_base, url_path_segment(name));
     let bytes = client.get_json_bytes(&url)?;
     let doc: NpmDoc =
         serde_json::from_slice(&bytes).map_err(|e| FetchError::BadResponse(e.to_string()))?;
+    if !registry_names_match(Ecosystem::Npm, name, &doc.name) {
+        return Err(FetchError::BadResponse(format!(
+            "npm response identified package '{}' instead of '{}'",
+            doc.name, name
+        )));
+    }
 
     let latest_version = doc
         .dist_tags
@@ -461,24 +650,39 @@ fn fetch_npm(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata
         .and_then(|v| doc.time.as_ref().and_then(|t| t.get(v)))
         .and_then(|s| parse_rfc3339_to_unix(s));
 
-    let previous_version = latest_version
+    let selected_version = exact_version
+        .map(str::to_string)
+        .or_else(|| latest_version.clone());
+    let selected_record = selected_version.as_ref().and_then(|v| doc.versions.get(v));
+    if exact_version.is_some() && selected_record.is_none() {
+        return Err(FetchError::VersionNotFound(
+            exact_version.unwrap_or_default().to_string(),
+        ));
+    }
+    let selected_version_unix = selected_version
         .as_ref()
-        .and_then(|latest| previous_version_key(doc.versions.keys(), latest));
+        .and_then(|v| doc.time.as_ref().and_then(|t| t.get(v)))
+        .and_then(|s| parse_rfc3339_to_unix(s));
+    let previous_version = selected_version
+        .as_ref()
+        .and_then(|selected| previous_version_key(doc.versions.keys(), selected));
 
-    // Deprecated when the latest version object has a non-empty `deprecated`.
-    let yanked_or_deprecated = latest_version
-        .as_ref()
-        .and_then(|v| doc.versions.get(v))
-        .map(|vd| vd.deprecated_present())
+    // Deprecated when the selected version object has a non-empty marker.
+    let yanked_or_deprecated = selected_record
+        .map(NpmVersion::deprecated_present)
         .unwrap_or(false);
+    let install_script_signals = selected_record.map(NpmVersion::install_script_signals);
 
     let repository_url = doc.repository.as_ref().and_then(|r| r.url_field());
 
     Ok(RegistryMetadata {
         source: "npm".to_string(),
+        package_name: Some(canonical_registry_name(Ecosystem::Npm, &doc.name)),
         created_unix,
         latest_version_unix,
         latest_version,
+        selected_version,
+        selected_version_unix,
         previous_version,
         // npm exposes `maintainers` → `Some` (an empty list is a real signal).
         maintainers: Some(doc.maintainers.into_iter().filter_map(|m| m.name).collect()),
@@ -486,11 +690,13 @@ fn fetch_npm(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata
         recent_downloads: None,
         repository_url,
         yanked_or_deprecated,
+        install_script_signals,
     })
 }
 
 #[derive(Debug, Deserialize)]
 struct NpmDoc {
+    name: String,
     #[serde(rename = "dist-tags")]
     dist_tags: Option<NpmDistTags>,
     #[serde(default)]
@@ -511,6 +717,8 @@ struct NpmDistTags {
 struct NpmVersion {
     /// `deprecated` is `false`/absent normally, or a string message when set.
     deprecated: Option<serde_json::Value>,
+    #[serde(default)]
+    scripts: std::collections::BTreeMap<String, String>,
 }
 
 impl NpmVersion {
@@ -522,6 +730,19 @@ impl NpmVersion {
             Some(serde_json::Value::Null) => false,
             Some(_) => true,
         }
+    }
+
+    fn install_script_signals(&self) -> InstallScriptSignals {
+        let mut script_text = String::new();
+        for hook in ["preinstall", "install", "postinstall", "prepare"] {
+            if let Some(body) = self.scripts.get(hook) {
+                if !body.trim().is_empty() {
+                    script_text.push_str(body);
+                    script_text.push('\n');
+                }
+            }
+        }
+        crate::install_script_analysis::analyze_script_text(&script_text)
     }
 }
 
@@ -552,17 +773,40 @@ impl NpmRepository {
 
 /// Fetch and normalize from the PyPI JSON API (`info` with `version`/`yanked`/
 /// `project_urls`, and a `releases` map of file records with upload times).
-fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata, FetchError> {
+fn fetch_pypi(
+    client: &HttpRegistryClient,
+    name: &str,
+    exact_version: Option<&str>,
+) -> Result<RegistryMetadata, FetchError> {
     let url = format!("{}/pypi/{}/json", client.pypi_base, url_path_segment(name));
     let bytes = client.get_json_bytes(&url)?;
     let doc: PypiDoc =
         serde_json::from_slice(&bytes).map_err(|e| FetchError::BadResponse(e.to_string()))?;
+    if !registry_names_match(Ecosystem::PyPI, name, &doc.info.name) {
+        return Err(FetchError::BadResponse(format!(
+            "PyPI response identified package '{}' instead of '{}'",
+            doc.info.name, name
+        )));
+    }
 
     let latest_version = doc.info.version.clone();
+    let selected_version = exact_version
+        .map(str::to_string)
+        .or_else(|| latest_version.clone());
+    // Tirith stores PEP 440 exact intent under its comparison identity (for
+    // example `2.31.0` and `2.31` compare equal), while the PyPI document keeps
+    // the registry's concrete release-key spelling. Bind the request to one
+    // unique equivalent key instead of requiring lossy string equality.
+    let selected_release_key = match exact_version {
+        Some(version) => matching_pypi_release_key(doc.releases.keys(), version)?
+            .ok_or_else(|| FetchError::VersionNotFound(version.to_string()))?,
+        None => latest_version.clone().unwrap_or_default(),
+    };
 
     // First publication = earliest upload time across all releases.
     let mut earliest: Option<u64> = None;
     let mut latest_ver_unix: Option<u64> = None;
+    let mut selected_ver_unix: Option<u64> = None;
     for (ver, files) in &doc.releases {
         for f in files {
             if let Some(t) = f
@@ -574,21 +818,26 @@ fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadat
                 if Some(ver) == latest_version.as_ref() {
                     latest_ver_unix = Some(latest_ver_unix.map_or(t, |e| e.max(t)));
                 }
+                if ver == &selected_release_key {
+                    selected_ver_unix = Some(selected_ver_unix.map_or(t, |e| e.max(t)));
+                }
             }
         }
     }
 
-    let previous_version = latest_version
-        .as_ref()
-        .and_then(|latest| previous_version_key(doc.releases.keys(), latest));
+    let previous_version = previous_version_key(doc.releases.keys(), &selected_release_key);
 
     // Yanked when `info.yanked`, or every file of the latest release is yanked.
-    let latest_files_yanked = latest_version
-        .as_ref()
-        .and_then(|v| doc.releases.get(v))
+    let selected_files_yanked = doc
+        .releases
+        .get(&selected_release_key)
         .map(|files| !files.is_empty() && files.iter().all(|f| f.yanked.unwrap_or(false)))
         .unwrap_or(false);
-    let yanked_or_deprecated = doc.info.yanked.unwrap_or(false) || latest_files_yanked;
+    let yanked_or_deprecated = if exact_version.is_some() {
+        selected_files_yanked
+    } else {
+        doc.info.yanked.unwrap_or(false) || selected_files_yanked
+    };
 
     // Prefer a `project_urls` entry naming a source repo; fall back to home_page.
     let repository_url = doc
@@ -600,15 +849,19 @@ fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadat
 
     Ok(RegistryMetadata {
         source: "pypi".to_string(),
+        package_name: Some(canonical_registry_name(Ecosystem::PyPI, &doc.info.name)),
         created_unix: earliest,
         latest_version_unix: latest_ver_unix,
         latest_version,
+        selected_version,
+        selected_version_unix: selected_ver_unix,
         previous_version,
         // PyPI's JSON API exposes no maintainers / downloads → `None` (unknown).
         maintainers: None,
         recent_downloads: None,
         repository_url,
         yanked_or_deprecated,
+        install_script_signals: None,
     })
 }
 
@@ -621,10 +874,35 @@ struct PypiDoc {
 
 #[derive(Debug, Deserialize)]
 struct PypiInfo {
+    name: String,
     version: Option<String>,
     yanked: Option<bool>,
     home_page: Option<String>,
     project_urls: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Resolve one exact PEP 440 comparison identity to the registry document's
+/// concrete release key. Multiple equivalent keys are an ambiguous response
+/// and therefore fail closed rather than choosing attacker-controlled order.
+fn matching_pypi_release_key<'a, I>(keys: I, requested: &str) -> Result<Option<String>, FetchError>
+where
+    I: Iterator<Item = &'a String>,
+{
+    let Some(requested) = crate::version_intent::canonical_pep440_version(requested) else {
+        return Ok(None);
+    };
+    let mut matched = None;
+    for key in keys {
+        if crate::version_intent::canonical_pep440_version(key).as_ref() == Some(&requested) {
+            if matched.is_some() {
+                return Err(FetchError::BadResponse(
+                    "PyPI response contained ambiguous equivalent release keys".to_string(),
+                ));
+            }
+            matched = Some(key.clone());
+        }
+    }
+    Ok(matched)
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,7 +933,11 @@ fn pick_repo_url(urls: &std::collections::BTreeMap<String, String>) -> Option<St
 
 /// Fetch and normalize a crate from the crates.io API (a `crate` object +
 /// `versions` array of `{num, created_at, yanked}`).
-fn fetch_crates(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata, FetchError> {
+fn fetch_crates(
+    client: &HttpRegistryClient,
+    name: &str,
+    exact_version: Option<&str>,
+) -> Result<RegistryMetadata, FetchError> {
     let url = format!(
         "{}/api/v1/crates/{}",
         client.crates_base,
@@ -664,6 +946,12 @@ fn fetch_crates(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetad
     let bytes = client.get_json_bytes(&url)?;
     let doc: CratesDoc =
         serde_json::from_slice(&bytes).map_err(|e| FetchError::BadResponse(e.to_string()))?;
+    if !registry_names_match(Ecosystem::Crates, name, &doc.krate.id) {
+        return Err(FetchError::BadResponse(format!(
+            "crates.io response identified package '{}' instead of '{}'",
+            doc.krate.id, name
+        )));
+    }
 
     let created_unix = doc
         .krate
@@ -672,6 +960,9 @@ fn fetch_crates(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetad
         .and_then(parse_rfc3339_to_unix);
 
     let latest_version = doc.krate.newest_version.clone();
+    let selected_version = exact_version
+        .map(str::to_string)
+        .or_else(|| latest_version.clone());
 
     // Latest version's publish time + yanked flag from `versions`.
     let latest_ver = latest_version
@@ -683,22 +974,43 @@ fn fetch_crates(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetad
     let yanked_or_deprecated = latest_ver
         .map(|cv| cv.yanked.unwrap_or(false))
         .unwrap_or(false);
+    let selected_ver = selected_version
+        .as_ref()
+        .and_then(|v| doc.versions.iter().find(|cv| cv.num.as_ref() == Some(v)));
+    if exact_version.is_some() && selected_ver.is_none() {
+        return Err(FetchError::VersionNotFound(
+            exact_version.unwrap_or_default().to_string(),
+        ));
+    }
+    let selected_version_unix = selected_ver
+        .and_then(|cv| cv.created_at.as_deref())
+        .and_then(parse_rfc3339_to_unix);
+    let yanked_or_deprecated = selected_ver
+        .map(|cv| cv.yanked.unwrap_or(false))
+        .unwrap_or(yanked_or_deprecated);
 
-    let previous_version = latest_version.as_ref().and_then(|latest| {
-        previous_version_key(doc.versions.iter().filter_map(|cv| cv.num.as_ref()), latest)
+    let previous_version = selected_version.as_ref().and_then(|selected| {
+        previous_version_key(
+            doc.versions.iter().filter_map(|cv| cv.num.as_ref()),
+            selected,
+        )
     });
 
     Ok(RegistryMetadata {
         source: "crates.io".to_string(),
+        package_name: Some(canonical_registry_name(Ecosystem::Crates, &doc.krate.id)),
         created_unix,
         latest_version_unix,
         latest_version,
+        selected_version,
+        selected_version_unix,
         previous_version,
         // Owners are a separate endpoint → `maintainers: None` (unknown).
         maintainers: None,
         recent_downloads: doc.krate.downloads,
         repository_url: doc.krate.repository,
         yanked_or_deprecated,
+        install_script_signals: None,
     })
 }
 
@@ -712,6 +1024,7 @@ struct CratesDoc {
 
 #[derive(Debug, Deserialize)]
 struct CratesCrate {
+    id: String,
     created_at: Option<String>,
     newest_version: Option<String>,
     downloads: Option<u64>,
@@ -728,6 +1041,47 @@ struct CratesVersion {
 // ===========================================================================
 // shared helpers
 // ===========================================================================
+
+/// Registry-native canonical package identity. PyPI follows PEP 503 by
+/// lowercasing and collapsing runs of `-`, `_`, and `.`. npm and crates.io
+/// identities are compared case-insensitively but otherwise remain distinct.
+pub(crate) fn canonical_registry_name(ecosystem: Ecosystem, name: &str) -> String {
+    match ecosystem {
+        Ecosystem::PyPI => {
+            let mut normalized = String::with_capacity(name.len());
+            let mut in_separator = false;
+            for ch in name.chars().flat_map(char::to_lowercase) {
+                if matches!(ch, '-' | '_' | '.') {
+                    if !in_separator {
+                        normalized.push('-');
+                    }
+                    in_separator = true;
+                } else {
+                    normalized.push(ch);
+                    in_separator = false;
+                }
+            }
+            normalized
+        }
+        Ecosystem::Npm | Ecosystem::Crates => name.to_ascii_lowercase(),
+        _ => name.to_string(),
+    }
+}
+
+fn registry_names_match(ecosystem: Ecosystem, requested: &str, returned: &str) -> bool {
+    canonical_registry_name(ecosystem, requested) == canonical_registry_name(ecosystem, returned)
+}
+
+fn metadata_identity_matches(
+    metadata: &RegistryMetadata,
+    ecosystem: Ecosystem,
+    requested: &str,
+) -> bool {
+    metadata
+        .package_name
+        .as_deref()
+        .is_some_and(|returned| registry_names_match(ecosystem, requested, returned))
+}
 
 /// Whether `name` can be safely interpolated into a registry URL path. A
 /// SECURITY gate (not a full validator): rejects a `.`/`..` segment (which a
@@ -828,9 +1182,9 @@ struct CacheEnvelope {
 }
 
 /// Cache file path for a package, under the tirith state dir.
-fn cache_path(ecosystem: Ecosystem, name: &str) -> Option<PathBuf> {
+fn cache_path(ecosystem: Ecosystem, name: &str, exact_version: Option<&str>) -> Option<PathBuf> {
     let state = policy::state_dir()?;
-    let key = format!("{ecosystem}:{name}");
+    let key = format!("{ecosystem}:{name}:{}", exact_version.unwrap_or("<latest>"));
     let digest = sha2::Sha256::digest(key.as_bytes());
     let hex: String = hex::encode(&digest[..16]);
     Some(
@@ -841,8 +1195,12 @@ fn cache_path(ecosystem: Ecosystem, name: &str) -> Option<PathBuf> {
 }
 
 /// Load a cached `RegistryMetadata` if one exists and is within the TTL.
-fn load_cache(ecosystem: Ecosystem, name: &str) -> Option<RegistryMetadata> {
-    let path = cache_path(ecosystem, name)?;
+fn load_cache(
+    ecosystem: Ecosystem,
+    name: &str,
+    exact_version: Option<&str>,
+) -> Option<RegistryMetadata> {
+    let path = cache_path(ecosystem, name, exact_version)?;
     let content = std::fs::read_to_string(path).ok()?;
     let envelope: CacheEnvelope = serde_json::from_str(&content).ok()?;
     if unix_now().saturating_sub(envelope.fetched_at) > CACHE_TTL_SECS {
@@ -853,8 +1211,13 @@ fn load_cache(ecosystem: Ecosystem, name: &str) -> Option<RegistryMetadata> {
 
 /// Store a fetched `RegistryMetadata` in the cache. Best-effort (I/O errors
 /// ignored — the cache is a performance convenience).
-fn store_cache(ecosystem: Ecosystem, name: &str, value: &RegistryMetadata) {
-    let Some(path) = cache_path(ecosystem, name) else {
+fn store_cache(
+    ecosystem: Ecosystem,
+    name: &str,
+    exact_version: Option<&str>,
+    value: &RegistryMetadata,
+) {
+    let Some(path) = cache_path(ecosystem, name, exact_version) else {
         return;
     };
     let Some(parent) = path.parent() else {
@@ -935,6 +1298,7 @@ mod tests {
     fn meta_clean() -> RegistryMetadata {
         RegistryMetadata {
             source: "npm".to_string(),
+            package_name: Some("react".to_string()),
             created_unix: Some(unix_now() - 3650 * SECONDS_PER_DAY),
             latest_version_unix: Some(unix_now() - 365 * SECONDS_PER_DAY),
             latest_version: Some("4.18.2".to_string()),
@@ -943,6 +1307,7 @@ mod tests {
             recent_downloads: Some(5_000_000),
             repository_url: Some("https://github.com/owner/repo".to_string()),
             yanked_or_deprecated: false,
+            ..Default::default()
         }
     }
 
@@ -983,6 +1348,40 @@ mod tests {
             PackageExistence::NotFound,
             "404 must surface as NotFound, distinct from Unknown"
         );
+    }
+
+    #[test]
+    fn exact_lookup_never_reuses_different_latest_version() {
+        let mut metadata = meta_clean();
+        metadata.latest_version = Some("2.0.0".to_string());
+        let client = FakeClient {
+            result: Ok(metadata),
+        };
+        let (signals, existence) =
+            gather_api_signals_exact(&client, Ecosystem::Npm, "demo", "1.0.0");
+        assert!(matches!(signals, ApiSignals::Unavailable { .. }));
+        assert_eq!(existence, PackageExistence::Exists);
+    }
+
+    #[test]
+    fn registry_redirects_stay_on_validated_origin_and_under_cap() {
+        let initial = url::Url::parse("https://registry.npmjs.org/demo").unwrap();
+        let same_origin = url::Url::parse("https://registry.npmjs.org/demo-2").unwrap();
+        assert!(registry_redirect_decision(&initial, &same_origin, 4, true).is_ok());
+
+        let cross_origin = url::Url::parse("https://example.com/demo").unwrap();
+        assert!(registry_redirect_decision(&initial, &cross_origin, 0, true).is_err());
+
+        let insecure = url::Url::parse("http://registry.npmjs.org/demo").unwrap();
+        assert!(registry_redirect_decision(&initial, &insecure, 0, true).is_err());
+        assert!(registry_redirect_decision(&initial, &same_origin, 5, true).is_err());
+    }
+
+    #[test]
+    fn registry_redirect_rejects_loopback_in_production_mode() {
+        let initial = url::Url::parse("https://registry.npmjs.org/demo").unwrap();
+        let loopback = url::Url::parse("http://127.0.0.1/metadata").unwrap();
+        assert!(registry_redirect_decision(&initial, &loopback, 0, false).is_err());
     }
 
     #[test]
@@ -1124,6 +1523,7 @@ mod tests {
     #[test]
     fn npm_doc_parses_real_shape() {
         let json = r#"{
+            "name": "demo",
             "dist-tags": { "latest": "2.0.0" },
             "time": {
                 "created": "2020-01-01T00:00:00.000Z",
@@ -1148,6 +1548,7 @@ mod tests {
     fn pypi_doc_parses_real_shape() {
         let json = r#"{
             "info": {
+                "name": "demo",
                 "version": "3.1.0",
                 "yanked": false,
                 "home_page": "",
@@ -1168,9 +1569,28 @@ mod tests {
     }
 
     #[test]
+    fn pypi_exact_lookup_binds_canonical_intent_to_concrete_release_key() {
+        let keys = ["2.30.0".to_string(), "2.31.0".to_string()];
+        assert_eq!(
+            matching_pypi_release_key(keys.iter(), "2.31").unwrap(),
+            Some("2.31.0".to_string())
+        );
+    }
+
+    #[test]
+    fn pypi_exact_lookup_rejects_ambiguous_equivalent_release_keys() {
+        let keys = ["2.31".to_string(), "2.31.0".to_string()];
+        assert!(matches!(
+            matching_pypi_release_key(keys.iter(), "2.31.0"),
+            Err(FetchError::BadResponse(_))
+        ));
+    }
+
+    #[test]
     fn crates_doc_parses_real_shape() {
         let json = r#"{
             "crate": {
+                "id": "demo",
                 "created_at": "2019-05-01T00:00:00.000000+00:00",
                 "newest_version": "1.4.0",
                 "downloads": 1234567,
@@ -1207,6 +1627,26 @@ mod tests {
         assert!(is_safe_registry_name("some-crate_name"));
         // A `..` substring without a surrounding `/` is a name component, kept.
         assert!(is_safe_registry_name("a..b"));
+    }
+
+    #[test]
+    fn registry_native_names_use_ecosystem_canonical_identity() {
+        assert!(registry_names_match(
+            Ecosystem::Npm,
+            "@Scope/Package",
+            "@scope/package"
+        ));
+        assert!(registry_names_match(
+            Ecosystem::PyPI,
+            "Demo_Package.Name",
+            "demo-package-name"
+        ));
+        assert!(registry_names_match(Ecosystem::Crates, "Serde", "serde"));
+        assert!(!registry_names_match(
+            Ecosystem::Crates,
+            "serde-json",
+            "serde_json"
+        ));
     }
 
     #[test]
@@ -1290,6 +1730,11 @@ mod tests {
         assert_eq!(
             env.value.maintainers,
             Some(vec!["alice".to_string(), "bob".to_string()])
+        );
+        assert_eq!(env.value.package_name, None);
+        assert!(
+            !metadata_identity_matches(&env.value, Ecosystem::Npm, "react"),
+            "pre-binding cache entries must be refreshed, never accepted by path alone"
         );
 
         // An envelope with no `maintainers` field defaults to `None`.

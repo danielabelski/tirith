@@ -212,6 +212,41 @@ fn supervisor_refuses_executable_identity_drift_before_spawn() {
 }
 
 #[test]
+fn trusted_lookup_retains_a_multicall_symlink_separately_from_its_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let installed = temp.path().join("installed-bin");
+    std::fs::create_dir(&installed).unwrap();
+    let target = installed.join("rustup");
+    make_executable(&target, "#!/bin/sh\nexit 0\n");
+    let proxy = installed.join("cargo");
+    std::os::unix::fs::symlink(&target, &proxy).unwrap();
+    let path = std::env::join_paths([&installed]).unwrap();
+
+    let executable = TrustedExecutable::resolve_on_path("cargo", &path, &[]).unwrap();
+    assert_eq!(executable.invocation_path(), proxy);
+    assert_eq!(executable.path(), target.canonicalize().unwrap());
+}
+
+#[test]
+fn trusted_lookup_rejects_a_proxy_link_inside_a_denied_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let denied = temp.path().join("repo-bin");
+    let installed = temp.path().join("installed-bin");
+    std::fs::create_dir(&denied).unwrap();
+    std::fs::create_dir(&installed).unwrap();
+    let target = installed.join("rustup");
+    make_executable(&target, "#!/bin/sh\nexit 0\n");
+    let proxy = denied.join("cargo");
+    std::os::unix::fs::symlink(&target, &proxy).unwrap();
+    let path = std::env::join_paths([&denied]).unwrap();
+
+    let error = TrustedExecutable::resolve_on_path("cargo", &path, std::slice::from_ref(&denied))
+        .unwrap_err();
+    assert!(error.to_string().contains(&proxy.display().to_string()));
+    assert!(error.to_string().contains(&denied.display().to_string()));
+}
+
+#[test]
 fn supervisor_preserves_short_legitimate_output_and_status() {
     let args = [OsStr::new("-c"), OsStr::new("printf legitimate")];
     let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 64, 64));

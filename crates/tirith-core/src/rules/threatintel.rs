@@ -190,15 +190,44 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // VCS / URL / local path installs aren't registry packages — skip.
-        if arg.contains("://") || lower.starts_with("git+") {
+        // PEP 508 evaluates the requirement before the optional environment
+        // marker. Registry identity and version scoring must therefore ignore
+        // the `; marker` suffix just as pip does. Do this before URL/local-path
+        // classification too: marker expressions can themselves contain `/`
+        // and must not make an ordinary registry requirement disappear.
+        // The shell tokenizer used by `tirith check` can retain a matching
+        // outer quote pair around a complex requirement, whereas the install
+        // CLI's exact argv has already had shell quoting removed. Normalize
+        // that tokenizer representation before splitting the PEP 508 marker.
+        let requirement_arg = arg.trim();
+        let requirement_arg = requirement_arg
+            .strip_prefix('\'')
+            .and_then(|inner| inner.strip_suffix('\''))
+            .or_else(|| {
+                requirement_arg
+                    .strip_prefix('"')
+                    .and_then(|inner| inner.strip_suffix('"'))
+            })
+            .unwrap_or(requirement_arg);
+        let pkg_str = requirement_arg
+            .split_once(';')
+            .map_or(requirement_arg, |(requirement, _)| requirement)
+            .trim();
+        if pkg_str.is_empty() {
             continue;
         }
-        if arg.contains('/') || arg.contains('\\') || arg.starts_with('.') {
-            continue;
-        }
+        let lower_pkg = pkg_str.to_ascii_lowercase();
 
-        let pkg_str = arg.as_str();
+        // VCS / URL / PEP 508 direct-reference / local-path installs aren't
+        // registry packages. PyPI distribution names cannot contain `@`, so
+        // retaining one here would falsely score a direct source as a registry
+        // identity (including schemeless VCS refs such as `git+ssh:host/repo`).
+        if pkg_str.contains("://") || lower_pkg.starts_with("git+") || pkg_str.contains('@') {
+            continue;
+        }
+        if pkg_str.contains('/') || pkg_str.contains('\\') || pkg_str.starts_with('.') {
+            continue;
+        }
 
         // Strip extras: `foo[bar,baz]==1.0` -> name=`foo`, rest=`==1.0`.
         let (name_part, rest) = if let Some(bracket_pos) = pkg_str.find('[') {
@@ -224,6 +253,24 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                 (pkg_str, "")
             }
         };
+
+        // PEP 508 permits whitespace around a specifier, and accepts the
+        // legacy parenthesized form (`name (==1.2.3)`). Normalize only this
+        // grammar punctuation; the original argv remains untouched for
+        // execution, coverage labels, JSON, and audit records.
+        let mut name_part = name_part.trim();
+        let mut rest = rest.trim();
+        if let Some(inner) = rest
+            .strip_prefix('(')
+            .and_then(|inner| inner.strip_suffix(')'))
+        {
+            rest = inner.trim();
+        } else if let (Some(name), Some(specifier)) =
+            (name_part.strip_suffix('('), rest.strip_suffix(')'))
+        {
+            name_part = name.trim_end();
+            rest = specifier.trim_end();
+        }
 
         if name_part.is_empty() {
             continue;
@@ -1320,6 +1367,54 @@ mod tests {
     }
 
     #[test]
+    fn pip_install_strips_pep508_marker_before_identity_and_version_parsing() {
+        let pkgs = tokenize_and_extract(
+            r#"pip install 'Requests[security]==2.31.0; sys_platform == "win/32"'"#,
+        );
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "requests");
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("2.31".to_string()));
+    }
+
+    #[test]
+    fn pip_install_normalizes_spaced_and_parenthesized_specifiers() {
+        for requirement in [
+            "requests == 2.31.0",
+            "requests (==2.31.0)",
+            "requests[security] ( == 2.31.0 )",
+        ] {
+            let pkgs = extract_packages(&[Segment {
+                byte_range: 0..requirement.len(),
+                raw: requirement.to_string(),
+                command: Some("pip".to_string()),
+                args: vec!["install".to_string(), requirement.to_string()],
+                preceding_separator: None,
+            }]);
+            assert_eq!(pkgs.len(), 1, "requirement={requirement}");
+            assert_eq!(pkgs[0].name, "requests", "requirement={requirement}");
+            assert_eq!(
+                pkgs[0].version,
+                VersionIntent::Exact("2.31".to_string()),
+                "requirement={requirement}"
+            );
+        }
+
+        let compatible_requirement = "requests ~= 2.31.0";
+        let compatible = extract_packages(&[Segment {
+            byte_range: 0..compatible_requirement.len(),
+            raw: compatible_requirement.to_string(),
+            command: Some("pip".to_string()),
+            args: vec!["install".to_string(), compatible_requirement.to_string()],
+            preceding_separator: None,
+        }]);
+        assert_eq!(compatible[0].name, "requests");
+        assert!(matches!(
+            &compatible[0].version,
+            VersionIntent::Constraint { raw, .. } if raw == "~= 2.31.0"
+        ));
+    }
+
+    #[test]
     fn pip_install_skips_flags() {
         let pkgs =
             tokenize_and_extract("pip install --index-url https://pypi.org/simple/ requests");
@@ -1333,6 +1428,24 @@ mod tests {
             tokenize_and_extract("pip install git+https://github.com/user/repo.git requests");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
+    }
+
+    #[test]
+    fn pip_install_skips_named_direct_references() {
+        for requirement in [
+            "demo @ git+ssh:host/repo",
+            "demo@git+file:./repo",
+            "nested/evil@pkg",
+        ] {
+            let pkgs = extract_packages(&[Segment {
+                byte_range: 0..requirement.len(),
+                raw: requirement.to_string(),
+                command: Some("pip".to_string()),
+                args: vec!["install".to_string(), requirement.to_string()],
+                preceding_separator: None,
+            }]);
+            assert!(pkgs.is_empty(), "requirement={requirement}");
+        }
     }
 
     #[test]
