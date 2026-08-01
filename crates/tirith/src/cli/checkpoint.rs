@@ -250,14 +250,16 @@ fn format_bytes(bytes: u64) -> String {
 /// `with_net_hints` opts into an EXPERIMENTAL resolver-cache mtime heuristic; it
 /// misses QUIC/UDP/direct-IP and is not a network monitor or security boundary.
 pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: bool) -> i32 {
-    let command_str = command.join(" ");
-    if command_str.trim().is_empty() {
+    if command.is_empty() || command[0].trim().is_empty() {
         eprintln!(
             "tirith watch: no command given \
              (usage: tirith watch -- npm install <pkg>)"
         );
         return 2;
     }
+    // This label is for receipts only. Execution below keeps the original argv
+    // vector intact instead of reparsing this reconstructed shell spelling.
+    let command_label = super::shell_join(command);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let home = match home_dir() {
@@ -287,7 +289,7 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
     install_watch_sigint_handler();
 
     // --- RUN the command with the user's full privileges (no isolation) ---
-    let run_status = run_command(&command_str);
+    let run_status = run_command(command);
     let exit_code = match run_status {
         Ok(code) => code,
         Err(e) => {
@@ -332,7 +334,8 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
 
     if json {
         emit_watch_json(
-            &command_str,
+            &command_label,
+            command,
             exit_code,
             &new_files,
             &modified_files,
@@ -345,7 +348,7 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
         );
     } else {
         print_watch_human(
-            &command_str,
+            &command_label,
             exit_code,
             &new_files,
             &modified_files,
@@ -376,25 +379,41 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-/// Run the watched command through the platform shell (pipelines/redirects
-/// behave as typed). Returns the child's exit code (128 if signal-killed). NOT
-/// isolation — runs with full privileges.
+/// Run the watched command while preserving the CLI's argv boundary. Multiple
+/// arguments execute directly (`argv[0]` plus the untouched remaining args), so
+/// data such as `safe; false` cannot turn into shell syntax. A single argument
+/// remains the documented complete shell-expression form, so pipelines and
+/// redirects still work when the user quotes the whole expression. Returns the
+/// child's exit code (128 if signal-killed). NOT isolation — runs with full
+/// privileges.
 ///
 /// F1: on Unix the child gets its OWN process group (`setpgid(0,0)` via
 /// `pre_exec`) so a terminal SIGINT hits only the child, not tirith — otherwise
 /// Ctrl-C would kill tirith before the AFTER snapshot + diff (and a half-finished
 /// installer's `.zshrc` persistence line would go unreported). The child still
 /// observes the interrupt; this only keeps tirith alive long enough to report.
-fn run_command(command_str: &str) -> std::io::Result<i32> {
+fn run_command(command: &[String]) -> std::io::Result<i32> {
     use std::process::Command;
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(command_str);
-        c
+    if command.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty watched command",
+        ));
+    }
+    let mut cmd = if command.len() == 1 {
+        if cfg!(windows) {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/D").arg("/S").arg("/C").arg(&command[0]);
+            c
+        } else {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let mut c = Command::new(shell);
+            c.arg("-c").arg(&command[0]);
+            c
+        }
     } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut c = Command::new(shell);
-        c.arg("-c").arg(command_str);
+        let mut c = Command::new(&command[0]);
+        c.args(&command[1..]);
         c
     };
     #[cfg(unix)]
@@ -557,6 +576,7 @@ fn print_watch_human(
     interrupted: bool,
 ) {
     let s = tirith_core::style::Stream::Stdout;
+    let command = super::sanitize_for_human_output(command, false);
     println!("{} {command}", tirith_core::style::bold("watched:", s));
     println!("  exit code: {exit_code}");
     if interrupted {
@@ -577,7 +597,7 @@ fn print_watch_human(
         let label = tirith_core::style::red("shell-rc modified", s);
         println!("\n  {label}:");
         for f in modified_rc {
-            println!("    {f}");
+            println!("    {}", super::sanitize_for_human_output(f, false));
         }
     } else {
         println!("\n  shell-rc modified: none");
@@ -592,7 +612,7 @@ fn print_watch_human(
             println!("    none observed (does NOT mean no network activity)");
         } else {
             for d in &state.domains_contacted {
-                println!("    {d}");
+                println!("    {}", super::sanitize_for_human_output(d, false));
             }
         }
     }
@@ -619,7 +639,7 @@ fn print_list_section(label: &str, items: &[String], _force: bool) {
     } else {
         println!("\n  {label} ({}):", items.len());
         for i in items {
-            println!("    {i}");
+            println!("    {}", super::sanitize_for_human_output(i, false));
         }
     }
 }
@@ -627,6 +647,7 @@ fn print_list_section(label: &str, items: &[String], _force: bool) {
 #[allow(clippy::too_many_arguments)]
 fn emit_watch_json(
     command: &str,
+    command_argv: &[String],
     exit_code: i32,
     new_files: &[String],
     modified_files: &[String],
@@ -654,6 +675,7 @@ fn emit_watch_json(
 
     let json_val = serde_json::json!({
         "command": command,
+        "argv": command_argv,
         "exit_code": exit_code,
         // True if tirith caught a SIGINT: the after-snapshot ran but the command
         // may not have finished — treat the diff as a lower bound.
@@ -684,6 +706,65 @@ mod tests {
 
     // Local env lock (tirith_core::TEST_ENV_LOCK is pub(crate), unreachable here).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_preserves_multiple_argv_boundaries() {
+        let command = vec!["/bin/echo".to_string(), "safe; false".to_string()];
+        assert_eq!(
+            super::run_command(&command).unwrap(),
+            0,
+            "a semicolon inside one argv element must remain data, not become shell syntax"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_single_argument_is_an_explicit_shell_expression() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let previous_shell = std::env::var_os("SHELL");
+        // SAFETY: this module serializes its environment-mutating tests.
+        unsafe { std::env::set_var("SHELL", "/bin/sh") };
+        let result = super::run_command(&["exit 7".to_string()]);
+        // SAFETY: restore the process environment before asserting.
+        unsafe {
+            match previous_shell {
+                Some(value) => std::env::set_var("SHELL", value),
+                None => std::env::remove_var("SHELL"),
+            }
+        }
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_direct_shell_argv_retains_child_status() {
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 7".to_string(),
+        ];
+        assert_eq!(super::run_command(&command).unwrap(), 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_command_windows_direct_argv_retains_child_status() {
+        let command = vec![
+            "cmd.exe".to_string(),
+            "/D".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            "exit /b 7".to_string(),
+        ];
+        assert_eq!(super::run_command(&command).unwrap(), 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_command_windows_single_argument_is_shell_expression() {
+        assert_eq!(super::run_command(&["exit /b 7".to_string()]).unwrap(), 7);
+    }
 
     /// F2: a partial/failed restore (any blob missing/corrupt, or a copy error)
     /// must return a NON-ZERO exit code so scripts don't mistake a half-restored

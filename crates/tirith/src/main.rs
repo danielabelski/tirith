@@ -64,8 +64,14 @@ What this is NOT:
   monitor; not a security boundary. Absence of hints does NOT mean no network
   activity occurred.
 
+Execution syntax:
+  Arguments after `--` execute directly with their original boundaries. To use
+  shell syntax such as a pipeline or redirect, pass the complete expression as
+  one quoted argument.
+
 Examples:
   tirith watch -- npm install left-pad
+  tirith watch -- \"npm test | tee test.log\"
   tirith watch --paths ~/.config -- ./install.sh
   tirith watch --with-net-hints -- pip install requests
   tirith watch --json -- cargo build";
