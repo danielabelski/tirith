@@ -2,10 +2,11 @@
 //!
 //! Security-sensitive callers resolve an executable once, validate its absolute
 //! identity, clear the ambient environment, and run it with explicit capture
-//! limits. On Unix every child owns a process group. On Windows every child is
-//! created suspended, assigned to a kill-on-close Job Object, then resumed. A
-//! timeout or output flood therefore terminates descendants as well as the direct
-//! child on both platform families.
+//! limits. On Linux every child owns an anchored process group; on Windows every
+//! child is created suspended, assigned to a kill-on-close Job Object, then
+//! resumed. Other hosts supervise only the direct child. Completion, timeout, or
+//! output-flood cleanup therefore covers descendants where the host provides a
+//! safe complete-tree primitive without risking numeric process-group reuse.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -37,6 +38,13 @@ struct BoundExecutable {
     sha256: [u8; 32],
     #[cfg(unix)]
     identity: UnixExecutableIdentity,
+    /// Linux launches use this immutable, anonymous file description rather
+    /// than reopening `path`. The complete seal set prevents another same-UID
+    /// process from changing the bytes between verification and `execveat`.
+    #[cfg(target_os = "linux")]
+    sealed_file: File,
+    #[cfg(target_os = "linux")]
+    sealed_identity: UnixExecutableIdentity,
 }
 
 #[cfg(target_os = "macos")]
@@ -54,6 +62,9 @@ impl Drop for BoundExecutable {
 
 #[derive(Debug, Clone)]
 pub struct TrustedExecutable {
+    /// Absolute caller/PATH spelling retained for consumers that must preserve
+    /// multicall or alias-sensitive invocation semantics. Trust and content
+    /// binding always apply to the separately canonicalized `path`.
     invocation_path: PathBuf,
     path: PathBuf,
     #[cfg(unix)]
@@ -566,6 +577,24 @@ impl TrustedExecutable {
                     reason: "bound executable content changed before launch".to_string(),
                 });
             }
+            #[cfg(target_os = "linux")]
+            {
+                let mut sealed = bound.sealed_file.try_clone().map_err(|error| {
+                    TrustedExecutableError::InvalidPath {
+                        path: bound.path.clone(),
+                        reason: format!("duplicate sealed executable descriptor: {error}"),
+                    }
+                })?;
+                verify_open_identity(&sealed, bound.sealed_identity, &bound.path)?;
+                verify_required_seals(&sealed, &bound.path)?;
+                let sealed_digest = hash_open_file(&mut sealed, &bound.path)?;
+                if sealed_digest != bound.sha256 {
+                    return Err(TrustedExecutableError::InvalidPath {
+                        path: bound.path.clone(),
+                        reason: "sealed executable content changed before launch".to_string(),
+                    });
+                }
+            }
             return Ok(());
         }
         let canonical =
@@ -613,26 +642,42 @@ impl TrustedExecutable {
         Ok(())
     }
 
-    /// Absolute path selected by the caller/PATH lookup before target
-    /// canonicalization. Multicall tools may execute this path to preserve
-    /// argv[0] semantics after separately binding it to [`Self::path`].
+    /// Absolute path selected by the caller or explicit PATH lookup before
+    /// canonicalizing the trusted target. Consumers may retain this spelling as
+    /// argv metadata, but must launch through the canonical path or sealed file.
     pub fn invocation_path(&self) -> &Path {
         &self.invocation_path
     }
 
-    /// Return the path that must be passed to the OS. For an ordinary trusted
-    /// child this is the validated canonical path. After [`Self::bind_content`]
-    /// it is a private snapshot whose bytes were fixed before external I/O.
+    /// Return the validated launch path. On Linux, content-bound security
+    /// boundaries launch the held sealed descriptor returned internally by
+    /// [`Self::bound_launch_fd`] rather than reopening this path.
     pub fn launch_path(&self) -> &Path {
         self.bound
             .as_ref()
             .map_or(self.path.as_path(), |bound| bound.path.as_path())
     }
 
+    /// Return the immutable held executable descriptor for a Linux
+    /// content-bound launch. The descriptor stays valid while `self` is alive;
+    /// callers duplicate it into the child after `fork` and execute it with
+    /// `execveat(AT_EMPTY_PATH)` so no pathname lookup can race verification.
+    #[cfg(target_os = "linux")]
+    pub fn bound_launch_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd as _;
+
+        self.bound
+            .as_ref()
+            .map(|bound| bound.sealed_file.as_raw_fd())
+    }
+
     /// Copy the selected executable into a private read-only snapshot and bind
-    /// future launches to those exact bytes. The source is opened without
-    /// following links and its device/inode is checked against resolution before
-    /// any byte is accepted, closing the resolve-to-copy replacement window.
+    /// future launches to those exact bytes. Linux additionally retains a fully
+    /// sealed anonymous descriptor used by the launch boundary, so same-UID path
+    /// replacement or in-place mutation cannot change the executed image. The
+    /// source is opened without following links and its device/inode is checked
+    /// against resolution before any byte is accepted, closing the
+    /// resolve-to-copy replacement window.
     ///
     /// This is intentionally opt-in: callers that resolve an interpreter before
     /// a network request use it, while ordinary short-lived trusted-child calls
@@ -736,6 +781,10 @@ impl TrustedExecutable {
         #[cfg(unix)]
         verify_open_identity(&source, self.identity, &self.path)?;
 
+        #[cfg(target_os = "linux")]
+        let (sealed_file, sealed_identity) =
+            create_sealed_executable(&mut target, &snapshot_path, sha256)?;
+
         #[cfg(target_os = "macos")]
         {
             use std::os::fd::AsRawFd as _;
@@ -763,6 +812,10 @@ impl TrustedExecutable {
             sha256,
             #[cfg(unix)]
             identity,
+            #[cfg(target_os = "linux")]
+            sealed_file,
+            #[cfg(target_os = "linux")]
+            sealed_identity,
         };
         Ok(Self {
             invocation_path: self.invocation_path.clone(),
@@ -823,6 +876,123 @@ impl TrustedExecutable {
             })
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+const REQUIRED_EXECUTABLE_SEALS: libc::c_int =
+    libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+
+/// Copy a verified snapshot into an anonymous sealable file and permanently
+/// revoke every byte-changing operation. A pathname snapshot owned by the same
+/// uid can always be chmod'd and replaced; a fully sealed memfd cannot.
+#[cfg(target_os = "linux")]
+fn create_sealed_executable(
+    source: &mut File,
+    source_path: &Path,
+    expected_sha256: [u8; 32],
+) -> Result<(File, UnixExecutableIdentity), TrustedExecutableError> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    source
+        .rewind()
+        .map_err(|error| TrustedExecutableError::InvalidPath {
+            path: source_path.to_path_buf(),
+            reason: format!("rewind executable snapshot for sealing: {error}"),
+        })?;
+    let name = std::ffi::CString::new(
+        source_path
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("tirith-bound-executable"))
+            .as_bytes(),
+    )
+    .map_err(|_| TrustedExecutableError::InvalidPath {
+        path: source_path.to_path_buf(),
+        reason: "executable file name contains NUL".to_string(),
+    })?;
+    // SAFETY: `name` is a live NUL-terminated string and the flags are the
+    // documented memfd_create bitset. The returned descriptor is uniquely owned.
+    let base_flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    let mut raw_fd = unsafe { libc::memfd_create(name.as_ptr(), base_flags | libc::MFD_EXEC) };
+    // MFD_EXEC was added after memfd sealing. Old kernels reject the unknown bit
+    // with EINVAL but create executable memfds by default, so retry only for that
+    // compatibility case. Modern no-exec-by-default hosts use the explicit flag.
+    if raw_fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        raw_fd = unsafe { libc::memfd_create(name.as_ptr(), base_flags) };
+    }
+    if raw_fd < 0 {
+        return Err(TrustedExecutableError::InvalidPath {
+            path: source_path.to_path_buf(),
+            reason: format!(
+                "create sealable executable descriptor: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    // SAFETY: `raw_fd` was just returned by memfd_create and has no other owner.
+    let mut sealed = unsafe { File::from_raw_fd(raw_fd) };
+    let digest = copy_and_hash(source, &mut sealed, source_path)?;
+    if digest != expected_sha256 {
+        return Err(TrustedExecutableError::InvalidPath {
+            path: source_path.to_path_buf(),
+            reason: "executable changed while creating sealed launch descriptor".to_string(),
+        });
+    }
+    if unsafe { libc::fchmod(sealed.as_raw_fd(), 0o500) } != 0 {
+        return Err(TrustedExecutableError::InvalidPath {
+            path: source_path.to_path_buf(),
+            reason: format!(
+                "make sealed executable descriptor executable: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    if unsafe {
+        libc::fcntl(
+            sealed.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            REQUIRED_EXECUTABLE_SEALS,
+        )
+    } < 0
+    {
+        return Err(TrustedExecutableError::InvalidPath {
+            path: source_path.to_path_buf(),
+            reason: format!(
+                "seal executable descriptor against mutation: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    verify_required_seals(&sealed, source_path)?;
+    let identity =
+        executable_identity(&sealed).map_err(|error| TrustedExecutableError::InvalidPath {
+            path: source_path.to_path_buf(),
+            reason: format!("identify sealed executable descriptor: {error}"),
+        })?;
+    Ok((sealed, identity))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_required_seals(file: &File, path: &Path) -> Result<(), TrustedExecutableError> {
+    use std::os::fd::AsRawFd as _;
+
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(TrustedExecutableError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: format!(
+                "inspect executable descriptor seals: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    if seals & REQUIRED_EXECUTABLE_SEALS != REQUIRED_EXECUTABLE_SEALS {
+        return Err(TrustedExecutableError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "executable descriptor is missing immutable-content seals".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -946,7 +1116,7 @@ fn validate_unix_executable(
 fn open_snapshot_for_verification(path: &Path) -> Result<File, TrustedExecutableError> {
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
@@ -1534,7 +1704,26 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     if let Err(error) = executable.verify_identity() {
         return ChildOutcome::SpawnError(error.to_string());
     }
-    let mut command = Command::new(executable.launch_path());
+    #[cfg(target_os = "linux")]
+    let bound_fd = executable.bound_launch_fd();
+    #[cfg(target_os = "linux")]
+    let launch_program = bound_fd.map_or_else(
+        || executable.launch_path().as_os_str().to_os_string(),
+        |fd| OsString::from(format!("/proc/self/fd/{fd}")),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let launch_program = executable.launch_path().as_os_str().to_os_string();
+    let mut command = Command::new(launch_program);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        // Execute only the verified canonical path (or sealed Linux descriptor),
+        // but preserve the caller-selected spelling as argv[0]. Multicall and
+        // proxy executables such as BusyBox and rustup select behavior from this
+        // value; canonicalizing it would silently invoke the wrong program.
+        command.arg0(executable.invocation_path());
+    }
     command
         .args(&spec.args)
         .env_clear()
@@ -1546,18 +1735,25 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         command.current_dir(cwd);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt as _;
-        // SAFETY: setpgid is async-signal-safe and is the only operation in the
-        // forked child before exec.
+        // SAFETY: setpgid/fcntl are async-signal-safe. A Linux content-bound
+        // launch clears CLOEXEC on the already-sealed descriptor so a shebang
+        // interpreter can reopen `/proc/self/fd/N`; the child can observe that
+        // immutable descriptor but cannot change its sealed bytes.
         unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
+                #[cfg(target_os = "linux")]
+                if let Some(fd) = bound_fd {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
             });
         }
     }
@@ -1586,6 +1782,9 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     }
 
     let deadline = Instant::now() + spec.limits.timeout;
+    #[cfg(target_os = "linux")]
+    let mut direct_exit_observed = false;
+    #[cfg(not(target_os = "linux"))]
     let mut status = None;
     let mut stdout = None;
     let mut stderr = None;
@@ -1595,102 +1794,135 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                 ReaderMessage::Complete(CaptureStream::Stdout, bytes) => stdout = Some(bytes),
                 ReaderMessage::Complete(CaptureStream::Stderr, bytes) => stderr = Some(bytes),
                 ReaderMessage::Limit(stream) => {
-                    let cleanup_succeeded = terminate_tree(&mut child, child_pid, status.is_some());
+                    let termination = terminate_tree(&mut child, child_pid, true);
                     return ChildOutcome::OutputLimitExceeded {
                         stream,
-                        cleanup_succeeded,
+                        cleanup_succeeded: termination.cleanup_confirmed(),
                     };
                 }
                 ReaderMessage::Error(stream, reason) => {
-                    let _ = terminate_tree(&mut child, child_pid, status.is_some());
+                    let _ = terminate_tree(&mut child, child_pid, true);
                     return ChildOutcome::WaitError(format!("read {stream:?}: {reason}"));
                 }
             }
         }
 
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit)) => status = Some(exit),
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = terminate_tree(&mut child, child_pid, false);
-                    return ChildOutcome::WaitError(error.to_string());
+        #[cfg(target_os = "linux")]
+        {
+            if !direct_exit_observed {
+                match observe_child_exit_without_reaping(child_pid, true) {
+                    Ok(observed) => direct_exit_observed = observed,
+                    Err(error) => {
+                        let _ = terminate_tree(&mut child, child_pid, true);
+                        return ChildOutcome::WaitError(error.to_string());
+                    }
                 }
             }
-        }
-        if let Some(exit_status) = status {
-            match (stdout.take(), stderr.take()) {
-                (Some(stdout_bytes), Some(stderr_bytes)) => {
-                    if !terminate_tree(&mut child, child_pid, true) {
-                        return ChildOutcome::WaitError(
-                            "child exited but descendant process-group cleanup failed".to_string(),
-                        );
-                    }
-                    return ChildOutcome::Completed {
-                        status: exit_status,
-                        stdout: stdout_bytes,
-                        stderr: stderr_bytes,
-                    };
+            if direct_exit_observed && stdout.is_some() && stderr.is_some() {
+                let termination = terminate_tree(&mut child, child_pid, false);
+                if !termination.signal_and_reap_succeeded() {
+                    return ChildOutcome::WaitError(
+                        "child process group could not be safely signalled and reaped".into(),
+                    );
                 }
-                (pending_stdout, pending_stderr) => {
-                    stdout = pending_stdout;
-                    stderr = pending_stderr;
+                let Some(status) = termination.status else {
+                    return ChildOutcome::WaitError(
+                        "direct child could not be reaped after group termination".into(),
+                    );
+                };
+                return ChildOutcome::Completed {
+                    status,
+                    stdout: stdout.take().expect("stdout completion checked"),
+                    stderr: stderr.take().expect("stderr completion checked"),
+                };
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(Some(exit)) => status = Some(exit),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = terminate_tree(&mut child, child_pid, true);
+                        return ChildOutcome::WaitError(error.to_string());
+                    }
+                }
+            }
+            if let Some(exit_status) = status {
+                match (stdout.take(), stderr.take()) {
+                    (Some(stdout_bytes), Some(stderr_bytes)) => {
+                        return ChildOutcome::Completed {
+                            status: exit_status,
+                            stdout: stdout_bytes,
+                            stderr: stderr_bytes,
+                        };
+                    }
+                    (pending_stdout, pending_stderr) => {
+                        stdout = pending_stdout;
+                        stderr = pending_stderr;
+                    }
                 }
             }
         }
         if Instant::now() >= deadline {
-            let cleanup_succeeded = terminate_tree(&mut child, child_pid, status.is_some());
-            return ChildOutcome::Timeout { cleanup_succeeded };
+            let termination = terminate_tree(&mut child, child_pid, true);
+            return ChildOutcome::Timeout {
+                cleanup_succeeded: termination.cleanup_confirmed(),
+            };
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-#[cfg(not(windows))]
-fn terminate_tree(child: &mut std::process::Child, _child_pid: u32, already_reaped: bool) -> bool {
-    let mut cleanup_succeeded = true;
-    #[cfg(unix)]
-    let mut process_group_needs_wait = false;
-    #[cfg(unix)]
-    {
-        let process_group = -(_child_pid as libc::pid_t);
-        // ESRCH is success for cleanup purposes: the group is already gone.
-        if unsafe { libc::kill(process_group, libc::SIGKILL) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                cleanup_succeeded = false;
-            }
-        } else {
-            process_group_needs_wait = true;
+#[cfg(target_os = "linux")]
+const PROCESS_GROUP_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Observe the direct child with `WNOWAIT`. Keeping its zombie unreaped reserves
+/// the numeric PID/PGID until the complete group has received its final signal,
+/// preventing a negative-PID signal from reaching an unrelated reused group.
+#[cfg(target_os = "linux")]
+fn observe_child_exit_without_reaping(child_pid: u32, nonblocking: bool) -> std::io::Result<bool> {
+    let mut flags = libc::WEXITED | libc::WNOWAIT;
+    if nonblocking {
+        flags |= libc::WNOHANG;
+    }
+    loop {
+        // SAFETY: `info` is valid writable storage and waitid does not retain it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result =
+            unsafe { libc::waitid(libc::P_PID, child_pid as libc::id_t, &mut info, flags) };
+        if result == 0 {
+            return Ok(!nonblocking || unsafe { info.si_pid() } != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        if !already_reaped && child.kill().is_err() {
-            cleanup_succeeded = false;
-        }
-    }
-    if !already_reaped && child.wait().is_err() {
-        cleanup_succeeded = false;
-    }
-    #[cfg(unix)]
-    if process_group_needs_wait && !wait_for_process_group_exit(_child_pid) {
-        cleanup_succeeded = false;
-    }
-    cleanup_succeeded
 }
 
-#[cfg(unix)]
-fn wait_for_process_group_exit(child_pid: u32) -> bool {
-    let process_group = -(child_pid as libc::pid_t);
-    let deadline = Instant::now() + Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+fn signal_process_group(process_group: u32, signal: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::kill(-(process_group as libc::pid_t), signal) } == 0 {
+        return Ok(());
+    }
+    // The direct child is still unreaped whenever this is called, so its
+    // setpgid-created group must exist. ESRCH is therefore an invariant failure,
+    // not successful cleanup (the child may have escaped its original group).
+    Err(std::io::Error::last_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_process_group_disappearance(process_group: u32) -> bool {
+    let deadline = Instant::now() + PROCESS_GROUP_EXIT_TIMEOUT;
     loop {
-        if unsafe { libc::kill(process_group, 0) } != 0 {
+        if unsafe { libc::kill(-(process_group as libc::pid_t), 0) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
                 return true;
             }
-            if error.raw_os_error() != Some(libc::EINTR) {
+            if error.raw_os_error() != Some(libc::EPERM) {
                 return false;
             }
         }
@@ -1698,5 +1930,57 @@ fn wait_for_process_group_exit(child_pid: u32) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct TreeTermination {
+    signal_succeeded: bool,
+    status: Option<ExitStatus>,
+    group_disappeared: bool,
+}
+
+impl TreeTermination {
+    fn signal_and_reap_succeeded(&self) -> bool {
+        self.signal_succeeded && self.status.is_some()
+    }
+
+    fn cleanup_confirmed(&self) -> bool {
+        self.signal_and_reap_succeeded() && self.group_disappeared
+    }
+}
+
+fn terminate_tree(
+    child: &mut std::process::Child,
+    child_pid: u32,
+    confirm_disappearance: bool,
+) -> TreeTermination {
+    #[cfg(target_os = "linux")]
+    {
+        // Signal before reaping. The unreaped direct child anchors the numeric
+        // process-group ID, so this cannot target an unrelated future group.
+        let signalled = signal_process_group(child_pid, libc::SIGKILL).is_ok();
+        // Also address the anchored direct PID. A trusted program normally
+        // remains its group leader, but this prevents an unbounded wait if it
+        // changed session or group before the supervisor's final signal.
+        let _ = child.kill();
+        let status = child.wait().ok();
+        let group_disappeared =
+            confirm_disappearance && wait_for_process_group_disappearance(child_pid);
+        return TreeTermination {
+            signal_succeeded: signalled,
+            status,
+            group_disappeared,
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (child_pid, confirm_disappearance);
+        let killed = child.kill().is_ok();
+        let status = child.wait().ok();
+        TreeTermination {
+            signal_succeeded: killed,
+            group_disappeared: status.is_some(),
+            status,
+        }
     }
 }

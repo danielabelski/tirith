@@ -44,21 +44,15 @@ fn find_by_rule<'a>(out: &'a [SafeSuggestion], rule: &str) -> Option<&'a SafeSug
     out.iter().find(|s| s.rule_id == rule)
 }
 
-// ── 1. typosquat-rewrite ──────────────────────────────────────────────────
+// ── 1. typosquat guidance ─────────────────────────────────────────────────
 
 #[test]
-fn typosquat_positive_npm_install_unambiguous_target() {
+fn typosquat_unambiguous_target_remains_guidance_only() {
     let cmd = "npm install reqeusts";
     let v = verdict_with(vec![typosquat_finding("reqeusts", "requests")]);
     let s = suggest(cmd, ShellType::Posix, &v);
     let entry = find_by_rule(&s, "threat_package_typosquat").expect("rule entry");
-    let sc = entry
-        .safe_command
-        .as_deref()
-        .expect("typosquat: target is unambiguous, rewrite should fire");
-    // The untrusted target name is single-quoted (PR124 shell-injection fix);
-    // for this benign all-alphanumeric name the quotes are inert but present.
-    assert_eq!(sc, "npm install 'requests'");
+    assert!(entry.safe_command.is_none());
     assert!(!entry.remediation.is_empty());
 }
 
@@ -82,18 +76,37 @@ fn typosquat_negative_ambiguous_target_no_rewrite() {
     assert!(!entry.remediation.is_empty());
 }
 
+#[test]
+fn typosquat_flags_multiple_packages_and_shell_variants_are_guidance_only() {
+    let finding = typosquat_finding("reqeusts", "--global");
+    for (cmd, shell) in [
+        ("npm install --save reqeusts", ShellType::Posix),
+        ("npm install reqeusts lodash", ShellType::Posix),
+        ("npm install other", ShellType::Posix),
+        ("npm install reqeusts", ShellType::PowerShell),
+        ("npm install reqeusts", ShellType::Cmd),
+    ] {
+        let suggestions = suggest(cmd, shell, &verdict_with(vec![finding.clone()]));
+        let entry = find_by_rule(&suggestions, "threat_package_typosquat").unwrap();
+        assert!(
+            entry.safe_command.is_none(),
+            "typosquat rewrite must stay guidance-only for {shell:?}: {cmd}"
+        );
+    }
+}
+
 // ── 2. sudo-narrow (negative tests only in M6) ────────────────────────────
 
 #[test]
 fn sudo_narrow_negative_sudo_rm_rf_root_no_rewrite() {
-    // Stripping sudo still leaves a flagged `rm -rf /`, so sudo-narrow returns None.
+    // Every sudo shape stays visible as guidance, never executable output.
     let cmd = "sudo rm -rf /";
     let v = verdict_with(vec![finding(RuleId::CommandNetworkDeny)]);
     let s = suggest(cmd, ShellType::Posix, &v);
-    let entry = find_by_rule(&s, "sudo_narrow");
+    let entry = find_by_rule(&s, "sudo_narrow").expect("sudo guidance");
     assert!(
-        entry.is_none(),
-        "sudo-narrow must not fire when the stripped inner command still flags; got {entry:?}"
+        entry.safe_command.is_none(),
+        "sudo-narrow must remain guidance-only; got {entry:?}"
     );
 }
 
@@ -112,44 +125,31 @@ fn sudo_narrow_negative_sudo_sh_returns_interactive_shell_remediation() {
     assert!(
         entry
             .rationale
-            .contains("no safe mechanical rewrite available"),
+            .contains("No safe mechanical rewrite is available"),
         "rationale should advertise no rewrite: {}",
         entry.rationale
     );
     assert!(
-        entry.rationale.contains("avoid interactive root shells"),
+        entry.rationale.contains("Avoid interactive root shells"),
         "rationale should warn about interactive root shells: {}",
         entry.rationale
     );
 }
 
-// ── 2a. sudo-narrow (M8 ch4 deferred POSITIVE) ───────────────────────────
-//
-// The M6 ch5 positive was deferred for lack of a stable benign-target fixture.
-// `sudo apt update` is the textbook case: `apt update` alone is Allow, so
-// `build_sudo_narrow_suggestion`'s re-analysis of the stripped inner command
-// produces the rewrite.
+// ── 2a. sudo-narrow guidance-only positive detection ─────────────────────
 
 #[test]
-fn sudo_narrow_positive_sudo_apt_update_strips_sudo() {
-    // Inner `apt update` is Allow and `apt` is not a shell → rewrite to bare command.
+fn sudo_narrow_sudo_apt_update_is_guidance_only() {
     let cmd = "sudo apt update";
     // Any finding triggers the command-shape transforms.
     let v = verdict_with(vec![finding(RuleId::CommandNetworkDeny)]);
     let s = suggest(cmd, ShellType::Posix, &v);
     let entry = find_by_rule(&s, "sudo_narrow")
         .expect("sudo_narrow entry must be present for sudo apt update");
-    let sc = entry
-        .safe_command
-        .as_deref()
-        .expect("sudo apt update: stripped leader is benign, rewrite should fire");
-    assert_eq!(
-        sc, "apt update",
-        "sudo-narrow should emit the bare inner command, got: {sc}"
-    );
+    assert!(entry.safe_command.is_none());
     assert!(
-        entry.rationale.contains("exact final command re-analyzed"),
-        "public rationale should record whole-command verification: {}",
+        entry.rationale.contains("No safe mechanical rewrite"),
+        "public rationale should explain guidance-only behavior: {}",
         entry.rationale
     );
 }
@@ -175,12 +175,12 @@ fn sudo_narrow_negative_sudo_shell_spawn_keeps_no_rewrite() {
     assert!(
         entry
             .rationale
-            .contains("no safe mechanical rewrite available"),
+            .contains("No safe mechanical rewrite is available"),
         "rationale should advertise no rewrite: {}",
         entry.rationale
     );
     assert!(
-        entry.rationale.contains("avoid interactive root shells"),
+        entry.rationale.contains("Avoid interactive root shells"),
         "rationale should mention interactive root shells: {}",
         entry.rationale
     );

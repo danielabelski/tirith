@@ -158,10 +158,11 @@ rewrite. The generated command uses Tirith's absolute path so a later `PATH`
 shadow cannot replace it. At execution, the runner requires the selected
 interpreter's first `PATH` hit to be root-managed, binds its bytes before the
 download, bounds and analyzes the downloaded bytes, asks for confirmation, then
-feeds the hash-verified private interpreter copy over stdin inside a fail-closed
-capsule. It also ignores a conflicting remote shebang. Other architectures,
-platforms, and user-owned Tirith installations show guidance instead of an
-executable rewrite. Curl rewrites require both `-f`/`--fail` and
+feeds the reviewed bytes to a hash-verified, sealed interpreter descriptor
+inside a fail-closed capsule. It also ignores a conflicting remote shebang.
+Other architectures, platforms, and user-owned Tirith installations show
+guidance instead of an executable rewrite. Curl rewrites require both
+`-f`/`--fail` and
 `-L`/`--location` semantics;
 plain curl, `-f` alone, or `-L` alone stays guidance-only.
 Literal no-argument `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, and

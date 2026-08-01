@@ -539,10 +539,11 @@ where
 /// `network_raw_denied = false`.
 ///
 /// The policy ALLOWS: basic process/memory syscalls, file I/O (read/write/open/
-/// metadata/close/stdio), thread creation, and fork/exec (the launcher must
-/// `execve` the target and an installer spawns sub-processes). It grants **no**
-/// socket-creation syscalls, so the child cannot open a raw outbound socket: the
-/// foundation of `network_raw_denied` for a `DenyAll` capsule.
+/// metadata/close/stdio), Landlock-confined directory creation, thread creation,
+/// and fork/exec (the launcher must `execve` the target and an installer spawns
+/// sub-processes). It grants **no** socket-creation syscalls, so the child cannot
+/// open a raw outbound socket: the foundation of `network_raw_denied` for a
+/// `DenyAll` capsule.
 #[cfg(target_arch = "x86_64")]
 struct SafeDescriptorControls;
 
@@ -600,6 +601,11 @@ impl extrasafe::RuleSet for PostExecRuntime {
             Sysno::dup3,
             Sysno::pipe,
             Sysno::pipe2,
+            // Targets need first-use cache/config trees beneath their writable
+            // roots. Landlock is already active before this filter and remains
+            // the authority over *where* either syscall may create a directory.
+            Sysno::mkdir,
+            Sysno::mkdirat,
         ]
     }
 
@@ -999,17 +1005,25 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn post_exec_runtime_excludes_network_and_supervisor_escape_syscalls() {
+    fn post_exec_runtime_allows_landlock_confined_mkdir_and_excludes_escape_syscalls() {
         use extrasafe::syscalls::Sysno;
         use extrasafe::RuleSet as _;
 
         let rules = PostExecRuntime.simple_rules();
+        assert!(rules.contains(&Sysno::mkdir));
+        assert!(rules.contains(&Sysno::mkdirat));
         for denied in [
             Sysno::socket,
             Sysno::socketpair,
             Sysno::connect,
             Sysno::setsid,
             Sysno::setpgid,
+            Sysno::kill,
+            Sysno::tkill,
+            Sysno::tgkill,
+            Sysno::rt_sigqueueinfo,
+            Sysno::rt_tgsigqueueinfo,
+            Sysno::pidfd_send_signal,
         ] {
             assert!(
                 !rules.contains(&denied),
@@ -1023,6 +1037,12 @@ mod tests {
             Sysno::connect,
             Sysno::setsid,
             Sysno::setpgid,
+            Sysno::kill,
+            Sysno::tkill,
+            Sysno::tgkill,
+            Sysno::rt_sigqueueinfo,
+            Sysno::rt_tgsigqueueinfo,
+            Sysno::pidfd_send_signal,
         ] {
             assert!(
                 !conditional.contains_key(&denied),

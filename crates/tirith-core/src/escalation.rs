@@ -450,17 +450,13 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
     }
 }
 
-/// Post-processing pipeline applied after the engine produces a raw verdict:
-/// action overrides, approvals, paranoia filtering, escalation, and session
-/// accounting, in that order. Cross-event enforcement evaluates the current
-/// command provisionally; it does not persist typed execution events. Callers that
-/// can confirm execution must later call [`record_executed_verdict_events`].
-/// Reads/writes session state best-effort and never panics.
-pub fn post_process_verdict(
+/// Apply policy effects that do not depend on mutable session state. Keeping
+/// this shared between enforcement and safe-command verification prevents a
+/// raw `Allow` from bypassing action overrides, `agent_rules`, approvals, or
+/// paranoia on an executable suggestion.
+fn apply_stateless_policy_effects(
     raw_verdict: &Verdict,
     policy: &crate::policy::Policy,
-    cmd: &str,
-    session_id: &str,
     caller: CallerContext,
 ) -> Verdict {
     let mut effective = raw_verdict.clone();
@@ -547,10 +543,94 @@ pub fn post_process_verdict(
         }
     }
 
+    effective
+}
+
+fn apply_correlation_findings(
+    effective: &mut Verdict,
+    policy: &crate::policy::Policy,
+    correlation_hits: &[crate::event_buffer::CorrelationHit],
+) {
+    if correlation_hits.is_empty() {
+        return;
+    }
+    for hit in correlation_hits {
+        let mut severity = hit.severity;
+        if let Some(override_sev) = policy.severity_override(&hit.rule_id) {
+            severity = override_sev;
+        }
+        effective.findings.push(Finding {
+            rule_id: hit.rule_id,
+            severity,
+            title: hit.title.clone(),
+            description: hit.description.clone(),
+            evidence: vec![Evidence::Text {
+                detail: hit.description.clone(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+    effective.action =
+        crate::verdict::upgraded_action_from_findings(&effective.findings, effective.action);
+}
+
+/// Read-only equivalent of [`post_process_verdict`] for candidate verification.
+/// It observes the same frozen policy, origin, caller, escalation history, and
+/// cross-event correlation window, but never records warnings, typed events,
+/// escalation markers, audit entries, or surfaced signatures.
+pub fn post_process_verdict_for_verification(
+    raw_verdict: &Verdict,
+    policy: &crate::policy::Policy,
+    cmd: &str,
+    session_id: &str,
+    caller: CallerContext,
+) -> Verdict {
+    let mut effective = apply_stateless_policy_effects(raw_verdict, policy, caller);
+    let session = crate::session_warnings::load(session_id);
+
+    if !policy.escalation.is_empty() && matches!(effective.action, Action::Warn | Action::WarnAck) {
+        let (new_action, _caused_by, _hits, reason) = apply_escalation(
+            effective.action,
+            &effective.findings,
+            &session,
+            &policy.escalation,
+        );
+        if new_action != effective.action {
+            effective.escalation_reason = reason;
+        }
+        effective.action = new_action;
+    }
+
+    let provisional_events = derive_typed_events(cmd, &effective);
+    let correlation_hits = if provisional_events.is_empty() {
+        Vec::new()
+    } else {
+        crate::session_warnings::correlate_session_with_provisional(session_id, &provisional_events)
+    };
+    apply_correlation_findings(&mut effective, policy, &correlation_hits);
+
+    effective
+}
+
+/// Post-processing pipeline applied after the engine produces a raw verdict:
+/// action overrides, approvals, paranoia filtering, escalation, and session
+/// recording, in that order. Reads/writes session state (best-effort, never panics).
+pub fn post_process_verdict(
+    raw_verdict: &Verdict,
+    policy: &crate::policy::Policy,
+    cmd: &str,
+    session_id: &str,
+    caller: CallerContext,
+) -> Verdict {
+    let mut effective = apply_stateless_policy_effects(raw_verdict, policy, caller);
+
     // Escalation runs BEFORE warning recording so the escalated action wins.
     if !policy.escalation.is_empty() && matches!(effective.action, Action::Warn | Action::WarnAck) {
         let session = crate::session_warnings::load(session_id);
-        let (new_action, caused_by, escalation_hits, reason) = apply_escalation(
+        let (new_action, _caused_by, escalation_hits, reason) = apply_escalation(
             effective.action,
             &effective.findings,
             &session,
@@ -563,7 +643,6 @@ pub fn post_process_verdict(
             crate::session_warnings::record_escalation_event(session_id, &escalation_hits);
         }
         effective.action = new_action;
-        causal_rule_ids.extend(caused_by);
     }
 
     // (`apply_agent_rules` used to be called HERE; PR #121 item 9 moved it above
@@ -639,31 +718,7 @@ pub fn post_process_verdict(
     } else {
         crate::session_warnings::correlate_session_with_provisional(session_id, &provisional_events)
     };
-    if !correlation_hits.is_empty() {
-        for hit in &correlation_hits {
-            let mut severity = hit.severity;
-            if let Some(override_sev) = policy.severity_override(&hit.rule_id) {
-                severity = override_sev;
-            }
-            effective.findings.push(Finding {
-                rule_id: hit.rule_id,
-                severity,
-                title: hit.title.clone(),
-                description: hit.description.clone(),
-                evidence: vec![Evidence::Text {
-                    detail: hit.description.clone(),
-                }],
-                human_view: None,
-                agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
-            });
-        }
-        // Re-derive the action from the augmented finding set, only ever raising
-        // it (a correlation must never weaken an existing Block/Warn).
-        effective.action =
-            crate::verdict::upgraded_action_from_findings(&effective.findings, effective.action);
-    }
+    apply_correlation_findings(&mut effective, policy, &correlation_hits);
 
     effective
 }

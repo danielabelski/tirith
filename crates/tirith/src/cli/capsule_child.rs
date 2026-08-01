@@ -16,7 +16,10 @@
 //!    full containment sequence via [`tirith_core::capsule::linux::apply_containment`]
 //!    (inherited-FD closure -> rlimits -> no-new-privs -> Landlock -> seccomp ->
 //!    env cleanup), verifies the achieved coverage is not degraded against the
-//!    spec's requirement, and only then `execve`s the target.
+//!    spec's requirement, and only then forks the target. The original launcher
+//!    remains as a contained process-group leader while its child executes the
+//!    target (a content-bound launch uses `execveat(AT_EMPTY_PATH)` on its sealed
+//!    inherited descriptor).
 //! 3. On macOS, builds the native `sandbox-exec` argv, closes unrelated inherited
 //!    descriptors, applies supported rlimits, and `execve`s `sandbox-exec`. This
 //!    second exec occurs only after Rust's private parent/child exec-status pipe
@@ -31,9 +34,10 @@
 //! which would make this process multi-threaded. To avoid that, [`is_invocation`]
 //! is checked at the very top of `main()` **before** the worker thread is spawned,
 //! and [`run_on_main_thread`] handles the command directly on the genuinely
-//! single-threaded main thread. It never returns on success (`execve` replaces the
-//! image); on any failure it prints to stderr and exits non-zero. It MUST NOT
-//! fall through to running the target uncontained (fail-closed).
+//! single-threaded main thread. It never returns: the fork child `exec`s the
+//! target while the original process waits as its contained guard, then exits
+//! with the target status. On any failure it prints to stderr and exits non-zero.
+//! It MUST NOT fall through to running the target uncontained (fail-closed).
 
 use std::ffi::{OsStr, OsString};
 
@@ -55,12 +59,17 @@ pub fn is_invocation(args: &[OsString]) -> bool {
 pub struct ParsedArgs {
     /// The serialized [`CapsuleSpec`] JSON.
     pub spec_json: String,
-    /// The executable path/name passed to `execvp`.
+    /// The executable path/name passed to `execvp` for an ordinary launch, or a
+    /// diagnostic label when `target_fd` selects held-descriptor execution.
     pub program: OsString,
     /// Optional explicit `argv[0]` for alias-sensitive or multicall targets.
     /// When absent, [`Self::program`] is used, preserving the legacy launcher
     /// contract.
     pub target_argv0: Option<OsString>,
+    /// Optional inherited, fully sealed Linux executable descriptor. When set,
+    /// the launcher executes this descriptor with `execveat(AT_EMPTY_PATH)` and
+    /// treats `program` as a diagnostic label only.
+    pub target_fd: Option<i32>,
     /// Optional parent-owned temporary HOME. The parent keeps the directory
     /// guard alive until the complete child tree has exited and grants this
     /// exact path in the finalized filesystem policy before launch.
@@ -71,7 +80,8 @@ pub struct ParsedArgs {
 
 /// Parse `tirith __capsule-child <spec-json> [internal options] -- <prog>
 /// <arg>...` from the full process argv. Internal options are closed and may
-/// appear at most once: `--target-argv0 <value>` and `--temp-home <absolute>`.
+/// appear at most once: `--target-argv0 <value>`, `--target-fd <number>`, and
+/// `--temp-home <absolute>`.
 /// Pure and platform-independent, so the argv grammar is unit-testable
 /// everywhere.
 pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
@@ -95,6 +105,7 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         return Err("the `--` separator must follow the spec JSON".to_string());
     }
     let mut target_argv0 = None;
+    let mut target_fd = None;
     let mut temp_home = None;
     let mut option_index = 3usize;
     while option_index < sep {
@@ -108,6 +119,20 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             if target_argv0.replace(value).is_some() {
                 return Err("duplicate `--target-argv0` launcher option".to_string());
             }
+        } else if option == "--target-fd" {
+            if target_fd.is_some() {
+                return Err("duplicate `--target-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--target-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--target-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--target-fd` must not overlap standard I/O".to_string());
+            }
+            target_fd = Some(parsed);
         } else if option == "--temp-home" {
             if temp_home.replace(value).is_some() {
                 return Err("duplicate `--temp-home` launcher option".to_string());
@@ -127,15 +152,18 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         spec_json,
         program,
         target_argv0,
+        target_fd,
         temp_home,
         program_args,
     })
 }
 
-/// Handle a `__capsule-child` invocation on the main thread and NEVER return on
-/// success: it `execve`s the contained target (replacing this image) or exits the
-/// process non-zero on any failure. Call this at the top of `main()` only when
-/// [`is_invocation`] is true and the process is still single-threaded.
+/// Handle a `__capsule-child` invocation on the main thread and never return. On
+/// Linux this process remains the stable contained guard while its fork child
+/// executes the target. On macOS it replaces itself with `sandbox-exec` after the
+/// trusted second-launch setup. Every failure exits non-zero. Call this at the top
+/// of `main()` only when [`is_invocation`] is true and the process is still
+/// single-threaded.
 ///
 /// On Windows and other non-Unix hosts this exits non-zero; those platforms use a
 /// different containment backend. macOS deliberately uses this re-exec launcher
@@ -242,8 +270,10 @@ fn macos_launch(parsed: &ParsedArgs) -> ! {
 
 /// Linux launch path: deserialize the spec, validate any parent-owned temporary
 /// HOME, apply containment, verify coverage is not degraded against the spec's
-/// requirement, then `execve` the target. Diverges (never returns): `execvp`
-/// replaces the image on success and every failure path exits non-zero.
+/// requirement, then fork the target beneath this stable process-group leader.
+/// A content-bound launch uses its held, sealed descriptor via
+/// `execveat(AT_EMPTY_PATH)`; ordinary launches retain the pathname `execvp`
+/// fallback. Every failure path exits non-zero.
 #[cfg(target_os = "linux")]
 fn linux_launch(parsed: &ParsedArgs) -> ! {
     use std::ffi::CString;
@@ -306,10 +336,17 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         }
     };
 
+    if let Some(fd) = parsed.target_fd {
+        if let Err(error) = validate_sealed_target_fd(&spec, fd) {
+            eprintln!("tirith __capsule-child: invalid sealed target descriptor: {error}");
+            std::process::exit(2);
+        }
+    }
+
     // Every temporary-HOME launch supplies a parent-owned directory that was
     // added to the finalized Landlock read/write policy. The parent keeps its
     // TempDir guard alive through complete-tree cleanup. Creating it here would
-    // be too late for the serialized policy and would leak it across execvp.
+    // be too late for the serialized policy and would leak it across target exec.
     let temp_home_path = match (spec.environment.temporary_home, parsed.temp_home.as_deref()) {
         (false, Some(_)) => {
             eprintln!(
@@ -365,10 +402,82 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         std::process::exit(13);
     }
 
-    // execvp searches PATH for a bare program name, matching how a user would run
-    // it; an absolute/relative path is used as-is. On success this never returns.
+    // Keep this contained launcher as the stable process-group leader and fork
+    // the target beneath it. This parent boundary is security-critical: Linux
+    // clone/clone3 permit a child-termination signal (including SIGKILL or
+    // SIGSTOP), and CLONE_PARENT directs that signal at the caller's parent. If
+    // the target replaced this launcher directly, a hostile descendant could
+    // therefore signal Tirith itself. With the launcher retained, every such
+    // signal lands on this already-contained guard instead. The outer supervisor
+    // owns the complete group and will kill it before reaping this leader.
+    let guard_pid = unsafe { libc::getpid() };
+    let process_group = unsafe { libc::getpgrp() };
+    if guard_pid <= 0 || process_group != guard_pid {
+        eprintln!(
+            "tirith __capsule-child: refusing target launch because the contained launcher is \
+             not its process-group leader"
+        );
+        std::process::exit(2);
+    }
+    let target_pid = unsafe { libc::fork() };
+    if target_pid < 0 {
+        eprintln!(
+            "tirith __capsule-child: fork contained target failed: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(127);
+    }
+    if target_pid > 0 {
+        match wait_for_contained_target(target_pid) {
+            Ok(ContainedTargetExit::Code(code)) => std::process::exit(code),
+            Ok(ContainedTargetExit::Signal(signal)) => std::process::exit(128 + signal),
+            Err(error) => {
+                eprintln!("tirith __capsule-child: wait for contained target failed: {error}");
+                std::process::exit(125);
+            }
+        }
+    }
+    // The fork child inherits the guard's group, Landlock domain, seccomp filter,
+    // rlimits, scrubbed environment, and descriptor policy. Refuse if that group
+    // relationship is ever changed by a future refactor before target exec.
+    if unsafe { libc::getpgrp() } != guard_pid {
+        eprintln!(
+            "tirith __capsule-child: contained target did not inherit the launcher's process group"
+        );
+        std::process::exit(126);
+    }
+
+    // Only the fork child reaches the execution primitives; the group-leader
+    // guard above never replaces itself with attacker-controlled target code.
     let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    if let Some(fd) = parsed.target_fd {
+        let empty = b"\0";
+        unsafe extern "C" {
+            static mut environ: *mut *mut libc::c_char;
+        }
+        // SAFETY: the descriptor was validated as a fully sealed executable and
+        // kept by HandlePolicy; `empty`, argv, and the current environ are all
+        // live and NUL-terminated as required by execveat(AT_EMPTY_PATH).
+        unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                fd,
+                empty.as_ptr() as *const libc::c_char,
+                ptrs.as_ptr(),
+                environ as *const *const libc::c_char,
+                libc::AT_EMPTY_PATH,
+            );
+        }
+        let error = std::io::Error::last_os_error();
+        eprintln!(
+            "tirith __capsule-child: execveat of sealed target {:?} failed: {error}",
+            parsed.program
+        );
+        std::process::exit(127);
+    }
+
+    // Ordinary launcher calls retain pathname/PATH behavior.
     // SAFETY: `prog_c` and every pointer in `ptrs` are valid, NUL-terminated C
     // strings that outlive the call (owned by `argv`/`prog_c`), and `ptrs` is
     // NULL-terminated as execvp requires.
@@ -382,6 +491,89 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         parsed.program
     );
     std::process::exit(127);
+}
+
+/// Wait for the direct contained target while this process remains its stable
+/// parent and process-group leader. The outer Tirith supervisor observes this
+/// guard, not attacker-controlled code, and owns termination of the entire group.
+/// A normally exited target preserves its code; a signal death is returned for
+/// the caller to represent as conventional non-zero `128 + signal`. If a hostile clone directs
+/// SIGKILL at this guard, the kernel terminates it directly and the outer
+/// supervisor still sees a signal death and finalizes the anchored group.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainedTargetExit {
+    Code(i32),
+    Signal(i32),
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_contained_target(target_pid: libc::pid_t) -> std::io::Result<ContainedTargetExit> {
+    let mut status = 0;
+    loop {
+        // __WALL is load-bearing: CLONE_PARENT makes target-created processes
+        // direct children of this guard, and a clone exit_signal of 0 is not
+        // waitable through ordinary SIGCHLD semantics. Reap every such child so
+        // a live target cannot accumulate zombies as a process-limit DoS, but
+        // return only when the primary target itself has terminated.
+        let waited = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
+        if waited > 0 && waited != target_pid {
+            continue;
+        }
+        if waited == target_pid {
+            if libc::WIFEXITED(status) {
+                return Ok(ContainedTargetExit::Code(libc::WEXITSTATUS(status)));
+            }
+            if libc::WIFSIGNALED(status) {
+                return Ok(ContainedTargetExit::Signal(libc::WTERMSIG(status)));
+            }
+            continue;
+        }
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_sealed_target_fd(
+    spec: &tirith_core::capsule::CapsuleSpec,
+    fd: i32,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if fd < 3 || !spec.handles.extra_unix_fds.contains(&fd) {
+        return Err("descriptor is not an explicit non-stdio HandlePolicy grant".to_string());
+    }
+    let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(format!(
+            "descriptor is not open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if seals < 0 || seals & required != required {
+        return Err("descriptor is not sealed against every content mutation".to_string());
+    }
+    let proc_path = std::path::PathBuf::from(format!("/proc/self/fd/{fd}"));
+    let metadata = std::fs::metadata(&proc_path)
+        .map_err(|error| format!("inspect executable descriptor: {error}"))?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err("descriptor is not an executable regular file".to_string());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "arm close-on-success for executable descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -544,13 +736,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_preserves_internal_argv0_and_parent_temp_home() {
+    fn parse_args_preserves_internal_argv0_fd_and_parent_temp_home() {
         let a = argv(&[
             "tirith",
             "__capsule-child",
             "{}",
             "--target-argv0",
             "sh",
+            "--target-fd",
+            "63",
             "--temp-home",
             "/tmp/tirith-capsule-fixed",
             "--",
@@ -559,6 +753,7 @@ mod tests {
         ]);
         let parsed = parse_args(&a).expect("parse internal launch options");
         assert_eq!(parsed.target_argv0.as_deref(), Some(OsStr::new("sh")));
+        assert_eq!(parsed.target_fd, Some(63));
         assert_eq!(
             parsed.temp_home.as_deref(),
             Some(OsStr::new("/tmp/tirith-capsule-fixed"))
@@ -587,6 +782,26 @@ mod tests {
                 "sh",
                 "--target-argv0",
                 "bash",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--target-fd",
+                "2",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--target-fd",
+                "63",
+                "--target-fd",
+                "62",
                 "--",
                 "ls",
             ]),
@@ -719,5 +934,187 @@ mod tests {
         let p = parse_args(&a).unwrap();
         let back: CapsuleSpec = serde_json::from_str(&p.spec_json).unwrap();
         assert_eq!(back, spec);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_clone_parent_reap_helper() {
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
+
+        let guard_pid = unsafe { libc::getpid() };
+        let guard_tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+        assert_eq!(
+            unsafe { libc::getpgrp() },
+            guard_pid,
+            "isolated guard helper must own its process group"
+        );
+
+        let mut descriptors = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "create clone-parent receipt pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        let target_pid = unsafe { libc::fork() };
+        assert!(
+            target_pid >= 0,
+            "fork exact contained-target fixture: {}",
+            std::io::Error::last_os_error()
+        );
+        if target_pid == 0 {
+            // This child was forked from libtest, which may own runtime locks in
+            // other threads. Use only async-signal-safe libc/syscall operations
+            // until _exit: the parent guard remains ordinary Rust and exercises
+            // the exact production wait loop below.
+            unsafe {
+                libc::close(descriptors[0]);
+                let mut clone_pids = [0 as libc::pid_t; 32];
+                for (index, pid_slot) in clone_pids.iter_mut().enumerate() {
+                    let exit_signal = if index < 16 { 0 } else { libc::SIGCHLD };
+                    let cloned = libc::syscall(
+                        libc::SYS_clone,
+                        libc::CLONE_PARENT | exit_signal,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ) as libc::pid_t;
+                    if cloned < 0 {
+                        libc::_exit(40);
+                    }
+                    if cloned == 0 {
+                        libc::_exit(0);
+                    }
+                    *pid_slot = cloned;
+                }
+                let bytes = std::slice::from_raw_parts(
+                    clone_pids.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&clone_pids),
+                );
+                let mut written = 0usize;
+                while written < bytes.len() {
+                    let count = libc::write(
+                        descriptors[1],
+                        bytes[written..].as_ptr().cast::<libc::c_void>(),
+                        bytes.len() - written,
+                    );
+                    if count < 0 {
+                        if *libc::__errno_location() == libc::EINTR {
+                            continue;
+                        }
+                        libc::_exit(41);
+                    }
+                    written += count as usize;
+                }
+                libc::close(descriptors[1]);
+                let requested = libc::timespec {
+                    tv_sec: 4,
+                    tv_nsec: 0,
+                };
+                let mut remaining = requested;
+                while libc::nanosleep(&remaining, &mut remaining) != 0 {
+                    if *libc::__errno_location() != libc::EINTR {
+                        libc::_exit(42);
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+
+        unsafe {
+            libc::close(descriptors[1]);
+        }
+        let mut pipe = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+        let watcher = std::thread::spawn(move || {
+            let mut clone_pids = [0 as libc::pid_t; 32];
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    clone_pids.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&clone_pids),
+                )
+            };
+            pipe.read_exact(bytes)
+                .expect("target publishes every CLONE_PARENT child pid");
+
+            // libtest runs this function on a worker thread, so the forked
+            // target is recorded under that thread's task entry. Production is
+            // single-threaded and has guard_tid == guard_pid; selecting the
+            // actual forking TID keeps this isolated receipt faithful to the
+            // kernel's per-task `children` accounting.
+            let children_path =
+                std::path::PathBuf::from(format!("/proc/{guard_pid}/task/{guard_tid}/children"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let children = std::fs::read_to_string(&children_path)
+                    .expect("inspect exact guard direct children")
+                    .split_whitespace()
+                    .map(str::parse::<libc::pid_t>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("numeric exact guard child list");
+                let clones_gone = clone_pids
+                    .iter()
+                    .all(|pid| !std::path::PathBuf::from(format!("/proc/{pid}")).exists());
+                if children == [target_pid] && clones_gone {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "production __WALL loop retained clone children or zombies while the primary target stayed alive: children={children:?} clone_pids={clone_pids:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+
+        let exit = wait_for_contained_target(target_pid)
+            .expect("exact production guard wait must reap the complete direct child set");
+        assert_eq!(exit, ContainedTargetExit::Code(0));
+        watcher
+            .join()
+            .expect("clone-parent no-zombie watcher completes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_guard_reaps_clone_parent_children_with_wall() {
+        const HELPER_ENV: &str = "TIRITH_TEST_CLONE_PARENT_REAP_HELPER";
+        if std::env::var_os(HELPER_ENV).is_some() {
+            run_clone_parent_reap_helper();
+            return;
+        }
+
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("locate current unit-test executable"),
+        );
+        command
+            .args([
+                "--exact",
+                "cli::capsule_child::tests::contained_guard_reaps_clone_parent_children_with_wall",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(HELPER_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let output = command
+            .output()
+            .expect("spawn isolated exact guard-wait receipt");
+        assert!(
+            output.status.success(),
+            "isolated exact guard-wait receipt failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

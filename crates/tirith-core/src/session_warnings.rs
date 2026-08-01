@@ -21,7 +21,7 @@ const MAX_ESCALATION_EVENTS: usize = 20;
 /// Maximum hidden events retained per session.
 const MAX_HIDDEN_EVENTS: usize = 50;
 /// W7: maximum typed events retained per session for cross-event correlation.
-const MAX_TYPED_EVENTS: usize = 200;
+pub(crate) const MAX_TYPED_EVENTS: usize = 200;
 /// W7: pathological-growth BACKSTOP for surfaced-correlation signatures. The
 /// primary eviction is now lockstep with the event window (a marker is dropped
 /// only once none of its source timestamps remain among the live `typed_events`;

@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -1176,7 +1176,7 @@ fn mcp_server_capsule_spec(cwd: &Path) -> tirith_core::capsule::CapsuleSpec {
 /// protocol), using the [`mcp_server_capsule_spec`] contained-launch policy.
 /// Enforcing surface: under degraded coverage [`crate::cli::capsule::spawn_piped`]
 /// returns `Err` and we never run the upstream uncontained. Returns the live
-/// [`Child`] for the existing bridge threads.
+/// [`ManagedChild`] for the existing bridge threads.
 fn spawn_upstream_capsuled(
     upstream_bin: &str,
     upstream_args: &[String],
@@ -1781,9 +1781,9 @@ pub fn run_gateway_with_options(
         }
     };
 
-    let child_stdin = child.stdin.take().expect("child stdin");
-    let child_stdout = child.stdout.take().expect("child stdout");
-    let child_stderr = child.stderr.take().expect("child stderr");
+    let child_stdin = child.take_stdin().expect("child stdin");
+    let child_stdout = child.take_stdout().expect("child stdout");
+    let child_stderr = child.take_stderr().expect("child stderr");
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let client_done = Arc::new(AtomicBool::new(false));
@@ -5523,7 +5523,7 @@ fn forward(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
-fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
+fn shutdown_child(child: &mut crate::cli::capsule::ManagedChild, abnormal: bool) -> i32 {
     if let Ok(Some(_)) = child.try_wait() {
         return if abnormal { 1 } else { 0 };
     }
@@ -5562,7 +5562,7 @@ fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
     }
 }
 
-fn terminate_completed_approval_child(child: &mut Child) {
+fn terminate_completed_approval_child(child: &mut crate::cli::capsule::ManagedChild) {
     if child.try_wait().ok().flatten().is_some() {
         return;
     }

@@ -527,10 +527,11 @@ pub fn run(
                 card_ref: card.clone(),
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             };
-            tirith_core::safe_command::suggest_verified_with_policy(
+            tirith_core::safe_command::suggest_verified_with_policy_and_session(
                 &suggestion_ctx,
                 &effective,
                 &policy,
+                &session_id,
             )
         } else {
             Vec::new()

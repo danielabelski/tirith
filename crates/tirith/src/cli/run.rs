@@ -206,14 +206,6 @@ fn validated_stdin_runtime(
         .ok_or_else(|| "trusted interpreter has no parent directory".to_string())?;
     push_root_managed_runtime_root(&mut read_roots, program_dir)?;
     push_root_managed_runtime_root(&mut path_dirs, program_dir)?;
-    if program.launch_path() != program.path() {
-        let snapshot_dir = program.launch_path().parent().ok_or_else(|| {
-            "bound trusted interpreter snapshot has no parent directory".to_string()
-        })?;
-        // The snapshot is executable content fixed before network I/O. It is a
-        // read root only; it never broadens PATH resolution for child commands.
-        push_private_snapshot_root(&mut read_roots, snapshot_dir)?;
-    }
 
     for directory in ["/bin", "/usr/bin"] {
         push_existing_root_managed_runtime_root(&mut read_roots, directory)?;
@@ -316,60 +308,6 @@ fn push_root_managed_runtime_root(
 #[cfg(unix)]
 fn root_managed_metadata_is_secure(uid: u32, mode: u32) -> bool {
     uid == 0 && mode & 0o022 == 0
-}
-
-/// Add the content-bound interpreter snapshot. Unlike system runtime roots this
-/// directory is intentionally parent-owned, but it is created before download,
-/// held open by `TrustedExecutable`, canonical, and accessible only to this UID.
-fn push_private_snapshot_root(
-    roots: &mut Vec<std::path::PathBuf>,
-    candidate: &std::path::Path,
-) -> Result<(), String> {
-    if !candidate.is_absolute() {
-        return Err(format!(
-            "capsule interpreter snapshot root is not absolute: {}",
-            candidate.display()
-        ));
-    }
-    let canonical = candidate.canonicalize().map_err(|error| {
-        format!(
-            "validate interpreter snapshot root {}: {error}",
-            candidate.display()
-        )
-    })?;
-    if canonical != candidate {
-        return Err(format!(
-            "capsule interpreter snapshot root is not canonical: {} -> {}",
-            candidate.display(),
-            canonical.display()
-        ));
-    }
-    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
-        format!(
-            "stat interpreter snapshot root {}: {error}",
-            canonical.display()
-        )
-    })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(format!(
-            "capsule interpreter snapshot root is not a real directory: {}",
-            canonical.display()
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700 {
-            return Err(format!(
-                "capsule interpreter snapshot root must be owned by the current uid with mode 0700: {}",
-                canonical.display()
-            ));
-        }
-    }
-    if !roots.contains(&canonical) {
-        roots.push(canonical);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

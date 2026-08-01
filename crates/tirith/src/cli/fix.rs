@@ -95,12 +95,13 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     // run the original command, but it must never bless an executable fix.
     // Policy discovery still runs normally and is preserved by the verification
     // context below. `fix` remains advisory and does not audit log.
+    let interactive = !non_interactive && !json && is_tty_pair();
     let ctx = AnalysisContext {
         input: cmd.clone(),
         shell: shell_type,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
-        interactive: false,
+        interactive,
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
@@ -111,10 +112,32 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
-    let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+    let (mut raw_verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+    let runtime_findings = tirith_core::threatdb_api::enrich_command(
+        &cmd,
+        shell_type,
+        &policy.threat_intel,
+        tirith_core::threatdb_api::RuntimeThreatMode::Inline,
+    );
+    if !runtime_findings.is_empty() {
+        raw_verdict.findings.extend(runtime_findings);
+        raw_verdict.action = tirith_core::verdict::upgraded_action_from_findings(
+            &raw_verdict.findings,
+            raw_verdict.action,
+        );
+    }
+    raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
+    let session_id = tirith_core::session::resolve_session_id();
+    let verdict = tirith_core::escalation::post_process_verdict_for_verification(
+        &raw_verdict,
+        &policy,
+        &cmd,
+        &session_id,
+        tirith_core::escalation::CallerContext::Cli,
+    );
 
-    // Allow path: nothing to fix.
-    if verdict.action == Action::Allow {
+    // Effective Allow path: nothing to fix, unless approval is still pending.
+    if no_fix_needed(&verdict) {
         if json || non_interactive {
             if !emit_no_findings_envelope(&FixEnvelope {
                 applied: false,
@@ -131,9 +154,15 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     }
 
     // Verdict has findings — ask the library for verified suggestions. Only an
-    // exact final command that re-analyzes to Allow under this same context can
-    // populate `safe_command` and cross stdout/JSON execution contracts.
-    let suggestions = safe_command::suggest_verified_with_policy(&ctx, &verdict, &policy);
+    // exact final command that re-analyzes to an approval-free Allow under this
+    // same context can populate `safe_command` and cross stdout/JSON execution
+    // contracts.
+    let suggestions = safe_command::suggest_verified_with_policy_and_session(
+        &ctx,
+        &verdict,
+        &policy,
+        &session_id,
+    );
 
     // JSON / non-interactive path: emit a plain JSON array, never prompt. Exit
     // 1 if no mechanical rewrite exists (guidance-only); 2 if rewrites are
@@ -235,6 +264,13 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
             }
         }
     }
+}
+
+/// An effective `Allow` still requires the approval flow when policy or
+/// escalation marked it as pending. Treating that state as "no fix needed"
+/// would let the advisory surface report success before approval was granted.
+fn no_fix_needed(verdict: &tirith_core::verdict::Verdict) -> bool {
+    verdict.action == Action::Allow && verdict.requires_approval != Some(true)
 }
 
 fn human_single_line(value: &str) -> String {
@@ -394,6 +430,7 @@ fn emit_suggestions_array(suggestions: &[SafeSuggestion]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_core::verdict::{Timings, Verdict};
 
     fn suggestion(
         rule_id: &str,
@@ -415,6 +452,19 @@ mod tests {
         assert_eq!(action_str(Action::Warn), "warn");
         assert_eq!(action_str(Action::WarnAck), "warn");
         assert_eq!(action_str(Action::Block), "block");
+    }
+
+    #[test]
+    fn pending_approval_is_not_reported_as_no_fix_needed() {
+        let mut verdict = Verdict::allow_fast(1, Timings::default());
+        verdict.requires_approval = Some(true);
+        assert!(!no_fix_needed(&verdict));
+
+        verdict.requires_approval = Some(false);
+        assert!(no_fix_needed(&verdict));
+
+        verdict.requires_approval = None;
+        assert!(no_fix_needed(&verdict));
     }
 
     #[test]

