@@ -1249,6 +1249,52 @@ pub fn log_verdict_with_raw(
     raw_action: Option<String>,
     raw_rule_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
+    log_verdict_with_raw_inner(
+        verdict,
+        command,
+        log_path,
+        event_id,
+        custom_dlp_patterns,
+        raw_action,
+        raw_rule_ids,
+        false,
+    )
+}
+
+/// Runner bypasses are exceptional live-execution authorizations and must not
+/// proceed when audit logging is disabled or unavailable. Unlike the ordinary
+/// best-effort API, an intentional skip is therefore an error here.
+pub(crate) fn log_verdict_with_raw_required(
+    verdict: &Verdict,
+    command: &str,
+    log_path: Option<PathBuf>,
+    event_id: Option<String>,
+    custom_dlp_patterns: &[String],
+    raw_action: Option<String>,
+    raw_rule_ids: Option<Vec<String>>,
+) -> Result<(), String> {
+    log_verdict_with_raw_inner(
+        verdict,
+        command,
+        log_path,
+        event_id,
+        custom_dlp_patterns,
+        raw_action,
+        raw_rule_ids,
+        true,
+    )
+}
+
+fn log_verdict_with_raw_inner(
+    verdict: &Verdict,
+    command: &str,
+    log_path: Option<PathBuf>,
+    event_id: Option<String>,
+    custom_dlp_patterns: &[String],
+    raw_action: Option<String>,
+    raw_rule_ids: Option<Vec<String>>,
+    require_write: bool,
+) -> Result<(), String> {
     let entry = AuditEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         session_id: crate::session::resolve_session_id(),
@@ -1290,6 +1336,9 @@ pub fn log_verdict_with_raw(
 
     let line = match append_to_audit_log(&entry, log_path) {
         AuditWrite::Written(l) => l,
+        AuditWrite::Skipped if require_write => {
+            return Err("required audit append was disabled or has no destination".to_string())
+        }
         AuditWrite::Skipped => return Ok(()),
         AuditWrite::Failed(reason) => return Err(reason),
     };
@@ -1665,6 +1714,47 @@ mod tests {
             "log file should not be created when TIRITH_LOG=0"
         );
 
+        unsafe { std::env::remove_var("TIRITH_LOG") };
+    }
+
+    #[test]
+    fn required_raw_audit_rejects_disabled_and_real_write_failure() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("required.jsonl");
+        let verdict = Verdict::allow_fast(1, crate::verdict::Timings::default());
+
+        unsafe { std::env::set_var("TIRITH_LOG", "0") };
+        assert!(log_verdict_with_raw(
+            &verdict,
+            "test",
+            Some(log_path.clone()),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .is_ok());
+        let disabled = log_verdict_with_raw_required(
+            &verdict,
+            "test",
+            Some(log_path.clone()),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .expect_err("required append must reject TIRITH_LOG=0");
+        assert!(disabled.contains("disabled"), "{disabled}");
+
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        std::fs::create_dir(&log_path).unwrap();
+        let write_failure =
+            log_verdict_with_raw_required(&verdict, "test", Some(log_path), None, &[], None, None)
+                .expect_err("directory-as-log must be a real required write failure");
+        assert!(write_failure.contains("cannot open"), "{write_failure}");
         unsafe { std::env::remove_var("TIRITH_LOG") };
     }
 

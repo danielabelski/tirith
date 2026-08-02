@@ -44,6 +44,14 @@ use std::ffi::{OsStr, OsString};
 /// The hidden subcommand name. A double-underscore prefix marks it internal and
 /// keeps it clear of any real command.
 pub const SUBCOMMAND: &str = "__capsule-child";
+#[cfg(target_os = "linux")]
+pub const TARGET_EXEC_OBSERVED: u8 = b'O';
+#[cfg(target_os = "linux")]
+pub const TARGET_ACK_RESUME: u8 = b'A';
+#[cfg(target_os = "linux")]
+pub const TARGET_LAUNCH_RESUMED: u8 = b'R';
+#[cfg(target_os = "linux")]
+pub const TARGET_LAUNCH_ERROR: u8 = b'E';
 
 /// Whether `args` (typically `std::env::args().collect()`) is a `__capsule-child`
 /// invocation. Checked at the top of `main()` so the launcher runs before the
@@ -70,6 +78,17 @@ pub struct ParsedArgs {
     /// the launcher executes this descriptor with `execveat(AT_EMPTY_PATH)` and
     /// treats `program` as a diagnostic label only.
     pub target_fd: Option<i32>,
+    /// Optional inherited, fully sealed reviewed-script descriptor. It is
+    /// carried into the target interpreter and named in argv via /proc/self/fd.
+    pub script_fd: Option<i32>,
+    /// Guard-owned status descriptor for proving the actual target crossed
+    /// exec. Linux only: the guard reports OBSERVED while the tracee is stopped,
+    /// then RESUMED only after exact parent authorization and successful detach.
+    pub launch_status_fd: Option<i32>,
+    /// Guard-owned read endpoint for the parent's one-shot ACK_RESUME. The
+    /// tracee remains stopped at PTRACE_EVENT_EXEC until this exact byte and EOF
+    /// are observed.
+    pub launch_ack_fd: Option<i32>,
     /// Optional parent-owned temporary HOME. The parent keeps the directory
     /// guard alive until the complete child tree has exited and grants this
     /// exact path in the finalized filesystem policy before launch.
@@ -80,7 +99,9 @@ pub struct ParsedArgs {
 
 /// Parse `tirith __capsule-child <spec-json> [internal options] -- <prog>
 /// <arg>...` from the full process argv. Internal options are closed and may
-/// appear at most once: `--target-argv0 <value>`, `--target-fd <number>`, and
+/// appear at most once: `--target-argv0 <value>`, `--target-fd <number>`,
+/// `--script-fd <number>`, `--launch-status-fd <number>`,
+/// `--launch-ack-fd <number>`, and
 /// `--temp-home <absolute>`.
 /// Pure and platform-independent, so the argv grammar is unit-testable
 /// everywhere.
@@ -106,6 +127,9 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     }
     let mut target_argv0 = None;
     let mut target_fd = None;
+    let mut script_fd = None;
+    let mut launch_status_fd = None;
+    let mut launch_ack_fd = None;
     let mut temp_home = None;
     let mut option_index = 3usize;
     while option_index < sep {
@@ -133,6 +157,48 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
                 return Err("`--target-fd` must not overlap standard I/O".to_string());
             }
             target_fd = Some(parsed);
+        } else if option == "--launch-status-fd" {
+            if launch_status_fd.is_some() {
+                return Err("duplicate `--launch-status-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--launch-status-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--launch-status-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--launch-status-fd` must not overlap standard I/O".to_string());
+            }
+            launch_status_fd = Some(parsed);
+        } else if option == "--script-fd" {
+            if script_fd.is_some() {
+                return Err("duplicate `--script-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--script-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--script-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--script-fd` must not overlap standard I/O".to_string());
+            }
+            script_fd = Some(parsed);
+        } else if option == "--launch-ack-fd" {
+            if launch_ack_fd.is_some() {
+                return Err("duplicate `--launch-ack-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--launch-ack-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--launch-ack-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--launch-ack-fd` must not overlap standard I/O".to_string());
+            }
+            launch_ack_fd = Some(parsed);
         } else if option == "--temp-home" {
             if temp_home.replace(value).is_some() {
                 return Err("duplicate `--temp-home` launcher option".to_string());
@@ -141,6 +207,17 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             return Err(format!("unknown internal launcher option {option:?}"));
         }
         option_index += 2;
+    }
+    let internal_fds = [target_fd, script_fd, launch_status_fd, launch_ack_fd];
+    for (index, descriptor) in internal_fds.iter().enumerate() {
+        if descriptor.is_some() && internal_fds[index + 1..].contains(descriptor) {
+            return Err("internal launcher descriptors must be pairwise distinct".to_string());
+        }
+    }
+    if launch_status_fd.is_some() != launch_ack_fd.is_some() {
+        return Err(
+            "`--launch-status-fd` and `--launch-ack-fd` must be supplied together".to_string(),
+        );
     }
     let rest = &args[sep + 1..];
     let program = rest
@@ -153,6 +230,9 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         program,
         target_argv0,
         target_fd,
+        script_fd,
+        launch_status_fd,
+        launch_ack_fd,
         temp_home,
         program_args,
     })
@@ -342,6 +422,82 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
             std::process::exit(2);
         }
     }
+    if parsed.launch_status_fd.is_some() != parsed.launch_ack_fd.is_some() {
+        eprintln!(
+            "tirith __capsule-child: target-exec status and authorization descriptors must be supplied together"
+        );
+        std::process::exit(2);
+    }
+    if let Some(fd) = parsed.launch_status_fd {
+        if let Err(error) = validate_launch_protocol_fd(&spec, fd, "status") {
+            eprintln!("tirith __capsule-child: invalid target-exec status descriptor: {error}");
+            std::process::exit(2);
+        }
+    }
+    if let Some(fd) = parsed.launch_ack_fd {
+        if let Err(error) = validate_launch_protocol_fd(&spec, fd, "authorization") {
+            eprintln!(
+                "tirith __capsule-child: invalid target-exec authorization descriptor: {error}"
+            );
+            std::process::exit(2);
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            eprintln!(
+                "tirith __capsule-child: cannot arm close-on-exec for target authorization descriptor: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(2);
+        }
+    }
+    if let Some(fd) = parsed.script_fd {
+        if Some(fd) == parsed.target_fd
+            || Some(fd) == parsed.launch_status_fd
+            || Some(fd) == parsed.launch_ack_fd
+        {
+            eprintln!(
+                "tirith __capsule-child: reviewed-script descriptor overlaps another internal descriptor"
+            );
+            std::process::exit(2);
+        }
+        if let Err(error) = validate_sealed_script_fd(&spec, fd) {
+            eprintln!("tirith __capsule-child: invalid reviewed-script descriptor: {error}");
+            std::process::exit(2);
+        }
+        let expected = OsString::from(format!("/proc/self/fd/{fd}"));
+        if parsed.program_args.last() != Some(&expected) {
+            eprintln!(
+                "tirith __capsule-child: reviewed-script argv does not name the validated descriptor"
+            );
+            std::process::exit(2);
+        }
+    } else if parsed
+        .program_args
+        .last()
+        .and_then(|arg| arg.to_str())
+        .and_then(|arg| arg.strip_prefix("/proc/self/fd/"))
+        .and_then(|fd| fd.parse::<i32>().ok())
+        .is_some_and(|fd| {
+            spec.handles.extra_unix_fds.contains(&fd)
+                && Some(fd) != parsed.target_fd
+                && Some(fd) != parsed.launch_status_fd
+                && Some(fd) != parsed.launch_ack_fd
+        })
+    {
+        eprintln!(
+            "tirith __capsule-child: inherited reviewed-script operand requires --script-fd validation"
+        );
+        std::process::exit(2);
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if let Some(fd) = parsed.launch_status_fd {
+        write_target_launch_status(fd, TARGET_LAUNCH_ERROR);
+        eprintln!(
+            "tirith __capsule-child: kernel target-exec proof is unavailable on this Linux architecture"
+        );
+        std::process::exit(2);
+    }
 
     // Every temporary-HOME launch supplies a parent-owned directory that was
     // added to the finalized Landlock read/write policy. The parent keeps its
@@ -428,6 +584,25 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         std::process::exit(127);
     }
     if target_pid > 0 {
+        if let (Some(status_fd), Some(ack_fd)) = (parsed.launch_status_fd, parsed.launch_ack_fd) {
+            if let Err(error) = confirm_target_exec_event(target_pid, status_fd, ack_fd) {
+                unsafe {
+                    libc::close(status_fd);
+                    libc::close(ack_fd);
+                }
+                eprintln!(
+                    "tirith __capsule-child: target did not cross the kernel exec boundary: {error}"
+                );
+                // kill(2) is deliberately absent from the seccomp policy. Use
+                // the narrowly-filtered PTRACE_KILL relationship to clean and
+                // reap a stopped tracee, including failures before EXITKILL is
+                // known armed. If it cannot be issued, never block here: exit
+                // immediately so an armed EXITKILL fires and let the outer
+                // uncontained supervisor finalize the anchored group.
+                let _ = terminate_stopped_tracee(target_pid);
+                std::process::exit(127);
+            }
+        }
         match wait_for_contained_target(target_pid) {
             Ok(ContainedTargetExit::Code(code)) => std::process::exit(code),
             Ok(ContainedTargetExit::Signal(signal)) => std::process::exit(128 + signal),
@@ -445,6 +620,70 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
             "tirith __capsule-child: contained target did not inherit the launcher's process group"
         );
         std::process::exit(126);
+    }
+
+    // Only the stable guard may consume the parent's ACK_RESUME. The target
+    // closes its inherited read endpoint before arming tracing, and the guard
+    // endpoint itself is CLOEXEC as defense in depth against future flow edits.
+    if let Some(fd) = parsed.launch_ack_fd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    // Close the pre-EXITKILL guard-death window. PR_SET_PDEATHSIG is inherited
+    // across exec, and the immediate parent recheck closes the race where the
+    // guard dies between fork and prctl. Thus an uncommitted target cannot
+    // auto-detach and run if its trusted tracer disappears before SETOPTIONS.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } < 0
+        || unsafe { libc::getppid() } != guard_pid
+    {
+        if let Some(fd) = parsed.launch_status_fd {
+            write_target_launch_status(fd, TARGET_LAUNCH_ERROR);
+        }
+        eprintln!("tirith __capsule-child: cannot bind contained target lifetime to its guard");
+        std::process::exit(126);
+    }
+
+    if let Some(fd) = parsed.launch_status_fd {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            write_target_launch_status(fd, TARGET_LAUNCH_ERROR);
+            eprintln!(
+                "tirith __capsule-child: cannot arm target-exec status descriptor: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(126);
+        }
+        let traced = unsafe {
+            libc::ptrace(
+                libc::PTRACE_TRACEME,
+                0,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        if traced < 0 {
+            write_target_launch_status(fd, TARGET_LAUNCH_ERROR);
+            eprintln!(
+                "tirith __capsule-child: cannot arm kernel target-exec tracing: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(126);
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            // A synchronous breakpoint produces the initial ptrace stop without
+            // granting kill/tgkill to code that survives the later exec.
+            std::arch::asm!("int3", options(nomem, nostack));
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // AArch64's synchronous breakpoint is the architectural equivalent
+            // of x86_64 int3 and yields the initial SIGTRAP trace stop without a
+            // signal-delivery syscall grant.
+            std::arch::asm!("brk #0", options(nomem, nostack));
+        }
     }
 
     // Only the fork child reaches the execution primitives; the group-leader
@@ -470,6 +709,9 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
             );
         }
         let error = std::io::Error::last_os_error();
+        if let Some(status_fd) = parsed.launch_status_fd {
+            write_target_launch_status(status_fd, TARGET_LAUNCH_ERROR);
+        }
         eprintln!(
             "tirith __capsule-child: execveat of sealed target {:?} failed: {error}",
             parsed.program
@@ -486,11 +728,286 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
     }
     // execvp only returns on error.
     let err = std::io::Error::last_os_error();
+    if let Some(status_fd) = parsed.launch_status_fd {
+        write_target_launch_status(status_fd, TARGET_LAUNCH_ERROR);
+    }
     eprintln!(
         "tirith __capsule-child: exec of {:?} failed: {err}",
         parsed.program
     );
     std::process::exit(127);
+}
+
+#[cfg(target_os = "linux")]
+fn write_target_launch_status(fd: i32, status: u8) -> bool {
+    let mut written = 0usize;
+    let bytes = [status];
+    while written < bytes.len() {
+        let result = unsafe {
+            libc::write(
+                fd,
+                bytes[written..].as_ptr().cast::<libc::c_void>(),
+                bytes.len() - written,
+            )
+        };
+        if result > 0 {
+            written += result as usize;
+            continue;
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_target_exec_event(
+    target_pid: libc::pid_t,
+    status_fd: i32,
+    ack_fd: i32,
+) -> Result<(), String> {
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(target_pid, &mut status, libc::__WALL) };
+        if waited == target_pid {
+            break;
+        }
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Err(format!("wait for target trace stop: {error}"));
+            }
+            return refuse_unarmed_stopped_tracee(
+                target_pid,
+                format!("wait for target trace stop: {error}"),
+            );
+        }
+    }
+    if !libc::WIFSTOPPED(status) {
+        return Err("target exited or signalled before arming exec tracing".to_string());
+    }
+    if libc::WSTOPSIG(status) != libc::SIGTRAP {
+        return refuse_unarmed_stopped_tracee(
+            target_pid,
+            format!(
+                "target stopped with signal {} before arming exec tracing",
+                libc::WSTOPSIG(status)
+            ),
+        );
+    }
+    let set_options = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETOPTIONS,
+            target_pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            ((libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_EXITKILL) as usize) as *mut libc::c_void,
+        )
+    };
+    if set_options < 0 {
+        return refuse_unarmed_stopped_tracee(
+            target_pid,
+            format!(
+                "set PTRACE_O_TRACEEXEC|PTRACE_O_EXITKILL: {}",
+                std::io::Error::last_os_error()
+            ),
+        );
+    }
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_CONT,
+            target_pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    } < 0
+    {
+        return Err(format!(
+            "continue traced target: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    loop {
+        let waited = unsafe { libc::waitpid(target_pid, &mut status, libc::__WALL) };
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("wait for target exec event: {error}"));
+        }
+        if waited != target_pid {
+            continue;
+        }
+        if libc::WIFSTOPPED(status)
+            && libc::WSTOPSIG(status) == libc::SIGTRAP
+            && ((status >> 16) as libc::c_uint) == libc::PTRACE_EVENT_EXEC as libc::c_uint
+        {
+            let confirmed = authorize_detach_and_report_target_exec(status_fd, ack_fd, || {
+                if unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_DETACH,
+                        target_pid,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                    )
+                } < 0
+                {
+                    return Err(format!(
+                        "detach kernel-confirmed target: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                Ok(())
+            });
+            if confirmed.is_ok() {
+                // confirm_target_exec_event owns both raw protocol endpoints.
+                // On error its caller closes them exactly once; on success
+                // ownership ends here after terminal RESUMED was published.
+                unsafe {
+                    libc::close(status_fd);
+                    libc::close(ack_fd);
+                }
+            }
+            return confirmed;
+        }
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            return Err("target exited before the kernel reported exec".to_string());
+        }
+        return Err(format!(
+            "target stopped with signal {} before exec",
+            libc::WSTOPSIG(status)
+        ));
+    }
+}
+
+/// Complete the stopped-exec authorization protocol in causal order: OBSERVED,
+/// exact ACK+EOF, detach/resume, then terminal RESUMED. The caller owns and
+/// closes both protocol descriptors exactly once.
+#[cfg(target_os = "linux")]
+fn authorize_detach_and_report_target_exec(
+    status_fd: i32,
+    ack_fd: i32,
+    detach: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    // The tracee is still stopped at the kernel's PTRACE_EVENT_EXEC boundary.
+    // Publish only that observation, then require the outer trusted parent to
+    // authorize resume with one exact byte and close its endpoint.
+    if !write_target_launch_status(status_fd, TARGET_EXEC_OBSERVED) {
+        return Err("report stopped kernel-confirmed target exec".to_string());
+    }
+    read_exact_resume_ack(ack_fd)?;
+    detach()?;
+    if !write_target_launch_status(status_fd, TARGET_LAUNCH_RESUMED) {
+        return Err("report detached kernel-confirmed target exec".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_exact_resume_ack(fd: i32) -> Result<(), String> {
+    let mut seen = false;
+    let mut bytes = [0u8; 16];
+    loop {
+        let count =
+            unsafe { libc::read(fd, bytes.as_mut_ptr().cast::<libc::c_void>(), bytes.len()) };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("read target-resume authorization: {error}"));
+        }
+        if count == 0 {
+            return if seen {
+                Ok(())
+            } else {
+                Err("target-resume authorization channel closed without ACK".to_string())
+            };
+        }
+        for byte in &bytes[..count as usize] {
+            if *byte != TARGET_ACK_RESUME {
+                return Err("target-resume authorization contained an invalid byte".to_string());
+            }
+            if seen {
+                return Err("target-resume authorization was duplicated".to_string());
+            }
+            seen = true;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_stopped_tracee(target_pid: libc::pid_t) -> bool {
+    let killed = unsafe {
+        libc::ptrace(
+            libc::PTRACE_KILL,
+            target_pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    if killed < 0 {
+        // ESRCH can also mean a live tracee is not currently in ptrace-stop; it
+        // is never terminal proof. Only a successful PTRACE_KILL followed by a
+        // terminal wait below proves cleanup.
+        return false;
+    }
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(target_pid, &mut status, libc::__WALL) };
+        if waited == target_pid && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
+            return true;
+        }
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return error.raw_os_error() == Some(libc::ECHILD);
+        }
+    }
+}
+
+/// Refuse before PTRACE_O_EXITKILL is known armed. A returned error guarantees
+/// the target was either already terminal (handled by the caller before this
+/// helper) or was PTRACE_KILLed and reaped here. If that proof cannot be made,
+/// keep this tracer alive and the tracee stopped until the outer uncontained
+/// supervisor kills the complete process group; exiting could auto-detach and
+/// resume an unacknowledged image.
+#[cfg(target_os = "linux")]
+fn refuse_unarmed_stopped_tracee(target_pid: libc::pid_t, reason: String) -> Result<(), String> {
+    if terminate_stopped_tracee(target_pid) {
+        return Err(format!("{reason}; unarmed tracee cleanup succeeded=true"));
+    }
+    eprintln!(
+        "tirith __capsule-child: {reason}; cannot prove unarmed tracee cleanup, waiting for outer process-group termination"
+    );
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(target_pid, &mut status, libc::__WALL) };
+        if waited == target_pid && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
+            return Err(format!(
+                "{reason}; outer tracee cleanup observed terminal state"
+            ));
+        }
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Err(format!("{reason}; tracee is no longer a child"));
+            }
+            // Do not exit on an ambiguous wait failure while EXITKILL is
+            // unarmed. Retry until the outer supervisor resolves the group.
+        }
+    }
 }
 
 /// Wait for the direct contained target while this process remains its stable
@@ -572,6 +1089,111 @@ fn validate_sealed_target_fd(
             "arm close-on-success for executable descriptor: {}",
             std::io::Error::last_os_error()
         ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_launch_protocol_fd(
+    spec: &tirith_core::capsule::CapsuleSpec,
+    fd: i32,
+    role: &str,
+) -> Result<(), String> {
+    if fd < 3 || !spec.handles.extra_unix_fds.contains(&fd) {
+        return Err(format!(
+            "{role} descriptor is not an explicit non-stdio HandlePolicy grant"
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(format!(
+            "{role} descriptor is not open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } < 0 {
+        return Err(format!(
+            "inspect {role} descriptor type: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fstat initialized the structure on success.
+    let metadata = unsafe { metadata.assume_init() };
+    let descriptor_type = metadata.st_mode & libc::S_IFMT;
+    match role {
+        "status" => {
+            let open_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if descriptor_type != libc::S_IFIFO
+                || open_flags < 0
+                || open_flags & libc::O_ACCMODE != libc::O_WRONLY
+            {
+                return Err(
+                    "status descriptor is not the write-only endpoint of a pipe".to_string()
+                );
+            }
+        }
+        "authorization" => {
+            let mut socket_type = 0i32;
+            let mut socket_type_len = std::mem::size_of::<i32>() as libc::socklen_t;
+            let mut socket_domain = 0i32;
+            let mut socket_domain_len = std::mem::size_of::<i32>() as libc::socklen_t;
+            if descriptor_type != libc::S_IFSOCK
+                || unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_TYPE,
+                        (&mut socket_type as *mut i32).cast::<libc::c_void>(),
+                        &mut socket_type_len,
+                    )
+                } < 0
+                || socket_type != libc::SOCK_STREAM
+                || unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_DOMAIN,
+                        (&mut socket_domain as *mut i32).cast::<libc::c_void>(),
+                        &mut socket_domain_len,
+                    )
+                } < 0
+                || socket_domain != libc::AF_UNIX
+            {
+                return Err(
+                    "authorization descriptor is not an AF_UNIX stream socket endpoint".to_string(),
+                );
+            }
+        }
+        _ => return Err("unknown target-exec protocol descriptor role".to_string()),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_sealed_script_fd(
+    spec: &tirith_core::capsule::CapsuleSpec,
+    fd: i32,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if fd < 3 || !spec.handles.extra_unix_fds.contains(&fd) {
+        return Err("descriptor is not an explicit non-stdio HandlePolicy grant".to_string());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(format!(
+            "descriptor is not open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if seals < 0 || seals & required != required {
+        return Err("descriptor is not sealed against every content mutation".to_string());
+    }
+    let metadata = std::fs::metadata(format!("/proc/self/fd/{fd}"))
+        .map_err(|error| format!("inspect reviewed-script descriptor: {error}"))?;
+    if !metadata.is_file() || metadata.mode() & 0o222 != 0 {
+        return Err("descriptor is not a read-only regular file".to_string());
     }
     Ok(())
 }
@@ -736,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_preserves_internal_argv0_fd_and_parent_temp_home() {
+    fn parse_args_preserves_every_internal_launch_operand() {
         let a = argv(&[
             "tirith",
             "__capsule-child",
@@ -745,6 +1367,12 @@ mod tests {
             "sh",
             "--target-fd",
             "63",
+            "--script-fd",
+            "62",
+            "--launch-status-fd",
+            "61",
+            "--launch-ack-fd",
+            "60",
             "--temp-home",
             "/tmp/tirith-capsule-fixed",
             "--",
@@ -754,6 +1382,9 @@ mod tests {
         let parsed = parse_args(&a).expect("parse internal launch options");
         assert_eq!(parsed.target_argv0.as_deref(), Some(OsStr::new("sh")));
         assert_eq!(parsed.target_fd, Some(63));
+        assert_eq!(parsed.script_fd, Some(62));
+        assert_eq!(parsed.launch_status_fd, Some(61));
+        assert_eq!(parsed.launch_ack_fd, Some(60));
         assert_eq!(
             parsed.temp_home.as_deref(),
             Some(OsStr::new("/tmp/tirith-capsule-fixed"))
@@ -801,6 +1432,41 @@ mod tests {
                 "--target-fd",
                 "63",
                 "--target-fd",
+                "62",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--script-fd",
+                "63",
+                "--script-fd",
+                "62",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--launch-status-fd",
+                "63",
+                "--launch-status-fd",
+                "62",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--target-fd",
+                "63",
+                "--script-fd",
+                "63",
+                "--launch-status-fd",
                 "62",
                 "--",
                 "ls",
@@ -934,6 +1600,332 @@ mod tests {
         let p = parse_args(&a).unwrap();
         let back: CapsuleSpec = serde_json::from_str(&p.spec_json).unwrap();
         assert_eq!(back, spec);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    struct TraceProtocolFixture {
+        target_pid: libc::pid_t,
+        status_reader: i32,
+        status_writer: i32,
+        ack_guard: i32,
+        ack_parent: i32,
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn spawn_trace_protocol_fixture(
+        program: &std::ffi::CString,
+        arguments: &[std::ffi::CString],
+        die_before_trace_stop: bool,
+    ) -> TraceProtocolFixture {
+        let mut status = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(status.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "status pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut ack = [0i32; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    ack.as_mut_ptr(),
+                )
+            },
+            0,
+            "ACK socketpair: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut argv: Vec<*const libc::c_char> =
+            arguments.iter().map(|argument| argument.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let target_pid = unsafe { libc::fork() };
+        assert!(
+            target_pid >= 0,
+            "fork traced target: {}",
+            std::io::Error::last_os_error()
+        );
+        if target_pid == 0 {
+            // libtest may have other threads. Use only async-signal-safe libc,
+            // inline trap instructions, and the already-built pointer vector.
+            unsafe {
+                libc::close(status[0]);
+                libc::close(ack[0]);
+                libc::close(ack[1]);
+                if die_before_trace_stop {
+                    libc::_exit(44);
+                }
+                let flags = libc::fcntl(status[1], libc::F_GETFD);
+                if flags < 0 || libc::fcntl(status[1], libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0
+                {
+                    libc::_exit(45);
+                }
+                if libc::ptrace(
+                    libc::PTRACE_TRACEME,
+                    0,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                ) < 0
+                {
+                    libc::_exit(46);
+                }
+                #[cfg(target_arch = "x86_64")]
+                std::arch::asm!("int3", options(nomem, nostack));
+                #[cfg(target_arch = "aarch64")]
+                std::arch::asm!("brk #0", options(nomem, nostack));
+                libc::execv(program.as_ptr(), argv.as_ptr());
+                let error = [TARGET_LAUNCH_ERROR];
+                let _ = libc::write(status[1], error.as_ptr().cast::<libc::c_void>(), 1);
+                libc::_exit(127);
+            }
+        }
+        TraceProtocolFixture {
+            target_pid,
+            status_reader: status[0],
+            status_writer: status[1],
+            ack_guard: ack[0],
+            ack_parent: ack[1],
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn send_test_ack(fd: i32, bytes: &[u8]) {
+        let sent = unsafe {
+            libc::send(
+                fd,
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent, bytes.len() as isize);
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn read_status_and_close(fd: i32) -> Vec<u8> {
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
+
+        // SAFETY: the fixture transfers unique ownership of its reader here.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read status to EOF");
+        bytes
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn real_ptrace_exec_event_requires_ack_then_detaches_and_reaps() {
+        let program = std::ffi::CString::new("/bin/true").unwrap();
+        let argv = [std::ffi::CString::new("true").unwrap()];
+        let fixture = spawn_trace_protocol_fixture(&program, &argv, false);
+        send_test_ack(fixture.ack_parent, &[TARGET_ACK_RESUME]);
+        confirm_target_exec_event(fixture.target_pid, fixture.status_writer, fixture.ack_guard)
+            .expect("kernel exec, ACK, detach, and terminal resume");
+        assert_eq!(
+            read_status_and_close(fixture.status_reader),
+            [TARGET_EXEC_OBSERVED, TARGET_LAUNCH_RESUMED]
+        );
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(fixture.target_pid, &mut status, 0) },
+            fixture.target_pid
+        );
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert_ne!(unsafe { libc::kill(fixture.target_pid, 0) }, 0);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn missing_invalid_or_duplicate_ack_cannot_run_execed_script_side_effects() {
+        for ack in [Vec::new(), vec![b'X'], vec![TARGET_ACK_RESUME; 2]] {
+            let temp = tempfile::tempdir().expect("marker directory");
+            let marker = temp.path().join("must-not-exist");
+            let command = format!("printf ran > '{}'", marker.display());
+            let program = std::ffi::CString::new("/bin/sh").unwrap();
+            let argv = [
+                std::ffi::CString::new("sh").unwrap(),
+                std::ffi::CString::new("-c").unwrap(),
+                std::ffi::CString::new(command).unwrap(),
+            ];
+            let fixture = spawn_trace_protocol_fixture(&program, &argv, false);
+            send_test_ack(fixture.ack_parent, &ack);
+            let refusal = confirm_target_exec_event(
+                fixture.target_pid,
+                fixture.status_writer,
+                fixture.ack_guard,
+            )
+            .expect_err("bad ACK must keep the execed image stopped");
+            assert!(refusal.contains("authorization"), "{refusal}");
+            assert!(terminate_stopped_tracee(fixture.target_pid));
+            unsafe {
+                libc::close(fixture.status_writer);
+                libc::close(fixture.ack_guard);
+            }
+            assert_eq!(
+                read_status_and_close(fixture.status_reader),
+                [TARGET_EXEC_OBSERVED]
+            );
+            assert!(!marker.exists(), "target code ran before an exact ACK");
+            assert_ne!(unsafe { libc::kill(fixture.target_pid, 0) }, 0);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn exec_failure_and_death_before_initial_stop_never_report_observed() {
+        for (program_path, die_before_stop) in [
+            ("/definitely/missing/tirith-target", false),
+            ("/bin/true", true),
+        ] {
+            let program = std::ffi::CString::new(program_path).unwrap();
+            let argv = [std::ffi::CString::new("fixture").unwrap()];
+            let fixture = spawn_trace_protocol_fixture(&program, &argv, die_before_stop);
+            send_test_ack(fixture.ack_parent, &[TARGET_ACK_RESUME]);
+            let refusal = confirm_target_exec_event(
+                fixture.target_pid,
+                fixture.status_writer,
+                fixture.ack_guard,
+            )
+            .expect_err("no successful exec event exists");
+            assert!(
+                refusal.contains("before") || refusal.contains("signalled"),
+                "{refusal}"
+            );
+            unsafe {
+                libc::close(fixture.status_writer);
+                libc::close(fixture.ack_guard);
+            }
+            let statuses = read_status_and_close(fixture.status_reader);
+            assert!(!statuses.contains(&TARGET_EXEC_OBSERVED), "{statuses:?}");
+            assert!(!statuses.contains(&TARGET_LAUNCH_RESUMED), "{statuses:?}");
+            assert_ne!(unsafe { libc::kill(fixture.target_pid, 0) }, 0);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn detach_failure_never_publishes_terminal_resumed() {
+        let mut status = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(status.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let mut ack = [0i32; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    ack.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        send_test_ack(ack[1], &[TARGET_ACK_RESUME]);
+        let refusal = authorize_detach_and_report_target_exec(status[1], ack[0], || {
+            Err("injected detach failure".to_string())
+        })
+        .expect_err("detach failure must not become terminal success");
+        assert!(refusal.contains("injected"));
+        unsafe {
+            libc::close(status[1]);
+            libc::close(ack[0]);
+        }
+        assert_eq!(read_status_and_close(status[0]), [TARGET_EXEC_OBSERVED]);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn unarmed_stopped_tracee_is_ptrace_killed_and_reaped_before_marker() {
+        let temp = tempfile::tempdir().expect("pre-option marker directory");
+        let marker = temp.path().join("must-not-exist");
+        let marker_c =
+            std::ffi::CString::new(marker.as_os_str().as_encoded_bytes()).expect("marker C path");
+        let target_pid = unsafe { libc::fork() };
+        assert!(target_pid >= 0);
+        if target_pid == 0 {
+            unsafe {
+                if libc::ptrace(
+                    libc::PTRACE_TRACEME,
+                    0,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                ) < 0
+                {
+                    libc::_exit(50);
+                }
+                #[cfg(target_arch = "x86_64")]
+                std::arch::asm!("int3", options(nomem, nostack));
+                #[cfg(target_arch = "aarch64")]
+                std::arch::asm!("brk #0", options(nomem, nostack));
+                let byte = [b'x'];
+                let fd = libc::open(
+                    marker_c.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                    0o600,
+                );
+                if fd >= 0 {
+                    let _ = libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1);
+                    libc::close(fd);
+                }
+                libc::_exit(0);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(target_pid, &mut status, libc::__WALL) },
+            target_pid
+        );
+        assert!(libc::WIFSTOPPED(status));
+        assert!(terminate_stopped_tracee(target_pid));
+        assert!(!marker.exists());
+        assert_ne!(unsafe { libc::kill(target_pid, 0) }, 0);
     }
 
     #[cfg(target_os = "linux")]

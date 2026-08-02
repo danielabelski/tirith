@@ -10,13 +10,21 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{File, OpenOptions};
+#[cfg(any(target_os = "linux", not(unix)))]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+#[cfg(not(unix))]
+use std::io::{Read as _, Seek as _};
+#[cfg(target_os = "linux")]
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 #[cfg(not(windows))]
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
@@ -24,40 +32,26 @@ use std::time::Instant;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(any(target_os = "linux", not(unix)))]
 use sha2::{Digest as _, Sha256};
 
-/// A resolved executable can be copied into a private, read-only snapshot before
-/// a security-sensitive caller performs network I/O. The snapshot, its open
-/// handle, and its temporary directory stay alive together until every clone of
-/// [`TrustedExecutable`] is dropped.
+/// Linux can bind a resolved executable to a private snapshot and fully sealed
+/// anonymous launch descriptor before a security-sensitive caller performs
+/// network I/O. The snapshot, descriptors, and temporary directory stay alive
+/// together until every clone of [`TrustedExecutable`] is dropped.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct BoundExecutable {
     _directory: tempfile::TempDir,
     path: PathBuf,
     _file: File,
     sha256: [u8; 32],
-    #[cfg(unix)]
     identity: UnixExecutableIdentity,
     /// Linux launches use this immutable, anonymous file description rather
     /// than reopening `path`. The complete seal set prevents another same-UID
     /// process from changing the bytes between verification and `execveat`.
-    #[cfg(target_os = "linux")]
     sealed_file: File,
-    #[cfg(target_os = "linux")]
     sealed_identity: UnixExecutableIdentity,
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for BoundExecutable {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-
-        // The owner immutable flag is defense in depth during launch. Clear it
-        // through the already-open descriptor so TempDir can remove the snapshot.
-        unsafe {
-            libc::fchflags(self._file.as_raw_fd(), 0);
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +67,7 @@ pub struct TrustedExecutable {
     digest: [u8; 32],
     #[cfg(windows)]
     source: WindowsExecutableSource,
+    #[cfg(target_os = "linux")]
     bound: Option<Arc<BoundExecutable>>,
 }
 
@@ -93,12 +88,22 @@ impl PartialEq for TrustedExecutable {
         if self.source != other.source {
             return false;
         }
-        match (&self.bound, &other.bound) {
-            (None, None) => true,
-            (Some(left), Some(right)) => left.path == right.path && left.sha256 == right.sha256,
-            _ => false,
-        }
+        bound_state_eq(self, other)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn bound_state_eq(left: &TrustedExecutable, right: &TrustedExecutable) -> bool {
+    match (&left.bound, &right.bound) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.path == right.path && left.sha256 == right.sha256,
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bound_state_eq(_: &TrustedExecutable, _: &TrustedExecutable) -> bool {
+    true
 }
 
 impl Eq for TrustedExecutable {}
@@ -445,6 +450,7 @@ impl TrustedExecutable {
                 invocation_path: path.to_path_buf(),
                 path: canonical,
                 identity,
+                #[cfg(target_os = "linux")]
                 bound: None,
             })
         }
@@ -462,7 +468,6 @@ impl TrustedExecutable {
                 path: canonical,
                 digest,
                 source: _source,
-                bound: None,
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -472,7 +477,6 @@ impl TrustedExecutable {
                 invocation_path: path.to_path_buf(),
                 path: canonical,
                 digest,
-                bound: None,
             })
         }
     }
@@ -566,34 +570,28 @@ impl TrustedExecutable {
     /// spawn. This detects replacement, permission/owner drift, and symlink
     /// retargeting between discovery and execution.
     pub fn revalidate(&self) -> Result<(), TrustedExecutableError> {
+        #[cfg(target_os = "linux")]
         if let Some(bound) = &self.bound {
-            let mut snapshot = open_snapshot_for_verification(&bound.path)?;
-            #[cfg(unix)]
+            let snapshot = open_snapshot_for_verification(&bound.path)?;
             verify_open_identity(&snapshot, bound.identity, &bound.path)?;
-            let digest = hash_open_file(&mut snapshot, &bound.path)?;
+            let digest = hash_open_file(&snapshot, &bound.path)?;
             if digest != bound.sha256 {
                 return Err(TrustedExecutableError::InvalidPath {
                     path: bound.path.clone(),
                     reason: "bound executable content changed before launch".to_string(),
                 });
             }
-            #[cfg(target_os = "linux")]
-            {
-                let mut sealed = bound.sealed_file.try_clone().map_err(|error| {
-                    TrustedExecutableError::InvalidPath {
-                        path: bound.path.clone(),
-                        reason: format!("duplicate sealed executable descriptor: {error}"),
-                    }
-                })?;
-                verify_open_identity(&sealed, bound.sealed_identity, &bound.path)?;
-                verify_required_seals(&sealed, &bound.path)?;
-                let sealed_digest = hash_open_file(&mut sealed, &bound.path)?;
-                if sealed_digest != bound.sha256 {
-                    return Err(TrustedExecutableError::InvalidPath {
-                        path: bound.path.clone(),
-                        reason: "sealed executable content changed before launch".to_string(),
-                    });
-                }
+            verify_open_identity(&bound.sealed_file, bound.sealed_identity, &bound.path)?;
+            verify_required_seals(&bound.sealed_file, &bound.path)?;
+            // File::try_clone shares an open-file-description offset on Unix.
+            // Hash the held descriptor with read_at so concurrent launches from
+            // clones cannot race one another's verification cursor.
+            let sealed_digest = hash_open_file(&bound.sealed_file, &bound.path)?;
+            if sealed_digest != bound.sha256 {
+                return Err(TrustedExecutableError::InvalidPath {
+                    path: bound.path.clone(),
+                    reason: "sealed executable content changed before launch".to_string(),
+                });
             }
             return Ok(());
         }
@@ -653,9 +651,11 @@ impl TrustedExecutable {
     /// boundaries launch the held sealed descriptor returned internally by
     /// [`Self::bound_launch_fd`] rather than reopening this path.
     pub fn launch_path(&self) -> &Path {
-        self.bound
-            .as_ref()
-            .map_or(self.path.as_path(), |bound| bound.path.as_path())
+        #[cfg(target_os = "linux")]
+        if let Some(bound) = &self.bound {
+            return bound.path.as_path();
+        }
+        self.path.as_path()
     }
 
     /// Return the immutable held executable descriptor for a Linux
@@ -671,18 +671,17 @@ impl TrustedExecutable {
             .map(|bound| bound.sealed_file.as_raw_fd())
     }
 
-    /// Copy the selected executable into a private read-only snapshot and bind
-    /// future launches to those exact bytes. Linux additionally retains a fully
-    /// sealed anonymous descriptor used by the launch boundary, so same-UID path
-    /// replacement or in-place mutation cannot change the executed image. The
-    /// source is opened without following links and its device/inode is checked
-    /// against resolution before any byte is accepted, closing the
-    /// resolve-to-copy replacement window.
+    /// On Linux, copy the selected executable into a private read-only snapshot
+    /// and bind future launches to those exact bytes through a fully sealed
+    /// anonymous descriptor. Same-UID path replacement or in-place mutation
+    /// therefore cannot change the executed image. The source is opened without
+    /// following links and its device/inode is checked against resolution before
+    /// any byte is accepted, closing the resolve-to-copy replacement window.
     ///
     /// This is intentionally opt-in: callers that resolve an interpreter before
     /// a network request use it, while ordinary short-lived trusted-child calls
     /// retain their canonical-path behavior and avoid an unnecessary file copy.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub fn bind_content(&self) -> Result<Self, TrustedExecutableError> {
         if self.bound.is_some() {
             return Ok(self.clone());
@@ -690,18 +689,14 @@ impl TrustedExecutable {
 
         let mut source_options = OpenOptions::new();
         source_options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            source_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        }
+        use std::os::unix::fs::OpenOptionsExt as _;
+        source_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         let mut source = source_options.open(&self.path).map_err(|error| {
             TrustedExecutableError::InvalidPath {
                 path: self.path.clone(),
                 reason: format!("open executable for content binding: {error}"),
             }
         })?;
-        #[cfg(unix)]
         verify_open_identity(&source, self.identity, &self.path)?;
 
         let temp_root = trusted_snapshot_temp_root()?;
@@ -712,7 +707,6 @@ impl TrustedExecutable {
                 path: temp_root.clone(),
                 reason: format!("create private executable snapshot: {error}"),
             })?;
-        #[cfg(unix)]
         std::fs::set_permissions(
             directory.path(),
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
@@ -732,11 +726,7 @@ impl TrustedExecutable {
         let snapshot_path = directory.path().join(file_name);
         let mut target_options = OpenOptions::new();
         target_options.write(true).read(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            target_options.mode(0o700).custom_flags(libc::O_CLOEXEC);
-        }
+        target_options.mode(0o700).custom_flags(libc::O_CLOEXEC);
         let mut target = target_options.open(&snapshot_path).map_err(|error| {
             TrustedExecutableError::InvalidPath {
                 path: snapshot_path.clone(),
@@ -751,7 +741,6 @@ impl TrustedExecutable {
                 path: snapshot_path.clone(),
                 reason: format!("sync executable content snapshot: {error}"),
             })?;
-        #[cfg(unix)]
         target
             .set_permissions(
                 <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o500),
@@ -764,42 +753,24 @@ impl TrustedExecutable {
         // Re-read both handles. A concurrent in-place source mutation must not be
         // accepted as a coherent binding, and the durable snapshot must contain
         // exactly the digest we recorded while copying.
-        let source_sha256 = hash_open_file(&mut source, &self.path)?;
+        let source_sha256 = hash_open_file(&source, &self.path)?;
         if source_sha256 != sha256 {
             return Err(TrustedExecutableError::InvalidPath {
                 path: self.path.clone(),
                 reason: "executable content changed while it was being bound".to_string(),
             });
         }
-        let snapshot_sha256 = hash_open_file(&mut target, &snapshot_path)?;
+        let snapshot_sha256 = hash_open_file(&target, &snapshot_path)?;
         if snapshot_sha256 != sha256 {
             return Err(TrustedExecutableError::InvalidPath {
                 path: snapshot_path,
                 reason: "executable snapshot digest changed before launch".to_string(),
             });
         }
-        #[cfg(unix)]
         verify_open_identity(&source, self.identity, &self.path)?;
 
-        #[cfg(target_os = "linux")]
         let (sealed_file, sealed_identity) =
             create_sealed_executable(&mut target, &snapshot_path, sha256)?;
-
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::fd::AsRawFd as _;
-            if unsafe { libc::fchflags(target.as_raw_fd(), libc::UF_IMMUTABLE) } != 0 {
-                return Err(TrustedExecutableError::InvalidPath {
-                    path: snapshot_path,
-                    reason: format!(
-                        "make executable content snapshot immutable: {}",
-                        std::io::Error::last_os_error()
-                    ),
-                });
-            }
-        }
-
-        #[cfg(unix)]
         let identity =
             executable_identity(&target).map_err(|error| TrustedExecutableError::InvalidPath {
                 path: snapshot_path.clone(),
@@ -810,11 +781,8 @@ impl TrustedExecutable {
             path: snapshot_path,
             _file: target,
             sha256,
-            #[cfg(unix)]
             identity,
-            #[cfg(target_os = "linux")]
             sealed_file,
-            #[cfg(target_os = "linux")]
             sealed_identity,
         };
         Ok(Self {
@@ -825,10 +793,10 @@ impl TrustedExecutable {
         })
     }
 
-    /// Content-bound execution is not exposed on platforms whose native
-    /// supervisor cannot launch the held snapshot without losing its security
-    /// guarantees (notably the Windows Job Object and explicit handle policy).
-    #[cfg(not(unix))]
+    /// Content-bound execution is unsupported outside Linux because those
+    /// launchers cannot execute the held, sealed bytes without reopening a path.
+    /// Fail closed instead of presenting a weaker platform-dependent binding.
+    #[cfg(not(target_os = "linux"))]
     pub fn bind_content(&self) -> Result<Self, TrustedExecutableError> {
         Err(TrustedExecutableError::InvalidPath {
             path: self.path.clone(),
@@ -995,7 +963,7 @@ fn verify_required_seals(file: &File, path: &Path) -> Result<(), TrustedExecutab
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn trusted_snapshot_temp_root() -> Result<PathBuf, TrustedExecutableError> {
     let root = PathBuf::from("/tmp");
     root.canonicalize()
@@ -1005,7 +973,7 @@ fn trusted_snapshot_temp_root() -> Result<PathBuf, TrustedExecutableError> {
         })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn copy_and_hash(
     source: &mut File,
     target: &mut File,
@@ -1035,6 +1003,35 @@ fn copy_and_hash(
     Ok(hasher.finalize().into())
 }
 
+#[cfg(target_os = "linux")]
+fn hash_open_file(file: &File, path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
+    use std::os::unix::fs::FileExt as _;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut offset = 0u64;
+    loop {
+        let count = file.read_at(&mut buffer, offset).map_err(|error| {
+            TrustedExecutableError::InvalidPath {
+                path: path.to_path_buf(),
+                reason: format!("read executable for content verification: {error}"),
+            }
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        offset = offset.checked_add(count as u64).ok_or_else(|| {
+            TrustedExecutableError::InvalidPath {
+                path: path.to_path_buf(),
+                reason: "executable length overflow during content verification".to_string(),
+            }
+        })?;
+    }
+    Ok(hasher.finalize().into())
+}
+
+#[cfg(not(unix))]
 fn hash_open_file(file: &mut File, path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
     file.rewind()
         .map_err(|error| TrustedExecutableError::InvalidPath {
@@ -1059,8 +1056,9 @@ fn hash_open_file(file: &mut File, path: &Path) -> Result<[u8; 32], TrustedExecu
 }
 
 /// Windows and other non-Unix hosts do not expose the Unix identity tuple used
-/// below through stable `std` APIs. Bind the canonical file's bytes instead so
-/// replacement or in-place modification is still detected before spawn.
+/// below through stable `std` APIs. Hash the canonical file's bytes and recheck
+/// them immediately before spawn so replacement or in-place modification is
+/// still detected.
 #[cfg(not(unix))]
 fn executable_digest(path: &Path) -> Result<[u8; 32], TrustedExecutableError> {
     let mut file = File::open(path).map_err(|error| TrustedExecutableError::InvalidPath {
@@ -1113,6 +1111,7 @@ fn validate_unix_executable(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn open_snapshot_for_verification(path: &Path) -> Result<File, TrustedExecutableError> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -1129,7 +1128,7 @@ fn open_snapshot_for_verification(path: &Path) -> Result<File, TrustedExecutable
         })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn executable_identity(file: &File) -> std::io::Result<UnixExecutableIdentity> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1335,7 +1334,7 @@ pub(crate) fn reject_unix_extended_acl(_path: &Path, _directory: bool) -> Result
     Err("this Unix platform has no extended-ACL verifier; refusing trusted path".to_string())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn verify_open_identity(
     file: &File,
     expected: UnixExecutableIdentity,

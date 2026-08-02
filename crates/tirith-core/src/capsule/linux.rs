@@ -637,12 +637,101 @@ impl extrasafe::RuleSet for PostExecRuntime {
             SeccompilerComparator::Eq,
             0,
         ));
-        [
+        // The forked target binds its lifetime to the contained guard before
+        // TRACEME. This closes the window before PTRACE_O_EXITKILL is installed;
+        // no other prctl option or death signal is granted.
+        let parent_death_signal = SeccompRule::new(Sysno::prctl)
+            .and_condition(SeccompArgumentFilter::new64(
+                0,
+                SeccompilerComparator::Eq,
+                libc::PR_SET_PDEATHSIG as u64,
+            ))
+            .and_condition(SeccompArgumentFilter::new64(
+                1,
+                SeccompilerComparator::Eq,
+                libc::SIGKILL as u64,
+            ))
+            .and_condition(SeccompArgumentFilter::new64(
+                2,
+                SeccompilerComparator::Eq,
+                0,
+            ))
+            .and_condition(SeccompArgumentFilter::new64(
+                3,
+                SeccompilerComparator::Eq,
+                0,
+            ))
+            .and_condition(SeccompArgumentFilter::new64(
+                4,
+                SeccompilerComparator::Eq,
+                0,
+            ));
+        let mut rules: std::collections::HashMap<_, Vec<_>> = [
             (Sysno::prlimit64, vec![prlimit]),
             (Sysno::getpgid, vec![getpgid]),
+            (Sysno::prctl, vec![parent_death_signal]),
         ]
         .into_iter()
-        .collect()
+        .collect();
+        // The contained guard uses ptrace only as a kernel-authenticated exec
+        // boundary. Bind every granted request to its exact argument contract:
+        // the child may declare only TRACEME with otherwise-null arguments; the
+        // guard may operate only on a positive child pid, may install exactly
+        // TRACEEXEC|EXITKILL, may resume/detach without injecting a signal, and
+        // may terminate only its already-traced positive-pid child if the proof
+        // protocol fails before EXITKILL is known armed.
+        // No attach, seize, peek/poke, register, arbitrary option, arbitrary
+        // signal, or self/negative-pid request is granted.
+        let null_arg = |index| SeccompArgumentFilter::new64(index, SeccompilerComparator::Eq, 0);
+        let positive_pid = || SeccompArgumentFilter::new64(1, SeccompilerComparator::Gt, 0);
+        // seccomp compares the raw unsigned register value. Without this upper
+        // bound, a negative pid_t is sign-extended to a large u64 and would pass
+        // the `Gt 0` condition.
+        let nonnegative_pid_t =
+            || SeccompArgumentFilter::new64(1, SeccompilerComparator::Le, i32::MAX as u64);
+        let ptrace_rules = rules.entry(Sysno::ptrace).or_default();
+        ptrace_rules.push(
+            SeccompRule::new(Sysno::ptrace)
+                .and_condition(SeccompArgumentFilter::new64(
+                    0,
+                    SeccompilerComparator::Eq,
+                    libc::PTRACE_TRACEME as u64,
+                ))
+                .and_condition(null_arg(1))
+                .and_condition(null_arg(2))
+                .and_condition(null_arg(3)),
+        );
+        ptrace_rules.push(
+            SeccompRule::new(Sysno::ptrace)
+                .and_condition(SeccompArgumentFilter::new64(
+                    0,
+                    SeccompilerComparator::Eq,
+                    libc::PTRACE_SETOPTIONS as u64,
+                ))
+                .and_condition(positive_pid())
+                .and_condition(nonnegative_pid_t())
+                .and_condition(null_arg(2))
+                .and_condition(SeccompArgumentFilter::new64(
+                    3,
+                    SeccompilerComparator::Eq,
+                    (libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_EXITKILL) as u64,
+                )),
+        );
+        for request in [libc::PTRACE_CONT, libc::PTRACE_DETACH, libc::PTRACE_KILL] {
+            ptrace_rules.push(
+                SeccompRule::new(Sysno::ptrace)
+                    .and_condition(SeccompArgumentFilter::new64(
+                        0,
+                        SeccompilerComparator::Eq,
+                        request as u64,
+                    ))
+                    .and_condition(positive_pid())
+                    .and_condition(nonnegative_pid_t())
+                    .and_condition(null_arg(2))
+                    .and_condition(null_arg(3)),
+            );
+        }
+        rules
     }
 
     fn name(&self) -> &'static str {
@@ -1069,6 +1158,326 @@ mod tests {
         assert_eq!(getpgid[0].argument_filters.len(), 1);
         assert_eq!(getpgid[0].argument_filters[0].arg_idx, 0);
         assert_eq!(getpgid[0].argument_filters[0].value, 0);
+
+        let parent_death_signal = conditional
+            .get(&Sysno::prctl)
+            .expect("exact guard parent-death prctl rule");
+        assert_eq!(parent_death_signal.len(), 1);
+        assert_eq!(parent_death_signal[0].argument_filters.len(), 5);
+        for (index, value) in [libc::PR_SET_PDEATHSIG as u64, libc::SIGKILL as u64, 0, 0, 0]
+            .into_iter()
+            .enumerate()
+        {
+            let filter = parent_death_signal[0]
+                .argument_filters
+                .iter()
+                .find(|filter| usize::from(filter.arg_idx) == index)
+                .unwrap_or_else(|| panic!("missing prctl argument {index}"));
+            assert_eq!(filter.value, value);
+            assert!(filter.is_64bit);
+        }
+
+        let ptrace = conditional
+            .get(&Sysno::ptrace)
+            .expect("exact target-exec ptrace rules");
+        assert_eq!(
+            ptrace.len(),
+            5,
+            "only the five exec-proof and traced-cleanup requests are granted"
+        );
+        let expected_requests = [
+            libc::PTRACE_TRACEME as u64,
+            libc::PTRACE_SETOPTIONS as u64,
+            libc::PTRACE_CONT as u64,
+            libc::PTRACE_DETACH as u64,
+            libc::PTRACE_KILL as u64,
+        ];
+        for request in expected_requests {
+            let rule = ptrace
+                .iter()
+                .find(|rule| {
+                    rule.argument_filters
+                        .iter()
+                        .any(|filter| filter.arg_idx == 0 && filter.value == request)
+                })
+                .unwrap_or_else(|| panic!("missing ptrace request {request}"));
+            let expected_filter_count = if request == libc::PTRACE_TRACEME as u64 {
+                4
+            } else {
+                5
+            };
+            assert_eq!(rule.argument_filters.len(), expected_filter_count);
+            assert_eq!(
+                rule.argument_filters
+                    .iter()
+                    .filter(|filter| filter.arg_idx == 0)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rule.argument_filters
+                    .iter()
+                    .filter(|filter| filter.arg_idx == 1)
+                    .count(),
+                if request == libc::PTRACE_TRACEME as u64 {
+                    1
+                } else {
+                    2
+                },
+                "guard requests must bind pid to 1..=i32::MAX"
+            );
+            for index in 2..=3 {
+                assert_eq!(
+                    rule.argument_filters
+                        .iter()
+                        .filter(|filter| filter.arg_idx == index)
+                        .count(),
+                    1,
+                    "ptrace argument {index} must be constrained exactly once"
+                );
+            }
+            assert!(rule.argument_filters.iter().all(|filter| filter.is_64bit));
+            assert_eq!(
+                rule.argument_filters
+                    .iter()
+                    .find(|filter| filter.arg_idx == 2)
+                    .expect("ptrace address filter")
+                    .value,
+                0,
+                "ptrace address must always be null"
+            );
+            if request != libc::PTRACE_TRACEME as u64 {
+                let pid_values: Vec<u64> = rule
+                    .argument_filters
+                    .iter()
+                    .filter(|filter| filter.arg_idx == 1)
+                    .map(|filter| filter.value)
+                    .collect();
+                assert!(pid_values.contains(&0));
+                assert!(pid_values.contains(&(i32::MAX as u64)));
+            }
+        }
+        let traceme = ptrace
+            .iter()
+            .find(|rule| rule.argument_filters[0].value == libc::PTRACE_TRACEME as u64)
+            .expect("TRACEME rule");
+        assert!(traceme
+            .argument_filters
+            .iter()
+            .filter(|filter| filter.arg_idx > 0)
+            .all(|filter| filter.value == 0));
+        let setoptions = ptrace
+            .iter()
+            .find(|rule| rule.argument_filters[0].value == libc::PTRACE_SETOPTIONS as u64)
+            .expect("SETOPTIONS rule");
+        assert_eq!(
+            setoptions
+                .argument_filters
+                .iter()
+                .find(|filter| filter.arg_idx == 3)
+                .expect("SETOPTIONS data filter")
+                .value,
+            (libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_EXITKILL) as u64
+        );
+        for request in [
+            libc::PTRACE_CONT as u64,
+            libc::PTRACE_DETACH as u64,
+            libc::PTRACE_KILL as u64,
+        ] {
+            let rule = ptrace
+                .iter()
+                .find(|rule| rule.argument_filters[0].value == request)
+                .expect("resume/detach/kill rule");
+            assert_eq!(
+                rule.argument_filters
+                    .iter()
+                    .find(|filter| filter.arg_idx == 3)
+                    .expect("signal filter")
+                    .value,
+                0,
+                "resume/detach/kill may not carry arbitrary data"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn seccomp_guard_death_subprocess() {
+        use std::io::BufRead as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        const MODE: &str = "TIRITH_SECCOMP_GUARD_DEATH_MODE";
+        const MARKER: &str = "TIRITH_SECCOMP_GUARD_DEATH_MARKER";
+        match std::env::var(MODE).ok().as_deref() {
+            None => return,
+            Some("guard") => {
+                let marker = std::path::PathBuf::from(
+                    std::env::var_os(MARKER).expect("guard-death marker path"),
+                );
+                let marker_c = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+                let mut lifetime = [0i32; 2];
+                assert_eq!(
+                    unsafe { libc::pipe2(lifetime.as_mut_ptr(), libc::O_CLOEXEC) },
+                    0
+                );
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                    0
+                );
+                assert!(apply_seccomp().expect("apply production seccomp in guard helper"));
+                let guard_pid = unsafe { libc::getpid() };
+                let target_pid = unsafe { libc::fork() };
+                assert!(target_pid >= 0);
+                if target_pid == 0 {
+                    unsafe {
+                        libc::close(lifetime[1]);
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) < 0
+                            || libc::getppid() != guard_pid
+                        {
+                            libc::_exit(71);
+                        }
+                        let mut receipt = [0u8; 64];
+                        let prefix = b"TARGET_PID:";
+                        receipt[..prefix.len()].copy_from_slice(prefix);
+                        let mut digits = [0u8; 20];
+                        let mut digit_count = 0usize;
+                        let mut pid = libc::getpid() as u32;
+                        loop {
+                            digits[digit_count] = b'0' + (pid % 10) as u8;
+                            digit_count += 1;
+                            pid /= 10;
+                            if pid == 0 {
+                                break;
+                            }
+                        }
+                        let mut length = prefix.len();
+                        while digit_count > 0 {
+                            digit_count -= 1;
+                            receipt[length] = digits[digit_count];
+                            length += 1;
+                        }
+                        receipt[length] = b'\n';
+                        length += 1;
+                        if libc::write(
+                            libc::STDOUT_FILENO,
+                            receipt.as_ptr().cast::<libc::c_void>(),
+                            length,
+                        ) != length as isize
+                        {
+                            libc::_exit(72);
+                        }
+                        let mut byte = 0u8;
+                        // The guard owns the only writer. Parent death closes it;
+                        // without PDEATHSIG this read reaches EOF and the marker
+                        // proves uncommitted code survived.
+                        let _ = libc::read(
+                            lifetime[0],
+                            (&mut byte as *mut u8).cast::<libc::c_void>(),
+                            1,
+                        );
+                        let fd = libc::open(
+                            marker_c.as_ptr(),
+                            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                            0o600,
+                        );
+                        if fd >= 0 {
+                            let marker_byte = [b'x'];
+                            let _ = libc::write(fd, marker_byte.as_ptr().cast::<libc::c_void>(), 1);
+                            libc::close(fd);
+                        }
+                        libc::_exit(73);
+                    }
+                }
+                unsafe {
+                    libc::close(lifetime[0]);
+                }
+                let mut status = 0;
+                let _ = unsafe { libc::waitpid(target_pid, &mut status, 0) };
+            }
+            Some("controller") => {
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+                    0
+                );
+                let executable = std::env::current_exe().expect("current test executable");
+                let mut guard = std::process::Command::new(executable)
+                    .args(["seccomp_guard_death_subprocess", "--nocapture"])
+                    .env(MODE, "guard")
+                    .env(MARKER, std::env::var_os(MARKER).expect("controller marker"))
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("spawn seccomp guard helper");
+                let mut output = std::io::BufReader::new(guard.stdout.take().unwrap());
+                let target_pid = loop {
+                    let mut line = String::new();
+                    assert_ne!(
+                        output.read_line(&mut line).unwrap(),
+                        0,
+                        "guard exited early"
+                    );
+                    if let Some(raw) = line.trim().strip_prefix("TARGET_PID:") {
+                        break raw.parse::<libc::pid_t>().expect("target pid receipt");
+                    }
+                };
+                assert_eq!(
+                    unsafe { libc::kill(guard.id() as libc::pid_t, libc::SIGKILL) },
+                    0
+                );
+                let guard_status = guard.wait().expect("reap killed guard");
+                assert!(!guard_status.success());
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let mut target_status = 0;
+                loop {
+                    let waited =
+                        unsafe { libc::waitpid(target_pid, &mut target_status, libc::WNOHANG) };
+                    if waited == target_pid {
+                        break;
+                    }
+                    assert_eq!(
+                        waited,
+                        0,
+                        "wait adopted target: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "PDEATHSIG target survived"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(libc::WIFSIGNALED(target_status));
+                assert_eq!(libc::WTERMSIG(target_status), libc::SIGKILL);
+                assert_ne!(unsafe { libc::kill(target_pid, 0) }, 0);
+            }
+            Some(other) => panic!("unknown guard-death helper mode {other}"),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn production_seccomp_parent_death_signal_kills_and_reaps_target() {
+        const MODE: &str = "TIRITH_SECCOMP_GUARD_DEATH_MODE";
+        const MARKER: &str = "TIRITH_SECCOMP_GUARD_DEATH_MARKER";
+        let marker_dir = tempfile::tempdir().expect("guard-death marker directory");
+        let marker = marker_dir.path().join("target-survived");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["seccomp_guard_death_subprocess", "--nocapture"])
+            .env(MODE, "controller")
+            .env(MARKER, &marker)
+            .output()
+            .expect("run isolated guard-death controller");
+        assert!(
+            output.status.success(),
+            "guard-death controller failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "target survived its seccomp-confined guard"
+        );
     }
 
     #[test]

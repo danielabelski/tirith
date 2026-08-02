@@ -10,6 +10,8 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
+#[cfg(not(target_os = "linux"))]
+use tirith_core::trusted_child::TrustedExecutableError;
 use tirith_core::trusted_child::{
     run, sanitized_path, CaptureStream, ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable,
 };
@@ -261,9 +263,24 @@ fn trusted_lookup_retains_a_multicall_symlink_separately_from_its_target() {
     let executable = TrustedExecutable::resolve_on_path("cargo", &path, &[]).unwrap();
     assert_eq!(executable.invocation_path(), proxy);
     assert_eq!(executable.path(), target.canonicalize().unwrap());
-    let bound = executable.bind_content().unwrap();
-    assert_eq!(bound.invocation_path(), proxy);
-    assert_eq!(bound.path(), target.canonicalize().unwrap());
+    #[cfg(target_os = "linux")]
+    {
+        let bound = executable.bind_content().unwrap();
+        assert_eq!(bound.invocation_path(), proxy);
+        assert_eq!(bound.path(), target.canonicalize().unwrap());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn content_binding_fails_closed_on_non_linux_unix() {
+    let executable = shell();
+    let error = executable.bind_content().unwrap_err();
+    assert!(
+        matches!(error, TrustedExecutableError::InvalidPath { .. }),
+        "unsupported binding must be an InvalidPath error: {error}"
+    );
+    assert!(error.to_string().contains("unsupported"), "{error}");
 }
 
 #[test]
@@ -476,6 +493,7 @@ fn replacing_the_canonical_target_is_detected_before_spawn() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn content_binding_survives_same_inode_source_mutation() {
     use std::os::unix::fs::MetadataExt as _;
@@ -505,6 +523,7 @@ fn content_binding_survives_same_inode_source_mutation() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn content_binding_survives_canonical_path_replacement() {
     let temp = tempfile::tempdir().unwrap();
@@ -529,6 +548,7 @@ fn content_binding_survives_canonical_path_replacement() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn content_binding_detects_snapshot_tampering_before_spawn() {
     let temp = tempfile::tempdir().unwrap();
@@ -539,14 +559,6 @@ fn content_binding_detects_snapshot_tampering_before_spawn() {
         .bind_content()
         .unwrap();
 
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let path = CString::new(selected.launch_path().as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::chflags(path.as_ptr(), 0) }, 0);
-    }
     std::fs::set_permissions(
         selected.launch_path(),
         std::fs::Permissions::from_mode(0o700),
@@ -559,7 +571,10 @@ fn content_binding_detects_snapshot_tampering_before_spawn() {
         ChildLimits::new(Duration::from_secs(2), 64, 64),
     );
     match run(&selected, &spec) {
-        ChildOutcome::SpawnError(reason) => assert!(reason.contains("content changed"), "{reason}"),
+        ChildOutcome::SpawnError(reason) => assert!(
+            reason.contains("identity changed") || reason.contains("content changed"),
+            "{reason}"
+        ),
         other => panic!("tampered bound snapshot must be refused before spawn: {other:?}"),
     }
 }
@@ -591,6 +606,50 @@ fn content_binding_holds_a_fully_sealed_executable_descriptor() {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::EPERM)
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cloned_content_binding_revalidates_and_launches_in_parallel() {
+    const WORKERS: usize = 12;
+    const ROUNDS: usize = 8;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("probe");
+    make_executable(&executable, "#!/bin/sh\nprintf original\n");
+    let selected = TrustedExecutable::from_absolute(&executable, &[])
+        .unwrap()
+        .bind_content()
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let mut workers = Vec::with_capacity(WORKERS);
+
+    for _ in 0..WORKERS {
+        let barrier = Arc::clone(&barrier);
+        let selected = selected.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..ROUNDS {
+                let spec = ChildSpec::new(
+                    std::iter::empty::<&OsStr>(),
+                    ChildLimits::new(Duration::from_secs(3), 64, 64),
+                );
+                match run(&selected, &spec) {
+                    ChildOutcome::Completed { status, stdout, .. } => {
+                        assert!(status.success(), "parallel bound launch failed: {status}");
+                        assert_eq!(stdout, b"original");
+                    }
+                    other => panic!("parallel bound launch failed: {other:?}"),
+                }
+            }
+        }));
+    }
+
+    for worker in workers {
+        worker
+            .join()
+            .expect("parallel bound-launch worker panicked");
+    }
 }
 
 #[test]

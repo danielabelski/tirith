@@ -35,7 +35,8 @@
 - **Runtime sandboxing of arbitrary shell commands by default**: tirith does not
   sandbox or contain the commands a user runs in their shell. The shell hook is a
   detection layer, not a containment boundary. There is one narrow, opt-in
-  exception (see "Opt-in runtime containment" below): the `tirith run --capsule`,
+  exception (see "Opt-in runtime containment" below): the Linux-only live
+  `tirith run --capsule`,
   `tirith temp-run --capsule`, `tirith gateway run --capsule`, and (future) `tirith
   pkg install` surfaces route the program they launch through an OS containment
   capsule. This is an explicit, per-invocation choice for tirith-launched
@@ -75,9 +76,10 @@ tirith ships an OS containment capsule (Landlock + seccomp on Linux, Seatbelt on
 macOS, an AppContainer + Job Object on Windows) that a handful of
 tirith-launched surfaces can route their child process through:
 
-- `tirith run --capsule` runs the downloaded script contained (deny-network,
-  scrubbed environment, resource limits, filesystem confined to the script's
-  cache dir).
+- On Linux, `tirith run --capsule` runs the exact reviewed bytes from a sealed
+  anonymous descriptor under containment (deny-network, scrubbed environment,
+  resource limits). Live remote-script execution refuses before download on
+  every non-Linux host; `--no-exec` remains inspection-only on Unix.
 - `tirith temp-run --capsule` additionally contains the previewed command, on top
   of the temp-dir file isolation.
 - `tirith gateway run --capsule` spawns the upstream MCP server contained
@@ -88,7 +90,8 @@ The capsule is **honest about what it enforces**. Every backend reports a
 per-capability coverage ledger and never claims a control it did not apply. The
 loopback egress broker is a broker, NOT the boundary: domain-egress is only
 claimed where the OS backend blocks raw outbound sockets except to the broker.
-Enforcing surfaces (`pkg install`, the contained gateway, `tirith run --capsule`)
+Enforcing surfaces (`pkg install`, the contained gateway, and Linux
+`tirith run --capsule`)
 **fail closed** when the host backend cannot deliver the required containment;
 `temp-run --capsule` is a best-effort hardening that runs uncontained, and says
 so, when no backend is available. `tirith doctor` reports the real per-platform

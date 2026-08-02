@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use tirith_core::trusted_child::{
     run, sanitized_path, ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable,
+    TrustedExecutableError,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
@@ -86,6 +87,17 @@ fn windows_validation_rejects_batch_launchers_without_shell_fallback() {
     std::fs::write(&script, "@exit /b 0\r\n").unwrap();
     let error = TrustedExecutable::from_absolute(&script, &[]).unwrap_err();
     assert!(error.to_string().contains("native .exe/.com"));
+}
+
+#[test]
+fn windows_content_binding_fails_closed() {
+    let executable = TrustedExecutable::current().unwrap();
+    let error = executable.bind_content().unwrap_err();
+    assert!(
+        matches!(error, TrustedExecutableError::InvalidPath { .. }),
+        "unsupported binding must be an InvalidPath error: {error}"
+    );
+    assert!(error.to_string().contains("unsupported"), "{error}");
 }
 
 #[test]

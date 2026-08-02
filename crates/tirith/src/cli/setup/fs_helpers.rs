@@ -353,7 +353,8 @@ struct FileGeneration {
 fn exchange_names(parent: &fs::File, left: &CStr, right: &CStr) -> Result<(), String> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             parent.as_raw_fd(),
             left.as_ptr(),
             parent.as_raw_fd(),
@@ -395,7 +396,8 @@ fn exchange_names(parent: &fs::File, left: &CStr, right: &CStr) -> Result<(), St
 fn move_no_replace(parent: &fs::File, source: &CStr, destination: &CStr) -> Result<(), String> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             parent.as_raw_fd(),
             source.as_ptr(),
             parent.as_raw_fd(),

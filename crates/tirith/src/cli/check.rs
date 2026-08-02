@@ -108,7 +108,7 @@ fn build_display_verdict(
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     cmd: &str,
-    shell: &str,
+    shell_type: ShellType,
     json: bool,
     non_interactive: bool,
     interactive_flag: bool,
@@ -121,6 +121,12 @@ pub fn run(
     suggest_safe_command: bool,
     card: Option<String>,
 ) -> i32 {
+    let shell_name = match shell_type {
+        ShellType::Posix => "posix",
+        ShellType::Fish => "fish",
+        ShellType::PowerShell => "powershell",
+        ShellType::Cmd => "cmd",
+    };
     // When clap left the positional empty and this is NOT the `--approval-check`
     // path (which has its own no-input contract below), accept the command from
     // piped stdin so `echo 'curl x | bash' | tirith check` works. Only read when
@@ -159,14 +165,6 @@ pub fn run(
         }
         return 0;
     }
-
-    let shell_type = match shell.parse::<ShellType>() {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("tirith: warning: unknown shell '{shell}', falling back to posix");
-            ShellType::Posix
-        }
-    };
 
     let interactive = if interactive_flag {
         true
@@ -211,7 +209,7 @@ pub fn run(
     // Policy::discover(); the daemon path returns None (analysis was server-side).
     let (mut raw_verdict, engine_policy) = if use_daemon {
         if let Some(resp) =
-            crate::cli::daemon::try_daemon_check(cmd, shell, cwd.as_deref(), interactive)
+            crate::cli::daemon::try_daemon_check(cmd, shell_name, cwd.as_deref(), interactive)
         {
             if let Some(ref raw_findings) = resp.raw_findings {
                 let raw_action_parsed = resp
@@ -527,12 +525,22 @@ pub fn run(
                 card_ref: card.clone(),
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             };
-            tirith_core::safe_command::suggest_verified_with_policy_and_session(
-                &suggestion_ctx,
-                &effective,
-                &policy,
-                &session_id,
-            )
+            if ran_locally {
+                tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_and_session(
+                    &suggestion_ctx,
+                    &policy,
+                    &session_id,
+                )
+            } else {
+                // A daemon verdict may include its longer-budget/private-network
+                // enrichment. Never replace that producer profile with a local
+                // Inline re-analysis at an executable-output boundary.
+                tirith_core::safe_command::suggest_verified_with_policy(
+                    &suggestion_ctx,
+                    &effective,
+                    &policy,
+                )
+            }
         } else {
             Vec::new()
         };

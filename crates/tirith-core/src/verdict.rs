@@ -488,12 +488,12 @@ pub enum RuleId {
 
     // Environment-variable lifecycle rules (M9 ch4). Two fire from the exec hot
     // path (gated by `policy.env_guard_enabled`); one only from `tirith env guard`.
-    // Sensitive-var list is the same `sensitive_env.toml` M6 ch5 env-scrub uses.
+    // Sensitive-var list is the same `sensitive_env.toml` M6 ch5 guidance uses.
     /// M9 ch4 — a sensitive env var is set AND the command pipes remote content
     /// into a shell (`curl … | bash`); the script inherits and can exfiltrate it.
-    /// High. This is the dedicated rule the M6 ch5 env-scrub `safe_command`
-    /// transform attaches to. Tier-1 rides the pipe-to-interpreter patterns; the
-    /// std::env check is wired in `engine.rs`.
+    /// High. This is the dedicated rule for M6 ch5 environment-scrubbing
+    /// guidance; it never emits an executable rewrite. Tier-1 rides the
+    /// pipe-to-interpreter patterns; the std::env check is wired in `engine.rs`.
     EnvSensitiveExposedToUnknownScript,
     /// M9 ch4 — a sensitive env var `export`ed in a shell rc/profile. High — leaks
     /// into every shell. Fires only from `tirith env guard` → `EXTERNALLY_TRIGGERED`.

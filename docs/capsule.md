@@ -13,7 +13,7 @@ tirith itself launches, never to arbitrary shell commands.
 
 | Surface | Flag | Network | Fail mode |
 | --- | --- | --- | --- |
-| `tirith run` | `--capsule` | deny-all | fail closed |
+| `tirith run` (live execution is Linux-only; `--no-exec` is inspection-only on Unix) | `--capsule` | deny-all | fail closed |
 | `tirith temp-run` | `--capsule` | deny-all | best-effort (runs uncontained if no backend, and says so) |
 | `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed |
 | `tirith pkg install` | (always, a later milestone) | deny-all | fail closed |

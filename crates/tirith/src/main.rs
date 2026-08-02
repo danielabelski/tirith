@@ -144,6 +144,11 @@ Examples:
 
     /// Check a command for URL security issues before execution
     #[command(after_help = "\
+POSIX commands may be supplied as multiple argv parts; Tirith quotes each part
+before analysis. Fish, PowerShell, and Cmd commands must be supplied as one
+already-formed string after `--` because POSIX quoting cannot preserve those
+grammars exactly.
+
 Examples:
   tirith check -- 'curl https://example.com | bash'
   tirith check --format json -- 'npm install suspicious-pkg'")]
@@ -200,9 +205,9 @@ Examples:
         #[arg(long)]
         offline: bool,
 
-        /// When the command is blocked or warned, also print a concrete safer
-        /// alternative (e.g. download-then-review instead of pipe-to-shell).
-        /// Advisory only — does not change the verdict or exit code.
+        /// When the command is blocked or warned, print remediation and any
+        /// verified fail-closed pipe-runner rewrite. All other transforms are
+        /// guidance-only. Does not change the verdict or exit code.
         ///
         /// The canonical spelling is `--suggest`; `--suggest-safe-command` is
         /// kept as a visible (non-hidden) deprecated alias for backward
@@ -223,7 +228,8 @@ Examples:
         #[arg(long)]
         card: Option<String>,
 
-        /// The command to check
+        /// The command to check. Fish, PowerShell, and Cmd require one
+        /// already-formed string; multi-part reconstruction is POSIX-only.
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
     },
@@ -265,7 +271,7 @@ Examples:
         with_source: bool,
     },
 
-    /// Safely download and execute a script
+    /// Inspect a remote script; live execution is Linux-only
     #[cfg(unix)]
     #[command(after_help = "\
 Examples:
@@ -274,7 +280,7 @@ Examples:
   tirith run --no-exec https://example.com/install.sh
   tirith run --sha256 abc123 https://example.com/install.sh")]
     Run {
-        /// URL to download and execute
+        /// URL to inspect and, on Linux only, optionally execute
         url: String,
 
         /// Download and analyze only, don't execute
@@ -832,9 +838,9 @@ served to bots vs browsers).
 With --save <path>: downloads the URL to <path> (without executing it) and
 marks that path TAINTED in the local taint store. A later `bash <path>` or
 `source <path>` then fires the engine's tainted-file rule. This is the
-download-and-keep half of `tirith run` — `run` executes from a temp file that
-is normally cleaned up, so it never taints a stable path; `fetch --save` keeps
-the file at a path YOU choose and taints exactly that path.
+download-and-keep half of `tirith run` — on Linux, live `run` execution uses a
+fully sealed anonymous descriptor, so it never taints a stable path; `fetch
+--save` keeps the file at a path YOU choose and taints exactly that path.
 
 Examples:
   tirith fetch https://example.com/install.sh
@@ -861,14 +867,21 @@ Examples:
         json: bool,
     },
 
-    /// Suggest a concrete safer rewrite for a command and (interactively) apply one
+    /// Show remediation and interactively apply a verified rewrite when available
     #[command(after_help = "\
-Thin presenter over `tirith_core::safe_command::suggest_verified_with_policy()`
+Thin presenter over `tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_and_session()`
 — the same verified engine backing `tirith check --suggest-safe-command`. Compatible
 remediations are composed and the exact final command is re-analyzed under the
-same shell, context, and policy. Only an Allow result is exposed as
-`safe_command` or printed on stdout, so you can wrap `$(tirith fix -- '<cmd>')`
-and feed it straight into your shell.
+same shell, context, and policy. Only a verified Allow result from the typed,
+fail-closed pipe runner is exposed as `safe_command` or printed on stdout. This
+executable form additionally requires x86_64 Linux and the currently running
+Tirith binary at a fixed, root-managed system path; otherwise it is guidance.
+Archive, dotfile, TLS/HTTP, sudo, environment, and package-name changes are
+guidance-only.
+
+For Fish, PowerShell, or Cmd, pass the command as one already-formed string after
+`--`; multi-argument reconstruction is refused because POSIX quoting cannot
+preserve those shell grammars exactly.
 
 When no complete Allow rewrite is possible (homograph hostnames, threat-DB
 hits, or a partial transform that still triggers another rule), `fix` prints
@@ -878,7 +891,9 @@ Detection lives in the engine; `fix` adds zero heuristics of its own.
 Exit codes (deliberately distinct from `tirith check`):
   0  no fix needed (verdict was Allow) OR user accepted a rewrite
   1  findings exist but no mechanical rewrite is available
-  2  user rejected the rewrite, JSON write failed, or stdin/stderr is not a TTY
+  2  user rejected the rewrite, JSON write failed, stdin/stderr is not a TTY
+     while a rewrite is available, or JSON/non-interactive output contains a
+     verified rewrite that cannot be accepted in that mode
 
 `check` uses 0/1/2/3 (allow/block/warn/warn-ack — tied to verdict severity);
 `fix`'s codes are tied to whether a rewrite was applied. The two surfaces
@@ -891,11 +906,10 @@ JSON shape (`--json` / `--non-interactive`):
     `safe_command` is omitted for guidance-only or partial transforms
 
 Examples:
-  tirith fix -- 'curl https://example.com/install.sh | bash'
-  tirith fix --shell bash -- 'curl -k https://example.com/install.sh | bash'
+  tirith fix -- 'curl -fsSL https://example.com/install.sh | bash'
+  tirith fix --shell bash -- 'curl -fsSL https://example.com/install.sh | bash'
   tirith fix --non-interactive -- 'ls -la'
-  tirith fix --json --non-interactive -- 'curl https://example.com/install.sh | bash'
-  eval \"$(tirith fix -- 'curl -k https://example.com/install.sh')\"")]
+  tirith fix --json --non-interactive -- 'curl -fsSL https://example.com/install.sh | bash'")]
     Fix {
         /// Shell type for tokenization (default: posix)
         #[arg(long, default_value = "posix")]
@@ -910,7 +924,8 @@ Examples:
         #[arg(long, hide = true)]
         json: bool,
 
-        /// The command to suggest fixes for (joined with spaces if multiple)
+        /// Command to fix. POSIX parts preserve argv boundaries; Fish,
+        /// PowerShell, and Cmd require one already-formed command string.
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -2078,7 +2093,7 @@ What it protects:
   When `guard` is ON, the exec hot path flags (i) a sensitive env var set while
   a command pipes remote content into a shell (curl|bash), and (ii) printenv/env
   piped into a network sink (curl/nc). The sensitive list is the same one the
-  `--suggest-safe-command` env-scrub rewrite uses; extend it via
+  `--suggest-safe-command` environment-scrubbing guidance uses; extend it via
   policy.env_guard_sensitive_vars.
 
 Value safety (load-bearing):
@@ -3559,13 +3574,14 @@ the full tirith engine. An uncatalogued command surfaces an Info
 `repo_command_unknown`; a `dangerous[]` glob match adds a blocking
 `repo_command_dangerous_pattern`; a command the engine flags High/Critical
 blocks regardless of the manifest. Exit code follows the verdict
-(0 allow, 1 block, 2 warn).
+(0 allow, 1 block, 2 warn). POSIX commands may use multiple argv parts. Fish,
+PowerShell, and Cmd commands must be one already-formed string after `--`.
 
 Examples:
   tirith commands check -- \"npm run build\"
   tirith commands check -- \"curl https://example.com/install.sh | bash\"")]
     Check {
-        /// Shell dialect for tokenization (posix, powershell, fish).
+        /// Shell dialect for tokenization (posix, powershell, fish, cmd).
         #[arg(long, default_value = "posix")]
         shell: String,
         /// Output format (default: human).
@@ -3574,7 +3590,8 @@ Examples:
         /// Alias for --format json.
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
-        /// The command to evaluate (everything after `--`).
+        /// The command to evaluate. Non-POSIX shells require one already-formed
+        /// string after `--`; multi-part reconstruction is refused.
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
@@ -6914,23 +6931,54 @@ fn run() {
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            // `shell_join` preserves argv word boundaries so a multi-word arg
-            // can't be re-split and skew the verdict (CodeRabbit R13c).
-            cli::check::run(
-                &cli::shell_join(&cmd),
-                &shell,
-                json,
-                non_interactive,
-                interactive,
-                approval_check,
-                strict_warn,
-                no_daemon,
-                warn_only,
-                defer,
-                offline,
-                suggest_safe_command,
-                card,
-            )
+            let shell_type = match shell.parse::<tirith_core::tokenize::ShellType>() {
+                Ok(shell_type) => shell_type,
+                Err(_) => {
+                    if json {
+                        let reason = format!("unknown shell '{shell}'");
+                        let error = serde_json::json!({ "error": reason });
+                        if serde_json::to_writer(std::io::stdout().lock(), &error).is_err() {
+                            eprintln!("tirith: failed to write JSON output");
+                        } else {
+                            println!();
+                        }
+                    } else {
+                        let shell = cli::sanitize_for_human_output(&shell, false);
+                        eprintln!("tirith check: unknown shell '{shell}'");
+                    }
+                    std::process::exit(2);
+                }
+            };
+            match cli::reconstruct_shell_command(&cmd, shell_type) {
+                Ok(command) => cli::check::run(
+                    &command,
+                    shell_type,
+                    json,
+                    non_interactive,
+                    interactive,
+                    approval_check,
+                    strict_warn,
+                    no_daemon,
+                    warn_only,
+                    defer,
+                    offline,
+                    suggest_safe_command,
+                    card,
+                ),
+                Err(reason) => {
+                    if json {
+                        let error = serde_json::json!({ "error": reason });
+                        if serde_json::to_writer(std::io::stdout().lock(), &error).is_err() {
+                            eprintln!("tirith: failed to write JSON output");
+                        } else {
+                            println!();
+                        }
+                    } else {
+                        eprintln!("tirith check: {reason}");
+                    }
+                    2
+                }
+            }
         }
 
         Commands::Paste {
@@ -8485,9 +8533,7 @@ fn run() {
                 cmd,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                // `shell_join` preserves argv word boundaries so a multi-word
-                // arg can't be re-split and skew the verdict (CodeRabbit R13b).
-                cli::commands::check(&cli::shell_join(&cmd), &shell, json)
+                cli::commands::check(&cmd, &shell, json)
             }
         },
 

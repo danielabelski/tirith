@@ -1,8 +1,8 @@
 //! Environment-variable lifecycle monitoring (M9 ch4).
 //!
 //! Backs `tirith env guard|diff|explain`. The sensitive-variable list is the
-//! SAME one [`crate::safe_command`]'s env-scrub transform uses (via
-//! [`sensitive_env_vars`]), with an optional user extension from
+//! SAME one [`crate::safe_command`] uses for environment-scrubbing guidance
+//! (via [`sensitive_env_vars`]), with an optional user extension from
 //! [`crate::policy::Policy::env_guard_sensitive_vars`] — one source of truth.
 //!
 //! Provides: [`EnvSnapshot`] (name + 8-char value-hash record, **never a raw
@@ -26,7 +26,7 @@ use crate::tokenize::ShellType;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Re-export of the single source-of-truth sensitive env-var list. M9 ch4
-/// shares the exact list the M6 ch5 env-scrub transform uses; see
+/// shares the exact list the M6 ch5 environment-scrubbing guidance uses; see
 /// [`crate::safe_command::sensitive_env_vars`].
 pub use crate::safe_command::sensitive_env_vars;
 
@@ -191,7 +191,7 @@ pub fn diff_sensitive(
 
 /// The set sensitive vars in *this* process as a `(name → 8-char value-hash)`
 /// map, to feed [`diff_sensitive`]. Empty-valued vars are treated as unset
-/// (no secret), matching the env-scrub transform's `!v.is_empty()` check.
+/// (no secret), matching the guard's decision not to report empty values.
 pub fn current_sensitive_in_process(sensitive: &[String]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for name in sensitive {

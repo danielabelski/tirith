@@ -26,7 +26,7 @@ what an experimental command must satisfy to move to stable.
 | `init` | Stable | Initialize shell hooks. |
 | `scan` | Experimental | File/directory scanning for hidden content and config poisoning. Integration-critical (CI, MCP). |
 | `doctor` | Experimental | Installation and configuration diagnostics. Integration-critical. |
-| `run` | Experimental | Safe script download/execute (Unix only). |
+| `run` | Experimental | Remote-script inspection on Unix; live execution is Linux-only, sealed-descriptor-bound, and refused before download elsewhere. |
 | `fetch` | Experimental | Server-side cloaking detection (Unix only). |
 | `checkpoint` | Experimental | File checkpoint and rollback. |
 | `gateway` | Experimental | MCP gateway proxy for AI-agent security. |
@@ -128,9 +128,10 @@ The following detection rules apply when `--shell powershell` is passed to
 | `ps_defender_exclusion` | `Add-MpPreference -ExclusionPath`, `-ExclusionProcess`, or `-ExclusionExtension`, including valid unambiguous parameter prefixes |
 | `ps_inline_download_execute` | `iex (iwr https://…)` — inline download-execute form where `iex` is the leading command |
 
-`tirith run` and `tirith fetch` are Unix-only and do not apply to PowerShell
-workflows. `tirith check`, `tirith paste`, `tirith score`, and the shell hook
-work on Windows with `pwsh`.
+`tirith run` and `tirith fetch` are not exposed on Windows and do not apply to
+PowerShell workflows. On Unix, `run --no-exec` is inspection-only; live
+remote-script execution is Linux-only. `tirith check`, `tirith paste`, `tirith
+score`, and the shell hook work on Windows with `pwsh`.
 
 `tirith doctor --compat` reports PowerShell hook health when `pwsh`
 (PowerShell 7+) or `powershell` (Windows PowerShell 5.1) is found on PATH:

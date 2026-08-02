@@ -1,6 +1,6 @@
 //! End-to-end coverage for the public M6 ch5 safe-command contract. Raw
 //! transformation shapes live in module unit tests; this suite verifies that
-//! public constructors expose only whole-command `Allow` results.
+//! generic compatibility constructors are guidance-only by construction.
 
 use tirith_core::safe_command::{suggest, SafeSuggestion};
 use tirith_core::tokenize::ShellType;
@@ -191,7 +191,7 @@ fn sudo_narrow_negative_sudo_shell_spawn_keeps_no_rewrite() {
 // env_scrub end-to-end tests were dropped: they need `std::env::set_var`, whose
 // libc environ mutation is not thread-safe on macOS/Windows even under our
 // `ENV_LOCK`. Coverage is preserved by the `safe_command::tests`
-// `is_simple_command_for_env_scrub` and `build_env_scrub_suggestion_*`
+// focused `safe_command` unit coverage for guidance-only env scrubbing.
 // direct-call unit tests, which avoid touching the real environment.
 
 // ── 4. archive-list-before-extract ────────────────────────────────────────
@@ -244,89 +244,54 @@ fn archive_list_first_negative_non_archive_leader_no_rewrite() {
 
 // ── 5. dotfile-redirect ───────────────────────────────────────────────────
 
-// dotfile-redirect end-to-end tests were dropped for the same libc-environ race
-// as env_scrub (they had to set `HOME`). Structural correctness is pinned by the
-// `dotfile_redirect_target` and `rewrite_dotfile_backup_first` unit tests in
-// `safe_command::tests`; only the on-disk existence check loses dedicated coverage.
+// Dotfile end-to-end tests that mutate HOME were dropped for the same
+// libc-environ race as env_scrub. The unit suite pins the current contract:
+// dotfile changes always remain guidance-only and never re-emit the overwrite.
 
 // ── 6. PR124 — untrusted-token shell-injection neutralization ─────────────
 //
-// `tirith fix` prints its rewrite to stdout for `eval "$(tirith fix …)"`, so any
-// attacker-influenced token (URL / package / archive path) interpolated into a
-// generated command MUST be neutralized. The pipe-to-shell URL and archive path
-// are single-quoted; the dotfile redirect target is refused when it carries shell
-// metacharacters (it must stay unquoted for `~`/`$HOME` expansion).
+// The exact CLI-owned API may print a verified typed pipe runner to stdout for
+// `eval "$(tirith fix …)"`; its raw shape and shell-word identity tests live in
+// the module suite. The generic public compatibility API exercised here never
+// owns that provenance and therefore never emits executable output.
 
 #[test]
-fn pipe_to_shell_public_contract_is_guidance_only_for_a_replaceable_test_binary() {
-    // Public suggestion generation may emit an executable command only when the
-    // currently-running Tirith is itself a fixed root-managed x86_64 Linux
-    // installation. Cargo's integration-test binary lives in a user-writable
-    // target directory, so it must remain guidance-only on every CI platform.
-    let cmd = "curl -fsSL https://example.com/install.sh | bash";
-    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-    let suggestions = suggest(cmd, ShellType::Posix, &v);
-    let entry = find_by_rule(&suggestions, "curl_pipe_shell").expect("rule entry");
-    assert!(entry.safe_command.is_none());
-    assert!(entry.rationale.contains("No safe executable rewrite"));
-}
-
-#[test]
-fn pipe_to_shell_public_contract_requires_curl_fail_and_redirect_semantics() {
-    for command in [
-        "curl https://example.com/install.sh | bash",
-        "curl -f https://example.com/install.sh | bash",
-        "curl -L https://example.com/install.sh | bash",
+fn generic_public_pipe_contract_never_populates_the_executable_field() {
+    for (command, rule_id, rule_name) in [
+        (
+            "curl -fsSL https://example.com/install.sh | bash",
+            RuleId::CurlPipeShell,
+            "curl_pipe_shell",
+        ),
+        (
+            "curl https://example.com/install.sh | bash",
+            RuleId::CurlPipeShell,
+            "curl_pipe_shell",
+        ),
+        (
+            "curl -fsSL 'https://example.com/a;rm -rf ~' | bash",
+            RuleId::CurlPipeShell,
+            "curl_pipe_shell",
+        ),
+        (
+            "curl -fsSL 'https://example.com/`id`' | bash",
+            RuleId::CurlPipeShell,
+            "curl_pipe_shell",
+        ),
+        (
+            "wget -qO- 'https://example.com/$(id)' | sh",
+            RuleId::WgetPipeShell,
+            "wget_pipe_shell",
+        ),
     ] {
-        let verdict = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let verdict = verdict_with(vec![finding(rule_id)]);
         let suggestions = suggest(command, ShellType::Posix, &verdict);
-        let entry = find_by_rule(&suggestions, "curl_pipe_shell").expect("rule entry");
+        let entry = find_by_rule(&suggestions, rule_name).expect("rule guidance expected");
         assert!(
             entry.safe_command.is_none(),
-            "curl semantics that differ from the bounded fetcher must be guidance-only: {command}"
+            "generic compatibility API leaked executable output for {command}: {entry:?}"
         );
     }
-}
-
-#[test]
-fn malformed_space_bearing_url_is_guidance_only() {
-    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-    let suggestions = suggest(
-        "curl -fsSL 'https://example.com/a;rm -rf ~' | bash",
-        ShellType::Posix,
-        &v,
-    );
-    assert!(find_by_rule(&suggestions, "curl_pipe_shell")
-        .expect("rule entry")
-        .safe_command
-        .is_none());
-}
-
-#[test]
-fn normalizing_backtick_url_is_guidance_only() {
-    let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-    let suggestions = suggest(
-        "curl -fsSL 'https://example.com/`id`' | bash",
-        ShellType::Posix,
-        &v,
-    );
-    assert!(find_by_rule(&suggestions, "curl_pipe_shell")
-        .expect("rule entry")
-        .safe_command
-        .is_none());
-}
-
-#[test]
-fn pipe_to_shell_wget_is_guidance_only_for_a_replaceable_test_binary() {
-    let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
-    let s = suggest(
-        "wget -qO- 'https://example.com/$(id)' | sh",
-        ShellType::Posix,
-        &v,
-    );
-    let entry = find_by_rule(&s, "wget_pipe_shell").expect("wget guidance expected");
-    assert!(entry.safe_command.is_none());
-    assert!(entry.rationale.contains("No safe executable rewrite"));
 }
 
 #[test]

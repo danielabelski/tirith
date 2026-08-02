@@ -74,6 +74,14 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --workspace --locked
+      - name: Production capsule reviewed-file receipt
+        if: matrix.name == 'Linux'
+        env:
+          TIRITH_REQUIRE_CAPSULE_RECEIPT: "1"
+        run: >-
+          cargo test -p tirith --test cli_integration
+          hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link
+          --locked -- --exact --nocapture
 
   msrv:
     name: MSRV (1.83)

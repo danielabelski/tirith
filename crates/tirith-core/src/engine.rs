@@ -1821,6 +1821,19 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     analyze_inner(ctx, true).0
 }
 
+/// Resolve the effective policy and every read-only enforcement overlay once.
+fn discover_fully_resolved_policy(ctx: &AnalysisContext) -> Policy {
+    let mut policy = Policy::discover(ctx.cwd.as_deref());
+    policy.load_user_lists();
+    policy.load_org_lists(ctx.cwd.as_deref());
+    policy.load_trust_entries(ctx.cwd.as_deref());
+    // M8 ch1/ch2 — context-labels + SSH host-labels files (NOT policy.yaml),
+    // each merging a user-scope and a repo-scope file.
+    policy.load_context_labels(ctx.cwd.as_deref());
+    policy.load_ssh_host_labels(ctx.cwd.as_deref());
+    policy
+}
+
 /// Like [`analyze`] but also returns the loaded policy, for enforcement callers
 /// (check/gateway/MCP) that need it — avoids a redundant `Policy::discover()`.
 pub fn analyze_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
@@ -1848,20 +1861,43 @@ pub(crate) fn analyze_with_policy_without_bypass(
     ctx: &AnalysisContext,
     policy_snapshot: &Policy,
 ) -> Verdict {
-    analyze_inner_with_policy(ctx, false, Some(policy_snapshot)).0
+    analyze_inner_with_policy(ctx, false, Some(policy_snapshot), false).0
+}
+
+/// Run a complete analysis without honoring a process/inline bypass and return
+/// the exact fully-resolved policy snapshot used by that analysis.
+///
+/// This is intentionally crate-private for execution runners. Unlike the public
+/// hot path, it always resolves every policy overlay before rule evaluation and
+/// never takes the tier-1 fast exit. A runner can therefore bind its decision and
+/// subsequent execution to one effective policy snapshot without changing the
+/// latency contract of [`analyze`] or [`analyze_returning_policy`].
+pub(crate) fn analyze_force_full_without_bypass_returning_policy(
+    ctx: &AnalysisContext,
+) -> (Verdict, Policy) {
+    analyze_inner_with_policy(ctx, false, None, true)
 }
 
 /// Shared implementation for `analyze()` and `analyze_returning_policy()`.
 fn analyze_inner(ctx: &AnalysisContext, honor_bypass: bool) -> (Verdict, Policy) {
-    analyze_inner_with_policy(ctx, honor_bypass, None)
+    analyze_inner_with_policy(ctx, honor_bypass, None, false)
 }
 
 fn analyze_inner_with_policy(
     ctx: &AnalysisContext,
     honor_bypass: bool,
     policy_snapshot: Option<&Policy>,
+    force_full: bool,
 ) -> (Verdict, Policy) {
     let start = Instant::now();
+
+    // Runner enforcement must make every rule decision against one complete,
+    // immutable-in-this-call policy object. Resolve all overlays once up front,
+    // then thread that snapshot through the gate, rule pass, and return value.
+    // Ordinary analysis deliberately leaves this `None` and retains its partial
+    // tier-1 hot path.
+    let force_full_policy = force_full.then(|| discover_fully_resolved_policy(ctx));
+    let effective_policy_snapshot = force_full_policy.as_ref().or(policy_snapshot);
 
     let tier0_start = Instant::now();
     let bypass_env = std::env::var("TIRITH").ok().as_deref() == Some("0");
@@ -1945,7 +1981,7 @@ fn analyze_inner_with_policy(
     let gate_partial: Option<Policy> =
         if matches!(ctx.scan_context, ScanContext::Exec | ScanContext::Paste) {
             Some(
-                policy_snapshot
+                effective_policy_snapshot
                     .cloned()
                     .unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref())),
             )
@@ -2055,7 +2091,8 @@ fn analyze_inner_with_policy(
 
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
-    if !byte_scan_triggered
+    if !force_full
+        && !byte_scan_triggered
         && !regex_triggered
         && !exec_bidi_triggered
         && !exec_guard_triggered
@@ -2097,7 +2134,7 @@ fn analyze_inner_with_policy(
     let tier2_start = Instant::now();
 
     if bypass_requested {
-        let policy = policy_snapshot
+        let policy = effective_policy_snapshot
             .cloned()
             .unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref()));
         let allow_bypass = if ctx.interactive {
@@ -2131,18 +2168,10 @@ fn analyze_inner_with_policy(
         }
     }
 
-    let policy = if let Some(snapshot) = policy_snapshot {
+    let policy = if let Some(snapshot) = effective_policy_snapshot {
         snapshot.clone()
     } else {
-        let mut discovered = Policy::discover(ctx.cwd.as_deref());
-        discovered.load_user_lists();
-        discovered.load_org_lists(ctx.cwd.as_deref());
-        discovered.load_trust_entries(ctx.cwd.as_deref());
-        // M8 ch1/ch2 — context-labels + SSH host-labels files (NOT policy.yaml),
-        // each merging a user-scope and a repo-scope file.
-        discovered.load_context_labels(ctx.cwd.as_deref());
-        discovered.load_ssh_host_labels(ctx.cwd.as_deref());
-        discovered
+        discover_fully_resolved_policy(ctx)
     };
 
     // Fail-open: None when the DB is unavailable.
@@ -3913,6 +3942,158 @@ mod tests {
         );
     }
 
+    /// Runner enforcement cannot inherit the public hot path's tier-1 shortcut:
+    /// a regex-only custom rule is intentionally NOT a force-past signal for
+    /// ordinary analysis, but it must still be evaluated before execution. The
+    /// runner entry point must also return the effective policy with the separate
+    /// read-only overlays loaded, rather than the partial gate policy.
+    #[test]
+    fn force_full_runner_evaluates_regex_rule_and_returns_effective_policy() {
+        let _state = isolate_state();
+        use crate::verdict::RuleId;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(
+            dir.path(),
+            "custom_rules:\n  \
+             - id: runner-regex\n    \
+             pattern: 'whoami$'\n    \
+             severity: high\n    \
+             title: \"runner regex\"\n    \
+             context: [exec]\n",
+        );
+        std::fs::write(
+            dir.path().join(".tirith").join("blocklist"),
+            "runner-overlay.invalid\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".tirith").join("context-labels.yaml"),
+            "'runner:test': critical\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".tirith").join("ssh-host-labels.yaml"),
+            "'runner.example': production\n",
+        )
+        .unwrap();
+        let user_config = crate::policy::config_dir().expect("isolated config directory");
+        std::fs::create_dir_all(&user_config).unwrap();
+        std::fs::write(user_config.join("allowlist"), "user-overlay.invalid\n").unwrap();
+        std::fs::write(
+            user_config.join("trust.json"),
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "pattern": "trusted-overlay.invalid",
+                  "ttl_expires": "2999-01-01T00:00:00Z"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let ctx = exec_ctx_in("whoami", dir.path());
+
+        // Public analysis keeps its latency contract: a regex-only custom rule
+        // does not defeat the tier-1 fast exit on otherwise-clean input.
+        let ordinary = analyze(&ctx);
+        assert_eq!(
+            ordinary.tier_reached, 1,
+            "ordinary analysis must retain the tier-1 fast exit"
+        );
+        assert!(
+            !ordinary.findings.iter().any(|finding| {
+                finding.rule_id == RuleId::CustomRuleMatch
+                    && finding.custom_rule_id.as_deref() == Some("runner-regex")
+            }),
+            "the regex-only rule must remain unevaluated on the ordinary fast path"
+        );
+
+        // The partial policy deliberately omits the flat-list and label overlays;
+        // this pins what the runner's returned snapshot must improve upon.
+        let partial = Policy::discover_partial(ctx.cwd.as_deref());
+        assert!(!partial
+            .blocklist
+            .iter()
+            .any(|entry| entry == "runner-overlay.invalid"));
+        assert!(!partial
+            .allowlist
+            .iter()
+            .any(|entry| entry == "user-overlay.invalid"));
+        assert!(!partial
+            .allowlist
+            .iter()
+            .any(|entry| entry == "trusted-overlay.invalid"));
+        assert!(!partial.context_labels.contains_key("runner:test"));
+        assert!(!partial.ssh_host_labels.contains_key("runner.example"));
+
+        let (forced, effective) = analyze_force_full_without_bypass_returning_policy(&ctx);
+        assert!(
+            forced.tier_reached >= 3,
+            "force-full analysis must reach the complete rule pass; got tier {}",
+            forced.tier_reached
+        );
+        assert!(
+            forced.findings.iter().any(|finding| {
+                finding.rule_id == RuleId::CustomRuleMatch
+                    && finding.custom_rule_id.as_deref() == Some("runner-regex")
+            }),
+            "force-full analysis must evaluate the regex-only custom rule; findings: {:?}",
+            forced
+                .findings
+                .iter()
+                .map(|finding| (&finding.rule_id, &finding.custom_rule_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(effective
+            .blocklist
+            .iter()
+            .any(|entry| entry == "runner-overlay.invalid"));
+        assert_eq!(
+            effective.allowlist.len(),
+            partial.allowlist.len() + 2,
+            "the resolved snapshot must load one user-list entry and one user-trust entry exactly once"
+        );
+        for expected in ["user-overlay.invalid", "trusted-overlay.invalid"] {
+            assert_eq!(
+                effective
+                    .allowlist
+                    .iter()
+                    .filter(|entry| entry.as_str() == expected)
+                    .count(),
+                1,
+                "resolved allowlist must contain {expected} exactly once"
+            );
+        }
+        assert_eq!(
+            effective
+                .context_labels
+                .get("runner:test")
+                .map(String::as_str),
+            Some("critical")
+        );
+        assert_eq!(
+            effective
+                .ssh_host_labels
+                .get("runner.example")
+                .map(String::as_str),
+            Some("production")
+        );
+        assert_eq!(forced.policy_path_used, effective.path);
+
+        // An inline bypass marker is parsed but never honored by the runner seam.
+        let bypass_ctx = exec_ctx_in("TIRITH=0 whoami", dir.path());
+        let (forced_bypass, _) = analyze_force_full_without_bypass_returning_policy(&bypass_ctx);
+        assert!(!forced_bypass.bypass_requested);
+        assert!(!forced_bypass.bypass_honored);
+        assert!(forced_bypass.findings.iter().any(|finding| {
+            finding.rule_id == RuleId::CustomRuleMatch
+                && finding.custom_rule_id.as_deref() == Some("runner-regex")
+        }));
+    }
+
     #[test]
     fn test_paranoia_filter_suppresses_info_low() {
         use crate::verdict::{Finding, RuleId, Severity, Timings, Verdict};
@@ -4380,44 +4561,60 @@ mod tests {
 
     struct IsolatedState {
         _tmp: tempfile::TempDir,
-        prev_xdg: Option<std::ffi::OsString>,
-        prev_home: Option<std::ffi::OsString>,
+        previous_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
     impl Drop for IsolatedState {
         fn drop(&mut self) {
             // SAFETY: serialized by TEST_ENV_LOCK held in this guard.
             unsafe {
-                match &self.prev_xdg {
-                    Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-                match &self.prev_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
+                for (name, previous) in self.previous_env.iter().rev() {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
     }
-    /// Point XDG_STATE_HOME (and HOME) at a fresh tempdir under TEST_ENV_LOCK so the
-    /// tier-1 force-past gate's taint/canary store stats see an EMPTY store, not the
-    /// developer's real ~/.local/state. Restores prior env on drop.
+    /// Isolate every XDG directory and HOME under TEST_ENV_LOCK, and disable
+    /// ambient org/remote-policy overrides. This keeps the analysis fixtures from
+    /// reading a developer's real policy, lists, trust store, state, or cache.
+    /// Restores every prior value on drop.
     fn isolate_state() -> IsolatedState {
         let lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-        let prev_home = std::env::var_os("HOME");
+        let isolated = [
+            ("HOME", tmp.path().join("home")),
+            ("XDG_STATE_HOME", tmp.path().join("state")),
+            ("XDG_CONFIG_HOME", tmp.path().join("config")),
+            ("XDG_DATA_HOME", tmp.path().join("data")),
+            ("XDG_CACHE_HOME", tmp.path().join("cache")),
+        ];
+        for (_, path) in &isolated {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let mut previous_env = isolated
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        for name in ["TIRITH_POLICY_ROOT", "TIRITH_SERVER_URL", "TIRITH_API_KEY"] {
+            previous_env.push((name, std::env::var_os(name)));
+        }
         // SAFETY: serialized by TEST_ENV_LOCK held above.
         unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmp.path());
-            std::env::set_var("HOME", tmp.path());
+            for (name, path) in &isolated {
+                std::env::set_var(name, path);
+            }
+            for name in ["TIRITH_POLICY_ROOT", "TIRITH_SERVER_URL", "TIRITH_API_KEY"] {
+                std::env::remove_var(name);
+            }
         }
         IsolatedState {
             _tmp: tmp,
-            prev_xdg,
-            prev_home,
+            previous_env,
             _lock: lock,
         }
     }

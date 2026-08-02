@@ -17,7 +17,7 @@ Inspected:
 | `tirith check` | Full | Tokenizes the command and inspects every extracted URL, path, and Docker ref through the full rule pipeline. | Yes |
 | `tirith paste` | Full | Scans the pasted bytes and rich-text HTML for injection, invisible characters, and homograph attacks. | Yes |
 | `tirith scan` | Full | Walks files, directories, and configs; inspects bytes, embedded URLs, and wheel/native artifact members. | Yes |
-| `tirith run` | Full | Downloads to a quarantined file, inspects the script and its interpreter shebang before any execution (Unix). | Yes |
+| `tirith run` | Full | Downloads and inspects the script and interpreter shebang. Live execution is Linux-only and uses the exact reviewed bytes from a sealed anonymous descriptor; --no-exec remains inspection-only on Unix. | Yes |
 | `tirith fix` | Full | Re-analyzes the command being rewritten so the suggested safer form is itself checked. | Yes |
 | `tirith view` | Full | Neutralizes terminal-deception escape sequences in the rendered bytes before they reach the terminal. | Yes |
 | `tirith score` | Full | Decomposes a URL into fixed, inspectable trust factors that sum to the final score. | Yes |

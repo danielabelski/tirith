@@ -534,13 +534,58 @@ fn render_findings(
 /// `tirith commands check -- "<cmd>"` — evaluate `cmd` against the manifest +
 /// engine by delegating to `tirith check` (which wires the manifest into its
 /// normal analysis). Exit code is the engine's action exit code.
-pub fn check(cmd: &str, shell: &str, json: bool) -> i32 {
+pub fn check(command_parts: &[String], shell: &str, json: bool) -> i32 {
+    let shell_type = match shell.parse::<tirith_core::tokenize::ShellType>() {
+        Ok(shell_type) => shell_type,
+        Err(_) => {
+            let reason = format!(
+                "unknown shell '{}'",
+                super::sanitize_for_human_output(shell, false)
+            );
+            if json {
+                if serde_json::to_writer(
+                    std::io::stdout().lock(),
+                    &serde_json::json!({ "error": reason }),
+                )
+                .is_err()
+                {
+                    eprintln!("tirith commands check: failed to write JSON error");
+                } else {
+                    println!();
+                }
+            } else {
+                eprintln!("tirith commands check: {reason}");
+            }
+            return 2;
+        }
+    };
+    let cmd = match super::reconstruct_shell_command(command_parts, shell_type) {
+        Ok(command) => command,
+        Err(reason) => {
+            if json {
+                if serde_json::to_writer(
+                    std::io::stdout().lock(),
+                    &serde_json::json!({ "error": reason }),
+                )
+                .is_err()
+                {
+                    eprintln!("tirith commands check: failed to write JSON error");
+                } else {
+                    println!();
+                }
+            } else {
+                eprintln!("tirith commands check: {reason}");
+            }
+            return 2;
+        }
+    };
     // Reuse the exact `tirith check` path — no divergent second code path.
     super::check::run(
-        cmd, shell, json, /* non_interactive */ false, /* interactive_flag */ false,
-        /* approval_check */ false, /* strict_warn */ false, /* no_daemon */ true,
-        /* warn_only */ false, /* defer */ false, /* offline */ false,
-        /* suggest_safe_command */ false, /* card */ None,
+        &cmd, shell_type, json, /* non_interactive */ false,
+        /* interactive_flag */ false, /* approval_check */ false,
+        /* strict_warn */ false, /* no_daemon */ true, /* warn_only */ false,
+        /* defer */ false, /* offline */ false, /* suggest_safe_command */ false,
+        /* card */ None,
     )
 }
 

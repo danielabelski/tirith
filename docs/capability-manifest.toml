@@ -56,7 +56,7 @@ policy_complete = true
 name = "run"
 group = "Scan & analyze"
 inspected = "full"
-coverage = "Downloads to a quarantined file, inspects the script and its interpreter shebang before any execution (Unix)."
+coverage = "Downloads and inspects the script and interpreter shebang. Live execution is Linux-only and uses the exact reviewed bytes from a sealed anonymous descriptor; --no-exec remains inspection-only on Unix."
 policy_complete = true
 
 [[command]]

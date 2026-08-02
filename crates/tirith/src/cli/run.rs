@@ -32,7 +32,7 @@ pub fn run(
     // whose backend cannot provide the spec's required coverage fails closed
     // instead of running uncontained. Download/DNS has already occurred under
     // the fetch validator and is not part of interpreter containment.
-    let exec_fn: Option<tirith_core::runner::ScriptExecutor> = if capsule {
+    let verified_executor: Option<tirith_core::runner::VerifiedScriptExecutor> = if capsule {
         Some(Box::new(capsuled_exec))
     } else {
         None
@@ -43,11 +43,20 @@ pub fn run(
         no_exec,
         interactive,
         expected_sha256,
-        requested_pipe_invocation,
-        exec_fn,
+        exec_fn: None,
     };
 
-    match runner::run(opts) {
+    let result = match (verified_executor, requested_pipe_invocation) {
+        (Some(executor), Some(requested)) => {
+            runner::run_with_verified_pipe_executor(opts, requested, executor)
+        }
+        (Some(executor), None) => runner::run_with_verified_executor(opts, executor),
+        (None, Some(_)) => {
+            Err("forced stdin execution requires the fail-closed capsule executor".to_string())
+        }
+        (None, None) => runner::run(opts),
+    };
+    match result {
         Ok(result) => {
             if json {
                 #[derive(serde::Serialize)]
@@ -95,49 +104,37 @@ pub fn run(
 }
 
 /// The contained executor for `tirith run --capsule` (E5). Runs the exact typed
-/// interpreter invocation through the locked-down OS capsule, with the private
-/// script directory readable when file mode needs it. Enforcing surface: fail
-/// closed when the backend cannot provide the spec's required coverage.
+/// interpreter invocation through the locked-down OS capsule. File mode receives
+/// only the inherited sealed reviewed-script descriptor; no downloaded-script
+/// pathname enters argv. Enforcing surface: fail closed when the backend cannot
+/// provide the spec's required coverage.
 fn capsuled_exec(
     invocation: &ScriptInvocation,
-    path: &std::path::Path,
-    reviewed_bytes: &[u8],
+    reviewed_script: tirith_core::runner::ReviewedScript<'_>,
 ) -> Result<i32, String> {
     use tirith_core::capsule::CapsuleSpec;
 
     let outcome = match invocation.input_mode {
         ScriptInputMode::File => {
+            let program = invocation.resolved_executable.as_ref().ok_or_else(|| {
+                "file execution reached the capsule without a trusted interpreter identity"
+                    .to_string()
+            })?;
             let mut spec = CapsuleSpec::locked_down();
-            if let Some(parent) = path.parent() {
-                spec.filesystem.read_roots.push(parent.to_path_buf());
-            }
-            for root in [
-                "/bin",
-                "/usr",
-                "/lib",
-                "/lib64",
-                "/etc",
-                "/System",
-                "/private/var/select",
-            ] {
-                let root = std::path::PathBuf::from(root);
-                if root.exists() {
-                    spec.filesystem.read_roots.push(root);
-                }
-            }
+            let (read_roots, runtime_path) = validated_stdin_runtime(program)?;
+            spec.filesystem.read_roots = read_roots;
             spec.environment.allow = ["PATH", "LANG", "TERM"]
                 .iter()
                 .map(|name| name.to_string())
                 .collect();
-            let mut args = invocation.args.clone();
-            args.push(path.to_string_lossy().into_owned());
-            crate::cli::capsule::run_to_completion(
+            crate::cli::capsule::run_to_completion_with_reviewed_file(
                 &spec,
-                &invocation.interpreter,
-                &args,
-                None,
-                &[],
-                crate::cli::capsule::DegradedPolicy::FailClosed,
+                program,
+                std::ffi::OsStr::new(&invocation.interpreter),
+                &invocation.args,
+                reviewed_script,
+                Some(std::path::Path::new("/")),
+                &[("PATH".to_string(), runtime_path)],
             )
         }
         ScriptInputMode::Stdin => {
@@ -165,7 +162,7 @@ fn capsuled_exec(
                 program,
                 target_argv0,
                 &invocation.args,
-                reviewed_bytes,
+                reviewed_script.bytes(),
                 // Stdin mode never needs the downloaded file path. A fixed
                 // system-owned cwd avoids inheriting an inaccessible or
                 // attacker-influenced caller directory into the capsule.

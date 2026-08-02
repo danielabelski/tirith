@@ -506,6 +506,27 @@ pub(crate) fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// Reconstruct a command for shell-string analysis without inventing operators
+/// from argv data. A single part is already a complete command and remains
+/// verbatim. Multi-part reconstruction is currently proven only for POSIX;
+/// other grammars must be supplied as one preformed command string.
+pub(crate) fn reconstruct_shell_command(
+    argv: &[String],
+    shell: tirith_core::tokenize::ShellType,
+) -> Result<String, &'static str> {
+    if argv.len() <= 1 {
+        return Ok(argv.first().cloned().unwrap_or_default());
+    }
+    match shell {
+        tirith_core::tokenize::ShellType::Posix => Ok(shell_join(argv)),
+        tirith_core::tokenize::ShellType::Fish
+        | tirith_core::tokenize::ShellType::PowerShell
+        | tirith_core::tokenize::ShellType::Cmd => Err(
+            "multi-argument Fish/PowerShell/Cmd input cannot be reconstructed without changing shell semantics; pass one quoted command string after --",
+        ),
+    }
+}
+
 /// Closest candidate by Levenshtein distance, or `None` if none is within
 /// `max_distance`.
 pub fn suggest_closest<'a>(

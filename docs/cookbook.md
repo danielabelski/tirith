@@ -140,10 +140,11 @@ vet_not_configured
 
 When tirith blocks a `curl | bash` pattern, the safest alternatives are:
 
-### Ask tirith for the rewrite
+### Ask tirith for a verified rewrite or guidance
 
-`tirith check --suggest-safe-command` prints a concrete safer version of the
-exact command you ran:
+`tirith check --suggest-safe-command` prints remediation for the exact command
+you ran and, when a narrow mechanical transform can be verified, a concrete
+safer version:
 
 ```bash
 tirith check --suggest-safe-command -- 'curl -fsSL https://example.com/install.sh | bash'
@@ -169,14 +170,19 @@ Literal no-argument `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, and
 `ash` are supported, as is the narrow POSIX-shell `-s -- <literal operands...>`
 form. Dynamic or malformed URL tokens, controls, PowerShell, Cmd, `|&`, and
 unsupported downloader/interpreter arguments produce guidance rather than an
-executable rewrite. Suggestions also drop insecure-TLS flags and upgrade
-`http://` to `https://`. The flag is advisory — it never changes the verdict or
-exit code.
+executable rewrite. Executable suggestions are limited to the verified,
+fail-closed pipe runner. Archive, dotfile, insecure-TLS removal, HTTP-to-HTTPS
+changes, sudo narrowing, environment scrubbing, and package-name
+corrections remain guidance-only because Tirith cannot mechanically prove the
+required semantics. The flag is advisory — it never changes the verdict or exit
+code.
 
-### Using tirith run (built-in, Unix only)
+### Using tirith run (inspection on Unix; live execution on Linux)
 
-`tirith run` downloads, analyzes, and prompts before executing a private copy.
-A manual invocation uses the fully analyzed remote shebang and file semantics;
+`tirith run` downloads and analyzes the script. On Linux, live mode prompts and
+executes the exact reviewed bytes from a fully sealed anonymous descriptor; on
+other hosts it refuses live mode before download. A manual invocation uses the
+fully analyzed remote shebang and file semantics;
 use the command emitted by `check --suggest` when preserving an original stdin
 pipeline matters:
 

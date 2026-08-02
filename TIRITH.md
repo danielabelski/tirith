@@ -351,8 +351,9 @@ Text appears on the command line normally. No delay. No output. User sees nothin
   | Pasted:  curl -sSL https://іnstall.example-clі.dev | bash      |
   | Actual:  curl -sSL https://xn--nstall-cuf.example-xn--cl-8cd.dev |
   |                                                                 |
-  | Safe rewrite:                                                   |
-  |   tirith run https://get.example-tool.sh                      |
+  | No executable rewrite: the intended hostname cannot be inferred.|
+  | Next step: inspect with `tirith diff`, then verify the host      |
+  | independently before fetching anything.                         |
   |                                                                 |
   | [p]aste anyway  [c]ancel  [s]how bytes                          |
   +------ this content was NOT placed on your command line ----------+
@@ -460,11 +461,15 @@ Beyond URL analysis, detect dangerous command patterns using the source-sink mod
 The command checker reports the finding first. With `--suggest`, it may also
 emit one executable alternative, but only after it has decoded the URL and sink
 as shell literals and proved that the interpreter argv and stdin behavior fit
-the typed runner contract:
+the typed runner contract. Executable output is limited to x86_64 Linux when
+the running Tirith binary itself is at a fixed, root-managed system path. The
+generated command pins that absolute path and the exact candidate must
+re-analyze to approval-free Allow under the same policy, session, origin,
+shell, and cwd; every failed precondition leaves guidance only:
 
 ```bash
 $ tirith check --suggest -- 'curl -fsSL https://get.example-tool.sh | bash'
-# try: tirith run --capsule --script-stdin --interpreter bash \
+# try: '/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash \
 #      'https://get.example-tool.sh'
 ```
 
@@ -591,8 +596,9 @@ remediation (shown as a `Fix:` line and in `--format json`); `tirith explain
 --rule <id> --fix` prints a rule's remediation on its own; and `tirith check
 --suggest-safe-command` rewrites the actual command into a safer one wherever a
 transformation is genuinely correct (supported pipe-to-shell → typed
-`tirith run --capsule --script-stdin --interpreter <shell>`, insecure-TLS flag
-dropped, `http://` → `https://`).
+`tirith run --capsule --script-stdin --interpreter <shell>` on the narrowly
+supported x86_64 Linux path). TLS-flag removal, HTTP-to-HTTPS changes, archive,
+dotfile, environment, sudo, and package-name changes are guidance-only.
 Where there is no safe mechanical rewrite, tirith says so plainly rather than
 inventing one.
 
@@ -809,12 +815,13 @@ This is a standard shell per-command prefix — the variable only exists for tha
 allow_bypass_env: false    # TIRITH=0 is ignored, org rules enforced
 ```
 
-### Every warning comes with a fix
+### Every warning comes with remediation
 
 No naked warnings. Every trigger includes:
 - What rule fired and why
 - The minimal proof (byte diff, domain comparison, etc.)
-- A safe rewrite or alternative command
+- Static remediation guidance, plus a verified executable pipe-runner command
+  only when Tirith can prove the complete supported transformation
 
 ```
   WARN: Pipe-to-shell detected.

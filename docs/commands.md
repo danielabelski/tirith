@@ -9,11 +9,11 @@ everyday subset; this is the complete reference.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds a safer rewrite; `--defer` records a non-critical block as pending and exits 4 instead of blocking) |
+| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds remediation and, only when fully verified on x86_64 Linux with the current Tirith binary at a fixed root-managed path, a typed pipe-runner command; `--defer` records a non-critical block as pending and exits 4 instead of blocking) |
 | `tirith paste` | Check pasted content (called by shell hooks; `--with-source` attributes the paste to its recorded clipboard origin) |
 | `tirith scan [path]` | Scan files, directories, and configs (`--include`, `--exclude`, `--profile`, `--format sarif`, `--ci`) |
-| `tirith run [--capsule] <url>` | Download, analyze, confirm, and execute a private copy; `check --suggest` supplies typed stdin/interpreter flags only for provable pipe rewrites (Unix) |
-| `tirith fix -- <cmd>` | Interactively rewrite a risky command into a safer form; the chosen rewrite prints to stdout for `$(tirith fix ...)` |
+| `tirith run [--capsule] <url>` | Inspect a remote script (`--no-exec` on Unix); live execution is Linux-only and executes the exact reviewed bytes from a sealed anonymous descriptor (`--capsule` fails closed) |
+| `tirith fix -- <cmd>` | On x86_64 Linux with the current Tirith binary at a fixed root-managed path, interactively apply a fully verified typed pipe-runner command when available; all other findings remain guidance-only, and an accepted command prints to stdout for `$(tirith fix ...)` |
 | `tirith view [file]` | Safe pager that neutralizes terminal-deception escape sequences before they reach your terminal |
 | `tirith score <url>` | Break down a URL's trust signals (`--explain` for the factor-by-factor derivation) |
 | `tirith diff <url>` | Byte-level view of where suspicious characters hide |

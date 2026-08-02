@@ -3,6 +3,8 @@
 #[cfg(unix)]
 use std::ffi::{OsStr, OsString};
 use std::fs;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -467,7 +469,7 @@ fn check_suggest_safe_command_is_guidance_for_replaceable_test_binary() {
 }
 
 #[test]
-fn check_suggest_safe_command_drops_insecure_tls_flag() {
+fn check_suggest_safe_command_keeps_insecure_tls_guidance_only() {
     let out = tirith()
         .args([
             "check",
@@ -476,15 +478,26 @@ fn check_suggest_safe_command_drops_insecure_tls_flag() {
             "--non-interactive",
             "--no-daemon",
             "--suggest-safe-command",
+            "--format",
+            "json",
             "--",
             "curl -k https://example.com/file",
         ])
         .output()
         .expect("failed to run tirith");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("check --suggest-safe-command --format json");
+    let tls = json["safe_suggestions"]
+        .as_array()
+        .and_then(|suggestions| {
+            suggestions
+                .iter()
+                .find(|suggestion| suggestion["rule_id"] == "insecure_tls_flags")
+        })
+        .expect("insecure_tls_flags guidance");
     assert!(
-        stderr.contains("curl https://example.com/file"),
-        "expected the -k flag dropped from the suggestion: {stderr}"
+        tls.get("safe_command").is_none(),
+        "TLS flag removal must remain guidance-only: {tls}"
     );
 }
 
@@ -529,6 +542,79 @@ fn check_suggest_safe_command_json_omits_untrusted_reinvocation() {
         .is_some_and(|s| !s.is_empty()));
 }
 
+#[test]
+fn commands_check_reconstructs_only_proven_posix_multi_argv() {
+    let cwd = tempfile::tempdir().expect("isolated nested commands-check cwd");
+    for (shell, command) in [
+        ("posix", "echo ok"),
+        ("fish", "echo ok"),
+        ("powershell", "Write-Output ok"),
+        ("cmd", "echo ok"),
+    ] {
+        let output = tirith()
+            .current_dir(cwd.path())
+            .args(["commands", "check", "--shell", shell, "--", command])
+            .output()
+            .expect("run single-string nested commands check");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "one already-formed {shell} command must remain verbatim: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let posix = tirith()
+        .current_dir(cwd.path())
+        .args([
+            "commands", "check", "--shell", "posix", "--", "printf", "%s", "a b",
+        ])
+        .output()
+        .expect("run POSIX multi-argv nested commands check");
+    assert_eq!(
+        posix.status.code(),
+        Some(0),
+        "POSIX multi-argv reconstruction must preserve word boundaries: stderr={}",
+        String::from_utf8_lossy(&posix.stderr)
+    );
+
+    for shell in ["fish", "powershell", "cmd"] {
+        let output = tirith()
+            .current_dir(cwd.path())
+            .args(["commands", "check", "--shell", shell, "--", "echo", "a b"])
+            .output()
+            .expect("run refused non-POSIX multi-argv nested commands check");
+        assert_eq!(output.status.code(), Some(2), "shell={shell}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("multi-argument Fish/PowerShell/Cmd input cannot be reconstructed"),
+            "shell={shell} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let json = tirith()
+        .current_dir(cwd.path())
+        .args([
+            "commands",
+            "check",
+            "--shell",
+            "powershell",
+            "--json",
+            "--",
+            "Write-Output",
+            "a b",
+        ])
+        .output()
+        .expect("run JSON non-POSIX multi-argv refusal");
+    assert_eq!(json.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("structured reconstruction refusal");
+    assert!(value["error"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("multi-argument Fish/PowerShell/Cmd")));
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
@@ -564,7 +650,7 @@ fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::CommandExt as _;
     use tirith_core::capsule::linux::LandlockSeccompCapsule;
@@ -573,6 +659,8 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
 
     const PLANTED_FD: i32 = 198;
     const SEALED_TARGET_FD: i32 = 63;
+    const LAUNCH_STATUS_FD: i32 = 61;
+    const LAUNCH_ACK_FD: i32 = 60;
     let secret_dir = tempfile::tempdir().expect("private inherited-fd fixture");
     let secret_path = secret_dir.path().join("secret");
     fs::write(&secret_path, b"must not be inherited").expect("write inherited-fd fixture");
@@ -581,6 +669,32 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         .expect("resolve canonical system bash")
         .bind_content()
         .expect("bind exact interpreter bytes before launch");
+
+    let mut status_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "create production status pipe: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut ack_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ack_descriptors.as_mut_ptr(),
+            )
+        },
+        0,
+        "create production ACK socket: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut status_reader = unsafe { fs::File::from_raw_fd(status_descriptors[0]) };
+    let status_writer = unsafe { fs::File::from_raw_fd(status_descriptors[1]) };
+    let ack_guard = unsafe { fs::File::from_raw_fd(ack_descriptors[0]) };
+    let ack_parent = unsafe { fs::File::from_raw_fd(ack_descriptors[1]) };
 
     // Compile a tiny probe before containment. It distinguishes an actual
     // `socket(2) -> EPERM` result from exec/loader/utility failures, so the test
@@ -673,6 +787,8 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
             .expect("canonical socket probe root"),
     );
     spec.handles.extra_unix_fds.push(SEALED_TARGET_FD);
+    spec.handles.extra_unix_fds.push(LAUNCH_STATUS_FD);
+    spec.handles.extra_unix_fds.push(LAUNCH_ACK_FD);
     spec.filesystem.read_roots.push(temp_home_path.clone());
     spec.filesystem.write_roots.push(temp_home_path.clone());
 
@@ -700,6 +816,10 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         .arg("bash")
         .arg("--target-fd")
         .arg(SEALED_TARGET_FD.to_string())
+        .arg("--launch-status-fd")
+        .arg(LAUNCH_STATUS_FD.to_string())
+        .arg("--launch-ack-fd")
+        .arg(LAUNCH_ACK_FD.to_string())
         .arg("--temp-home")
         .arg(&temp_home_path)
         .arg("--")
@@ -715,6 +835,8 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     let interpreter_fd = interpreter
         .bound_launch_fd()
         .expect("Linux binding must retain a sealed executable descriptor");
+    let status_writer_fd = status_writer.as_raw_fd();
+    let ack_guard_fd = ack_guard.as_raw_fd();
     // Destroy the pathname snapshot before spawn. The held descriptor remains
     // immutable and executable; any later path reopen would run these hostile
     // bytes and fail the receipt instead of producing the expected shell output.
@@ -741,10 +863,51 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
             if libc::fcntl(SEALED_TARGET_FD, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if libc::dup2(status_writer_fd, LAUNCH_STATUS_FD) < 0
+                || libc::fcntl(LAUNCH_STATUS_FD, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(ack_guard_fd, LAUNCH_ACK_FD) < 0
+                || libc::fcntl(LAUNCH_ACK_FD, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
     let mut child = command.spawn().expect("spawn real hidden capsule launcher");
+    drop(status_writer);
+    drop(ack_guard);
+    let mut observed = [0u8; 1];
+    status_reader
+        .read_exact(&mut observed)
+        .expect("read kernel OBSERVED status");
+    assert_eq!(observed, [b'O'], "target must remain stopped until ACK");
+    let ack = [b'A'];
+    assert_eq!(
+        unsafe {
+            libc::send(
+                ack_parent.as_raw_fd(),
+                ack.as_ptr().cast::<libc::c_void>(),
+                ack.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        1,
+        "send production ACK_RESUME: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(ack_parent);
+    let mut terminal = Vec::new();
+    status_reader
+        .read_to_end(&mut terminal)
+        .expect("read RESUMED and EOF");
+    assert_eq!(
+        terminal,
+        [b'R'],
+        "terminal success requires detach/resume then EOF"
+    );
     let script = "printf '<%s:%s>' \"$0\" \"$1\"\n\
          printf home > \"$TMPDIR/probe\"\n\
          IFS= read -r home_value < \"$TMPDIR/probe\"\n\
@@ -797,6 +960,459 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     assert!(
         !temp_home_path.exists(),
         "parent-owned capsule HOME must be removed after the complete child exits"
+    );
+}
+
+/// Production availability receipt for reviewed File mode. The hidden launcher
+/// installs the real Landlock/seccomp policy before the target shell execs, and
+/// `/proc` is deliberately absent from every read grant. Success therefore proves
+/// that the interpreter can open the inherited, fully sealed script memfd through
+/// its `/proc/self/fd/<n>` magic link after containment is active.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link() {
+    use std::ffi::CString;
+    use std::io::Seek as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
+    use tirith_core::capsule::linux::LandlockSeccompCapsule;
+    use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+    use tirith_core::trusted_child::TrustedExecutable;
+
+    const SEALED_TARGET_FD: i32 = 63;
+    const SEALED_SCRIPT_FD: i32 = 62;
+    const LAUNCH_STATUS_FD: i32 = 61;
+    const LAUNCH_ACK_FD: i32 = 60;
+
+    let interpreter = TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
+        .expect("resolve canonical system shell")
+        .bind_content()
+        .expect("bind exact interpreter bytes before launch");
+
+    let script_name = CString::new("tirith-reviewed-file-receipt").unwrap();
+    let script_raw = unsafe {
+        libc::memfd_create(
+            script_name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    assert!(
+        script_raw >= 0,
+        "create reviewed-script memfd: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut reviewed_script = unsafe { fs::File::from_raw_fd(script_raw) };
+    reviewed_script
+        .write_all(b"printf 'reviewed-file:%s' \"$0\"\n")
+        .expect("write reviewed script bytes");
+    reviewed_script.rewind().expect("rewind reviewed script");
+    assert_eq!(
+        unsafe { libc::fchmod(reviewed_script.as_raw_fd(), 0o400) },
+        0,
+        "make reviewed script read-only: {}",
+        std::io::Error::last_os_error()
+    );
+    let required_seals =
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                reviewed_script.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                required_seals,
+            )
+        },
+        0,
+        "fully seal reviewed script: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let mut status_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "create target status pipe: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut ack_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ack_descriptors.as_mut_ptr(),
+            )
+        },
+        0,
+        "create target ACK socket: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut status_reader = unsafe { fs::File::from_raw_fd(status_descriptors[0]) };
+    let status_writer = unsafe { fs::File::from_raw_fd(status_descriptors[1]) };
+    let ack_guard = unsafe { fs::File::from_raw_fd(ack_descriptors[0]) };
+    let ack_parent = unsafe { fs::File::from_raw_fd(ack_descriptors[1]) };
+
+    let temp_home = tempfile::Builder::new()
+        .prefix("tirith-reviewed-file-capsule-")
+        .tempdir_in("/tmp")
+        .expect("create parent-owned capsule HOME");
+    fs::set_permissions(temp_home.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure parent-owned capsule HOME");
+    let temp_home_path = temp_home
+        .path()
+        .canonicalize()
+        .expect("canonical capsule HOME");
+    for relative in [
+        ".config",
+        ".cache",
+        ".local",
+        ".local/share",
+        ".local/state",
+    ] {
+        let directory = temp_home_path.join(relative);
+        fs::create_dir_all(&directory).expect("precreate advertised XDG directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("secure advertised XDG directory");
+    }
+
+    let mut spec = CapsuleSpec::locked_down();
+    spec.resources = ResourceLimits {
+        cpu_seconds: Some(10),
+        memory_bytes: Some(256 * 1024 * 1024),
+        max_processes: Some(32),
+        max_open_files: Some(64),
+        max_output_bytes: None,
+        wall_clock_seconds: None,
+    };
+    spec.environment.allow = vec!["PATH".to_string()];
+    for root in [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/etc/ld.so.cache",
+    ] {
+        let path = Path::new(root);
+        if let Ok(canonical) = path.canonicalize() {
+            if !spec.filesystem.read_roots.contains(&canonical) {
+                spec.filesystem.read_roots.push(canonical);
+            }
+        }
+    }
+    assert!(
+        spec.filesystem
+            .read_roots
+            .iter()
+            .all(|root| root != Path::new("/proc") && !root.starts_with("/proc/")),
+        "the receipt must not grant /proc as a Landlock read root"
+    );
+    spec.handles.extra_unix_fds.extend([
+        SEALED_TARGET_FD,
+        SEALED_SCRIPT_FD,
+        LAUNCH_STATUS_FD,
+        LAUNCH_ACK_FD,
+    ]);
+    spec.filesystem.read_roots.push(temp_home_path.clone());
+    spec.filesystem.write_roots.push(temp_home_path.clone());
+
+    let backend = LandlockSeccompCapsule;
+    let available = backend.available_coverage(&spec);
+    if available.is_degraded_against(&spec.required_coverage()) {
+        assert!(
+            std::env::var_os("TIRITH_REQUIRE_CAPSULE_RECEIPT").is_none(),
+            "required reviewed-file capsule receipt cannot run: available={:?} required={:?}",
+            available,
+            spec.required_coverage()
+        );
+        eprintln!(
+            "skipping reviewed-file capsule receipt: this Linux host lacks required Landlock/seccomp coverage"
+        );
+        return;
+    }
+
+    let spec_json = serde_json::to_string(&spec).expect("serialize reviewed-file capsule spec");
+    let script_operand = format!("/proc/self/fd/{SEALED_SCRIPT_FD}");
+    let mut command = tirith();
+    command
+        .arg("__capsule-child")
+        .arg(spec_json)
+        .arg("--target-argv0")
+        .arg("sh")
+        .arg("--target-fd")
+        .arg(SEALED_TARGET_FD.to_string())
+        .arg("--script-fd")
+        .arg(SEALED_SCRIPT_FD.to_string())
+        .arg("--launch-status-fd")
+        .arg(LAUNCH_STATUS_FD.to_string())
+        .arg("--launch-ack-fd")
+        .arg(LAUNCH_ACK_FD.to_string())
+        .arg("--temp-home")
+        .arg(&temp_home_path)
+        .arg("--")
+        .arg(interpreter.launch_path())
+        .arg(&script_operand)
+        .env("PATH", "/bin:/usr/bin")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let interpreter_fd = interpreter
+        .bound_launch_fd()
+        .expect("Linux binding retains sealed interpreter descriptor");
+    let reviewed_script_fd = reviewed_script.as_raw_fd();
+    let status_writer_fd = status_writer.as_raw_fd();
+    let ack_guard_fd = ack_guard.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for (source, destination) in [
+                (interpreter_fd, SEALED_TARGET_FD),
+                (reviewed_script_fd, SEALED_SCRIPT_FD),
+                (status_writer_fd, LAUNCH_STATUS_FD),
+                (ack_guard_fd, LAUNCH_ACK_FD),
+            ] {
+                if libc::dup2(source, destination) < 0
+                    || libc::fcntl(destination, libc::F_SETFD, 0) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+
+    let child = command
+        .spawn()
+        .expect("spawn production reviewed-file hidden launcher");
+    let child_pid = child.id();
+    drop(status_writer);
+    drop(ack_guard);
+    let mut observed = [0u8; 1];
+    status_reader
+        .read_exact(&mut observed)
+        .expect("read stopped target EXEC observation");
+    assert_eq!(observed, [b'O']);
+    assert_eq!(
+        unsafe {
+            libc::send(
+                ack_parent.as_raw_fd(),
+                b"A".as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        1,
+        "send reviewed-file target ACK: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(ack_parent);
+    let mut terminal = Vec::new();
+    status_reader
+        .read_to_end(&mut terminal)
+        .expect("read resumed target status and EOF");
+    assert_eq!(terminal, [b'R']);
+
+    let output = child
+        .wait_with_output()
+        .expect("wait for reviewed-file capsule target");
+    assert!(
+        output.status.success(),
+        "reviewed-file target failed after Landlock: status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("reviewed-file:{script_operand}").as_bytes(),
+        "the shell must read and execute the exact sealed memfd operand after containment"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr: {:?}",
+        output.stderr
+    );
+    assert_eq!(
+        unsafe { libc::kill(-(child_pid as libc::pid_t), 0) },
+        -1,
+        "reviewed-file process group must be gone after the guard reaps its target"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH),
+        "reviewed-file target left a live process-group member"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
+    use tirith_core::capsule::linux::LandlockSeccompCapsule;
+    use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+
+    const STATUS_FD: i32 = 61;
+    const ACK_FD: i32 = 60;
+    let home = tempfile::Builder::new()
+        .prefix("tirith-capsule-invalid-ack-")
+        .tempdir_in("/tmp")
+        .expect("invalid-ACK HOME");
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    for relative in [
+        ".config",
+        ".cache",
+        ".local",
+        ".local/share",
+        ".local/state",
+    ] {
+        let path = home_path.join(relative);
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let marker = home_path.join("target-ran");
+
+    let mut spec = CapsuleSpec::locked_down();
+    spec.resources = ResourceLimits {
+        cpu_seconds: Some(10),
+        memory_bytes: Some(512 * 1024 * 1024),
+        max_processes: Some(32),
+        max_open_files: Some(64),
+        max_output_bytes: None,
+        wall_clock_seconds: None,
+    };
+    spec.environment.allow = vec!["PATH".to_string()];
+    for root in [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/share",
+        "/etc/ld.so.cache",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+    ] {
+        if let Ok(canonical) = Path::new(root).canonicalize() {
+            if !spec.filesystem.read_roots.contains(&canonical) {
+                spec.filesystem.read_roots.push(canonical);
+            }
+        }
+    }
+    spec.filesystem.read_roots.push(home_path.clone());
+    spec.filesystem.write_roots.push(home_path.clone());
+    spec.handles.extra_unix_fds.extend([STATUS_FD, ACK_FD]);
+
+    let backend = LandlockSeccompCapsule;
+    let available = backend.available_coverage(&spec);
+    if available.is_degraded_against(&spec.required_coverage()) {
+        assert!(
+            std::env::var_os("TIRITH_REQUIRE_CAPSULE_RECEIPT").is_none(),
+            "required invalid-ACK receipt cannot run: available={available:?} required={:?}",
+            spec.required_coverage()
+        );
+        eprintln!("skipping invalid-ACK capsule receipt: required coverage unavailable");
+        return;
+    }
+
+    let mut status_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let mut ack_descriptors = [0i32; 2];
+    assert_eq!(
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ack_descriptors.as_mut_ptr(),
+            )
+        },
+        0
+    );
+    let mut status_reader = unsafe { fs::File::from_raw_fd(status_descriptors[0]) };
+    let status_writer = unsafe { fs::File::from_raw_fd(status_descriptors[1]) };
+    let ack_guard = unsafe { fs::File::from_raw_fd(ack_descriptors[0]) };
+    let ack_parent = unsafe { fs::File::from_raw_fd(ack_descriptors[1]) };
+    let status_source = status_writer.as_raw_fd();
+    let ack_source = ack_guard.as_raw_fd();
+
+    let command_body = format!("printf ran > '{}'", marker.display());
+    let spec_json = serde_json::to_string(&spec).unwrap();
+    let mut command = tirith();
+    command
+        .arg("__capsule-child")
+        .arg(spec_json)
+        .arg("--launch-status-fd")
+        .arg(STATUS_FD.to_string())
+        .arg("--launch-ack-fd")
+        .arg(ACK_FD.to_string())
+        .arg("--temp-home")
+        .arg(&home_path)
+        .arg("--")
+        .arg("/bin/sh")
+        .args(["-c", command_body.as_str()])
+        .env("PATH", "/bin:/usr/bin")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0
+                || libc::dup2(status_source, STATUS_FD) < 0
+                || libc::fcntl(STATUS_FD, libc::F_SETFD, 0) < 0
+                || libc::dup2(ack_source, ACK_FD) < 0
+                || libc::fcntl(ACK_FD, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().expect("spawn invalid-ACK capsule guard");
+    let group = child.id();
+    drop(status_writer);
+    drop(ack_guard);
+    let mut observed = [0u8; 1];
+    status_reader
+        .read_exact(&mut observed)
+        .expect("read stopped exec observation");
+    assert_eq!(observed, [b'O']);
+    let invalid = [b'X'];
+    assert_eq!(
+        unsafe {
+            libc::send(
+                ack_parent.as_raw_fd(),
+                invalid.as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        1
+    );
+    drop(ack_parent);
+    let mut terminal = Vec::new();
+    status_reader.read_to_end(&mut terminal).unwrap();
+    assert!(terminal.is_empty(), "invalid ACK produced terminal success");
+    let output = child.wait_with_output().expect("reap invalid-ACK guard");
+    assert!(
+        !output.status.success(),
+        "invalid ACK launch unexpectedly succeeded"
+    );
+    assert!(!marker.exists(), "target code ran without exact ACK");
+    assert!(
+        process_group_disappears(group, std::time::Duration::from_secs(2)),
+        "invalid-ACK process group survived cleanup"
     );
 }
 
@@ -1367,13 +1983,17 @@ fn check_suggestions_never_mix_daemon_verdict_with_local_policy() {
             String::from_utf8_lossy(&out.stderr)
         )
     });
+    let tls = json["safe_suggestions"]
+        .as_array()
+        .and_then(|suggestions| {
+            suggestions
+                .iter()
+                .find(|suggestion| suggestion["rule_id"] == "insecure_tls_flags")
+        })
+        .expect("the local policy/verdict pair must produce TLS guidance");
     assert!(
-        json["safe_suggestions"]
-            .as_array()
-            .is_some_and(|suggestions| suggestions.iter().any(|suggestion| {
-                suggestion["safe_command"] == "curl https://example.com/file"
-            })),
-        "the local policy/verdict pair must drive suggestions: {json}"
+        tls.get("safe_command").is_none(),
+        "TLS flag removal must remain guidance-only: {json}"
     );
 }
 
@@ -5784,6 +6404,50 @@ fn install_help_states_it_is_not_a_sandbox() {
 }
 
 #[test]
+fn check_fix_and_commands_check_help_pin_safe_reconstruction_boundaries() {
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["check", "--help"],
+            &[
+                "POSIX commands may be supplied as multiple argv parts",
+                "Fish, PowerShell, and Cmd commands must be supplied as one",
+            ],
+        ),
+        (
+            &["fix", "--help"],
+            &[
+                "requires x86_64 Linux",
+                "fixed, root-managed system path",
+                "guidance-only",
+                "findings exist but no mechanical rewrite is available",
+            ],
+        ),
+        (
+            &["commands", "check", "--help"],
+            &[
+                "POSIX commands may use multiple argv parts",
+                "PowerShell, and Cmd commands must be one already-formed string",
+            ],
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let output = tirith().args(*args).output().expect("render command help");
+        assert!(
+            output.status.success(),
+            "help failed for {args:?}: {output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for needle in *expected {
+            assert!(
+                stdout.contains(needle),
+                "help for {args:?} omitted {needle:?}:\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn install_url_no_url_is_usage_error() {
     // The url form with no URL — short-circuits before any download.
     let out = tirith_install()
@@ -8794,7 +9458,7 @@ fn explain_fix_without_rule_or_finding_is_rejected() {
 }
 
 // tirith fix (M6 ch4). `tirith fix` is a thin presenter over
-// `safe_command::suggest_verified_with_policy()`.
+// `safe_command::suggest_verified_for_cli_inline_with_policy_and_session()`.
 
 #[test]
 fn fix_clean_command_exits_zero_with_no_findings_envelope() {
@@ -8825,6 +9489,94 @@ fn fix_clean_command_human_prints_no_fix_needed() {
         stdout.contains("no fix needed"),
         "fix on clean command must print 'no fix needed', got: {stdout}"
     );
+}
+
+#[test]
+fn fix_separate_posix_argv_preserves_literal_operator_bytes_as_data() {
+    let out = tirith()
+        .args([
+            "fix",
+            "--json",
+            "--non-interactive",
+            "--",
+            "curl",
+            "-fsSL",
+            "https://example.com/x|bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("literal-pipe fix output is JSON");
+    assert_eq!(value["reason"], "no_findings", "{value}");
+    assert_eq!(value["command"], "curl -fsSL 'https://example.com/x|bash'");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("--script-stdin"),
+        "literal argv pipe invented an executable pipeline"
+    );
+}
+
+#[test]
+fn fix_non_posix_multi_argv_refuses_before_analysis_or_safe_output() {
+    for shell in ["fish", "powershell", "cmd"] {
+        let out = tirith()
+            .args([
+                "fix",
+                "--shell",
+                shell,
+                "--json",
+                "--non-interactive",
+                "--",
+                "curl",
+                "https://example.com/x|bash",
+            ])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(out.status.code(), Some(2), "shell={shell}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|error| panic!("shell={shell}: invalid JSON: {error}"));
+        assert_eq!(value["applied"], false, "shell={shell}");
+        assert_eq!(value["reason"], "ambiguous_command_argv", "shell={shell}");
+        assert!(value.get("safe_command").is_none(), "shell={shell}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("one quoted command string"),
+            "shell={shell}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn check_non_posix_multi_argv_refuses_before_suggestion_output() {
+    for shell in ["fish", "powershell", "cmd"] {
+        let out = tirith()
+            .args([
+                "check",
+                "--shell",
+                shell,
+                "--format",
+                "json",
+                "--suggest-safe-command",
+                "--",
+                "curl",
+                "https://example.com/x|bash",
+            ])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(out.status.code(), Some(2), "shell={shell}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|error| panic!("shell={shell}: invalid JSON: {error}"));
+        assert!(value.get("error").is_some(), "shell={shell}: {value}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("safe_command"),
+            "shell={shell}: executable suggestion leaked"
+        );
+    }
 }
 
 #[test]
@@ -8941,9 +9693,10 @@ fn fix_keeps_archive_preview_then_extract_partial_rewrite_out_of_json() {
 
 #[test]
 fn fix_reanalysis_preserves_custom_policy_and_cwd_context() {
-    // The raw TLS rewrite is clean under built-in rules, but this repo policy
-    // forbids the target host at Medium severity. Losing cwd/policy during
-    // re-analysis would incorrectly expose it as executable.
+    // This exact pipe shape has a raw typed-runner candidate on supported Linux,
+    // but this repo policy forbids the target host. The core exact-seam test
+    // proves the executable gate against the frozen snapshot; this CLI receipt
+    // proves discovery retains the caller's cwd and surfaces that custom rule.
     let policy = r#"custom_rules:
   - id: forbid-example-fetch
     when:
@@ -8959,13 +9712,21 @@ fn fix_reanalysis_preserves_custom_policy_and_cwd_context() {
             "--json",
             "--non-interactive",
             "--",
-            "curl -k https://example.com/file",
+            "curl -fsSL https://example.com/install.sh | bash",
         ])
         .output()
         .expect("failed to run tirith fix under custom policy");
     assert_eq!(out.status.code(), Some(1));
     let suggestions: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix output is JSON");
+    assert!(
+        suggestions
+            .as_array()
+            .expect("findings-present shape is an array")
+            .iter()
+            .any(|suggestion| suggestion["rule_id"] == "custom_rule_match"),
+        "repo-local custom rule must be present: {suggestions}"
+    );
     assert!(
         suggestions
             .as_array()
@@ -9008,7 +9769,7 @@ fn fix_partial_rewrite_human_guidance_is_terminal_safe() {
 }
 
 #[test]
-fn fix_non_interactive_emits_array_without_json_flag() {
+fn fix_non_interactive_guidance_emits_array_without_json_flag() {
     // Spec step 8: `--non-interactive` → JSON-emit all suggestions; `--json`
     // is its strict superset. Both should produce the same shape.
     let out = tirith()
@@ -9020,7 +9781,7 @@ fn fix_non_interactive_emits_array_without_json_flag() {
         ])
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("fix --non-interactive (no --json) valid JSON");
     assert!(
@@ -9030,9 +9791,9 @@ fn fix_non_interactive_emits_array_without_json_flag() {
 }
 
 #[test]
-fn fix_no_tty_with_rewrites_exits_two() {
-    // Spec acceptance: `tirith fix --non-interactive -- "echo nope" </dev/null` exits 2 IF no
-    // suggestion can be applied.
+fn fix_no_tty_with_guidance_only_exits_one() {
+    // This curl shape lacks the status/redirect proof needed for an executable
+    // typed runner, so non-interactive output is guidance and exits 1.
     use std::process::Stdio;
     let out = tirith()
         .args([
@@ -9044,7 +9805,7 @@ fn fix_no_tty_with_rewrites_exits_two() {
         .stdin(Stdio::null())
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
 }
 
 #[test]
@@ -9089,8 +9850,7 @@ fn fix_with_shell_flag_routes_through_powershell_tokenizer() {
 }
 
 #[test]
-fn fix_unknown_shell_falls_back_to_posix_with_warning() {
-    // `tirith check` warns and falls back to posix on an unknown --shell.
+fn fix_unknown_shell_is_rejected_without_fallback() {
     let out = tirith()
         .args([
             "fix",
@@ -9102,11 +9862,35 @@ fn fix_unknown_shell_falls_back_to_posix_with_warning() {
         ])
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("unknown shell"),
         "expected stderr warning for unknown shell, got: {stderr}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("unknown shell response is valid JSON");
+    assert_eq!(value["reason"], "unknown_shell");
+}
+
+#[test]
+fn check_unknown_shell_human_diagnostic_is_terminal_safe() {
+    let hostile_shell = "tcsh\x1b[2J\nFORGED\u{202e}";
+    let out = tirith()
+        .args(["check", "--shell", hostile_shell, "--", "ls"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown shell 'tcshFORGED'"), "{stderr:?}");
+    assert!(!stderr.contains('\x1b'), "ANSI escape leaked: {stderr:?}");
+    assert!(
+        !stderr.contains('\u{202e}'),
+        "bidi override leaked: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("\nFORGED"),
+        "forged row leaked: {stderr:?}"
     );
 }
 
@@ -9136,10 +9920,10 @@ fn fix_sudo_download_emits_guidance_without_rewrite() {
         .output()
         .expect("failed to run tirith");
     // Verdict has findings + no mechanical rewrite → exit 1 (guidance only).
-    let exit = out.status.code();
-    assert!(
-        exit == Some(1) || exit == Some(2),
-        "expected exit 1 or 2, got: {exit:?} stdout={}",
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "guidance-only sudo download must exit 1; stdout={}",
         String::from_utf8_lossy(&out.stdout)
     );
     let v: serde_json::Value =
@@ -9169,10 +9953,10 @@ fn fix_sudo_sh_emits_no_rewrite_with_interactive_shell_rationale() {
         .output()
         .expect("failed to run tirith");
     // Verdict has findings, no mechanical rewrite possible.
-    let exit = out.status.code();
-    assert!(
-        exit == Some(1) || exit == Some(2),
-        "expected exit 1 or 2, got: {exit:?} stdout={}",
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "guidance-only sudo shell finding must exit 1; stdout={}",
         String::from_utf8_lossy(&out.stdout)
     );
     let v: serde_json::Value =
@@ -17665,17 +18449,23 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
 }
 
 #[test]
-fn fix_on_non_tty_prints_rerun_hint() {
-    // Item 14d (pre-existing): the non-interactive `tirith fix` path must surface
-    // the rerun hint so a piped user knows how to capture suggestions.
+fn fix_on_non_tty_guidance_exits_one_without_rerun_hint() {
+    // This shape has guidance but no verified executable rewrite. Non-TTY mode
+    // must report that distinction directly instead of implying a rewrite can be
+    // captured on a second invocation.
     let out = tirith()
         .args(["fix", "curl https://example.com/install.sh | bash"])
         .output()
         .expect("run fix");
     let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
     assert!(
-        err.contains("--non-interactive") && err.contains("--json"),
-        "fix on a non-TTY prints the rerun hint; stderr: {err}"
+        err.contains("no mechanical rewrite available"),
+        "guidance-only fix must explain why nothing is applyable; stderr: {err}"
+    );
+    assert!(
+        !err.contains("--non-interactive") && !err.contains("--json"),
+        "guidance-only fix must not advertise a nonexistent rewrite; stderr: {err}"
     );
 }
 
