@@ -170,7 +170,6 @@ impl Db {
 
     /// First-time provision path (triggered by `order.paid` or the first
     /// `subscription.active`).
-
     pub async fn process_subscription_created(
         &self,
         data: CreatedData,
