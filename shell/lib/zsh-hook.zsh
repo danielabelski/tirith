@@ -285,6 +285,14 @@ _tirith_accept_line() {
   fi
 
   # Empty input: pass through
+  #
+  # Protocol v3 calls the BUILTIN accept-line rather than a saved third-party
+  # widget, here and after a receipt commit below. That is deliberate: a saved
+  # widget runs with full control of $BUFFER, so on the commit path it executes
+  # after the "command changed after receipt commit" check and could run
+  # something the armed receipt does not cover, and on this empty-buffer path it
+  # could synthesize a command that was never analyzed at all. The legacy
+  # (protocol-off) path keeps delegating, because it has no receipt to bind.
   if [[ -z "$buf" ]]; then
     if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
       zle .accept-line
@@ -376,6 +384,9 @@ _tirith_accept_line() {
         zle redisplay
         return
       fi
+      # Builtin accept-line, not _tirith_original_accept_line: a third-party
+      # widget would run AFTER the buffer check directly above and could mutate
+      # $BUFFER, executing a command the committed receipt does not describe.
       zle .accept-line
       return
     fi
