@@ -246,8 +246,12 @@ pub fn detect_provider(provider: Provider) -> Result<ProviderContext, ContextDet
     result
 }
 
-/// Clear the per-process cache. Tests call this between scenarios.
-pub fn clear_cache_for_tests() {
+/// Evict the per-process detection cache.
+///
+/// Production calls this when a command is about to CHANGE provider
+/// configuration, so the next command cannot reuse a stale context during the
+/// five-second TTL; tests call it between scenarios for the same reason.
+pub fn invalidate_cache() {
     if let Some(lock) = CACHE.get() {
         if let Ok(mut guard) = lock.lock() {
             *guard = CacheEntry::default();
@@ -640,13 +644,13 @@ mod tests {
         unsafe {
             std::env::set_var("TIRITH_CONTEXT_DETECT_DISABLE", "1");
         }
-        clear_cache_for_tests();
+        invalidate_cache();
         let r = detect_all();
         assert!(r.is_empty(), "disable env must produce empty result");
         unsafe {
             std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
         }
-        clear_cache_for_tests();
+        invalidate_cache();
     }
 
     #[test]

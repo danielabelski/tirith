@@ -74,7 +74,7 @@ fn check_segment(
         // The command is analyzed before it changes provider configuration.
         // Evict the process cache now so the next command cannot reuse the old
         // context during its five-second TTL.
-        context_detect::clear_cache_for_tests();
+        context_detect::invalidate_cache();
         return None;
     }
 
@@ -1523,7 +1523,7 @@ mod tests {
         unsafe {
             std::env::set_var("TIRITH_CONTEXT_DETECT_DISABLE", "1");
         }
-        crate::context_detect::clear_cache_for_tests();
+        crate::context_detect::invalidate_cache();
         let policy = policy_with_label("kube:prod-us-east", "critical");
         let findings = check(
             "kubectl delete namespace payments",
@@ -1536,7 +1536,7 @@ mod tests {
         unsafe {
             std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
         }
-        crate::context_detect::clear_cache_for_tests();
+        crate::context_detect::invalidate_cache();
     }
 
     #[test]
