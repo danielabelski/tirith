@@ -99,6 +99,15 @@ chmod +x "$FAKE_BIN/git" "$FAKE_BIN/curl" "$FAKE_BIN/timeout"
 
 compile_reached="$TEST_ROOT/compile-reached"
 
+# The negative cases below deliberately drive the fetch script into its refusal
+# paths, and it reports those with GitHub workflow commands (`::error::...`).
+# Left alone, Actions renders each expected refusal as a job error annotation,
+# so a real assertion failure is buried under annotations describing the cases
+# that worked. Suppress command interpretation for the negative section and
+# resume it before the positive case; the text still reaches the log verbatim.
+STOP_TOKEN="tirith-threatdb-negative-cases"
+echo "::stop-commands::${STOP_TOKEN}"
+
 # Preflight validation happens after private staging is created. Invalid
 # configuration must still leave neither staging nor a compiler-visible output.
 status=0
@@ -206,6 +215,8 @@ if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
   echo "hung source-fetch staging state was not cleaned" >&2
   exit 1
 fi
+
+echo "::${STOP_TOKEN}::"
 
 PATH="$FAKE_BIN:$PATH" \
 THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
