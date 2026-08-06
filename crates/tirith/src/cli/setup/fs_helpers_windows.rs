@@ -1407,15 +1407,59 @@ impl PlatformTransaction {
                         ));
                     }
                 };
-                if !installed.as_ref().is_some_and(|generation| {
-                    generation.same_identity(&temp.generation)
-                        && generation.size == temp.generation.size
-                        && generation.digest == temp.generation.digest
-                        && generation.reparse_tag == temp.generation.reparse_tag
-                        && path_rules::attributes_are_safe(generation.attributes, false)
-                        && generation.security_descriptor == expected_generation.security_descriptor
-                }) || displaced.as_ref() != Some(expected_generation)
-                {
+                // Name each component that disagreed. The publication contract
+                // spans identity, bytes, attributes, and the preserved security
+                // descriptor, and an opaque "changed at publication" gives a
+                // caller nothing to act on.
+                let mut mismatches = Vec::new();
+                match installed.as_ref() {
+                    None => mismatches.push("destination absent after replace".to_string()),
+                    Some(generation) => {
+                        if !generation.same_identity(&temp.generation) {
+                            mismatches
+                                .push("installed identity is not the replacement".to_string());
+                        }
+                        if generation.size != temp.generation.size {
+                            mismatches.push(format!(
+                                "installed size {} != replacement size {}",
+                                generation.size, temp.generation.size
+                            ));
+                        }
+                        if generation.digest != temp.generation.digest {
+                            mismatches.push("installed digest is not the replacement".to_string());
+                        }
+                        if generation.reparse_tag != temp.generation.reparse_tag {
+                            mismatches.push("installed reparse tag changed".to_string());
+                        }
+                        if !path_rules::attributes_are_safe(generation.attributes, false) {
+                            mismatches.push(format!(
+                                "installed attributes {:#x} are unsafe",
+                                generation.attributes
+                            ));
+                        }
+                        if generation.security_descriptor != expected_generation.security_descriptor
+                        {
+                            mismatches.push(format!(
+                                "installed security descriptor ({} bytes) is not the preserved one ({} bytes)",
+                                generation.security_descriptor.len(),
+                                expected_generation.security_descriptor.len()
+                            ));
+                        }
+                    }
+                }
+                match displaced.as_ref() {
+                    None => mismatches.push("no displaced backup was produced".to_string()),
+                    Some(generation) if generation != expected_generation => {
+                        mismatches.push(format!(
+                            "displaced identity differs (same_identity={}, sd_len {} vs {})",
+                            generation.same_identity(expected_generation),
+                            generation.security_descriptor.len(),
+                            expected_generation.security_descriptor.len()
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                if !mismatches.is_empty() {
                     // ReplaceFileW's backup captured the exact competing file.
                     // Atomically restore it and keep our attempted replacement
                     // at the original private temp name.
@@ -1429,8 +1473,9 @@ impl PlatformTransaction {
                         && generation_at(&temp.path).is_ok_and(|live| live == installed)
                     {
                         return Err(format!(
-                            "{} or its prepared replacement changed at publication; restored the competing destination and published nothing",
-                            self.destination.display()
+                            "{} or its prepared replacement changed at publication ({}); restored the competing destination and published nothing",
+                            self.destination.display(),
+                            mismatches.join("; ")
                         ));
                     }
 
@@ -1443,8 +1488,9 @@ impl PlatformTransaction {
                         })?;
                     temp.armed = false;
                     return Err(format!(
-                        "{} or its prepared replacement changed at publication and rollback could not be proven; retained recovery snapshot {}, replacement {}, and displaced identity {}",
+                        "{} or its prepared replacement changed at publication ({}) and rollback could not be proven; retained recovery snapshot {}, replacement {}, and displaced identity {}",
                         self.destination.display(),
+                        mismatches.join("; "),
                         recovery_path.display(),
                         temp.path.display(),
                         displaced_path.display()

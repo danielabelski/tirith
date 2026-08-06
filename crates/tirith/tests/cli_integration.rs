@@ -637,7 +637,7 @@ fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("temporary_home requires a parent-owned, policy-granted --temp-home"),
+            .contains("temporary_home requires paired parent-owned --temp-home"),
         "unexpected refusal: {}",
         String::from_utf8_lossy(&output.stderr)
     );
