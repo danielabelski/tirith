@@ -7149,10 +7149,13 @@ mod tests {
             let ctx = exec_ctx_in(command, root.path());
             assert!(leader_is_hook_triggering(&ctx, &ctx.input));
             let findings = check_repo_hooks_hot(&ctx, &ctx.input);
-            assert!(findings.iter().any(|finding| {
-                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
-                    && finding.severity == crate::verdict::Severity::High
-            }));
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                        && finding.severity == crate::verdict::Severity::High
+                }),
+                "command {command:?} produced {findings:?}"
+            );
         }
     }
 
@@ -7169,11 +7172,14 @@ mod tests {
             let ctx = exec_ctx_in(command, root.path());
             assert!(leader_is_hook_triggering(&ctx, &ctx.input));
             let findings = check_repo_hooks_hot(&ctx, &ctx.input);
-            assert!(findings.iter().any(|finding| {
-                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
-                    && finding.severity == crate::verdict::Severity::High
-                    && finding.description.contains("GIT_")
-            }));
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                        && finding.severity == crate::verdict::Severity::High
+                        && finding.description.contains("GIT_")
+                }),
+                "command {command:?} produced {findings:?}"
+            );
         }
 
         let environment = crate::rules::command::EffectiveEnvironment::default();
