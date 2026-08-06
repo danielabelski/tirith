@@ -5928,7 +5928,10 @@ fn mcp_lock_writes_lockfile_for_planted_config() {
     let lock: serde_json::Value = serde_json::from_str(&contents).expect("lockfile must be JSON");
     // format_version 6 — adds the live `tools/list` descriptor lock (captured at
     // runtime; empty for a config-only `mcp lock`) atop v5's `tools_declared` hash.
-    assert_eq!(lock["format_version"], 6);
+    assert_eq!(
+        lock["format_version"],
+        tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION
+    );
     let servers = lock["servers"].as_array().expect("servers array");
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0]["name"], "filesystem");
@@ -6025,16 +6028,38 @@ fn mcp_lock_is_deterministic_across_runs() {
 }
 
 #[test]
-fn mcp_lock_malformed_config_is_recorded_not_fatal() {
-    // A malformed MCP config contributes no servers and is reported as
-    // unparseable — it is never an error.
+fn mcp_lock_malformed_config_requires_explicit_incomplete_override() {
+    // A malformed MCP config must not silently become a trusted partial
+    // baseline. The explicit audit override may record the gap, but verify will
+    // continue to treat that baseline as incomplete.
     let repo = tempfile::tempdir().unwrap();
     let iso = tempfile::tempdir().unwrap();
     fs::create_dir_all(repo.path().join(".git")).unwrap();
     fs::write(repo.path().join("mcp.json"), "{ not valid json at all").unwrap();
 
-    let (stdout, _err, code) = run_mcp_lock(repo.path(), iso.path(), &["--format", "json"]);
-    assert_eq!(code, 0, "a malformed config is not fatal");
+    let lock_path = repo.path().join(".tirith").join("mcp.lock");
+    let (stdout, stderr, code) = run_mcp_lock(repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 1, "a malformed config must refuse an ordinary lock");
+    let refusal = format!("{stdout}{stderr}");
+    assert!(
+        refusal.contains("incomplete MCP baseline")
+            && refusal.contains("--allow-incomplete-configs"),
+        "the refusal must explain the explicit audit override: {refusal}"
+    );
+    assert!(
+        !lock_path.exists(),
+        "default refusal must not publish a partial MCP baseline"
+    );
+
+    let (stdout, _err, code) = run_mcp_lock(
+        repo.path(),
+        iso.path(),
+        &["--allow-incomplete-configs", "--format", "json"],
+    );
+    assert_eq!(
+        code, 0,
+        "the explicit incomplete-baseline override may record the gap"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("mcp lock JSON");
     // The file is discovered (counts as a config) but yields no servers.
     assert_eq!(v["configs_found"], 1);
@@ -6042,6 +6067,7 @@ fn mcp_lock_malformed_config_is_recorded_not_fatal() {
     let malformed = v["malformed_configs"].as_array().unwrap();
     assert_eq!(malformed.len(), 1);
     assert_eq!(malformed[0], "mcp.json");
+    assert_eq!(v["incomplete_override_used"], true);
 }
 
 #[test]
@@ -6088,7 +6114,10 @@ fn mcp_lock_does_not_leak_url_userinfo_into_committed_file() {
     // The schema is at format_version 6 (which adds the live `tools/list` descriptor lock);
     // v4's URL userinfo redaction is preserved through the bumps.
     let lock: serde_json::Value = serde_json::from_str(lock_text).expect("lockfile must be JSON");
-    assert_eq!(lock["format_version"], 6);
+    assert_eq!(
+        lock["format_version"],
+        tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION
+    );
 
     // The URL transport stores the redacted URL and carries the `userinfo_hash` field; it does
     // NOT carry a plaintext userinfo / credential / token field.
@@ -6317,7 +6346,10 @@ fn mcp_verify_json_emits_envelope() {
     assert_eq!(v["in_sync"], true);
     assert_eq!(v["drift_count"], 0);
     assert_eq!(v["command"], "tirith mcp verify");
-    assert_eq!(v["lockfile_format_version"], 6);
+    assert_eq!(
+        v["lockfile_format_version"],
+        tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION
+    );
 }
 
 #[test]
@@ -17429,7 +17461,7 @@ fn package_inspect_cross_distribution_attaches_to_loader_names_payload() {
 }
 
 #[test]
-fn package_inspect_sdist_is_unsupported_gap_exit_0() {
+fn package_inspect_sdist_unsupported_gap_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path();
     // A gzip-magic file named `.whl` would still sniff as gzip → Unsupported; here
@@ -17441,19 +17473,27 @@ fn package_inspect_sdist_is_unsupported_gap_exit_0() {
         .arg(&sdist)
         .output()
         .expect("run package inspect sdist");
-    // An sdist is Unsupported (a coverage gap), not a finding: clean exit 0.
+    // An sdist is Unsupported. On the enforcing artifact surface that coverage
+    // gap is material and therefore fails closed.
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "an unsupported sdist is a coverage gap, not a block; stderr:\n{}",
+        Some(1),
+        "an unsupported sdist must fail closed; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(json["action"], "block");
     assert!(
         json["coverage_gaps"]
             .as_array()
-            .is_some_and(|g| !g.is_empty()),
+            .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "unsupported")),
         "the sdist must be recorded as a coverage gap: {json}"
+    );
+    assert!(
+        json["findings"].as_array().is_some_and(|findings| findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "analysis_incomplete")),
+        "the unresolved artifact coverage must produce analysis_incomplete: {json}"
     );
 }
 
