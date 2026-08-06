@@ -27,11 +27,56 @@ const MAX_CLIENT_HELLO: usize = 64 * 1024;
 const MAX_RESOLVED_ADDRESSES: usize = 16;
 const MAX_CONCURRENT_SESSIONS: usize = 32;
 const MAX_CONCURRENT_DNS_LOOKUPS: usize = 4;
+const MAX_CACHED_ORIGINS: usize = 64;
+/// Per-direction byte ceiling for one proxied session. Reaching it ABORTS the
+/// connection rather than truncating the body: a silently short download would
+/// surface later as a digest mismatch, which reads like a tampered artifact
+/// instead of a broker limit. Large ML wheels can legitimately approach this,
+/// so a raise is a policy decision — but it must stay a decision, not a silent
+/// corruption.
 const MAX_TUNNEL_BYTES_PER_DIRECTION: u64 = 256 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 static ACTIVE_DNS_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+/// Approved addresses for an origin already resolved during this broker's life.
+///
+/// A resolve normally targets one or two origins, but pip and uv open several
+/// connections in parallel, and every session used to take one of the four DNS
+/// worker slots. The fifth concurrent CONNECT to an ALREADY-resolved host then
+/// failed with "resolver DNS worker capacity exhausted".
+///
+/// Only the post-approval list is stored, so a cache hit cannot admit an
+/// address that `approve_resolved_addresses` would have refused. Reusing the
+/// first approved answer is also strictly stronger against DNS rebinding than
+/// re-resolving, which is why the entry is not re-validated on hit. The broker
+/// clears this when it starts, so one run never inherits another's answers.
+static RESOLVED_ORIGINS: Mutex<BTreeMap<(String, u16), Vec<SocketAddr>>> =
+    Mutex::new(BTreeMap::new());
+
+fn cached_origin_addresses(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    RESOLVED_ORIGINS
+        .lock()
+        .ok()?
+        .get(&(host.to_string(), port))
+        .cloned()
+}
+
+fn remember_origin_addresses(host: &str, port: u16, approved: &[SocketAddr]) {
+    if let Ok(mut cache) = RESOLVED_ORIGINS.lock() {
+        // A resolve targets a handful of origins; the bound only guards against
+        // a pathological permitted-origin set.
+        if cache.len() < MAX_CACHED_ORIGINS {
+            cache.insert((host.to_string(), port), approved.to_vec());
+        }
+    }
+}
+
+fn forget_all_origin_addresses() {
+    if let Ok(mut cache) = RESOLVED_ORIGINS.lock() {
+        cache.clear();
+    }
+}
 
 type ConnectionRegistry = Arc<Mutex<BTreeMap<u64, Vec<TcpStream>>>>;
 
@@ -97,6 +142,9 @@ pub(super) struct ResolverBroker {
 
 impl ResolverBroker {
     pub(super) fn start(permitted: PermittedOrigins) -> Result<Self, String> {
+        // Scope the approved-address cache to this broker: a long-lived process
+        // (the MCP server) must not let one resolve inherit another's answers.
+        forget_all_origin_addresses();
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .map_err(|e| format!("could not bind resolver broker: {e}"))?;
         listener
@@ -310,9 +358,17 @@ fn serve_connection(
     if stop.load(Ordering::Acquire) {
         return Err("resolver broker is shutting down".to_string());
     }
-    let dns_deadline = deadline.min(Instant::now() + DNS_TIMEOUT);
-    let resolved = resolve_with_deadline(request.host.clone(), request.port, dns_deadline, stop)?;
-    let approved = approve_resolved_addresses(&resolved)?;
+    let approved = match cached_origin_addresses(&request.host, request.port) {
+        Some(approved) => approved,
+        None => {
+            let dns_deadline = deadline.min(Instant::now() + DNS_TIMEOUT);
+            let resolved =
+                resolve_with_deadline(request.host.clone(), request.port, dns_deadline, stop)?;
+            let approved = approve_resolved_addresses(&resolved)?;
+            remember_origin_addresses(&request.host, request.port, &approved);
+            approved
+        }
+    };
     let mut upstream = connect_with_fallback(&approved, deadline, stop)?;
     if let Ok(clone) = upstream.try_clone() {
         let mut registry = connections
@@ -663,30 +719,54 @@ fn tunnel(client: TcpStream, upstream: TcpStream) {
         return;
     };
     let up = std::thread::spawn(move || {
-        copy_capped(&mut client_reader, &mut upstream_writer);
-        let _ = upstream_writer.shutdown(Shutdown::Write);
+        let outcome = copy_capped(&mut client_reader, &mut upstream_writer);
+        // A clean write-shutdown after a capped copy would look like a complete
+        // body to the peer. Abort instead, so the transfer visibly fails.
+        let _ = match outcome {
+            CopyOutcome::Complete => upstream_writer.shutdown(Shutdown::Write),
+            CopyOutcome::CapReached => upstream_writer.shutdown(Shutdown::Both),
+        };
     });
     let mut upstream_reader = upstream;
     let mut client_writer = client;
-    copy_capped(&mut upstream_reader, &mut client_writer);
-    let _ = client_writer.shutdown(Shutdown::Write);
+    let outcome = copy_capped(&mut upstream_reader, &mut client_writer);
+    let _ = match outcome {
+        CopyOutcome::Complete => client_writer.shutdown(Shutdown::Write),
+        CopyOutcome::CapReached => {
+            eprintln!(
+                "tirith: resolver broker aborted a session at its {} MiB per-direction limit; \
+                 the artifact was NOT truncated into the install",
+                MAX_TUNNEL_BYTES_PER_DIRECTION / (1024 * 1024)
+            );
+            client_writer.shutdown(Shutdown::Both)
+        }
+    };
     let _ = up.join();
 }
 
-fn copy_capped(reader: &mut TcpStream, writer: &mut TcpStream) {
+/// Whether a proxied copy ended on its own or ran into the per-direction cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyOutcome {
+    Complete,
+    CapReached,
+}
+
+fn copy_capped(reader: &mut TcpStream, writer: &mut TcpStream) -> CopyOutcome {
     let mut remaining = MAX_TUNNEL_BYTES_PER_DIRECTION;
     let mut buffer = [0u8; 16 * 1024];
     while remaining > 0 {
         let take = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
         let count = match reader.read(&mut buffer[..take]) {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => return CopyOutcome::Complete,
             Ok(count) => count,
         };
         if writer.write_all(&buffer[..count]).is_err() {
-            break;
+            return CopyOutcome::Complete;
         }
         remaining -= count as u64;
     }
+    // The reader still had bytes to give when the budget ran out.
+    CopyOutcome::CapReached
 }
 
 fn deny(stream: &mut TcpStream, status: u16, reason: &str) {
@@ -1002,6 +1082,38 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "drop must cancel and join partial sessions promptly"
+        );
+    }
+
+    #[test]
+    fn approved_origin_addresses_are_reused_and_scoped_to_one_broker() {
+        // Parallel sessions to an already-resolved origin must not each take a
+        // DNS worker slot, and one broker's answers must not survive into the
+        // next.
+        forget_all_origin_addresses();
+        let approved = vec![SocketAddr::from(([93, 184, 216, 34], 443))];
+        remember_origin_addresses("example.com", 443, &approved);
+        assert_eq!(
+            cached_origin_addresses("example.com", 443),
+            Some(approved.clone()),
+            "a resolved origin is reused without another lookup"
+        );
+        assert_eq!(
+            cached_origin_addresses("example.com", 8443),
+            None,
+            "the port is part of the key"
+        );
+        assert_eq!(
+            cached_origin_addresses("other.example", 443),
+            None,
+            "the host is part of the key"
+        );
+
+        forget_all_origin_addresses();
+        assert_eq!(
+            cached_origin_addresses("example.com", 443),
+            None,
+            "a new broker must not inherit the previous run's addresses"
         );
     }
 }
