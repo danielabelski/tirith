@@ -616,8 +616,13 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                     byte_idx += byte_width;
                     continue;
                 }
-                if matches!(b, 0x90 | 0x9F) {
-                    // C1 DCS/APC: consume the opaque string through ST.
+                if matches!(b, 0x90 | 0x98 | 0x9E | 0x9F) {
+                    // C1 DCS / SOS / PM / APC: every one opens an opaque string
+                    // terminated by ST. Leaving SOS (0x98) and PM (0x9E) out
+                    // meant their payload was scanned as ordinary bytes and an
+                    // unterminated one left the phase Idle, so
+                    // finalize_scan_state reported no truncated control for a
+                    // terminal that is in fact wedged.
                     state.phase = OutputPhase::InStringControl;
                     state.osc_pending_st = false;
                     byte_idx += byte_width;
@@ -655,13 +660,13 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                         state.osc_pending_st = false;
                         state.osc_start_offset = (chunk_start_offset + byte_idx).saturating_sub(1);
                     }
-                    b'P' | b'_' => {
-                        // ESC P / ESC _ are the 7-bit DCS / APC introducers, the
-                        // exact equivalents of C1 0x90 / 0x9F handled above.
-                        // Without this a stream ending in an unterminated
-                        // `ESC P` left the phase Idle, so finalize_scan_state
-                        // reported no truncated control for a terminal that is
-                        // in fact wedged in DCS mode.
+                    b'P' | b'X' | b'^' | b'_' => {
+                        // The 7-bit DCS / SOS / PM / APC introducers, exact
+                        // equivalents of C1 0x90 / 0x98 / 0x9E / 0x9F handled
+                        // above. Without these a stream ending in an
+                        // unterminated `ESC P` left the phase Idle, so
+                        // finalize_scan_state reported no truncated control for
+                        // a terminal that is in fact wedged in a string control.
                         state.phase = OutputPhase::InStringControl;
                         state.osc_pending_st = false;
                     }
@@ -14391,5 +14396,53 @@ mod tests {
         assert!(!urls
             .iter()
             .any(|url| url.parsed.host() == Some("github.com")));
+    }
+
+    #[test]
+    fn every_string_control_introducer_is_consumed_through_st() {
+        // DCS / SOS / PM / APC each open an opaque string terminated by ST, in
+        // both their 7-bit `ESC x` and C1 single-byte forms. A missing one had
+        // its payload scanned as ordinary bytes, and an unterminated one left
+        // the phase Idle so finalize_scan_state reported nothing for a terminal
+        // that is actually wedged.
+        for introducer in [
+            &b"\x1bP"[..],
+            &b"\x1bX"[..],
+            &b"\x1b^"[..],
+            &b"\x1b_"[..],
+            "\u{90}".as_bytes(),
+            "\u{98}".as_bytes(),
+            "\u{9e}".as_bytes(),
+            "\u{9f}".as_bytes(),
+        ] {
+            // Complete: the payload is consumed and ST returns to Idle.
+            let mut state = OutputScanState::default();
+            let mut result = OutputScanResult::default();
+            let mut complete = introducer.to_vec();
+            complete.extend_from_slice(b"payload\x1b\\");
+            scan_output_chunk(&complete, &mut state, &mut result);
+            assert_eq!(
+                state.phase,
+                OutputPhase::Idle,
+                "ST must close the string control for {introducer:?}"
+            );
+
+            // Truncated: the phase stays in-flight so finalize reports it.
+            let mut state = OutputScanState::default();
+            let mut result = OutputScanResult::default();
+            let mut truncated = introducer.to_vec();
+            truncated.extend_from_slice(b"payload");
+            scan_output_chunk(&truncated, &mut state, &mut result);
+            assert_eq!(
+                state.phase,
+                OutputPhase::InStringControl,
+                "an unterminated string control must stay in flight for {introducer:?}"
+            );
+            let finalize = finalize_scan_state(&mut state);
+            assert!(
+                finalize.truncated_escape,
+                "finalize must report the wedged terminal for {introducer:?}"
+            );
+        }
     }
 }
