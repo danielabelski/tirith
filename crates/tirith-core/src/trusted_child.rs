@@ -1291,12 +1291,7 @@ mod linux_acl_policy_tests {
                 0,
             )
         };
-        assert_eq!(
-            status,
-            0,
-            "setxattr: {}",
-            std::io::Error::last_os_error()
-        );
+        assert_eq!(status, 0, "setxattr: {}", std::io::Error::last_os_error());
     }
 
     const UNDEFINED_ID: u32 = u32::MAX;
