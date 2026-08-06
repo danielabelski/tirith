@@ -487,9 +487,9 @@ pub struct ToolDescriptor {
     /// identity used to pair descriptors across two locks for drift.
     pub name: String,
     /// Hash over the [`canonical_json`] of the whole captured descriptor
-    /// (`title` + `description` + `inputSchema` + `outputSchema` + `annotations`
-    /// + `icons` + `execution` + `_meta`, each present-or-null), framed with the
-    /// tool name. The single value drift compares.
+    /// (`title`, `description`, `inputSchema`, `outputSchema`, `annotations`,
+    /// `icons`, `execution`, and `_meta`, each present-or-null), framed with
+    /// the tool name. The single value drift compares.
     pub descriptor_hash: String,
 }
 
@@ -2049,9 +2049,9 @@ fn parse_mcp_config_detailed(
 
     let mut entries = Vec::with_capacity(servers_obj.len());
     for (name, config) in servers_obj {
-        let obj = config
-            .as_object()
-            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerEntry))?;
+        let obj = config.as_object().ok_or(McpConfigParseError::Rejected(
+            RejectedReason::InvalidServerEntry,
+        ))?;
 
         // Exact-lock mode recognizes a deliberately small launch schema. An
         // ignored header/env-file/cwd/enable flag can change what another client
@@ -2098,10 +2098,9 @@ fn parse_transport(
     }
 
     if let Some(url_value) = obj.get("url") {
-        let url = url_value
-            .as_str()
-            .filter(|url| !url.is_empty())
-            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+        let url = url_value.as_str().filter(|url| !url.is_empty()).ok_or(
+            McpConfigParseError::Rejected(RejectedReason::InvalidServerField),
+        )?;
         if url_has_secret_bearing_components(url, false) {
             return Err(McpConfigParseError::Rejected(
                 RejectedReason::SecretBearingUrl,
@@ -2118,13 +2117,17 @@ fn parse_transport(
         let command = command_value
             .as_str()
             .filter(|command| !command.is_empty())
-            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+            .ok_or(McpConfigParseError::Rejected(
+                RejectedReason::InvalidServerField,
+            ))?;
         let args: Vec<String> = match obj.get("args") {
             None => Vec::new(),
             Some(value) => value
                 .as_array()
                 .filter(|args| args.iter().all(|arg| arg.is_string()))
-                .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?
+                .ok_or(McpConfigParseError::Rejected(
+                    RejectedReason::InvalidServerField,
+                ))?
                 .iter()
                 .map(|arg| arg.as_str().expect("validated string").to_string())
                 .collect(),
@@ -2159,13 +2162,12 @@ fn args_have_secret_bearing_value(args: &[String]) -> bool {
             return true;
         }
 
-        if header_flag_name(arg) {
-            if args
+        if header_flag_name(arg)
+            && args
                 .get(index + 1)
                 .is_some_and(|value| credential_header_has_literal(value))
-            {
-                return true;
-            }
+        {
+            return true;
         }
         if let Some(header) = arg
             .strip_prefix("--header=")
@@ -2611,9 +2613,9 @@ fn parse_env_strict(
     let Some(value) = obj.get("env") else {
         return Ok(Vec::new());
     };
-    let map = value
-        .as_object()
-        .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+    let map = value.as_object().ok_or(McpConfigParseError::Rejected(
+        RejectedReason::InvalidServerField,
+    ))?;
     if !map.values().all(serde_json::Value::is_string) {
         return Err(McpConfigParseError::Rejected(
             RejectedReason::InvalidServerField,
@@ -2641,7 +2643,9 @@ fn parse_tools_strict(
     let arr = value
         .as_array()
         .filter(|tools| tools.iter().all(serde_json::Value::is_string))
-        .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+        .ok_or(McpConfigParseError::Rejected(
+            RejectedReason::InvalidServerField,
+        ))?;
     let mut tools: Vec<String> = arr
         .iter()
         .map(|tool| tool.as_str().expect("validated string").to_string())

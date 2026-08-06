@@ -2899,6 +2899,10 @@ fn handle_guarded_call(
     }
 }
 
+// One dispatch hop for a single failed extraction: every parameter is a
+// distinct upstream/session handle, and bundling them would only move the
+// same values behind a struct built at the one call site.
+#[allow(clippy::too_many_arguments)]
 fn handle_extraction_failed(
     id: Value,
     tool_name: &str,
@@ -4831,7 +4835,7 @@ fn persist_descriptor_approval(
     let lock_path = approval.repo_root.join(".tirith").join("mcp.lock");
     let original = tirith_core::util::read_text_no_follow_capped(
         &lock_path,
-        tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE as u64,
+        tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE,
     )
     .map_err(|_| "could not read current lockfile")?;
     if original.len() > tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE as usize {
@@ -4883,7 +4887,7 @@ fn persist_descriptor_approval(
     }
     let current_bytes = tirith_core::util::read_text_no_follow_capped(
         &lock_path,
-        tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE as u64,
+        tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE,
     )
     .map_err(|_| "could not re-read current lockfile")?;
     if current_bytes != original {
