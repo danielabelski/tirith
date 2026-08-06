@@ -826,6 +826,19 @@ pub fn try_redact_for_audience_with_custom(
 
     // 2. Credential patterns — ahead of built-ins so a built-in's labeled
     //    output doesn't shadow a credential match.
+    // `Authorization: Bearer` values are sensitive by protocol, so they are
+    // redacted here as well as in `redact()` — the narrow provider patterns
+    // below do not recognize JWT or opaque bearer alphabets.
+    let bearer_matches = AUTHORIZATION_BEARER_PATTERN.find_iter(&result).count();
+    if bearer_matches > 0 {
+        result = AUTHORIZATION_BEARER_PATTERN
+            .replace_all(&result, |captures: &regex::Captures| {
+                format!("{}[REDACTED:Bearer Token]", &captures[1])
+            })
+            .into_owned();
+        bump("bearer_token", bearer_matches, &mut counts, &mut order);
+    }
+
     for entry in CREDENTIAL_REDACT_PATTERNS.iter() {
         let matches = entry.regex.find_iter(&result).count();
         if matches > 0 {
