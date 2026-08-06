@@ -61,6 +61,11 @@ pub struct BlastReport {
     /// The traversal stopped because its global operation budget was exhausted.
     /// `walk_truncated` remains set too for compatibility with existing clients.
     pub work_cap_reached: bool,
+    /// The budget ran out with destructive targets still unclassified, so
+    /// `paths_outside_repo` and the symlink signals are NOT a complete answer
+    /// for this command — a later target could escape the repository without
+    /// ever being examined.
+    pub classification_incomplete: bool,
     /// Successfully charged traversal operations before completion or cutoff.
     pub work_units_used: u64,
     /// Operation limit applied to this report.
@@ -423,11 +428,13 @@ fn simulate_with_work_limit(
             // Expand the target (glob against cwd, else literal) to concrete paths.
             let Some(expanded) = expand_target(&resolved_target, cwd, &mut report, &mut budget)
             else {
+                report.classification_incomplete = true;
                 return report;
             };
 
             for path in expanded {
                 if !walk_into(&path, &mut report, &mut budget) {
+                    report.classification_incomplete = true;
                     return report;
                 }
                 if path_escapes_repo(&path, cwd, repo_root) {
@@ -445,6 +452,25 @@ fn simulate_with_work_limit(
 /// [`BlastReport`]; the caller merges in the cheap [`cheap_check`] rules.
 pub fn report_findings(report: &BlastReport) -> Vec<Finding> {
     let mut findings = Vec::new();
+
+    if report.classification_incomplete {
+        findings.push(finding(
+            RuleId::AnalysisIncomplete,
+            Severity::High,
+            "destructive target classification stopped at the work budget",
+            "The traversal budget ran out while destructive targets were still \
+             unclassified, so \"outside repo\" and the symlink signals describe only \
+             the part that was examined. A remaining target could reach outside the \
+             repository without appearing here, so this is reported instead of being \
+             presented as a complete result.",
+            Evidence::Text {
+                detail: format!(
+                    "traversal stopped after {} of {} work units with targets unclassified",
+                    report.work_units_used, report.work_limit
+                ),
+            },
+        ));
+    }
 
     if report.paths_outside_repo && !report.unsafe_empty_var_glob {
         findings.push(finding(
@@ -1929,6 +1955,40 @@ mod tests {
         assert!(report.file_count > LARGE_FILE_COUNT_THRESHOLD);
         let f = report_findings(&report);
         assert!(f.iter().any(|f| f.rule_id == RuleId::BlastLargeFileCount));
+    }
+
+    #[test]
+    fn budget_cutoff_before_a_later_target_fails_closed() {
+        // The first target exhausts the work budget, so the second target — which
+        // escapes the repository — is never classified. The report must say so
+        // rather than presenting "outside repo: no" as a complete answer.
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let wide = repo.path().join("wide");
+        fs::create_dir_all(&wide).unwrap();
+        for i in 0..8 {
+            fs::write(wide.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let command = format!("rm -rf ./wide {}", outside.path().display());
+        let report = simulate_with_work_limit(
+            &command,
+            ShellType::Posix,
+            repo.path(),
+            Some(repo.path()),
+            &empty_env(),
+            2,
+        );
+        assert!(
+            report.classification_incomplete,
+            "a budget cutoff with targets left must be reported: {report:?}"
+        );
+        let findings = report_findings(&report);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::AnalysisIncomplete),
+            "incomplete classification must fail closed: {findings:?}"
+        );
     }
 
     #[test]
