@@ -3407,7 +3407,8 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
         // Pre-approval-bit v6 lockfiles represented approval solely by a
         // non-empty descriptor vector. Preserve that safe existing baseline;
         // the explicit bit additionally lets a newly approved empty set exist.
-        if !server.descriptors.is_empty() {
+        if lock.schema_state == LockfileSchema::LegacyV6Migration && !server.descriptors.is_empty()
+        {
             server.descriptors_approved = true;
         }
         server.descriptor_hash = compute_descriptor_hash(&server.descriptors);
