@@ -81,15 +81,32 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
     let has_high = has_blocking_findings(&verdict);
 
     if has_high && !redact {
+        // Secret-shaped content has a remedy the operator can act on; other
+        // blockers do not, so name the two cases apart.
+        let secret_shaped = verdict.findings.iter().any(|finding| {
+            use tirith_core::verdict::RuleId;
+            matches!(
+                finding.rule_id,
+                RuleId::CredentialInText
+                    | RuleId::HighEntropySecret
+                    | RuleId::PrivateKeyExposed
+                    | RuleId::SensitiveEnvExport
+            )
+        });
+        let refusal = if secret_shaped {
+            "secret-shaped content detected; clipboard write refused; use --redact to attempt a sanitized copy (unrelated blockers remain refused)"
+        } else {
+            "blocking content detected; clipboard write refused"
+        };
         if json {
             let env = ScanEnvelope {
                 status: "refused",
                 verdict: Some(&verdict),
-                error: Some("blocking content detected; clipboard write refused"),
+                error: Some(refusal),
             };
             write_json_or_complain(&env);
         } else {
-            eprintln!("tirith clipboard copy: blocking content detected; clipboard write refused");
+            eprintln!("tirith clipboard copy: {refusal}");
         }
         return 1;
     }
