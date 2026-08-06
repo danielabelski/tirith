@@ -20,6 +20,14 @@ enum UrlValidationMode {
 /// policy can approve one hostname or a bounded private-use CIDR, while the
 /// centralized address classifier still unconditionally refuses link-local,
 /// cloud control-plane/credential, multicast, and other special-use space.
+///
+/// SCOPE OF A HOSTNAME ENTRY: a host approved by name is approved for WHATEVER
+/// it resolves to within private-use and loopback space, including `127.0.0.1`
+/// and the rest of RFC 1918. Name resolution is not part of the trust decision,
+/// so whoever controls that name's DNS chooses the destination inside those
+/// ranges. Use a CIDR entry when the intended destination is a fixed address
+/// range; use a hostname entry only when the name itself is the thing being
+/// trusted. The unconditional refusals above still apply either way.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PrivateFetchPolicy {
     hosts: Vec<String>,
