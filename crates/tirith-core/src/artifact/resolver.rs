@@ -2582,14 +2582,15 @@ fn python_version_from_executable(path: &Path) -> Option<String> {
     Some(format!("{major}.{minor}"))
 }
 
+/// Interpreter version string plus the pip-tree binding proven alongside it.
+#[cfg(unix)]
+type AttestPythonRuntimeResult = Result<(String, PipTreeBinding), ResolverError>;
+
 /// Locate and attest pip without importing or executing pip. Only the built-in
 /// `sys` module is used for the first `-I -S` probe. The returned stdlib is then
 /// checked as a bounded root-managed tree before a second no-site probe imports
 /// the now-proven system `site` module to enumerate system site roots.
 #[cfg(unix)]
-/// Interpreter version string plus the pip-tree binding proven alongside it.
-type AttestPythonRuntimeResult = Result<(String, PipTreeBinding), ResolverError>;
-
 fn attest_python_runtime_and_pip(
     python: &TrustedExecutable,
     runtime: &ValidatedPythonRuntime,
