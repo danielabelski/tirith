@@ -3429,6 +3429,10 @@ fn handle_guarded_call(
     }
 }
 
+// One dispatch hop for a single failed extraction: every parameter is a
+// distinct upstream/session handle, and bundling them would only move the
+// same values behind a struct built at the one call site.
+#[allow(clippy::too_many_arguments)]
 fn handle_extraction_failed(
     id: Value,
     tool_name: &str,
