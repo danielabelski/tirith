@@ -1904,7 +1904,7 @@ mod tests {
                 std::arch::asm!("int3", options(nomem, nostack));
                 #[cfg(target_arch = "aarch64")]
                 std::arch::asm!("brk #0", options(nomem, nostack));
-                let byte = [b'x'];
+                let byte = *b"x";
                 let fd = libc::open(
                     marker_c.as_ptr(),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,

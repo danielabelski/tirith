@@ -1965,11 +1965,11 @@ fn terminate_tree(
         let status = child.wait().ok();
         let group_disappeared =
             confirm_disappearance && wait_for_process_group_disappearance(child_pid);
-        return TreeTermination {
+        TreeTermination {
             signal_succeeded: signalled,
             status,
             group_disappeared,
-        };
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {

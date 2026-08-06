@@ -667,6 +667,7 @@ struct BoundTargetFd {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct TargetLaunchStatusPipe {
     status_reader: std::fs::File,
     status_writer: std::fs::File,
@@ -1690,6 +1691,7 @@ fn validate_reviewed_script_fd(fd: i32) -> Result<(), CapsuleRefused> {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct SupervisedChildOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
@@ -2544,6 +2546,9 @@ fn linux_contained_command_os(
     Ok(prepared)
 }
 
+// The Linux containment entry point: every parameter is a distinct piece of
+// the launch plan the two call sites already hold separately.
+#[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "linux")]
 fn linux_contained_command_os_with_options(
     spec: &CapsuleSpec,
