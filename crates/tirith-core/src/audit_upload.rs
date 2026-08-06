@@ -246,6 +246,11 @@ pub fn spool_and_upload(
     // repo-0194: coalesce bursts into ONE drainer. A thread per event lets a
     // burst create unbounded concurrent workers in a long-lived process.
     static DRAIN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // The running drainer snapshots the spool once, so an event appended after
+    // that snapshot is not covered by it. Record that the spool changed and let
+    // the drainer take another pass; without this the event waits for an
+    // unrelated later append and retention can drop it undelivered.
+    static DRAIN_RESCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DRAIN_ACTIVE
         .compare_exchange(
             false,
@@ -255,15 +260,39 @@ pub fn spool_and_upload(
         )
         .is_err()
     {
-        return; // a drainer is already running; it will pick up this event
+        DRAIN_RESCAN.store(true, std::sync::atomic::Ordering::Release);
+        return; // a drainer is already running; the flag makes it rescan
     }
 
     // Drain runs on a background thread — the CLI path must never block on network I/O.
     let url = server_url.to_string();
     let key = api_key.to_string();
     std::thread::spawn(move || {
-        drain_spool(&url, &key, max_ev, max_b);
-        DRAIN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        loop {
+            // Clear before draining: an append during this pass sets the flag
+            // again and earns another one.
+            DRAIN_RESCAN.store(false, std::sync::atomic::Ordering::Release);
+            drain_spool(&url, &key, max_ev, max_b);
+            if DRAIN_RESCAN.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            DRAIN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+            // An append between the load above and this release saw an active
+            // drainer and only set the flag, so re-take ownership for it. If
+            // another caller already became the drainer, it owns the work.
+            if !DRAIN_RESCAN.load(std::sync::atomic::Ordering::Acquire)
+                || DRAIN_ACTIVE
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+            {
+                break;
+            }
+        }
     });
 }
 
