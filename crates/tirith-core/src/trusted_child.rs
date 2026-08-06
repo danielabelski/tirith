@@ -2956,3 +2956,116 @@ mod linux_acl_policy_tests {
         assert!(reason.contains("mutation authority"), "{reason}");
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod linux_acl_policy_tests {
+    use super::reject_unix_extended_acl;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_USER: u16 = 0x02;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_GROUP: u16 = 0x08;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+
+    fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut blob = 2_u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&perm.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        blob
+    }
+
+    fn set_default_acl(path: &Path, blob: &[u8]) {
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: both pointers reference live NUL-terminated / sized buffers.
+        let status = unsafe {
+            libc::setxattr(
+                path_bytes.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                blob.as_ptr().cast(),
+                blob.len(),
+                0,
+            )
+        };
+        assert_eq!(status, 0, "setxattr: {}", std::io::Error::last_os_error());
+    }
+
+    const UNDEFINED_ID: u32 = u32::MAX;
+
+    #[test]
+    fn default_acl_granting_current_user_write_is_accepted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        // The shape GitHub runners seed on /home: a self-grant plus base entries.
+        set_default_acl(
+            temp.path(),
+            &acl_blob(&[
+                (ACL_USER_OBJ, 7, UNDEFINED_ID),
+                (ACL_USER, 7, euid),
+                (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+                (ACL_MASK, 7, UNDEFINED_ID),
+                (ACL_OTHER, 5, UNDEFINED_ID),
+            ]),
+        );
+        reject_unix_extended_acl(temp.path(), true).expect("self-grant default ACL is benign");
+    }
+
+    #[test]
+    fn default_acl_granting_foreign_user_write_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: geteuid has no preconditions.
+        let foreign = unsafe { libc::geteuid() }.wrapping_add(31_337);
+        set_default_acl(
+            temp.path(),
+            &acl_blob(&[
+                (ACL_USER_OBJ, 7, UNDEFINED_ID),
+                (ACL_USER, 7, foreign),
+                (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+                (ACL_MASK, 7, UNDEFINED_ID),
+                (ACL_OTHER, 5, UNDEFINED_ID),
+            ]),
+        );
+        let reason = reject_unix_extended_acl(temp.path(), true)
+            .expect_err("foreign write grant must stay rejected");
+        assert!(reason.contains("mutation authority"), "{reason}");
+    }
+
+    #[test]
+    fn default_acl_read_only_foreign_entries_are_accepted_but_group_write_is_not() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: geteuid has no preconditions.
+        let foreign = unsafe { libc::geteuid() }.wrapping_add(31_337);
+        set_default_acl(
+            temp.path(),
+            &acl_blob(&[
+                (ACL_USER_OBJ, 7, UNDEFINED_ID),
+                (ACL_USER, 5, foreign),
+                (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+                (ACL_MASK, 7, UNDEFINED_ID),
+                (ACL_OTHER, 5, UNDEFINED_ID),
+            ]),
+        );
+        reject_unix_extended_acl(temp.path(), true)
+            .expect("read-only foreign entries add no mutation authority");
+
+        set_default_acl(
+            temp.path(),
+            &acl_blob(&[
+                (ACL_USER_OBJ, 7, UNDEFINED_ID),
+                (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+                (ACL_GROUP, 7, 12_345),
+                (ACL_MASK, 7, UNDEFINED_ID),
+                (ACL_OTHER, 5, UNDEFINED_ID),
+            ]),
+        );
+        let reason = reject_unix_extended_acl(temp.path(), true)
+            .expect_err("named-group write must stay rejected");
+        assert!(reason.contains("mutation authority"), "{reason}");
+    }
+}
