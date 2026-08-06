@@ -1285,6 +1285,9 @@ pub(crate) fn log_verdict_with_raw_required(
     )
 }
 
+// The public wrappers differ only in these flags; threading them as
+// parameters keeps one implementation instead of duplicating the writer.
+#[allow(clippy::too_many_arguments)]
 fn log_verdict_with_raw_inner(
     verdict: &Verdict,
     command: &str,

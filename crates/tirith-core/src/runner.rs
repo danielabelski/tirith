@@ -706,7 +706,7 @@ fn materialize_execution_file(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (content, expected_sha256);
-        return Err("exact content-bound script execution is supported only on Linux".to_string());
+        Err("exact content-bound script execution is supported only on Linux".to_string())
     }
 
     #[cfg(target_os = "linux")]

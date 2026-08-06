@@ -201,10 +201,14 @@ struct StableFileState {
 
 type CleanupFailures = Rc<RefCell<Vec<String>>>;
 
+/// Test-only observer invoked with each retired backup path.
+#[cfg(test)]
+type BackupRetirementHook = Box<dyn FnMut(&Path)>;
+
 #[cfg(test)]
 thread_local! {
     static SCRUB_FAILURE_TEST_HOOK: RefCell<Option<&'static str>> = const { RefCell::new(None) };
-    static BACKUP_RETIREMENT_TEST_HOOK: RefCell<Option<Box<dyn FnMut(&Path)>>> = RefCell::new(None);
+    static BACKUP_RETIREMENT_TEST_HOOK: RefCell<Option<BackupRetirementHook>> = RefCell::new(None);
 }
 
 fn inject_scrub_failure(_label: &str) -> Result<(), String> {

@@ -523,12 +523,12 @@ impl TrustedInstallEnvironment {
 
         #[cfg(unix)]
         {
-            return Ok(Self {
+            Ok(Self {
                 account_home,
                 private_temp,
                 presentation,
                 sanitized_path,
-            });
+            })
         }
 
         #[cfg(not(any(unix, windows)))]

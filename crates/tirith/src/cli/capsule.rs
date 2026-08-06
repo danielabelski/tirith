@@ -1520,11 +1520,11 @@ fn run_to_completion_with_reviewed_file_captured(
             cwd,
             extra_env,
         );
-        return Err(CapsuleRefused {
+        Err(CapsuleRefused {
             backend_id: "unsupported",
             reason: "content-bound reviewed-file capsule execution is supported only on Linux; refusing before launch"
                 .to_string(),
-        });
+        })
     }
 
     #[cfg(target_os = "linux")]
