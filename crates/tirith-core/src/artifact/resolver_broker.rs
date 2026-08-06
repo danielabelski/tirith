@@ -718,6 +718,10 @@ fn connect_with_fallback(
         if Instant::now() >= deadline {
             break;
         }
+        // A refused port returns in microseconds, so retrying without a pause
+        // burns a core and floods the destination with SYNs until the deadline.
+        let backoff = Duration::from_millis(20).min(remaining_until(deadline)?);
+        std::thread::sleep(backoff);
     }
     Err(format!(
         "resolver destination connect failed for every approved address: {}",
