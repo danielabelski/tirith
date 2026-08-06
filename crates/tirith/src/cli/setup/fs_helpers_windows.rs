@@ -3400,16 +3400,15 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(
-            output.status.success(),
-            "status={:?} stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        // `set /p` reports errorlevel 1 when its input reaches EOF, which the
+        // `<nul` redirect guarantees, so the exit code carries no signal here.
+        // What this case proves is that the supervisor hands back the child's
+        // exact bytes.
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
             "setup-ok",
-            "stderr={}",
+            "status={:?} stderr={}",
+            output.status,
             String::from_utf8_lossy(&output.stderr)
         );
     }
