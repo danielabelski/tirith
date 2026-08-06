@@ -12211,8 +12211,27 @@ fn prompt_status_warm_cache_is_faster_than_cold() {
     );
 }
 
+/// The prompt-status snippet binds to the running executable, and the trusted
+/// resolver refuses a binary whose owner chain it does not recognize. Hosted
+/// Windows runners build under an ancestor owned outside that set, so the
+/// binding legitimately fails there and these cases have nothing to assert.
+fn prompt_status_binding_unavailable() -> Option<String> {
+    let out = tirith()
+        .args(["init", "--shell", "zsh", "--prompt-status"])
+        .output()
+        .expect("failed to probe tirith init --prompt-status");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    stderr
+        .contains("cannot bind prompt status to the running executable")
+        .then_some(stderr)
+}
+
 #[test]
 fn init_prompt_status_emits_marker_wrapped_snippet_zsh() {
+    if let Some(reason) = prompt_status_binding_unavailable() {
+        eprintln!("skipping prompt-status case: {reason}");
+        return;
+    }
     let out = tirith()
         .args(["init", "--shell", "zsh", "--prompt-status"])
         .output()
@@ -12252,6 +12271,10 @@ fn init_prompt_status_emits_marker_wrapped_snippet_zsh() {
 
 #[test]
 fn init_prompt_status_is_idempotent_when_run_twice() {
+    if let Some(reason) = prompt_status_binding_unavailable() {
+        eprintln!("skipping prompt-status case: {reason}");
+        return;
+    }
     // Running `tirith init --shell zsh --prompt-status` twice must produce the SAME
     // single-snippet output each time — repeat invocations are idempotent (the snippet itself is
     // also guarded by _TIRITH_PROMPT_STATUS_LOADED so eval-ing it twice in one shell doesn't
@@ -12339,6 +12362,10 @@ fn init_without_prompt_status_does_not_emit_snippet() {
 
 #[test]
 fn init_prompt_status_supports_bash_and_fish_and_powershell() {
+    if let Some(reason) = prompt_status_binding_unavailable() {
+        eprintln!("skipping prompt-status case: {reason}");
+        return;
+    }
     for (shell, must_contain) in [
         ("bash", "PS1="),
         ("fish", "function fish_right_prompt"),
