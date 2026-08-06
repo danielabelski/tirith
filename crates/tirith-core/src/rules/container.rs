@@ -409,6 +409,11 @@ fn matches_sensitive(src: &str) -> bool {
         "~/.kube/",
         "~/.gnupg/",
         "~/.docker/",
+        // The exact-match set already carries /root/.ssh and /root/.aws; without
+        // the prefixes a file inside them (`-v /root/.ssh/id_rsa:/k`) is missed
+        // while the `~` spelling of the same mount is flagged.
+        "/root/.ssh/",
+        "/root/.aws/",
     ];
     for prefix in dir_prefixes {
         if normalized.starts_with(prefix) {
