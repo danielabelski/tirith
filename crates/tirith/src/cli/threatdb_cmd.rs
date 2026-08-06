@@ -1058,7 +1058,9 @@ pub(crate) struct ThreatDbStatus {
 }
 
 pub(crate) fn gather_status() -> ThreatDbStatus {
-    let db_path = ThreatDb::default_path();
+    // repo-0501: report the EFFECTIVE database path (v2 when installed), not
+    // the legacy v1 location.
+    let db_path = ThreatDb::resolve_primary_path();
     let path_str = db_path.as_ref().map(|p| p.display().to_string());
 
     let db_path_ref = match db_path {
@@ -2379,7 +2381,8 @@ pub fn health(json: bool) -> i32 {
 }
 
 fn gather_health() -> HealthReport {
-    let db_path = ThreatDb::default_path();
+    // repo-0501: same fix on the health surface.
+    let db_path = ThreatDb::resolve_primary_path();
     let path_str = db_path.as_ref().map(|p| p.display().to_string());
     let policy = policy::Policy::discover(None);
     let refresh_interval_hours = policy.threat_intel.auto_update_hours;

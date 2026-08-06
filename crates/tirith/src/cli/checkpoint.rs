@@ -291,7 +291,7 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
     snapshot_paths.extend(paths.iter().cloned());
 
     // --- BEFORE: file inventory + runtime state ---
-    let files_before = inventory_files(&snapshot_paths);
+    let (files_before, _trunc_before) = inventory_files(&snapshot_paths);
     let rt_before = checkpoint::capture_runtime_state(&home);
     let net_before = if with_net_hints {
         Some(net_hint_sources(&home))
@@ -315,7 +315,12 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
     let interrupted = WATCH_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed);
 
     // --- AFTER: re-inventory + re-capture (ALWAYS, even after an interrupt) ---
-    let files_after = inventory_files(&snapshot_paths);
+    let (files_after, truncated_after) = inventory_files(&snapshot_paths);
+    if truncated_after {
+        eprintln!(
+            "tirith watch: WARNING: file inventory hit the 100,000-entry cap — the before/after diff is partial"
+        );
+    }
     let rt_after = checkpoint::capture_runtime_state(&home);
 
     let (mut post_run_state, modified_rc) = checkpoint::diff_runtime_state(&rt_before, &rt_after);
@@ -431,11 +436,14 @@ fn run_command(command: &[String]) -> std::io::Result<i32> {
         c.args(&command[1..]);
         c
     };
+    // repo-0215: a new process group still leaves the TERMINAL's foreground
+    // group on tirith, so Ctrl-C never reaches the watched child. Hand the
+    // terminal to the child's group for the duration, then take it back.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: `setpgid` is async-signal-safe and the only call in the forked
-        // child before exec; it puts the child in its own process group.
+        // SAFETY: `setpgid` is async-signal-safe and the only call in the
+        // forked child before exec; it puts the child in its own process group.
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setpgid(0, 0) != 0 {
@@ -444,8 +452,32 @@ fn run_command(command: &[String]) -> std::io::Result<i32> {
                 Ok(())
             });
         }
+        let mut child = cmd.spawn()?;
+        let child_pgid = child.id() as libc::pid_t;
+        let stdin_fd = libc::STDIN_FILENO;
+        let our_pgid = unsafe { libc::getpgrp() };
+        let is_tty = unsafe { libc::isatty(stdin_fd) } == 1;
+        if is_tty {
+            // Move the terminal's foreground group to the child. SIGTTOU can
+            // fire when a background group writes to the tty; ignore it for
+            // the handoff window.
+            unsafe {
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                libc::tcsetpgrp(stdin_fd, child_pgid);
+            }
+        }
+        let status = child.wait()?;
+        if is_tty {
+            unsafe {
+                libc::tcsetpgrp(stdin_fd, our_pgid);
+                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            }
+        }
+        return Ok(status.code().unwrap_or(128));
     }
+    #[cfg(not(unix))]
     let status = cmd.status()?;
+    #[cfg(not(unix))]
     Ok(status.code().unwrap_or(128))
 }
 
@@ -476,9 +508,11 @@ fn install_watch_sigint_handler() {}
 
 /// Inventory files under `roots` as a `path -> mtime` map (capped). Symlinks are
 /// recorded by their own metadata (not followed); hidden dirs (`.git`, …) skipped.
-fn inventory_files(roots: &[String]) -> std::collections::BTreeMap<String, SystemTime> {
+fn inventory_files(roots: &[String]) -> (std::collections::BTreeMap<String, SystemTime>, bool) {
     const MAX_FILES: usize = 100_000;
     let mut out = std::collections::BTreeMap::new();
+    // repo-0477: deterministic order + a truncation flag, so before/after
+    // snapshots cover the SAME subset and a capped inventory is reported.
     for root in roots {
         let path = Path::new(root);
         if path.is_file() {
@@ -489,7 +523,8 @@ fn inventory_files(roots: &[String]) -> std::collections::BTreeMap<String, Syste
             inventory_dir(path, &mut out, MAX_FILES);
         }
     }
-    out
+    let truncated = out.len() >= MAX_FILES;
+    (out, truncated)
 }
 
 fn inventory_dir(
@@ -504,11 +539,14 @@ fn inventory_dir(
         Ok(e) => e,
         Err(_) => return,
     };
-    for entry in entries.flatten() {
+    // repo-0477: sort so a capped inventory covers the SAME subset on every
+    // run (filesystem order is arbitrary).
+    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
         if out.len() >= max_files {
             break;
         }
-        let p = entry.path();
         let meta = match p.symlink_metadata() {
             Ok(m) => m,
             Err(_) => continue,

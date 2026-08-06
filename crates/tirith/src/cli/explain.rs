@@ -63,7 +63,9 @@ fn resolve_finding_id(id: &str) -> Result<RuleId, String> {
         ));
     }
 
-    let read = audit_aggregator::read_log(&log_path)
+    // repo-0480: bounded tail read — the scan limit must apply DURING the
+    // read, not after the whole log is materialized.
+    let read = audit_aggregator::read_log_tail(&log_path, AUDIT_SCAN_LIMIT)
         .map_err(|e| format!("could not read {}: {e}", log_path.display()))?;
 
     // Walk newest-first (log is append-only, newest at the bottom), bounded by

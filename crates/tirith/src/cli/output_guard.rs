@@ -45,14 +45,70 @@ fn enable() -> i32 {
         }
     }
 
-    let current = fs::read_to_string(&profile).unwrap_or_default();
+    // repo-0224: only a MISSING file means "empty profile". Any other read
+    // failure (invalid UTF-8, permissions, transient I/O) must abort rather
+    // than replacing the real profile with just our snippet.
+    let current = match fs::read_to_string(&profile) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            eprintln!(
+                "tirith output wrap: cannot read {} ({e}); refusing to modify it",
+                profile.display()
+            );
+            return 1;
+        }
+    };
     if current.contains(BEGIN_MARKER) {
+        // repo-0225: a present BEGIN marker is not proof of a healthy block.
+        // Compare the exact managed block; a tampered/obsolete one is repaired
+        // in place so enable actually guarantees the wrapper exists.
+        let expected = build_snippet(shell);
+        let existing_block = {
+            let mut found = String::new();
+            let mut in_block = false;
+            for line in current.lines() {
+                if line == BEGIN_MARKER {
+                    in_block = true;
+                }
+                if in_block {
+                    found.push_str(line);
+                    found.push('\n');
+                }
+                if in_block && line == END_MARKER {
+                    break;
+                }
+            }
+            found
+        };
+        if existing_block == expected {
+            eprintln!(
+                "tirith output wrap: already enabled in {} (no changes made)",
+                profile.display()
+            );
+            eprintln!("  function:  tirith-output-guard-wrap");
+            eprintln!("  alias:     tirith-out");
+            return 0;
+        }
+        let Some(stripped) = strip_block(&current) else {
+            eprintln!(
+                "tirith output wrap: the tirith block in {} is corrupted (missing END marker); fix it manually — no changes made",
+                profile.display()
+            );
+            return 1;
+        };
+        let new_content = format!("{stripped}{expected}");
+        if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes(), true) {
+            eprintln!(
+                "tirith output wrap: failed to repair {}: {e}",
+                profile.display()
+            );
+            return 1;
+        }
         eprintln!(
-            "tirith output wrap: already enabled in {} (no changes made)",
+            "tirith output wrap: repaired the tirith block in {} (function: tirith-output-guard-wrap, alias: tirith-out)",
             profile.display()
         );
-        eprintln!("  function:  tirith-output-guard-wrap");
-        eprintln!("  alias:     tirith-out");
         return 0;
     }
 
@@ -111,7 +167,15 @@ fn disable() -> i32 {
         return 0;
     }
 
-    let new_content = strip_block(&current);
+    let Some(new_content) = strip_block(&current) else {
+        // repo-0225: an unterminated/tampered block must fail loudly — silently
+        // publishing would discard every profile line after the BEGIN marker.
+        eprintln!(
+            "tirith output wrap: the tirith block in {} is corrupted (missing END marker); fix it manually — no changes made",
+            profile.display()
+        );
+        return 1;
+    };
     // Atomic write (see `enable`): removing the block also rewrites the rc file.
     if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes(), true) {
         eprintln!(
@@ -146,12 +210,17 @@ fn status() -> i32 {
 }
 
 /// Strip the BEGIN…END block (inclusive), preserving surrounding user content.
-fn strip_block(content: &str) -> String {
+/// Returns `None` when the BEGIN marker has no matching END (repo-0225): a
+/// corrupted block must NOT truncate every following line of the profile.
+fn strip_block(content: &str) -> Option<String> {
     let mut out = String::with_capacity(content.len());
     let mut in_block = false;
     let mut first = true;
     for line in content.lines() {
         if line == BEGIN_MARKER {
+            if in_block {
+                return None; // nested BEGIN: corrupted
+            }
             in_block = true;
             continue;
         }
@@ -167,10 +236,13 @@ fn strip_block(content: &str) -> String {
         first = false;
         out.push_str(line);
     }
+    if in_block {
+        return None; // unterminated block
+    }
     if content.ends_with('\n') && !out.ends_with('\n') {
         out.push('\n');
     }
-    out
+    Some(out)
 }
 
 fn build_snippet(shell: &str) -> String {
@@ -185,8 +257,10 @@ fn build_snippet(shell: &str) -> String {
             begin = BEGIN_MARKER,
             end = END_MARKER,
         ),
-        "powershell" => format!(
-            "{begin}\nfunction tirith-output-guard-wrap {{\n    param([Parameter(ValueFromRemainingArguments=$true)]$Args)\n    if ($Args.Count -eq 0) {{\n        Write-Error 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'\n        return\n    }}\n    & $Args[0] $Args[1..($Args.Count-1)] 2>&1 | & tirith view --max-bytes 16777216 -\n}}\nSet-Alias tirith-out tirith-output-guard-wrap\n{end}\n",
+        // repo-0226: `pwsh` is PowerShell 7's shell label — it needs the
+        // PowerShell snippet, not the POSIX one.
+        "powershell" | "pwsh" => format!(
+            "{begin}\nfunction tirith-output-guard-wrap {{\n    param([Parameter(ValueFromRemainingArguments=$true)]$Args)\n    if ($Args.Count -eq 0) {{\n        Write-Error 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'\n        return\n    }}\n    if ($Args.Count -eq 1) {{ & $Args[0] 2>&1 | & tirith view --max-bytes 16777216 - }} else {{ & $Args[0] $Args[1..($Args.Count-1)] 2>&1 | & tirith view --max-bytes 16777216 - }}\n}}\nSet-Alias tirith-out tirith-output-guard-wrap\n{end}\n",
             begin = BEGIN_MARKER,
             end = END_MARKER,
         ),
@@ -237,7 +311,7 @@ mod tests {
             begin = BEGIN_MARKER,
             end = END_MARKER,
         );
-        let out = strip_block(&content);
+        let out = strip_block(&content).expect("balanced block strips");
         assert!(out.contains("before line"));
         assert!(out.contains("after line"));
         assert!(!out.contains(BEGIN_MARKER));
@@ -248,7 +322,7 @@ mod tests {
     #[test]
     fn strip_block_no_marker_is_noop() {
         let content = "alpha\nbeta\n";
-        assert_eq!(strip_block(content), content);
+        assert_eq!(strip_block(content).as_deref(), Some(content));
     }
 
     #[test]

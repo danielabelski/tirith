@@ -46,6 +46,15 @@ pub struct CheckpointMeta {
     pub paths: Vec<String>,
     pub total_bytes: u64,
     pub file_count: usize,
+    /// repo-0200: true when the capture hit a budget cap (entry count, per-file
+    /// size, total bytes) or skipped unreadable entries, so the checkpoint is
+    /// NOT a complete backup. Surfaced by list/restore consumers; restore of a
+    /// partial checkpoint still works but is flagged.
+    #[serde(default)]
+    pub incomplete: bool,
+    /// Why `incomplete` is set (first reason wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
     /// F6: the working directory at capture time, persisted so a RELATIVE
     /// `original_path` in the manifest is restored against the SAME root it was
     /// captured under, not against whatever cwd the restore happens to run in
@@ -280,6 +289,8 @@ pub fn create_with_config(
     let mut manifest: Vec<ManifestEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
 
+    // repo-0200: every capture gap lands here and is persisted in the meta.
+    let mut capture_gaps: Vec<String> = Vec::new();
     let mut fill = || -> Result<(), BackupError> {
         for path_str in paths {
             let path = Path::new(path_str);
@@ -294,12 +305,13 @@ pub fn create_with_config(
                         manifest.push(entry);
                     }
                     Err(BackupError::Skip(e)) => {
+                        capture_gaps.push(format!("skipped {path_str}: {e}"));
                         eprintln!("tirith: checkpoint: skip {path_str}: {e}");
                     }
                     Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
                 }
             } else if path.is_dir() {
-                match backup_dir(path, &files_dir, &mut budget) {
+                match backup_dir(path, &files_dir, &mut budget, &mut capture_gaps) {
                     Ok(entries) => {
                         for entry in entries {
                             total_bytes += entry.size;
@@ -307,6 +319,7 @@ pub fn create_with_config(
                         }
                     }
                     Err(BackupError::Skip(e)) => {
+                        capture_gaps.push(format!("skipped dir {path_str}: {e}"));
                         eprintln!("tirith: checkpoint: skip dir {path_str}: {e}");
                     }
                     Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
@@ -346,6 +359,8 @@ pub fn create_with_config(
         paths: paths.iter().map(|s| s.to_string()).collect(),
         total_bytes,
         file_count: manifest.len(),
+        incomplete: !capture_gaps.is_empty(),
+        incomplete_reason: capture_gaps.first().cloned(),
         // Persist the capture-time cwd so a relative `original_path` restores
         // against this root, independent of the cwd at restore time. Canonicalize
         // it first: on macOS the cwd often contains a symlinked ancestor
@@ -1246,6 +1261,24 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
+        // repo-0202: an EXISTING blob is not proof of integrity — hash it and
+        // compare against its content-addressed name so a truncated/tampered
+        // blob is reported corrupt instead of falsely matching later at
+        // restore time.
+        match sha256_file(&backup) {
+            Ok(actual) if actual == entry.sha256 => {}
+            _ => {
+                diffs.push(DiffEntry {
+                    path: entry.original_path.clone(),
+                    status: DiffStatus::BackupCorrupt,
+                    checkpoint_sha256: entry.sha256.clone(),
+                    current_sha256: None,
+                });
+                classified_paths.insert(entry.original_path.clone());
+                continue;
+            }
+        }
+
         // Anchor through the SAME helper restore uses: an absolute entry passes
         // through, a relative entry is anchored to the recorded `capture_root`, and
         // a relative entry with NO recorded root is non-anchorable -> skip it rather
@@ -1688,9 +1721,6 @@ fn backup_file(
     files_dir: &Path,
     budget: &mut CreationBudget,
 ) -> Result<ManifestEntry, BackupError> {
-    let sha = sha256_file(path).map_err(BackupError::Skip)?;
-    let dst = files_dir.join(&sha);
-
     let meta = match path.metadata() {
         Ok(m) => Some(m),
         Err(e) => {
@@ -1703,32 +1733,75 @@ fn backup_file(
     };
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
+    // repo-0201: hash and copy through ONE open handle — hashing first and
+    // reopening for the copy let a concurrent modification desync the
+    // content-addressed blob from the manifest digest (restore would then
+    // reject the only backup as corrupt).
+    let src_file = fs::File::open(path)
+        .map_err(|e| BackupError::Skip(format!("open {}: {e}", path.display())))?;
+
+    // Refuse to START a large copy the filesystem cannot hold (repo-0262):
+    // failing mid-copy would leave a torn blob and a wasted partial write.
+    #[cfg(unix)]
+    if size >= 1024 * 1024 {
+        if let Some(free) = available_bytes(files_dir) {
+            if free < size {
+                return Err(BackupError::Abort(format!(
+                    "insufficient filesystem space for checkpoint copy of {} ({size} bytes needed, {free} available)",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    // Stream once, hashing and writing to a temp sibling, then rename to the
+    // digest name. The digest always describes the copied bytes.
+    let mut copied: u64 = 0;
+    let (sha, dst) = {
+        let mut hasher = Sha256::new();
+        let mut tmp = tempfile::NamedTempFile::new_in(files_dir)
+            .map_err(|e| BackupError::Skip(format!("tempfile: {e}")))?;
+        let mut reader = std::io::BufReader::new(src_file);
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = std::io::Read::read(&mut reader, &mut buf)
+                .map_err(|e| BackupError::Skip(format!("read {}: {e}", path.display())))?;
+            if n == 0 {
+                break;
+            }
+            if budget.remaining_copy_bytes < n as u64 {
+                return Err(BackupError::Abort(format!(
+                    "checkpoint exceeds the configured total-byte limit of {} bytes while copying {}; aborting",
+                    budget.limit,
+                    path.display()
+                )));
+            }
+            budget.remaining_copy_bytes -= n as u64;
+            copied += n as u64;
+            hasher.update(&buf[..n]);
+            use std::io::Write as _;
+            tmp.write_all(&buf[..n])
+                .map_err(|e| BackupError::Skip(format!("write blob: {e}")))?;
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        let dst = files_dir.join(&digest);
+        (digest, (tmp, dst))
+    };
+    let (tmp, dst) = dst;
+    let sha = sha;
+
     // Content-addressed dedup: two checkpointed files with identical contents
     // share a single on-disk copy. Only a REAL copy draws down the cumulative
     // creation budget (repo-0262).
-    if !dst.exists() {
-        if size > budget.remaining_copy_bytes {
-            return Err(BackupError::Abort(format!(
-                "checkpoint exceeds the configured total-byte limit of {} bytes while copying {}; aborting",
-                budget.limit,
-                path.display()
-            )));
-        }
-        // Refuse to START a large copy the filesystem cannot hold (repo-0262):
-        // failing mid-copy would leave a torn blob and a wasted partial write.
-        #[cfg(unix)]
-        if size >= 1024 * 1024 {
-            if let Some(free) = available_bytes(files_dir) {
-                if free < size {
-                    return Err(BackupError::Abort(format!(
-                        "insufficient filesystem space for checkpoint copy of {} ({size} bytes needed, {free} available)",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        fs::copy(path, &dst).map_err(|e| BackupError::Skip(format!("copy: {e}")))?;
-        budget.remaining_copy_bytes = budget.remaining_copy_bytes.saturating_sub(size);
+    if dst.exists() {
+        // Identical content already stored; drop the duplicate temp copy.
+        drop(tmp);
+        // repo-0262: a deduplicated copy draws NO budget — refund what the
+        // streaming pass charged.
+        budget.remaining_copy_bytes = budget.remaining_copy_bytes.saturating_add(copied);
+    } else {
+        tmp.persist(&dst)
+            .map_err(|e| BackupError::Skip(format!("publish blob: {e}")))?;
     }
 
     Ok(ManifestEntry {
@@ -1745,10 +1818,14 @@ fn backup_file(
 /// Directory entries are recorded too (repo-0261): restore recreates empty
 /// directories and re-applies each recorded directory mode after the files are
 /// in place, instead of leaving every parent at the umask default.
+/// repo-0200: capturing with a gap channel — every skip/cap is recorded so the
+/// checkpoint metadata can flag the backup as incomplete instead of reporting
+/// silent success.
 fn backup_dir(
     dir: &Path,
     files_dir: &Path,
     budget: &mut CreationBudget,
+    gaps: &mut Vec<String>,
 ) -> Result<Vec<ManifestEntry>, BackupError> {
     let mut entries = Vec::new();
     const MAX_FILES: usize = 10_000;
@@ -1774,6 +1851,7 @@ fn backup_dir(
         MAX_FILES,
         MAX_SINGLE_FILE,
         budget,
+        gaps,
     )?;
     Ok(entries)
 }
@@ -1785,8 +1863,12 @@ fn backup_dir_recursive(
     max_files: usize,
     max_single_file: u64,
     budget: &mut CreationBudget,
+    gaps: &mut Vec<String>,
 ) -> Result<(), BackupError> {
     if entries.len() >= max_files {
+        gaps.push(format!(
+            "entry cap of {max_files} reached before all files were captured"
+        ));
         return Ok(());
     }
 
@@ -1813,6 +1895,7 @@ fn backup_dir_recursive(
         let meta = match path.symlink_metadata() {
             Ok(m) => m,
             Err(e) => {
+                gaps.push(format!("unreadable entry {}: {e}", path.display()));
                 eprintln!("tirith: checkpoint: skip {}: {e}", path.display());
                 continue;
             }
@@ -1825,6 +1908,11 @@ fn backup_dir_recursive(
         if meta.file_type().is_file() {
             let size = meta.len();
             if size > max_single_file {
+                gaps.push(format!(
+                    "file {} ({} bytes) exceeds the per-file cap",
+                    path.display(),
+                    size
+                ));
                 eprintln!(
                     "tirith: checkpoint: skip large file {} ({} bytes)",
                     path.display(),
@@ -1835,6 +1923,7 @@ fn backup_dir_recursive(
             match backup_file(&path, files_dir, budget) {
                 Ok(e) => entries.push(e),
                 Err(BackupError::Skip(e)) => {
+                    gaps.push(format!("skipped {}: {e}", path.display()));
                     eprintln!("tirith: checkpoint: skip {}: {e}", path.display());
                 }
                 Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
@@ -1865,6 +1954,7 @@ fn backup_dir_recursive(
                 max_files,
                 max_single_file,
                 budget,
+                gaps,
             )?;
         }
     }
@@ -1959,6 +2049,8 @@ mod tests {
                 paths: Vec::new(),
                 total_bytes: 123,
                 file_count: 0,
+                incomplete: false,
+                incomplete_reason: None,
                 capture_root: None,
             };
             fs::write(
@@ -2073,7 +2165,7 @@ mod tests {
         let files_dir = tmp.path().join("files");
         fs::create_dir_all(&files_dir).unwrap();
 
-        let entries = backup_dir(&dir, &files_dir, &mut test_budget()).unwrap();
+        let entries = backup_dir(&dir, &files_dir, &mut test_budget(), &mut Vec::new()).unwrap();
         let files = entries.iter().filter(|e| !e.is_dir).count();
         let dirs = entries.iter().filter(|e| e.is_dir).count();
         assert_eq!(files, 2, "should backup 2 files: {entries:?}");

@@ -569,9 +569,26 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
         Vec::new()
     };
 
-    // Stream-collapse duplicates and (optionally) redact + strip ANSI; holds at
-    // most `max_lines * 2` collapsed entries, far smaller than the input.
-    let mut collected: Vec<String> = Vec::new();
+    // repo-0223: the old "bounded" claim was false — every UNIQUE line was
+    // retained and truncated only after EOF. Keep only the head and a rolling
+    // tail window, so memory is O(max_lines) regardless of input size.
+    let mut lines_head: Vec<String> = Vec::new();
+    let mut lines_tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let budget = max_lines.saturating_sub(1).max(1);
+    let head_cap = budget.div_ceil(2);
+    let tail_cap = budget - head_cap;
+    let mut total_lines: usize = 0;
+    let mut push_bounded = |line: String| {
+        total_lines += 1;
+        if lines_head.len() < head_cap {
+            lines_head.push(line);
+        } else {
+            lines_tail.push_back(line);
+            while lines_tail.len() > tail_cap {
+                lines_tail.pop_front();
+            }
+        }
+    };
     let mut collapsed_runs: usize = 0;
     let mut secret_count: usize = 0;
     let mut redaction_breakdown: Vec<RedactionCount> = Vec::new();
@@ -580,11 +597,11 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
     let mut last_line: Option<String> = None;
     let mut last_count: usize = 0;
 
-    let push_collapsed = |collected: &mut Vec<String>, line: &str, count: usize| {
+    let push_collapsed = |push_bounded: &mut dyn FnMut(String), line: &str, count: usize| {
         if count > 1 {
-            collected.push(format!("{line} [×{count}]"));
+            push_bounded(format!("{line} [×{count}]"));
         } else {
-            collected.push(line.to_string());
+            push_bounded(line.to_string());
         }
     };
 
@@ -597,7 +614,7 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
                 if last_count > 1 {
                     collapsed_runs += last_count - 1;
                 }
-                push_collapsed(&mut collected, &prev, last_count);
+                push_collapsed(&mut push_bounded, prev.as_str(), last_count);
             }
             last_line = Some(processed);
             last_count = 1;
@@ -652,11 +669,21 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
         if last_count > 1 {
             collapsed_runs += last_count - 1;
         }
-        push_collapsed(&mut collected, &prev, last_count);
+        push_collapsed(&mut push_bounded, prev.as_str(), last_count);
     }
 
-    // Head+tail truncation to `max_lines`.
-    let (final_lines, elided) = head_tail_truncate(&collected, max_lines);
+    // Head+tail truncation to `max_lines` from the bounded buffers.
+    let (final_lines, elided) = if total_lines <= max_lines {
+        let mut all = lines_head.clone();
+        all.extend(lines_tail.iter().cloned());
+        (all, 0)
+    } else {
+        let elided = total_lines.saturating_sub(lines_head.len() + lines_tail.len());
+        let mut out = lines_head.clone();
+        out.push(format!("[... {elided} lines collapsed ...]"));
+        out.extend(lines_tail.iter().cloned());
+        (out, elided)
+    };
 
     if json {
         return emit_summarize_json(
@@ -753,6 +780,7 @@ fn emit_summarize_json(
 /// remaining count plus the elision marker fits in `max_lines`. Returns
 /// `(final_lines, elided_count)`. When the input already fits, the
 /// original lines are returned unchanged with `elided = 0`.
+#[cfg(test)]
 fn head_tail_truncate(lines: &[String], max_lines: usize) -> (Vec<String>, usize) {
     if lines.len() <= max_lines {
         return (lines.to_vec(), 0);

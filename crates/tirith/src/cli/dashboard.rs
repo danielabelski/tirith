@@ -305,6 +305,12 @@ fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
 /// default `%USERPROFILE%\Documents` is already user-private via NTFS ACL) but
 /// emit a one-line stderr warning that protection relies on directory perms.
 fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
+    // repo-0478: the default `~/Documents` parent may not exist (headless
+    // accounts); create it so the documented default flow works.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create export directory {}: {e}", parent.display()))?;
+    }
     // repo-0374: the export path can be a repository-planted symlink (the
     // documented `--out .` flow writes ./dashboard.html). `write_file_atomic`
     // deliberately resolves symlinks for config files, so refuse them here

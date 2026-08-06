@@ -130,6 +130,40 @@ pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
     parse_log_from_reader(reader, Some(path))
 }
 
+/// repo-0479/0480/0481: bounded variant for diagnostic consumers — keeps only
+/// the NEWEST `max_records` parsed records, so a huge or attacker-inflated
+/// audit log cannot hang or OOM `doctor`, `explain`, or `incident`.
+pub fn read_log_tail(path: &Path, max_records: usize) -> Result<ReadLogResult, String> {
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut records: std::collections::VecDeque<AuditRecord> =
+        std::collections::VecDeque::with_capacity(max_records.min(1024));
+    let mut skipped_lines = 0usize;
+    for (idx, line) in reader.lines().enumerate() {
+        let line_num = idx + 1;
+        match line {
+            Ok(line) => {
+                let mut one = Vec::new();
+                parse_log_line(&line, line_num, Some(path), &mut one, &mut skipped_lines);
+                if let Some(record) = one.into_iter().next() {
+                    if records.len() >= max_records {
+                        records.pop_front();
+                    }
+                    records.push_back(record);
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to read {}: {e}", path.display()));
+            }
+        }
+    }
+    Ok(ReadLogResult {
+        records: records.into_iter().collect(),
+        skipped_lines,
+    })
+}
+
 /// Streaming counterpart of [`parse_log`]: pulls one line at a time from
 /// `reader`, identical malformed-line skipping / `skipped_lines` accounting.
 ///

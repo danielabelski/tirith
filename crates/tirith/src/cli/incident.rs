@@ -516,7 +516,9 @@ fn append_timeline(s: &mut String, since: Option<u64>) {
         s.push_str("_No audit log on this machine yet._\n\n");
         return;
     }
-    let records = match tirith_core::audit_aggregator::read_log(&path) {
+    // repo-0481: bounded tail read (the incident window only needs the newest
+    // records; the full log can be arbitrarily large).
+    let records = match tirith_core::audit_aggregator::read_log_tail(&path, 10_000) {
         Ok(r) => r.records,
         Err(e) => {
             s.push_str(&format!("_Could not read audit log: {e}_\n\n"));
@@ -598,7 +600,9 @@ fn append_top_findings(s: &mut String, since: Option<u64>) {
         s.push_str("_No audit log on this machine yet._\n\n");
         return;
     }
-    let records = match tirith_core::audit_aggregator::read_log(&path) {
+    // repo-0481: bounded tail read (the incident window only needs the newest
+    // records; the full log can be arbitrarily large).
+    let records = match tirith_core::audit_aggregator::read_log_tail(&path, 10_000) {
         Ok(r) => r.records,
         Err(e) => {
             s.push_str(&format!("_Could not read audit log: {e}_\n\n"));
@@ -797,11 +801,20 @@ fn append_actions_taken(s: &mut String) {
 
 /// Escape a Markdown table cell: collapse newlines, escape `|` so the row holds.
 fn md_cell(raw: &str) -> String {
-    let collapsed: String = raw
+    // repo-0161: report fields carry audit-log content (command text) that can
+    // include raw HTML — a Markdown report opened in a previewer/tracker would
+    // execute it. Strip terminal controls AND neutralize HTML metacharacters.
+    let safe = tirith_core::mcp::output_filter::sanitize_for_display(raw);
+    let collapsed: String = safe
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect();
-    collapsed.replace('|', "\\|").trim().to_string()
+    collapsed
+        .replace('|', "\\|")
+        .replace('<', "\\<")
+        .replace('>', "\\>")
+        .trim()
+        .to_string()
 }
 
 /// Escape a value for inline Markdown code: backticks would break the span.

@@ -627,8 +627,19 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 // Re-read the source just before the delete and compare hashes; a
                 // mismatch means it was edited after our first read, so keep the
                 // original and fail rather than lose the newer content.
+                // repo-0209: open ONCE and remember the inode we hashed, so
+                // the pre-delete check compares the live pathname against the
+                // exact file whose bytes we verified.
+                #[cfg(unix)]
+                #[allow(unused_assignments)]
+                let mut hashed_ino: Option<u64> = None;
                 match read_capped(&src) {
                     Ok(current) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt as _;
+                            hashed_ino = std::fs::metadata(&src).ok().map(|m| m.ino());
+                        }
                         let current_sha = tirith_core::clipboard::content_sha256_hex(&current);
                         if current_sha != sha {
                             if !emit_error(
@@ -658,6 +669,29 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                                  before deleting; left the original in place: {e}",
                                 dest.display(),
                                 src.display()
+                            ),
+                        ) {
+                            return 2;
+                        }
+                        return 1;
+                    }
+                }
+                // repo-0209: the hash check above verified CONTENT, but a
+                // replace-then-delete race could still remove a DIFFERENT
+                // inode that now sits at `src`. Compare the inode we hashed
+                // against the live pathname immediately before unlinking.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let now_ino = std::fs::symlink_metadata(&src).map(|m| m.ino()).ok();
+                    if hashed_ino.is_none() || now_ino.is_none() || hashed_ino != now_ino {
+                        if !emit_error(
+                            json,
+                            "tirith ai quarantine",
+                            &format!(
+                                "{} was replaced during quarantine; the copy at {} is kept and the original was NOT removed",
+                                src.display(),
+                                dest.display()
                             ),
                         ) {
                             return 2;

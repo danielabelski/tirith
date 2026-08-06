@@ -4784,7 +4784,9 @@ pub fn run_to_completion_os(
         #[cfg(target_os = "windows")]
         {
             if !is_degraded {
-                return windows_run_to_completion_os(spec, program, args, &sel);
+                // repo-0475/0476: carry the caller's working directory through
+                // to CreateProcessW instead of silently dropping it.
+                return windows_run_to_completion_os(spec, program, args, cwd, &sel);
             }
             // Degraded + AllowDegraded on Windows: run uncontained via a plain Command.
             // An enforcing surface would have failed closed above; assert it here.
@@ -5769,6 +5771,31 @@ fn macos_contained_command_os(
     if let Some(environment) = exact_env {
         reject_macos_loader_control_env(environment, "exact environment", sel.backend_id)?;
     }
+    // repo-0198: create the temporary HOME up front, add it to the spec's
+    // write roots BEFORE serialization, and hand the SAME path to the env
+    // scrub — otherwise the Seatbelt profile (deny default) blocks the child's
+    // own temp directory.
+    let mut spec_owned;
+    let mut macos_temp_home: Option<std::path::PathBuf> = None;
+    let spec = if spec.environment.temporary_home {
+        spec_owned = spec.clone();
+        let temp_home_path = tempfile::Builder::new()
+            .prefix("tirith-capsule-")
+            .tempdir()
+            .map_err(|e| CapsuleRefused {
+                backend_id: sel.backend_id,
+                reason: format!("cannot create capsule temporary home: {e}"),
+            })?
+            .keep();
+        spec_owned
+            .filesystem
+            .write_roots
+            .push(temp_home_path.clone());
+        macos_temp_home = Some(temp_home_path);
+        &spec_owned
+    } else {
+        spec
+    };
     // Validate the final sandbox argv before spawning. The launcher reconstructs
     // it after the first exec so a direct invocation of the hidden subcommand
     // cannot substitute an uncontained program for sandbox-exec.
@@ -5801,9 +5828,10 @@ fn macos_contained_command_os(
     // temporary HOME cannot be created for a `temporary_home` spec: skipping it
     // would leave the real `$HOME` reachable (env_clear already ran, but
     // `getpwuid()->pw_dir` still resolves it) while `env_isolated` claims true.
-    let env_result = match exact_env {
-        Some(environment) => apply_macos_env_from(&mut cmd, spec, Some(environment)),
-        None => apply_macos_env(&mut cmd, spec),
+    let env_result = match (exact_env, macos_temp_home) {
+        (Some(environment), _) => apply_macos_env_from(&mut cmd, spec, Some(environment)),
+        (None, Some(home)) => apply_macos_env_with_home(&mut cmd, spec, home),
+        (None, None) => apply_macos_env(&mut cmd, spec),
     };
     env_result.map_err(|reason| CapsuleRefused {
         backend_id: sel.backend_id,
@@ -5831,6 +5859,17 @@ fn macos_contained_command_os(
 #[cfg(target_os = "macos")]
 fn apply_macos_env(cmd: &mut Command, spec: &CapsuleSpec) -> Result<(), String> {
     apply_macos_env_from(cmd, spec, None)
+}
+
+/// repo-0198: variant taking an already-created temp home (shared with the
+/// Seatbelt write roots so the profile grants what the env points at).
+#[cfg(target_os = "macos")]
+fn apply_macos_env_with_home(
+    cmd: &mut Command,
+    spec: &CapsuleSpec,
+    home: std::path::PathBuf,
+) -> Result<(), String> {
+    apply_macos_env_with_source(cmd, spec, None, move || Ok(home))
 }
 
 #[cfg(target_os = "macos")]
@@ -6047,14 +6086,13 @@ fn windows_run_to_completion_os(
     spec: &CapsuleSpec,
     program: &OsStr,
     args: &[OsString],
+    cwd: Option<&std::path::Path>,
     sel: &SelectedBackend,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
-    let mut child =
-        crate::cli::capsule_windows::launch_contained_os(spec, program, args).map_err(|e| {
-            CapsuleRefused {
-                backend_id: sel.backend_id,
-                reason: format!("contained launch failed: {e}"),
-            }
+    let mut child = crate::cli::capsule_windows::launch_contained_os(spec, program, args, cwd)
+        .map_err(|e| CapsuleRefused {
+            backend_id: sel.backend_id,
+            reason: format!("contained launch failed: {e}"),
         })?;
     let exit_code = crate::cli::capsule_windows::wait_for(&child).map_err(|e| CapsuleRefused {
         backend_id: sel.backend_id,
@@ -8162,7 +8200,8 @@ mod tests {
         );
         let refused = result.err().unwrap();
         assert!(
-            refused.reason.contains("real HOME reachable"),
+            refused.reason.contains("real HOME reachable")
+                || refused.reason.contains("temporary home"),
             "refusal must carry the env-isolation fail-closed reason: {refused}"
         );
     }

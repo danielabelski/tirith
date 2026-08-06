@@ -221,6 +221,18 @@ impl PathAuditReport {
     }
 }
 
+/// repo-0403: standard package-manager prefixes are user-writable BY DESIGN
+/// (Homebrew, user-local installs); they are exempt from the report-surface
+/// writable-before-system finding.
+fn is_package_manager_prefix(dir: &Path) -> bool {
+    let s = dir.to_string_lossy().to_lowercase();
+    s.starts_with("/opt/homebrew/")
+        || s.starts_with("/usr/local/")
+        || s.starts_with("/home/linuxbrew/")
+        || s.starts_with("/opt/homebrew")
+        || s == "/usr/local/bin"
+}
+
 /// Audit a `$PATH` string. `repo_root` and `tmp_roots` are injected for
 /// hermeticity; directory existence + writability are probed on the real FS, so
 /// tests that want those signals create real temp dirs.
@@ -256,6 +268,20 @@ pub fn audit_path_str(
         // Writable-before-system is SCOPED to repo-local / /tmp dirs, matching
         // the hot-path rule (flagging every writable dir would fire everywhere).
         if (repo_local || tmp_local) && dir_precedes_system(dir, &dirs) && dir_is_user_writable(dir)
+        {
+            report.findings.push(PathAuditEntry {
+                dir: dir.display().to_string(),
+                risk: PathDirRisk::WritableBeforeSystem,
+                command: String::new(),
+            });
+        }
+        // repo-0403: the REPORT surface additionally flags any other
+        // user-writable directory that precedes a system dir (outside the
+        // standard package-manager prefixes, where writability is by design).
+        if !(repo_local || tmp_local)
+            && dir_precedes_system(dir, &dirs)
+            && dir_is_user_writable(dir)
+            && !is_package_manager_prefix(dir)
         {
             report.findings.push(PathAuditEntry {
                 dir: dir.display().to_string(),

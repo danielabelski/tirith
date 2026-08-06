@@ -12,7 +12,6 @@
 //! - `explain <name>` — show every matching surface's body, CREDENTIAL-REDACTED,
 //!   plus findings.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use tirith_core::policy::{self as policy_mod, Policy};
@@ -264,7 +263,12 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     // absent file is an empty baseline (the key is then appended); any other read
     // failure (symlinked, oversized, I/O) aborts rather than clobbering blind.
     let existing = match tirith_core::util::read_text_no_follow_capped(path, MAX_POLICY_SIZE) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "policy file is not valid UTF-8; refusing to rewrite it",
+            )
+        })?,
         Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
         Err(e) => return Err(open_regular_io_error(e)),
     };
@@ -302,9 +306,11 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     // guard disabled.
     verify_guard_key_effective(&out, enable)?;
 
-    // Truncating write that REFUSES to follow a symlinked final component (0600).
-    let mut f = tirith_core::util::open_write_no_follow(path, true)?;
-    f.write_all(out.as_bytes())
+    // Atomic publish (temp + fsync + rename, no-follow, 0600): a crash or
+    // full disk mid-write leaves the previous policy intact, never an empty
+    // or partial file (R3 reliability: the truncating in-place write could
+    // destroy security policy on interruption).
+    tirith_core::util::write_file_atomic_0600(path, out.as_bytes())
 }
 
 /// Parse the candidate policy and require the top-level `hooks_guard_enabled`

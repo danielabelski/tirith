@@ -528,7 +528,10 @@ pub fn run(
         if let Some(cwd_val) = &cwd {
             let cwd_owned = cwd_val.clone();
             let cmd_owned = cmd.to_string();
-            std::thread::spawn(move || {
+            // repo-0214: keep the handle — a detached snapshot is killed at
+            // process exit, so a destructive command could run with NO usable
+            // checkpoint. Joined (bounded) before the command returns.
+            let handle = std::thread::spawn(move || {
                 if let Err(e) =
                     tirith_core::checkpoint::create(&[cwd_owned.as_str()], Some(&cmd_owned))
                 {
@@ -541,6 +544,17 @@ pub fn run(
                     }
                 }
             });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                eprintln!(
+                    "tirith: auto-checkpoint did not finish within 60s; the destructive command may proceed without a complete snapshot"
+                );
+            }
         }
     }
 
@@ -808,6 +822,11 @@ pub fn run(
         }
         return 1;
     }
+
+    // repo-0208: wait (bounded) for in-flight webhook deliveries so a one-shot
+    // `check` does not terminate them at process exit. Delivery remains
+    // best-effort; the verdict exit code is unaffected.
+    tirith_core::webhook::wait_for_pending_webhooks(std::time::Duration::from_secs(5));
 
     exit_code
 }

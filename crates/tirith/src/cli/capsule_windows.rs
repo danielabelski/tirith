@@ -218,7 +218,7 @@ pub fn launch_contained(
     args: &[String],
 ) -> Result<ContainedChild, WindowsLaunchError> {
     let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
-    launch_contained_os(spec, OsStr::new(program), &args_os)
+    launch_contained_os(spec, OsStr::new(program), &args_os, None)
 }
 
 /// OS-native launch entry point. This keeps Windows UTF-16 argument data intact
@@ -228,10 +228,16 @@ pub fn launch_contained_os(
     spec: &CapsuleSpec,
     program: &OsStr,
     args: &[OsString],
+    cwd: Option<&std::path::Path>,
 ) -> Result<ContainedChild, WindowsLaunchError> {
     let plan = tirith_core::capsule::windows::windows_launch_plan_os(spec, program, args)
         .map_err(|e| WindowsLaunchError::Encoding(e.to_string()))?;
-    apply_plan(&plan, &spec.environment, spec.resources.wall_clock_seconds)
+    apply_plan(
+        &plan,
+        &spec.environment,
+        spec.resources.wall_clock_seconds,
+        cwd,
+    )
 }
 
 /// Wait for a contained child to exit and return its process exit code (E5
@@ -291,6 +297,7 @@ fn apply_plan(
     plan: &WindowsLaunchPlan,
     env: &EnvironmentPolicy,
     wall_clock_seconds: Option<u64>,
+    cwd: Option<&std::path::Path>,
 ) -> Result<ContainedChild, WindowsLaunchError> {
     // 1. AppContainer profile (idempotent) + package SID.
     let container_sid = create_or_open_appcontainer(plan)?;
@@ -298,6 +305,16 @@ fn apply_plan(
 
     // 2. ACL grants — tracked so they are reverted on any later failure or when the
     //    child finishes.
+    // repo-0199: create the isolated HOME/TEMP directory BEFORE granting the
+    // container SID access to it (the grant is in plan.acl_grants).
+    if let Some(home) = &plan.temp_home {
+        std::fs::create_dir_all(home).map_err(|e| {
+            WindowsLaunchError::Encoding(format!(
+                "cannot create capsule temporary home {}: {e}",
+                home.display()
+            ))
+        })?;
+    }
     let mut acl_guards = Vec::with_capacity(plan.acl_grants.len());
     for grant in &plan.acl_grants {
         match apply_acl_grant(grant, container_sid.psid()) {
@@ -327,8 +344,8 @@ fn apply_plan(
     };
 
     // 4. CreateProcessW: suspended, extended startupinfo, NO inherited handles, a
-    //    scrubbed environment block.
-    let launched = match create_process(plan, env, &mut attr_list) {
+    //    scrubbed environment block, and the caller's working directory (repo-0475).
+    let launched = match create_process(plan, env, &mut attr_list, cwd) {
         Ok(l) => l,
         Err(e) => {
             revert_all(&mut acl_guards);
@@ -768,6 +785,7 @@ fn create_process(
     plan: &WindowsLaunchPlan,
     env: &EnvironmentPolicy,
     attr_list: &mut ProcThreadAttributeList,
+    cwd: Option<&std::path::Path>,
 ) -> Result<Launched, WindowsLaunchError> {
     let app = wide_nul_os(&plan.program)
         .map_err(|_| WindowsLaunchError::Encoding("program path has NUL".to_string()))?;
@@ -782,7 +800,7 @@ fn create_process(
     cmdline.push(0);
 
     // Scrubbed environment block (double-NUL-terminated UTF-16).
-    let mut env_block = build_environment_block(env);
+    let mut env_block = build_environment_block(env, plan.temp_home.as_deref());
 
     let mut si = STARTUPINFOEXW::default();
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -790,9 +808,23 @@ fn create_process(
 
     let mut pi = PROCESS_INFORMATION::default();
 
+    // repo-0475/0476: `lpCurrentDirectory` — the contained child runs in the
+    // caller's working directory (null = inherit, the old behavior).
+    let cwd_wide = match cwd {
+        Some(dir) => Some(wide_nul_os(dir.as_os_str()).map_err(|_| {
+            WindowsLaunchError::Encoding("working directory path has NUL".to_string())
+        })?),
+        None => None,
+    };
+    let cwd_ptr = cwd_wide
+        .as_ref()
+        .map(|w| PCWSTR(w.as_ptr()))
+        .unwrap_or(PCWSTR::null());
+
     // SAFETY: `app` and `cmdline` are NUL-terminated wide buffers that outlive the
     // call; `cmdline` is writable (CreateProcessW may edit it). The attribute list is
     // valid for the call. `env_block` is a double-NUL-terminated UTF-16 block. The
+    // `cwd_wide` buffer outlives the call. The
     // STARTUPINFOEXW is reinterpreted as STARTUPINFOW as the API expects when
     // EXTENDED_STARTUPINFO_PRESENT is set.
     let ok = unsafe {
@@ -810,7 +842,7 @@ fn create_process(
             // attribute binds the AppContainer at creation.
             CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
             Some(env_block.as_mut_ptr() as *const c_void),
-            PCWSTR::null(),
+            cwd_ptr,
             &si as *const STARTUPINFOEXW as *const STARTUPINFOW,
             &mut pi,
         )
@@ -834,15 +866,23 @@ fn create_process(
 /// / TEMP / TMP are pointed at an isolated temp directory.
 ///
 /// The returned `Vec<u16>` is the `lpEnvironment` block: `KEY=VALUE\0KEY=VALUE\0\0`.
-fn build_environment_block(policy: &EnvironmentPolicy) -> Vec<u16> {
+fn build_environment_block(
+    policy: &EnvironmentPolicy,
+    temp_home_override: Option<&std::path::Path>,
+) -> Vec<u16> {
     let present: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
         .collect();
     let survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
 
-    // Isolated HOME/TEMP for the child when temporary_home is set.
+    // Isolated HOME/TEMP for the child when temporary_home is set — the SAME
+    // path the launch plan granted to the container SID (repo-0199).
     let temp_home = if policy.temporary_home {
-        std::env::temp_dir().join(format!("tirith-capsule-{}", std::process::id()))
+        temp_home_override
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("tirith-capsule-{}", std::process::id()))
+            })
     } else {
         std::path::PathBuf::new()
     };
@@ -1128,7 +1168,7 @@ mod tests {
             deny_sensitive: true,
             temporary_home: false,
         };
-        let block = build_environment_block(&policy);
+        let block = build_environment_block(&policy, None);
         // Decode to a string for substring checks (entries are KEY=VALUE\0...).
         let decoded = String::from_utf16_lossy(&block);
         assert!(decoded.contains("TIRITH_TEST_BENIGN=ok"));
@@ -1150,7 +1190,7 @@ mod tests {
             deny_sensitive: true,
             temporary_home: true,
         };
-        let block = build_environment_block(&policy);
+        let block = build_environment_block(&policy, None);
         let decoded = String::from_utf16_lossy(&block);
         // The real profile path must NOT survive; an isolated temp dir replaces it.
         assert!(

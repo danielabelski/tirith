@@ -71,6 +71,7 @@ fn confirm(prompt: &str, yes: bool) -> bool {
 
 fn run_fix(yes: bool) -> i32 {
     let mut fixed = 0;
+    let mut failed = 0;
 
     if !hooks_installed() {
         println!("Fix: Install shell hooks");
@@ -81,6 +82,7 @@ fn run_fix(yes: bool) -> i32 {
                 fixed += 1;
             } else {
                 eprintln!("  Hook installation failed (exit code {rc}).");
+                failed += 1;
             }
         }
     }
@@ -96,6 +98,7 @@ fn run_fix(yes: bool) -> i32 {
                 }
                 None => {
                     eprintln!("  Failed to materialize hooks.");
+                    failed += 1;
                 }
             }
         }
@@ -111,6 +114,7 @@ fn run_fix(yes: bool) -> i32 {
                 }
                 Err(e) => {
                     eprintln!("  Failed to create policy: {e}");
+                    failed += 1;
                 }
             }
         }
@@ -137,6 +141,7 @@ fn run_fix(yes: bool) -> i32 {
                         fixed += 1;
                     } else {
                         eprintln!("  Failed to configure {}.", tool.name);
+                        failed += 1;
                     }
                 }
             }
@@ -164,6 +169,7 @@ fn run_fix(yes: bool) -> i32 {
                     fixed += 1;
                 } else {
                     eprintln!("  Threat DB download failed.");
+                    failed += 1;
                 }
             }
         }
@@ -197,7 +203,7 @@ fn run_fix(yes: bool) -> i32 {
         );
     }
 
-    if fixed == 0 {
+    if fixed == 0 && failed == 0 {
         if shadows.is_empty() {
             println!("tirith: no issues to fix");
         } else {
@@ -205,9 +211,15 @@ fn run_fix(yes: bool) -> i32 {
             println!("tirith: no auto-fixable issues (see manual steps above)");
         }
     } else {
-        println!("tirith: fixed {fixed} issue(s)");
+        println!("tirith: fixed {fixed} issue(s), {failed} failed");
     }
-    0
+    // repo-0217: a failed remediation must return non-zero — "fixed 0 issues"
+    // with a silent exit 0 hides real breakage.
+    if failed > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Check whether shell hooks are configured in the user's profile.
@@ -511,7 +523,8 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
         return None;
     }
 
-    let read_result = match tirith_core::audit_aggregator::read_log(&log_path) {
+    // repo-0479: bounded tail read — a huge audit log must not hang doctor.
+    let read_result = match tirith_core::audit_aggregator::read_log_tail(&log_path, 10_000) {
         Ok(r) => r,
         Err(e) => {
             eprintln!(

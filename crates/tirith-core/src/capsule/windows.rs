@@ -71,7 +71,7 @@
 //! egress).
 
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{
     canonicalize_and_validate_filesystem_policy, CapabilityLevel, Capsule, CapsuleCoverage,
@@ -479,6 +479,11 @@ pub struct WindowsLaunchPlan {
     pub profile: AppContainerProfile,
     /// The ACL grants to add (and later revoke) for the container SID.
     pub acl_grants: Vec<AclGrant>,
+    /// The isolated HOME/TEMP directory granted to the container when
+    /// `temporary_home` is set (repo-0199). The executor creates it before
+    /// applying the grant; `build_environment_block` points the HOME family
+    /// here.
+    pub temp_home: Option<PathBuf>,
     /// The Job Object limits to apply.
     pub job_limits: JobObjectLimits,
     /// The target program (the executable path / `lpApplicationName`).
@@ -550,10 +555,25 @@ pub fn windows_launch_plan_os(
 
     let mut normalized_spec = spec.clone();
     normalized_spec.filesystem = filesystem;
-    let grants = acl_grants_from_validated(&normalized_spec.filesystem);
+    let mut grants = acl_grants_from_validated(&normalized_spec.filesystem);
+    // repo-0199: a `temporary_home` spec points HOME/USERPROFILE/TEMP at an
+    // isolated directory — which must EXIST and be granted to the AppContainer
+    // SID, or contained programs get inaccessible profile/temp dirs while
+    // `env_isolated` claims success. Add its Modify grant to the plan.
+    let temp_home = if spec.environment.temporary_home {
+        let home = std::env::temp_dir().join(format!("tirith-capsule-{}", std::process::id()));
+        grants.push(AclGrant {
+            path: home.clone(),
+            access: AclAccess::Modify,
+        });
+        Some(home)
+    } else {
+        None
+    };
     Ok(WindowsLaunchPlan {
         profile: app_container_profile(&normalized_spec)?,
         acl_grants: grants,
+        temp_home,
         job_limits: job_object_limits(&spec.resources),
         program: program.to_os_string(),
         program_args: program_args.to_vec(),

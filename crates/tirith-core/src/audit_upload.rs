@@ -234,13 +234,56 @@ pub fn spool_and_upload(
         return;
     }
 
+    // repo-0195: enforce retention AT APPEND TIME, before any destination
+    // validation or network state can skip it — a prolonged outage must not
+    // grow the queue past the configured bounds.
+    let max_ev = max_events.unwrap_or(DEFAULT_MAX_EVENTS);
+    let max_b = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    trim_spool_to_retention(max_ev, max_b);
+
+    // repo-0194: coalesce bursts into ONE drainer. A thread per event lets a
+    // burst create unbounded concurrent workers in a long-lived process.
+    static DRAIN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DRAIN_ACTIVE
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return; // a drainer is already running; it will pick up this event
+    }
+
     // Drain runs on a background thread — the CLI path must never block on network I/O.
     let url = server_url.to_string();
     let key = api_key.to_string();
-    let max_ev = max_events.unwrap_or(DEFAULT_MAX_EVENTS);
-    let max_b = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     std::thread::spawn(move || {
         drain_spool(&url, &key, max_ev, max_b);
+        DRAIN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+    });
+}
+
+/// Trim the spool file to the retention bounds (event count and total bytes),
+/// dropping the oldest lines. Runs under the spool lock.
+fn trim_spool_to_retention(max_events: usize, max_bytes: u64) {
+    let path = spool_path();
+    let _ = with_spool_lock(|| -> std::io::Result<()> {
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+        let trimmed = enforce_retention(lines, max_events, max_bytes);
+        if trimmed.len() != content.lines().count() {
+            let mut out = trimmed.join("\n");
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            fs::write(&path, out)?;
+        }
+        Ok(())
     });
 }
 

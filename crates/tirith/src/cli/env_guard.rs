@@ -14,7 +14,6 @@
 //! - `_snapshot` (hidden): the shell hook execs this child once per session; it
 //!   reads its OWN environment and stores NAMES + 8-char value-hash prefixes.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use tirith_core::env_guard::{self, EnvSnapshot};
@@ -188,7 +187,12 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     // read failure (symlinked, oversized, I/O) aborts rather than clobbering
     // blind.
     let existing = match tirith_core::util::read_text_no_follow_capped(path, MAX_POLICY_SIZE) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "policy file is not valid UTF-8; refusing to rewrite it",
+            )
+        })?,
         Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
         Err(e) => return Err(open_regular_io_error(e)),
     };
@@ -214,11 +218,9 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
-    // Truncating write that REFUSES to follow a symlinked final component
-    // (0600), then fsync the parent dir so the update is crash-durable.
-    let mut f = tirith_core::util::open_write_no_follow(path, true)?;
-    f.write_all(out.as_bytes())?;
-    tirith_core::util::fsync_parent_dir_logged(path, "env guard policy update");
+    // Atomic publish (temp + fsync + rename, no-follow, 0600): a crash or full
+    // disk mid-write leaves the previous policy intact (R3 reliability).
+    tirith_core::util::write_file_atomic_0600(path, out.as_bytes())?;
     Ok(())
 }
 

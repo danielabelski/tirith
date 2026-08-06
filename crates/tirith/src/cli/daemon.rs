@@ -907,6 +907,28 @@ fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// repo-0216: confirm a PID belongs to OUR daemon before signaling it — a
+/// recycled PID must never receive our SIGTERM. Checks the daemon socket
+/// (a live tirith answers) and, on Linux, `/proc/<pid>/comm`.
+#[cfg(unix)]
+fn daemon_identity_confirmed(#[allow(unused_variables)] pid: u32, sock: &std::path::Path) -> bool {
+    // Socket liveness is the strongest signal.
+    if sock.exists() {
+        use std::os::unix::net::UnixStream;
+        if UnixStream::connect(sock).is_ok() {
+            return true;
+        }
+    }
+    // Linux-only: confirm the process name.
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            return comm.trim().starts_with("tirith");
+        }
+    }
+    false
+}
+
 #[cfg(not(unix))]
 fn process_alive(_pid: u32) -> bool {
     // Conservatively assume alive (Windows should use OpenProcess).
@@ -1137,6 +1159,18 @@ pub fn stop() -> i32 {
         let _ = std::fs::remove_file(&pid);
         let _ = std::fs::remove_file(&sock);
         return 0;
+    }
+
+    // repo-0216: a stale PID file can name a RECYCLED pid belonging to an
+    // unrelated process. Only signal it when the daemon socket actually
+    // answers (or, on Linux, /proc confirms the binary), never on a bare
+    // kill(pid, 0).
+    if !daemon_identity_confirmed(pid_num, &sock) {
+        eprintln!(
+            "tirith: PID {pid_num} is not the tirith daemon (socket not answering / identity mismatch); refusing to signal it. Remove {} manually if the daemon is truly gone.",
+            pid.display()
+        );
+        return 1;
     }
 
     if kill_process(pid_num) {

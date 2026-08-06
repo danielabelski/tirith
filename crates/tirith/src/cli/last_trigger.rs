@@ -123,7 +123,15 @@ pub fn write_last_trigger(
 
             let mut tmp_file = match NamedTempFile::new_in(&dir) {
                 Ok(f) => f,
-                Err(_) => return,
+                Err(e) => {
+                    // repo-0486: a stale last_trigger.json is a WRONG-TRUST
+                    // hazard (`trust --from-last-trigger` would act on an old
+                    // event) — never fail silently.
+                    tirith_core::audit::audit_diagnostic(format!(
+                        "tirith: warning: last-trigger temp file failed: {e}"
+                    ));
+                    return;
+                }
             };
             #[cfg(unix)]
             {
@@ -133,9 +141,17 @@ pub fn write_last_trigger(
                     .set_permissions(std::fs::Permissions::from_mode(0o600));
             }
             if tmp_file.write_all(json.as_bytes()).is_err() {
+                tirith_core::audit::audit_diagnostic(
+                    "tirith: warning: last-trigger write failed".to_string(),
+                );
                 return;
             }
-            let _ = tmp_file.persist(&path);
+            if let Err(e) = tmp_file.persist(&path) {
+                tirith_core::audit::audit_diagnostic(format!(
+                    "tirith: warning: last-trigger publish failed: {}",
+                    e.error
+                ));
+            }
         }
     }
 }
