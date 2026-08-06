@@ -1150,6 +1150,33 @@ fn windows_path_exts() -> Vec<String> {
     }
 }
 
+/// Split an editable-requirement option from its target.
+///
+/// `-e` and `--editable` take their target either as the next token (already
+/// joined by the caller, so a space here) or attached with `=`. Matching the
+/// prefix WITHOUT requiring one of those delimiters treated any option starting
+/// with the same letters as editable: `-editable-pkg` parsed as `-e` plus the
+/// target `ditable-pkg`, and both classifiers then reported success for an
+/// option-form token the resolver child would reject. Return the target only
+/// when a real delimiter follows, or the option is exactly the flag.
+fn editable_requirement_target(trimmed: &str) -> Option<&str> {
+    let lower = trimmed.to_ascii_lowercase();
+    for flag in ["--editable", "-e"] {
+        if !lower.starts_with(flag) {
+            continue;
+        }
+        let rest = &trimmed[flag.len()..];
+        // Exactly the flag, `=target`, or ` target`. Anything else — another
+        // option that merely starts with these letters — is not editable.
+        if rest.is_empty() || rest.starts_with('=') || rest.starts_with(|c: char| c.is_whitespace())
+        {
+            return Some(rest);
+        }
+        return None;
+    }
+    None
+}
+
 /// Classify a requirement spec, refusing the forms that would build from source
 /// or pull bytes from outside the approved indexes, unless the governing
 /// allowance is set. Returns `Ok(())` for an acceptable
@@ -1184,12 +1211,7 @@ pub fn validate_requirement(
     // refused: callers pass concrete specs, and a `-r` could pull an
     // attacker-controlled file of further requirements past these checks.
     if trimmed.starts_with('-') {
-        let lower = trimmed.to_ascii_lowercase();
-        let editable_target = lower
-            .strip_prefix("--editable")
-            .map(|_| &trimmed["--editable".len()..])
-            .or_else(|| lower.strip_prefix("-e").map(|_| &trimmed["-e".len()..]));
-        if let Some(target) = editable_target {
+        if let Some(target) = editable_requirement_target(trimmed) {
             if !allowances.allow_editable {
                 return reject("editable installs (-e/--editable) are not permitted");
             }
@@ -2050,12 +2072,7 @@ fn permitted_requirement_url(
 ) -> Result<Option<url::Url>, ResolverError> {
     let trimmed = spec.trim();
     if trimmed.starts_with('-') && allowances.allow_editable {
-        let lower = trimmed.to_ascii_lowercase();
-        let target = if lower.starts_with("--editable") {
-            &trimmed["--editable".len()..]
-        } else if lower.starts_with("-e") {
-            &trimmed["-e".len()..]
-        } else {
+        let Some(target) = editable_requirement_target(trimmed) else {
             return Ok(None);
         };
         return permitted_requirement_url(target.trim_start_matches('=').trim(), allowances);
