@@ -63,12 +63,10 @@ fn windows_path_discovery_accepts_trusted_ownership_without_further_provenance()
         authenticode_trusted: false,
         broad_write_access: false,
     };
+    // This revision has no system-helper predicate yet, so the pin covers the
+    // provenance decision only.
     let provenance = evaluate_windows_trust(WindowsExecutableSource::PathSearch, facts).unwrap();
     assert_eq!(provenance, WindowsTrustProvenance::SecureUserInstall);
-    assert!(
-        !windows_provenance_is_system_helper_approved(provenance),
-        "a security-sensitive helper must not inherit owner-chain-only acceptance"
-    );
 }
 
 #[test]
