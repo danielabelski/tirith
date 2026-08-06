@@ -1507,8 +1507,24 @@ fn check_mcp_config(
     // the lock parser. If the path cannot be made repo-relative, or the config
     // is ambiguous/unsafe and therefore fails strict parsing, no trust entry can
     // suppress its findings.
-    let parsed_identities = crate::mcp_lock::source_config_identity_path(path, repo_root)
-        .and_then(|source| crate::mcp_lock::parse_mcp_config(content, &source))
+    let parsed = crate::mcp_lock::source_config_identity_path(path, repo_root)
+        .and_then(|source| crate::mcp_lock::parse_mcp_config(content, &source));
+    if parsed.is_none() {
+        // `build_inventory` reports a config the strict parser refuses; this
+        // surface used to swallow it and continue with an empty identity map,
+        // so a config carrying an unsupported field (`inputs`, `cwd`, `type`)
+        // produced no ConfigMalformed finding at all. The raw security checks
+        // below still run — this only stops the refusal from being silent.
+        push_mcp_structural_finding(
+            findings,
+            "MCP config rejected by strict parsing",
+            "This MCP configuration could not be parsed under the strict schema, so no trust \
+             entry can bind to its servers and its declared identities are not authoritative. \
+             The raw configuration was still inspected for the checks below.",
+            "strict MCP config parse refused",
+        );
+    }
+    let parsed_identities = parsed
         .map(|entries| {
             entries
                 .into_iter()
