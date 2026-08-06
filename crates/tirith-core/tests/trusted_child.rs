@@ -71,7 +71,8 @@ fn denied_origin_cannot_be_hidden_with_parent_components() {
     let traversal = safe.join("..").join("repo-bin");
     let path = std::env::join_paths([&traversal]).unwrap();
 
-    let error = TrustedExecutable::resolve_on_path("probe", &path, &[denied.clone()]).unwrap_err();
+    let error = TrustedExecutable::resolve_on_path("probe", &path, std::slice::from_ref(&denied))
+        .unwrap_err();
     assert!(error.to_string().contains("untrusted"));
     assert!(sanitized_path(&path, &[denied]).is_empty());
 }

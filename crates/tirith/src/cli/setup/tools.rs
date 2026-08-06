@@ -127,6 +127,16 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
 }
 
 pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
+    setup_codex_with_runner(opts, fs_helpers::run_cli)
+}
+
+/// `setup_codex` with the registration CLI injected. The trusted resolver
+/// refuses ambient executables under temp roots and the repository, so tests
+/// cannot stage a fixture binary on PATH; they drive this seam instead.
+fn setup_codex_with_runner<R>(opts: &SetupOpts, mut run: R) -> Result<(), String>
+where
+    R: FnMut(&str, &[&str]) -> Result<std::process::Output, String>,
+{
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
 
     if opts.update_configs {
@@ -157,7 +167,7 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
         eprintln!("[dry-run] would run: codex {}", add_args.join(" "));
         eprintln!("  (cannot check existing registrations in dry-run mode)");
     } else {
-        let get_out = fs_helpers::run_cli("codex", &["mcp", "get", "tirith-gateway"])?;
+        let get_out = run("codex", &["mcp", "get", "tirith-gateway"])?;
 
         let exists = if get_out.status.success() {
             true
@@ -176,8 +186,7 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
         if exists && !opts.force {
             // Drift detection: compare existing registration's command+args
             // with what we would write, via `codex mcp get --json`.
-            let json_out =
-                fs_helpers::run_cli("codex", &["mcp", "get", "--json", "tirith-gateway"]);
+            let json_out = run("codex", &["mcp", "get", "--json", "tirith-gateway"]);
             let expected_args: Vec<&str> = vec![
                 "gateway",
                 "run",
@@ -218,9 +227,9 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
             }
         } else {
             if exists {
-                let _ = fs_helpers::run_cli("codex", &["mcp", "remove", "tirith-gateway"]);
+                let _ = run("codex", &["mcp", "remove", "tirith-gateway"]);
             }
-            let add_out = fs_helpers::run_cli("codex", &add_args)?;
+            let add_out = run("codex", &add_args)?;
             if !add_out.status.success() {
                 let stderr = String::from_utf8_lossy(&add_out.stderr);
                 return Err(format!(
@@ -950,14 +959,15 @@ mod tests {
         assert!(!codex_mcp_config_matches(&value, "tirith", &expected_args));
     }
 
+    /// Build a `std::process::Output` for the injected registration runner.
     #[cfg(unix)]
-    fn write_fake_codex(bin_dir: &std::path::Path, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let codex = bin_dir.join("codex");
-        std::fs::write(&codex, script).unwrap();
-        let mut perms = std::fs::metadata(&codex).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&codex, perms).unwrap();
+    fn process_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout,
+            stderr,
+        }
     }
 
     #[cfg(unix)]
@@ -969,36 +979,28 @@ mod tests {
             let xdg = home.join(".config");
             let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
 
-            let bin_dir = tempfile::tempdir().unwrap();
-            let log_path = home.join("codex.log");
-            let _path = EnvGuard::set("PATH", bin_dir.path());
-            let _log = EnvGuard::set("CODEX_LOG", &log_path);
             let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
-
-            write_fake_codex(
-                bin_dir.path(),
-                // Literal r#"..."# — Rust raw strings can't interpolate; don't
-                // "simplify" into a heredoc expecting Rust-side substitution.
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> "$CODEX_LOG"
-if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "tirith-gateway" ]; then
-  echo "Error: No MCP server named 'tirith-gateway' found." >&2
-  exit 1
-fi
-if [ "$1" = "mcp" ] && [ "$2" = "add" ]; then
-  exit 0
-fi
-echo "unexpected codex args: $*" >&2
-exit 64
-"#,
-            );
 
             let mut opts = opts_for(Scope::User);
             opts.tirith_bin = "/bin/tirith".to_string();
 
-            setup_codex(&opts).unwrap();
+            let mut log = String::new();
+            setup_codex_with_runner(&opts, |command, args| {
+                assert_eq!(command, "codex");
+                log.push_str(&args.join(" "));
+                log.push('\n');
+                match args {
+                    ["mcp", "get", "tirith-gateway"] => Ok(process_output(
+                        1,
+                        Vec::new(),
+                        b"Error: No MCP server named 'tirith-gateway' found.\n".to_vec(),
+                    )),
+                    ["mcp", "add", ..] => Ok(process_output(0, Vec::new(), Vec::new())),
+                    _ => panic!("unexpected codex args: {args:?}"),
+                }
+            })
+            .unwrap();
 
-            let log = std::fs::read_to_string(&log_path).unwrap();
             assert!(
                 log.contains("mcp get tirith-gateway"),
                 "should probe for existing registration; log: {log}"
@@ -1027,38 +1029,37 @@ exit 64
             let xdg = home.join(".config");
             let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
 
-            let bin_dir = tempfile::tempdir().unwrap();
-            let log_path = home.join("codex.log");
-            let _path = EnvGuard::set("PATH", bin_dir.path());
-            let _log = EnvGuard::set("CODEX_LOG", &log_path);
             let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
-
-            // The fake script splices $XDG_CONFIG_HOME at shell-execution time;
-            // it must stay a raw string (the test relies on the spawned shell's
-            // $XDG_CONFIG_HOME matching what etcetera computes in setup_codex).
-            write_fake_codex(
-                bin_dir.path(),
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> "$CODEX_LOG"
-if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "tirith-gateway" ]; then
-  echo "tirith-gateway"
-  exit 0
-fi
-if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "--json" ] && [ "$4" = "tirith-gateway" ]; then
-  printf '%s%s%s\n' '{"name":"tirith-gateway","transport":{"type":"stdio","command":"/bin/tirith","args":["gateway","run","--upstream-bin","/bin/tirith","--upstream-arg","mcp-server","--config","' "$XDG_CONFIG_HOME" '/tirith/gateway.yaml"]}}'
-  exit 0
-fi
-echo "unexpected codex args: $*" >&2
-exit 64
-"#,
-            );
 
             let mut opts = opts_for(Scope::User);
             opts.tirith_bin = "/bin/tirith".to_string();
 
-            setup_codex(&opts).unwrap();
+            // The registered transport JSON must name the exact gateway path
+            // setup_codex computes from XDG_CONFIG_HOME, or the drift check
+            // would report a mismatch instead of "up to date".
+            let registered = format!(
+                r#"{{"name":"tirith-gateway","transport":{{"type":"stdio","command":"/bin/tirith","args":["gateway","run","--upstream-bin","/bin/tirith","--upstream-arg","mcp-server","--config","{}"]}}}}"#,
+                xdg.join("tirith/gateway.yaml").display()
+            );
+            let mut log = String::new();
+            setup_codex_with_runner(&opts, |command, args| {
+                assert_eq!(command, "codex");
+                log.push_str(&args.join(" "));
+                log.push('\n');
+                match args {
+                    ["mcp", "get", "tirith-gateway"] => {
+                        Ok(process_output(0, b"tirith-gateway\n".to_vec(), Vec::new()))
+                    }
+                    ["mcp", "get", "--json", "tirith-gateway"] => Ok(process_output(
+                        0,
+                        registered.clone().into_bytes(),
+                        Vec::new(),
+                    )),
+                    _ => panic!("unexpected codex args: {args:?}"),
+                }
+            })
+            .unwrap();
 
-            let log = std::fs::read_to_string(&log_path).unwrap();
             assert!(log.contains("mcp get tirith-gateway"));
             assert!(log.contains("mcp get --json tirith-gateway"));
             assert!(

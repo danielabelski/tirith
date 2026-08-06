@@ -343,14 +343,32 @@ mod tests {
 
     #[test]
     fn windows_setup_runner_preserves_short_legitimate_output() {
+        // Room to spare on both streams: this case proves legitimate output
+        // survives the supervisor, and any host-dependent extra bytes surface
+        // in the assertion below instead of as an opaque limit refusal. The
+        // limit path itself is covered by the next test.
         let output = run_cli_with(
             &cmd(),
             &["/D", "/S", "/C", "<nul set /p =setup-ok"],
-            tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(5), 64, 64),
+            tirith_core::trusted_child::ChildLimits::new(
+                std::time::Duration::from_secs(5),
+                4096,
+                4096,
+            ),
         )
         .unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"setup-ok");
+        assert!(
+            output.status.success(),
+            "status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "setup-ok",
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
