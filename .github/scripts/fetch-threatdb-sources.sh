@@ -56,31 +56,35 @@ if [ -z "$TIMEOUT_BIN" ] || [ ! -x "$TIMEOUT_BIN" ]; then
   exit 1
 fi
 
+# Background INSIDE the function: `run_fetch ... &` would record this shell's
+# subshell PID, so cleanup would kill the subshell and orphan `timeout` and its
+# fetch child, which then keeps writing into a staging tree cleanup just removed.
+# `$!` set here is visible to the caller.
 run_fetch() {
-  "$TIMEOUT_BIN" --signal=TERM --kill-after=10s "${FETCH_TIMEOUT_SECONDS}s" "$@"
+  "$TIMEOUT_BIN" --signal=TERM --kill-after=10s "${FETCH_TIMEOUT_SECONDS}s" "$@" &
 }
 
 run_fetch git clone --depth 1 \
   https://github.com/ossf/malicious-packages.git \
-  "$STAGED_SOURCES/ossf-mp" &
+  "$STAGED_SOURCES/ossf-mp"
 pids+=("$!")
 labels+=("OpenSSF malicious-packages")
 
 run_fetch git clone --depth 1 \
   https://github.com/DataDog/malicious-software-packages-dataset.git \
-  "$STAGED_SOURCES/dd-mp" &
+  "$STAGED_SOURCES/dd-mp"
 pids+=("$!")
 labels+=("DataDog malicious-software-packages-dataset")
 
 run_fetch curl -sSfL \
   https://feodotracker.abuse.ch/downloads/ipblocklist.txt \
-  -o "$STAGED_SOURCES/feodo.txt" &
+  -o "$STAGED_SOURCES/feodo.txt"
 pids+=("$!")
 labels+=("Feodo Tracker")
 
 run_fetch curl -sSfL \
   https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json \
-  -o "$STAGED_SOURCES/cisa-kev.json" &
+  -o "$STAGED_SOURCES/cisa-kev.json"
 pids+=("$!")
 labels+=("CISA KEV")
 

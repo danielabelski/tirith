@@ -956,14 +956,15 @@ fn write_human(
             }
             if let Some(signals) = install_script_signals {
                 if signals.fires() {
-                    println!(
+                    writeln!(
+                        w,
                         "               - install behavior: network={} shell={} ({} match(es))",
                         signals.has_network_call,
                         signals.has_shell_spawn,
                         signals.suspicious_patterns.len(),
-                    );
+                    )?;
                 } else {
-                    println!("               - install behavior: analyzed, no match");
+                    writeln!(w, "               - install behavior: analyzed, no match")?;
                 }
             }
             match (has_binary_blob, binary_blob_detail) {
