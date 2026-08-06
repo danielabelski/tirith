@@ -2524,8 +2524,30 @@ fn looks_like_secret_literal(value: &str) -> bool {
 /// `reject_userinfo` is true for URLs embedded in stdio arguments (which would
 /// otherwise be serialized verbatim); the top-level URL transport instead
 /// hashes and strips userinfo via `redact_url_userinfo`.
+/// Userinfo in a URL-shaped string `url::Url::parse` refused. Only the authority
+/// segment is inspected, so an ordinary `--mail=a@b.example` argument (no `//`
+/// authority) is not misread as a credential.
+fn raw_authority_has_userinfo(raw: &str) -> bool {
+    let after_scheme = match raw.split_once("://") {
+        Some((_, rest)) => rest,
+        None => match raw.strip_prefix("//") {
+            Some(rest) => rest,
+            None => return false,
+        },
+    };
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
 fn url_has_secret_bearing_components(raw: &str, reject_userinfo: bool) -> bool {
     let Ok(parsed) = url::Url::parse(raw) else {
+        // An unparsable URL-shaped argument still reaches the lock verbatim, so
+        // the userinfo boundary has to be checked on the raw text too.
+        if reject_userinfo && raw_authority_has_userinfo(raw) {
+            return true;
+        }
         let fragment_present = raw
             .split_once('#')
             .is_some_and(|(_, fragment)| !fragment.is_empty());
@@ -3537,7 +3559,8 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
         // Pre-approval-bit v6 lockfiles represented approval solely by a
         // non-empty descriptor vector. Preserve that safe existing baseline;
         // the explicit bit additionally lets a newly approved empty set exist.
-        if !server.descriptors.is_empty() {
+        if lock.schema_state == LockfileSchema::LegacyV6Migration && !server.descriptors.is_empty()
+        {
             server.descriptors_approved = true;
         }
         server.descriptor_hash = compute_descriptor_hash(&server.descriptors);

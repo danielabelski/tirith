@@ -3219,12 +3219,13 @@ fn write_context_label_with_hook(
         Ok(bytes) => merge_context_label_bytes(path, bytes, &mut existing, LabelMergeMode::Trusted),
         Err(crate::util::OpenRegularError::NotFound) => {}
         Err(error) => {
-            // Match the load path's visible failure semantics: a malformed or
-            // unreadable prior label file does not silently disappear.
-            eprintln!(
-                "tirith: warning: context-labels file at {} read error: {error:?}",
-                path.display(),
-            );
+            // Publishing on top of labels we could not read would destroy every
+            // prior operator label. The load path can warn and skip because it
+            // is non-destructive; this path is not.
+            return Err(std::io::Error::other(format!(
+                "cannot read existing context labels at {}: {error:?}",
+                path.display()
+            )));
         }
     }
     existing.insert(label_key.to_string(), criticality.to_string());
