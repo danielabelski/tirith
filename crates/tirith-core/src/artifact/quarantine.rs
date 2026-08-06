@@ -1217,7 +1217,7 @@ impl QuarantineTransaction {
             // identity invariant too: callers also report the visible transaction
             // path and must fail if a same-UID peer replaced it during pinning.
             self.ensure_secure_path()?;
-            return Ok(pins);
+            Ok(pins)
         }
 
         #[cfg(all(not(windows), not(target_os = "linux")))]
