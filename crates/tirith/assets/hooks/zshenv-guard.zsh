@@ -10,43 +10,31 @@ if [[ -n "${ZSH_EXECUTION_STRING:-}" \
    && "${TIRITH_ZSHENV_SKIP:-}" != "1" \
    && -z "${VSCODE_RESOLVING_ENVIRONMENT:-}" ]]; then
 
-  # The assignment below is replaced at setup time with a zsh-quoted
-  # absolute path to the tirith binary; TIRITH_BIN env override still
-  # wins at runtime. The placeholder token is intentionally absent from
-  # this comment because offer_zshenv_guard does a global string replace.
-  _tirith_bin="${TIRITH_BIN:-}"
-  if [[ -z "$_tirith_bin" ]]; then
-    _tirith_bin=__TIRITH_BIN__
-  fi
+  # Setup replaces the assignment below with a zsh-quoted absolute path.
+  # Do not honor runtime path overrides: the guard must reach the exact
+  # executable that setup verified, independent of an untrusted PATH/env.
+  _tirith_bin=__TIRITH_BIN__
 
-  if [[ ! -x "$(command -v "$_tirith_bin" 2>/dev/null)" ]]; then
-    echo "tirith: $_tirith_bin not found — command blocked for safety" >&2
+  if [[ ! -f "$_tirith_bin" || ! -x "$_tirith_bin" ]]; then
+    builtin print -r -- "tirith: configured binary is unavailable — command blocked for safety" >&2
     exit 1
   fi
 
-  _tirith_tmp=$(mktemp 2>/dev/null) || {
-    echo "tirith: could not create temp file — command blocked for safety" >&2
-    exit 1
-  }
-
-  "$_tirith_bin" check --non-interactive --shell posix -- "$ZSH_EXECUTION_STRING" >"$_tirith_tmp" 2>&1
+  # Capture output using zsh-native command substitution. No PATH-resolved
+  # utility may execute before Tirith makes the security decision.
+  _tirith_output=$("$_tirith_bin" check --non-interactive --shell posix -- "$ZSH_EXECUTION_STRING" 2>&1)
   _tirith_rc=$?
 
-  if [[ $_tirith_rc -eq 0 ]]; then
-    rm -f "$_tirith_tmp"
-  elif [[ $_tirith_rc -eq 1 ]]; then
-    cat "$_tirith_tmp" >&2
-    rm -f "$_tirith_tmp"
+  if [[ $_tirith_rc -eq 1 ]]; then
+    [[ -z "$_tirith_output" ]] || builtin print -r -- "$_tirith_output" >&2
     exit 1
   elif [[ $_tirith_rc -eq 2 ]]; then
-    cat "$_tirith_tmp" >&2
-    rm -f "$_tirith_tmp"
-  else
-    cat "$_tirith_tmp" >&2
-    echo "tirith: unexpected exit code $_tirith_rc" >&2
-    rm -f "$_tirith_tmp"
+    [[ -z "$_tirith_output" ]] || builtin print -r -- "$_tirith_output" >&2
+  elif [[ $_tirith_rc -ne 0 ]]; then
+    [[ -z "$_tirith_output" ]] || builtin print -r -- "$_tirith_output" >&2
+    builtin print -r -- "tirith: unexpected exit code $_tirith_rc" >&2
     exit 1
   fi
 
-  unset _tirith_bin _tirith_tmp _tirith_rc
+  builtin unset _tirith_bin _tirith_output _tirith_rc
 fi
