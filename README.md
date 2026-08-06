@@ -776,7 +776,11 @@ That is the daily-driver set. tirith ships 74 commands in all, in 8 groups: scan
   `registry.internal,10.42.0.0/24`). The legacy broad
   `TIRITH_ALLOW_PRIVATE_FETCH=1` switch is not honored. Link-local, special-use,
   and cloud control-plane/credential endpoints remain blocked even when a host is
-  approved.
+  approved. Note what a *hostname* entry grants: that name is approved for
+  whatever it resolves to inside private-use and loopback space, `127.0.0.1`
+  included, because resolution is not part of the trust decision. Prefer a CIDR
+  entry when you mean a fixed address range, and use a hostname only when the
+  name itself is what you trust.
 
 ---
 
