@@ -470,8 +470,10 @@ fn analyze_shell_line_depth(
     let mut analysis = ShellLineAnalysis::default();
 
     for (index, segment) in segments.iter().enumerate() {
+        // The segment byte ranges index the execution view the tokenizer read,
+        // which is not the raw line whenever heredoc recovery rewrote it.
         let crosses_command_newline = index > 0
-            && line
+            && execution_view
                 .get(segments[index - 1].byte_range.end..segment.byte_range.start)
                 .is_some_and(|between| between.contains('\n'));
         let continues_pipeline = index > 0
