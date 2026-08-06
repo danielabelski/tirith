@@ -718,8 +718,16 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     let secret_path = secret_dir.path().join("secret");
     fs::write(&secret_path, b"must not be inherited").expect("write inherited-fd fixture");
     let secret = fs::File::open(&secret_path).expect("open inherited-fd fixture");
-    let interpreter = TrustedExecutable::from_absolute(Path::new("/bin/bash"), &[])
-        .expect("resolve canonical system bash")
+    // Bind a private copy: the fixture below destroys the pathname snapshot
+    // after binding, and doing that to the host's real /bin/bash would replace
+    // the system shell for everything that runs afterwards.
+    let interpreter_dir = tempfile::tempdir().expect("private interpreter fixture");
+    let interpreter_path = interpreter_dir.path().join("bash");
+    fs::copy("/bin/bash", &interpreter_path).expect("copy system bash into the fixture");
+    fs::set_permissions(&interpreter_path, fs::Permissions::from_mode(0o755))
+        .expect("make the interpreter copy executable");
+    let interpreter = TrustedExecutable::from_absolute(&interpreter_path, &[])
+        .expect("resolve the copied interpreter")
         .bind_content()
         .expect("bind exact interpreter bytes before launch");
 
@@ -838,6 +846,12 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
             .path()
             .canonicalize()
             .expect("canonical socket probe root"),
+    );
+    spec.filesystem.read_roots.push(
+        interpreter_dir
+            .path()
+            .canonicalize()
+            .expect("canonical interpreter fixture root"),
     );
     spec.handles.extra_unix_fds.push(SEALED_TARGET_FD);
     spec.handles.extra_unix_fds.push(LAUNCH_STATUS_FD);
@@ -3734,6 +3748,13 @@ fn capability_cache_body(verdict: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn bash_hook_startup_gate_degrade_persists() {
+    // Enter mode needs bind -x and the health gate this exercises; macOS ships
+    // bash 3.2, where the hook legitimately never enters enter mode.
+    if bash_major_version().map(|v| v < 5).unwrap_or(true) {
+        eprintln!("skipping bash enter-mode test: requires bash >= 5");
+        return;
+    }
+
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
 
     let hook = format!(
