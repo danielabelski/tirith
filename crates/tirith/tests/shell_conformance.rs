@@ -71,6 +71,18 @@ fn strict_ledger_counts(env: &IsolatedEnv) -> (usize, usize) {
         let Some(payload) = bytes.get(offset + HEADER_LEN..offset + HEADER_LEN + length) else {
             continue;
         };
+        // The writer's own reader rejects a slot whose payload digest differs
+        // from the header's, so this independent check has to apply the same
+        // rule — otherwise a newer slot with valid JSON and a bad digest could
+        // be selected here and never by the product.
+        {
+            use sha2::{Digest as _, Sha256};
+
+            let digest = Sha256::digest(payload);
+            if digest.as_slice() != &header[16..HEADER_LEN] {
+                continue;
+            }
+        }
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
             ledgers.push(value);
         }
