@@ -395,6 +395,17 @@ impl<'a> StreamingLogRedactor<'a> {
                     .saturating_add(line.len().saturating_sub(cursor))
                     .saturating_add(1);
                 block.oversized |= block.bytes_seen > self.block_limit;
+                // Opening a new block resets `bytes_seen`, so a repeated
+                // open/close pattern trips neither the line nor the block cap
+                // and the stashed record grows with the whole input. Bound it
+                // with the same fail-closed marker an oversized line gets.
+                if record.content.len() > self.line_limit {
+                    let mut incomplete = StreamRecord::default();
+                    incomplete.append_marker(INCOMPLETE_REDACTION_MARKER, "redaction_incomplete");
+                    self.block = None;
+                    self.discard_remainder = true;
+                    return Some(incomplete);
+                }
                 self.pending_record = record;
                 return None;
             }
