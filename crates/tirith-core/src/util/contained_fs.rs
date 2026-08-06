@@ -763,6 +763,19 @@ mod platform {
         io::Error::new(io::ErrorKind::PermissionDenied, message.into())
     }
 
+    /// Name the syscall and its target on the way out. A bare `io::Error` from
+    /// one of these handle-relative calls says only "The parameter is
+    /// incorrect", which cannot be told apart from a dozen other call sites.
+    /// The kind is preserved so `is_not_found` and `is_already_exists` still
+    /// classify a wrapped error.
+    fn with_context(
+        operation: &str,
+        target: impl std::fmt::Display,
+        error: io::Error,
+    ) -> io::Error {
+        io::Error::new(error.kind(), format!("{operation} {target}: {error}"))
+    }
+
     fn absolute(path: &Path) -> io::Result<PathBuf> {
         if path.is_absolute() {
             Ok(path.to_path_buf())
@@ -803,22 +816,24 @@ mod platform {
     }
 
     fn is_not_found(error: &io::Error) -> bool {
-        matches!(
-            error.raw_os_error().map(|code| code as u32),
-            Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PATH_NOT_FOUND)
-        )
+        error.kind() == io::ErrorKind::NotFound
+            || matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PATH_NOT_FOUND)
+            )
     }
 
     fn is_already_exists(error: &io::Error) -> bool {
-        matches!(
-            error.raw_os_error().map(|code| code as u32),
-            Some(ERROR_ALREADY_EXISTS) | Some(ERROR_FILE_EXISTS)
-        )
+        error.kind() == io::ErrorKind::AlreadyExists
+            || matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_ALREADY_EXISTS) | Some(ERROR_FILE_EXISTS)
+            )
     }
 
     fn nt_open_relative(
         parent: HANDLE,
-        _display_parent: &Path,
+        display_parent: &Path,
         name: &OsStr,
         desired_access: u32,
         disposition: u32,
@@ -828,7 +843,7 @@ mod platform {
         #[cfg(test)]
         RELATIVE_OPEN_TEST_HOOK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().as_mut() {
-                hook(_display_parent, name);
+                hook(display_parent, name);
             }
         });
         let mut name = relative_name(name)?;
@@ -872,7 +887,17 @@ mod platform {
             // constructing io::Error so NotFound/AlreadyExists classification
             // remains correct at the Rust boundary.
             let code = unsafe { RtlNtStatusToDosError(status) };
-            return Err(io::Error::from_raw_os_error(code as i32));
+            return Err(with_context(
+                &format!(
+                    "NtCreateFile (status 0x{:08x}, access 0x{:08x}, \
+                     disposition {disposition}, options 0x{:08x})",
+                    status as u32,
+                    desired_access | SYNCHRONIZE,
+                    options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                ),
+                display_parent.join(name).display(),
+                io::Error::from_raw_os_error(code as i32),
+            ));
         }
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::other(
@@ -886,7 +911,11 @@ mod platform {
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: handle is live and `info` is writable.
         if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(with_context(
+                "inspect directory handle",
+                path.display(),
+                io::Error::last_os_error(),
+            ));
         }
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
@@ -928,7 +957,7 @@ mod platform {
             ) {
                 return Ok(None);
             }
-            return Err(error);
+            return Err(with_context("open directory", path.display(), error));
         }
         let handle = OwnedHandle(handle);
         inspect_directory(handle.0, path)?;
@@ -1132,7 +1161,11 @@ mod platform {
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: handle is live and `info` is writable.
         if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(with_context(
+                "inspect file handle",
+                display.display(),
+                io::Error::last_os_error(),
+            ));
         }
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
@@ -1293,6 +1326,7 @@ mod platform {
         name: &OsStr,
         overwrite: bool,
     ) -> io::Result<()> {
+        let display_name = name.to_string_lossy().into_owned();
         let name = relative_name(name)?;
         let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
         let bytes = offset + name.len() * std::mem::size_of::<u16>();
@@ -1318,7 +1352,11 @@ mod platform {
                 ) {
                     return Err(io::Error::new(io::ErrorKind::AlreadyExists, error));
                 }
-                return Err(error);
+                return Err(with_context(
+                    &format!("publish held temp (replace_if_exists {overwrite}, {bytes} bytes)"),
+                    &display_name,
+                    error,
+                ));
             }
         }
         Ok(())
