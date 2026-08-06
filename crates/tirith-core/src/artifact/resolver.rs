@@ -979,7 +979,7 @@ fn validate_static_linux_uv(path: &Path) -> Result<(), String> {
     };
     let phentsize = u64::from(read_u16(phentsize_offset));
     let phnum = u64::from(read_u16(phnum_offset));
-    if phnum == 0 || phnum > MAX_PROGRAM_HEADERS || phentsize < 4 || phentsize > 256 {
+    if phnum == 0 || phnum > MAX_PROGRAM_HEADERS || !(4..=256).contains(&phentsize) {
         return Err("enrolled uv has an invalid or unbounded ELF program-header table".to_string());
     }
     let table_bytes = phentsize
@@ -2582,6 +2582,10 @@ fn python_version_from_executable(path: &Path) -> Option<String> {
     Some(format!("{major}.{minor}"))
 }
 
+/// Interpreter version string plus the pip-tree binding proven alongside it.
+#[cfg(unix)]
+type AttestPythonRuntimeResult = Result<(String, PipTreeBinding), ResolverError>;
+
 /// Locate and attest pip without importing or executing pip. Only the built-in
 /// `sys` module is used for the first `-I -S` probe. The returned stdlib is then
 /// checked as a bounded root-managed tree before a second no-site probe imports
@@ -2590,7 +2594,7 @@ fn python_version_from_executable(path: &Path) -> Option<String> {
 fn attest_python_runtime_and_pip(
     python: &TrustedExecutable,
     runtime: &ValidatedPythonRuntime,
-) -> Result<(String, PipTreeBinding), ResolverError> {
+) -> AttestPythonRuntimeResult {
     const RUNTIME_PROBE: &str =
         "import sys; print(sys.base_prefix); print(f'{sys.version_info[0]}.{sys.version_info[1]}')";
     let output =
@@ -3968,13 +3972,9 @@ mod tests {
 
         // Compile-time API guard: the process-running attestation function cannot
         // be called with unchecked paths; it requires the validation token.
-        let _attest_requires_validated_runtime: fn(
-            &TrustedExecutable,
-            &ValidatedPythonRuntime,
-        ) -> Result<
-            (String, PipTreeBinding),
-            ResolverError,
-        > = attest_python_runtime_and_pip;
+        type AttestFn =
+            fn(&TrustedExecutable, &ValidatedPythonRuntime) -> AttestPythonRuntimeResult;
+        let _attest_requires_validated_runtime: AttestFn = attest_python_runtime_and_pip;
 
         let result: Result<(), ResolverError> = (|| {
             let _validated = ValidatedPythonRuntime::validate(
