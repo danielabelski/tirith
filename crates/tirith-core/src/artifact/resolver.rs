@@ -2501,17 +2501,62 @@ fn revalidate_bound_tool_digest(
 /// trusted-child API: every component must be root-owned, non-group/world
 /// writable, and free of mutating extended ACLs.
 #[cfg(unix)]
-fn resolver_root_managed_path_chain_is_secure(path: &Path) -> bool {
+fn resolver_component_is_root_managed(component: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
-    path.ancestors().all(|component| {
-        let Ok(metadata) = std::fs::metadata(component) else {
-            return false;
-        };
-        metadata.uid() == 0
-            && metadata.mode() & 0o022 == 0
-            && crate::trusted_child::reject_unix_extended_acl(component, metadata.is_dir()).is_ok()
-    })
+    let Ok(metadata) = std::fs::metadata(component) else {
+        return false;
+    };
+    metadata.uid() == 0
+        && metadata.mode() & 0o022 == 0
+        && crate::trusted_child::reject_unix_extended_acl(component, metadata.is_dir()).is_ok()
+}
+
+/// Directories already proven root-managed and non-writable during ONE
+/// validation pass.
+///
+/// The chain check costs a `stat` plus an extended-ACL read per component, and
+/// the runtime walk runs it once per entry, so a CPython stdlib near
+/// `PYTHON_RUNTIME_MAX_FILES` re-proved the same handful of directories
+/// hundreds of thousands of times — repeated again on every
+/// `revalidate_install_authority`. The security property is that each distinct
+/// component is proven during the pass, which this preserves: it only skips
+/// re-proving a directory this same pass already accepted. A caller that needs
+/// a fresh proof starts a new `ProvenChain`.
+#[derive(Default)]
+struct ProvenChain {
+    proven: std::collections::BTreeSet<PathBuf>,
+}
+
+impl ProvenChain {
+    fn path_chain_is_secure(&mut self, path: &Path) -> bool {
+        let mut pending: Vec<&Path> = Vec::new();
+        for component in path.ancestors() {
+            if self.proven.contains(component) {
+                break;
+            }
+            pending.push(component);
+        }
+        // Root-downward, so a failure is reported at the outermost component
+        // that broke rather than at the leaf.
+        for component in pending.iter().rev() {
+            if !resolver_component_is_root_managed(component) {
+                return false;
+            }
+        }
+        for component in pending {
+            // Only directories are worth remembering: a leaf file never
+            // reappears as another entry's ancestor.
+            if component.is_dir() {
+                self.proven.insert(component.to_path_buf());
+            }
+        }
+        true
+    }
+}
+
+fn resolver_root_managed_path_chain_is_secure(path: &Path) -> bool {
+    ProvenChain::default().path_chain_is_secure(path)
 }
 
 impl PipTreeBinding {
@@ -2727,6 +2772,9 @@ fn attest_python_runtime_and_pip(
 fn validate_root_managed_runtime_tree(root: &Path) -> Result<(), ResolverError> {
     let mut files = 0_u64;
     let mut bytes = 0_u64;
+    // One pass over a stdlib re-walks the same ancestors for every entry, so
+    // share the proof across the walk instead of re-stat'ing them per file.
+    let mut chain = ProvenChain::default();
     let mut walk = walkdir::WalkDir::new(root).follow_links(false).into_iter();
     while let Some(entry) = walk.next() {
         let entry = entry.map_err(|error| resolver_io_error(error.to_string()))?;
@@ -2749,7 +2797,7 @@ fn validate_root_managed_runtime_tree(root: &Path) -> Result<(), ResolverError> 
             walk.skip_current_dir();
             continue;
         }
-        if !resolver_root_managed_path_chain_is_secure(entry.path()) {
+        if !chain.path_chain_is_secure(entry.path()) {
             return Err(ResolverError::ToolUntrusted {
                 tool: entry.path().display().to_string(),
                 reason: "Python runtime dependency is not root-managed and non-writable"
@@ -2777,13 +2825,14 @@ fn validate_root_managed_runtime_tree(root: &Path) -> Result<(), ResolverError> 
 
 #[cfg(unix)]
 fn validate_site_startup_controls(site_root: &Path) -> Result<(), ResolverError> {
+    let mut chain = ProvenChain::default();
     for entry in std::fs::read_dir(site_root).map_err(ResolverError::Io)? {
         let entry = entry.map_err(ResolverError::Io)?;
         let name = entry.file_name();
         let is_control = name.to_str().is_some_and(|name| {
             name.ends_with(".pth") || name == "sitecustomize.py" || name == "usercustomize.py"
         });
-        if is_control && !resolver_root_managed_path_chain_is_secure(&entry.path()) {
+        if is_control && !chain.path_chain_is_secure(&entry.path()) {
             return Err(ResolverError::ToolUntrusted {
                 tool: entry.path().display().to_string(),
                 reason: "Python startup control file is user-writable".to_string(),
@@ -4828,5 +4877,32 @@ certifi==2024.2.2 \\
         assert!(!r.allowances.allow_local_path);
         assert!(!r.allowances.allow_direct_url);
         assert!(!r.allowances.allow_untrusted_tool);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proven_chain_reuses_a_directory_but_still_refuses_a_bad_one() {
+        // A directory proven once this pass is not re-proved, and a component
+        // that fails is still refused even after its parent was accepted.
+        let mut chain = ProvenChain::default();
+        assert!(
+            chain.path_chain_is_secure(std::path::Path::new("/usr")),
+            "a root-managed system directory must pass"
+        );
+        assert!(
+            chain.proven.contains(std::path::Path::new("/usr")),
+            "a passing directory is remembered for this pass"
+        );
+
+        let writable = tempfile::tempdir().unwrap();
+        let mut fresh = ProvenChain::default();
+        assert!(
+            !fresh.path_chain_is_secure(writable.path()),
+            "a user-owned temp directory is not root-managed"
+        );
+        assert!(
+            !fresh.proven.contains(writable.path()),
+            "a refused component must never be remembered"
+        );
     }
 }
