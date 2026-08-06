@@ -636,6 +636,28 @@ fn authenticode_trusted(path: &Path) -> Result<bool, String> {
     Ok(result == 0)
 }
 
+/// Rewrite a canonical `\\?\C:\...` directory as the plain `C:\...` form.
+/// Only the prefix changes: the directory the child receives is the same one
+/// the ACL and ownership checks above accepted.
+fn dos_directory_for_child(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    match prefix.kind() {
+        Prefix::VerbatimDisk(letter) => {
+            let mut rebuilt = PathBuf::from(format!("{}:\\", letter as char));
+            rebuilt.extend(components.filter(|component| !matches!(component, Component::RootDir)));
+            rebuilt
+        }
+        // Verbatim UNC and device paths have no DOS equivalent to fall back to,
+        // and a plain DOS prefix is already what the child wants.
+        _ => path.to_path_buf(),
+    }
+}
+
 pub(super) fn run(executable: &super::TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     let mut child = match WindowsChild::launch(executable.path(), spec) {
         Ok(child) => child,
@@ -873,7 +895,11 @@ impl WindowsChild {
                 cwd_path.display()
             ));
         }
-        let cwd = wide_nul(cwd_path.as_os_str())?;
+        // The trusted path is canonical, so it carries the `\\?\` verbatim
+        // prefix. CreateProcessW accepts that form, but a child that reads its
+        // own working directory can reject it: cmd.exe refuses a UNC-looking
+        // cwd, warns, and exits 1. Hand the child the equivalent DOS form.
+        let cwd = wide_nul(dos_directory_for_child(&cwd_path).as_os_str())?;
 
         let job = configured_job()?;
         let helper =
