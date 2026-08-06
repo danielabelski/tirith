@@ -248,7 +248,23 @@ impl ResolverBroker {
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(10));
                         }
-                        Err(_) => break,
+                        Err(error) => {
+                            // A client aborting mid-handshake, an interrupted
+                            // call, or transient descriptor pressure must not
+                            // retire the listener: every later pip/uv connection
+                            // would get ECONNREFUSED for the rest of the resolve.
+                            let retryable = matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::OutOfMemory
+                            );
+                            if !retryable {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
                     }
                 }
                 for worker in workers {
