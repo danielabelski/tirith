@@ -10,10 +10,12 @@
 //! Windows/Linux report not-applicable), and package-manager ownership by
 //! matching well-known install roots.
 //!
-//! Both child processes are bounded by [`crate::util::run_trusted_with_timeout`]
-//! (2s, args as an array — no shell/injection); a timeout or missing binary
-//! degrades to "unknown", never a hang. Provenance is gathered at ANALYSIS
-//! time — TOCTOU: the file could be replaced before the shell executes it.
+//! Both child processes are selected from fixed/root-managed system provenance
+//! and bounded by [`crate::util::run_trusted_with_timeout`] (2s, args as an
+//! array — no shell/injection); a timeout, missing binary, or untrusted PATH
+//! shadow degrades to "unknown", never a hang. Provenance is gathered at
+//! ANALYSIS time — TOCTOU: the inspected file could be replaced before the
+//! shell executes it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -282,7 +284,13 @@ fn modified_secs_ago(md: &std::fs::Metadata) -> Option<u64> {
 /// `None` on missing `file`, non-zero exit, or timeout.
 fn file_brief(path: &Path) -> Option<String> {
     let path_str = path.to_str()?;
-    let program = crate::trusted_child::resolve_ambient("file").ok()?;
+    let program = crate::trusted_child::TrustedExecutable::from_system_candidates(&[
+        Path::new("/usr/bin/file"),
+        Path::new("/bin/file"),
+    ])
+    .ok()?
+    .require_system_helper_provenance()
+    .ok()?;
     match run_trusted_with_timeout(
         &program,
         &["--brief", path_str],
@@ -315,6 +323,7 @@ fn verify_signature(path: &Path) -> SignatureStatus {
         crate::trusted_child::TrustedExecutable::from_system_candidates(&[Path::new(
             "/usr/bin/codesign",
         )])
+        .and_then(|program| program.require_system_helper_provenance())
     else {
         return SignatureStatus::NotApplicable;
     };
@@ -379,10 +388,104 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: the caller holds the crate-wide TEST_ENV_LOCK until this
+            // guard restores the previous value in Drop.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the owning test still holds TEST_ENV_LOCK.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn mkexec(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, b"#!/bin/sh\necho hi\n").unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provenance_file_probe_rejects_a_same_uid_path_shadow_without_execution() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temporary = tempfile::Builder::new()
+            .prefix("tirith-file-probe-shadow-")
+            .tempdir_in(home::home_dir().expect("test account home"))
+            .unwrap();
+        let shadow_bin = temporary.path().join("shadow-bin");
+        std::fs::create_dir(&shadow_bin).unwrap();
+        let marker = temporary.path().join("file-helper-executed");
+        let quoted_marker = marker.display().to_string().replace('\'', "'\"'\"'");
+        for helper in ["file", "codesign"] {
+            let helper = shadow_bin.join(helper);
+            std::fs::write(
+                &helper,
+                format!("#!/bin/sh\n: > '{quoted_marker}'\nexit 97\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![shadow_bin];
+        path_entries.extend(std::env::split_paths(&inherited));
+        let _path = EnvVarGuard::set("PATH", std::env::join_paths(path_entries).unwrap());
+        let inspected = temporary.path().join("candidate");
+        std::fs::write(&inspected, b"candidate bytes").unwrap();
+
+        let provenance = provenance_of(&inspected);
+        assert!(provenance.exists);
+        if Path::new("/usr/bin/file").is_file() || Path::new("/bin/file").is_file() {
+            assert!(
+                provenance.file_type.is_some(),
+                "the fixed root-managed file utility should preserve provenance detail"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "provenance inspection must not execute same-UID file/codesign PATH shadows"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provenance_file_probe_preserves_the_system_file_utility() {
+        if !Path::new("/usr/bin/file").is_file() && !Path::new("/bin/file").is_file() {
+            return;
+        }
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let _path = EnvVarGuard::set("PATH", path);
+
+        assert!(
+            file_brief(Path::new("/bin/sh")).is_some(),
+            "the root-managed system file utility must remain usable"
+        );
     }
 
     #[test]

@@ -14,7 +14,83 @@ set -g _TIRITH_FISH_LOADED 1
 
 # Session tracking: generate ID per shell session if not inherited
 if not set -q TIRITH_SESSION_ID
-    set -gx TIRITH_SESSION_ID (printf '%x-%x' %self (date +%s))
+    set -gx TIRITH_SESSION_ID (builtin printf '%x-%x-%x-%x' \
+        "$fish_pid" (builtin random) (builtin random) (builtin random))
+end
+
+# Pin the executable before any repository command can mutate PATH. Refuse an
+# interactive hook when fish cannot resolve an absolute executable path.
+set -g _TIRITH_BIN (command -s tirith 2>/dev/null)
+if not string match -q '/*' -- "$_TIRITH_BIN"; or not test -x "$_TIRITH_BIN"
+    if status is-interactive
+        printf '%s\n' 'tirith: executable not found; fish hooks disabled' >&2
+        set -g TIRITH_STATUS off
+        return
+    end
+    set -g _TIRITH_BIN tirith
+end
+
+# Protocol-v3 callbacks run after arbitrary commands may have changed PATH.
+# Pin every external helper they use to a fixed system location now, and only
+# advertise receipt support when the complete helper set is available.
+set -g _TIRITH_MKTEMP_BIN ""
+if test -f /usr/bin/mktemp; and test -x /usr/bin/mktemp
+    set -g _TIRITH_MKTEMP_BIN /usr/bin/mktemp
+else if test -f /bin/mktemp; and test -x /bin/mktemp
+    set -g _TIRITH_MKTEMP_BIN /bin/mktemp
+end
+set -g _TIRITH_RM_BIN ""
+if test -f /bin/rm; and test -x /bin/rm
+    set -g _TIRITH_RM_BIN /bin/rm
+else if test -f /usr/bin/rm; and test -x /usr/bin/rm
+    set -g _TIRITH_RM_BIN /usr/bin/rm
+end
+set -g _TIRITH_WC_BIN ""
+if test -f /usr/bin/wc; and test -x /usr/bin/wc
+    set -g _TIRITH_WC_BIN /usr/bin/wc
+else if test -f /bin/wc; and test -x /bin/wc
+    set -g _TIRITH_WC_BIN /bin/wc
+end
+set -g _TIRITH_ENV_BIN ""
+if test -f /usr/bin/env; and test -x /usr/bin/env
+    set -g _TIRITH_ENV_BIN /usr/bin/env
+else if test -f /bin/env; and test -x /bin/env
+    set -g _TIRITH_ENV_BIN /bin/env
+end
+set -g _TIRITH_SH_BIN ""
+if test -f /bin/sh; and test -x /bin/sh
+    set -g _TIRITH_SH_BIN /bin/sh
+else if test -f /usr/bin/sh; and test -x /usr/bin/sh
+    set -g _TIRITH_SH_BIN /usr/bin/sh
+end
+set -g _TIRITH_BASH_TIMEOUT_BIN ""
+if test -f /bin/bash; and test -x /bin/bash
+    set -g _TIRITH_BASH_TIMEOUT_BIN /bin/bash
+else if test -f /usr/bin/bash; and test -x /usr/bin/bash
+    set -g _TIRITH_BASH_TIMEOUT_BIN /usr/bin/bash
+end
+set -g _TIRITH_V3_HELPERS_READY 1
+for helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" \
+        "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN"
+    if not string match -q '/*' -- "$helper"; or not test -f "$helper"; or not test -x "$helper"
+        set -g _TIRITH_V3_HELPERS_READY 0
+    end
+end
+
+set -g _TIRITH_RECEIPT_PROTOCOL 0
+set -g _TIRITH_RECEIPT_INSTANCE ""
+set -g _TIRITH_RECEIPT_SHELL_PID "$fish_pid"
+set -g _TIRITH_RECEIPT_FAMILY fish
+if status is-interactive
+    and test $_TIRITH_V3_HELPERS_READY -eq 1
+    and test (command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null) = "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3"
+    set -g _TIRITH_RECEIPT_INSTANCE (command "$_TIRITH_BIN" __execution-receipt register \
+        --family fish --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" 2>/dev/null)
+    if string match -rq '^[0-9a-f]{64}$' -- "$_TIRITH_RECEIPT_INSTANCE"
+        set -g _TIRITH_RECEIPT_PROTOCOL 3
+    else
+        set -g _TIRITH_RECEIPT_INSTANCE ""
+    end
 end
 
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
@@ -37,7 +113,7 @@ end
 # inherits this shell's exported env, so no value crosses an argv boundary or a
 # temp file. Interactive-only and backgrounded so it never blocks the prompt.
 if status is-interactive
-    command tirith env snapshot >/dev/null 2>&1 &
+    command "$_TIRITH_BIN" env snapshot >/dev/null 2>&1 &
     disown 2>/dev/null
 end
 
@@ -55,6 +131,105 @@ function _tirith_escape_preview
     string escape -- $argv[1]
 end
 
+function _tirith_receipt_consume_at
+    set -l token "$argv[1]"
+    set -l command_text "$argv[2]"
+    set -l original_cwd "$argv[3]"
+    test $_TIRITH_V3_HELPERS_READY -eq 1; or return 1
+    test -n "$token"; and test -n "$original_cwd"; or return 1
+    builtin printf '%s\n%s' "$token" "$command_text" | command "$_TIRITH_ENV_BIN" \
+        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        _TIRITH_RECEIPT_CWD="$original_cwd" \
+        _TIRITH_BIN="$_TIRITH_BIN" \
+        "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt consume --channel fish' \
+        >/dev/null
+end
+
+function _tirith_receipt_reconcile_at
+    set -l token "$argv[1]"
+    set -l original_cwd "$argv[2]"
+    test $_TIRITH_V3_HELPERS_READY -eq 1; or return 1
+    test -n "$token"; and test -n "$original_cwd"; or return 1
+    builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
+        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        _TIRITH_RECEIPT_CWD="$original_cwd" \
+        _TIRITH_BIN="$_TIRITH_BIN" \
+        "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt reconcile --channel fish' \
+        >/dev/null 2>&1
+end
+
+function _tirith_receipt_discard_at
+    set -l token "$argv[1]"
+    set -l original_cwd "$argv[2]"
+    test $_TIRITH_V3_HELPERS_READY -eq 1; or return 1
+    test -n "$token"; and test -n "$original_cwd"; or return 1
+    builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
+        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        _TIRITH_RECEIPT_CWD="$original_cwd" \
+        _TIRITH_BIN="$_TIRITH_BIN" \
+        "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt discard --channel fish' \
+        >/dev/null 2>&1
+end
+
+function _tirith_unresolved_receipt_cleanup
+    set -l token "$_TIRITH_UNRESOLVED_RECEIPT"
+    set -l original_cwd "$_TIRITH_UNRESOLVED_RECEIPT_CWD"
+    test -n "$token"; or return 0
+    if _tirith_receipt_reconcile_at "$token" "$original_cwd"
+        or _tirith_receipt_discard_at "$token" "$original_cwd"
+        set -e _TIRITH_UNRESOLVED_RECEIPT _TIRITH_UNRESOLVED_RECEIPT_CWD
+        return 0
+    end
+    return 1
+end
+
+function _tirith_receipt_discard_or_retain
+    set -l token "$argv[1]"
+    set -l original_cwd "$argv[2]"
+    test -n "$token"; and test -n "$original_cwd"; or return 1
+    if _tirith_receipt_discard_at "$token" "$original_cwd"
+        return 0
+    end
+    if not set -q _TIRITH_UNRESOLVED_RECEIPT; or test -z "$_TIRITH_UNRESOLVED_RECEIPT"
+        set -g _TIRITH_UNRESOLVED_RECEIPT "$token"
+        set -g _TIRITH_UNRESOLVED_RECEIPT_CWD "$original_cwd"
+    end
+    return 1
+end
+
+function _tirith_v3_new_capture_file
+    if not string match -q '/*' -- "$_TIRITH_MKTEMP_BIN"; or \
+            not string match -q '/*' -- "$_TIRITH_RM_BIN"
+        return 1
+    end
+    set -l file (umask 077; command "$_TIRITH_MKTEMP_BIN")
+    set -l create_status $status
+    if test $create_status -ne 0; or test -z "$file"; or not test -f "$file"; or test -L "$file"; or not test -O "$file"
+        if test -n "$file"
+            command "$_TIRITH_RM_BIN" -f -- "$file" 2>/dev/null
+        end
+        return 1
+    end
+    builtin printf '%s\n' "$file"
+end
+
+function _tirith_v3_remove_capture_files
+    if not string match -q '/*' -- "$_TIRITH_RM_BIN"; or test (count $argv) -eq 0
+        return 1
+    end
+    command "$_TIRITH_RM_BIN" -f -- $argv
+end
+
+function _tirith_receipt_exit --on-event fish_exit
+    _tirith_unresolved_receipt_cleanup
+end
+
 
 function _tirith_parse_approval
     set -g _tirith_ap_required "no"
@@ -65,7 +240,7 @@ function _tirith_parse_approval
 
     if not test -r "$argv[1]"
         _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
-        command rm -f "$argv[1]"  # delete on all paths
+        _tirith_v3_remove_capture_files "$argv[1]" >/dev/null 2>&1  # delete on all paths
         set -g _tirith_ap_required "yes"
         set -g _tirith_ap_fallback "block"
         return 1
@@ -91,7 +266,7 @@ function _tirith_parse_approval
         end
     end < "$argv[1]"
 
-    command rm -f "$argv[1]"
+    _tirith_v3_remove_capture_files "$argv[1]" >/dev/null 2>&1
 
     if test $valid_keys -eq 0
         _tirith_output "tirith: warning: approval file corrupt, failing closed"
@@ -108,7 +283,7 @@ function _tirith_parse_warn_ack
     set -g _tirith_wa_max_severity ""
 
     if not test -r "$argv[1]"
-        command rm -f "$argv[1]"
+        _tirith_v3_remove_capture_files "$argv[1]" >/dev/null 2>&1
         return 1
     end
 
@@ -124,7 +299,7 @@ function _tirith_parse_warn_ack
         end
     end < "$argv[1]"
 
-    command rm -f "$argv[1]"
+    _tirith_v3_remove_capture_files "$argv[1]" >/dev/null 2>&1
     return 0
 end
 
@@ -144,11 +319,23 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
             return
         end
 
-        set -l tmpfile (mktemp)
-        echo -n "$content" | env _TIRITH_HOOK=1 tirith paste --shell fish --interactive >$tmpfile 2>&1
+        set -l tmpfile (_tirith_v3_new_capture_file)
+        set -l capture_status $status
+        if test $capture_status -ne 0
+            _tirith_output "tirith: secure paste capture unavailable; paste blocked for safety"
+            commandline -f repaint
+            return
+        end
+        set -lx _TIRITH_HOOK 1
+        builtin printf '%s' "$content" \
+            | command "$_TIRITH_BIN" paste --shell fish --interactive >$tmpfile 2>&1
         set -l rc $status
         set -l output (string collect < $tmpfile)
-        command rm -f $tmpfile
+        if not _tirith_v3_remove_capture_files "$tmpfile" >/dev/null 2>&1
+            _tirith_output "tirith: secure paste capture cleanup failed; paste blocked for safety"
+            commandline -f repaint
+            return
+        end
 
         if test $rc -eq 0
             # Allow: fall through to echo
@@ -174,12 +361,20 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
             return
         end
 
-        echo -n "$content"
+        builtin printf '%s' "$content"
     end
 end
 
 function _tirith_check_command
     set -l cmd (commandline)
+
+    # Never create or deliver a second receipt while recovery of an older one is
+    # unresolved. Reconciliation/discard runs in the original working directory.
+    if test $_TIRITH_RECEIPT_PROTOCOL -eq 3; and not _tirith_unresolved_receipt_cleanup
+        _tirith_output "tirith: execution receipt remains unresolved; command not accepted"
+        commandline -f repaint
+        return 1
+    end
 
     # Empty input: execute normally
     if test -z "$cmd"
@@ -191,11 +386,162 @@ function _tirith_check_command
     # Redirect both stdout and stderr to temp files instead of using command substitution —
     # fish 4.0+ changed terminal mode handling for external commands in key bindings,
     # and command substitution (set -l x (cmd)) can hang in that context.
-    set -l outfile (mktemp)
-    set -l errfile (mktemp)
-    env _TIRITH_HOOK=1 tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" >$outfile 2>$errfile
+    set -l outfile ""
+    set -l errfile ""
+    if test $_TIRITH_RECEIPT_PROTOCOL -eq 3
+        set outfile (_tirith_v3_new_capture_file)
+        set -l outfile_status $status
+        set -l errfile_status 1
+        if test $outfile_status -eq 0
+            set errfile (_tirith_v3_new_capture_file)
+            set errfile_status $status
+        end
+        if test $outfile_status -ne 0; or test $errfile_status -ne 0
+            if test -n "$outfile"
+                _tirith_v3_remove_capture_files "$outfile" >/dev/null 2>&1
+            end
+            _tirith_output "tirith: secure execution-receipt capture unavailable; command blocked"
+            commandline -r ""
+            commandline -f repaint
+            return 1
+        end
+        set -lx _TIRITH_HOOK 1
+        set -lx _TIRITH_RECEIPT_INSTANCE "$_TIRITH_RECEIPT_INSTANCE"
+        set -lx _TIRITH_RECEIPT_SHELL_PID "$_TIRITH_RECEIPT_SHELL_PID"
+        set -lx _TIRITH_RECEIPT_FAMILY "$_TIRITH_RECEIPT_FAMILY"
+        command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell fish \
+            --execution-receipt fish -- "$cmd" >$outfile 2>$errfile
+    else
+        set outfile (_tirith_v3_new_capture_file)
+        set -l outfile_status $status
+        set -l errfile_status 1
+        if test $outfile_status -eq 0
+            set errfile (_tirith_v3_new_capture_file)
+            set errfile_status $status
+        end
+        if test $outfile_status -ne 0; or test $errfile_status -ne 0
+            if test -n "$outfile"
+                _tirith_v3_remove_capture_files "$outfile" >/dev/null 2>&1
+            end
+            _tirith_output "tirith: secure preflight capture unavailable; command blocked"
+            commandline -r ""
+            commandline -f repaint
+            return 1
+        end
+        set -lx _TIRITH_HOOK 1
+        command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell fish \
+            -- "$cmd" >$outfile 2>$errfile
+    end
     set -l rc $status
-    # Read stdout lines: line 1 = approval path, line 2 = warn-ack path (exit code 3 only)
+
+    if test $_TIRITH_RECEIPT_PROTOCOL -eq 3
+        set -l output ""
+        if test -s "$errfile"
+            set output (string collect < "$errfile")
+        end
+
+        set -l receipt_prefix "TIRITH_EXECUTION_RECEIPT="
+        set -l receipt_line ""
+        set -l receipt_token ""
+        set -l receipt_cwd "$PWD"
+        set -l stdout_bytes (command "$_TIRITH_WC_BIN" -c < "$outfile" 2>/dev/null | string trim)
+        set -l stdout_lines (command "$_TIRITH_WC_BIN" -l < "$outfile" 2>/dev/null | string trim)
+        set -l first_line_status 1
+        set -l frame_valid 0
+        read receipt_line < "$outfile"
+        set first_line_status $status
+
+        if string match -q "$receipt_prefix*" -- "$receipt_line"
+            set -l candidate_token (string replace "$receipt_prefix" "" -- "$receipt_line")
+            if string match -rq '^[0-9a-f]{64}$' -- "$candidate_token"
+                set receipt_token "$candidate_token"
+            end
+        end
+
+        if test $rc -eq 0; or test $rc -eq 2
+            if test $first_line_status -eq 0
+                and test "$stdout_bytes" = 90
+                and test "$stdout_lines" = 1
+                and string match -rq '^TIRITH_EXECUTION_RECEIPT=[0-9a-f]{64}$' -- "$receipt_line"
+                set frame_valid 1
+            end
+        end
+
+        if test $frame_valid -eq 1
+            if not _tirith_v3_remove_capture_files "$outfile" "$errfile"
+                _tirith_receipt_discard_or_retain "$receipt_token" "$receipt_cwd" >/dev/null 2>&1
+                _tirith_output "tirith: execution-receipt capture cleanup failed; command blocked"
+                commandline -f repaint
+                return 1
+            end
+            set -l precommit_cmd (commandline | string collect)
+            if test "$precommit_cmd" != "$cmd"
+                _tirith_receipt_discard_or_retain "$receipt_token" "$receipt_cwd" >/dev/null 2>&1
+                _tirith_output "tirith: command changed before receipt commit; command not executed — press Enter for a fresh check"
+                commandline -f repaint
+                return 1
+            end
+            if not _tirith_receipt_consume_at "$receipt_token" "$cmd" "$receipt_cwd"
+                if _tirith_receipt_reconcile_at "$receipt_token" "$receipt_cwd"
+                    _tirith_output "tirith: receipt recovery completed but cannot authorize replay; command not executed — press Enter for a fresh check"
+                else
+                    _tirith_receipt_discard_or_retain "$receipt_token" "$receipt_cwd" >/dev/null 2>&1
+                    _tirith_output "tirith: execution receipt could not be committed; command not executed — press Enter for a fresh check"
+                end
+                commandline -f repaint
+                return 1
+            end
+            if test $rc -eq 2
+                set -l v3_escaped_cmd (_tirith_escape_preview "$cmd")
+                _tirith_output ""
+                _tirith_output "command> $v3_escaped_cmd"
+                if test -n "$output"
+                    _tirith_output "$output"
+                end
+            end
+            set -l postcommit_cmd (commandline | string collect)
+            if test "$postcommit_cmd" != "$cmd"
+                _tirith_output "tirith: command changed after receipt commit; command not executed with conservative unresolved line-acceptance evidence"
+                commandline -f repaint
+                return 1
+            end
+            commandline -f execute
+            return
+        end
+
+        if test $rc -eq 1; and test "$stdout_bytes" = 0
+            _tirith_v3_remove_capture_files "$outfile" "$errfile" >/dev/null 2>&1
+            set -l v3_blocked_cmd (_tirith_escape_preview "$cmd")
+            _tirith_output ""
+            _tirith_output "command> $v3_blocked_cmd"
+            if test -n "$output"
+                _tirith_output "$output"
+            end
+            commandline -r ""
+            commandline -f repaint
+            return 1
+        end
+
+        # Any other status/stdout pairing is a malformed v3 frame. If its first
+        # line contains a syntactically valid token, retire it before blocking.
+        if test -n "$receipt_token"
+            _tirith_receipt_discard_or_retain "$receipt_token" "$receipt_cwd" >/dev/null 2>&1
+        end
+        _tirith_v3_remove_capture_files "$outfile" "$errfile" >/dev/null 2>&1
+        set -l v3_malformed_cmd (_tirith_escape_preview "$cmd")
+        _tirith_output ""
+        _tirith_output "command> $v3_malformed_cmd"
+        if test -n "$output"
+            _tirith_output "$output"
+        end
+        _tirith_output "tirith: invalid execution-receipt response; command blocked"
+        commandline -r ""
+        commandline -f repaint
+        return 1
+    end
+
+    # Legacy protocol-off behavior: stdout carries approval metadata paths, and
+    # the shell owns the historical prompt/fallback workflow below.
     set -l approval_path ""
     set -l warn_ack_path ""
     if test -s $outfile
@@ -211,7 +557,12 @@ function _tirith_check_command
     if test -s $errfile
         set output (string collect < $errfile)
     end
-    command rm -f $outfile $errfile
+    if not _tirith_v3_remove_capture_files "$outfile" "$errfile" >/dev/null 2>&1
+        _tirith_output "tirith: secure preflight capture cleanup failed; command blocked"
+        commandline -r ""
+        commandline -f repaint
+        return 1
+    end
 
     if test $rc -eq 0
         # Allow: no output
@@ -236,8 +587,8 @@ function _tirith_check_command
             _tirith_output "$output"
         end
         _tirith_output "tirith: unexpected exit code $rc — running unprotected"
-        test -n "$approval_path"; and command rm -f "$approval_path"
-        test -n "$warn_ack_path"; and command rm -f "$warn_ack_path"
+        test -n "$approval_path"; and _tirith_v3_remove_capture_files "$approval_path" >/dev/null 2>&1
+        test -n "$warn_ack_path"; and _tirith_v3_remove_capture_files "$warn_ack_path" >/dev/null 2>&1
         commandline -f execute
         return
     end
@@ -253,10 +604,12 @@ function _tirith_check_command
             end
             set -l response ""
             if test "$_tirith_ap_timeout" -gt 0
-                # Fish read has no timeout flag; delegate to bash read -t
+                # Fish read has no timeout flag; delegate to a pinned system Bash.
                 set -l timeout_s $_tirith_ap_timeout
-                if command -q bash
-                    set response (bash -c 'read -t '"$timeout_s"' -p "Approve? ('"$timeout_s"'s timeout) [y/N] " r </dev/tty 2>/dev/null && echo "$r" || echo ""')
+                if test -n "$_TIRITH_BASH_TIMEOUT_BIN"
+                    set response (command "$_TIRITH_BASH_TIMEOUT_BIN" -c \
+                        'read -r -t "$1" -p "Approve? (${1}s timeout) [y/N] " response </dev/tty 2>/dev/null && printf "%s\n" "$response" || :' \
+                        tirith-approval "$timeout_s")
                 else
                     # Fallback: blocking read (no timeout support without bash)
                     read -P "Approve? [y/N] " response
@@ -274,7 +627,7 @@ function _tirith_check_command
                         _tirith_output "tirith: approval not granted — fallback: warn"
                     case '*'
                         _tirith_output "tirith: approval not granted — fallback: block"
-                        test -n "$warn_ack_path"; and command rm -f "$warn_ack_path"
+                        test -n "$warn_ack_path"; and _tirith_v3_remove_capture_files "$warn_ack_path" >/dev/null 2>&1
                         commandline -r ""
                         commandline -f repaint
                         return 1
@@ -282,7 +635,7 @@ function _tirith_check_command
             end
         else if test $rc -eq 1
             # Approval not required but command was blocked: honor block
-            test -n "$warn_ack_path"; and command rm -f "$warn_ack_path"
+            test -n "$warn_ack_path"; and _tirith_v3_remove_capture_files "$warn_ack_path" >/dev/null 2>&1
             commandline -r ""
             commandline -f repaint
             return 1
@@ -308,7 +661,7 @@ function _tirith_check_command
             return 1
         end
     else if test -n "$warn_ack_path"
-        command rm -f "$warn_ack_path"
+        _tirith_v3_remove_capture_files "$warn_ack_path" >/dev/null 2>&1
     end
 
     commandline -f execute
@@ -360,7 +713,12 @@ end
 # and a non-interactive child process has no tirith protection — so it must not
 # inherit a status that would misrepresent it.
 if status is-interactive
-    set -g TIRITH_STATUS blocks
+    if test $_TIRITH_RECEIPT_PROTOCOL -eq 3
+        set -g TIRITH_STATUS blocks
+    else
+        set -g TIRITH_STATUS degraded
+        _tirith_output "tirith: execution receipts unavailable; shell protection is running in legacy mode"
+    end
 end
 
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────

@@ -66,17 +66,23 @@ struct TrustListRow {
 /// when the error mentions "git repository" (i.e., `--scope repo` failed
 /// because we are outside a git repo).
 fn print_trust_error(subcmd: &str, err: &str, hint_pattern: Option<&str>) {
-    let subcmd = human(subcmd);
-    let err = human(err);
-    eprintln!("tirith: trust {subcmd}: {err}");
+    eprintln!("{}", trust_error_line(subcmd, err));
     if err.contains("git repository") {
         if let Some(pattern) = hint_pattern {
             let display_pattern = human(pattern);
-            let quoted = tirith_core::safe_command::shell_single_quote(&display_pattern)
-                .unwrap_or_else(|| "'[unsafe pattern]'".to_string());
-            eprintln!("  try: tirith trust {subcmd} {} --scope user", quoted);
+            let quoted = if display_pattern == pattern {
+                tirith_core::safe_command::shell_single_quote(pattern)
+                    .unwrap_or_else(|| "'[unsafe pattern]'".to_string())
+            } else {
+                "'[unsafe pattern]'".to_string()
+            };
+            eprintln!(
+                "  try: tirith trust {} {} --scope user",
+                human(subcmd),
+                quoted
+            );
         } else {
-            eprintln!("  try: tirith trust {subcmd} --scope user");
+            eprintln!("  try: tirith trust {} --scope user", human(subcmd));
         }
     }
 }
@@ -87,6 +93,25 @@ fn human(value: &str) -> String {
 
 fn human_multiline(value: &str) -> String {
     super::sanitize_for_human_output(value, true)
+}
+
+/// Render one trust-command error at the final human-output boundary. Both the
+/// action and detail may originate outside the typed CLI path (library callers,
+/// loaded parser diagnostics, environment-derived paths), so sanitize the
+/// complete dynamic fields here instead of relying on validation upstream.
+fn trust_error_line(action: &str, detail: &str) -> String {
+    format!("tirith: trust {}: {}", human(action), human(detail))
+}
+
+fn unknown_scope_line(action: &str, scope: &str, allowed: &str) -> String {
+    trust_error_line(action, &format!("unknown scope '{scope}' (use {allowed})"))
+}
+
+fn trust_prompt_line(domain: &str) -> String {
+    format!(
+        "Trust {}? [y/N/r(rule-scoped)/t(temporary 7d)] ",
+        human(domain)
+    )
 }
 
 /// Serialize `value` as pretty JSON to stdout. Returns `0` on success, `1` on a
@@ -100,7 +125,10 @@ fn print_json(value: &impl Serialize) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("tirith: JSON serialization failed: {e}");
+            eprintln!(
+                "tirith: JSON serialization failed: {}",
+                human(&e.to_string())
+            );
             1
         }
     }
@@ -398,34 +426,508 @@ fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), St
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
-    let root = path
-        .parent()
-        .and_then(std::path::Path::parent)
-        .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
-    if path.parent().is_some_and(std::path::Path::exists)
-        && !tirith_core::util::canonical_within(path, root)
-    {
-        return Err("refusing repo trust path outside the repository root".to_string());
+#[cfg(windows)]
+mod windows_repo_store {
+    use super::{fs, io, Read, TrustStore, Write, TRUST_STORE_MAX_BYTES};
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle};
+    use std::path::{Path, PathBuf};
+
+    use windows::core::{HRESULT, PCWSTR};
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, FileDispositionInfo, FileRenameInfo,
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, SetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO_0,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
+    };
+
+    struct OwnedHandle(HANDLE);
+
+    impl OwnedHandle {
+        fn into_file(self) -> fs::File {
+            let raw = self.0 .0 as RawHandle;
+            std::mem::forget(self);
+            // SAFETY: the handle is valid, uniquely owned, and forgotten above.
+            unsafe { fs::File::from_raw_handle(raw) }
+        }
     }
-    load_store(path)
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: `OwnedHandle` owns exactly one live Win32 handle.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct RepoTrustDir {
+        path: PathBuf,
+        final_path: String,
+        _root: OwnedHandle,
+        directory: OwnedHandle,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct FileIdentity {
+        volume: u32,
+        index: u64,
+        size: u64,
+        last_write: u64,
+        attributes: u32,
+    }
+
+    #[repr(C)]
+    struct TrustRenameInfo {
+        _anonymous: FILE_RENAME_INFO_0,
+        _root_directory: HANDLE,
+        _file_name_length: u32,
+        _file_name: [u16; 10],
+    }
+
+    const TRUST_FILE_NAME_UTF16: [u16; 10] = [
+        b't' as u16,
+        b'r' as u16,
+        b'u' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'.' as u16,
+        b'j' as u16,
+        b's' as u16,
+        b'o' as u16,
+        b'n' as u16,
+    ];
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    fn is_win32(error: &windows::core::Error, code: u32) -> bool {
+        error.code() == HRESULT::from_win32(code)
+    }
+
+    fn final_path(handle: HANDLE) -> Result<String, String> {
+        let mut buffer = vec![0u16; 512];
+        loop {
+            let length =
+                unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, Default::default()) };
+            if length == 0 {
+                return Err(format!(
+                    "cannot resolve path held by repo trust handle: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            if (length as usize) < buffer.len() {
+                return Ok(String::from_utf16_lossy(&buffer[..length as usize]));
+            }
+            buffer.resize(length as usize + 1, 0);
+        }
+    }
+
+    fn normalized_final_path(path: &str) -> String {
+        let path = path.replace('/', "\\");
+        let path = path
+            .strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| path.strip_prefix(r"\\?\").map(str::to_owned))
+            .unwrap_or(path);
+        path.trim_end_matches('\\').to_lowercase()
+    }
+
+    fn is_exact_child(parent: &str, child: &str, name: &str) -> bool {
+        let expected = format!("{}\\{}", normalized_final_path(parent), name.to_lowercase());
+        normalized_final_path(child) == expected
+    }
+
+    fn inspect_directory(handle: HANDLE, path: &Path) -> Result<(), String> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(|error| {
+            format!(
+                "cannot inspect repo trust directory {}: {error}",
+                path.display()
+            )
+        })?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0
+        {
+            return Err(format!(
+                "refusing reparse or non-directory repo trust component {}",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_directory(path: &Path) -> Result<Option<OwnedHandle>, String> {
+        let path_wide = wide(path);
+        let handle = match unsafe {
+            CreateFileW(
+                PCWSTR(path_wide.as_ptr()),
+                (FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        } {
+            Ok(handle) => handle,
+            Err(error)
+                if is_win32(&error, ERROR_FILE_NOT_FOUND.0)
+                    || is_win32(&error, ERROR_PATH_NOT_FOUND.0) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot open repo trust directory {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let owned = OwnedHandle(handle);
+        inspect_directory(handle, path)?;
+        Ok(Some(owned))
+    }
+
+    fn split_path(path: &Path) -> Result<(&Path, &Path), String> {
+        if path.file_name() != Some(std::ffi::OsStr::new("trust.json")) {
+            return Err("repo trust path is not <root>/.tirith/trust.json".to_string());
+        }
+        let directory = path
+            .parent()
+            .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new(".tirith")))
+            .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
+        let root = directory
+            .parent()
+            .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
+        Ok((root, directory))
+    }
+
+    fn open_repo_dir(path: &Path, create: bool) -> Result<Option<RepoTrustDir>, String> {
+        let (root_path, directory_path) = split_path(path)?;
+        let root = open_directory(root_path)?
+            .ok_or_else(|| format!("repository root {} does not exist", root_path.display()))?;
+        let root_final = final_path(root.0)?;
+
+        let directory = match open_directory(directory_path)? {
+            Some(directory) => directory,
+            None if !create => return Ok(None),
+            None => {
+                let directory_wide = wide(directory_path);
+                if let Err(error) =
+                    unsafe { CreateDirectoryW(PCWSTR(directory_wide.as_ptr()), None) }
+                {
+                    if !is_win32(&error, ERROR_ALREADY_EXISTS.0) {
+                        return Err(format!(
+                            "cannot create repo trust directory {}: {error}",
+                            directory_path.display()
+                        ));
+                    }
+                }
+                open_directory(directory_path)?.ok_or_else(|| {
+                    format!(
+                        "repo trust directory {} disappeared after creation",
+                        directory_path.display()
+                    )
+                })?
+            }
+        };
+        let directory_final = final_path(directory.0)?;
+        if !is_exact_child(&root_final, &directory_final, ".tirith") {
+            return Err(
+                "repo trust directory resolves outside the held repository root".to_string(),
+            );
+        }
+        Ok(Some(RepoTrustDir {
+            path: directory_path.to_path_buf(),
+            final_path: directory_final,
+            _root: root,
+            directory,
+        }))
+    }
+
+    fn inspect_regular(handle: HANDLE, path: &Path) -> Result<FileIdentity, String> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(|error| {
+            format!("cannot inspect repo trust file {}: {error}", path.display())
+        })?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        {
+            return Err(format!(
+                "refusing reparse or non-regular repo trust file {}",
+                path.display()
+            ));
+        }
+        Ok(FileIdentity {
+            volume: info.dwVolumeSerialNumber,
+            index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+            last_write: ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+                | info.ftLastWriteTime.dwLowDateTime as u64,
+            attributes: info.dwFileAttributes,
+        })
+    }
+
+    fn open_regular_file(
+        directory: &RepoTrustDir,
+        path: &Path,
+    ) -> Result<Option<(fs::File, FileIdentity)>, String> {
+        let path_wide = wide(path);
+        let handle = match unsafe {
+            CreateFileW(
+                PCWSTR(path_wide.as_ptr()),
+                (FILE_GENERIC_READ | FILE_READ_ATTRIBUTES).0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        } {
+            Ok(handle) => handle,
+            Err(error)
+                if is_win32(&error, ERROR_FILE_NOT_FOUND.0)
+                    || is_win32(&error, ERROR_PATH_NOT_FOUND.0) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "refusing repo trust file {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let owned = OwnedHandle(handle);
+        let identity = inspect_regular(handle, path)?;
+        let file_final = final_path(handle)?;
+        if !is_exact_child(&directory.final_path, &file_final, "trust.json") {
+            return Err("repo trust file resolves outside the held .tirith directory".to_string());
+        }
+        Ok(Some((owned.into_file(), identity)))
+    }
+
+    fn mark_held_file_for_deletion(file: &fs::File) -> Result<(), String> {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        }
+        .map_err(|error| format!("cannot remove exact repo trust temp identity: {error}"))
+    }
+
+    fn cleanup_suffix(file: &fs::File) -> String {
+        mark_held_file_for_deletion(file)
+            .err()
+            .map(|error| format!("; exact-handle cleanup also failed: {error}"))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn load(path: &Path) -> Result<TrustStore, String> {
+        let Some(directory) = open_repo_dir(path, false)? else {
+            return Ok(TrustStore::default());
+        };
+        let Some((mut file, before)) = open_regular_file(&directory, path)? else {
+            return Ok(TrustStore::default());
+        };
+        if before.size > TRUST_STORE_MAX_BYTES {
+            return Err(format!(
+                "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
+            ));
+        }
+        let mut bytes = Vec::with_capacity(before.size as usize);
+        (&mut file)
+            .take(TRUST_STORE_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cannot read repo trust store: {error}"))?;
+        if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
+            return Err(format!(
+                "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
+            ));
+        }
+        let after = inspect_regular(HANDLE(file.as_raw_handle()), path)?;
+        if before != after || bytes.len() as u64 != after.size {
+            return Err("repo trust store changed while being read".to_string());
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("corrupt trust store at {}: {error}", path.display()))
+    }
+
+    pub(super) fn write(path: &Path, store: &TrustStore) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(store)
+            .map_err(|error| format!("failed to serialize trust store: {error}"))?;
+        if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
+            return Err(format!(
+                "refusing to write repo trust store above the {TRUST_STORE_MAX_BYTES} byte limit"
+            ));
+        }
+
+        let directory = open_repo_dir(path, true)?
+            .ok_or_else(|| "repo trust directory disappeared during creation".to_string())?;
+        // Reject an existing reparse point or non-regular object. A later
+        // destination swap is safe because publication replaces the directory
+        // entry through the held temporary-file and parent-directory handles.
+        drop(open_regular_file(&directory, path)?);
+
+        let temp_name = format!(".trust.json.{}.tmp", uuid::Uuid::new_v4().simple());
+        let temp_path = directory.path.join(&temp_name);
+        let temp_wide = wide(&temp_path);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(temp_wide.as_ptr()),
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE).0,
+                Default::default(),
+                None,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|error| format!("cannot create exclusive repo trust temp file: {error}"))?;
+        let owned = OwnedHandle(handle);
+        let temp_final = match final_path(handle) {
+            Ok(path) => path,
+            Err(error) => {
+                let file = owned.into_file();
+                let cleanup = cleanup_suffix(&file);
+                return Err(format!("{error}{cleanup}"));
+            }
+        };
+        if !is_exact_child(&directory.final_path, &temp_final, &temp_name) {
+            let file = owned.into_file();
+            let cleanup = cleanup_suffix(&file);
+            return Err(format!(
+                "repo trust temp file resolves outside the held .tirith directory{cleanup}"
+            ));
+        }
+        let mut file = owned.into_file();
+        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+            let cleanup = cleanup_suffix(&file);
+            return Err(format!(
+                "failed to write and sync repo trust temp file: {error}{cleanup}"
+            ));
+        }
+        let temp_identity = match inspect_regular(HANDLE(file.as_raw_handle()), &temp_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let cleanup = cleanup_suffix(&file);
+                return Err(format!("{error}{cleanup}"));
+            }
+        };
+        if temp_identity.size != bytes.len() as u64 {
+            let cleanup = cleanup_suffix(&file);
+            return Err(format!(
+                "repo trust temp file size changed before publication{cleanup}"
+            ));
+        }
+
+        let mut rename_mode = FILE_RENAME_INFO_0::default();
+        rename_mode.ReplaceIfExists = true;
+        let rename = TrustRenameInfo {
+            _anonymous: rename_mode,
+            _root_directory: directory.directory.0,
+            _file_name_length: (TRUST_FILE_NAME_UTF16.len() * std::mem::size_of::<u16>()) as u32,
+            _file_name: TRUST_FILE_NAME_UTF16,
+        };
+        if let Err(error) = unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileRenameInfo,
+                (&rename as *const TrustRenameInfo).cast(),
+                std::mem::size_of::<TrustRenameInfo>() as u32,
+            )
+        } {
+            let cleanup = cleanup_suffix(&file);
+            return Err(format!(
+                "failed to atomically publish repo trust store: {error}{cleanup}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+        #[test]
+        fn fixed_rename_buffer_matches_win32_header_layout() {
+            assert_eq!(
+                std::mem::offset_of!(TrustRenameInfo, _anonymous),
+                std::mem::offset_of!(FILE_RENAME_INFO, Anonymous)
+            );
+            assert_eq!(
+                std::mem::offset_of!(TrustRenameInfo, _root_directory),
+                std::mem::offset_of!(FILE_RENAME_INFO, RootDirectory)
+            );
+            assert_eq!(
+                std::mem::offset_of!(TrustRenameInfo, _file_name_length),
+                std::mem::offset_of!(FILE_RENAME_INFO, FileNameLength)
+            );
+            assert_eq!(
+                std::mem::offset_of!(TrustRenameInfo, _file_name),
+                std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+            );
+            assert_eq!(
+                std::mem::size_of::<TrustRenameInfo>(),
+                std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+                    + std::mem::size_of_val(&TRUST_FILE_NAME_UTF16)
+            );
+        }
+    }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
+    windows_repo_store::load(path)
+}
+
+#[cfg(windows)]
 fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
-    let root = path
+    windows_repo_store::write(path, store)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
+    let parent = path
         .parent()
-        .and_then(std::path::Path::parent)
-        .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
-    let dir = path.parent().expect("checked above");
-    if !dir.exists() {
-        fs::create_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        .ok_or_else(|| "repo trust path has no parent".to_string())?;
+    match fs::symlink_metadata(parent) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(TrustStore::default()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("refusing symlinked or non-directory repo trust path".to_string())
+        }
+        Ok(_) => {}
+        Err(error) => return Err(format!("cannot inspect repo trust directory: {error}")),
     }
-    if !tirith_core::util::canonical_within(path, root) {
-        return Err("refusing repo trust path outside the repository root".to_string());
+    if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+        return Ok(TrustStore::default());
     }
-    write_store(path, store)
+    Err(
+        "repo-scoped trust requires descriptor-relative no-symlink filesystem operations, which are not available on this platform; use --scope user"
+            .to_string(),
+    )
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
+    let _ = (path, store);
+    Err(
+        "repo-scoped trust requires descriptor-relative no-symlink filesystem operations, which are not available on this platform; use --scope user"
+            .to_string(),
+    )
 }
 
 /// Parse a duration string like "1h", "7d", "30d" into an expiry timestamp.
@@ -548,7 +1050,7 @@ pub fn add(
     policy.load_user_lists();
     policy.load_org_lists(None);
     if let Err(e) = validate_pattern(pattern, &policy) {
-        eprintln!("tirith: trust add: {e}");
+        eprintln!("{}", trust_error_line("add", &e));
         return 1;
     }
 
@@ -594,7 +1096,7 @@ pub fn add(
     let mut store = match load_store_scoped(scope, &path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tirith: trust add: {e}");
+            eprintln!("{}", trust_error_line("add", &e));
             return 1;
         }
     };
@@ -610,7 +1112,7 @@ pub fn add(
         match parse_ttl(effective) {
             Ok(exp) => (Some(exp), Some(effective.to_string())),
             Err(e) => {
-                eprintln!("tirith: trust add: {e}");
+                eprintln!("{}", trust_error_line("add", &e));
                 return 1;
             }
         }
@@ -628,7 +1130,7 @@ pub fn add(
     store.entries.push(entry);
 
     if let Err(e) = write_store_scoped(scope, &path, &store) {
-        eprintln!("tirith: trust add: {e}");
+        eprintln!("{}", trust_error_line("add", &e));
         return 1;
     }
 
@@ -672,14 +1174,17 @@ pub fn add(
 /// `tirith trust list [--rule <id>] [--json] [--expired] [--scope user|repo|all]`
 pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &str) -> i32 {
     if !matches!(scope, "user" | "repo" | "all") {
-        eprintln!("tirith: trust list: unknown scope '{scope}' (use 'user', 'repo', or 'all')");
+        eprintln!(
+            "{}",
+            unknown_scope_line("list", scope, "'user', 'repo', or 'all'")
+        );
         return 1;
     }
 
     let mut rows: Vec<TrustListRow> = match collect_rows(scope, show_expired) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("tirith: trust list: {e}");
+            eprintln!("{}", trust_error_line("list", &e));
             return 1;
         }
     };
@@ -913,7 +1418,7 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
     let mut store = match load_store_scoped(scope, &path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tirith: trust remove: {e}");
+            eprintln!("{}", trust_error_line("remove", &e));
             return 1;
         }
     };
@@ -939,7 +1444,7 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
     }
 
     if let Err(e) = write_store_scoped(scope, &path, &store) {
-        eprintln!("tirith: trust remove: {e}");
+        eprintln!("{}", trust_error_line("remove", &e));
         return 1;
     }
 
@@ -1089,19 +1594,17 @@ fn suggestion_lines(pairs: &[(String, Option<String>)]) -> Vec<String> {
 fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> String {
     // The target is attacker-controlled (a URL/host pulled from the trigger's
     // finding evidence) and this line is printed for the operator to copy/paste
-    // into a shell. Scrub terminal-control bytes first, then shell-single-quote.
-    // The scrub (`sanitize_text_str`, same filter `output.rs::write_block_advisories`
-    // applies to blocklist URLs) strips ANSI/OSC/zero-width bytes so the target
-    // cannot repaint the operator's terminal at suggest time. The single-quote
-    // then keeps a target carrying `$( )`, backticks, `;`, spaces, a `>` redirect,
-    // or a glob from executing on paste. If it can't be safely quoted (e.g. it
-    // contains a newline), do NOT emit a runnable command — print a safe
-    // manual-trust note instead. The `--rule <rid>` is a snake_case enum Display
-    // (not attacker-controlled), so it needs no quoting. The printed `--ttl` uses
-    // `DEFAULT_TTL`, the same value `--apply` resolves to (see `from_last_trigger`),
-    // so the suggestion and the applied entry can't drift.
-    let scrubbed = tirith_core::mcp::output_filter::sanitize_text_str(target);
-    let Some(quoted) = tirith_core::safe_command::shell_single_quote(&scrubbed) else {
+    // into a shell. If display sanitization would alter any character, emit only
+    // a static manual-review note: silently stripping an escape, bidi control, or
+    // forged newline could turn untrusted data into a different runnable trust
+    // command. Benign shell metacharacters remain unchanged here and are protected
+    // by the single-quote below.
+    if human(target) != target {
+        return "# trust this target manually with `tirith trust add` \
+                (it contains characters unsafe to embed in a suggested command)."
+            .to_string();
+    }
+    let Some(quoted) = tirith_core::safe_command::shell_single_quote(target) else {
         return "# trust this target manually with `tirith trust add` \
                 (it contains characters unsafe to embed in a suggested command)."
             .to_string();
@@ -1109,15 +1612,19 @@ fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> St
     let broad = if needs_broad { " --broad" } else { "" };
     match rule_id {
         Some(rid) => {
-            let rid = human(rid);
+            if human(rid) != rid {
+                return "# trust this target manually with `tirith trust add` \
+                        (its rule id contains characters unsafe to embed in a suggested command)."
+                    .to_string();
+            }
             let rid = if rid
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
                 && !rid.is_empty()
             {
-                rid
+                rid.to_string()
             } else {
-                let Some(quoted) = tirith_core::safe_command::shell_single_quote(&rid) else {
+                let Some(quoted) = tirith_core::safe_command::shell_single_quote(rid) else {
                     return "# trust this target manually with `tirith trust add` \
                             (its rule id contains characters unsafe to embed in a suggested command)."
                         .to_string();
@@ -1146,7 +1653,7 @@ pub fn from_last_trigger(apply: bool) -> i32 {
             return 0;
         }
         Err(e) => {
-            eprintln!("tirith: trust from-last-trigger: {e}");
+            eprintln!("{}", trust_error_line("from-last-trigger", &e));
             return 1;
         }
     };
@@ -1160,7 +1667,7 @@ pub fn from_last_trigger(apply: bool) -> i32 {
         eprintln!("Suggested trust commands (run the narrowest one that fits):");
         eprintln!();
         for line in suggestion_lines(&pairs) {
-            println!("{line}");
+            println!("{}", human(&line));
         }
         eprintln!();
         eprintln!("Re-run with --apply to add these automatically.");
@@ -1215,7 +1722,7 @@ pub fn last() -> i32 {
             return 1;
         }
         Err(e) => {
-            eprintln!("tirith: {e}");
+            eprintln!("{}", trust_error_line("last", &e));
             return 1;
         }
     };
@@ -1261,7 +1768,7 @@ pub fn last() -> i32 {
     for domain in &domains {
         let display_domain = human(domain);
         eprintln!();
-        eprint!("Trust {display_domain}? [y/N/r(rule-scoped)/t(temporary 7d)] ");
+        eprint!("{}", trust_prompt_line(domain));
         let _ = io::stderr().flush();
 
         let stdin = io::stdin();
@@ -1324,7 +1831,8 @@ pub fn prune(expired: bool, scope: &str, json: bool) -> i32 {
 fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) -> i32 {
     if !matches!(scope, "user" | "repo" | "all") {
         eprintln!(
-            "tirith: trust {action_label}: unknown scope '{scope}' (use 'user', 'repo', or 'all')",
+            "{}",
+            unknown_scope_line(action_label, scope, "'user', 'repo', or 'all'"),
         );
         return 1;
     }
@@ -1355,7 +1863,7 @@ fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) ->
         let mut store = match load_store_scoped(s, &path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("tirith: trust {action_label}: {e}");
+                eprintln!("{}", trust_error_line(action_label, &e));
                 return 1;
             }
         };
@@ -1373,7 +1881,7 @@ fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) ->
 
         if removed > 0 {
             if let Err(e) = write_store_scoped(s, &path, &store) {
-                eprintln!("tirith: trust {action_label}: {e}");
+                eprintln!("{}", trust_error_line(action_label, &e));
                 return 1;
             }
             for entry in &expired_entries {
@@ -1387,7 +1895,9 @@ fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) ->
             }
             if !json {
                 eprintln!(
-                    "tirith: {action_label}: removed {removed} expired entries from {s} scope",
+                    "tirith: {}: removed {removed} expired entries from {} scope",
+                    human(action_label),
+                    human(s),
                 );
             }
         }
@@ -1407,7 +1917,7 @@ fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) ->
         return print_json(&out);
     }
     if total_removed == 0 {
-        eprintln!("tirith: {action_label}: no expired entries found");
+        eprintln!("tirith: {}: no expired entries found", human(action_label));
     }
 
     0
@@ -1446,7 +1956,10 @@ struct ExplainMatch {
 /// `tirith trust explain <pattern>`.
 pub fn explain(pattern: &str, scope: &str, json: bool) -> i32 {
     if !matches!(scope, "user" | "repo" | "all") {
-        eprintln!("tirith: trust explain: unknown scope '{scope}' (use 'user', 'repo', or 'all')");
+        eprintln!(
+            "{}",
+            unknown_scope_line("explain", scope, "'user', 'repo', or 'all'")
+        );
         return 1;
     }
     if pattern.is_empty() {
@@ -1477,7 +1990,7 @@ pub fn explain(pattern: &str, scope: &str, json: bool) -> i32 {
         let store = match load_store_scoped(s, &path) {
             Ok(st) => st,
             Err(e) => {
-                eprintln!("tirith: trust explain: {e}");
+                eprintln!("{}", trust_error_line("explain", &e));
                 return 1;
             }
         };
@@ -1791,7 +2304,10 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
         Some(s) => match parse_relative_duration(s) {
             Ok(c) => Some(c),
             Err(e) => {
-                eprintln!("tirith: trust audit: invalid --since value: {e}");
+                eprintln!(
+                    "{}",
+                    trust_error_line("audit", &format!("invalid --since value: {e}"))
+                );
                 return 1;
             }
         },
@@ -1810,8 +2326,11 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
             let _ = print_json(&serde_json::json!({"entries": [], "skipped_lines": 0_usize}));
         } else {
             eprintln!(
-                "tirith: trust audit: no audit log yet at {}",
-                log_path.display()
+                "{}",
+                trust_error_line(
+                    "audit",
+                    &format!("no audit log yet at {}", log_path.display())
+                )
             );
         }
         return 0;
@@ -1822,8 +2341,11 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
-                "tirith: trust audit: cannot read audit log at {}: {e}",
-                log_path.display(),
+                "{}",
+                trust_error_line(
+                    "audit",
+                    &format!("cannot read audit log at {}: {e}", log_path.display())
+                )
             );
             return 1;
         }
@@ -1833,9 +2355,15 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
     // operator chasing a missing entry. JSON shape includes it in the envelope below.
     if result.skipped_lines > 0 && !json {
         eprintln!(
-            "tirith: trust audit: skipped {} malformed audit log line(s) at {}",
-            result.skipped_lines,
-            log_path.display(),
+            "{}",
+            trust_error_line(
+                "audit",
+                &format!(
+                    "skipped {} malformed audit log line(s) at {}",
+                    result.skipped_lines,
+                    log_path.display()
+                )
+            )
         );
     }
 
@@ -2251,11 +2779,12 @@ mod tests {
         assert_eq!(loaded.entries[0].reason.as_deref(), Some("internal mirror"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn repo_store_roundtrip_is_atomic_and_leaves_no_temp_files() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join(".tirith/trust.json");
+        assert!(load_repo_store(&path).unwrap().entries.is_empty());
         let store = TrustStore {
             version: 1,
             entries: vec![TrustEntry {
@@ -2269,6 +2798,8 @@ mod tests {
         };
         write_repo_store(&path, &store).unwrap();
         assert_eq!(load_repo_store(&path).unwrap().entries.len(), 1);
+        write_repo_store(&path, &TrustStore::default()).unwrap();
+        assert!(load_repo_store(&path).unwrap().entries.is_empty());
         let names: Vec<_> = fs::read_dir(root.path().join(".tirith"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -2312,7 +2843,55 @@ mod tests {
         assert_eq!(fs::read(outside.path()).unwrap(), before);
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn repo_store_rejects_windows_reparse_directory_component() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_store = outside.path().join("trust.json");
+        fs::write(&outside_store, r#"{"version":1,"entries":[]}"#).unwrap();
+        if let Err(error) = symlink_dir(outside.path(), root.path().join(".tirith")) {
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("cannot create Windows directory symlink fixture: {error}");
+        }
+        let path = root.path().join(".tirith/trust.json");
+        let before = fs::read(&outside_store).unwrap();
+
+        assert!(load_repo_store(&path).is_err());
+        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
+        assert_eq!(fs::read(&outside_store).unwrap(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repo_store_rejects_windows_reparse_destination() {
+        use std::os::windows::fs::symlink_file;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), r#"{"version":1,"entries":[]}"#).unwrap();
+        fs::create_dir(root.path().join(".tirith")).unwrap();
+        let path = root.path().join(".tirith/trust.json");
+        if let Err(error) = symlink_file(outside.path(), &path) {
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("cannot create Windows file symlink fixture: {error}");
+        }
+        let before = fs::read(outside.path()).unwrap();
+
+        assert!(load_repo_store(&path).is_err());
+        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
+        assert_eq!(fs::read(outside.path()).unwrap(), before);
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn repo_store_rejects_oversized_and_non_regular_files() {
         let root = tempfile::tempdir().unwrap();
@@ -2325,6 +2904,24 @@ mod tests {
         fs::create_dir(&path).unwrap();
         assert!(load_repo_store(&path).is_err());
         assert!(write_repo_store(&path, &TrustStore::default()).is_err());
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    #[test]
+    fn repo_store_is_empty_when_absent_and_mutation_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".tirith/trust.json");
+        assert!(load_repo_store(&path).unwrap().entries.is_empty());
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        assert!(load_repo_store(&path).unwrap().entries.is_empty());
+        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
+        assert!(!path.exists());
+
+        fs::write(&path, br#"{"version":1,"entries":[]}"#).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(load_repo_store(&path).is_err());
+        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -2347,6 +2944,53 @@ mod tests {
             !structured.contains('\u{1b}'),
             "JSON must escape raw ESC bytes"
         );
+    }
+
+    fn assert_safe_single_line(rendered: &str) {
+        for forbidden in ['\u{1b}', '\u{7}', '\u{202e}', '\u{200b}'] {
+            assert!(
+                !rendered.contains(forbidden),
+                "forbidden terminal/deception character {forbidden:?} survived in {rendered:?}"
+            );
+        }
+        assert!(
+            !rendered.contains('\n'),
+            "forged line survived: {rendered:?}"
+        );
+        assert!(!rendered.contains('\r'), "bare CR survived: {rendered:?}");
+    }
+
+    #[test]
+    fn hostile_scope_action_and_prompt_are_safe_at_the_final_sink() {
+        let hostile = "repo\u{1b}]52;c;Y2xpcA\u{7}\u{1b}[2J\nFORGED\u{202e}\u{200b}";
+        let scope_line = unknown_scope_line(hostile, hostile, "'user', 'repo', or 'all'");
+        let prompt = trust_prompt_line(hostile);
+        assert_safe_single_line(&scope_line);
+        assert_safe_single_line(&prompt);
+        assert_eq!(
+            unknown_scope_line("list", "staging", "'user', 'repo', or 'all'"),
+            "tirith: trust list: unknown scope 'staging' (use 'user', 'repo', or 'all')"
+        );
+        assert_eq!(
+            trust_prompt_line("example.com"),
+            "Trust example.com? [y/N/r(rule-scoped)/t(temporary 7d)] "
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_store_error_sanitizes_hostile_path_and_parser_diagnostic_at_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("trust\u{1b}]52;c;Y2xpcA\u{7}\nFORGED\u{202e}\u{200b}.json");
+        fs::write(&path, b"{ definitely-not-json").unwrap();
+
+        let error = load_store(&path).unwrap_err();
+        let rendered = trust_error_line("list", &error);
+        assert_safe_single_line(&rendered);
+        assert!(rendered.contains("tirith: trust list: corrupt trust store at"));
+        assert!(rendered.contains("definitely-not-json") || rendered.contains("key"));
     }
 
     #[test]
@@ -2820,24 +3464,27 @@ mod tests {
              (it contains characters unsafe to embed in a suggested command)."
         );
 
-        // Defense-in-depth: ANSI/OSC escape bytes in the target are scrubbed
-        // BEFORE quoting (single-quoting blocks shell execution, but a raw ESC
-        // could still spoof the operator's terminal as the line is printed). The
-        // emitted line must carry no raw ESC (0x1B) byte.
+        // ANSI/OSC and deceptive Unicode must never be silently stripped into a
+        // different runnable trust command. The sink emits only the static,
+        // non-runnable manual-review note.
         let osc = format_add_line(
             "evil.example/\u{1b}]0;pwned\u{7}\u{1b}[31m",
             Some("confusable_domain"),
             true,
         );
-        assert!(
-            !osc.contains('\u{1b}'),
-            "ESC (0x1B) must be scrubbed before the suggestion is printed: {osc:?}"
+        assert_eq!(
+            osc,
+            "# trust this target manually with `tirith trust add` \
+             (it contains characters unsafe to embed in a suggested command)."
         );
-        // The scrub strips the control bytes but keeps the printable remainder,
-        // so this is still a runnable (single-quoted) trust command.
-        assert!(
-            osc.contains("tirith trust add"),
-            "scrubbed target should still yield a runnable trust line: {osc:?}"
+        assert_eq!(
+            format_add_line(
+                "evil.example/\u{202e}txt.exe\u{200b}",
+                Some("confusable_domain"),
+                true,
+            ),
+            "# trust this target manually with `tirith trust add` \
+             (it contains characters unsafe to embed in a suggested command)."
         );
     }
 

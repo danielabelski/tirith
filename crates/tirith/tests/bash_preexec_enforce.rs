@@ -384,9 +384,16 @@ printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
     );
     // The prompt indicator (non-exported shell var, read in the same shell) also
     // reports `blocks` once enforcement engages (it starts warn-only, upgrades).
+    // This fake binary does not negotiate receipt protocol v3; that separately
+    // degrades durable execution evidence, not the hook's blocking ability.
     assert!(
         stderr.contains("STATUS=blocks"),
         "engaged enforcement must set TIRITH_STATUS=blocks, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("execution receipts unavailable")
+            && stderr.contains("execution evidence is degraded"),
+        "receipt evidence loss must remain visible without relabeling blocking protection: {stderr}"
     );
     let _ = fs::remove_dir_all(&_tmp);
 }
@@ -414,6 +421,11 @@ printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
     assert!(
         stderr.contains("STATUS=degraded"),
         "enforcement refused by hostile history must set TIRITH_STATUS=degraded, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("execution receipts unavailable")
+            && stderr.contains("execution evidence is degraded"),
+        "receipt evidence loss must remain visible without relabeling warn-only protection: {stderr}"
     );
     let _ = fs::remove_dir_all(&_tmp);
 }

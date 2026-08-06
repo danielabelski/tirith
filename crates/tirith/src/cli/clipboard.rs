@@ -22,7 +22,7 @@ use tirith_core::extract::ScanContext;
 use tirith_core::output;
 use tirith_core::redact::{redact_for_audience_with_custom, ShareAudience};
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::Severity;
+use tirith_core::verdict::{RuleId, Severity};
 
 /// Max file size for `tirith clipboard copy` — matches `tirith paste`'s 1 MiB cap.
 const MAX_COPY_BYTES: u64 = 1024 * 1024;
@@ -81,15 +81,29 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
     let has_high = has_blocking_findings(&verdict);
 
     if has_high && !redact {
+        let secret_shaped = verdict.findings.iter().any(|finding| {
+            matches!(
+                finding.rule_id,
+                RuleId::CredentialInText
+                    | RuleId::HighEntropySecret
+                    | RuleId::PrivateKeyExposed
+                    | RuleId::SensitiveEnvExport
+            )
+        });
+        let refusal = if secret_shaped {
+            "secret-shaped content detected; clipboard write refused; use --redact to attempt a sanitized copy (unrelated blockers remain refused)"
+        } else {
+            "blocking content detected; clipboard write refused"
+        };
         if json {
             let env = ScanEnvelope {
                 status: "refused",
                 verdict: Some(&verdict),
-                error: Some("blocking content detected; clipboard write refused"),
+                error: Some(refusal),
             };
             write_json_or_complain(&env);
         } else {
-            eprintln!("tirith clipboard copy: blocking content detected; clipboard write refused");
+            eprintln!("tirith clipboard copy: {refusal}");
         }
         return 1;
     }

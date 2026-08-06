@@ -11,9 +11,7 @@ on:
         default: true
 
 permissions:
-  contents: write
-  id-token: write # For sigstore signing
-  packages: write # For GHCR Docker images
+  contents: read
 
 jobs:
   enforcement-check:
@@ -58,6 +56,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: "1.97.0"
+
+      - name: Verify release security contracts
+        run: cargo test --release --locked -p tirith --test release_security
 
       - name: Build native binary for completions
         run: cargo build --release --locked -p tirith
@@ -239,11 +240,93 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Remove-Item -Recurse -Force $tmpdir -ErrorAction SilentlyContinue
 
+  attest-packages:
+    name: Attest Linux Packages
+    needs: [build-deb, build-rpm]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download Debian package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tirith-deb
+          path: packages
+
+      - name: Download RPM package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tirith-rpm
+          path: packages
+
+      - name: Verify exact package subject set
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VER="${VERSION#v}"
+          expected_deb="packages/tirith_${VER}_amd64.deb"
+          if [ ! -f "$expected_deb" ]; then
+            echo "ERROR: expected Debian package is missing: ${expected_deb}"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          rpms=(packages/tirith-"${VER}"-*.x86_64.rpm)
+          packages=(packages/*.deb packages/*.rpm)
+          if [ "${#rpms[@]}" -ne 1 ]; then
+            echo "ERROR: expected exactly one x86_64 RPM for ${VER}, found ${#rpms[@]}"
+            exit 1
+          fi
+          if [ "${#packages[@]}" -ne 2 ]; then
+            echo "ERROR: expected exactly one .deb and one .rpm subject, found ${#packages[@]} package files"
+            printf '%s\n' "${packages[@]}"
+            exit 1
+          fi
+
+          sha256sum -- "$expected_deb" "${rpms[0]}"
+
+      - name: Generate package build provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            packages/*.deb
+            packages/*.rpm
+
+      - name: Verify package provenance before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(packages/*.deb packages/*.rpm)
+          if [ "${#packages[@]}" -ne 2 ]; then
+            echo "ERROR: package subject set changed before attestation verification"
+            exit 1
+          fi
+
+          for package in "${packages[@]}"; do
+            gh attestation verify "$package" \
+              --repo "$GITHUB_REPOSITORY" \
+              --cert-identity "$EXPECTED_CERT_IDENTITY" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF" \
+              --signer-digest "$GITHUB_SHA" \
+              --predicate-type https://slsa.dev/provenance/v1
+          done
+
   release:
     name: Create Release
-    needs: [smoke-test, build-deb, build-rpm]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [smoke-test, build-deb, build-rpm, attest-packages]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -345,7 +428,7 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -402,7 +485,7 @@ jobs:
   publish-homebrew:
     name: Update Homebrew Tap
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -457,7 +540,7 @@ jobs:
   publish-npm:
     name: Publish npm Packages
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -572,7 +655,7 @@ jobs:
   publish-scoop:
     name: Update Scoop Bucket
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -622,8 +705,11 @@ jobs:
   publish-docker:
     name: Publish Docker Image
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -696,7 +782,7 @@ jobs:
   build-deb:
     name: Build Debian Package
     needs: smoke-test
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -815,7 +901,7 @@ jobs:
   build-rpm:
     name: Build RPM package
     needs: smoke-test
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -903,7 +989,7 @@ jobs:
   publish-chocolatey:
     name: Publish to Chocolatey
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -952,7 +1038,7 @@ jobs:
   publish-aur:
     name: Update AUR Package
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     continue-on-error: true  # AUR SSH can be transiently unavailable; don't fail the release
     steps:

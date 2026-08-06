@@ -131,6 +131,20 @@ pub fn fish_bin() -> Option<PathBuf> {
     }
 }
 
+/// Locate a zsh shell. Returns `None` when zsh is not installed.
+pub fn zsh_bin() -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/bin/zsh"), PathBuf::from("/usr/bin/zsh")];
+    if let Ok(out) = Command::new("sh").args(["-c", "command -v zsh"]).output() {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() {
+                candidates.push(PathBuf::from(path));
+            }
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 /// A fresh, fully-isolated environment for one PTY session: holds the temp dirs
 /// alive and exposes the env var map for the spawned shell. Drop cleans up.
 pub struct IsolatedEnv {
@@ -207,6 +221,20 @@ impl IsolatedEnv {
     pub fn unset(&mut self, key: &str) -> &mut Self {
         self.env.remove(key);
         self
+    }
+
+    /// Stable session identity injected into the shell under test.
+    pub fn session_id(&self) -> &str {
+        self.env
+            .get("TIRITH_SESSION_ID")
+            .expect("pty harness: session id must be present")
+    }
+
+    /// Fixed-slot execution ledger created by protocol-v3 receipt consumption.
+    pub fn strict_execution_ledger_path(&self) -> PathBuf {
+        self.state_home
+            .join("tirith/sessions")
+            .join(format!("{}.execution", self.session_id()))
     }
 
     /// Path to the persisted bash safe-mode flag (the hook writes it on enter-mode

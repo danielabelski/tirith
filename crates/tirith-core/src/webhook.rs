@@ -205,13 +205,8 @@ fn send_with_retry(
     headers: &[(String, String)],
     max_attempts: u32,
 ) -> Result<(), String> {
-    let client = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
+    let client = crate::ssrf_guard::server_client_builder()
         .timeout(std::time::Duration::from_secs(10))
-        // F7: re-validate every redirect target and cap the hop count; the
-        // implicit default would silently follow up to 10 hops into anywhere.
-        .redirect(crate::ssrf_guard::server_redirect_policy())
         .build()
         .map_err(|e| format!("client build: {e}"))?;
 

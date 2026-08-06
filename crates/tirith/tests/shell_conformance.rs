@@ -31,7 +31,7 @@ mod pty_support;
 
 use pty_support::{
     bash_major_version, count_occurrences, embedded_hook, fish_bin, modern_bash, wait_for_marker,
-    IsolatedEnv, PtySession,
+    zsh_bin, IsolatedEnv, PtySession,
 };
 
 // Shared timings: generous for a loaded CI box yet bounded so a hung shell
@@ -44,6 +44,51 @@ const SETTLE_MAX: Duration = Duration::from_secs(12);
 /// Hard cap on a side-effect-only command's marker file (no terminal output, so
 /// [`PtySession::wait_idle`] can't time it — poll via [`wait_for_marker`]).
 const MARKER_MAX: Duration = Duration::from_secs(15);
+
+/// Return `(confirmed, unresolved)` from the newest valid fixed-slot ledger.
+/// This independently verifies that a PTY command crossed the durable receipt
+/// boundary instead of merely exercising the hook's legacy fallback.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn strict_ledger_counts(env: &IsolatedEnv) -> (usize, usize) {
+    const MAGIC: &[u8; 8] = b"TIRXST02";
+    const HEADER_LEN: usize = 8 + 8 + 32;
+    const SLOT_SIZE: usize = 4 * 1024 * 1024;
+
+    let bytes = std::fs::read(env.strict_execution_ledger_path())
+        .expect("protocol-v3 hook must create its strict execution ledger");
+    let mut ledgers = Vec::new();
+    for offset in [0, SLOT_SIZE] {
+        let Some(header) = bytes.get(offset..offset + HEADER_LEN) else {
+            continue;
+        };
+        if &header[..8] != MAGIC {
+            continue;
+        }
+        let length = u64::from_le_bytes(header[8..16].try_into().expect("slot length")) as usize;
+        if length == 0 || length > SLOT_SIZE - HEADER_LEN {
+            continue;
+        }
+        let Some(payload) = bytes.get(offset + HEADER_LEN..offset + HEADER_LEN + length) else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
+            ledgers.push(value);
+        }
+    }
+    let ledger = ledgers
+        .into_iter()
+        .max_by_key(|value| value["generation"].as_u64().unwrap_or(0))
+        .expect("at least one strict execution slot must contain valid JSON");
+    let confirmed = ledger["confirmed"]
+        .as_array()
+        .expect("strict ledger confirmed records")
+        .len();
+    let unresolved = ledger["unresolved"]
+        .as_array()
+        .expect("strict ledger unresolved records")
+        .len();
+    (confirmed, unresolved)
+}
 
 // === bash — PREEXEC mode (DEBUG-trap, warn-only unless
 // TIRITH_BASH_PREEXEC_ENFORCE) ===
@@ -537,6 +582,22 @@ fn fish_session(env: &mut IsolatedEnv) -> Option<PtySession> {
     sess.expect("TIRITH_PTY> ");
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        sess.send_line("printf 'TIRITH_PROTOCOL=%s\\n' \"$_TIRITH_RECEIPT_PROTOCOL\"");
+        sess.expect("TIRITH_PROTOCOL=3");
+        sess.wait_idle(QUIET, SETTLE_MAX);
+        sess.clear_buffer();
+        let (confirmed, unresolved) = strict_ledger_counts(env);
+        assert_eq!(
+            confirmed, 0,
+            "a shell line must not be mislabeled as kernel-confirmed execution"
+        );
+        assert!(
+            unresolved >= 1,
+            "fish protocol-v3 probe must create durable shell-boundary evidence"
+        );
+    }
     Some(sess)
 }
 
@@ -698,15 +759,201 @@ fn fish_noninteractive_source_is_a_noop() {
     );
 }
 
-// === zsh / PowerShell / nushell — M0.1 follow-up stubs ===
-// The harness is shell-agnostic; each needs a spawn helper + its delivery
-// quirks (zsh: `zle` widget; pwsh: PSReadLine handler; nu: its own model).
-// Left as `#[ignore]` stubs so `cargo test` neither runs nor fails them.
+// === trusted controlling-terminal confirmation ===
 
-/// Follow-up stub: zsh PTY conformance not yet implemented (coverage-gap marker).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn commands_warn_session(env: &mut IsolatedEnv, marker_name: &str) -> Option<PtySession> {
+    let bash = Path::new("/bin/bash");
+    if !bash.is_file() {
+        return None;
+    }
+    let manifest_dir = env.workdir.join(".tirith");
+    std::fs::create_dir_all(&manifest_dir).expect("create commands manifest directory");
+    std::fs::write(
+        manifest_dir.join("commands.yaml"),
+        format!(
+            "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x > {marker_name}\"\n"
+        ),
+    )
+    .expect("write commands manifest");
+    let policy_root = env.workdir.display().to_string();
+    env.set("TIRITH_POLICY_ROOT", &policy_root);
+    env.set("TIRITH_OFFLINE", "1");
+
+    let mut sess = PtySession::spawn(env, bash, &["--noprofile", "--norc", "-i"]);
+    sess.send_line("export PS1='TIRITH_PTY> '");
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+    Some(sess)
+}
+
 #[test]
-#[ignore = "M0.1 follow-up: zsh PTY conformance not yet implemented"]
-fn zsh_conformance_followup() {}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn commands_warn_accepts_yes_only_from_foreground_controlling_terminal() {
+    let mut env = IsolatedEnv::new();
+    let marker = env.workdir.join("tty_yes.txt");
+    let mut sess = commands_warn_session(&mut env, "tty_yes.txt")
+        .expect("supported Unix test hosts provide /bin/bash");
+    sess.send_line("tirith commands run greet");
+    sess.expect("? [y/N] ");
+    sess.send_line("yes");
+    let body = wait_for_marker(&marker, "bit.ly/x", MARKER_MAX);
+    let output = sess.expect("Running allowed command");
+    sess.close();
+
+    assert_eq!(
+        count_occurrences(&body, "bit.ly/x"),
+        1,
+        "foreground controlling-terminal approval must execute exactly once"
+    );
+    assert!(
+        output.contains("shortened_url") || output.contains("WARNING"),
+        "confirmation must follow a visible warning verdict, got:\n{output}"
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn commands_warn_foreground_no_refuses_without_execution() {
+    let mut env = IsolatedEnv::new();
+    let marker = env.workdir.join("tty_no.txt");
+    let mut sess = commands_warn_session(&mut env, "tty_no.txt")
+        .expect("supported Unix test hosts provide /bin/bash");
+    sess.send_line("tirith commands run greet");
+    sess.expect("? [y/N] ");
+    sess.send_line("n");
+    let output = sess.expect("aborted by user");
+    sess.close();
+
+    assert!(!marker.exists(), "a declined warning must not execute");
+    assert!(
+        output.contains("shortened_url") || output.contains("WARNING"),
+        "decline must retain the warning context, got:\n{output}"
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn commands_warn_background_process_group_cannot_prompt_or_execute() {
+    let mut env = IsolatedEnv::new();
+    let marker = env.workdir.join("tty_background.txt");
+    let mut sess = commands_warn_session(&mut env, "tty_background.txt")
+        .expect("supported Unix test hosts provide /bin/bash");
+    sess.send_line("tirith commands run greet &");
+    let output = sess.expect("not in the controlling terminal foreground process group");
+    sess.close();
+
+    assert!(
+        output.contains("trusted controlling-terminal confirmation is unavailable"),
+        "background refusal must explain the trusted-terminal boundary, got:\n{output}"
+    );
+    assert!(
+        !marker.exists(),
+        "a background process group must not gain confirmation or execute"
+    );
+}
+
+// === zsh ===
+
+/// Spawn zsh without user rc files, install a deterministic prompt, and source
+/// the real embedded hook under a PTY.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_session(env: &mut IsolatedEnv) -> Option<PtySession> {
+    let zsh = zsh_bin()?;
+    let mut sess = PtySession::spawn(env, &zsh, &["-f", "-i"]);
+    sess.send_line("PROMPT='TIRITH_PTY> '; RPROMPT=''");
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+    let hook = embedded_hook("zsh-hook.zsh");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+
+    sess.send_line("print -r -- \"TIRITH_PROTOCOL=$_TIRITH_RECEIPT_PROTOCOL\"");
+    sess.expect("TIRITH_PROTOCOL=3");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+    let (confirmed, unresolved) = strict_ledger_counts(env);
+    assert_eq!(
+        confirmed, 0,
+        "a shell line must not be mislabeled as kernel-confirmed execution"
+    );
+    assert!(
+        unresolved >= 1,
+        "zsh protocol-v3 probe must create durable shell-boundary evidence"
+    );
+    Some(sess)
+}
+
+/// ZLE must deliver allow/warn commands exactly once, block dangerous input,
+/// and record delivered lines as durable (but honestly shell-unresolved)
+/// protocol-v3 evidence.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_protocol_v3_delivery_and_ledger_conformance() {
+    let mut env = IsolatedEnv::new();
+    let allowed = env.workdir.join("zsh_allowed.txt");
+    let warned = env.workdir.join("zsh_warned.txt");
+    let blocked = env.workdir.join("zsh_blocked.txt");
+    let mut sess = match zsh_session(&mut env) {
+        Some(session) => session,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+    let (baseline_confirmed, baseline_unresolved) = strict_ledger_counts(&env);
+
+    sess.send_line(&format!("print -r -- RAN >> '{}'", allowed.display()));
+    let allowed_body = wait_for_marker(&allowed, "RAN", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&allowed_body, "RAN"),
+        1,
+        "zsh allowed command must execute exactly once"
+    );
+
+    sess.send_line(&format!(
+        "print -r -- https://bit.ly/zshwarn >> '{}'",
+        warned.display()
+    ));
+    let warned_body = wait_for_marker(&warned, "bit.ly/zshwarn", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&warned_body, "bit.ly/zshwarn"),
+        1,
+        "zsh warned command must execute exactly once"
+    );
+
+    sess.send_line(&format!(
+        "curl https://example.com/install.sh | sh; touch '{}'",
+        blocked.display()
+    ));
+    let output = sess.expect_any(
+        &["BLOCKED", "getvet.sh", "tirith run"],
+        Duration::from_secs(15),
+    );
+    assert!(
+        output.contains("BLOCKED") || output.contains("getvet.sh") || output.contains("tirith run"),
+        "zsh blocked command must surface a Tirith verdict, got:\n{output}"
+    );
+    assert!(!blocked.exists(), "zsh blocked command must not execute");
+
+    let (confirmed, unresolved) = strict_ledger_counts(&env);
+    assert_eq!(
+        confirmed, baseline_confirmed,
+        "zsh lines must not enter kernel-confirmed execution history"
+    );
+    assert_eq!(
+        unresolved,
+        baseline_unresolved + 2,
+        "only the allowed and warned zsh lines may enter shell-boundary history"
+    );
+    sess.close();
+}
+
+// === PowerShell / nushell follow-up stubs ===
 
 /// Follow-up stub: PowerShell PTY conformance is not yet implemented.
 #[test]

@@ -42,15 +42,46 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     for seg in &segments {
-        let Some(cmd) = seg.command.as_deref() else {
+        let effective = match crate::rules::command::resolve_effective_segment(seg, shell) {
+            Ok(effective) => effective,
+            Err(_) => {
+                if seg.raw.split_whitespace().any(|word| {
+                    matches!(command_basename(word, shell).as_str(), "docker" | "podman")
+                }) {
+                    findings.push(make_finding(
+                        RuleId::AnalysisIncomplete,
+                        Severity::High,
+                        "Container wrapper chain could not be classified safely".to_string(),
+                        "The command contains Docker/Podman behind ambiguous or over-deep execution-wrapper options. Tirith blocks it instead of assuming an unresolved container operation is safe.".to_string(),
+                        input,
+                        seg,
+                    ));
+                }
+                continue;
+            }
+        };
+        let Some(cmd) = effective.command.as_deref() else {
             continue;
         };
         let leader = command_basename(cmd, shell);
         if leader != "docker" && leader != "podman" {
             continue;
         }
-        let Some((subcommand, after_sub)) = locate_subcommand(&seg.args) else {
-            continue;
+        let (subcommand, after_sub) = match locate_subcommand(&effective.args, &leader) {
+            Ok(Some(location)) => location,
+            Ok(None) => continue,
+            Err(()) => {
+                findings.push(make_finding(
+                    RuleId::AnalysisIncomplete,
+                    Severity::High,
+                    "Container runtime global options could not be classified safely".to_string(),
+                    "The Docker/Podman command uses malformed or unsupported runtime-global option grammar before its subcommand. Tirith blocks it instead of guessing where a privileged run, sensitive mount, or production exec begins."
+                        .to_string(),
+                    input,
+                    seg,
+                ));
+                continue;
+            }
         };
         match subcommand.as_str() {
             "run" | "create" => {
@@ -140,20 +171,136 @@ fn check_exec(
     ));
 }
 
-/// First non-flag positional — the docker subcommand. Returns it plus the args
-/// AFTER it.
-fn locate_subcommand(args: &[String]) -> Option<(String, &[String])> {
-    for (i, raw) in args.iter().enumerate() {
-        let a = strip_outer_quotes(raw);
-        if a.starts_with('-') {
-            continue;
-        }
+/// Locate the Docker/Podman subcommand after consuming runtime-global options.
+///
+/// This deliberately models the global grammar instead of treating every
+/// dash-prefixed token as a valueless flag: `docker --context prod run ...`
+/// must not mistake `prod` for the subcommand. Both runtimes accept `--x=y`,
+/// and their short value options accept attached values (`-Hunix://...`,
+/// `-cprod`).
+fn locate_subcommand<'a>(
+    args: &'a [String],
+    runtime: &str,
+) -> Result<Option<(String, &'a [String])>, ()> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = strip_outer_quotes(&args[idx]);
         if a.is_empty() {
+            idx += 1;
             continue;
         }
-        return Some((a.to_lowercase(), &args[i + 1..]));
+        if a == "--" {
+            let subcommand = strip_outer_quotes(args.get(idx + 1).ok_or(())?);
+            if subcommand.is_empty() {
+                return Err(());
+            }
+            return Ok(Some((subcommand.to_lowercase(), &args[idx + 2..])));
+        }
+        if !a.starts_with('-') || a == "-" {
+            return Ok(Some((a.to_lowercase(), &args[idx + 1..])));
+        }
+
+        if a.starts_with("--") {
+            if let Some((option, _value)) = a.split_once('=') {
+                if !global_value_option(runtime, option) && !global_boolean_option(runtime, option)
+                {
+                    return Err(());
+                }
+                idx += 1;
+                continue;
+            }
+            if global_boolean_option(runtime, a) {
+                idx += 1;
+                continue;
+            }
+            if global_value_option(runtime, a) {
+                // A missing value is an invalid/incomplete invocation, not a
+                // license to reinterpret a later token as a subcommand.
+                args.get(idx + 1).ok_or(())?;
+                idx += 2;
+                continue;
+            }
+            // Unknown global option grammar is ambiguous. Refuse to guess;
+            // supported Docker/Podman options are enumerated below.
+            return Err(());
+        }
+
+        if short_global_option_is_attached(runtime, a) || global_boolean_option(runtime, a) {
+            idx += 1;
+            continue;
+        }
+        if global_value_option(runtime, a) {
+            args.get(idx + 1).ok_or(())?;
+            idx += 2;
+            continue;
+        }
+        return Err(());
     }
-    None
+    Ok(None)
+}
+
+fn global_value_option(runtime: &str, option: &str) -> bool {
+    let common = matches!(
+        option,
+        "--config" | "--connection" | "--context" | "--host" | "--log-level" | "--url"
+    );
+    if common {
+        return true;
+    }
+    match runtime {
+        "docker" => matches!(
+            option,
+            "-c" | "-H" | "-l" | "--tlscacert" | "--tlscert" | "--tlskey"
+        ),
+        "podman" => matches!(
+            option,
+            "-c" | "--cgroup-manager"
+                | "--conmon"
+                | "--db-backend"
+                | "--events-backend"
+                | "--hooks-dir"
+                | "--identity"
+                | "--module"
+                | "--network-cmd-path"
+                | "--network-config-dir"
+                | "--out"
+                | "--root"
+                | "--runroot"
+                | "--runtime"
+                | "--runtime-flag"
+                | "--storage-driver"
+                | "--storage-opt"
+                | "--tmpdir"
+                | "--volumepath"
+        ),
+        _ => false,
+    }
+}
+
+fn global_boolean_option(runtime: &str, option: &str) -> bool {
+    let common = matches!(option, "--debug" | "--help" | "--version");
+    if common {
+        return true;
+    }
+    match runtime {
+        "docker" => matches!(option, "-D" | "--tls" | "--tlsverify"),
+        "podman" => matches!(
+            option,
+            "--remote" | "--syslog" | "--transient-store" | "--ssh"
+        ),
+        _ => false,
+    }
+}
+
+fn short_global_option_is_attached(runtime: &str, option: &str) -> bool {
+    match runtime {
+        "docker" => {
+            (option.starts_with("-c") || option.starts_with("-H") || option.starts_with("-l"))
+                && option.len() > 2
+        }
+        "podman" => option.starts_with("-c") && option.len() > 2,
+        _ => false,
+    }
 }
 
 fn has_privileged_flag(args: &[String]) -> bool {
@@ -242,20 +389,76 @@ fn extract_mount_source(spec: &str) -> Option<String> {
 }
 
 fn matches_sensitive(src: &str) -> bool {
-    if SENSITIVE_BIND_SOURCES.contains(src) {
+    let normalized = match normalize_bind_source(src) {
+        Ok(path) => path,
+        // Absolute/home-relative paths that attempt to walk above their root
+        // are not safe to classify as benign.
+        Err(()) => return true,
+    };
+    if SENSITIVE_BIND_SOURCES.contains(normalized.as_str()) {
         return true;
     }
-    let trimmed = src.trim_end_matches('/');
+    let trimmed = normalized.trim_end_matches('/');
     if SENSITIVE_BIND_SOURCES.contains(trimmed) {
         return true;
     }
-    let dir_prefixes = ["/etc/", "~/.ssh/", "~/.aws/", "~/.kube/", "~/.docker/"];
+    let dir_prefixes = [
+        "/etc/",
+        "~/.ssh/",
+        "~/.aws/",
+        "~/.kube/",
+        "~/.gnupg/",
+        "~/.docker/",
+    ];
     for prefix in dir_prefixes {
-        if src.starts_with(prefix) {
+        if normalized.starts_with(prefix) {
             return true;
         }
     }
     false
+}
+
+/// Lexically normalize a bind source without touching the filesystem. Known
+/// home expansions are represented as `~`, repeated separators and `.` are
+/// collapsed, and a `..` that would escape the absolute/home root is rejected.
+fn normalize_bind_source(src: &str) -> Result<String, ()> {
+    let src = strip_outer_quotes(src).trim();
+    let (root, tail) = if let Some(tail) = src.strip_prefix("${HOME}/") {
+        ("~", tail)
+    } else if let Some(tail) = src.strip_prefix("$HOME/") {
+        ("~", tail)
+    } else if let Some(tail) = src.strip_prefix("~/") {
+        ("~", tail)
+    } else if src == "${HOME}" || src == "$HOME" || src == "~" {
+        return Ok("~".to_string());
+    } else if let Some(tail) = src.strip_prefix('/') {
+        ("/", tail)
+    } else {
+        // Named volumes and unresolved relative host paths are not aliases for
+        // the absolute/home protected paths this rule owns.
+        return Ok(src.to_string());
+    };
+
+    let mut components: Vec<&str> = Vec::new();
+    for component in tail.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(());
+                }
+            }
+            other => components.push(other),
+        }
+    }
+    if components.is_empty() {
+        return Ok(root.to_string());
+    }
+    if root == "/" {
+        Ok(format!("/{}", components.join("/")))
+    } else {
+        Ok(format!("~/{}", components.join("/")))
+    }
 }
 
 fn first_positional_arg(args: &[String]) -> Option<String> {
@@ -364,6 +567,50 @@ mod tests {
     }
 
     #[test]
+    fn execution_wrappers_do_not_hide_container_boundaries() {
+        let policy = Policy::default();
+        for command in [
+            "sudo docker run --privileged alpine",
+            "env podman run -v /etc:/host-etc alpine",
+            "command docker run --mount type=bind,source=/var/run/docker.sock,target=/sock alpine",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings.iter().any(|finding| matches!(
+                    finding.rule_id,
+                    RuleId::DockerRunPrivileged | RuleId::DockerRunSensitiveBindMount
+                )),
+                "wrapper hid container boundary for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_wrapper_around_container_fails_closed() {
+        let policy = Policy::default();
+        let findings = check(
+            "sudo --future-option value docker run --privileged alpine",
+            ShellType::Posix,
+            &policy,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+        }));
+    }
+
+    #[test]
+    fn execution_wrapper_does_not_hide_labeled_container_exec() {
+        let mut policy = Policy::default();
+        policy
+            .context_labels
+            .insert("container:payments".to_string(), "production".to_string());
+        let findings = check("env docker exec payments sh", ShellType::Posix, &policy);
+        assert!(findings
+            .iter()
+            .any(|finding| matches!(finding.rule_id, RuleId::DockerExecProdContainer)));
+    }
+
+    #[test]
     fn privileged_true_form_fires() {
         let policy = Policy::default();
         let findings = check(
@@ -374,6 +621,83 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| matches!(f.rule_id, RuleId::DockerRunPrivileged)));
+    }
+
+    #[test]
+    fn global_options_with_split_and_attached_values_reach_subcommand() {
+        let policy = Policy::default();
+        for command in [
+            "docker --context prod run --privileged alpine",
+            "docker --context=prod --debug run --privileged alpine",
+            "docker -cprod run --privileged alpine",
+            "docker -Hunix:///var/run/docker.sock run --privileged alpine",
+            "podman --connection prod run --privileged alpine",
+            "podman -cprod run --privileged alpine",
+            "podman --db-backend sqlite run --privileged alpine",
+            "podman --db-backend=sqlite run --privileged alpine",
+            "podman --runtime-flag log-format=json run --privileged alpine",
+            "podman --runtime-flag=log-format=json run --privileged alpine",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| matches!(f.rule_id, RuleId::DockerRunPrivileged)),
+                "global option bypassed privileged detection for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_option_value_is_not_mistaken_for_subcommand() {
+        let args = ["--context", "prod", "run", "--privileged"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let (subcommand, rest) = locate_subcommand(&args, "docker")
+            .expect("global grammar")
+            .expect("subcommand");
+        assert_eq!(subcommand, "run");
+        assert_eq!(rest, &["--privileged"]);
+    }
+
+    #[test]
+    fn unresolved_global_option_grammar_fails_closed() {
+        let policy = Policy::default();
+        for command in [
+            "podman --future-global value run --privileged alpine",
+            "podman --future-global=value run --privileged alpine",
+            "docker --context",
+            "podman --",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::AnalysisIncomplete
+                        && finding.severity == Severity::High
+                }),
+                "unresolved global grammar must fail closed for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_benign_global_option_forms_remain_clean() {
+        let policy = Policy::default();
+        for command in [
+            "podman --db-backend sqlite run --rm alpine",
+            "podman --db-backend=sqlite run --rm alpine",
+            "podman --runtime-flag log-format=json run --rm alpine",
+            "podman --runtime-flag=log-format=json run --rm alpine",
+            "podman --help",
+            "docker --version",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings.is_empty(),
+                "known benign global grammar must remain clean for {command:?}: {findings:?}"
+            );
+        }
     }
 
     #[test]
@@ -402,6 +726,38 @@ mod tests {
                 .any(|f| matches!(f.rule_id, RuleId::DockerRunSensitiveBindMount)),
             "{findings:?}"
         );
+    }
+
+    #[test]
+    fn equivalent_sensitive_bind_paths_fire() {
+        let policy = Policy::default();
+        for source in [
+            "/var/run//docker.sock",
+            "/var/run/./docker.sock",
+            "/var/run/../run/docker.sock",
+            "$HOME/.ssh/../.ssh",
+            "${HOME}/.aws/./credentials",
+        ] {
+            let command = format!("docker run -v {source}:/host alpine");
+            let findings = check(&command, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| matches!(f.rule_id, RuleId::DockerRunSensitiveBindMount)),
+                "equivalent sensitive source escaped detection for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_bind_normalization_preserves_benign_paths() {
+        assert_eq!(
+            normalize_bind_source("/home/me/data/../cache"),
+            Ok("/home/me/cache".to_string())
+        );
+        assert!(!matches_sensitive("/home/me/data/../cache"));
+        assert!(normalize_bind_source("/../../etc").is_err());
+        assert!(matches_sensitive("/../../etc"));
     }
 
     #[test]

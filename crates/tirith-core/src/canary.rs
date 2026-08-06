@@ -758,6 +758,65 @@ pub fn detect(text: &str) -> Vec<CanaryHit> {
     }
 }
 
+#[derive(Serialize)]
+struct CallbackBody {
+    kind: String,
+    detected_at: String,
+    context: String,
+}
+
+enum CallbackSendFailure {
+    UrlRejected,
+    ClientBuild,
+    HttpStatus(u16),
+    Request(reqwest::Error),
+}
+
+impl CallbackSendFailure {
+    fn audit_reason(&self) -> String {
+        match self {
+            Self::UrlRejected => "callback URL rejected by destination policy".to_string(),
+            Self::ClientBuild => "client build failed".to_string(),
+            Self::HttpStatus(status) => format!("callback returned HTTP {status}"),
+            Self::Request(error) => classify_callback_error(error).to_string(),
+        }
+    }
+}
+
+fn send_callback_once(url: &str, body: &CallbackBody) -> Result<(), CallbackSendFailure> {
+    send_callback_once_with(url, body, crate::url_validate::validate_server_url, || {
+        crate::ssrf_guard::server_client_builder()
+            .connect_timeout(Duration::from_millis(1500))
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|_| CallbackSendFailure::ClientBuild)
+    })
+}
+
+fn send_callback_once_with<Validate, BuildClient>(
+    url: &str,
+    body: &CallbackBody,
+    validate_url: Validate,
+    build_client: BuildClient,
+) -> Result<(), CallbackSendFailure>
+where
+    Validate: FnOnce(&str) -> Result<(), String>,
+    BuildClient: FnOnce() -> Result<reqwest::blocking::Client, CallbackSendFailure>,
+{
+    validate_url(url).map_err(|_| CallbackSendFailure::UrlRejected)?;
+    let client = build_client()?;
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .map_err(CallbackSendFailure::Request)?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(CallbackSendFailure::HttpStatus(response.status().as_u16()))
+    }
+}
+
 /// Fire the OPT-IN, best-effort detection callback: ONE POST to
 /// `hit.callback_url` (when set) of `{kind, detected_at, context}` — NEVER the
 /// token value (it is deliberately not a parameter). The single network path
@@ -787,56 +846,17 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
     let spawn_result = std::thread::Builder::new()
         .name("tirith-canary-callback".to_string())
         .spawn(move || {
-            #[derive(Serialize)]
-            struct CallbackBody {
-                kind: String,
-                detected_at: String,
-                context: String,
-            }
             let body = CallbackBody {
                 kind,
                 detected_at,
                 context,
             };
 
-            // Revalidate immediately before building/sending. This protects
-            // legacy or concurrently modified stores; the installed resolver
-            // then enforces the same policy on the address actually connected.
-            if crate::url_validate::validate_server_url(&url).is_err() {
-                log_callback_failure(&id, "callback URL rejected by destination policy");
-                return;
-            }
-
-            let client = match reqwest::blocking::Client::builder()
-                .no_proxy()
-                .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
-                .connect_timeout(Duration::from_millis(1500))
-                .timeout(Duration::from_secs(3))
-                .redirect(crate::ssrf_guard::server_redirect_policy())
-                .build()
-            {
-                Ok(c) => c,
-                Err(_e) => {
-                    log_callback_failure(&id, "client build failed");
-                    return;
-                }
-            };
-
-            match client.post(&url).json(&body).send() {
-                Ok(resp) if resp.status().is_success() => {}
-                Ok(resp) => {
-                    // Numeric status only — never the URL.
-                    log_callback_failure(
-                        &id,
-                        &format!("callback returned HTTP {}", resp.status().as_u16()),
-                    );
-                }
-                Err(e) => {
-                    // CRITICAL: a `reqwest::Error`'s Display embeds the (operator-
-                    // private) URL, so classify to a coarse, URL-free reason
-                    // instead of logging it raw.
-                    log_callback_failure(&id, classify_callback_error(&e));
-                }
+            if let Err(error) = send_callback_once(&url, &body) {
+                // CRITICAL: a `reqwest::Error`'s Display embeds the operator-
+                // private URL. The typed failure retains it only for tests and
+                // maps to a coarse, URL-free audit reason here.
+                log_callback_failure(&id, &error.audit_reason());
             }
         });
 
@@ -1529,5 +1549,205 @@ mod tests {
             reason.starts_with("callback POST failed: "),
             "classified reason must be a coarse category string; got: {reason}"
         );
+    }
+
+    fn callback_request_error_messages(error: CallbackSendFailure) -> Vec<String> {
+        use std::error::Error as _;
+
+        let CallbackSendFailure::Request(error) = error else {
+            panic!("expected callback request failure");
+        };
+        let mut messages = vec![error.to_string()];
+        let mut source = error.source();
+        while let Some(cause) = source {
+            messages.push(cause.to_string());
+            source = cause.source();
+        }
+        messages
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn callback_sender_rejects_connect_time_private_dns_rebind() {
+        use crate::ssrf_guard::test_support::EnvironmentRestore;
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut restore = EnvironmentRestore::new();
+        restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+        let url = "http://callback-public.example.test:8080/canary";
+        let body = CallbackBody {
+            kind: "aws-like".to_string(),
+            detected_at: "2026-08-03T00:00:00Z".to_string(),
+            context: "exec".to_string(),
+        };
+        let resolver = crate::ssrf_guard::ssrf_guard_resolver_with_lookup_for_test(|host| {
+            assert_eq!(host, "callback-public.example.test");
+            Ok(vec!["127.0.0.1:9".parse().unwrap()])
+        });
+        let error = send_callback_once_with(
+            url,
+            &body,
+            |candidate| {
+                crate::url_validate::validate_server_url_with_resolver_for_test(
+                    candidate,
+                    &|host, _| {
+                        assert_eq!(host, "callback-public.example.test");
+                        Ok(vec!["93.184.216.34".parse().unwrap()])
+                    },
+                )
+            },
+            || {
+                crate::ssrf_guard::server_client_builder_with_resolver_for_test(resolver)
+                    .connect_timeout(Duration::from_millis(250))
+                    .timeout(Duration::from_secs(1))
+                    .build()
+                    .map_err(|_| CallbackSendFailure::ClientBuild)
+            },
+        )
+        .expect_err("connect-time private answer must be refused");
+        let messages = callback_request_error_messages(error);
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("ssrf_guard") && message.contains("non-public address")
+            }),
+            "callback failure must come from the guarded resolver: {messages:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn callback_sender_rejects_redirect_to_private_destination() {
+        use crate::ssrf_guard::test_support::{
+            http_response, EnvironmentRestore, ScriptedHttpServer,
+        };
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut restore = EnvironmentRestore::new();
+        restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+        let location = "http://127.0.0.1:9/internal";
+        let fixture = ScriptedHttpServer::start(vec![http_response(
+            "302 Found",
+            &[("Location", location)],
+            b"",
+        )]);
+        let address = fixture.address();
+        let url = format!(
+            "http://callback-public.example.test:{}/canary",
+            address.port()
+        );
+        let resolver = crate::ssrf_guard::fixture_resolver_with_lookup_for_test(move |host| {
+            assert_eq!(host, "callback-public.example.test");
+            Ok(vec![address])
+        });
+        let body = CallbackBody {
+            kind: "aws-like".to_string(),
+            detected_at: "2026-08-03T00:00:00Z".to_string(),
+            context: "exec".to_string(),
+        };
+        let error = send_callback_once_with(
+            &url,
+            &body,
+            |candidate| {
+                crate::url_validate::validate_server_url_with_resolver_for_test(
+                    candidate,
+                    &|host, _| {
+                        assert_eq!(host, "callback-public.example.test");
+                        Ok(vec!["93.184.216.34".parse().unwrap()])
+                    },
+                )
+            },
+            || {
+                crate::ssrf_guard::server_client_builder_with_resolver_for_test(resolver)
+                    .timeout(Duration::from_secs(1))
+                    .build()
+                    .map_err(|_| CallbackSendFailure::ClientBuild)
+            },
+        )
+        .expect_err("private redirect must be refused");
+        assert_eq!(fixture.finish().len(), 1);
+        let messages = callback_request_error_messages(error);
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("non-public") || message.contains("destination policy")
+            }),
+            "redirect refusal must come from destination validation: {messages:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn callback_sender_ignores_ambient_proxy_and_posts_only_public_safe_fields() {
+        use crate::ssrf_guard::test_support::{
+            http_response, EnvironmentRestore, ProxyTrap, ScriptedHttpServer,
+        };
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = ScriptedHttpServer::start(vec![http_response("204 No Content", &[], b"")]);
+        let proxy = ProxyTrap::start();
+        let mut restore = EnvironmentRestore::new();
+        restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+        restore.install_ambient_proxy(&proxy.url());
+        let address = fixture.address();
+        let url = format!(
+            "http://callback-public.example.test:{}/canary",
+            address.port()
+        );
+        let resolver = crate::ssrf_guard::fixture_resolver_with_lookup_for_test(move |host| {
+            assert_eq!(host, "callback-public.example.test");
+            Ok(vec![address])
+        });
+        let body = CallbackBody {
+            kind: "aws-like".to_string(),
+            detected_at: "2026-08-03T00:00:00Z".to_string(),
+            context: "exec".to_string(),
+        };
+        send_callback_once_with(
+            &url,
+            &body,
+            |candidate| {
+                crate::url_validate::validate_server_url_with_resolver_for_test(
+                    candidate,
+                    &|host, _| {
+                        assert_eq!(host, "callback-public.example.test");
+                        Ok(vec!["93.184.216.34".parse().unwrap()])
+                    },
+                )
+            },
+            || {
+                crate::ssrf_guard::server_client_builder_with_resolver_for_test(resolver)
+                    .timeout(Duration::from_secs(1))
+                    .build()
+                    .map_err(|_| CallbackSendFailure::ClientBuild)
+            },
+        )
+        .unwrap_or_else(|error| panic!("legitimate callback failed: {}", error.audit_reason()));
+
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !proxy.finish(),
+            "callback sender must not delegate the target to an ambient proxy"
+        );
+        let request = &requests[0];
+        assert!(request.starts_with(b"POST /canary HTTP/1.1\r\n"));
+        let body_start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("callback request headers")
+            + 4;
+        let json: serde_json::Value =
+            serde_json::from_slice(&request[body_start..]).expect("callback JSON body");
+        assert_eq!(json["kind"], "aws-like");
+        assert_eq!(json["detected_at"], "2026-08-03T00:00:00Z");
+        assert_eq!(json["context"], "exec");
+        assert_eq!(json.as_object().expect("callback object").len(), 3);
+        assert!(json.get("token").is_none());
+        assert!(json.get("id").is_none());
     }
 }

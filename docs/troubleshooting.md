@@ -13,7 +13,8 @@ tirith doctor --compat
 Add `--format json` for a machine-readable report. `--compat` is a static report; to (re)measure bash enter-mode delivery use `tirith doctor --simulate-enter`.
 
 If hooks are not found:
-1. Ensure `tirith` is in your PATH
+1. Ensure `tirith` is in your PATH when the hook is sourced. Bash, zsh, and
+   fish resolve and pin that executable for the lifetime of the shell session.
 2. Run `eval "$(tirith init)"` and check for error messages (if you use multiple shells, prefer `tirith init --shell bash|zsh|fish`)
 3. Set `TIRITH_SHELL_DIR` to point to your shell hooks directory explicitly
 
@@ -72,6 +73,27 @@ output of its own; wiring `TIRITH_STATUS` into a prompt is opt-in.
 To recover full protection after a degrade, restart your shell (and see
 "Persistent safe mode" below if it keeps happening).
 
+## Execution receipts unavailable or degraded
+
+Strict protocol-v3 receipts are available only to interactive bash, zsh, and
+fish hooks. Each live shell process registers once, and the capability is bound
+to that process and start identity, shell family, session ID, effective user,
+and the pinned Tirith executable identity. Nested shells register independently
+even when they inherit the same session ID. Do not export or manually set any
+`_TIRITH_RECEIPT_*` variable.
+
+If the hook reports that receipts are unavailable, start a fresh shell after
+fixing PATH or upgrading/replacing Tirith. Re-sourcing into the same live shell
+process is not a recovery path: duplicate process registration deliberately
+returns no bearer. In particular, an `exec`-replacement shell keeps the same
+PID/start identity but loses the deliberately non-exported bearer, so start a
+fresh terminal or child shell to recover strict receipts; `exec "$SHELL"` is
+not a receipt-protocol restart. PowerShell remains a PSReadLine preflight gate
+and intentionally has no
+strict receipt channel. Even when a bash/zsh/fish receipt commits, it records a
+conservative shell-boundary observation, not proof that every component of a
+compound command executed.
+
 ## Brew upgrade applied but behavior did not change
 
 If `brew` reports a newer version but `tirith --version` is older, or shell behavior looks unchanged:
@@ -108,6 +130,10 @@ Fix: remove the Python package and clear the shell hash:
 pip uninstall tirith
 hash -r
 ```
+
+Then restart the shell. An already-loaded bash, zsh, or fish hook keeps using
+the absolute executable it pinned when it was sourced; changing PATH or only
+clearing the command hash does not rebind that running hook.
 
 ## Bash: Enter mode vs preexec mode
 
@@ -264,6 +290,9 @@ This avoids `bind -x` enter interception in environments where PTY handling is f
 ## PowerShell: PSReadLine conflicts
 
 If using PSReadLine, ensure the tirith hook loads after PSReadLine initialization. The hook overrides `PSConsoleHostReadLine` to intercept pastes.
+This is preflight interception only. Tirith does not claim a strict PowerShell
+execution receipt because mutable PSReadLine history is not accepted as proof
+that the command executed.
 
 ## Fish: clipboard paste scope
 
@@ -333,10 +362,23 @@ in your gateway YAML and rerun the script.
 Tirith uses a **mixed fail-safe policy** for unexpected exit codes (crashes, OOM-kills, missing binary). The policy balances safety against terminal usability:
 
 - **Bash enter mode**: Auto-degrades to preexec on unexpected tirith exit code. The current command is not executed; subsequent commands go through preexec warn-only mode. Recoverable via `tirith doctor --reset-bash-safe-mode` or `export TIRITH_BASH_MODE=enter`.
-- **Zsh / Fish / PowerShell**: Warns and executes on unexpected exit code. A diagnostic message is printed so you know protection is degraded. The terminal never breaks.
+- **Zsh / Fish, negotiated receipt protocol v3**: An unexpected exit code or
+  malformed response blocks the current command. Receipt capture, cleanup, or
+  durable-commit failures also block, and unresolved evidence is never promoted
+  to confirmed execution.
+- **Zsh / Fish, legacy protocol-off fallback**: Warns and executes on an
+  unexpected preflight exit code to preserve the historical terminal behavior.
+  Expected legacy results still honor allow, block, warn, and warn-ack flows.
+- **PowerShell**: Warns and executes on an unexpected preflight exit code. It
+  has no strict receipt channel, so this behavior makes no post-execution proof
+  claim.
 - **All paste paths**: Fail-closed — discards paste on any unexpected exit code. Safe because you can re-paste.
 
-Expected exit codes: `0` (allow), `1` (block), `2` (warn). Anything else is treated as unexpected.
+Negotiated protocol v3 expects `0` (allow), `1` (block), or `2` (warn), plus
+the exact receipt framing documented in `docs/shell-hook-conformance.md`.
+The legacy Bash/Zsh/Fish approval flow additionally expects `3` (warn with
+explicit acknowledgement). Anything else is treated as unexpected under the
+mode-specific policy above.
 
 ## Audit log location
 

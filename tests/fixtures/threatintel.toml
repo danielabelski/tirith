@@ -69,6 +69,7 @@ input = "npm install evil-package@2.0.0"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+forbidden_rules = ["raw_ip_url", "schemeless_to_sink"]
 
 # A1 — an unpinned install of a version-specific malicious record cannot be
 # resolved, so it warns (not blocks) and must NOT claim a confirmed exact match.

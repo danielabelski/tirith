@@ -233,7 +233,7 @@ mod tests {
     fn curl_insecure_is_detected_around_every_boolean_short_option() {
         for option in CURL_BOOLEAN_SHORT_OPTIONS {
             for cluster in [format!("-{option}k"), format!("-k{option}")] {
-                let findings = check_insecure_flags("curl", &[cluster.clone()], true);
+                let findings = check_insecure_flags("curl", std::slice::from_ref(&cluster), true);
                 assert_eq!(
                     findings.len(),
                     1,
@@ -254,7 +254,7 @@ mod tests {
                 format!("-s{unknown}k"),
                 format!("-ks{unknown}"),
             ] {
-                let findings = check_insecure_flags("curl", &[argument.clone()], true);
+                let findings = check_insecure_flags("curl", std::slice::from_ref(&argument), true);
                 assert!(
                     findings.is_empty(),
                     "invalid curl cluster must not elevate: {argument}"
@@ -279,7 +279,8 @@ mod tests {
         for option in CURL_VALUE_SHORT_OPTIONS {
             let attached_k_value = format!("-{option}k");
             assert!(
-                check_insecure_flags("curl", &[attached_k_value.clone()], true).is_empty(),
+                check_insecure_flags("curl", std::slice::from_ref(&attached_k_value), true)
+                    .is_empty(),
                 "attached value must not be reparsed as -k: {attached_k_value}"
             );
 

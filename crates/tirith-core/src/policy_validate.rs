@@ -418,33 +418,25 @@ fn validate_package_policy(policy: &crate::policy::Policy, issues: &mut Vec<Poli
         }
     }
 
-    // Day-based thresholds: must be > 0 to be meaningful (0 disables the
-    // signal in the same way `None` does, but is silently misleading)
-    if let Some(d) = pp.block_newer_than_days {
-        if d == 0 {
-            issues.push(PolicyIssue {
-                level: IssueLevel::Warning,
-                message: "package_policy.block_newer_than_days: 0 disables the block path; \
-                          omit the field instead for clarity"
-                    .into(),
-                field: Some("package_policy.block_newer_than_days".into()),
-            });
-        }
-    }
+    // Zero is meaningful for the block threshold: it blocks packages first
+    // published today while allowing older packages to fall through to the
+    // warning threshold. `None`, not zero, disables blocking by age.
     if let Some(d) = pp.warn_newer_than_days {
         if d == 0 {
             issues.push(PolicyIssue {
                 level: IssueLevel::Warning,
-                message: "package_policy.warn_newer_than_days: 0 disables the warn path; \
-                          omit the field instead for clarity"
+                message: "package_policy.warn_newer_than_days: 0 only warns for packages \
+                          published today; omit the field to retain the 30-day baseline"
                     .into(),
                 field: Some("package_policy.warn_newer_than_days".into()),
             });
         }
     }
 
-    // If both set, the Block age window must be stricter (smaller) than Warn.
-    if let (Some(b), Some(w)) = (pp.block_newer_than_days, pp.warn_newer_than_days) {
+    // The Block age window must fit inside the effective Warn window, including
+    // the shipped 30-day warning baseline when the warn field is omitted.
+    if let Some(b) = pp.block_newer_than_days {
+        let w = pp.warn_newer_than_days_effective();
         if b > w {
             issues.push(PolicyIssue {
                 level: IssueLevel::Error,
@@ -616,63 +608,46 @@ fn validate_network_entries(policy: &crate::policy::Policy, issues: &mut Vec<Pol
 
 /// Check if a string is a valid hostname, IP, or CIDR notation.
 fn is_valid_cidr_or_host(s: &str) -> bool {
-    // Hostnames (domain-like strings).
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '*')
-        && !s.is_empty()
-    {
-        return true;
-    }
-
     // CIDR: split on '/' for the prefix length.
     if let Some((ip_part, prefix)) = s.split_once('/') {
         let Ok(prefix_len) = prefix.parse::<u32>() else {
             return false;
         };
-        if ip_part.contains('.') {
-            return prefix_len <= 32 && parse_ipv4(ip_part);
-        }
-        if ip_part.contains(':') {
-            return prefix_len <= 128 && parse_ipv6(ip_part);
-        }
+        // Runtime enforcement currently has an IPv4 CIDR matcher only. Use its
+        // exact `Ipv4Addr` grammar rather than a parallel handwritten parser.
+        return prefix_len <= 32 && ip_part.parse::<std::net::Ipv4Addr>().is_ok();
+    }
+
+    if s.contains('*') {
         return false;
     }
 
-    // Plain IP.
-    if s.contains(':') {
-        return parse_ipv6(s);
-    }
-    if s.contains('.') && s.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return parse_ipv4(s);
-    }
-
-    false
-}
-
-fn parse_ipv4(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-    parts.len() == 4
-        && parts.iter().all(|p| {
-            p.parse::<u8>().is_ok() || (*p == "0" || p.parse::<u16>().is_ok_and(|n| n <= 255))
-        })
-}
-
-fn parse_ipv6(s: &str) -> bool {
-    // Basic IPv6 validation: 1-8 groups of hex, with :: allowed once
-    let double_colon_count = s.matches("::").count();
-    if double_colon_count > 1 {
+    // A leading dot is the runtime's explicit suffix-policy spelling. All
+    // remaining hostname/IP grammar and normalization comes from the same
+    // parser used by enforcement, so validation cannot approve an entry the
+    // matcher will silently discard.
+    let Some(canonical) = crate::rules::command::canonical_network_host(s.trim_start_matches('.'))
+    else {
         return false;
+    };
+    if canonical.parse::<std::net::IpAddr>().is_ok() {
+        return true;
     }
-    let groups: Vec<&str> = s.split(':').collect();
-    if double_colon_count == 0 && groups.len() != 8 {
-        return false;
-    }
-    if double_colon_count == 1 && groups.len() > 8 {
-        return false;
-    }
-    groups
-        .iter()
-        .all(|g| g.is_empty() || (g.len() <= 4 && g.chars().all(|c| c.is_ascii_hexdigit())))
+    canonical.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+    })
 }
 
 fn validate_action_overrides(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
@@ -819,6 +794,17 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_day_zero_block_is_valid_and_meaningful() {
+        let issues = validate("package_policy:\n  block_newer_than_days: 0\n");
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.field.as_deref() != Some("package_policy.block_newer_than_days")),
+            "day-zero package blocking must not be treated as disabled: {issues:?}"
+        );
+    }
 
     fn unknown_fields(yaml: &str) -> Vec<String> {
         let runtime = crate::policy::Policy::try_parse_yaml(yaml);
@@ -1037,6 +1023,65 @@ custom_rules:
         assert!(issues
             .iter()
             .any(|i| i.message.contains("both allowlist and blocklist")));
+    }
+
+    #[test]
+    fn network_policy_rejects_unenforceable_wildcard_and_ipv6_cidr() {
+        for entry in [
+            "*.example.com",
+            "2001:db8::/32",
+            ".",
+            "...",
+            "bad host.example",
+            "bad_host.example",
+            "-bad.example",
+            "bad-.example",
+            "bad..example",
+        ] {
+            let yaml = format!("network_deny:\n  - '{entry}'\n");
+            let issues = validate(&yaml);
+            assert!(
+                issues.iter().any(|issue| {
+                    issue.level == IssueLevel::Error
+                        && issue.field.as_deref() == Some("network_deny[0]")
+                }),
+                "validator accepted unenforceable network entry {entry}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_policy_accepts_runtime_enforceable_forms() {
+        let entries = [
+            ("example.com", "sub.example.com"),
+            (".example.net", "sub.example.net"),
+            ("10.0.0.0/8", "10.2.3.4"),
+            ("2001:db8::1", "2001:db8::1"),
+        ];
+        let yaml = format!(
+            "network_deny:\n{}",
+            entries
+                .iter()
+                .map(|(entry, _)| format!("  - '{entry}'\n"))
+                .collect::<String>()
+        );
+        let issues = validate(&yaml);
+        assert!(
+            !issues.iter().any(|issue| {
+                issue.level == IssueLevel::Error
+                    && issue
+                        .field
+                        .as_deref()
+                        .is_some_and(|field| field.starts_with("network_deny["))
+            }),
+            "validator rejected runtime-enforceable network entries: {issues:?}"
+        );
+        for (entry, host) in entries {
+            assert!(
+                crate::rules::command::matches_network_list(host, &[entry.to_string()]),
+                "validation accepted {entry}, but runtime did not match {host}"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,31 @@ security state and its evidence explicitly**. I recommend Option 2. It lets the
 product state what was actually enforced and makes invalid transitions visible,
 while local locks remain useful inside the owned transaction.
 
+## R1 implementation status
+
+R1 implements the execution-state slice of this proposal. A strict per-session
+owner now holds a stable lock across generation validation, policy recheck,
+typed evidence transition, durable publication, and launch/forward completion.
+Provisional launcher, gateway, and shell observations cannot be represented as
+confirmed execution:
+
+- Linux records stopped-`exec` as unresolved, authorizes resume only after that
+  transition is durable, and promotes it to confirmed only after the exact
+  resume/EOF protocol completes.
+- The gateway uses an internal proxy identity, records a durable forward as
+  unresolved, and promotes only an exact correlated complete result. Timeout,
+  cancellation, partial write, and EOF remain unresolved.
+- Interactive bash, zsh, and fish use protocol-v3, one-time
+  process/session/executable-bound capabilities and terminal receipt states.
+  Tirith owns approval and warning acknowledgement before returning an armed
+  receipt. Shell-boundary evidence remains deliberately unresolved. PowerShell
+  strict receipts are unsupported.
+
+This is not a claim that every state owner or every finding named by the broader
+proposal is complete. Native Linux launcher runtime verification also remains a
+Linux CI/native-host gate; portable code, macOS paths, and
+platform-independent tests do not satisfy that gate.
+
 ## Evidence
 
 | Evidence | Finding or document | What it establishes |
@@ -144,7 +169,7 @@ crosses a process, file generation, output schema, or authorization decision.
 | Evidence | Effect under Option 2 | Tactical fix still required | Residual risk |
 | --- | --- | --- | --- |
 | `repo-0033` — containment overlap | Addresses dimensions/evidence | Yes, backend overlap validation | OS policy expressiveness varies |
-| `repo-0044` — provisional history | Addresses transitions | Yes, reorder decision/persistence | Session semantics migration |
+| `repo-0044` — provisional history | R1 implements strict unresolved-to-confirmed transitions for launcher and gateway plus unresolved shell receipts | Exact native Linux runtime and remaining surface migration | Shell evidence and gateway timeout/cancellation intentionally remain unresolved |
 | `repo-0196` — audit generation | Addresses consistent handle/generation | Yes, rotation protocol | External log rotation compatibility |
 | `repo-0258` — containment dimensions | Addresses representation | Yes, each backend applies/reports controls | Runtime probes remain platform-specific |
 | `repo-0343` — taint transaction | Addresses stable lock/corruption | Yes, append/clear/read migration | Mixed old/new writers |
@@ -152,11 +177,13 @@ crosses a process, file generation, output schema, or authorization decision.
 
 ## Migration And Rollout
 
-Within R1-FND, implement typed coverage, contained Unix/Windows I/O, and stable
-state transactions; R1-PLT then migrates P0/P1 state and containment owners. R2
-finishes P2 consumers and R3 finishes reliability consumers and convergence.
-Use dual-read/single-write, versioned records, last-known-good preservation, and
-process restart requirements where stable-lock protocols change.
+The R1 execution-state owner now uses typed evidence, strict generations, a
+stable lock, and durable publication for its migrated launcher, gateway, and
+shell consumers. That implemented slice does not mark unrelated R1-FND/R1-PLT
+state owners complete. R2 finishes P2 consumers and R3 finishes reliability
+consumers and convergence. Continue to use dual-read/single-write, versioned
+records, last-known-good preservation, and process restart requirements where
+stable-lock protocols change.
 
 ## Validation Plan
 

@@ -83,10 +83,18 @@ expected_rules = ["invalid_host_chars"]
 [[fixture]]
 name = "invalid_host_chars_backslash"
 min_milestone = 1
-input = "curl https://example\\.com/install"
+input = "curl 'https://example\\.com/install'"
 context = "exec"
 expected_action = "block"
 expected_rules = ["invalid_host_chars"]
+
+[[fixture]]
+name = "shell_escape_removes_host_backslash"
+min_milestone = 1
+input = "curl https://example\\.com/install"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
 
 [[fixture]]
 name = "invalid_host_chars_fullwidth_dot"

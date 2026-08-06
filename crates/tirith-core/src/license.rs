@@ -499,13 +499,8 @@ pub fn refresh_from_server(server_url: &str, api_key: &str) -> Result<String, St
         .map_err(|reason| format!("invalid server URL: {reason}"))?;
 
     let url = format!("{}/api/license/refresh", server_url.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
+    let client = crate::ssrf_guard::server_client_builder()
         .timeout(std::time::Duration::from_secs(30))
-        // F7: re-validate every redirect target and cap the hop count; the
-        // implicit default would silently follow up to 10 hops into anywhere.
-        .redirect(crate::ssrf_guard::server_redirect_policy())
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
     let resp = client

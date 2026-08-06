@@ -1,10 +1,12 @@
 # Shell-Hook Conformance Contract
 
-Tirith installs a shell hook (bash, zsh, fish, PowerShell, nushell) that
-intercepts every command *before* it runs. The hook is the only thing standing
-between a pasted `curl … | bash` and your shell executing it, so the hook must
-be correct about one thing above all else: **delivering the command you typed —
-exactly the command, exactly once, and only when it is allowed.**
+Tirith installs interactive shell hooks for bash, zsh, fish, PowerShell, and
+nushell. On the modes that can intercept a command, the hook checks it before
+the interactive shell accepts it. Non-interactive shells, direct `exec` calls,
+and processes that did not load a hook are outside this contract. Within the
+documented interactive surface, the hook must be correct about one thing above
+all else: **delivering the command you typed — exactly the command, exactly
+once, and only when it is allowed.**
 
 A hook that gets delivery wrong is both a correctness bug and a safety bug:
 
@@ -22,8 +24,9 @@ PTY harness in `crates/tirith/tests/shell_conformance.rs` (driver:
 
 ## The contract
 
-Every shell hook, in every mode it supports, must satisfy all seven
-invariants:
+Every documented interactive hook mode must satisfy the applicable invariants
+below; warn-only modes do not claim invariant (d), and shells without command
+interception do not claim command-delivery coverage:
 
 | # | Invariant | What it means |
 |---|-----------|---------------|
@@ -33,7 +36,31 @@ invariants:
 | d | **A blocked command does not execute** | When the hook (in a blocking mode) blocks a command, the command's side effects never happen. |
 | e | **A warned command executes once** | A *warn* verdict is advisory: the command still runs, exactly once. |
 | f | **Degradation is visible, not silent** | If the hook cannot deliver on its protection guarantee, it must say so — and (where applicable) persist a safe-mode flag — never quietly drop to a weaker mode. |
-| g | **Non-interactive shells carry no tirith status** | Sourcing the hook in a non-interactive shell (a script, `bash -c`, `BASH_ENV`, `fish -c`) installs nothing: no traps, no key bindings, no state writes. The `TIRITH_STATUS` prompt indicator is a non-exported shell variable, so a non-interactive *child* of a protected interactive shell never inherits it either — a process with no tirith protection must never appear to carry a tirith status. |
+| g | **Non-interactive shells claim no protection or execution evidence** | A non-interactive shell (a script, `bash -c`, `BASH_ENV`, `fish -c`) must not arm or consume a receipt, install active command interception, or expose a protected `TIRITH_STATUS`. An explicitly sourced file may define inert helpers and session variables, but a process with no active interception must never appear protected or write execution evidence. |
+
+### Execution evidence contract
+
+Preflight delivery and durable execution evidence are separate claims. Bash,
+zsh, and fish resolve and pin an absolute Tirith executable when the interactive
+hook loads, then negotiate protocol v3. Registration creates one process-scoped
+capability bound to the live parent PID and start identity, effective user,
+shell family, session, and Tirith executable identity. The bearer is returned
+only to that shell; its persistent record stores a hash, not the bearer. Nested
+shells therefore register independently even when they inherit one session ID.
+Tirith owns approval and warning-acknowledgement interaction before it returns
+an armed receipt; hook code cannot assert either outcome after the decision.
+
+Each receipt is one-shot and follows
+`Prepared → Armed → Consuming → Committed | Conflict | Discarded`. Replay,
+command drift, expiry, a different family/session/process, an executable
+replacement, or a durable identity mismatch refuses. Zsh and fish consume at
+the line-acceptance boundary before native handoff; notification-only preexec
+events are never authorization gates. An acceptance-boundary or Bash line-start
+observation is still recorded as conservative
+`ShellBoundaryUnresolved` evidence: it improves provenance but does not claim
+that every component of a compound line executed. PowerShell deliberately has
+PSReadLine preflight interception without strict receipts because mutable
+history is not accepted as execution proof.
 
 Invariant (f) is the safety floor. A hook is allowed to *fail* — terminals are
 varied and hostile environments exist — but it is never allowed to fail
@@ -102,6 +129,7 @@ cleanly** — never fails — when a prerequisite is missing:
 | zsh | — | Follow-up |
 | PowerShell | — | Follow-up |
 | nushell | — | Follow-up |
+| bash / zsh / fish protocol-v3 capability and receipt state | replay, identity, process-scoped one-time registration, terminal conflict, CLI-owned approval/ack | Unit and CLI integration passing; PTY delivery remains as above |
 
 ### Issue #111 — bash enter-mode delivery, and the capability gate
 
@@ -169,7 +197,8 @@ an already-enabled `extdebug`) is covered by the `capability_*` tests in
   shell-agnostic; each shell needs a spawn helper and its delivery quirks
   encoded (zsh `zle` widget, PowerShell PSReadLine handler, nushell hook
   model). Tracked as M0.1 follow-up; placeholder `#[ignore]`d tests mark the
-  gap.
+  gap. PowerShell PTY coverage can validate preflight delivery, but cannot turn
+  the intentionally unsupported strict receipt into an execution-proof claim.
 - **Offline isolation.** The bash enter-mode hook shells out to `tirith
   check`, which may attempt a background threat-DB refresh. The conformance
   tests do not currently assert on network behaviour. The `--offline` switch

@@ -42,24 +42,45 @@ pub fn check_bytes_with_ignore(
         });
     }
 
-    if scan.has_control_chars {
+    let invalid_utf8_evidence = if scan.has_invalid_utf8 {
+        invalid_utf8_evidence(input, ignore_ranges)
+    } else {
+        Vec::new()
+    };
+
+    if scan.has_control_chars || !invalid_utf8_evidence.is_empty() {
+        let has_invalid_utf8 = !invalid_utf8_evidence.is_empty();
+        let mut evidence: Vec<_> = scan
+            .details
+            .iter()
+            .filter(|d| d.description.contains("control"))
+            .map(|d| Evidence::ByteSequence {
+                offset: d.offset,
+                hex: d
+                    .codepoint
+                    .map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
+                description: d.description.clone(),
+            })
+            .collect();
+        evidence.extend(invalid_utf8_evidence);
         findings.push(Finding {
             rule_id: RuleId::ControlChars,
             severity: Severity::High,
-            title: "Control characters in pasted content".to_string(),
-            description: "Pasted content contains control characters (display-overwriting carriage return, backspace, etc.) that could hide the true command being executed".to_string(),
-            evidence: scan.details.iter()
-                .filter(|d| d.description.contains("control"))
-                .map(|d| Evidence::ByteSequence {
-                    offset: d.offset,
-                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
-                    description: d.description.clone(),
-                })
-                .collect(),
+            title: if has_invalid_utf8 {
+                "Malformed terminal text in pasted content".to_string()
+            } else {
+                "Control characters in pasted content".to_string()
+            },
+            description: if has_invalid_utf8 {
+                "Pasted content contains invalid UTF-8 bytes. Malformed terminal text can hide or change the display of adjacent commands and is refused under the protected paste profile".to_string()
+            } else {
+                "Pasted content contains control characters (display-overwriting carriage return, backspace, etc.) that could hide the true command being executed".to_string()
+            },
+            evidence,
             human_view: None,
             agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 
@@ -297,6 +318,47 @@ pub fn check_bytes_with_ignore(
     }
 
     findings
+}
+
+/// Return bounded evidence for every malformed UTF-8 sequence whose first byte
+/// is outside an inert inspection-argument range. `Utf8Error::valid_up_to` and
+/// `error_len` let us advance over each malformed sequence without discarding a
+/// valid scalar immediately before or after it.
+fn invalid_utf8_evidence(input: &[u8], ignore_ranges: &[std::ops::Range<usize>]) -> Vec<Evidence> {
+    const MAX_INVALID_UTF8_EVIDENCE: usize = 16;
+
+    let mut evidence = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() && evidence.len() < MAX_INVALID_UTF8_EVIDENCE {
+        let error = match std::str::from_utf8(&input[cursor..]) {
+            Ok(_) => break,
+            Err(error) => error,
+        };
+        let offset = cursor + error.valid_up_to();
+        let invalid_len = error
+            .error_len()
+            .unwrap_or_else(|| input.len().saturating_sub(offset))
+            .max(1);
+        let end = offset.saturating_add(invalid_len).min(input.len());
+        for (invalid_offset, byte) in input.iter().enumerate().take(end).skip(offset) {
+            if evidence.len() == MAX_INVALID_UTF8_EVIDENCE {
+                break;
+            }
+            if ignore_ranges
+                .iter()
+                .any(|range| range.contains(&invalid_offset))
+            {
+                continue;
+            }
+            evidence.push(Evidence::ByteSequence {
+                offset: invalid_offset,
+                hex: format!("0x{byte:02x}"),
+                description: "invalid UTF-8 byte in terminal input".to_string(),
+            });
+        }
+        cursor = end;
+    }
+    evidence
 }
 
 /// Decode Unicode Tag characters (U+E0000–U+E007F) to hidden ASCII (codepoint -
@@ -674,6 +736,44 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_utf8_is_an_explicit_protected_paste_finding() {
+        let findings = check_bytes(b"printf safe\xff");
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ControlChars)
+            .expect("invalid UTF-8 must produce a security finding");
+        assert_eq!(finding.severity, Severity::High);
+        assert!(finding.title.contains("Malformed terminal text"));
+        assert!(finding.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::ByteSequence { offset: 11, hex, description }
+                if hex == "0xff" && description.contains("invalid UTF-8")
+        )));
+    }
+
+    #[test]
+    fn malformed_utf8_cannot_hide_an_adjacent_bidi_control() {
+        let input = b"echo \xe2\x80\xae\xffsafe";
+        let findings = check_bytes(input);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::BidiControls));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ControlChars));
+    }
+
+    #[test]
+    fn malformed_utf8_inside_an_inert_range_is_not_reported() {
+        let input = b"ok\xff";
+        let ignored_range = 2..3;
+        let findings = check_bytes_with_ignore(input, std::slice::from_ref(&ignored_range));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ControlChars));
+    }
 
     #[test]
     fn test_clipboard_html_css_hiding() {

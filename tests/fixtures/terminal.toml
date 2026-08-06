@@ -201,8 +201,8 @@ name = "paste_invalid_utf8"
 min_milestone = 1
 input = "test"
 context = "paste"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["control_chars"]
 raw_bytes = [128, 255, 116, 101, 115, 116]
 
 [[fixture]]

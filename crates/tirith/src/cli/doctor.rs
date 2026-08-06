@@ -1231,8 +1231,9 @@ fn gather_visual_audit_compat() -> Option<VisualAuditCompatInfo> {
 }
 
 /// Detect PowerShell hook compatibility. `None` when neither `pwsh` nor
-/// `powershell` is on PATH (so JSON consumers see no `powershell_compat` key);
-/// otherwise resolves the binary and probes PSReadLine against the SAME binary.
+/// `powershell` has approved system/AuthentiCode PATH provenance (so JSON
+/// consumers see no `powershell_compat` key); otherwise resolves the binary and
+/// probes PSReadLine against the SAME binary.
 fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
     let binary = detect_powershell_binary(detected_shell)?;
     // `Option<bool>` keeps three states: Some(true)/Some(false)/None (probe
@@ -1251,11 +1252,13 @@ fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
     })
 }
 
-/// Resolve the PATH PowerShell binary best matching the active shell. For
+/// Resolve the trusted PATH PowerShell binary best matching the active shell. For
 /// `detected_shell == "powershell"` (5.1) probe `powershell` first, else
 /// pwsh-first — otherwise PSReadLine health would be reported from a DIFFERENT
-/// runtime than the operator runs. Used for both the availability check and the
-/// PSReadLine probe so they agree on one interpreter.
+/// runtime than the operator runs. An untrusted first hit for either name fails
+/// that candidate closed; it is never run or skipped in favor of a later
+/// same-name PATH entry. Used for both the availability check and the PSReadLine
+/// probe so they agree on one interpreter.
 fn detect_powershell_binary(
     detected_shell: &str,
 ) -> Option<tirith_core::trusted_child::TrustedExecutable> {
@@ -1265,7 +1268,7 @@ fn detect_powershell_binary(
     };
     candidates
         .into_iter()
-        .filter_map(|candidate| tirith_core::trusted_child::resolve_ambient(candidate).ok())
+        .filter_map(|candidate| tirith_core::trusted_child::resolve_system_helper(candidate).ok())
         .find(probe_command_available)
 }
 
@@ -3423,6 +3426,46 @@ mod tests {
             hook_version_match: None,
         });
         r
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_compat_rejects_same_uid_path_shadows_without_execution() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temporary = tempfile::Builder::new()
+            .prefix("tirith-doctor-powershell-shadow-")
+            .tempdir_in(home::home_dir().expect("test account home"))
+            .unwrap();
+        let shadow_bin = temporary.path().join("shadow-bin");
+        std::fs::create_dir(&shadow_bin).unwrap();
+        let marker = temporary.path().join("powershell-helper-executed");
+        let quoted_marker = marker.display().to_string().replace('\'', "'\"'\"'");
+        for helper in ["pwsh", "powershell"] {
+            let path = shadow_bin.join(helper);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\n: > '{quoted_marker}'\nexit 97\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![shadow_bin];
+        path_entries.extend(std::env::split_paths(&inherited));
+        let path = std::env::join_paths(path_entries).unwrap();
+        let _path = EnvGuard::set("PATH", std::path::Path::new(path.as_os_str()));
+
+        assert!(
+            detect_powershell_binary("powershell").is_none(),
+            "doctor must refuse same-UID PATH-selected PowerShell interpreters"
+        );
+        assert!(
+            !marker.exists(),
+            "doctor compatibility probing must not execute a PATH shadow"
+        );
     }
 
     #[test]

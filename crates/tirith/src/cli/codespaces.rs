@@ -79,7 +79,37 @@ pub fn inject(path: Option<&Path>, create: bool, json: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
+
+    fn write_decoy_hook(root: &Path) -> std::path::PathBuf {
+        let config_dir = root.join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&json!({
+                "postCreateCommand": "echo 'tirith init --shell auto'",
+                "containerEnv": {"TIRITH_DEVCONTAINER": "1"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        config_path
+    }
+
+    fn assert_decoy_replaced_by_exact_independent_hook(config_path: &Path) {
+        let updated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(
+            updated["postCreateCommand"][tirith_core::devcontainer_writer::TIRITH_HOOK_KEY],
+            json!(["tirith", "init", "--shell", "auto"]),
+        );
+        assert_eq!(
+            updated["postCreateCommand"]["existing"], "echo 'tirith init --shell auto'",
+            "the repository command must remain separate from Tirith's managed hook",
+        );
+    }
 
     #[test]
     fn setup_creates_devcontainer_and_gitignore() {
@@ -99,5 +129,23 @@ mod tests {
         let _ = setup(Some(dir.path()), false);
         let code = setup(Some(dir.path()), false);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn setup_does_not_trust_a_hook_substring() {
+        let dir = tempdir().unwrap();
+        let config_path = write_decoy_hook(dir.path());
+
+        assert_eq!(setup(Some(dir.path()), false), 0);
+        assert_decoy_replaced_by_exact_independent_hook(&config_path);
+    }
+
+    #[test]
+    fn inject_does_not_trust_a_hook_substring() {
+        let dir = tempdir().unwrap();
+        let config_path = write_decoy_hook(dir.path());
+
+        assert_eq!(inject(Some(dir.path()), false, false), 0);
+        assert_decoy_replaced_by_exact_independent_hook(&config_path);
     }
 }

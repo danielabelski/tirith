@@ -168,6 +168,12 @@ pub fn run(
     }
 
     if let Some(file_path) = file {
+        // An explicitly requested target is part of the CLI contract, not an
+        // optional discovery location. Validate it before include/exclude/ignore
+        // filters so a missing target can never turn into a successful no-op.
+        if !explicit_target_exists(std::path::Path::new(file_path), "file") {
+            return 1;
+        }
         if should_skip_file(
             file_path,
             &effective_include,
@@ -182,6 +188,14 @@ pub fn run(
     let scan_path = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // The default current-directory scan remains best-effort discovery, but an
+    // explicitly supplied positional target must exist. In particular, do not
+    // route a missing path into the directory collector and report a clean
+    // zero-file scan.
+    if path.is_some() && !explicit_target_exists(&scan_path, "path") {
+        return 1;
+    }
 
     if scan_path.is_file() {
         let path_str = scan_path.display().to_string();
@@ -445,15 +459,25 @@ fn run_single_file(
     }
 }
 
-/// Whether a set of coverage gaps must FAIL a CI run under `policy`: either
-/// `scan.require_complete` is set and a security-relevant gap exists, or a
-/// SECURITY-RELEVANT gap whose effective per-kind action is [`GapAction::Fail`].
-/// Both conditions gate on security-relevance so the exit decision matches the
+/// Whether a set of coverage gaps must FAIL a CI run under `policy`: an
+/// intrinsically security-relevant directory-enumeration failure always fails;
+/// otherwise `scan.require_complete` must be set with a security-relevant gap, or
+/// a SECURITY-RELEVANT gap must have effective [`GapAction::Fail`].
+/// The policy-driven conditions gate on security-relevance so the exit decision matches the
 /// AnalysisIncomplete finding assembly (which only emits for security-relevant gaps) -
 /// the scan never exits non-zero with an empty findings list. Shared by the directory
 /// and single-file paths so both fail closed identically.
 fn coverage_requires_failure(gaps: &[scan::CoverageGap], policy: &Policy) -> bool {
     use tirith_core::policy::GapAction;
+    // A failed directory enumeration hides an unknown set of paths before their
+    // kinds can be classified. `--ci` therefore fails on it unconditionally,
+    // including when an operator policy ignores ordinary unreadable files.
+    if gaps
+        .iter()
+        .any(|g| g.kind == scan::CoverageGapKind::EnumerationFailed)
+    {
+        return true;
+    }
     // `require_complete` fails on a security-relevant gap, BUT a per-kind `Ignore` action is
     // an explicit operator override for that kind: an Ignore'd gap produces no
     // AnalysisIncomplete finding, so it must not fail the run either (else exit 1 pairs with
@@ -478,6 +502,27 @@ fn coverage_requires_failure(gaps: &[scan::CoverageGap], policy: &Policy) -> boo
     })
 }
 
+/// Check an explicitly named CLI scan target without following a missing target
+/// into the best-effort collection path. `try_exists` also distinguishes an I/O
+/// failure from absence for useful diagnostics; both are operational errors.
+fn explicit_target_exists(path: &std::path::Path, target_kind: &str) -> bool {
+    match path.try_exists() {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!("tirith scan: {target_kind} not found: {}", path.display());
+            eprintln!("  try: tirith scan ./  (scan the current directory)");
+            false
+        }
+        Err(error) => {
+            eprintln!(
+                "tirith scan: cannot access requested {target_kind} {}: {error}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
 /// Print coverage gaps to stderr for the human output path (so `--json`/SARIF
 /// stdout stays uncorrupted). A no-op when there are none.
 fn print_coverage_gaps_human(gaps: &[scan::CoverageGap]) {
@@ -490,8 +535,8 @@ fn print_coverage_gaps_human(gaps: &[scan::CoverageGap]) {
     );
     for gap in gaps {
         // A coverage-gap location is an attacker-controlled file name from the scanned
-        // tree; neutralize control characters so a malicious name cannot inject terminal
-        // escape sequences into tirith's OWN stderr.
+        // tree; neutralize terminal controls and deceptive/invisible Unicode so a
+        // malicious name cannot forge or visually reorder tirith's OWN stderr.
         eprintln!(
             "  {} ({})",
             sanitize_location_for_terminal(&gap.location.to_string()),
@@ -500,20 +545,12 @@ fn print_coverage_gaps_human(gaps: &[scan::CoverageGap]) {
     }
 }
 
-/// Escape control characters (ANSI ESC, CR, BEL, etc.) in an attacker-controlled location
-/// before it is printed to a terminal, so a hostile file name in a scanned tree cannot
-/// inject escape sequences into tirith's own output. Printable and non-ASCII characters are
-/// kept as-is so legitimate paths stay readable.
+/// Project an attacker-controlled location through the shared single-line human-output
+/// sanitizer before it is printed to a terminal. This removes terminal control sequences,
+/// line breaks, bidi overrides, and deceptive/invisible Unicode while preserving ordinary
+/// printable non-ASCII paths.
 fn sanitize_location_for_terminal(loc: &str) -> String {
-    loc.chars()
-        .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<char>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
+    super::sanitize_for_human_output(loc, false)
 }
 
 fn parse_severity(s: &str) -> Severity {
@@ -864,14 +901,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_location_neutralizes_control_chars() {
-        // An attacker-controlled file name with ANSI/control chars must not reach the
-        // terminal raw; printable + non-ASCII content stays readable.
-        let safe = sanitize_location_for_terminal("evil\x1b[31m\rname.so");
+    fn ci_gate_always_fails_on_enumeration_gap() {
+        let gap = scan::CoverageGap {
+            location: tirith_core::location::SubjectLocation::from_path(PathBuf::from(
+                "ordinary-directory",
+            )),
+            kind: scan::CoverageGapKind::EnumerationFailed,
+            sha256: None,
+        };
+        let mut policy = Policy::default();
+        policy.scan.unreadable_file_action = Some(tirith_core::policy::GapAction::Ignore);
+
+        assert!(
+            coverage_requires_failure(&[gap], &policy),
+            "CI must fail before path-kind or unreadable Ignore filtering"
+        );
+    }
+
+    #[test]
+    fn sanitize_location_neutralizes_controls_and_deceptive_unicode() {
+        // An attacker-controlled file name with ANSI/control or deceptive Unicode must
+        // not reach the terminal raw; ordinary printable + non-ASCII content stays readable.
+        let safe = sanitize_location_for_terminal("evil\x1b[31m\rname\u{202e}txt\u{200b}.so");
         assert!(!safe.contains('\x1b'), "ESC must be escaped: {safe:?}");
         assert!(!safe.contains('\r'), "CR must be escaped: {safe:?}");
         assert!(
-            safe.contains("evil") && safe.contains("name.so"),
+            !safe.contains('\u{202e}'),
+            "bidi override must be removed: {safe:?}"
+        );
+        assert!(
+            !safe.contains('\u{200b}'),
+            "zero-width space must be removed: {safe:?}"
+        );
+        assert!(
+            safe.contains("evil") && safe.contains("name") && safe.ends_with(".so"),
             "printable text kept: {safe:?}"
         );
         // A clean non-ASCII path is unchanged.

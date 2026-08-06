@@ -37,6 +37,18 @@ if (-not [Environment]::UserInteractive) {
     return
 }
 
+# Resolve the trusted executable once while the interactive hook is loaded.
+# Repository-local PATH changes made by a later command must not redirect the
+# security hook into an attacker-controlled `tirith` shim.
+$tirithCommand = Get-Command tirith -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($null -eq $tirithCommand -or [string]::IsNullOrWhiteSpace($tirithCommand.Source)) {
+    Write-Host 'tirith: executable not found; PowerShell hooks disabled' -ForegroundColor Yellow
+    $global:TIRITH_STATUS = 'off'
+    return
+}
+$global:_TIRITH_BIN = [System.IO.Path]::GetFullPath($tirithCommand.Source)
+
 # M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
 # Start a background job that execs a hidden tirith subcommand; the child reads
 # ITS OWN inherited environment and writes ONLY variable names + an 8-char
@@ -46,7 +58,10 @@ if (-not [Environment]::UserInteractive) {
 # swallowed so a missing binary never disrupts the shell. Runs once per session
 # (this hook is sourced once per shell start).
 try {
-    Start-Job -ScriptBlock { & tirith env snapshot 2>$null 1>$null } | Out-Null
+    Start-Job -ScriptBlock {
+        param([string]$TirithBin)
+        & $TirithBin env snapshot 2>$null 1>$null
+    } -ArgumentList $global:_TIRITH_BIN | Out-Null
 } catch {
     # Ignore — the snapshot is best-effort and must never break the shell.
 }
@@ -207,7 +222,7 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
     $prevHook = $env:_TIRITH_HOOK
     $env:_TIRITH_HOOK = '1'
     try {
-        $approvalPath = & tirith check --approval-check --non-interactive --interactive --shell powershell -- $line 2>$errfile
+        $approvalPath = & $global:_TIRITH_BIN check --approval-check --non-interactive --interactive --shell powershell -- $line 2>$errfile
         $rc = $LASTEXITCODE
     } finally {
         if ($null -eq $prevHook) { Remove-Item Env:\_TIRITH_HOOK -ErrorAction SilentlyContinue } else { $env:_TIRITH_HOOK = $prevHook }
@@ -332,7 +347,7 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
     $prevHook = $env:_TIRITH_HOOK
     $env:_TIRITH_HOOK = '1'
     try {
-        $pasted | & tirith paste --shell powershell --interactive > $tmpfile 2>&1
+        $pasted | & $global:_TIRITH_BIN paste --shell powershell --interactive > $tmpfile 2>&1
         $rc = $LASTEXITCODE
     } finally {
         if ($null -eq $prevHook) { Remove-Item Env:\_TIRITH_HOOK -ErrorAction SilentlyContinue } else { $env:_TIRITH_HOOK = $prevHook }

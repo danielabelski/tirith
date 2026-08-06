@@ -68,12 +68,35 @@ consumer contracts—not a silent local bypass. If future runtime evidence shows
 that process/service isolation is necessary for a parser or feed, that isolated
 component should be proposed separately with its own operational budget.
 
+## R1 Implementation Checkpoint
+
+The current R1 branch implements the `repo-0044` proof-carrying execution-state
+slice described in the proposal. It keeps provisional decisions separate from
+durable execution evidence, serializes promotion through a stable per-session
+lock, assigns monotonic event identities, and refuses corrupt or ambiguous
+security state without repairing it into an apparently clean history.
+
+The integrated execution boundaries are deliberately evidence-specific:
+
+- Linux direct and capsule launch use a stopped-exec proof and resume only after
+  durable state publication and an exact acknowledgement;
+- gateway requests use proxy-owned identities and record matched results as
+  confirmed, while timeout/write uncertainty remains unresolved evidence;
+- Unix sourced-shell hooks use process-bound, one-shot command receipts and
+  CLI-owned approval/acknowledgement, but their preexec/history observation
+  remains lower-assurance than a kernel exec stop;
+- PowerShell retains preflight protection only and does not claim strict
+  execution receipts.
+
+This checkpoint is an implementation status, not a release-readiness claim.
+Native Linux runtime validation, packaged-hook parity, targeted DeepSec
+revalidation, and the remaining R1 acceptance gates must be attached to the
+exact implementation commit before the stacked PR is ready for merge.
+
 ## Next Decisions
 
-The current decisions needed before implementation are concrete:
+The remaining portfolio and release decisions are concrete:
 
-- approve the three-PR ownership and the internal foundation order in the
-  [stacked implementation plan](implementation/stacked-pr-plan.md);
 - define initial latency, allocation, and binary-size thresholds for R1-FND's
   completeness, child-process, command-IR, output, and egress controls;
 - define approval-rule precedence before releasing `repo-0244` from hold;

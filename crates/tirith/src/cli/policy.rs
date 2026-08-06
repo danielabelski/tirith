@@ -431,10 +431,11 @@ fn print_validate_json(path: &std::path::Path, issues: &[policy_validate::Policy
 }
 
 fn print_validate_human(path: &std::path::Path, issues: &[policy_validate::PolicyIssue]) {
+    let display_path = bounded_human_value(&path.display().to_string(), 512);
     if issues.is_empty() {
         eprintln!(
             "tirith policy validate: {} — valid, no issues",
-            path.display()
+            display_path
         );
         return;
     }
@@ -450,24 +451,55 @@ fn print_validate_human(path: &std::path::Path, issues: &[policy_validate::Polic
 
     eprintln!(
         "tirith policy validate: {} — {} error(s), {} warning(s)",
-        path.display(),
-        error_count,
-        warning_count
+        display_path, error_count, warning_count
     );
 
-    for issue in issues {
+    for (index, issue) in issues.iter().enumerate() {
         let s = tirith_core::style::Stream::Stderr;
         let prefix = match issue.level {
             IssueLevel::Error => tirith_core::style::red("error", s),
             IssueLevel::Warning => tirith_core::style::yellow("warning", s),
         };
-        let field_suffix = issue
-            .field
-            .as_ref()
-            .map(|f| format!(" ({f})"))
-            .unwrap_or_default();
-        eprintln!("  {prefix}: {}{field_suffix}", issue.message);
+        eprintln!(
+            "  {prefix}: {}",
+            human_validation_issue(issue, index.saturating_add(1))
+        );
     }
+}
+
+/// Render a validation issue without ever echoing an attacker-controlled policy
+/// value. Exact diagnostics remain available through `--json`, whose serializer
+/// escapes controls and is a machine-data boundary. Human output exposes only a
+/// fixed category plus its non-secret ordinal in the structured issue list.
+fn human_validation_issue(issue: &policy_validate::PolicyIssue, ordinal: usize) -> String {
+    let category = if issue.message.starts_with("YAML parse error") {
+        "YAML parse error"
+    } else if issue.message.starts_with("Policy migration error") {
+        "policy migration error"
+    } else if issue.message.contains("invalid regex") {
+        "invalid regular expression"
+    } else if issue.message.starts_with("unknown field") {
+        "unknown policy field"
+    } else if issue.message.contains("too long") || issue.message.contains("maximum") {
+        "policy value exceeds its allowed size"
+    } else {
+        match issue.level {
+            IssueLevel::Error => "invalid policy value",
+            IssueLevel::Warning => "policy validation warning",
+        }
+    };
+
+    format!("{category} (issue #{ordinal}; details available with --json)")
+}
+
+fn bounded_human_value(value: &str, max_chars: usize) -> String {
+    let safe = super::sanitize_for_human_output(value, false);
+    if safe.chars().count() <= max_chars {
+        return safe;
+    }
+    let mut bounded = safe.chars().take(max_chars).collect::<String>();
+    bounded.push('…');
+    bounded
 }
 
 pub fn test(command: Option<&str>, file: Option<&str>, json: bool) -> i32 {
@@ -1010,6 +1042,26 @@ fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use tirith_core::policy_validate::{self, IssueLevel};
+
+    #[test]
+    fn human_validation_issue_never_echoes_policy_values_or_controls() {
+        let issue = policy_validate::PolicyIssue {
+            level: IssueLevel::Error,
+            message: "custom_rules.secret: invalid regex 'TOKEN-42\x1b]52;c;YQ==\x07\nFORGED'"
+                .to_string(),
+            field: Some("custom_rules.TOKEN-42\u{202e}\nFORGED.pattern".to_string()),
+        };
+        let rendered = human_validation_issue(&issue, 7);
+        assert!(
+            rendered.contains("invalid regular expression"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("issue #7"), "{rendered:?}");
+        assert!(!rendered.contains("TOKEN-42"), "{rendered:?}");
+        assert!(!rendered.contains('\x1b'), "{rendered:?}");
+        assert!(!rendered.contains('\n'), "{rendered:?}");
+        assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+    }
 
     /// Every curated template must validate cleanly — no errors AND no warnings
     /// (warnings include the unknown-field typo guard, so this proves every key

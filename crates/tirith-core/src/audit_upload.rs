@@ -107,13 +107,8 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
         return;
     }
 
-    let client = match reqwest::blocking::Client::builder()
-        .no_proxy()
-        .dns_resolver(crate::ssrf_guard::ssrf_guard_resolver())
+    let client = match crate::ssrf_guard::server_client_builder()
         .timeout(std::time::Duration::from_secs(10))
-        // F7: re-validate every redirect target and cap the hop count; the
-        // implicit default would silently follow up to 10 hops into anywhere.
-        .redirect(crate::ssrf_guard::server_redirect_policy())
         .build()
     {
         Ok(c) => c,

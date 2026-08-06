@@ -234,18 +234,14 @@ fn collect_uri_violations(result: &Value, kind: ResponseKind, out: &mut Vec<Resp
                     }
                 }
             }
-            // Resource templates carry a `uriTemplate` (RFC 6570). We screen only
-            // a concrete-looking template (no `{` expansion), since an expansion
-            // is not a resolvable URL; a templated host is reported as a distinct,
-            // lower-detail violation so an attacker cannot launder an SSRF host
-            // through a fake template.
+            // Resource templates carry an RFC 6570 `uriTemplate`. Validate the
+            // literal scheme/authority even when path, query, or fragment
+            // components contain expansions. Variables in the scheme/authority
+            // are rejected because their eventual destination cannot be proven.
             if let Some(arr) = result.get("resourceTemplates").and_then(Value::as_array) {
                 for entry in arr {
                     if let Some(t) = entry.get("uriTemplate").and_then(Value::as_str) {
-                        if t.contains('{') {
-                            continue;
-                        }
-                        screen_uri(t, "resource_template_ssrf", out);
+                        screen_uri_template(t, "resource_template_ssrf", out);
                     }
                 }
             }
@@ -373,17 +369,19 @@ fn dedup_violations(violations: &mut Vec<ResponseViolation>) {
 /// gap it closes: network-fetchable metadata / SSRF targets hidden outside the
 /// modeled URI fields.
 ///
-/// An http(s) string carrying an RFC 6570 expansion (`{var}`) is an unexpanded
-/// URI TEMPLATE, not a resolvable URL, running it through the SSRF validator
-/// would spuriously fail to resolve the literal `{var}` host. The generic pass now
-/// also reaches `uri` / `uriTemplate` keys (CR1), so it must mirror the
-/// `uriTemplate` template skip the kind-specific descriptor screen already applies.
+/// An http(s) string carrying an RFC 6570 expansion (`{var}`) is screened as a
+/// template: its fixed scheme/authority is validated while expansion-controlled
+/// destinations are rejected. This mirrors the kind-specific `uriTemplate` path
+/// without treating braces as a validation exemption.
 fn screen_http_string(s: &str, out: &mut Vec<ResponseViolation>) {
-    let lower = s.trim().to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        if s.contains('{') {
-            return;
+    if s.contains('{') || s.contains('}') {
+        if matches!(fixed_template_scheme(s).as_deref(), Some("http" | "https")) {
+            screen_uri_template(s, "metadata_uri_ssrf", out);
         }
+        return;
+    }
+
+    if matches!(normalized_uri_scheme(s).as_deref(), Some("http" | "https")) {
         screen_uri(s, "metadata_uri_ssrf", out);
     }
 }
@@ -420,11 +418,35 @@ const FORBIDDEN_URI_SCHEMES: &[&str] = &[
 ///   over the network (`tirith://`, `ui://`, a custom app scheme, or a bare
 ///   path) — is left alone. Only network-fetchable URIs are SSRF vectors.
 fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
-    let lower = uri.trim().to_ascii_lowercase();
+    let trimmed = uri.trim();
+    let scheme = normalized_uri_scheme(trimmed);
 
-    // http(s): run the full SSRF screen (scheme/creds/metadata/private/loopback).
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        if let Err(e) = crate::url_validate::validate_fetch_url(uri) {
+    // RFC 3986 network-path references inherit their transport scheme from a
+    // base URI. The gateway has no trustworthy base against which to validate
+    // them, so they are not equivalent to the ordinary relative paths allowed
+    // below.
+    if trimmed.starts_with("//") {
+        out.push(ResponseViolation {
+            code,
+            detail:
+                "resource link failed SSRF policy: scheme-relative network targets are ambiguous"
+                    .to_string(),
+        });
+        return;
+    }
+
+    // Classify the parsed/normalized scheme rather than depending on a textual
+    // `http://` prefix. The WHATWG parser treats backslashes as separators for
+    // special schemes, so a value such as `http:\\127.0.0.1` is still an HTTP
+    // network URL and must reach this branch. Reject the ambiguous spelling even
+    // if the normalized destination would otherwise be public.
+    if matches!(scheme.as_deref(), Some("http" | "https")) {
+        let result = if trimmed.contains('\\') {
+            Err("backslashes are not allowed in HTTP(S) resource URLs".to_string())
+        } else {
+            crate::url_validate::validate_fetch_url(trimmed).map(|_| ())
+        };
+        if let Err(e) = result {
             out.push(ResponseViolation {
                 code,
                 detail: format!("resource link failed SSRF policy: {e}"),
@@ -434,7 +456,7 @@ fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
     }
 
     // A known-dangerous non-http scheme: reject without resolution.
-    let scheme = scheme_of(&lower);
+    let scheme = scheme.unwrap_or_else(|| "unknown".to_string());
     if FORBIDDEN_URI_SCHEMES.contains(&scheme.as_str()) {
         out.push(ResponseViolation {
             code,
@@ -445,13 +467,374 @@ fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
     // leave it alone.
 }
 
-/// The scheme prefix of a lowercased URI up to the first `:`, for the audit
-/// detail. Never includes the authority/path (no secrets).
-fn scheme_of(lower: &str) -> String {
-    match lower.split_once(':') {
-        Some((s, _)) => s.to_string(),
-        None => "unknown".to_string(),
+/// Return the normalized scheme for an absolute URI. Prefer the WHATWG parser so
+/// special-scheme spellings (including slash confusion) are classified the same
+/// way a downstream URL consumer classifies them. If parsing fails, retain a
+/// syntactically valid leading scheme so malformed HTTP(S) values fail closed in
+/// [`screen_uri`] rather than becoming opaque internal identifiers.
+fn normalized_uri_scheme(uri: &str) -> Option<String> {
+    let trimmed = uri.trim();
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        return Some(parsed.scheme().to_ascii_lowercase());
     }
+    lexical_scheme(trimmed).map(str::to_ascii_lowercase)
+}
+
+/// Return a leading RFC 3986 scheme token, without interpreting authority/path.
+fn lexical_scheme(uri: &str) -> Option<&str> {
+    let (candidate, _) = uri.split_once(':')?;
+    let mut bytes = candidate.bytes();
+    if !bytes.next()?.is_ascii_alphabetic()
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UriTemplateTarget {
+    /// A fixed HTTP(S) authority, represented as a concrete base URL suitable for
+    /// the canonical outbound URL validator.
+    HttpBase(String),
+    /// A statically forbidden non-HTTP scheme.
+    ForbiddenScheme(String),
+    /// A fixed opaque/internal or relative target with no network authority.
+    Opaque,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TemplateExpression {
+    start: usize,
+    end: usize,
+    operator: Option<u8>,
+}
+
+/// Screen an RFC 6570 URI template without expanding attacker-selected values.
+/// The template grammar is validated, variables in the scheme or authority are
+/// rejected, and a fixed HTTP(S) authority is passed to the same canonical URL,
+/// hostname, metadata, and address policy as a concrete resource URL.
+fn screen_uri_template(template: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
+    let target = match inspect_uri_template_target(template) {
+        Ok(target) => target,
+        Err(e) => {
+            out.push(ResponseViolation {
+                code,
+                detail: format!("resource URI template rejected: {e}"),
+            });
+            return;
+        }
+    };
+
+    match target {
+        UriTemplateTarget::HttpBase(base) => {
+            if let Err(e) = crate::url_validate::validate_fetch_url(&base) {
+                out.push(ResponseViolation {
+                    code,
+                    detail: format!("resource link failed SSRF policy: {e}"),
+                });
+            }
+        }
+        UriTemplateTarget::ForbiddenScheme(scheme) => out.push(ResponseViolation {
+            code,
+            detail: format!("forbidden URI scheme in resource link: {scheme}"),
+        }),
+        UriTemplateTarget::Opaque => {}
+    }
+}
+
+/// Return a template's fixed scheme for the generic string walker. This is only
+/// a routing hint: the full grammar and authority decision remain centralized in
+/// [`inspect_uri_template_target`].
+fn fixed_template_scheme(template: &str) -> Option<String> {
+    let trimmed = template.trim();
+    lexical_scheme(trimmed).map(str::to_ascii_lowercase)
+}
+
+fn inspect_uri_template_target(template: &str) -> Result<UriTemplateTarget, String> {
+    let trimmed = template.trim();
+    if trimmed.is_empty() {
+        return Err("template is empty".to_string());
+    }
+    if trimmed
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err("literal whitespace or controls are not allowed".to_string());
+    }
+
+    let expressions = parse_template_expressions(trimmed)?;
+    if expressions.is_empty() {
+        // A concrete value in a uriTemplate field follows the ordinary URI path.
+        return match normalized_uri_scheme(trimmed).as_deref() {
+            Some("http" | "https") => {
+                if trimmed.contains('\\') {
+                    Err("backslashes are not allowed in HTTP(S) templates".to_string())
+                } else {
+                    Ok(UriTemplateTarget::HttpBase(trimmed.to_string()))
+                }
+            }
+            Some(scheme) if FORBIDDEN_URI_SCHEMES.contains(&scheme) => {
+                Ok(UriTemplateTarget::ForbiddenScheme(scheme.to_string()))
+            }
+            _ if trimmed.starts_with("//") => {
+                Err("scheme-relative network targets are ambiguous".to_string())
+            }
+            _ => Ok(UriTemplateTarget::Opaque),
+        };
+    }
+
+    let colon = scheme_colon(trimmed, &expressions)?;
+    let Some(colon) = colon else {
+        if trimmed.starts_with("//")
+            || static_template_literals(trimmed, &expressions).starts_with("//")
+        {
+            return Err("scheme-relative network targets are ambiguous".to_string());
+        }
+        // A leading variable could expand to an absolute/network URI. Delimited
+        // path/query/fragment operators are safe because their expansion cannot
+        // manufacture a scheme or authority.
+        if expressions.first().is_some_and(|expr| {
+            expr.start == 0 && !matches!(expr.operator, Some(b'/' | b'?' | b'#'))
+        }) {
+            return Err("the template target cannot be expansion-controlled".to_string());
+        }
+        return Ok(UriTemplateTarget::Opaque);
+    };
+
+    let scheme = lexical_scheme(&trimmed[..=colon])
+        .ok_or_else(|| "template has an invalid URI scheme".to_string())?
+        .to_ascii_lowercase();
+    let after_scheme = colon + 1;
+
+    if FORBIDDEN_URI_SCHEMES.contains(&scheme.as_str()) {
+        return Ok(UriTemplateTarget::ForbiddenScheme(scheme));
+    }
+
+    let has_authority = trimmed[after_scheme..].starts_with("//");
+    if matches!(scheme.as_str(), "http" | "https") && !has_authority {
+        return Err("HTTP(S) templates require a literal // authority".to_string());
+    }
+    if !has_authority {
+        return Ok(UriTemplateTarget::Opaque);
+    }
+
+    let authority_start = after_scheme + 2;
+    let authority_end = template_authority_end(trimmed, authority_start, &expressions)?;
+    let authority = &trimmed[authority_start..authority_end];
+    if authority.is_empty() {
+        return Err("template authority is empty".to_string());
+    }
+
+    if matches!(scheme.as_str(), "http" | "https") {
+        if trimmed.contains('\\') {
+            return Err("backslashes are not allowed in HTTP(S) templates".to_string());
+        }
+        Ok(UriTemplateTarget::HttpBase(format!(
+            "{scheme}://{authority}/"
+        )))
+    } else {
+        Ok(UriTemplateTarget::Opaque)
+    }
+}
+
+/// Concatenate only literal template text. RFC 6570 variables are optional, so
+/// this is the concrete form a downstream client can observe when every variable
+/// is undefined. It is used to catch an expression that hides a leading `//`.
+fn static_template_literals(template: &str, expressions: &[TemplateExpression]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut cursor = 0usize;
+    for expr in expressions {
+        out.push_str(&template[cursor..expr.start]);
+        cursor = expr.end;
+    }
+    out.push_str(&template[cursor..]);
+    out
+}
+
+/// Locate a fixed scheme separator. An expansion before a later `:` is rejected:
+/// every RFC 6570 expression may expand to the empty string, so even `/`, `?`,
+/// and `#` operators cannot be treated as unconditional delimiters. Only a
+/// literal path/query/fragment delimiter proves the template is relative.
+fn scheme_colon(
+    template: &str,
+    expressions: &[TemplateExpression],
+) -> Result<Option<usize>, String> {
+    let mut expression_index = 0usize;
+    let mut cursor = 0usize;
+    let mut saw_expression = false;
+    while cursor < template.len() {
+        if expression_index < expressions.len() && expressions[expression_index].start == cursor {
+            let expr = expressions[expression_index];
+            saw_expression = true;
+            cursor = expr.end;
+            expression_index += 1;
+            continue;
+        }
+        match template.as_bytes()[cursor] {
+            b':' => {
+                if saw_expression {
+                    return Err("variables are not allowed in URI template schemes".to_string());
+                }
+                return Ok(Some(cursor));
+            }
+            b'/' | b'?' | b'#' => return Ok(None),
+            _ => cursor += 1,
+        }
+    }
+    Ok(None)
+}
+
+/// Find the end of a literal authority. A `/`, `?`, or `#` expression can start a
+/// path/query/fragment when populated, but RFC 6570 expressions may also expand
+/// to empty. It is therefore safe at the authority boundary only when everything
+/// after it until an unconditional literal delimiter is another delimiter
+/// expression (or the end of the template). This prevents an empty expansion
+/// from exposing a suffix such as `@127.0.0.1` as part of the authority.
+fn template_authority_end(
+    template: &str,
+    authority_start: usize,
+    expressions: &[TemplateExpression],
+) -> Result<usize, String> {
+    let mut expression_index = expressions.partition_point(|expr| expr.end <= authority_start);
+    let mut cursor = authority_start;
+    let mut optional_delimiter_start = None;
+    while cursor < template.len() {
+        if expression_index < expressions.len() && expressions[expression_index].start == cursor {
+            let expr = expressions[expression_index];
+            if !matches!(expr.operator, Some(b'/' | b'?' | b'#')) {
+                return Err("variables are not allowed in URI template authorities".to_string());
+            }
+            optional_delimiter_start.get_or_insert(cursor);
+            cursor = expr.end;
+            expression_index += 1;
+            continue;
+        }
+        match template.as_bytes()[cursor] {
+            b'/' | b'?' | b'#' => return Ok(optional_delimiter_start.unwrap_or(cursor)),
+            _ if optional_delimiter_start.is_some() => {
+                return Err(
+                    "literal data after an optional delimiter can alter the template authority"
+                        .to_string(),
+                )
+            }
+            _ => cursor += 1,
+        }
+    }
+    Ok(optional_delimiter_start.unwrap_or(template.len()))
+}
+
+fn parse_template_expressions(template: &str) -> Result<Vec<TemplateExpression>, String> {
+    let bytes = template.as_bytes();
+    let mut expressions = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'{' => {
+                let start = cursor;
+                cursor += 1;
+                let body_start = cursor;
+                while cursor < bytes.len() && bytes[cursor] != b'}' {
+                    if bytes[cursor] == b'{' {
+                        return Err("template expressions cannot be nested".to_string());
+                    }
+                    cursor += 1;
+                }
+                if cursor == bytes.len() {
+                    return Err("template expression is missing a closing brace".to_string());
+                }
+                let body = &template[body_start..cursor];
+                let operator = validate_template_expression(body)?;
+                cursor += 1;
+                expressions.push(TemplateExpression {
+                    start,
+                    end: cursor,
+                    operator,
+                });
+            }
+            b'}' => return Err("template has an unmatched closing brace".to_string()),
+            _ => cursor += 1,
+        }
+    }
+    Ok(expressions)
+}
+
+fn validate_template_expression(body: &str) -> Result<Option<u8>, String> {
+    if body.is_empty() {
+        return Err("template expression is empty".to_string());
+    }
+    let first = body.as_bytes()[0];
+    let (operator, variables) = if matches!(first, b'+' | b'#' | b'.' | b'/' | b';' | b'?' | b'&') {
+        (Some(first), &body[1..])
+    } else if matches!(first, b'=' | b',' | b'!' | b'@' | b'|') {
+        return Err("template uses a reserved RFC 6570 operator".to_string());
+    } else {
+        (None, body)
+    };
+    if variables.is_empty() {
+        return Err("template expression has no variables".to_string());
+    }
+    for varspec in variables.split(',') {
+        validate_template_varspec(varspec)?;
+    }
+    Ok(operator)
+}
+
+fn validate_template_varspec(varspec: &str) -> Result<(), String> {
+    if varspec.is_empty() {
+        return Err("template expression contains an empty variable".to_string());
+    }
+    let (name, modifier) = if let Some(name) = varspec.strip_suffix('*') {
+        (name, Some("*"))
+    } else if let Some((name, prefix)) = varspec.split_once(':') {
+        if prefix.is_empty()
+            || prefix.len() > 4
+            || !prefix.bytes().all(|b| b.is_ascii_digit())
+            || prefix.starts_with('0')
+        {
+            return Err("template prefix modifier is invalid".to_string());
+        }
+        (name, Some(prefix))
+    } else {
+        (varspec, None)
+    };
+    if modifier.is_some() && (name.contains('*') || name.contains(':')) {
+        return Err("template variable has conflicting modifiers".to_string());
+    }
+    if name.is_empty() {
+        return Err("template variable name is empty".to_string());
+    }
+
+    let bytes = name.as_bytes();
+    let mut cursor = 0usize;
+    let mut segment_has_char = false;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'%' => {
+                if cursor + 2 >= bytes.len()
+                    || !bytes[cursor + 1].is_ascii_hexdigit()
+                    || !bytes[cursor + 2].is_ascii_hexdigit()
+                {
+                    return Err("template variable has invalid percent-encoding".to_string());
+                }
+                cursor += 3;
+                segment_has_char = true;
+            }
+            b'.' if segment_has_char => {
+                segment_has_char = false;
+                cursor += 1;
+            }
+            b if b.is_ascii_alphanumeric() || b == b'_' => {
+                segment_has_char = true;
+                cursor += 1;
+            }
+            _ => return Err("template variable name contains invalid characters".to_string()),
+        }
+    }
+    if !segment_has_char {
+        return Err("template variable name has an empty dotted segment".to_string());
+    }
+    Ok(())
 }
 
 /// Decode inline `blob`s in a `resources/read` response (bounded) and compare the
@@ -860,6 +1243,82 @@ mod tests {
     }
 
     #[test]
+    fn noncanonical_http_backslashes_do_not_bypass_ssrf_validation() {
+        // WHATWG special-scheme parsing treats backslashes as path separators.
+        // The old textual `http://` gate missed this spelling completely.
+        let result = json!({
+            "content": [
+                { "type": "resource_link", "uri": r"HtTp:\\169.254.169.254\latest\meta-data", "name": "r" }
+            ]
+        });
+        let outcome = inspect_response(&result, ResponseKind::PromptsGet, &ctx());
+        assert!(
+            outcome.is_block(),
+            "a noncanonical HTTP metadata URL must block: {outcome:?}"
+        );
+        assert!(outcome
+            .violations
+            .iter()
+            .any(|v| { v.code == "resource_link_ssrf" && v.detail.contains("backslashes") }));
+    }
+
+    #[test]
+    fn noncanonical_http_in_generic_field_is_screened() {
+        let result = json!({
+            "tools": [{
+                "name": "t",
+                "description": "ok",
+                "callback": r"https:\\127.0.0.1\admin"
+            }]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ToolsList, &ctx());
+        assert!(
+            outcome.is_block(),
+            "the generic walker must classify normalized HTTP URLs: {outcome:?}"
+        );
+        assert!(outcome
+            .violations
+            .iter()
+            .any(|v| v.code == "metadata_uri_ssrf"));
+    }
+
+    #[test]
+    fn malformed_http_scheme_confusion_fails_closed() {
+        let result = json!({
+            "resources": [
+                { "uri": "http:opaque-without-an-authority", "name": "r" }
+            ]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ResourcesList, &ctx());
+        assert!(
+            outcome.is_block(),
+            "a malformed HTTP-family URI must not become an opaque URI: {outcome:?}"
+        );
+        assert!(outcome
+            .violations
+            .iter()
+            .any(|v| v.code == "resource_descriptor_ssrf"));
+    }
+
+    #[test]
+    fn scheme_relative_resource_link_fails_closed() {
+        let result = json!({
+            "content": [
+                { "type": "resource_link", "uri": "//169.254.169.254/latest/meta-data", "name": "r" }
+            ]
+        });
+        let outcome = inspect_response(&result, ResponseKind::PromptsGet, &ctx());
+        assert!(
+            outcome.is_block(),
+            "a scheme-relative network target must not be treated as an internal URI: {outcome:?}"
+        );
+        assert!(outcome
+            .violations
+            .iter()
+            .any(|v| v.detail.contains("scheme-relative")));
+    }
+
+    #[test]
     fn file_scheme_resource_link_blocks() {
         let result = json!({
             "content": [
@@ -1199,18 +1658,126 @@ mod tests {
     }
 
     #[test]
-    fn templated_resource_uri_is_not_screened_as_concrete() {
-        // A uriTemplate with `{var}` is not a resolvable URL and must not be run
-        // through the SSRF screen (it would spuriously fail to parse).
+    fn fixed_metadata_authority_in_path_template_blocks() {
         let result = json!({
             "resourceTemplates": [
-                { "uriTemplate": "https://{host}/files/{path}", "name": "t" }
+                { "uriTemplate": "http://169.254.169.254/latest/{path}", "name": "t" }
             ]
         });
         let outcome = inspect_response(&result, ResponseKind::ResourcesTemplatesList, &ctx());
         assert!(
-            outcome.violations.is_empty(),
-            "a templated URI must be skipped: {outcome:?}"
+            outcome.is_block(),
+            "a path expansion must not exempt a fixed metadata host: {outcome:?}"
         );
+        assert_eq!(
+            outcome
+                .violations
+                .iter()
+                .filter(|v| v.code == "resource_template_ssrf")
+                .count(),
+            1,
+            "canonical and generic template screens must deduplicate: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn fixed_loopback_authority_in_query_template_blocks() {
+        let result = json!({
+            "resourceTemplates": [
+                { "uriTemplate": "https://127.0.0.1/data{?id,format}", "name": "t" }
+            ]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ResourcesTemplatesList, &ctx());
+        assert!(
+            outcome.is_block(),
+            "query controls must not exempt a fixed loopback host: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn expansion_controlled_template_authority_blocks() {
+        for template in [
+            "https://{host}/files/{path}",
+            "https://api.{domain}/files/{path}",
+            "https://93.184.216.34:{port}/files/{path}",
+            "https://93.184.216.34{+path}",
+            // Delimiter operators are optional when their variable is undefined;
+            // the suffix would then become part of the authority.
+            "https://93.184.216.34{?q}@127.0.0.1/path",
+            "https://93.184.216.34{/path}.attacker.invalid/x",
+        ] {
+            let result = json!({
+                "resourceTemplates": [{ "uriTemplate": template, "name": "t" }]
+            });
+            let outcome = inspect_response(&result, ResponseKind::ResourcesTemplatesList, &ctx());
+            assert!(
+                outcome.is_block(),
+                "an expansion-controlled authority must block for {template:?}: {outcome:?}"
+            );
+            assert!(outcome
+                .violations
+                .iter()
+                .any(|v| { v.code == "resource_template_ssrf" && v.detail.contains("authorit") }));
+        }
+    }
+
+    #[test]
+    fn expansion_controlled_template_scheme_blocks() {
+        let result = json!({
+            "resourceTemplates": [
+                { "uriTemplate": "{scheme}://93.184.216.34/files/{path}", "name": "t" }
+            ]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ResourcesTemplatesList, &ctx());
+        assert!(
+            outcome.is_block(),
+            "an expansion-controlled scheme must block: {outcome:?}"
+        );
+        assert!(outcome
+            .violations
+            .iter()
+            .any(|v| { v.code == "resource_template_ssrf" && v.detail.contains("scheme") }));
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_uri_templates_block() {
+        for template in [
+            "https://93.184.216.34/files/{path",
+            "https://93.184.216.34/files/{}",
+            "https://93.184.216.34/files/{path,,format}",
+            "//93.184.216.34/files/{path}",
+            "{/prefix}//169.254.169.254/{path}",
+            r"https://93.184.216.34\files\{path}",
+        ] {
+            let result = json!({
+                "resourceTemplates": [{ "uriTemplate": template, "name": "t" }]
+            });
+            let outcome = inspect_response(&result, ResponseKind::ResourcesTemplatesList, &ctx());
+            assert!(
+                outcome.is_block(),
+                "malformed/ambiguous template must block for {template:?}: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_public_authority_preserves_legitimate_template_controls() {
+        // Literal public IP keeps the test hermetic while exercising level 1-4
+        // path/query/fragment controls after the fixed authority boundary.
+        for template in [
+            "https://93.184.216.34/files/{path}",
+            "https://93.184.216.34{/segments*}{?q,lang}{#fragment}",
+            "https://93.184.216.34/files/{+path}{;params*}{?q:3}",
+        ] {
+            let result = json!({
+                "resourceTemplates": [{ "uriTemplate": template, "name": "t" }]
+            });
+            let outcome = inspect_response(&result, ResponseKind::ResourcesTemplatesList, &ctx());
+            assert!(
+                outcome.violations.is_empty(),
+                "fixed public templates must remain usable for {template:?}: {outcome:?}"
+            );
+            assert_eq!(outcome.action, Action::Allow);
+        }
     }
 }

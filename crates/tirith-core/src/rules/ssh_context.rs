@@ -18,7 +18,7 @@
 
 use crate::policy::Policy;
 use crate::rules::context::classify_inner_command_for_ssh;
-use crate::rules::shared::is_critical_label;
+use crate::rules::shared::{canonicalize_ssh_label_key, is_critical_label};
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -29,20 +29,52 @@ const SSH_FLAGS_WITH_ARG: &[&str] = &[
     "-I", "-O", "-w", "-m",
 ];
 
-/// Run SSH-context rules; returns at most one finding. A destructive inner
-/// command on a labeled host → `SshRemoteDestructiveOnLabeledHost` (High); a
-/// bare `ssh host` on a labeled host → `SshRemoteShellOnLabeledHost` (Info).
+/// Run SSH-context rules across every executable shell segment.
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     // Empty labels file → no enforcement (opt-in).
-    if policy.ssh_host_labels.is_empty() {
+    if !policy.context_guard_enabled || policy.ssh_host_labels.is_empty() {
         return Vec::new();
     }
 
-    let segments = tokenize::tokenize(input, shell);
-    let Some(seg) = segments.first() else {
-        return Vec::new();
+    tokenize::tokenize(input, shell)
+        .iter()
+        .flat_map(|seg| check_segment(input, shell, policy, seg))
+        .collect()
+}
+
+fn check_segment(
+    input: &str,
+    shell: ShellType,
+    policy: &Policy,
+    seg: &tokenize::Segment,
+) -> Vec<Finding> {
+    let effective = match crate::rules::command::resolve_effective_segment(seg, shell) {
+        Ok(effective) => effective,
+        Err(_) => {
+            if seg
+                .raw
+                .split_whitespace()
+                .any(|word| command_basename(word, shell) == "ssh")
+            {
+                return vec![Finding {
+                    rule_id: RuleId::AnalysisIncomplete,
+                    severity: Severity::High,
+                    title: "SSH wrapper chain could not be classified safely".to_string(),
+                    description: "SSH appears behind ambiguous or over-deep execution-wrapper options while SSH host labels are active. Tirith blocks it instead of assuming the unresolved remote target is safe.".to_string(),
+                    evidence: vec![Evidence::CommandPattern {
+                        pattern: "ssh <analysis-incomplete>".to_string(),
+                        matched: seg.raw.chars().take(200).collect(),
+                    }],
+                    human_view: Some("SSH context guard could not prove this command safe.".to_string()),
+                    agent_view: Some("tirith refused: SSH wrapper analysis incomplete.".to_string()),
+                    mitre_id: None,
+                    custom_rule_id: None,
+                }];
+            }
+            return Vec::new();
+        }
     };
-    let Some(cmd) = seg.command.as_deref() else {
+    let Some(cmd) = effective.command.as_deref() else {
         return Vec::new();
     };
     let base = command_basename(cmd, shell);
@@ -50,16 +82,24 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         return Vec::new();
     }
 
-    let parsed = match parse_ssh_invocation(seg.args.as_slice()) {
+    let parsed = match parse_ssh_invocation(effective.args.as_slice()) {
         Some(p) => p,
         None => return Vec::new(),
     };
 
-    // Try the user@host label first, then the bare host.
-    let label = match policy
-        .ssh_host_labels
-        .get(&parsed.user_at_host)
-        .or_else(|| policy.ssh_host_labels.get(&parsed.host))
+    // Consider both identities and retain the more restrictive semantic
+    // result. Exact `user@host` inventory remains useful, but a noncritical
+    // exact label must never shadow a critical bare-host label.
+    let exact_key = canonicalize_ssh_label_key(&parsed.user_at_host)
+        .unwrap_or_else(|| parsed.user_at_host.clone());
+    let bare_key = canonicalize_ssh_label_key(&parsed.host).unwrap_or_else(|| parsed.host.clone());
+    let exact_label = policy.ssh_host_labels.get(&exact_key);
+    let bare_label = policy.ssh_host_labels.get(&bare_key);
+    let label = match exact_label
+        .filter(|label| is_critical_label(label))
+        .or_else(|| bare_label.filter(|label| is_critical_label(label)))
+        .or(exact_label)
+        .or(bare_label)
     {
         Some(l) => l,
         None => return Vec::new(),
@@ -73,9 +113,18 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         // Classify the inner command with the same verb classifier as
         // `rules::context`, using POSIX even from a PowerShell launcher.
         let category = classify_inner_command_for_ssh(&inner, ShellType::Posix);
-        if !category.is_actionable() {
+        let conservative_remote_command = parsed.remote_command_from_option
+            && (parsed.remote_command_unparseable
+                || category == crate::rules::context::VerbCategory::Unknown);
+        if !category.is_actionable() && !conservative_remote_command {
             return Vec::new();
         }
+
+        let category_text = if conservative_remote_command {
+            "unclassifiable_remote_command"
+        } else {
+            category.as_str()
+        };
 
         let title = format!(
             "Destructive remote command against labeled-{} host '{}'",
@@ -83,7 +132,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
             parsed.host,
         );
         let description = format!(
-            "About to run a {category} command on remote host '{}' (label: '{label}'). \
+            "About to run a {category_text} command on remote host '{}' (label: '{label}'). \
              SSH inner commands bypass tirith's local enter / paste interception.",
             parsed.host,
         );
@@ -95,7 +144,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
             evidence: vec![
                 Evidence::Text {
                     detail: format!(
-                        "host={} user_at_host={} label={} category={category} inner={}",
+                        "host={} user_at_host={} label={} category={category_text} inner={}",
                         parsed.host,
                         parsed.user_at_host,
                         label,
@@ -104,16 +153,16 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
                     ),
                 },
                 Evidence::CommandPattern {
-                    pattern: format!("ssh {} <{category}>", parsed.host),
+                    pattern: format!("ssh {} <{category_text}>", parsed.host),
                     matched: input.chars().take(200).collect(),
                 },
             ],
             human_view: Some(format!(
-                "tirith refused: '{}' is labeled '{label}'. The inner command falls in the {category} category.",
+                "tirith refused: '{}' is labeled '{label}'. The inner command falls in the {category_text} category.",
                 parsed.host,
             )),
             agent_view: Some(format!(
-                "tirith refused: remote SSH command. host='{}' label='{label}' category={category}.",
+                "tirith refused: remote SSH command. host='{}' label='{label}' category={category_text}.",
                 parsed.host,
             )),
             mitre_id: None,
@@ -163,57 +212,217 @@ struct ParsedSsh {
     user_at_host: String,
     /// The inner command portion (after the host) if present.
     inner_command: Option<String>,
+    /// Whether at least part of the effective command came from `-o
+    /// RemoteCommand=...`; unknown syntax on this channel fails conservatively.
+    remote_command_from_option: bool,
+    remote_command_unparseable: bool,
 }
 
 fn parse_ssh_invocation(args: &[String]) -> Option<ParsedSsh> {
     let mut idx = 0;
+    let mut option_user: Option<String> = None;
+    let mut remote_commands: Vec<String> = Vec::new();
+    let mut remote_command_from_option = false;
+    let mut remote_command_unparseable = false;
     while idx < args.len() {
         let raw = strip_outer_quotes(&args[idx]);
 
-        if raw.starts_with('-') {
-            if SSH_FLAGS_WITH_ARG.contains(&raw) {
-                // Flag takes a separate value — consume both.
+        if raw == "--" {
+            idx += 1;
+            break;
+        }
+        if raw.starts_with('-') && raw != "-" {
+            if raw == "-l" || raw == "-o" {
+                let value = strip_outer_quotes(args.get(idx + 1)?);
+                if raw == "-l" {
+                    if value.is_empty() {
+                        return None;
+                    }
+                    if option_user.is_none() {
+                        option_user = Some(value.to_string());
+                    }
+                } else {
+                    parse_ssh_config_option(
+                        value,
+                        &mut option_user,
+                        &mut remote_commands,
+                        &mut remote_command_from_option,
+                        &mut remote_command_unparseable,
+                    );
+                }
                 idx += 2;
-            } else if SSH_FLAGS_WITH_ARG
-                .iter()
-                .any(|f| raw.starts_with(f) && raw.len() > f.len())
-            {
-                // `-iidentity` form — value glued on, single token.
-                idx += 1;
-            } else {
-                idx += 1;
+                continue;
             }
+            if let Some(value) = raw.strip_prefix("-l").filter(|value| !value.is_empty()) {
+                if option_user.is_none() {
+                    option_user = Some(strip_outer_quotes(value).to_string());
+                }
+                idx += 1;
+                continue;
+            }
+            if let Some(value) = raw.strip_prefix("-o").filter(|value| !value.is_empty()) {
+                parse_ssh_config_option(
+                    value,
+                    &mut option_user,
+                    &mut remote_commands,
+                    &mut remote_command_from_option,
+                    &mut remote_command_unparseable,
+                );
+                idx += 1;
+                continue;
+            }
+            if SSH_FLAGS_WITH_ARG.contains(&raw) {
+                args.get(idx + 1)?;
+                idx += 2;
+                continue;
+            }
+            if SSH_FLAGS_WITH_ARG
+                .iter()
+                .filter(|flag| !matches!(**flag, "-l" | "-o"))
+                .any(|flag| raw.starts_with(flag) && raw.len() > flag.len())
+            {
+                idx += 1;
+                continue;
+            }
+            // Boolean flags, including clusters such as `-tt`.
+            idx += 1;
             continue;
         }
         // First positional — the host (possibly `user@host`).
-        let user_at_host = raw.to_string();
-        let host = match user_at_host.rsplit_once('@') {
-            Some((_, h)) => h.to_string(),
-            None => user_at_host.clone(),
+        let destination = raw.to_string();
+        let (destination_user, host) = match destination.rsplit_once('@') {
+            Some((user, host)) => (Some(user.to_string()), host.to_string()),
+            None => (None, destination.clone()),
         };
 
         if host.is_empty() {
             return None;
         }
 
+        // OpenSSH uses the first command-line user value it obtains. Since
+        // options precede the destination, `-l`/`-o User` wins over a later
+        // `user@host` spelling, and repeated user options do not overwrite it.
+        let effective_user = option_user.or(destination_user);
+        let user_at_host = effective_user
+            .as_deref()
+            .map(|user| format!("{user}@{host}"))
+            .unwrap_or_else(|| host.clone());
+
         let inner: Vec<String> = args[idx + 1..]
             .iter()
             .map(|a| strip_outer_quotes(a).to_string())
             .collect();
 
-        let inner_command = if inner.is_empty() {
-            None
+        if !inner.is_empty() {
+            remote_commands.push(inner.join(" "));
+        }
+        let inner_command = if remote_command_unparseable && remote_commands.is_empty() {
+            Some("<unparseable RemoteCommand>".to_string())
         } else {
-            Some(inner.join(" "))
+            (!remote_commands.is_empty()).then(|| remote_commands.join(" ; "))
         };
 
         return Some(ParsedSsh {
             host,
             user_at_host,
             inner_command,
+            remote_command_from_option,
+            remote_command_unparseable,
         });
     }
+
+    // `--` may have ended options immediately before the destination.
+    if idx < args.len() {
+        let mut tail = args[idx..].to_vec();
+        if let Some(first) = tail.first_mut() {
+            *first = strip_outer_quotes(first).to_string();
+        }
+        return parse_ssh_invocation_with_options(
+            &tail,
+            option_user,
+            remote_commands,
+            remote_command_from_option,
+            remote_command_unparseable,
+        );
+    }
     None
+}
+
+fn parse_ssh_invocation_with_options(
+    args: &[String],
+    option_user: Option<String>,
+    mut remote_commands: Vec<String>,
+    remote_command_from_option: bool,
+    remote_command_unparseable: bool,
+) -> Option<ParsedSsh> {
+    let destination = strip_outer_quotes(args.first()?);
+    let (destination_user, host) = match destination.rsplit_once('@') {
+        Some((user, host)) => (Some(user.to_string()), host.to_string()),
+        None => (None, destination.to_string()),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let effective_user = option_user.or(destination_user);
+    let user_at_host = effective_user
+        .as_deref()
+        .map(|user| format!("{user}@{host}"))
+        .unwrap_or_else(|| host.clone());
+    let positional = args[1..]
+        .iter()
+        .map(|arg| strip_outer_quotes(arg).to_string())
+        .collect::<Vec<_>>();
+    if !positional.is_empty() {
+        remote_commands.push(positional.join(" "));
+    }
+    Some(ParsedSsh {
+        host,
+        user_at_host,
+        inner_command: if remote_command_unparseable && remote_commands.is_empty() {
+            Some("<unparseable RemoteCommand>".to_string())
+        } else {
+            (!remote_commands.is_empty()).then(|| remote_commands.join(" ; "))
+        },
+        remote_command_from_option,
+        remote_command_unparseable,
+    })
+}
+
+fn parse_ssh_config_option(
+    raw: &str,
+    option_user: &mut Option<String>,
+    remote_commands: &mut Vec<String>,
+    remote_command_from_option: &mut bool,
+    remote_command_unparseable: &mut bool,
+) {
+    let raw = strip_outer_quotes(raw).trim();
+    let parsed = raw
+        .split_once('=')
+        .or_else(|| raw.split_once(char::is_whitespace));
+    let Some((name, value)) = parsed else {
+        if raw.eq_ignore_ascii_case("RemoteCommand") {
+            *remote_command_from_option = true;
+            *remote_command_unparseable = true;
+        }
+        return;
+    };
+    let name = name.trim();
+    let value = strip_outer_quotes(value.trim()).trim();
+    if name.eq_ignore_ascii_case("User") {
+        if !value.is_empty() && option_user.is_none() {
+            *option_user = Some(value.to_string());
+        }
+    } else if name.eq_ignore_ascii_case("RemoteCommand") {
+        if *remote_command_from_option {
+            return;
+        }
+        *remote_command_from_option = true;
+        if value.is_empty() {
+            *remote_command_unparseable = true;
+        } else if !value.eq_ignore_ascii_case("none") {
+            remote_commands.push(value.to_string());
+        }
+    }
 }
 
 fn strip_outer_quotes(s: &str) -> &str {
@@ -268,6 +477,65 @@ mod tests {
     }
 
     #[test]
+    fn disabled_context_guard_silences_ssh_labels() {
+        let mut policy = policy_with_label("prod-host", "critical");
+        policy.context_guard_enabled = false;
+        let findings = check(
+            "ssh prod-host 'systemctl restart payments'",
+            ShellType::Posix,
+            &policy,
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn execution_wrappers_do_not_hide_ssh() {
+        let policy = policy_with_label("prod-host", "critical");
+        for command in [
+            "env ssh prod-host 'systemctl restart payments'",
+            "sudo ssh prod-host 'systemctl restart payments'",
+            "command ssh prod-host 'systemctl restart payments'",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings.iter().any(|finding| matches!(
+                    finding.rule_id,
+                    RuleId::SshRemoteDestructiveOnLabeledHost
+                )),
+                "wrapper hid SSH invocation for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_wrapper_around_ssh_fails_closed() {
+        let policy = policy_with_label("prod-host", "critical");
+        let findings = check(
+            "sudo --future-option value ssh prod-host 'systemctl restart payments'",
+            ShellType::Posix,
+            &policy,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+        }));
+    }
+
+    #[test]
+    fn host_lookup_is_case_insensitive_and_ignores_dns_root_dot() {
+        let policy = policy_with_label("prod.example", "critical");
+        let findings = check(
+            "ssh Alice@PROD.EXAMPLE. 'systemctl restart payments'",
+            ShellType::Posix,
+            &policy,
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "canonical host did not match: {findings:?}"
+        );
+    }
+
+    #[test]
     fn destructive_inner_command_blocks_labeled_host() {
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
@@ -281,6 +549,57 @@ mod tests {
             RuleId::SshRemoteDestructiveOnLabeledHost
         ));
         assert!(matches!(findings[0].severity, Severity::High));
+    }
+
+    #[test]
+    fn every_local_and_remote_segment_is_classified() {
+        let policy = policy_with_label("prod-host", "critical");
+        for command in [
+            "true; ssh prod-host 'systemctl restart payments'",
+            "ssh prod-host 'true; systemctl restart payments'",
+            "ssh prod-host 'ls && kubectl delete namespace payments'",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings.iter().any(|finding| {
+                    matches!(finding.rule_id, RuleId::SshRemoteDestructiveOnLabeledHost)
+                }),
+                "later SSH segment escaped detection for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_command_option_is_preserved_and_classified() {
+        let policy = policy_with_label("prod-host", "critical");
+        for command in [
+            r#"ssh -oRemoteCommand='systemctl restart payments' prod-host"#,
+            r#"ssh -o "RemoteCommand=systemctl restart payments" prod-host"#,
+            r#"ssh -o 'remotecommand systemctl restart payments' prod-host"#,
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings.iter().any(|finding| {
+                    matches!(finding.rule_id, RuleId::SshRemoteDestructiveOnLabeledHost)
+                }),
+                "RemoteCommand bypassed classification for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_remote_command_fails_conservatively_on_critical_host() {
+        let policy = policy_with_label("prod-host", "critical");
+        for command in [
+            "ssh -oRemoteCommand=custom-deployer prod-host",
+            "ssh -oRemoteCommand prod-host",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(findings.iter().any(|finding| {
+                matches!(finding.rule_id, RuleId::SshRemoteDestructiveOnLabeledHost)
+                    && finding.severity == Severity::High
+            }));
+        }
     }
 
     #[test]
@@ -377,7 +696,7 @@ mod tests {
 
     #[test]
     fn user_at_host_prefers_user_at_host_label() {
-        // The exact user@host key should win over the bare host.
+        // A critical exact user@host label wins over noncritical bare inventory.
         let mut policy = Policy::default();
         let mut labels = BTreeMap::new();
         labels.insert("root@prod-host".to_string(), "critical".to_string());
@@ -395,6 +714,56 @@ mod tests {
             findings[0].rule_id,
             RuleId::SshRemoteDestructiveOnLabeledHost
         ));
+    }
+
+    #[test]
+    fn noncritical_exact_label_cannot_shadow_critical_bare_host() {
+        let mut policy = Policy::default();
+        policy
+            .ssh_host_labels
+            .insert("root@prod-host".to_string(), "dev".to_string());
+        policy
+            .ssh_host_labels
+            .insert("prod-host".to_string(), "production".to_string());
+
+        let findings = check(
+            "ssh root@prod-host 'sudo rm -rf /tmp/x'",
+            ShellType::Posix,
+            &policy,
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(
+            findings[0].rule_id,
+            RuleId::SshRemoteDestructiveOnLabeledHost
+        ));
+    }
+
+    #[test]
+    fn split_and_attached_user_options_preserve_exact_label_identity() {
+        let mut policy = Policy::default();
+        policy
+            .ssh_host_labels
+            .insert("root@prod-host".to_string(), "critical".to_string());
+        policy
+            .ssh_host_labels
+            .insert("prod-host".to_string(), "staging".to_string());
+
+        for command in [
+            "ssh -l root prod-host 'systemctl restart payments'",
+            "ssh -lroot prod-host 'systemctl restart payments'",
+            "ssh -oUser=root prod-host 'systemctl restart payments'",
+            "ssh -o 'User root' prod-host 'systemctl restart payments'",
+            "ssh -l root dev@prod-host 'systemctl restart payments'",
+            "ssh -oUser=root -oUser=dev prod-host 'systemctl restart payments'",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings.iter().any(|finding| {
+                    matches!(finding.rule_id, RuleId::SshRemoteDestructiveOnLabeledHost)
+                }),
+                "effective SSH user was lost for {command:?}: {findings:?}"
+            );
+        }
     }
 
     #[test]

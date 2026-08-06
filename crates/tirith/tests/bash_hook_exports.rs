@@ -23,6 +23,22 @@ fn hook_path() -> String {
     )
 }
 
+/// PATH for hook integration tests. Cargo exposes the freshly built binary via
+/// `CARGO_BIN_EXE_tirith` but does not place its directory on PATH; the hook
+/// deliberately resolves `tirith` by name. Prepend the matching binary so a
+/// stale user installation cannot make protocol negotiation degrade the shell.
+fn path_with_tirith_under_test() -> std::ffi::OsString {
+    let tirith = std::path::Path::new(env!("CARGO_BIN_EXE_tirith"));
+    let mut directories = vec![tirith
+        .parent()
+        .expect("CARGO_BIN_EXE_tirith must have a parent directory")
+        .to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        directories.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(directories).expect("test PATH must be representable")
+}
+
 /// Split `extra_env` into a session-local shell prelude and real env vars.
 /// `_TIRITH_TEST_*` MUST be session-local: the hook unsets exported (inherited)
 /// `_TIRITH_TEST_*` values as attacker-controllable and honors only local ones.
@@ -96,7 +112,7 @@ fn source_hook_and_dump_exports(capability: Option<&str>, extra_env: &[(&str, &s
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path());
     for (k, v) in &env_vars {
         cmd.env(k, v);
@@ -198,7 +214,7 @@ fn hook_does_not_export_in_noninteractive_shell() {
         .args(["--norc", "--noprofile", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
         .expect("failed to run bash");
@@ -264,7 +280,7 @@ fn status_is_not_exported_to_child_processes() {
         .args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
         .expect("failed to run bash");
@@ -438,7 +454,7 @@ fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path());
     for (k, v) in &env_vars {
         cmd.env(k, v);

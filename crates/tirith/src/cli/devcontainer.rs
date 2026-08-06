@@ -249,4 +249,63 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("context_guard_enabled: true"));
     }
+
+    #[test]
+    fn inject_requires_an_exact_independent_lifecycle_entry() {
+        for (label, command, preserved_key, preserved_value) in [
+            (
+                "decoy substring",
+                serde_json::json!("echo 'tirith init --shell auto'"),
+                "existing",
+                serde_json::json!("echo 'tirith init --shell auto'"),
+            ),
+            (
+                "argv lifecycle",
+                serde_json::json!(["npm", "ci"]),
+                "existing",
+                serde_json::json!(["npm", "ci"]),
+            ),
+            (
+                "object lifecycle",
+                serde_json::json!({"setup": ["npm", "ci"]}),
+                "setup",
+                serde_json::json!(["npm", "ci"]),
+            ),
+        ] {
+            let repo = tempdir().unwrap();
+            let devcontainer_dir = repo.path().join(".devcontainer");
+            std::fs::create_dir_all(&devcontainer_dir).unwrap();
+            let config_path = devcontainer_dir.join("devcontainer.json");
+            let initial = serde_json::json!({
+                "postCreateCommand": command,
+                "containerEnv": {"TIRITH_DEVCONTAINER": "1"}
+            });
+            std::fs::write(&config_path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+            assert_eq!(
+                inject(Some(repo.path()), false, false),
+                0,
+                "{label} must be updated through the CLI outcome path"
+            );
+            let updated_bytes = std::fs::read(&config_path).unwrap();
+            let updated: serde_json::Value = serde_json::from_slice(&updated_bytes).unwrap();
+            assert_eq!(
+                updated["postCreateCommand"][devcontainer_writer::TIRITH_HOOK_KEY],
+                serde_json::json!(["tirith", "init", "--shell", "auto"]),
+                "{label} must gain Tirith's exact reserved argv entry"
+            );
+            assert_eq!(
+                updated["postCreateCommand"][preserved_key], preserved_value,
+                "{label} must be preserved as an independent lifecycle command"
+            );
+            assert_eq!(updated["containerEnv"]["TIRITH_DEVCONTAINER"], "1");
+
+            assert_eq!(inject(Some(repo.path()), false, false), 0);
+            assert_eq!(
+                std::fs::read(&config_path).unwrap(),
+                updated_bytes,
+                "only the structurally exact hook may trigger idempotent success"
+            );
+        }
+    }
 }

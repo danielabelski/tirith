@@ -1865,7 +1865,7 @@ fn policy_findings_for_assessment(
 
     // PackagePolicyNewerThanDays — package_age_days vs thresholds
     if let Some(age_days) = prov.package_age_days {
-        let warn_d = pp.warn_newer_than_days;
+        let warn_d = Some(pp.warn_newer_than_days_effective());
         let block_d = pp.block_newer_than_days;
         let (fired, sev) = match (block_d, warn_d) {
             (Some(b), _) if (age_days as u32) <= b => (true, Severity::High),
