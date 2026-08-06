@@ -5143,6 +5143,17 @@ mod tests {
 
     /// Build an Exec context whose cwd is `dir` (for policy + repo-root
     /// discovery). Used by the exec-guard ON/OFF tests.
+    /// The repo-hook guard refuses to inspect hook state at all when the Git on
+    /// PATH is not the trusted system Git (`/usr/bin/git`), because an
+    /// installation's own system config can select a different
+    /// `core.hooksPath`. Hosts that ship Git elsewhere — Homebrew Git on the
+    /// macOS runners — therefore get `AnalysisIncomplete` before any of the
+    /// routing below can be observed, so those cases have nothing to assert.
+    fn runtime_git_is_the_trusted_inspector(dir: &std::path::Path) -> bool {
+        let ctx = exec_ctx_in("git commit -m probe", dir);
+        runtime_git_matches_hook_inspector(&ctx, "git", ShellType::Posix)
+    }
+
     fn exec_ctx_in(input: &str, dir: &std::path::Path) -> AnalysisContext {
         AnalysisContext {
             input: input.to_string(),
@@ -6999,6 +7010,10 @@ mod tests {
     fn repo_hook_hot_path_maps_uninspectable_git_update_to_blocking_finding() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        if !runtime_git_is_the_trusted_inspector(root.path()) {
+            eprintln!("skipping: this host's PATH Git is not the trusted system Git");
+            return;
+        }
         let ctx = exec_ctx_in("git pull", root.path());
         let findings = check_repo_hooks_hot(&ctx, &ctx.input);
         let finding = findings
@@ -7006,8 +7021,8 @@ mod tests {
             .find(|finding| finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete)
             .expect("git pull must be refused before a destination hook can run");
         assert_eq!(finding.severity, crate::verdict::Severity::High);
-        assert!(finding.description.contains("blocked"));
-        assert!(finding.description.contains("git fetch"));
+        assert!(finding.description.contains("blocked"), "{finding:?}");
+        assert!(finding.description.contains("git fetch"), "{finding:?}");
 
         assert!(leader_is_hook_triggering(
             &ctx,
@@ -7030,6 +7045,10 @@ mod tests {
     fn repo_hook_hot_path_preserves_high_severity_and_surfaces_fetch_fallback() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        if !runtime_git_is_the_trusted_inspector(root.path()) {
+            eprintln!("skipping: this host's PATH Git is not the trusted system Git");
+            return;
+        }
         std::fs::create_dir_all(root.path().join(".husky")).unwrap();
         std::fs::write(
             root.path().join(".husky/pre-commit"),
@@ -7041,7 +7060,11 @@ mod tests {
         let network = findings
             .iter()
             .find(|finding| finding.rule_id == crate::verdict::RuleId::RepoHookNetworkCall)
-            .expect("an automatically executed quoted curl must reach the hot path");
+            .unwrap_or_else(|| {
+                panic!(
+                    "an automatically executed quoted curl must reach the hot path: {findings:?}"
+                )
+            });
         assert_eq!(network.severity, crate::verdict::Severity::High);
 
         std::fs::write(
@@ -7163,6 +7186,10 @@ mod tests {
     fn repo_hook_hot_path_blocks_git_environment_context_overrides() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        if !runtime_git_is_the_trusted_inspector(root.path()) {
+            eprintln!("skipping: this host's PATH Git is not the trusted system Git");
+            return;
+        }
         for command in [
             "GIT_DIR=../other/.git git commit -m test",
             "GIT_CONFIG_PARAMETERS=core.hooksPath=../hooks git commit -m test",
@@ -7273,6 +7300,10 @@ mod tests {
     fn repo_hook_hot_path_normalizes_executable_quotes_and_escapes_before_routing() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        if !runtime_git_is_the_trusted_inspector(root.path()) {
+            eprintln!("skipping: this host's PATH Git is not the trusted system Git");
+            return;
+        }
         std::fs::create_dir_all(root.path().join(".husky")).unwrap();
         std::fs::write(
             root.path().join(".husky/pre-commit"),
