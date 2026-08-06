@@ -314,7 +314,33 @@ pub fn cheap_check(
 
             let resolved_target = match expand_known_path(target, env_map) {
                 Ok(target) => target,
-                Err(()) => {
+                // An absent variable is the same ambiguity `EmptyVarKind::Absent`
+                // already treats as advisory: tirith cannot see a non-exported
+                // shell-local, so `rm -rf build/$TARGET` must not block harder
+                // than `rm -rf "$TARGET/"`, which is the more dangerous shape.
+                // Anything tirith genuinely cannot model — an operator, a
+                // command substitution, `~user`, a malformed reference — still
+                // blocks.
+                Err(ExpansionFailure::MissingVariable(name)) => {
+                    findings.push(finding(
+                        RuleId::AnalysisIncomplete,
+                        Severity::Info,
+                        "destructive target references a variable tirith cannot see",
+                        &format!(
+                            "The destructive target '{target}' references `${name}`, which is \
+                             NOT set in tirith's environment. If it is also unset in your \
+                             shell the target is not what it looks like; if it is a \
+                             non-exported shell-local that IS set, this is harmless — tirith \
+                             cannot see shell-locals, so this is advisory only. Run \
+                             `tirith preview` in the same shell to resolve it."
+                        ),
+                        Evidence::Text {
+                            detail: format!("unresolved destructive target '{target}'"),
+                        },
+                    ));
+                    continue;
+                }
+                Err(ExpansionFailure::Unsupported) => {
                     findings.push(finding(
                         RuleId::AnalysisIncomplete,
                         Severity::High,
@@ -410,7 +436,7 @@ fn simulate_with_work_limit(
 
             let resolved_target = match expand_known_path(target, env_map) {
                 Ok(target) => target,
-                Err(()) => {
+                Err(_) => {
                     report.walk_errors += 1;
                     report.walk_truncated = true;
                     continue;
@@ -793,11 +819,31 @@ fn empty_var_glob_var(
 /// `${NAME}` references supplied by the injected environment. Shell operators,
 /// command substitutions, and unknown variables are unresolved rather than
 /// compared as harmless literal text.
-fn expand_known_path(target: &str, env_map: &HashMap<String, String>) -> Result<String, ()> {
+/// Why a deterministic expansion could not be performed. The distinction
+/// matters for severity: an absent variable may simply be a non-exported
+/// shell-local tirith cannot see (the same reasoning `EmptyVarKind::Absent`
+/// already applies), while a shell operator, command substitution, or malformed
+/// brace is something tirith genuinely cannot model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpansionFailure {
+    /// `$NAME` / `${NAME}` naming a variable absent from the injected
+    /// environment.
+    MissingVariable(String),
+    /// `~user`, a parameter-expansion operator, a command substitution, or a
+    /// malformed reference.
+    Unsupported,
+}
+
+fn expand_known_path(
+    target: &str,
+    env_map: &HashMap<String, String>,
+) -> Result<String, ExpansionFailure> {
     let target = target.trim();
     let mut source = target.to_string();
     if source == "~" || source.starts_with("~/") {
-        let home = env_map.get("HOME").ok_or(())?;
+        let home = env_map
+            .get("HOME")
+            .ok_or_else(|| ExpansionFailure::MissingVariable("HOME".to_string()))?;
         source = if source == "~" {
             home.clone()
         } else {
@@ -805,7 +851,7 @@ fn expand_known_path(target: &str, env_map: &HashMap<String, String>) -> Result<
         };
     } else if source.starts_with('~') {
         // `~user` requires passwd-database lookup and is intentionally unresolved.
-        return Err(());
+        return Err(ExpansionFailure::Unsupported);
     }
 
     let chars: Vec<char> = source.chars().collect();
@@ -825,7 +871,7 @@ fn expand_known_path(target: &str, env_map: &HashMap<String, String>) -> Result<
                 idx += 1;
             }
             if idx == start || idx >= chars.len() || chars[idx] != '}' {
-                return Err(());
+                return Err(ExpansionFailure::Unsupported);
             }
             let name: String = chars[start..idx].iter().collect();
             idx += 1;
@@ -836,11 +882,15 @@ fn expand_known_path(target: &str, env_map: &HashMap<String, String>) -> Result<
                 idx += 1;
             }
             if idx == start {
-                return Err(());
+                return Err(ExpansionFailure::Unsupported);
             }
             chars[start..idx].iter().collect()
         };
-        out.push_str(env_map.get(&name).ok_or(())?);
+        out.push_str(
+            env_map
+                .get(&name)
+                .ok_or_else(|| ExpansionFailure::MissingVariable(name.clone()))?,
+        );
     }
     Ok(out)
 }
@@ -2201,5 +2251,34 @@ mod tests {
             Severity::Info,
             "an absent var might be a shell-local → Info, never Block"
         );
+    }
+
+    #[test]
+    fn absent_variable_is_advisory_but_an_unsupported_expansion_still_blocks() {
+        // The same absent variable must not block harder in the LESS dangerous
+        // shape: `"$TARGET/"` (which collapses toward root) is already advisory,
+        // so `build/$TARGET` is too.
+        let findings = cheap_check("rm -rf build/$TARGET", ShellType::Posix, &empty_env());
+        let incomplete: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == RuleId::AnalysisIncomplete)
+            .collect();
+        assert_eq!(incomplete.len(), 1, "{findings:?}");
+        assert_eq!(incomplete[0].severity, Severity::Info);
+
+        // An expansion tirith genuinely cannot model still fails closed.
+        for command in [
+            "rm -rf ${TARGET:-/}",
+            "rm -rf ~someone/build",
+            "rm -rf build/${TARGET",
+        ] {
+            let findings = cheap_check(command, ShellType::Posix, &empty_env());
+            assert!(
+                findings.iter().any(|f| {
+                    f.rule_id == RuleId::AnalysisIncomplete && f.severity == Severity::High
+                }),
+                "{command} must still block: {findings:?}"
+            );
+        }
     }
 }
