@@ -2829,6 +2829,9 @@ fn collect_from_installed_tree(
 
 /// Parse one [`DiscoveredManifest`] into `out`, recording a note on any read
 /// or parse failure so a partly-broken project still reports.
+// One manifest, one call site: the extra parameters are the per-scan
+// budgets and sinks the parser reports through.
+#[allow(clippy::too_many_arguments)]
 fn parse_one_manifest(
     manifest: &DiscoveredManifest,
     rel: &str,

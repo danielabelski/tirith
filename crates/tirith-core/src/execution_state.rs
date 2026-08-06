@@ -4920,14 +4920,18 @@ mod tests {
         // Two policies differing ONLY in a secret (redacted out of the
         // projection) share one projection hash but must have distinct exact
         // execution identities.
-        let mut left_intel = crate::policy::ThreatIntelConfig::default();
-        left_intel.abusech_auth_key = Some("key-alpha".to_string());
+        let left_intel = crate::policy::ThreatIntelConfig {
+            abusech_auth_key: Some("key-alpha".to_string()),
+            ..Default::default()
+        };
         let left = Policy {
             threat_intel: left_intel,
             ..Policy::default()
         };
-        let mut right_intel = crate::policy::ThreatIntelConfig::default();
-        right_intel.abusech_auth_key = Some("key-beta".to_string());
+        let right_intel = crate::policy::ThreatIntelConfig {
+            abusech_auth_key: Some("key-beta".to_string()),
+            ..Default::default()
+        };
         let right = Policy {
             threat_intel: right_intel,
             ..Policy::default()

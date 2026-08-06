@@ -195,7 +195,7 @@ fn current_fingerprint() -> ContextFingerprint {
             })
             .as_deref()
             .map(std::path::Path::new)
-            .and_then(|p| file_mtime(p)),
+            .and_then(file_mtime),
         kube_default_mtime: kube_default.as_deref().and_then(file_mtime),
         aws_profile: std::env::var("AWS_PROFILE").ok(),
         aws_default_profile: std::env::var("AWS_DEFAULT_PROFILE").ok(),

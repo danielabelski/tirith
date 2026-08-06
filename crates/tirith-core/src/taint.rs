@@ -218,7 +218,9 @@ fn with_store_lock<R>(
     let file = opts.open(&lock_path)?;
     file.lock_exclusive()?;
     let result = f(store);
-    let _ = file.unlock();
+    // Call the fs2 trait method explicitly: std gained an inherent
+    // File::unlock in 1.89 that would otherwise shadow it above the MSRV.
+    let _ = fs2::FileExt::unlock(&file);
     result
 }
 

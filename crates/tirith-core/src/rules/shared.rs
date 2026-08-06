@@ -171,7 +171,7 @@ pub fn is_url_shortener(host: &str) -> bool {
     // semantically identical (`bit.ly.` == `bit.ly`).
     let lower = host.to_ascii_lowercase();
     let lower = lower.trim_end_matches('.');
-    URL_SHORTENER_HOSTS.iter().any(|s| lower == *s)
+    URL_SHORTENER_HOSTS.contains(&lower)
 }
 
 /// `true` when `host` is a loopback / local target that never leaves the
