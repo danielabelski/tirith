@@ -469,8 +469,8 @@ impl HeldEphemeralDirectory {
                 || visible.st_mode & libc::S_IFMT != libc::S_IFDIR
                 || initial.dev() != held.dev()
                 || initial.ino() != held.ino()
-                || visible.st_dev as u64 != held.dev()
-                || visible.st_ino as u64 != held.ino()
+                || visible.st_dev != held.dev()
+                || visible.st_ino != held.ino()
             {
                 return Err(CapsuleRefused {
                     backend_id,
@@ -535,8 +535,8 @@ impl HeldEphemeralDirectory {
         // SAFETY: fstatat initialized the structure on success.
         let stat = unsafe { stat.assume_init() };
         Ok(stat.st_mode & libc::S_IFMT == libc::S_IFDIR
-            && stat.st_dev as u64 == self.device
-            && stat.st_ino as u64 == self.inode)
+            && stat.st_dev == self.device
+            && stat.st_ino == self.inode)
     }
 
     fn preserve(mut self) {
@@ -1127,7 +1127,7 @@ fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
     let statx = unsafe { statx.assume_init() };
     let required = libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID;
     if statx.stx_mask & required != required
-        || statx.stx_ino != stat.st_ino as u64
+        || statx.stx_ino != stat.st_ino
         || (statx.stx_mode as libc::mode_t) & libc::S_IFMT != stat.st_mode & libc::S_IFMT
     {
         return Err(std::io::Error::other(
@@ -1135,8 +1135,8 @@ fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
         ));
     }
     Ok(CleanupIdentity {
-        device: stat.st_dev as u64,
-        inode: stat.st_ino as u64,
+        device: stat.st_dev,
+        inode: stat.st_ino,
         file_type: stat.st_mode & libc::S_IFMT,
         mount_id: statx.stx_mnt_id,
     })
@@ -1150,7 +1150,7 @@ fn cleanup_fd_link_count(fd: i32) -> std::io::Result<u64> {
     }
     // SAFETY: fstat initialized the structure on success.
     let stat = unsafe { stat.assume_init() };
-    Ok(stat.st_nlink as u64)
+    Ok(stat.st_nlink)
 }
 
 #[cfg(target_os = "linux")]
@@ -1750,14 +1750,14 @@ pub fn run_to_completion_bound_directory(
             });
         }
         let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
-        return linux_run_to_completion_bound_directory_supervised(
+        linux_run_to_completion_bound_directory_supervised(
             spec,
             OsStr::new(program),
             &args_os,
             directory_path,
             directory_handle,
             extra_env,
-        );
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -4765,7 +4765,7 @@ pub fn run_to_completion_os(
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     #[cfg(target_os = "linux")]
     {
-        return linux_run_to_completion_supervised(spec, program, args, cwd, extra_env, degraded);
+        linux_run_to_completion_supervised(spec, program, args, cwd, extra_env, degraded)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -5343,6 +5343,9 @@ fn linux_contained_command_os(
     Ok(prepared)
 }
 
+// The Linux containment entry point: every parameter is a distinct piece of
+// the launch plan the two call sites already hold separately.
+#[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "linux")]
 fn linux_contained_command_os_with_options(
     spec: &CapsuleSpec,
