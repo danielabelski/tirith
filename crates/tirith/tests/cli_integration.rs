@@ -668,6 +668,29 @@ fn commands_check_reconstructs_only_proven_posix_multi_argv() {
         .is_some_and(|reason| reason.contains("multi-argument Fish/PowerShell/Cmd")));
 }
 
+/// Read a capsule child's one-byte kernel observation.
+///
+/// `read_exact` reports only "failed to fill whole buffer" when the child died
+/// before publishing, which says nothing about why the sandbox refused to come
+/// up. Reap the child and name its exit status instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_capsule_observation(
+    reader: &mut impl std::io::Read,
+    child: &mut std::process::Child,
+    what: &str,
+) -> [u8; 1] {
+    use std::io::Read as _;
+
+    let mut observed = [0u8; 1];
+    match reader.read_exact(&mut observed) {
+        Ok(()) => observed,
+        Err(error) => {
+            let status = child.wait();
+            panic!("{what}: {error}; the capsule child exited with {status:?}");
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
@@ -965,10 +988,11 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     let mut child = command.spawn().expect("spawn real hidden capsule launcher");
     drop(status_writer);
     drop(ack_guard);
-    let mut observed = [0u8; 1];
-    status_reader
-        .read_exact(&mut observed)
-        .expect("read kernel OBSERVED status");
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read kernel OBSERVED status",
+    );
     assert_eq!(observed, [b'O'], "target must remain stopped until ACK");
     let ack = *b"A";
     assert_eq!(
@@ -1273,16 +1297,17 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         });
     }
 
-    let child = command
+    let mut child = command
         .spawn()
         .expect("spawn production reviewed-file hidden launcher");
     let child_pid = child.id();
     drop(status_writer);
     drop(ack_guard);
-    let mut observed = [0u8; 1];
-    status_reader
-        .read_exact(&mut observed)
-        .expect("read stopped target EXEC observation");
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read stopped target EXEC observation",
+    );
     assert_eq!(observed, [b'O']);
     assert_eq!(
         unsafe {
@@ -1465,14 +1490,15 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
             Ok(())
         });
     }
-    let child = command.spawn().expect("spawn invalid-ACK capsule guard");
+    let mut child = command.spawn().expect("spawn invalid-ACK capsule guard");
     let group = child.id();
     drop(status_writer);
     drop(ack_guard);
-    let mut observed = [0u8; 1];
-    status_reader
-        .read_exact(&mut observed)
-        .expect("read stopped exec observation");
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read stopped exec observation",
+    );
     assert_eq!(observed, [b'O']);
     let invalid = *b"X";
     assert_eq!(
@@ -1677,7 +1703,12 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         let line_bytes = target_output
             .read_line(&mut target_line)
             .expect("read contained target pid");
-        assert_ne!(line_bytes, 0, "target did not publish its pid");
+        assert_ne!(
+            line_bytes,
+            0,
+            "target did not publish its pid; the guard exited with {:?}",
+            guard.wait()
+        );
         let target_pid: libc::pid_t = target_line
             .trim()
             .parse()
