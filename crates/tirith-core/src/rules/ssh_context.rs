@@ -113,6 +113,15 @@ fn check_segment(
         // Classify the inner command with the same verb classifier as
         // `rules::context`, using POSIX even from a PowerShell launcher.
         let category = classify_inner_command_for_ssh(&inner, ShellType::Posix);
+        // The conservative treatment is scoped to the `-o RemoteCommand=`
+        // channel on purpose. That channel is an evasion vector, and unknown
+        // syntax there should not buy a pass. A POSITIONAL remote command is
+        // the ordinary way to run anything on a host, so an `Unknown` verb
+        // there is usually a project's own script name; blocking on it would
+        // turn this High finding into "refuse every unrecognized command on a
+        // critical host" and take out the deploy workflows the label exists to
+        // protect. `positional_unknown_command_is_not_blocked_on_a_critical_host`
+        // pins that boundary.
         let conservative_remote_command = parsed.remote_command_from_option
             && (parsed.remote_command_unparseable
                 || category == crate::rules::context::VerbCategory::Unknown);
@@ -600,6 +609,31 @@ mod tests {
                     && finding.severity == Severity::High
             }));
         }
+    }
+
+    #[test]
+    fn positional_unknown_command_is_not_blocked_on_a_critical_host() {
+        // Counterpart to the `-o RemoteCommand=` case above. A positional
+        // command that classifies as Unknown is an ordinary project script, and
+        // this rule blocks at High, so firing here would refuse every
+        // unrecognized command against a critical host. The destructive verbs
+        // still fire, and the obscure option channel still fails closed.
+        let policy = policy_with_label("prod-host", "critical");
+        let findings = check("ssh prod-host 'custom-deployer'", ShellType::Posix, &policy);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::SshRemoteDestructiveOnLabeledHost),
+            "an unclassifiable positional command must not block: {findings:?}"
+        );
+
+        let destructive = check("ssh prod-host 'rm -rf /srv'", ShellType::Posix, &policy);
+        assert!(
+            destructive
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::SshRemoteDestructiveOnLabeledHost),
+            "a destructive positional command must still fire: {destructive:?}"
+        );
     }
 
     #[test]
