@@ -83,7 +83,13 @@ where
     };
     let _cwd_guard = cwd_tmp.as_ref().map(|t| CwdGuard::set(t.path()));
 
-    let cwd_path = cwd_tmp.as_ref().map(|t| t.path().to_path_buf());
+    // Hand back the canonical path. macOS puts temp dirs under the /var ->
+    // /private/var symlink, so code that observes its own cwd (or canonicalizes
+    // one) sees /private/var/... while the tempdir handle reports /var/...;
+    // tests that compare the two forms would fail on macOS only.
+    let cwd_path = cwd_tmp
+        .as_ref()
+        .map(|t| std::fs::canonicalize(t.path()).unwrap_or_else(|_| t.path().to_path_buf()));
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         f(home_tmp.path(), cwd_path.as_deref())
     }));
