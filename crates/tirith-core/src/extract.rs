@@ -603,8 +603,13 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                     byte_idx += byte_width;
                     continue;
                 }
-                if matches!(b, 0x90 | 0x9F) {
-                    // C1 DCS/APC: consume the opaque string through ST.
+                if matches!(b, 0x90 | 0x98 | 0x9E | 0x9F) {
+                    // C1 DCS / SOS / PM / APC: every one opens an opaque string
+                    // terminated by ST. Leaving SOS (0x98) and PM (0x9E) out
+                    // meant their payload was scanned as ordinary bytes and an
+                    // unterminated one left the phase Idle, so
+                    // finalize_scan_state reported no truncated control for a
+                    // terminal that is in fact wedged.
                     state.phase = OutputPhase::InStringControl;
                     state.osc_pending_st = false;
                     byte_idx += byte_width;
