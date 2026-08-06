@@ -1967,7 +1967,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
         std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
     }
-    tirith_core::context_detect::clear_cache_for_tests();
+    tirith_core::context_detect::invalidate_cache();
 
     let ctx = AnalysisContext {
         input: "kubectl delete namespace payments".to_string(),
@@ -1991,7 +1991,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         std::env::remove_var("KUBECONFIG");
         std::env::remove_var("TIRITH_POLICY_ROOT");
     }
-    tirith_core::context_detect::clear_cache_for_tests();
+    tirith_core::context_detect::invalidate_cache();
 
     let context_finding = verdict.findings.iter().find(|f| {
         matches!(
@@ -2041,7 +2041,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
         std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
     }
-    tirith_core::context_detect::clear_cache_for_tests();
+    tirith_core::context_detect::invalidate_cache();
 
     let ctx = AnalysisContext {
         input: "kubectl get pods -n payments".to_string(),
@@ -2064,7 +2064,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         std::env::remove_var("KUBECONFIG");
         std::env::remove_var("TIRITH_POLICY_ROOT");
     }
-    tirith_core::context_detect::clear_cache_for_tests();
+    tirith_core::context_detect::invalidate_cache();
 
     let context_findings: Vec<_> = verdict
         .findings
