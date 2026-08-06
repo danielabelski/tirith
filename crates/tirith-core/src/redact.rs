@@ -399,15 +399,6 @@ fn find_matching_private_key_footer(
     None
 }
 
-/// Credential carried in an HTTP Authorization header. Provider-specific
-/// token patterns are intentionally narrow, but a Bearer value is sensitive by
-/// protocol regardless of its provider or alphabet (for example, JWTs and
-/// hyphenated opaque tokens). Preserve only the header prefix.
-static AUTHORIZATION_BEARER_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(\b(?:proxy-)?authorization[ \t]*:[ \t]*bearer[ \t]+)[A-Za-z0-9._~+/=-]+")
-        .expect("static authorization bearer regex")
-});
-
 /// Redact sensitive content from a string using built-in and credential patterns.
 pub fn redact(input: &str) -> String {
     let (mut result, _) = redact_private_key_blocks(input);
