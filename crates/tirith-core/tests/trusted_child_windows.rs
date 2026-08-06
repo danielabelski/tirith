@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use tirith_core::trusted_child::{
     run, sanitized_path, ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable,
+    TrustedExecutableError,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
@@ -69,6 +70,23 @@ fn windows_helper_parent_exits_with_a_live_grandchild() {
     // deliberately remains live with inherited stdout/stderr handles.
 }
 
+/// Hosted Windows runners build under a directory whose owner sits outside the
+/// trusted set, so the resolver legitimately refuses to bind the running test
+/// binary. The supervisor cases below need that binding to have anything to
+/// assert, so they skip there rather than restating the runner's ownership.
+fn trusted_current_exe() -> Option<TrustedExecutable> {
+    match TrustedExecutable::current() {
+        Ok(executable) => Some(executable),
+        Err(error @ TrustedExecutableError::InvalidPath { .. })
+            if error.to_string().contains("untrusted owner") =>
+        {
+            eprintln!("skipping: {error}");
+            None
+        }
+        Err(other) => panic!("unexpected trusted-executable error: {other}"),
+    }
+}
+
 fn helper_spec(args: &[&str], limits: ChildLimits) -> ChildSpec {
     ChildSpec::new(args, limits).inherit_env(&[
         "SystemRoot",
@@ -125,7 +143,9 @@ fn windows_denied_origin_check_is_case_insensitive() {
 
 #[test]
 fn windows_supervisor_preserves_short_output_and_status() {
-    let executable = TrustedExecutable::current().unwrap();
+    let Some(executable) = trusted_current_exe() else {
+        return;
+    };
     let spec = helper_spec(
         &[
             "--exact",
@@ -151,7 +171,9 @@ fn windows_supervisor_preserves_short_output_and_status() {
 
 #[test]
 fn windows_supervisor_enforces_output_cap_and_cleans_up_job() {
-    let executable = TrustedExecutable::current().unwrap();
+    let Some(executable) = trusted_current_exe() else {
+        return;
+    };
     let spec = helper_spec(
         &["--exact", "windows_helper_floods_stdout", "--nocapture"],
         ChildLimits::new(Duration::from_secs(5), 128, 4096),
@@ -168,7 +190,9 @@ fn windows_supervisor_enforces_output_cap_and_cleans_up_job() {
 
 #[test]
 fn windows_supervisor_rejects_an_explicit_working_directory() {
-    let executable = TrustedExecutable::current().unwrap();
+    let Some(executable) = trusted_current_exe() else {
+        return;
+    };
     let directory = tempfile::tempdir().unwrap();
     let spec = helper_spec(
         &[
@@ -191,7 +215,9 @@ fn windows_supervisor_rejects_an_explicit_working_directory() {
 
 #[test]
 fn windows_supervisor_kills_descendants_holding_pipes_at_deadline() {
-    let executable = TrustedExecutable::current().unwrap();
+    let Some(executable) = trusted_current_exe() else {
+        return;
+    };
     let directory = tempfile::tempdir().unwrap();
     let pid_file = directory.path().join("grandchild.pid");
     let spec = helper_spec(
