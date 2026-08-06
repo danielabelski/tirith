@@ -225,6 +225,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
             .map(|path| ScanCandidate::Text {
                 logical_path: path.clone(),
                 read_path: path,
+                expected_identity: None,
             }),
     );
     candidates.extend(
@@ -234,6 +235,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
             .map(|candidate| ScanCandidate::Text {
                 read_path: candidate.read_path,
                 logical_path: candidate.logical_path,
+                expected_identity: candidate.identity,
             }),
     );
     candidates.extend(
@@ -292,7 +294,8 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
             ScanCandidate::Text {
                 read_path,
                 logical_path,
-            } => match scan_single_file_guarded_at(&read_path, &logical_path) {
+                expected_identity,
+            } => match scan_single_file_guarded_at(&read_path, &logical_path, expected_identity) {
                 GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(result)) => {
                     scanned_count += 1;
                     file_results.push(result)
@@ -533,10 +536,16 @@ fn hash_path_within_budget(path: &Path) -> Option<String> {
 /// `HashBudgetExceeded`, `Unreadable`, `Unsupported`) rather than a silent skip,
 /// so a skip can never be read as "clean".
 pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
-    scan_single_file_at(file_path, file_path)
+    // No rebinding: the read path IS the caller's path, so there is no earlier
+    // validation for a later open to drift away from.
+    scan_single_file_at(file_path, file_path, None)
 }
 
-fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome {
+fn scan_single_file_at(
+    read_path: &Path,
+    logical_path: &Path,
+    expected_identity: Option<FileIdentity>,
+) -> ScanFileOutcome {
     let location = SubjectLocation::from_path(logical_path.to_path_buf());
 
     // An artifact candidate (`.so`/`.whl`/...) has no analyzer yet, so it is an
@@ -586,6 +595,26 @@ fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome
             });
         }
     };
+
+    // A linked config was validated as in-root at collection time by a path that
+    // `open_read_no_follow_capped` re-walks here. That open refuses only a
+    // symlinked FINAL component, so an intermediate directory swapped in between
+    // would redirect this read outside the root. Prove the handle names the same
+    // file that passed containment, and treat a mismatch — or an identity we
+    // cannot read — as a coverage gap rather than scanning an unvalidated file.
+    if let Some(expected) = expected_identity {
+        if FileIdentity::of(&file) != Some(expected) {
+            eprintln!(
+                "tirith: scan: {} no longer resolves to the file that passed containment",
+                logical_path.display()
+            );
+            return ScanFileOutcome::Skipped(CoverageGap {
+                location,
+                kind: CoverageGapKind::Unreadable,
+                sha256: None,
+            });
+        }
+    }
 
     // Artifact candidate: an `Unsupported` coverage gap, hashed from THIS handle
     // (never a path reopen) so the recorded digest is exactly the inode we opened.
@@ -772,12 +801,16 @@ pub struct RulePanic;
 /// directly; the directory walk routes through here so a per-file panic becomes a
 /// recorded gap rather than a process crash.
 pub fn scan_single_file_guarded(file_path: &Path) -> GuardedScanOutcome {
-    scan_single_file_guarded_at(file_path, file_path)
+    scan_single_file_guarded_at(file_path, file_path, None)
 }
 
-fn scan_single_file_guarded_at(read_path: &Path, logical_path: &Path) -> GuardedScanOutcome {
+fn scan_single_file_guarded_at(
+    read_path: &Path,
+    logical_path: &Path,
+    expected_identity: Option<FileIdentity>,
+) -> GuardedScanOutcome {
     match catch_panic_scanning(logical_path, || {
-        scan_single_file_at(read_path, logical_path)
+        scan_single_file_at(read_path, logical_path, expected_identity)
     }) {
         Some(outcome) => GuardedScanOutcome::Completed(outcome),
         None => GuardedScanOutcome::RulePanic(CoverageGap {
@@ -870,12 +903,62 @@ struct LinkedTextCandidate {
     read_path: PathBuf,
     /// The config symlink path exposed to rules, findings, and callers.
     logical_path: PathBuf,
+    /// Identity of the file that passed containment, so the later open can
+    /// prove it reached the same file.
+    identity: Option<FileIdentity>,
+}
+
+/// The identity of a file on disk, taken from an OPEN handle so it names the
+/// object rather than a pathname another process can redirect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    fn of(file: &std::fs::File) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file.metadata().ok()?;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn of(file: &std::fs::File) -> Option<Self> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        let metadata = file.metadata().ok()?;
+        Some(Self {
+            volume_serial: metadata.volume_serial_number()?,
+            file_index: metadata.file_index()?,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn of(_file: &std::fs::File) -> Option<Self> {
+        None
+    }
 }
 
 enum ScanCandidate {
     Text {
         read_path: PathBuf,
         logical_path: PathBuf,
+        /// Set only for a linked config, whose `read_path` is a resolved target
+        /// rather than the walked path. `None` means the read path IS the
+        /// walked path and needs no rebinding.
+        expected_identity: Option<FileIdentity>,
     },
     Artifact(PathBuf),
 }
@@ -1151,12 +1234,27 @@ fn collect_config_symlink(
         collected.coverage_gaps.push(unreadable_gap(logical_path));
         return;
     }
+    // Take the identity from an OPEN handle, not a path stat, so it names the
+    // object that passed containment. `scan_single_file_at` re-opens the same
+    // path later and refuses to read anything else.
+    let identity = match crate::util::open_read_no_follow_capped(&resolved, u64::MAX) {
+        Ok(file) => FileIdentity::of(&file),
+        Err(_) => {
+            collected.coverage_gaps.push(unreadable_gap(logical_path));
+            return;
+        }
+    };
+    if identity.is_none() {
+        collected.coverage_gaps.push(unreadable_gap(logical_path));
+        return;
+    }
     match std::fs::metadata(&resolved) {
         Ok(metadata) if metadata.is_file() => {
             if classify_collected_path(logical_path) == CollectedFileKind::TextCandidate {
                 collected.linked_text_candidates.push(LinkedTextCandidate {
                     read_path: resolved,
                     logical_path: logical_path.to_path_buf(),
+                    identity,
                 });
             } else {
                 collected.coverage_gaps.push(unreadable_gap(logical_path));
@@ -1638,6 +1736,62 @@ mod tests {
         assert_eq!(result.scanned_count, 1);
         assert_eq!(result.skipped_count, 0);
         assert!(result.coverage_gaps.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_config_read_is_bound_to_the_file_that_passed_containment() {
+        // Containment is checked against a canonicalized path, and the read
+        // re-walks that path. Swap the file the path names between the two and
+        // the read must refuse, because it would otherwise scan content that
+        // was never validated.
+        let root = tempfile::tempdir().expect("create scan root");
+        let validated = root.path().join("validated.txt");
+        let logical = root.path().join("CLAUDE.md");
+        std::fs::write(&validated, "validated instructions").unwrap();
+        std::os::unix::fs::symlink("validated.txt", &logical).unwrap();
+
+        let mut collected = CollectedFiles {
+            text_candidates: Vec::new(),
+            linked_text_candidates: Vec::new(),
+            artifact_candidates: Vec::new(),
+            coverage_gaps: Vec::new(),
+        };
+        collect_config_symlink(root.path(), &logical, &[], &[], &[], &mut collected);
+        let candidate = collected
+            .linked_text_candidates
+            .pop()
+            .expect("an in-root config symlink is a linked candidate");
+        assert!(candidate.identity.is_some(), "identity must be recorded");
+
+        // The same path, a different file.
+        std::fs::remove_file(&validated).unwrap();
+        std::fs::write(&validated, "swapped instructions").unwrap();
+
+        let outcome = scan_single_file_at(
+            &candidate.read_path,
+            &candidate.logical_path,
+            candidate.identity,
+        );
+        match outcome {
+            ScanFileOutcome::Skipped(gap) => {
+                assert_eq!(gap.kind, CoverageGapKind::Unreadable);
+            }
+            _ => panic!("a swapped read target must not be scanned"),
+        }
+
+        // The unswapped file still scans normally.
+        let outcome = scan_single_file_at(
+            &candidate.read_path,
+            &candidate.logical_path,
+            FileIdentity::of(
+                &crate::util::open_read_no_follow_capped(&candidate.read_path, u64::MAX).unwrap(),
+            ),
+        );
+        assert!(
+            matches!(outcome, ScanFileOutcome::Scanned(_)),
+            "the validated file must still scan"
+        );
     }
 
     #[cfg(unix)]
