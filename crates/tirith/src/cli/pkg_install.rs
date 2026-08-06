@@ -177,8 +177,29 @@ impl EnvironmentCheckpoint {
 
 impl Drop for EnvironmentCheckpoint {
     fn drop(&mut self) {
-        if self.active {
-            let _ = self.rollback();
+        if !self.active {
+            return;
+        }
+        let Err(error) = self.rollback() else {
+            return;
+        };
+        // Both restore renames failed, so the target can be absent while the
+        // only copies of it — `environment` and `failed-install` — sit inside
+        // the workspace. Dropping the TempDir would delete them, so retain it
+        // and say where it is instead of discarding the error silently.
+        let retained = self.workspace.take().map(tempfile::TempDir::keep);
+        match retained {
+            Some(path) => eprintln!(
+                "tirith: error: could not restore {} after a failed install ({error}); \
+                 the snapshot and the failed tree are retained in {}",
+                self.target.display(),
+                path.display()
+            ),
+            None => eprintln!(
+                "tirith: error: could not restore {} after a failed install ({error}); \
+                 no checkpoint workspace was available to retain",
+                self.target.display()
+            ),
         }
     }
 }
