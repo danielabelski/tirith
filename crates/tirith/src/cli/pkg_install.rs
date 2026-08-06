@@ -67,15 +67,25 @@ pub struct EnvironmentCheckpoint {
 impl EnvironmentCheckpoint {
     pub fn begin(target: &Path) -> std::io::Result<Self> {
         let target = std::path::absolute(target)?;
-        let parent = match target.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => std::env::current_dir()?,
-        };
-        if parent == target {
-            return Err(std::io::Error::new(
+        let root_refusal = || {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "refusing to checkpoint a filesystem root as an install target",
-            ));
+            )
+        };
+        let parent = match target.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            // A bare relative name ("venv") has an EMPTY parent, meaning the
+            // current directory. A `None` parent means the target itself is a
+            // root or prefix, which is exactly what this guard refuses — it
+            // must not fall through to the current directory, because then
+            // `parent == target` is false and `begin` would snapshot the whole
+            // filesystem into a temp directory.
+            Some(_) => std::env::current_dir()?,
+            None => return Err(root_refusal()),
+        };
+        if parent == target {
+            return Err(root_refusal());
         }
         tirith_core::util::create_dir_durable(&parent)?;
 
@@ -509,6 +519,22 @@ pub fn record_install_receipt(
 mod tests {
     use super::*;
     use tirith_core::capsule::CapsuleSpec;
+
+    #[test]
+    fn checkpoint_refuses_a_target_with_no_parent() {
+        // `Path::new("/").parent()` is None. That must reach the root refusal,
+        // not the current-directory fallback meant for a bare relative name —
+        // otherwise `parent == target` is false and begin would snapshot the
+        // whole filesystem into a temp directory.
+        let error = EnvironmentCheckpoint::begin(Path::new("/"))
+            .err()
+            .expect("a filesystem root is never a valid install target");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("filesystem root"),
+            "unexpected refusal: {error}"
+        );
+    }
 
     /// A directly-constructed [`DigestInstallPlan`] over a single synthetic wheel
     /// path, plus a tempdir standing in for the transaction directory. The core
