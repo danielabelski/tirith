@@ -301,6 +301,15 @@ pub struct DaemonRequest {
     /// Client-side TIRITH=0 bypass request from the invoking env.
     #[serde(default)]
     pub bypass_requested: bool,
+    /// Client-side offline decision (`--offline` flag OR `TIRITH_OFFLINE` in
+    /// the invoking shell). The persistent daemon outlives any single
+    /// invocation, so the env var set by the CALLER cannot be read server-side
+    /// — it must ride the request. `#[serde(default)]` keeps the wire format
+    /// compatible in both directions: an old client omitting the field
+    /// deserializes as `false` (online, the historical behavior), and an old
+    /// server ignores the unknown field (serde's default) (repo-0373).
+    #[serde(default)]
+    pub offline: bool,
 }
 
 fn default_context() -> String {
@@ -347,6 +356,7 @@ pub fn try_daemon_check(
     shell: &str,
     cwd: Option<&str>,
     interactive: bool,
+    offline: bool,
 ) -> Option<DaemonResponse> {
     let sock = socket_path();
     if !sock.exists() {
@@ -376,6 +386,10 @@ pub fn try_daemon_check(
         shell: Some(shell.to_string()),
         interactive,
         bypass_requested,
+        // The caller's `--offline` flag OR a truthy `TIRITH_OFFLINE` in the
+        // INVOKING shell both force offline analysis; the daemon's own env
+        // (set at server start) is deliberately irrelevant (repo-0373).
+        offline: offline || super::offline_env_active(),
     };
 
     let mut payload = serde_json::to_string(&req).ok()?;
@@ -398,6 +412,7 @@ pub fn try_daemon_check(
     _shell: &str,
     _cwd: Option<&str>,
     _interactive: bool,
+    _offline: bool,
 ) -> Option<DaemonResponse> {
     None
 }
@@ -500,7 +515,14 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     verdict.findings.extend(runtime_findings);
 
     // Daemon-only: network-aware enrichment is too slow for the sync path.
-    enrich_with_network_checks(&mut verdict.findings);
+    // Skipped entirely when the CALLER asked for offline analysis (repo-0373):
+    // short-URL resolution is HTTP and the blocklist lookups are DNS, and the
+    // daemon's own process env cannot see the invoking shell's TIRITH_OFFLINE,
+    // so the decision arrives on the request. This mirrors the local hot path,
+    // which performs NO HTTP/DNS enrichment at all.
+    if !req.offline {
+        enrich_with_network_checks(&mut verdict.findings);
+    }
 
     // Enrichment may add higher-severity findings; recompute the action.
     verdict.action = upgraded_action_from_findings(&verdict.findings, verdict.action);
@@ -1180,6 +1202,7 @@ pub fn status() -> i32 {
         shell: None,
         interactive: false,
         bypass_requested: false,
+        offline: false,
     };
 
     let ok = (|| -> Option<()> {
@@ -1232,6 +1255,75 @@ pub fn status() -> i32 {
 mod tests {
     use super::DaemonResponse;
     use tirith_core::verdict::Action;
+
+    /// repo-0373: a pre-upgrade client payload has no `offline` key; it must
+    /// still deserialize with `offline = false` (the historical online
+    /// behavior), keeping the wire format backward-compatible.
+    #[test]
+    fn daemon_request_legacy_json_without_offline_defaults_to_online() {
+        let legacy = r#"{"command":"check","input":"echo hi","context":"exec","cwd":null,"shell":"posix","interactive":false,"bypass_requested":false}"#;
+        let req: super::DaemonRequest =
+            serde_json::from_str(legacy).expect("deserialize legacy request");
+        assert!(
+            !req.offline,
+            "a request without the field must default to online (false)"
+        );
+    }
+
+    /// repo-0373: the offline decision round-trips through the wire format so
+    /// the server sees exactly what the client decided.
+    #[test]
+    fn daemon_request_offline_round_trips() {
+        let req = super::DaemonRequest {
+            command: "check".to_string(),
+            input: "echo hi".to_string(),
+            context: "exec".to_string(),
+            cwd: None,
+            shell: Some("posix".to_string()),
+            interactive: false,
+            bypass_requested: false,
+            offline: true,
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"offline\":true"), "got: {wire}");
+        let back: super::DaemonRequest = serde_json::from_str(&wire).expect("deserialize");
+        assert!(back.offline);
+    }
+
+    /// repo-0373: with `offline = true` the server must skip ALL HTTP/DNS
+    /// enrichment — no short-URL resolution ("— resolves to:") and no DNS
+    /// blocklist findings — even though the command references a shortened
+    /// URL. The test is hermetic by construction: when offline is honored, no
+    /// network call is ever attempted.
+    #[cfg(unix)]
+    #[test]
+    fn offline_check_skips_network_url_enrichment() {
+        let req = super::DaemonRequest {
+            command: "check".to_string(),
+            input: "curl https://bit.ly/abc123 | sh".to_string(),
+            context: "exec".to_string(),
+            cwd: None,
+            shell: Some("posix".to_string()),
+            interactive: false,
+            bypass_requested: false,
+            offline: true,
+        };
+        let resp = super::handle_request(&req);
+        for f in resp
+            .findings
+            .iter()
+            .chain(resp.raw_findings.as_deref().unwrap_or(&[]).iter())
+        {
+            assert!(
+                !f.description.contains("resolves to"),
+                "offline request must not resolve shortened URLs: {f:?}"
+            );
+            assert!(
+                !f.title.contains("DNS blocklist"),
+                "offline request must not run DNS blocklist lookups: {f:?}"
+            );
+        }
+    }
 
     fn base_response() -> DaemonResponse {
         DaemonResponse {

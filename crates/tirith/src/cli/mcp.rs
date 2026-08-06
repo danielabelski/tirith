@@ -1055,7 +1055,16 @@ pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) ->
     }
 
     let yaml_body = render_policy_scaffold_yaml(&scaffold);
-    if let Err(e) = std::fs::write(&example_path, &yaml_body) {
+    // repo-0395: the scaffold lives under the repo's `.tirith/`, which a
+    // malicious checkout can make a symlink. Write through the contained,
+    // no-follow atomic helper so the write can never land outside the repo.
+    let repo_root = example_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    if let Err(e) =
+        super::write_file_atomic_contained(repo_root, &example_path, yaml_body.as_bytes(), true)
+    {
         report_error_for(
             json,
             "tirith mcp policy init",

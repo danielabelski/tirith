@@ -115,6 +115,16 @@ pub fn merge_hooks_json(
         } else {
             json!({"hooks": {}})
         };
+        // repo-0429: when the consumer REQUIRES `version: 1` (Cursor), an
+        // existing project-controlled hooks.json without it must not be
+        // silently extended — Cursor would ignore the whole document and the
+        // hook would never run. Fail loudly instead of reporting success.
+        if require_version && config.get("version") != Some(&json!(1)) {
+            return Err(format!(
+                "tirith: {} exists without a `\"version\": 1` field; Cursor requires it, so no hook was added — fix or remove the file and re-run setup",
+                path.display()
+            ));
+        }
         let hooks = config
             .as_object_mut()
             .ok_or_else(|| format!("{} is not a JSON object", path.display()))?

@@ -54,13 +54,37 @@ pub fn run(
         is_terminal::is_terminal(std::io::stderr())
     };
 
-    let clipboard_html = html_path.and_then(|path| match std::fs::read_to_string(path) {
-        Ok(html) => Some(html),
-        Err(e) => {
-            eprintln!("tirith: warning: failed to read clipboard HTML from '{path}': {e}");
-            None
+    let clipboard_html = match html_path {
+        Some(path) => {
+            // repo-0402: bounded read — the HTML sidecar was previously slurped
+            // with no cap while the paste input itself is limited to 1 MiB.
+            // repo-0401: an explicitly requested analyzer that cannot run must
+            // FAIL CLOSED (exit non-zero), never silently degrade to plain
+            // text — an unreadable/invalid sidecar means the hidden-content
+            // analysis did not happen.
+            match tirith_core::util::read_text_no_follow_capped(
+                std::path::Path::new(path),
+                MAX_PASTE,
+            ) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(html) => Some(html),
+                    Err(_) => {
+                        eprintln!(
+                            "tirith: clipboard HTML '{path}' is not valid UTF-8; refusing to skip rich-text analysis"
+                        );
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "tirith: cannot read clipboard HTML '{path}' safely ({e:?}); refusing to skip rich-text analysis"
+                    );
+                    return 2;
+                }
+            }
         }
-    });
+        None => None,
+    };
 
     // M12 ch1 G1 TOCTOU fix: only `--with-source` reads `clipboard_source.json`, and
     // exactly ONCE — the same record feeds both the engine (paste_source_mismatch) and

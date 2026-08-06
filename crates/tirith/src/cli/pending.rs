@@ -51,7 +51,12 @@ pub fn list(format_json: bool) -> i32 {
         println!("{}", "-".repeat(90));
         for e in &entries {
             let source = format!("{:?}", e.source).to_lowercase();
-            let command = e.command_redacted.chars().take(32).collect::<String>();
+            // repo-0405: the persisted preview is attacker-derived — redaction
+            // strips secrets, not ANSI/OSC/bidi/newlines. Sanitize before print.
+            let command = super::sanitize_for_human_output(
+                &e.command_redacted.chars().take(32).collect::<String>(),
+                false,
+            );
             println!(
                 "{:<10} {:<26} {:<11} {:<9} {}",
                 e.id, e.created_at, source, e.severity, command
@@ -147,6 +152,19 @@ pub fn export(output: Option<PathBuf>) -> i32 {
 
     match output {
         Some(path) => {
+            // repo-0406: a repository can pre-plant the chosen export name as a
+            // symlink to a writable external file; write_file_atomic resolves
+            // symlinks deliberately, so refuse a symlinked destination here.
+            if std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "tirith pending export: refusing to write through symlink {}",
+                    path.display()
+                );
+                return 2;
+            }
             // The file path still pre-serializes (the bytes are written to a file,
             // not stdout, so the EPIPE concern does not apply here).
             let json = match serde_json::to_string_pretty(&all) {

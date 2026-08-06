@@ -351,13 +351,67 @@ fn resolve_policy_path() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
+/// Largest policy file we will read-modify-write for a policy-key toggle. A
+/// policy YAML is hand-authored and tiny; 1 MiB bounds a hostile or
+/// symlinked-to-huge target so the read cannot be turned into an unbounded
+/// slurp.
+const MAX_POLICY_SIZE: u64 = 1024 * 1024;
+
 /// Idempotent append-or-rewrite of a single policy key. Mirrors the
 /// helper used by `cli::ssh` / `cli::context` for `context_guard_enabled`.
+///
+/// Symlink-hardened (repo-0387, mirrors the F16 pattern in
+/// `cli::exec::update_policy_guard_key`): the policy path is a repo-discovered
+/// `<repo>/.tirith/policy.yaml` (or `<config>/tirith/policy.yaml`), so an
+/// attacker who can plant a symlink there could otherwise redirect this
+/// truncating write onto an arbitrary file. Three layers defend the write:
+///   * `canonical_within` against the GRANDPARENT (`<repo>` / `<config>`)
+///     canonicalizes through the containing `.tirith` directory, so a SYMLINKED
+///     `.tirith` that escapes the repo is rejected before any read or write.
+///   * the read uses `O_NOFOLLOW` + a size cap (refuses a symlinked final
+///     component, bounds a hostile target) and ABORTS on any read error other
+///     than genuine absence (the old `unwrap_or_default` turned an unreadable
+///     policy into an empty one and then truncated it); and
+///   * the write uses `O_NOFOLLOW` + `0600` (refuses a symlinked final
+///     component), then the parent dir is fsync'd.
 fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    // The containment root is the grandparent: <repo>/.tirith/policy.yaml →
+    // <repo>, <config>/tirith/policy.yaml → <config>. A policy path is always
+    // at least three components deep; refuse a malformed shallower path rather
+    // than guess.
+    let containment_root = path.parent().and_then(|p| p.parent()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "policy path must be <root>/<dir>/policy.yaml",
+        )
+    })?;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+
+    // Containment FIRST: reject a symlinked containing directory (e.g. a
+    // planted `.tirith` symlink) that escapes the trusted root before we read
+    // or write through it. `O_NOFOLLOW` on the final component alone misses
+    // this, because the OS still follows an intermediate-dir symlink during
+    // path resolution. Done after create_dir_all so a legit first-run `.tirith`
+    // exists to canonicalize.
+    if !tirith_core::util::canonical_within(path, containment_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to write policy through a symlinked path",
+        ));
+    }
+
+    // Read the current contents WITHOUT following a symlinked final component.
+    // An absent file is an empty baseline (the key is then appended); any other
+    // read failure (symlinked, oversized, I/O) aborts rather than clobbering
+    // blind.
+    let existing = match tirith_core::util::read_text_no_follow_capped(path, MAX_POLICY_SIZE) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
+        Err(e) => return Err(open_regular_io_error(e)),
+    };
     let new_line = format!("{key}: {value}");
 
     let prefix = format!("{key}:");
@@ -383,16 +437,32 @@ fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()>
         out.push('\n');
     }
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    // Truncating write that REFUSES to follow a symlinked final component
+    // (0600), then fsync the parent dir so the update is crash-durable.
+    let mut f = tirith_core::util::open_write_no_follow(path, true)?;
+    f.write_all(out.as_bytes())?;
+    tirith_core::util::fsync_parent_dir_logged(path, "iac policy update");
+    Ok(())
+}
+
+/// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
+/// so the policy-key read-modify-write surfaces a single failure type to the
+/// caller.
+fn open_regular_io_error(e: tirith_core::util::OpenRegularError) -> std::io::Error {
+    match e {
+        tirith_core::util::OpenRegularError::Io(io) => io,
+        tirith_core::util::OpenRegularError::NotRegularFile => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy path is not a regular file (symlink or special file)",
+        ),
+        tirith_core::util::OpenRegularError::TooLarge => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy file exceeds the size cap",
+        ),
+        tirith_core::util::OpenRegularError::NotFound => {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "policy file not found")
+        }
     }
-    let mut f = opts.open(path)?;
-    use std::io::Write as _;
-    f.write_all(out.as_bytes())
 }
 
 #[cfg(test)]
@@ -439,5 +509,64 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("context_guard_enabled: false"));
         assert!(content.contains("iac_require_plan_before_apply: true"));
+    }
+
+    /// repo-0387: a symlinked containing directory (planted `.tirith`) that
+    /// escapes the repo must abort the update BEFORE any read/write, and the
+    /// external target must stay untouched.
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_key_refuses_symlinked_containing_dir() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.join(".tirith")).unwrap();
+
+        let path = repo.join(".tirith").join("policy.yaml");
+        let err = update_policy_key(&path, "iac_require_plan_before_apply", "true").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            !outside.path().join("policy.yaml").exists(),
+            "no policy file may be created outside the repo"
+        );
+    }
+
+    /// repo-0387: a symlinked FINAL component must be refused; the link
+    /// target's bytes must be preserved (the old code truncated it blind via
+    /// `unwrap_or_default` + a following write).
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_key_refuses_symlinked_final_component() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("victim.yaml");
+        std::fs::write(&victim, "SENTINEL: do not truncate\n").unwrap();
+        let dir = root.path().join("repo").join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.yaml");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        assert!(update_policy_key(&path, "iac_require_plan_before_apply", "true").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "SENTINEL: do not truncate\n",
+            "symlink target must not be read-modify-written"
+        );
+    }
+
+    /// repo-0387: a read error other than genuine absence (here: the policy
+    /// path is a directory) must abort the update, not fall back to an empty
+    /// baseline that then truncates the target.
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_key_aborts_on_non_regular_policy() {
+        let root = tempdir().unwrap();
+        let dir = root.path().join("repo").join(".tirith");
+        let path = dir.join("policy.yaml");
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert!(update_policy_key(&path, "iac_require_plan_before_apply", "true").is_err());
+        assert!(path.is_dir(), "the directory must remain, not be replaced");
     }
 }

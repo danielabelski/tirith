@@ -228,10 +228,11 @@ fn exit_code(action: Action) -> i32 {
     }
 }
 
-/// Whether `(eco, name)` is allowlisted: an exact, case-insensitive match (bare
-/// `react` or qualified `npm:react`) against the global allowlist or a
-/// supply-chain rule-scoped one. Exact (not substring) so a short name can't
-/// silence every longer name containing it.
+/// repo-0380: an exact, case-insensitive match (bare `react` or qualified
+/// `npm:react`) against the GLOBAL allowlist only. Rule-scoped entries are
+/// applied per-finding by the scan engine — folding them into this Boolean
+/// suppressed every finding (including malicious-package intelligence) for the
+/// dependency.
 fn package_allowlisted(policy: &Policy, eco: Ecosystem, name: &str) -> bool {
     let bare = name.to_lowercase();
     let qualified = format!("{}:{}", eco, bare);
@@ -241,23 +242,7 @@ fn package_allowlisted(policy: &Policy, eco: Ecosystem, name: &str) -> bool {
         e == bare || e == qualified
     };
 
-    if policy.allowlist.iter().any(|e| matches_entry(e)) {
-        return true;
-    }
-    // Rule-scoped allowlist, for the rules `ecosystem scan` emits.
-    for rule in &policy.allowlist_rules {
-        let scoped = matches!(
-            rule.rule_id.to_lowercase().as_str(),
-            "threat_malicious_package"
-                | "threat_package_typosquat"
-                | "threat_package_similar_name"
-                | "threat_suspicious_package"
-        );
-        if scoped && rule.patterns.iter().any(|p| matches_entry(p)) {
-            return true;
-        }
-    }
-    false
+    policy.allowlist.iter().any(|e| matches_entry(e))
 }
 
 /// Emit the full report (a `schema_version`-tagged wrapper over
@@ -415,12 +400,15 @@ fn print_integrity_summary(integrity: &tirith_core::ecosystem_scan::InstalledInt
     for dup in &integrity.duplicate_owned_paths {
         eprintln!(
             "    - path '{}' owned by multiple distributions: {}",
-            dup.path,
-            dup.owners.join(", ")
+            super::sanitize_for_human_output(&dup.path, false),
+            super::sanitize_for_human_output(&dup.owners.join(", "), false)
         );
     }
     for hook in &integrity.unowned_startup_hooks {
-        eprintln!("    - unowned startup hook: {hook}");
+        eprintln!(
+            "    - unowned startup hook: {}",
+            super::sanitize_for_human_output(hook, false)
+        );
     }
     if integrity.native_modules_triaged > 0 {
         eprintln!(
@@ -627,7 +615,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(package_allowlisted(
+        // repo-0380: a rule-scoped entry must NOT widen the package-wide gate;
+        // per-rule suppression is applied per-finding inside the core scan.
+        assert!(!package_allowlisted(
             &policy,
             Ecosystem::PyPI,
             "python-data-helper"

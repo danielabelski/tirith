@@ -19,6 +19,11 @@ mkdir -p -- "$FAKE_BIN" "$OUTPUT_ROOT"
 cat > "$FAKE_BIN/git" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+# `git -C <dir> rev-parse HEAD` records the resolved source revision.
+if [[ "$*" == *rev-parse* ]]; then
+  echo "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+  exit 0
+fi
 destination=${!#}
 mkdir -p -- "$destination/.git"
 printf 'fixture\n' > "$destination/feed.json"
@@ -175,6 +180,10 @@ do
     echo "a partial source set became visible after $failed_source failed" >&2
     exit 1
   fi
+  if [ -e "$OUTPUT_ROOT/tirith-threatdb-source-pins.json" ]; then
+    echo "source pins were recorded after $failed_source failed" >&2
+    exit 1
+  fi
   if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
     echo "failed source-fetch staging state was not cleaned after $failed_source" >&2
     exit 1
@@ -217,5 +226,10 @@ test -d "$published/ossf-mp/.git"
 test -d "$published/dd-mp/.git"
 test -s "$published/feodo.txt"
 test -s "$published/cisa-kev.json"
+
+# The resolved upstream revisions must be recorded on the success path only.
+test -s "$OUTPUT_ROOT/tirith-threatdb-source-pins.json"
+grep -q '"commit": "da39a3ee5e6b4b0d3255bfef95601890afd80709"' \
+  "$OUTPUT_ROOT/tirith-threatdb-source-pins.json"
 
 echo "threatdb source-fetch orchestration regression passed"

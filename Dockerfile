@@ -2,7 +2,11 @@
 # Build context must contain:
 #   bin/tirith   — the pre-built binary for the target platform
 #   shell/       — shell hook scripts
-FROM debian:bookworm-slim
+# Pinned by digest (repo-0443): a movable tag could silently swap the base
+# image for attacker-controlled content. Refresh the digest regularly (e.g.
+# via Dependabot/Renovate) to keep receiving Debian security updates.
+# Digest source: registry-1.docker.io manifest list for debian:bookworm-slim.
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

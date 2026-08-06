@@ -18,6 +18,11 @@ mod secure_file_windows;
 
 const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+/// Maximum accepted token size for `inspect`. A real license token is a few
+/// hundred bytes; anything near 64 KiB is junk or a resource-exhaustion
+/// attempt, so it is rejected before base64/JSON decoding (repo-0451).
+const MAX_INSPECT_TOKEN_BYTES: usize = 64 * 1024;
+
 #[derive(Parser)]
 #[command(name = "tirith-sign", about = "Sign tirith license tokens")]
 struct Cli {
@@ -310,17 +315,25 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
     let token = match token_arg {
         Some(t) => t,
         None => {
-            let mut buf = String::new();
+            // Bounded read: never buffer more than the limit + 1 from stdin.
+            let mut buf = Vec::new();
             std::io::stdin()
-                .read_to_string(&mut buf)
+                .take((MAX_INSPECT_TOKEN_BYTES + 1) as u64)
+                .read_to_end(&mut buf)
                 .map_err(|e| format!("failed to read stdin: {e}"))?;
-            buf
+            String::from_utf8(buf).map_err(|_| "token from stdin is not valid UTF-8")?
         }
     };
     let token = token.trim();
 
     if token.is_empty() {
         return Err("no token provided".to_string());
+    }
+    if token.len() > MAX_INSPECT_TOKEN_BYTES {
+        return Err(format!(
+            "token is too large ({} bytes; max {MAX_INSPECT_TOKEN_BYTES}) — refusing to inspect",
+            token.len()
+        ));
     }
 
     let (payload_b64, sig_b64) = token
@@ -349,12 +362,19 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| format!("{payload:?}"))
     );
 
-    println!("\n--- Summary ---");
+    // `inspect` performs NO signature verification. Every decoded field may be
+    // attacker-controlled, so strings are JSON-escaped before they reach the
+    // operator's terminal (raw ESC/OSC sequences could spoof output or drive
+    // terminal features such as OSC 52 clipboard writes) and the summary is
+    // explicitly labelled unverified (repo-0451).
+    println!(
+        "\n--- Summary (UNVERIFIED — signature NOT checked; fields may be attacker-controlled) ---"
+    );
     if let Some(tier) = payload.get("tier").and_then(|v| v.as_str()) {
-        println!("Tier:    {tier}");
+        println!("Tier:    {}", escape_decoded(tier));
     }
     if let Some(kid) = payload.get("kid").and_then(|v| v.as_str()) {
-        println!("Key ID:  {kid}");
+        println!("Key ID:  {}", escape_decoded(kid));
     }
     if let Some(exp) = payload.get("exp").and_then(|v| v.as_i64()) {
         let exp_dt = chrono::DateTime::from_timestamp(exp, 0)
@@ -371,10 +391,10 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
         println!("Not before: {nbf_dt}");
     }
     if let Some(org) = payload.get("org_id").and_then(|v| v.as_str()) {
-        println!("Org ID:  {org}");
+        println!("Org ID:  {}", escape_decoded(org));
     }
     if let Some(sso) = payload.get("sso_provider").and_then(|v| v.as_str()) {
-        println!("SSO:     {sso}");
+        println!("SSO:     {}", escape_decoded(sso));
     }
     if let Some(seats) = payload.get("seat_count").and_then(|v| v.as_u64()) {
         println!("Seats:   {seats}");
@@ -419,6 +439,14 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
             let _ = write!(s, "{b:02x}");
             s
         })
+}
+
+/// JSON-encode a decoded payload string so terminal control characters
+/// (ESC/OSC/CSI, CR, LF) can never reach the operator's terminal raw when an
+/// unverified token is inspected. The surrounding quotes also make leading or
+/// trailing whitespace visible.
+fn escape_decoded(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"<unencodable>\"".to_string())
 }
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
@@ -513,5 +541,37 @@ mod tests {
 
         let sig_decoded = B64URL.decode(right).unwrap();
         assert_eq!(sig_decoded.len(), 64);
+    }
+
+    /// repo-0451: decoded payload strings must be JSON-escaped before they
+    /// reach the terminal, so ANSI/OSC sequences in an unverified token are
+    /// displayed inertly instead of being interpreted by the terminal.
+    #[test]
+    fn test_escape_decoded_neutralizes_control_sequences() {
+        let escaped = escape_decoded("pro\u{1b}]52;c;YXR0YWNr\u{7}\r\nFAKE");
+        assert_eq!(escaped, "\"pro\\u001b]52;c;YXR0YWNr\\u0007\\r\\nFAKE\"");
+        assert!(!escaped.contains('\u{1b}'));
+        assert!(!escaped.contains('\r'));
+        assert!(!escaped.contains('\n'));
+    }
+
+    /// repo-0451: inspect must reject oversized tokens before decoding.
+    #[test]
+    fn test_inspect_rejects_oversized_token() {
+        let oversized = "a".repeat(MAX_INSPECT_TOKEN_BYTES + 1);
+        let err = cmd_inspect(Some(oversized)).unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
+    }
+
+    /// repo-0451: a token at the size limit still fails cleanly (not a valid
+    /// token), but with a decode error rather than the size guard.
+    #[test]
+    fn test_inspect_size_limit_boundary() {
+        let at_limit = "a".repeat(MAX_INSPECT_TOKEN_BYTES);
+        let err = cmd_inspect(Some(at_limit)).unwrap_err();
+        assert!(
+            !err.contains("too large"),
+            "boundary token wrongly rejected"
+        );
     }
 }

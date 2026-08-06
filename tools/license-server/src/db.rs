@@ -92,6 +92,22 @@ CREATE INDEX IF NOT EXISTS idx_tokens_sub ON tokens(subscription_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_sub ON api_keys(subscription_id);
 "#;
 
+/// repo-0445: `last_event_at` participates in SQLite `MAX()` over TEXT, which
+/// only matches chronological order when every value shares one fixed-width
+/// UTC encoding. Normalize RFC3339 inputs (any offset/fraction) to
+/// `...T..:..:.. .mmmZ`; unparseable values pass through unchanged (the stale
+/// guards treat them conservatively).
+fn normalize_event_ts(raw: Option<&str>) -> Option<String> {
+    raw.map(|value| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|ts| {
+                ts.to_utc()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            })
+            .unwrap_or_else(|_| value.to_string())
+    })
+}
+
 impl Db {
     pub fn open(path: &str) -> Result<Self, AppError> {
         let conn =
@@ -154,6 +170,7 @@ impl Db {
 
     /// First-time provision path (triggered by `order.paid` or the first
     /// `subscription.active`).
+
     pub async fn process_subscription_created(
         &self,
         data: CreatedData,
@@ -185,7 +202,7 @@ impl Db {
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
-                   status=CASE WHEN subscriptions.status='revoked' THEN 'revoked' ELSE 'active' END,
+                   status=CASE WHEN subscriptions.status='revoked' THEN 'revoked' ELSE subscriptions.status END,
                    email=excluded.email, product_id=excluded.product_id, tier=excluded.tier,
                    last_event_at=MAX(COALESCE(subscriptions.last_event_at,''), excluded.last_event_at),
                    updated_at=datetime('now')",
@@ -195,7 +212,7 @@ impl Db {
                     data.email,
                     data.tier,
                     data.product_id,
-                    data.occurred_at,
+                    normalize_event_ts(data.occurred_at.as_deref()),
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert sub: {e}")))?;
@@ -356,7 +373,7 @@ impl Db {
                     data.email.as_deref().unwrap_or("unknown"),
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    data.occurred_at,
+                    normalize_event_ts(data.occurred_at.as_deref()),
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert canceled: {e}")))?;
@@ -413,7 +430,7 @@ impl Db {
                     data.email.as_deref().unwrap_or("unknown"),
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    data.occurred_at,
+                    normalize_event_ts(data.occurred_at.as_deref()),
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert revoked: {e}")))?;
@@ -584,7 +601,7 @@ impl Db {
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.new_status,
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    data.occurred_at,
+                    normalize_event_ts(data.occurred_at.as_deref()),
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert updated: {e}")))?;
@@ -785,6 +802,24 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
+    /// Seconds since the most recent token issuance for `sub_id` (`None` when
+    /// never issued). Drives the repo-0449 per-subscription refresh interval.
+    pub async fn seconds_since_last_token(&self, sub_id: &str) -> Result<Option<i64>, AppError> {
+        let conn = self.conn.clone();
+        let sid = sub_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = acquire_db(&conn);
+            conn.query_row(
+                "SELECT CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', MAX(created_at)) AS INTEGER) FROM tokens WHERE subscription_id=?1",
+                params![sid],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| AppError::Internal(format!("db token age: {e}")))
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
+    }
+
     pub async fn insert_dead_letter(&self, dl: DeadLetterData) -> Result<(), AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -859,6 +894,7 @@ impl Db {
         sub_id: &str,
         new_tier: &str,
         new_product_id: &str,
+        expected_last_event_at: Option<String>,
     ) -> Result<(), AppError> {
         let conn = self.conn.clone();
         let sid = sub_id.to_string();
@@ -866,9 +902,12 @@ impl Db {
         let pid = new_product_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = acquire_db(&conn);
+            // repo-0448: compare-and-swap on the version observed when the
+            // Polar request STARTED. A plan transition landing mid-flight must
+            // not be overwritten by the stale response.
             conn.execute(
-                "UPDATE subscriptions SET tier=?1, product_id=?2, updated_at=datetime('now') WHERE id=?3 AND tier='unknown'",
-                params![tier, pid, sid],
+                "UPDATE subscriptions SET tier=?1, product_id=?2, updated_at=datetime('now') WHERE id=?3 AND tier='unknown' AND last_event_at IS ?4",
+                params![tier, pid, sid, expected_last_event_at],
             )
             .map_err(|e| AppError::Internal(format!("db retry tier fix: {e}")))?;
             conn.execute(

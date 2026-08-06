@@ -428,37 +428,60 @@ blocklist: []
 ";
 
     if let Some(repo_root) = tirith_core::policy::find_repo_root(None) {
-        let policy_dir = repo_root.join(".tirith");
-        if std::fs::create_dir_all(&policy_dir).is_ok() {
-            let path = policy_dir.join("policy.yaml");
-            if path.exists() {
-                return Err(format!(
-                    "policy already exists at {} — not overwriting",
-                    path.display()
-                ));
-            }
-            return std::fs::write(&path, content)
-                .map(|()| path)
-                .map_err(|e| e.to_string());
+        let path = repo_root.join(".tirith").join("policy.yaml");
+        match create_policy_contained(&repo_root, &path, content) {
+            Ok(()) => return Ok(path),
+            Err(e) => return Err(e),
         }
     }
 
     if let Some(config) = tirith_core::policy::config_dir() {
-        if std::fs::create_dir_all(&config).is_ok() {
-            let path = config.join("policy.yaml");
-            if path.exists() {
-                return Err(format!(
-                    "policy already exists at {} — not overwriting",
-                    path.display()
-                ));
-            }
-            return std::fs::write(&path, content)
-                .map(|()| path)
-                .map_err(|e| e.to_string());
+        let path = config.join("policy.yaml");
+        match create_policy_contained(&config, &path, content) {
+            Ok(()) => return Ok(path),
+            Err(e) => return Err(e),
         }
     }
 
     Err("could not determine a location for policy file".to_string())
+}
+
+/// Publish `content` to `path` (a policy file directly beneath `root` or one
+/// directory down) with create-new, no-follow semantics (repo-0378).
+///
+/// `util::ContainedAtomicFile` binds `path` beneath `root` through retained
+/// directory capabilities: every intermediate component is traversed without
+/// following attacker-controlled symlinks (a planted `.tirith` symlink that
+/// escapes the repo is refused, closing the old `create_dir_all` +
+/// `std::fs::write` follow), a symlinked or non-regular final component is
+/// rejected, and the write is an atomic same-directory temp-then-rename.
+/// `overwrite = false` gives create-new semantics: anything already at `path`
+/// (including a dangling symlink the old `exists()` check could not see) fails
+/// with `AlreadyExists` instead of being clobbered or followed.
+fn create_policy_contained(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), String> {
+    let contained =
+        tirith_core::util::ContainedAtomicFile::prepare(root, path, true).map_err(|e| {
+            format!(
+                "refusing to create {} through a symlinked or escaping path: {e}",
+                path.display()
+            )
+        })?;
+    contained
+        .write_atomic(content.as_bytes(), false)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "policy already exists at {} — not overwriting",
+                    path.display()
+                )
+            } else {
+                format!("failed to write {}: {e}", path.display())
+            }
+        })
 }
 
 /// Findings hidden by the current paranoia level.
@@ -3853,5 +3876,67 @@ mod tests {
             // The entry itself returns success in JSON mode.
             assert_eq!(run_quick(true), 0, "run_quick(json=true) must exit 0");
         });
+    }
+
+    /// repo-0378: the starter policy is created beneath the repo root with
+    /// create-new semantics through the contained writer.
+    #[test]
+    fn create_policy_contained_creates_policy() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join(".tirith").join("policy.yaml");
+        create_policy_contained(repo.path(), &path, "fail_mode: open\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fail_mode: open\n");
+    }
+
+    /// repo-0378: an existing policy is never clobbered — the friendly
+    /// "already exists" error is preserved.
+    #[test]
+    fn create_policy_contained_refuses_to_clobber_existing() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.yaml");
+        std::fs::write(&path, "SENTINEL\n").unwrap();
+
+        let err = create_policy_contained(repo.path(), &path, "fail_mode: open\n").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SENTINEL\n");
+    }
+
+    /// repo-0378: a SYMLINKED `.tirith` directory escaping the repo is refused
+    /// (the old `create_dir_all` + `std::fs::write` followed it and created the
+    /// file OUTSIDE the repo).
+    #[test]
+    fn create_policy_contained_refuses_symlinked_tirith_dir() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".tirith")).unwrap();
+
+        let path = repo.path().join(".tirith").join("policy.yaml");
+        assert!(create_policy_contained(repo.path(), &path, "fail_mode: open\n").is_err());
+        assert!(
+            !outside.path().join("policy.yaml").exists(),
+            "no file may be created outside the repo"
+        );
+    }
+
+    /// repo-0378: a DANGLING symlink at the final component is invisible to
+    /// `exists()`; the old code followed it and created an external file. The
+    /// contained writer refuses it.
+    #[test]
+    fn create_policy_contained_refuses_dangling_symlink_at_final_component() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.yaml");
+        let dir = repo.path().join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.yaml");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        assert!(create_policy_contained(repo.path(), &path, "fail_mode: open\n").is_err());
+        assert!(
+            !victim.exists(),
+            "no external file may be created through the dangling symlink"
+        );
     }
 }

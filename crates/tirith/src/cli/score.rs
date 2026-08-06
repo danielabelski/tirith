@@ -78,11 +78,17 @@ fn print_human(
     explain: bool,
 ) {
     if verdict.findings.is_empty() {
-        eprintln!("tirith: {url} — no issues found (score: 0/100)");
+        // repo-0423: the inspected URL is untrusted — sanitize before rendering.
+        eprintln!(
+            "tirith: {} — no issues found (score: 0/100)",
+            super::sanitize_for_human_output(url, false)
+        );
     } else {
         eprintln!(
-            "tirith: {url} — risk score: {}/100 ({})",
-            breakdown.score, breakdown.risk_level
+            "tirith: {} — risk score: {}/100 ({})",
+            super::sanitize_for_human_output(url, false),
+            breakdown.score,
+            breakdown.risk_level
         );
         if output::write_human_auto(verdict, false).is_err() {
             eprintln!("tirith: failed to write output");
@@ -119,9 +125,14 @@ fn write_breakdown_human(
         writeln!(
             w,
             "    {sign}{:<4} {}  (running total: {running})",
-            factor.points, factor.label
+            factor.points,
+            super::sanitize_for_human_output(&factor.label, false)
         )?;
-        writeln!(w, "           {}", factor.detail)?;
+        writeln!(
+            w,
+            "           {}",
+            super::sanitize_for_human_output(&factor.detail, true)
+        )?;
     }
     writeln!(
         w,

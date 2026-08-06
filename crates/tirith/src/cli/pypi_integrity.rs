@@ -210,16 +210,30 @@ fn fetch_provenance_at(url: &str) -> Result<String, FetchError> {
         )));
     }
 
-    // Cap the body: a provenance document is small.
-    let bytes = resp
-        .bytes()
+    // Cap the body BEFORE buffering (repo-0413): reject an excessive
+    // Content-Length up front, then stream the decoded body through a reader
+    // limited to `MAX_PROVENANCE_BYTES + 1` and abort the moment the cap is
+    // crossed — `Response::bytes()` would buffer the complete (possibly
+    // highly-expanded decompressed) response before any check ran.
+    if let Some(len) = resp.content_length() {
+        if len > MAX_PROVENANCE_BYTES as u64 {
+            return Err(FetchError::Transport(format!(
+                "provenance response exceeds the {MAX_PROVENANCE_BYTES}-byte cap"
+            )));
+        }
+    }
+    use std::io::Read as _;
+    let mut limited = resp.take(MAX_PROVENANCE_BYTES as u64 + 1);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
         .map_err(|e| FetchError::Transport(e.to_string()))?;
     if bytes.len() > MAX_PROVENANCE_BYTES {
         return Err(FetchError::Transport(format!(
             "provenance response exceeds the {MAX_PROVENANCE_BYTES}-byte cap"
         )));
     }
-    String::from_utf8(bytes.to_vec())
+    String::from_utf8(bytes)
         .map_err(|_| FetchError::Transport("provenance response is not valid UTF-8".to_string()))
 }
 
@@ -490,7 +504,14 @@ fn render(
         let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
         println!();
     } else {
-        eprintln!("tirith pkg attest: {project} {version}");
+        // repo-0414: project/version come from the attacker-controlled wheel
+        // filename; remote identity/reason fields are registry-controlled.
+        // Sanitize everything before the terminal (JSON stays raw).
+        eprintln!(
+            "tirith pkg attest: {} {}",
+            super::sanitize_for_human_output(project, false),
+            super::sanitize_for_human_output(version, false)
+        );
         eprintln!("  artifact sha256: {artifact_sha256}");
         eprintln!("  attestation:     {}", outcome.label());
         match outcome {
@@ -499,11 +520,17 @@ fn render(
                 render_identity(identity);
             }
             AttestationOutcome::Missing { reason } => {
-                eprintln!("  no attestation: {reason}");
+                eprintln!(
+                    "  no attestation: {}",
+                    super::sanitize_for_human_output(reason, false)
+                );
                 eprintln!("  (absence of provenance is not a block; the firewall verdict is over the bytes)");
             }
             AttestationOutcome::Invalid { reason } => {
-                eprintln!("  attestation invalid: {reason}");
+                eprintln!(
+                    "  attestation invalid: {}",
+                    super::sanitize_for_human_output(reason, false)
+                );
             }
             AttestationOutcome::SubjectMismatch {
                 attested_sha256,
@@ -516,11 +543,17 @@ fn render(
                 eprintln!("    artifact: {artifact_sha256}");
             }
             AttestationOutcome::PublisherNotAllowed { identity, reason } => {
-                eprintln!("  publisher not allowed: {reason}");
+                eprintln!(
+                    "  publisher not allowed: {}",
+                    super::sanitize_for_human_output(reason, false)
+                );
                 render_identity(identity);
             }
             AttestationOutcome::VerificationUnavailable { reason } => {
-                eprintln!("  verification unavailable: {reason}");
+                eprintln!(
+                    "  verification unavailable: {}",
+                    super::sanitize_for_human_output(reason, false)
+                );
             }
         }
     }
@@ -530,13 +563,22 @@ fn render(
 /// summary.
 fn render_identity(identity: &PublisherIdentity) {
     if let Some(repo) = &identity.repository {
-        eprintln!("    repository: {repo}");
+        eprintln!(
+            "    repository: {}",
+            super::sanitize_for_human_output(repo, false)
+        );
     }
     if let Some(wf) = &identity.workflow {
-        eprintln!("    workflow:   {wf}");
+        eprintln!(
+            "    workflow:   {}",
+            super::sanitize_for_human_output(wf, false)
+        );
     }
     if let Some(sid) = &identity.signer_identity {
-        eprintln!("    signer:     {sid}");
+        eprintln!(
+            "    signer:     {}",
+            super::sanitize_for_human_output(sid, false)
+        );
     }
 }
 

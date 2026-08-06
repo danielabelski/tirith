@@ -305,6 +305,18 @@ fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
 /// default `%USERPROFILE%\Documents` is already user-private via NTFS ACL) but
 /// emit a one-line stderr warning that protection relies on directory perms.
 fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
+    // repo-0374: the export path can be a repository-planted symlink (the
+    // documented `--out .` flow writes ./dashboard.html). `write_file_atomic`
+    // deliberately resolves symlinks for config files, so refuse them here
+    // instead of overwriting an out-of-repo target.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to write export through symlink {}",
+                path.display()
+            ));
+        }
+    }
     // Atomic temp+fsync+rename; `overwrite = true` replaces an existing export.
     // On Unix the 0600 temp mode is preserved by the rename; the helper also
     // creates any missing parent dirs.

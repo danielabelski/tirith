@@ -433,7 +433,26 @@ const READ_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 /// a TOCTOU race (the file can grow between stat and read). Reading at most
 /// `MAX_BYTES + 1` and rejecting over `MAX_BYTES` bounds memory regardless.
 fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
+    // repo-0356: open no-follow + nonblocking and require a REGULAR file before
+    // reading. A project-controlled FIFO (or device/socket) named like a
+    // config file must not block `ai diff`/`snapshot`/`quarantine` forever.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is not a regular file; skipping",
+                sanitize_display(&path.display().to_string())
+            ),
+        ));
+    }
     let mut bytes = Vec::new();
     // One byte past the cap so an exactly-`MAX_BYTES` file is accepted.
     file.take(READ_MAX_BYTES as u64 + 1)
@@ -441,7 +460,10 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     if bytes.len() > READ_MAX_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("{} is larger than 10 MiB; skipping", path.display()),
+            format!(
+                "{} is larger than 10 MiB; skipping",
+                sanitize_display(&path.display().to_string())
+            ),
         ));
     }
     Ok(bytes)
@@ -526,7 +548,10 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         && !confirm(
             &format!(
                 "Move (DELETE original) {} into quarantine? The original will be removed.",
-                src.display()
+                // repo-0357: `src` is a project-controlled path — sanitize
+                // terminal controls before asking the operator to approve a
+                // deletion.
+                sanitize_display(&src.display().to_string())
             ),
             yes,
         )

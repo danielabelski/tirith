@@ -82,7 +82,12 @@ pub fn triage(json: bool, verbose: bool) -> i32 {
     for item in &items {
         println!("  - {}", item.next_step());
         if verbose {
-            println!("      redacted: {}", item.redacted);
+            // repo-0424: DLP redaction removes credential VALUES but not
+            // terminal-control sequences the attacker embedded alongside them.
+            println!(
+                "      redacted: {}",
+                super::sanitize_for_human_output(&item.redacted, false)
+            );
             if let Some(p) = item.provider {
                 println!("      docs:     {}", p.doc_url);
                 println!("      verified: {}", p.last_verified);

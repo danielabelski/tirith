@@ -706,39 +706,61 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
 
     let mut supplemental = SupplementalEntries::default();
     let mut attempted_feeds = 0usize;
+    let mut failed_feeds: Vec<&str> = Vec::new();
 
     if let Some(auth_key) = policy.threat_intel.abusech_auth_key.as_deref() {
         if !auth_key.trim().is_empty() {
             attempted_feeds += 1;
-            log_feed_result(
+            if !log_feed_result(
                 "URLhaus",
                 fetch_urlhaus_feed(&client, auth_key.trim(), &mut supplemental),
-            );
+            ) {
+                failed_feeds.push("URLhaus");
+            }
             attempted_feeds += 1;
-            log_feed_result(
+            if !log_feed_result(
                 "ThreatFox",
                 fetch_threatfox_feed(&client, auth_key.trim(), &mut supplemental),
-            );
+            ) {
+                failed_feeds.push("ThreatFox");
+            }
         }
     }
 
     if policy.threat_intel.phishing_army_enabled {
         attempted_feeds += 1;
-        log_feed_result(
+        if !log_feed_result(
             "Phishing Army",
             fetch_phishing_army_feed(&client, &mut supplemental),
-        );
+        ) {
+            failed_feeds.push("Phishing Army");
+        }
         attempted_feeds += 1;
-        log_feed_result(
+        if !log_feed_result(
             "PhishTank",
             fetch_phishtank_feed(&client, &mut supplemental),
-        );
+        ) {
+            failed_feeds.push("PhishTank");
+        }
     }
 
     // At least one group is enabled here (fully-disabled returned early), so Tor
     // exit is always included as a supplemental IP signal.
     attempted_feeds += 1;
-    log_feed_result("Tor exit", fetch_tor_exit_feed(&client, &mut supplemental));
+    if !log_feed_result("Tor exit", fetch_tor_exit_feed(&client, &mut supplemental)) {
+        failed_feeds.push("Tor exit");
+    }
+
+    // repo-0441: a PARTIAL outage must never replace the last-known-good
+    // supplemental DB — the old code rebuilt from only the successful feeds,
+    // silently dropping every indicator of the failed source.
+    if !failed_feeds.is_empty() {
+        eprintln!(
+            "tirith: warning: supplemental feed(s) failed ({}); keeping the existing supplemental threat DB unchanged",
+            failed_feeds.join(", ")
+        );
+        return Ok(());
+    }
 
     if supplemental.is_empty() {
         eprintln!(
@@ -772,11 +794,20 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
     Ok(())
 }
 
-fn log_feed_result(feed_name: &str, result: Result<usize, String>) {
+/// Log a feed outcome; `true` when the feed genuinely produced entries.
+/// repo-0441: an EMPTY successful response is treated as a failure for
+/// publication purposes — a wiped/zero-answer upstream must not shrink the DB.
+fn log_feed_result(feed_name: &str, result: Result<usize, String>) -> bool {
     match result {
-        Ok(0) => eprintln!("tirith: warning: {feed_name} feed returned no entries"),
-        Ok(_) => {}
-        Err(e) => eprintln!("tirith: warning: {feed_name} feed failed: {e}"),
+        Ok(0) => {
+            eprintln!("tirith: warning: {feed_name} feed returned no entries");
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("tirith: warning: {feed_name} feed failed: {e}");
+            false
+        }
     }
 }
 
@@ -858,7 +889,20 @@ fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>,
         )
         .send()
         .and_then(|resp| resp.error_for_status())
-        .map_err(|e| format!("fetch failed for {safe}: {e}"))?;
+        // repo-0439: a reqwest error's Display embeds the FULL request URL —
+        // including `?auth-key=` credentials. Map to a coarse, URL-free reason.
+        .map_err(|e| {
+            let reason = if e.is_timeout() {
+                "timed out"
+            } else if e.is_connect() {
+                "connection failed"
+            } else if e.is_status() {
+                "unexpected HTTP status"
+            } else {
+                "request failed"
+            };
+            format!("fetch failed for {safe}: {reason}")
+        })?;
 
     let content_length = response.content_length();
     read_bounded_bytes(response, &safe, content_length, MAX_SUPPLEMENTAL_FEED_SIZE)
@@ -1383,12 +1427,11 @@ fn fetch_manifest_from_with_state_and_client(
                 content_len, MAX_MANIFEST_SIZE
             ));
         }
-        let body = resp
-            .text()
-            .map_err(|e| format!("failed to read manifest body: {e}"))?;
-        if body.len() as u64 > MAX_MANIFEST_SIZE {
-            return Err(format!("manifest body too large: {} bytes", body.len()));
-        }
+        // repo-0440: bound DURING the read — a chunked/no-length response
+        // bypasses the Content-Length precheck.
+        let body_bytes = read_bounded_bytes(resp, "manifest", None, MAX_MANIFEST_SIZE)?;
+        let body = String::from_utf8(body_bytes)
+            .map_err(|e| format!("manifest body is not valid UTF-8: {e}"))?;
         Some(body)
     } else {
         None
@@ -1456,15 +1499,10 @@ fn fetch_manifest_from_with_state_and_client(
                 .get("etag")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let retry_body = retry_resp
-                .text()
-                .map_err(|e| format!("failed to read retry body: {e}"))?;
-            if retry_body.len() as u64 > MAX_MANIFEST_SIZE {
-                return Err(format!(
-                    "manifest body too large on retry: {} bytes",
-                    retry_body.len()
-                ));
-            }
+            let retry_body_bytes =
+                read_bounded_bytes(retry_resp, "manifest-retry", None, MAX_MANIFEST_SIZE)?;
+            let retry_body = String::from_utf8(retry_body_bytes)
+                .map_err(|e| format!("retry body is not valid UTF-8: {e}"))?;
             let manifest = serde_json::from_str::<Manifest>(&retry_body)
                 .map_err(|e| format!("invalid manifest JSON on retry: {e}"))?;
             persist_cache_files(&etag_path, retry_etag.as_deref(), &body_path, &retry_body);
@@ -1533,15 +1571,9 @@ fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
         return Err(format!("DB download HTTP {}", resp.status()));
     }
 
-    let bytes = resp
-        .bytes()
-        .map_err(|e| format!("failed to read DB body: {e}"))?;
+    let bytes = read_bounded_bytes(resp, "threatdb", None, MAX_DB_SIZE)?;
 
-    if bytes.len() as u64 > MAX_DB_SIZE {
-        return Err(format!("DB body too large: {} bytes", bytes.len()));
-    }
-
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// Fetch and authenticate the signed v2 index, trying the primary raw URL and
@@ -1630,12 +1662,9 @@ fn fetch_index_v2_from(url: &str) -> Result<IndexV2, String> {
             content_len, MAX_MANIFEST_SIZE
         ));
     }
-    let body = resp
-        .text()
-        .map_err(|e| format!("failed to read v2 index body: {e}"))?;
-    if body.len() as u64 > MAX_MANIFEST_SIZE {
-        return Err(format!("v2 index body too large: {} bytes", body.len()));
-    }
+    let body_bytes = read_bounded_bytes(resp, "v2-index", None, MAX_MANIFEST_SIZE)?;
+    let body = String::from_utf8(body_bytes)
+        .map_err(|e| format!("v2 index body is not valid UTF-8: {e}"))?;
     serde_json::from_str::<IndexV2>(&body).map_err(|e| format!("invalid v2 index JSON: {e}"))
 }
 

@@ -587,14 +587,20 @@ pub fn suggest_closest<'a>(
         .map(|(c, _)| c)
 }
 
-/// Prompt for confirmation. `true` only if `--yes`, or stderr is a TTY and the
-/// user types y/yes. `false` in non-interactive contexts without `--yes`, so
-/// destructive operations are never silently approved.
+/// Prompt for confirmation. `true` only if `--yes`, or BOTH stdin and stderr
+/// are TTYs and the user types y/yes. `false` in non-interactive contexts
+/// without `--yes`, so destructive operations are never silently approved.
+///
+/// repo-0398: checking only the prompt stream (stderr) lets a piped stdin
+/// (`yes | tirith <destructive>`) answer the prompt — stderr is still the
+/// user's terminal, but the "human" typing `y` is attacker-controlled input.
+/// Requiring stdin to be a terminal too, as onboard's `is_tty_pair` already
+/// does, closes that approval bypass.
 pub fn confirm(prompt: &str, yes: bool) -> bool {
     if yes {
         return true;
     }
-    if !is_terminal::is_terminal(std::io::stderr()) {
+    if !is_terminal::is_terminal(std::io::stderr()) || !is_terminal::is_terminal(std::io::stdin()) {
         eprintln!("tirith: skipping prompt (not a TTY — use --yes to auto-approve)");
         return false;
     }

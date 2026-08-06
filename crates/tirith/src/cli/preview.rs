@@ -81,7 +81,13 @@ fn print_human(
         Action::Block => "tirith preview: HIGH-IMPACT — do not run without review",
     };
     println!("{banner}");
-    println!("  command: {command}");
+    // repo-0410: the command and any filesystem-derived path are untrusted —
+    // scrub terminal controls before printing (findings below are sanitized
+    // the same way).
+    println!(
+        "  command: {}",
+        super::sanitize_for_human_output(command, false)
+    );
     println!();
 
     let suffix = if report.walk_truncated { "+" } else { "" };
@@ -89,7 +95,11 @@ fn print_human(
     println!("  dirs:     {}{suffix}", report.dir_count);
     println!("  symlinks: {}", report.symlink_count);
     if let Some((path, size)) = &report.largest_file {
-        println!("  largest:  {path} ({})", human_size(*size));
+        println!(
+            "  largest:  {} ({})",
+            super::sanitize_for_human_output(path, false),
+            human_size(*size)
+        );
     }
     if report.glob_expansion_count > 0 {
         println!(

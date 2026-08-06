@@ -88,13 +88,15 @@ pub fn status(json: bool) -> i32 {
                     .get(&ctx.label_key())
                     .map(String::as_str)
                     .unwrap_or("(unlabeled)");
-                eprintln!(
-                    "  {:<6} {}  [label: {label}]",
-                    provider.as_str(),
-                    ctx.context,
-                );
+                // Context names and repo-controlled labels are untrusted
+                // display values: scrub terminal controls / deceptive Unicode
+                // before human rendering (JSON stays raw, serde-escaped).
+                let context = super::sanitize_for_human_output(&ctx.context, false);
+                let label = super::sanitize_for_human_output(label, false);
+                eprintln!("  {:<6} {}  [label: {label}]", provider.as_str(), context,);
             }
             (None, Some(failure)) => {
+                let failure = super::sanitize_for_human_output(&failure.to_string(), false);
                 eprintln!("  {:<6} <error: {failure}>", provider.as_str());
             }
             (None, None) => {
@@ -263,18 +265,33 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
 
 /// Idempotently append-or-rewrite the `context_guard_enabled` line in a policy
 /// YAML file, never touching other lines.
+///
+/// Write-side hardening (repo-0371): the discovered path may be a
+/// repository-controlled policy, so this writer
+/// - refuses to read or write through a symlinked final component,
+/// - for repo-scope policies, enforces that the canonicalized parent directory
+///   stays inside the canonical repository root (no intermediate-symlink
+///   escape),
+/// - never treats an unreadable / non-UTF-8 existing file as empty input
+///   (which previously clobbered the target with only the guard key), and
+/// - publishes through a 0600 atomic temp-file rename instead of truncating
+///   in place.
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    reject_symlinked_policy_target(path)?;
+    let existing = read_existing_policy_for_guard(path)?;
     let new_line = format!("context_guard_enabled: {enable}");
 
     let mut out = String::new();
     let mut replaced = false;
     for line in existing.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("context_guard_enabled:") {
+        // Root-mapping keys ONLY (column zero). An indented lookalike is a
+        // nested mapping entry — rewriting it at column zero would corrupt
+        // the YAML and suppress the real append, the same failure shape as
+        // repo-0385 in the hooks guard.
+        if line.starts_with("context_guard_enabled:") {
             out.push_str(&new_line);
             out.push('\n');
             replaced = true;
@@ -291,16 +308,109 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    // Verify BEFORE publishing: the candidate must parse and its top-level
+    // `context_guard_enabled` must equal the requested value.
+    verify_context_guard_effective(&out, enable)?;
+
+    tirith_core::util::write_file_atomic_0600(path, out.as_bytes())
+}
+
+/// Parse the candidate policy and require the top-level `context_guard_enabled`
+/// to equal `expected`, so a corrupt or lookalike-only document can never be
+/// published as a successful guard toggle.
+fn verify_context_guard_effective(candidate: &str, expected: bool) -> std::io::Result<()> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(candidate).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("resulting policy would not parse as YAML: {e}"),
+        )
+    })?;
+    let effective = parsed
+        .get("context_guard_enabled")
+        .and_then(serde_yaml::Value::as_bool);
+    if effective == Some(expected) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resulting policy does not have the requested top-level context_guard_enabled value",
+        ))
     }
-    let mut f = opts.open(path)?;
-    use std::io::Write as _;
-    f.write_all(out.as_bytes())
+}
+
+/// Refuse to operate on a policy path whose final component is a symlink, and
+/// — for policies discovered inside a repository — whose canonicalized parent
+/// directory escapes the canonical repository root (intermediate-symlink
+/// escape). A malicious checkout must not turn `tirith context guard on|off`
+/// into an arbitrary-file rewrite.
+fn reject_symlinked_policy_target(path: &std::path::Path) -> std::io::Result<()> {
+    // Final component: never follow a symlink for read-modify-write.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to update {}: policy path is a symlink",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    // Intermediate components: if this policy lives under a repository root,
+    // its canonicalized directory must remain inside the canonical repo root.
+    if let Some(repo_root) = policy_mod::find_repo_root(None) {
+        if path.starts_with(&repo_root) {
+            let canon_root = repo_root.canonicalize().unwrap_or(repo_root.clone());
+            if let Some(parent) = path.parent() {
+                if parent.exists() {
+                    let canon_parent = parent.canonicalize()?;
+                    if !canon_parent.starts_with(&canon_root) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "refusing to update {}: policy directory escapes the repository root",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the existing policy text for a guard update. A missing file is empty
+/// input; ANY other failure (unreadable, non-UTF-8, symlink, oversized) is an
+/// error — never silently treat the target as empty and clobber it.
+fn read_existing_policy_for_guard(path: &std::path::Path) -> std::io::Result<String> {
+    use tirith_core::util::OpenRegularError;
+    const GUARD_POLICY_READ_CAP: u64 = 1024 * 1024;
+    match tirith_core::util::read_text_no_follow_capped(path, GUARD_POLICY_READ_CAP) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "refusing to update {}: existing policy is not valid UTF-8",
+                    path.display()
+                ),
+            )
+        }),
+        Err(OpenRegularError::NotFound) => Ok(String::new()),
+        Err(OpenRegularError::NotRegularFile) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to update {}: not a regular file (symlink?)",
+                path.display()
+            ),
+        )),
+        Err(OpenRegularError::TooLarge) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("refusing to update {}: exceeds 1 MiB", path.display()),
+        )),
+        Err(OpenRegularError::Io(e)) => Err(e),
+    }
 }
 
 /// `tirith context label <provider:context> <criticality> [--scope user|repo]`.
@@ -435,5 +545,76 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("paranoia: 2"));
         assert!(content.contains("context_guard_enabled: true"));
+    }
+
+    #[test]
+    fn update_policy_guard_key_ignores_indented_lookalike() {
+        // An indented nested-mapping lookalike must not be rewritten at column
+        // zero; the real root key is appended and the document stays valid.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &path,
+            "custom_rule:\n  context_guard_enabled: false\n  other: 1\n",
+        )
+        .unwrap();
+        update_policy_guard_key(&path, true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("  context_guard_enabled: false"));
+        let top_level = content
+            .lines()
+            .filter(|l| l.starts_with("context_guard_enabled:"))
+            .count();
+        assert_eq!(top_level, 1);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed
+                .get("context_guard_enabled")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_policy_guard_key_refuses_symlink_target() {
+        // Regression: repo-0371 — a repository-controlled policy.yaml symlink
+        // must not turn the guard update into an arbitrary-file rewrite.
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "do not touch\n").unwrap();
+        let link = dir.path().join("policy.yaml");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = update_policy_guard_key(&link, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "do not touch\n");
+    }
+
+    #[test]
+    fn update_policy_guard_key_refuses_non_utf8_existing() {
+        // Regression: repo-0371 — non-UTF-8 content must not be treated as
+        // empty and clobbered with only the guard key.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let err = update_policy_guard_key(&path, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            vec![0xff, 0xfe, 0x00, 0x01],
+            "target must be left untouched"
+        );
+    }
+
+    #[test]
+    fn status_sanitizes_untrusted_fields() {
+        // Regression: repo-0372 — context names / labels must not carry
+        // terminal control sequences into human status output.
+        let s = super::super::sanitize_for_human_output(
+            "aws:default\u{1b}]52;c;SGFja2Vk\u{7}\u{202e}",
+            false,
+        );
+        assert!(!s.contains('\u{1b}'));
+        assert!(!s.contains('\u{202e}'));
     }
 }

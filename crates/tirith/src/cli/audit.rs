@@ -155,7 +155,14 @@ pub fn stats(session: Option<&str>, json: bool, entry_type: &str) -> i32 {
                 let mut event_list: Vec<_> = events.iter().collect();
                 event_list.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
                 for (event, count) in event_list {
-                    println!("  {integration} / {event}: {count:>5}");
+                    // repo-0360: integration/event strings come from the audit
+                    // log, which records caller-supplied values — sanitize
+                    // terminal controls before printing.
+                    println!(
+                        "  {} / {}: {count:>5}",
+                        super::sanitize_for_human_output(integration, false),
+                        super::sanitize_for_human_output(event, false),
+                    );
                 }
             }
             if hook_stats.total_events == 0 {

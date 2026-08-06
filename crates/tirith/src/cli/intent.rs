@@ -51,6 +51,13 @@ pub fn run(intent: &str, command: &str, explain: bool, json: bool) -> i32 {
 }
 
 fn print_human(intent: &str, command: &str, report: &IntentBehaviorReport, explain: bool) {
+    // Untrusted display values: the intent sentence and analyzed command are
+    // attacker-controllable (newlines, ANSI/OSC, bidi, zero-width). Scrub them
+    // through the shared single-line human-output sanitizer before printing so
+    // they cannot forge an OK/MISMATCH row, repaint the terminal, or reach the
+    // clipboard via OSC 52.
+    let intent = super::sanitize_for_human_output(intent, false);
+    let command = super::sanitize_for_human_output(command, false);
     if report.has_mismatch() {
         println!(
             "tirith intend: MISMATCH — the command does more than the stated intent justifies"
@@ -206,5 +213,24 @@ mod tests {
             true,
         );
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn human_output_sanitizes_control_sequences() {
+        // Regression: repo-0390 — attacker-controlled intent/command text must
+        // not reach the terminal with ANSI/OSC, bidi, zero-width, or newline
+        // content intact on the human path.
+        let evil_intent = "ok\n\u{1b}]52;c;SGFja2Vk\u{7}\u{202e}\u{200b}";
+        let evil_cmd = "ls\r\n\u{1b}[31mrm -rf /\u{1b}[0m";
+        // Must not panic and must still exit per mismatch semantics.
+        let code = run(evil_intent, evil_cmd, false, false);
+        assert!(code == 0 || code == 1);
+        let sanitized_i = super::super::sanitize_for_human_output(evil_intent, false);
+        let sanitized_c = super::super::sanitize_for_human_output(evil_cmd, false);
+        for s in [sanitized_i, sanitized_c] {
+            assert!(!s.contains('\u{1b}'), "ESC must be stripped: {s:?}");
+            assert!(!s.contains('\n') && !s.contains('\r'));
+            assert!(!s.contains('\u{202e}') && !s.contains('\u{200b}'));
+        }
     }
 }

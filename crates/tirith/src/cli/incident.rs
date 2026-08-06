@@ -16,7 +16,6 @@
 //! `report` copies the audit log's already-redacted `command_redacted` preview
 //! verbatim and NEVER reconstructs a full command.
 
-use std::io::Write as _;
 use std::path::PathBuf;
 
 use tirith_core::incident::{self, IncidentState, StartError};
@@ -56,13 +55,18 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
             println!("Incident mode ACTIVE.");
             println!();
             println!("  started_at: {}", state.started_at_display());
-            println!("  started_by: {}", state.started_by);
+            // repo-0287: `started_by`/`reason` are operator/env-controlled and
+            // stored verbatim for JSON; every HUMAN sink sanitizes them.
+            println!(
+                "  started_by: {}",
+                super::sanitize_for_human_output(&state.started_by, false)
+            );
             println!(
                 "  reason:     {}",
                 if state.reason.is_empty() {
-                    "<none>"
+                    "<none>".to_string()
                 } else {
-                    &state.reason
+                    super::sanitize_for_human_output(&state.reason, false)
                 }
             );
             println!();
@@ -106,9 +110,9 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
                 "tirith incident start: an incident is already active since {} (reason: {}).",
                 existing.started_at_display(),
                 if existing.reason.is_empty() {
-                    "<none>"
+                    "<none>".to_string()
                 } else {
-                    &existing.reason
+                    super::sanitize_for_human_output(&existing.reason, false)
                 }
             );
             eprintln!("Run `tirith incident stop` to end it before starting a new one.");
@@ -292,13 +296,16 @@ pub fn status(json: bool) -> i32 {
         Some(s) => {
             println!("Incident status: ACTIVE");
             println!("  started_at: {}", s.started_at_display());
-            println!("  started_by: {}", s.started_by);
+            println!(
+                "  started_by: {}",
+                super::sanitize_for_human_output(&s.started_by, false)
+            );
             println!(
                 "  reason:     {}",
                 if s.reason.is_empty() {
-                    "<none>"
+                    "<none>".to_string()
                 } else {
-                    &s.reason
+                    super::sanitize_for_human_output(&s.reason, false)
                 }
             );
             println!("  flag:       {flag}");
@@ -391,33 +398,25 @@ pub fn report(out: Option<PathBuf>, json: bool) -> i32 {
 /// Write the report to `path` with `0o600` perms on Unix (it may contain
 /// repo-internal hostnames / paths even after redaction).
 fn write_report_file(path: &std::path::Path, body: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-        }
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    // `mode(0o600)` only applies on CREATE; a pre-existing `--out` file keeps its
-    // old (possibly world-readable) mode. Re-assert 0600 BEFORE writing the body
-    // and PROPAGATE the error (CodeRabbit R11 #7) so a chmod failure aborts the
-    // write — sensitive repo-internal paths/hostnames are never left readable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod 0600 {}: {e}", path.display()))?;
-    }
-    f.write_all(body.as_bytes())
+    // repo-0388: never open the operator-selected destination with a
+    // path-based create+truncate — a repository can pre-plant the expected
+    // report path as a symlink to another operator-writable file. Confine the
+    // write beneath the destination's own directory through a retained
+    // no-follow parent capability (refusing a symlinked final component AND
+    // any symlinked intermediate directory) and publish atomically: the
+    // report is born mode-0600 in a same-directory temporary file and renamed
+    // over the destination only after the live entry is revalidated. A
+    // pre-existing loose mode is replaced by the rename, so the 0600
+    // confidentiality guarantee holds for overwrites too.
+    let root = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let prepared = tirith_core::util::ContainedAtomicFile::prepare(&root, path, true)
+        .map_err(|e| format!("refusing unsafe report destination {}: {e}", path.display()))?;
+    prepared
+        .write_atomic(body.as_bytes(), true)
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
@@ -427,14 +426,17 @@ const REPORT_TOP_FINDINGS: usize = 25;
 const REPORT_TIMELINE_ROWS: usize = 50;
 
 /// Escape a single-line value for safe inline embedding in the Markdown report.
-/// Neutralizes two hazards: STRUCTURE — CR/LF collapse to a space so a
-/// multi-line value (e.g. a `--reason` with a newline) can't break its list item
-/// or inject a `#` heading (the load-bearing fix); RENDERING — inline
-/// Markdown-significant chars (`` ` `` `*` `_` `[` `]` `<` `>` `\` `#` `|`) are
-/// backslash-escaped.
+/// Neutralizes three hazards (repo-0287): TERMINAL — the central display
+/// sanitizer strips C0/C1 controls, ESC/OSC sequences, and deceptive Unicode
+/// so a value rendered from the report later cannot forge output or move the
+/// clipboard; STRUCTURE — CR/LF collapse to a space so a multi-line value
+/// (e.g. a `--reason` with a newline) can't break its list item or inject a
+/// `#` heading; RENDERING — inline Markdown-significant chars (`` ` `` `*`
+/// `_` `[` `]` `<` `>` `\` `#` `|`) are backslash-escaped.
 fn md_inline_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
+    let sanitized = tirith_core::mcp::output_filter::sanitize_for_display(value);
+    let mut out = String::with_capacity(sanitized.len());
+    for ch in sanitized.chars() {
         match ch {
             // Collapse line breaks to a space (a `\r\n` → two spaces, harmless).
             '\n' | '\r' => out.push(' '),

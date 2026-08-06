@@ -84,25 +84,31 @@ pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
                 );
             } else {
                 println!("Restored {restored_n} file(s):");
+                // repo-0366: every persisted path is project-controlled; all
+                // restore/diff output goes through terminal sanitization.
                 for path in &report.restored {
-                    println!("  {path}");
+                    println!("  {}", super::sanitize_for_human_output(path, false));
                 }
                 if !report.missing.is_empty() {
                     println!("Missing backup data ({}):", report.missing.len());
                     for path in &report.missing {
-                        println!("  {path}");
+                        println!("  {}", super::sanitize_for_human_output(path, false));
                     }
                 }
                 if !report.corrupt.is_empty() {
                     println!("Corrupt backup data, skipped ({}):", report.corrupt.len());
                     for path in &report.corrupt {
-                        println!("  {path}");
+                        println!("  {}", super::sanitize_for_human_output(path, false));
                     }
                 }
                 if !report.errors.is_empty() {
                     println!("Errors ({}):", report.errors.len());
                     for (path, err) in &report.errors {
-                        println!("  {path}: {err}");
+                        println!(
+                            "  {}: {}",
+                            super::sanitize_for_human_output(path, false),
+                            super::sanitize_for_human_output(err, false)
+                        );
                     }
                 }
                 println!(
@@ -158,7 +164,10 @@ pub fn diff_checkpoint(id: &str, json: bool) -> i32 {
                             tirith_core::style::red("corrupt", s)
                         }
                     };
-                    println!("  {status:>18}  {}", d.path);
+                    println!(
+                        "  {status:>18}  {}",
+                        super::sanitize_for_human_output(&d.path, false)
+                    );
                 }
                 println!("\n{} difference(s)", diffs.len());
             }

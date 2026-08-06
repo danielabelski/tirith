@@ -266,7 +266,9 @@ fn normalize_name(eco: Ecosystem, name: &str) -> String {
     // This function feeds the legacy v1 publication as well as v2. Keep the
     // exact historical spellings here so v1-only readers continue to hash the
     // same keys; ThreatDbWriter canonicalizes a private working copy only when
-    // it emits v2.
+    // it emits v2 (via `canonical_package_name`), which is the spelling the
+    // current runtime hashes. pr173-0025's casing mismatch is closed by that
+    // v2 canonicalization; the v1 spelling must not change.
     match eco {
         Ecosystem::PyPI => name.to_lowercase().replace(['_', '.'], "-"),
         Ecosystem::Npm => name.to_string(),
@@ -638,8 +640,24 @@ fn parse_ossf(root: &Path) -> FeedResult<(Vec<PackageEntry>, OssfStats, OssfIndi
                     reference: reference.clone(),
                 });
                 stats.parsed_packages += 1;
+            } else if has_ranges && is_confirmed {
+                // pr173-0026: a CONFIRMED malicious record whose affected entry
+                // carries only ranges used to vanish entirely — a victim
+                // version inside the range scored NoRecord (clean). The record
+                // asserts the package itself is malicious, so mark all
+                // versions malicious rather than dropping the record.
+                entries.push(PackageEntry {
+                    ecosystem,
+                    name,
+                    affected_versions: Vec::new(),
+                    all_versions_malicious: true,
+                    source: ThreatSource::OssfMalicious,
+                    confidence,
+                    reference: reference.clone(),
+                });
+                stats.parsed_packages += 1;
             } else if has_ranges {
-                // Ranges but no explicit version list — skipped in Phase A.
+                // Unconfirmed range-only records remain skipped (counted).
                 stats.skipped_range_only_count += 1;
             } else if is_confirmed {
                 // Confirmed-malicious (legacy MALWARE type or a MAL-* id) with no
@@ -2650,6 +2668,29 @@ fn main() {
     }
     for url in &v2_malicious_urls {
         common_writer.add_malicious_url(url, ThreatSource::OssfMalicious);
+    }
+
+    // pr173-0024: the OpenSSF `iocs.ips` / `iocs.domains` were collected but
+    // never written — connections to a listed IP/domain evaded the gate.
+    // Emit them through the same writer as every other feed.
+    let mut v2_ioc_ips = BTreeSet::new();
+    for ip in &ossf_indicators.ips {
+        if let Ok(addr) = ip.trim().parse::<std::net::Ipv4Addr>() {
+            v2_ioc_ips.insert(addr);
+        }
+    }
+    for addr in &v2_ioc_ips {
+        common_writer.add_ip(*addr, ThreatSource::OssfMalicious);
+    }
+    let mut v2_ioc_domains = BTreeSet::new();
+    for domain in &ossf_indicators.domains {
+        let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !normalized.is_empty() {
+            v2_ioc_domains.insert(normalized);
+        }
+    }
+    for domain in &v2_ioc_domains {
+        common_writer.add_hostname(domain, ThreatSource::OssfMalicious);
     }
 
     // v2-only: persist the curated malicious file-content hashes into the FileHash

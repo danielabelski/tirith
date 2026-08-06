@@ -16,6 +16,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned upstream threat-intel source revisions (repo-0241), consumed by
+  # .github/scripts/fetch-threatdb-sources.sh. Branch-name pins: replace with
+  # full 40-hex commit SHAs after an upstream review to make fetches immutable.
+  # The resolved commit SHA of every fetch is recorded in the job log and in
+  # /tmp/tirith-threatdb-source-pins.json.
+  THREATDB_OSSF_MP_REF: main
+  THREATDB_DD_MP_REF: main
 
 jobs:
   build-threatdb:

@@ -228,9 +228,13 @@ pub fn run(
     // Local paths return the engine's policy to avoid a redundant
     // Policy::discover(); the daemon path returns None (analysis was server-side).
     let (mut raw_verdict, engine_policy) = if use_daemon {
-        if let Some(resp) =
-            crate::cli::daemon::try_daemon_check(cmd, shell_name, cwd.as_deref(), interactive)
-        {
+        if let Some(resp) = crate::cli::daemon::try_daemon_check(
+            cmd,
+            shell_name,
+            cwd.as_deref(),
+            interactive,
+            offline,
+        ) {
             if let Some(ref raw_findings) = resp.raw_findings {
                 let raw_action_parsed = resp
                     .raw_action

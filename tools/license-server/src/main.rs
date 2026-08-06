@@ -64,7 +64,30 @@ async fn main() {
     // health is trivial.
     let app = routes::router()
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        // repo-0447: the default request span records the full URI, which
+        // leaks the one-time receipt secret (`/receipt/{secret}`) and the
+        // checkout capability (`/receipt/lookup?checkout=...`) into logs.
+        // Trace only method + path template, never the raw URI.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                // The path alone can carry the one-time receipt secret; the
+                // query can carry the checkout capability. Both are replaced
+                // with a static label.
+                let path = request.uri().path();
+                let safe_path = if path.starts_with("/receipt/") && path.len() > "/receipt/".len() {
+                    "/receipt/[redacted]"
+                } else if path == "/receipt/lookup" {
+                    "/receipt/lookup"
+                } else {
+                    path
+                };
+                tracing::info_span!(
+                    "http",
+                    method = %request.method(),
+                    route = %safe_path,
+                )
+            }),
+        );
 
     let addr = format!("0.0.0.0:{port}");
     info!("listening on {addr}");
@@ -206,7 +229,9 @@ async fn retry_dead_letters(
                     tier = %tier,
                     "resolved product via Polar API retry"
                 );
-                let _ = db.apply_retry_tier_fix(entry.id, &sub_id, tier, pid).await;
+                let _ = db
+                    .apply_retry_tier_fix(entry.id, &sub_id, tier, pid, entry.last_event_at.clone())
+                    .await;
             } else {
                 warn!(
                     dead_letter_id = entry.id,

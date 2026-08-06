@@ -273,7 +273,12 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     let mut out = String::new();
     let mut replaced = false;
     for line in existing.lines() {
-        if line.trim_start().starts_with("hooks_guard_enabled:") {
+        // Root-mapping keys ONLY: a top-level YAML block-mapping key sits at
+        // column zero. An indented `hooks_guard_enabled:` is a NESTED mapping
+        // entry (an attacker-planted lookalike), not the policy switch —
+        // rewriting it at column zero would corrupt the document and suppress
+        // the real append (repo-0385). Comments are excluded too.
+        if line.starts_with("hooks_guard_enabled:") {
             out.push_str(&new_line);
             out.push('\n');
             replaced = true;
@@ -290,9 +295,40 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
+    // Verify BEFORE publishing: the candidate must parse as YAML and its
+    // effective top-level `hooks_guard_enabled` must equal the requested
+    // value. Otherwise the operator would be told the guard is ON while
+    // subsequent loads fall back to the fail-closed base policy with the
+    // guard disabled.
+    verify_guard_key_effective(&out, enable)?;
+
     // Truncating write that REFUSES to follow a symlinked final component (0600).
     let mut f = tirith_core::util::open_write_no_follow(path, true)?;
     f.write_all(out.as_bytes())
+}
+
+/// Parse the candidate policy and require the top-level `hooks_guard_enabled`
+/// to equal `expected`. Guards against lookalike-key corruption and against
+/// pre-existing invalid YAML silently defeating the toggle.
+fn verify_guard_key_effective(candidate: &str, expected: bool) -> std::io::Result<()> {
+    // An empty file parses as `Value::Null`; treat it as an empty mapping.
+    let parsed: serde_yaml::Value = serde_yaml::from_str(candidate).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("resulting policy would not parse as YAML: {e}"),
+        )
+    })?;
+    let effective = parsed
+        .get("hooks_guard_enabled")
+        .and_then(serde_yaml::Value::as_bool);
+    if effective == Some(expected) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resulting policy does not have the requested top-level hooks_guard_enabled value",
+        ))
+    }
 }
 
 /// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
@@ -528,6 +564,56 @@ mod tests {
             1,
             "must not duplicate the key"
         );
+    }
+
+    #[test]
+    fn update_policy_guard_key_ignores_indented_lookalike() {
+        // Regression: repo-0385 — an indented (nested-mapping) lookalike key
+        // must NOT be treated as the root key; the real root key is appended
+        // and the document stays valid YAML with the guard effective.
+        let dir = tempfile::tempdir().unwrap();
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir(&tirith_dir).unwrap();
+        let path = tirith_dir.join("policy.yaml");
+        std::fs::write(
+            &path,
+            "custom_rule:\n  hooks_guard_enabled: false\n  other: 1\nparanoia: 2\n",
+        )
+        .unwrap();
+
+        update_policy_guard_key(&path, true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        // The nested lookalike is preserved untouched...
+        assert!(
+            content.contains("  hooks_guard_enabled: false"),
+            "nested key must be preserved with its indentation: {content}"
+        );
+        // ...and a real top-level key was appended exactly once.
+        let top_level = content
+            .lines()
+            .filter(|l| l.starts_with("hooks_guard_enabled:"))
+            .count();
+        assert_eq!(top_level, 1, "exactly one root key: {content}");
+        // The resulting document parses and the guard is effective.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed.get("hooks_guard_enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn update_policy_guard_key_rejects_unparseable_candidate() {
+        // Defense in depth for repo-0385: if the existing file is invalid
+        // YAML, the toggle must fail rather than report a guard state that
+        // policy loading would silently ignore.
+        let dir = tempfile::tempdir().unwrap();
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir(&tirith_dir).unwrap();
+        let path = tirith_dir.join("policy.yaml");
+        std::fs::write(&path, "a:\n - 1\n  - 2\n  bad: [\n").unwrap();
+        let res = update_policy_guard_key(&path, true);
+        assert!(res.is_err(), "invalid YAML baseline must fail: {res:?}");
     }
 
     /// F16: a guard toggle whose policy path's FINAL component is a SYMLINK must

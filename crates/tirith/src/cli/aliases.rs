@@ -118,7 +118,10 @@ fn print_human_scan(scan: &AliasScan, include_runtime: bool) {
 
 fn print_human_explain(name: &str, ex: &aliases::AliasExplain) {
     if ex.matches.is_empty() {
-        eprintln!("tirith aliases: no alias or function named `{name}` found.");
+        eprintln!(
+            "tirith aliases: no alias or function named `{}` found.",
+            super::sanitize_for_human_output(name, false)
+        );
         eprintln!(
             "  (static parse of your rc/profile files; pass --include-runtime to also check \
              live shells.)"
@@ -127,29 +130,43 @@ fn print_human_explain(name: &str, ex: &aliases::AliasExplain) {
     }
 
     eprintln!(
-        "tirith aliases explain `{name}`: {} definition(s).\n",
+        "tirith aliases explain `{}`: {} definition(s).\n",
+        super::sanitize_for_human_output(name, false),
         ex.matches.len()
     );
     for e in &ex.matches {
         eprintln!(
             "  {} ({}) — {}",
-            e.name,
+            super::sanitize_for_human_output(&e.name, false),
             e.kind.as_str(),
-            aliases::short_location(e),
+            super::sanitize_for_human_output(&aliases::short_location(e), false),
         );
         if e.body.is_empty() {
             eprintln!("    body: (empty / not captured)");
         } else if e.body_parsed {
             // Redact body before display — a function body may inline a secret.
-            eprintln!("    body: {}", redact(&e.body));
+            // Then scrub terminal controls/deceptive Unicode: the body is
+            // attacker-controllable shell config and must not inject ANSI/OSC
+            // or forge tirith output rows. Multiline is allowed, with
+            // continuation lines re-indented by the sanitizer.
+            eprintln!(
+                "    body: {}",
+                super::sanitize_for_human_output(&redact(&e.body), true)
+            );
         } else {
-            eprintln!("    body (UNPARSED — review manually): {}", redact(&e.body));
+            eprintln!(
+                "    body (UNPARSED — review manually): {}",
+                super::sanitize_for_human_output(&redact(&e.body), true)
+            );
         }
         eprintln!();
     }
 
     if ex.findings.is_empty() {
-        eprintln!("Analysis: no risk rules fired for `{name}`.");
+        eprintln!(
+            "Analysis: no risk rules fired for `{}`.",
+            super::sanitize_for_human_output(name, false)
+        );
         return;
     }
     eprintln!("Analysis — {} finding(s):", ex.findings.len());
@@ -277,5 +294,22 @@ mod tests {
         let empty = aliases::AliasExplain::default();
         let body2 = explain_json_body("nope", &empty);
         assert_eq!(body2["found"], false);
+    }
+
+    #[test]
+    fn explain_body_display_strips_terminal_controls() {
+        // Regression: repo-0358 — a redacted-but-unsanitized body must not
+        // reach the terminal with ANSI/OSC, bidi, or zero-width content.
+        let body = "cat ~/.aws/credentials \u{1b}]52;c;SGFja2Vk\u{7}\u{202e}\u{200b}evil";
+        let rendered = super::super::sanitize_for_human_output(&redact(body), true);
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC must be stripped: {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\u{200b}'));
+        // Multiline bodies keep newlines but continuation lines are indented.
+        let ml = super::super::sanitize_for_human_output(&redact("line1\nline2"), true);
+        assert!(ml.contains("line1\n  line2"), "continuation indent: {ml:?}");
     }
 }

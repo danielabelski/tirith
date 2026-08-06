@@ -91,7 +91,10 @@ pub fn fix(dry_run: bool, yes: bool, json: bool) -> i32 {
             if !json {
                 eprintln!(
                     "would chmod {:04o} {}  ({} → {})",
-                    mode, path, f.actual, f.expected
+                    mode,
+                    path,
+                    super::sanitize_for_human_output(&f.actual, false),
+                    super::sanitize_for_human_output(&f.expected, false)
                 );
             }
             continue;
@@ -143,13 +146,30 @@ pub fn fix(dry_run: bool, yes: bool, json: bool) -> i32 {
 
 // ─── chmod application ───────────────────────────────────────────────────────
 
-/// Apply a chmod to `path`. On non-Unix this is a no-op success (perm rules
-/// never fire there, so this branch is unreachable in practice).
+/// Apply a chmod to `path` WITHOUT following a final symlink (repo-0386 /
+/// repo-0284): the target is opened with `O_NOFOLLOW`, the live descriptor is
+/// fstat-verified as a regular file, and the mode change is applied through
+/// that descriptor (`fchmod`). A scanned regular file replaced by a symlink
+/// between scan and fix is refused instead of chmodding an attacker-selected
+/// target outside the repository. A file the operator cannot open for reading
+/// fails loudly (manual fix) rather than being opened through a weaker API.
+/// On non-Unix this is a no-op success (perm rules never fire there, so this
+/// branch is unreachable in practice).
 #[cfg(unix)]
 fn apply_chmod(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms)
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing chmod: not a regular file",
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
@@ -174,15 +194,19 @@ fn print_human_scan(findings: &[HygieneFinding]) {
             FixKind::Chmod { mode } => format!("auto-fixable (chmod {mode:04o})"),
             FixKind::Manual => "manual fix".to_string(),
         };
+        // repo-0285: every finding field that can carry repository-controlled
+        // filenames or SSH configuration values is attacker-controlled; only
+        // the path column was sanitized previously. Treat `actual`,
+        // `expected`, and `fix_suggestion` as untrusted terminal input too.
         eprintln!(
             "  [{}] {}  ({})\n      path:     {}\n      expected: {}\n      actual:   {}\n      fix:      {}\n      {}\n",
             severity_label(f.severity),
             f.rule_id,
             f.category.as_str(),
             super::sanitize_for_human_output(&f.path.display().to_string(), false),
-            f.expected,
-            f.actual,
-            f.fix_suggestion,
+            super::sanitize_for_human_output(&f.expected, false),
+            super::sanitize_for_human_output(&f.actual, false),
+            super::sanitize_for_human_output(&f.fix_suggestion, false),
             auto,
         );
     }
@@ -217,7 +241,7 @@ fn print_human_fix_summary(dry_run: bool, results: &[FixResult], manual: &[&Hygi
                 "  [{}] {}\n      {}",
                 severity_label(f.severity),
                 super::sanitize_for_human_output(&f.path.display().to_string(), false),
-                f.fix_suggestion
+                super::sanitize_for_human_output(&f.fix_suggestion, false)
             );
         }
     }
@@ -314,6 +338,28 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_chmod_refuses_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-env");
+        std::fs::write(&target, b"SECRET=1").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join(".env");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            apply_chmod(&link, 0o600).is_err(),
+            "a symlinked finding path must be refused, not followed"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the link target's mode must be untouched"
+        );
     }
 
     #[test]

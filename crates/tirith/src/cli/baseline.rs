@@ -12,7 +12,6 @@
 //! Privacy: the store records only salted-sha256 hashes and low-cardinality
 //! categoricals — never raw hostnames or paths.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use tirith_core::baseline;
@@ -210,10 +209,39 @@ fn resolve_policy_path() -> Result<PathBuf, i32> {
 /// Idempotently set the `baseline_enabled` line in a policy YAML file:
 /// append-or-rewrite, never touching other lines.
 fn update_baseline_flag(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Baseline enablement must never follow an untrusted repository policy
+    // symlink (repo-0361): confine the read-modify-write beneath the policy
+    // file's own directory (the repository `.tirith` directory or the user
+    // config dir) through a retained no-follow parent capability, refuse a
+    // symlinked destination, and publish atomically. A repository checkout
+    // that points `.tirith/policy.yaml` at `~/.bashrc` is refused instead of
+    // appended to, and an unreadable file is no longer treated as empty
+    // (which would have clobbered its real contents).
+    let root = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "policy path has no parent directory",
+            )
+        })?;
+    let prepared = tirith_core::util::ContainedAtomicFile::prepare(root, path, true)?;
+    let existing = match prepared.read_capped(1024 * 1024) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "policy file is not UTF-8; refusing to rewrite it",
+            )
+        })?,
+        Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to read unsafe policy file: {e:?}"),
+            ))
+        }
+    };
     let new_line = format!("baseline_enabled: {enable}");
 
     let mut out = String::new();
@@ -236,15 +264,7 @@ fn update_baseline_flag(path: &std::path::Path, enable: bool) -> std::io::Result
         out.push('\n');
     }
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(out.as_bytes())
+    prepared.write_atomic(out.as_bytes(), true)
 }
 
 #[cfg(test)]
@@ -271,6 +291,27 @@ mod tests {
             content.matches("baseline_enabled:").count(),
             1,
             "must not duplicate the key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_baseline_flag_refuses_symlinked_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external = outside.path().join("bashrc-like");
+        std::fs::write(&external, "export PATH=/usr/bin\n").unwrap();
+        let link = dir.path().join("policy.yaml");
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+
+        assert!(
+            update_baseline_flag(&link, true).is_err(),
+            "a symlinked policy must be refused, not appended to"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&external).unwrap(),
+            "export PATH=/usr/bin\n",
+            "the symlink target must remain untouched"
         );
     }
 }

@@ -19,6 +19,41 @@
 /// bytes (`< 0x20`, `0x7f` DEL) are checked separately in [`safe_scalar`].
 pub(crate) const YAML_NEEDS_QUOTING_BYTES: &[u8] = b":#-?,[]{}&*!|>'\"%@` \t";
 
+/// repo-0442: Unicode code points that must never appear verbatim in a YAML
+/// scalar or comment: C1 controls (U+0085 NEL terminates a YAML line, U+009B
+/// CSI reaches the terminal), line/paragraph separators, bidi controls,
+/// zero-width and BOM characters. Byte-level checks (`< 0x20`, DEL) miss all
+/// of these because they are multi-byte UTF-8.
+fn is_risky_unicode(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{2028}' | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200B}'..='\u{200D}'
+                | '\u{FEFF}'
+        )
+}
+
+/// Escape every [`is_risky_unicode`] character left literal in an already
+/// quoted/escaped string as `\u{XXXX}` (YAML 1.2 accepts the escape in
+/// double-quoted scalars; in a Debug-rendered comment it stays inert ASCII).
+fn escape_risky_unicode(s: &str) -> String {
+    if !s.chars().any(is_risky_unicode) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if is_risky_unicode(ch) {
+            out.push_str(&format!("\\u{{{:04X}}}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Render a scalar (server / tool / matcher name) for a YAML document. Returns
 /// the input unmodified when safe as a bare scalar; otherwise quotes and
 /// JSON-escapes it.
@@ -36,7 +71,8 @@ pub(crate) fn safe_scalar(s: &str) -> String {
     // checked separately so a future indicator change can't drop the guards.
     let needs_quoting = s
         .bytes()
-        .any(|b| YAML_NEEDS_QUOTING_BYTES.contains(&b) || b < 0x20 || b == 0x7f);
+        .any(|b| YAML_NEEDS_QUOTING_BYTES.contains(&b) || b < 0x20 || b == 0x7f)
+        || s.chars().any(is_risky_unicode);
     if !needs_quoting {
         return s.to_string();
     }
@@ -45,7 +81,7 @@ pub(crate) fn safe_scalar(s: &str) -> String {
     // a literal DEL in a quoted scalar; replace with``
     // (pinned by `yaml_safe_scalar_round_trips_del` in `cli/mcp.rs`).
     serde_json::to_string(s)
-        .map(|json| json.replace('\u{7f}', "\\u007F"))
+        .map(|json| escape_risky_unicode(&json.replace('\u{7f}', "\\u007F")))
         .unwrap_or_else(|_| format!("\"{}\"", s.escape_debug()))
 }
 
@@ -54,8 +90,10 @@ pub(crate) fn safe_scalar(s: &str) -> String {
 /// (printable bytes only).
 pub(crate) fn safe_inline_comment(s: &str) -> String {
     // No control bytes → as-is; otherwise debug-escape.
-    if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        format!("{s:?}")
+    if s.bytes().any(|b| b < 0x20 || b == 0x7f) || s.chars().any(is_risky_unicode) {
+        // Debug-escape handles C0/DEL; the Unicode pass catches what it leaves
+        // literal (C1, U+2028/2029, bidi, zero-width).
+        escape_risky_unicode(&format!("{s:?}"))
     } else {
         s.to_string()
     }
@@ -64,6 +102,31 @@ pub(crate) fn safe_inline_comment(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn risky_unicode_is_escaped_in_scalars_and_comments() {
+        // repo-0442: C1 NEL/CSI, line separators, bidi and zero-width must
+        // never survive verbatim into a YAML scaffold.
+        for ch in [
+            '\u{85}', '\u{9b}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{200B}', '\u{FEFF}',
+        ] {
+            let raw = format!("server{ch}name");
+            let scalar = safe_scalar(&raw);
+            assert!(
+                scalar.starts_with('"'),
+                "{raw:?} must be quoted: {scalar:?}"
+            );
+            assert!(!scalar.contains(ch), "{raw:?} leaked verbatim: {scalar:?}");
+            let comment = safe_inline_comment(&raw);
+            assert!(
+                !comment.contains(ch),
+                "{raw:?} leaked into comment: {comment:?}"
+            );
+        }
+        // A bare safe name is unchanged (note: '-' is a YAML indicator byte
+        // and intentionally forces quoting, so use a bare-alphanumeric name).
+        assert_eq!(safe_scalar("plainserver"), "plainserver");
+    }
 
     // Full round-trip behavior is pinned by the call-site modules (`cli/mcp.rs`,
     // `cli/agent.rs`); these are a load-bearing smoke subset.

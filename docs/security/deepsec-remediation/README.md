@@ -1,9 +1,10 @@
 # DeepSec remediation program
 
-Status: plan plus R1 implementation checkpoint. R1 has source and regression
-coverage on its implementation branch, but targeted DeepSec revalidation was
-intentionally not run for that checkpoint, so this document does not claim any
-finding is DeepSec-verified or closed. R2 and R3 remain implementation plans.
+Status: plan plus R1 and R2 implementation checkpoints. Both have source and
+regression coverage on their implementation branches, but targeted DeepSec
+revalidation was intentionally not run for either checkpoint, so this document
+does not claim any finding is DeepSec-verified or closed. R3 remains an
+implementation plan.
 
 This program turns the adjudicated DeepSec inventory at
 `e1ec47ef9f43e32872a550522067a680ff659e6e` into reviewable, dependency-aware

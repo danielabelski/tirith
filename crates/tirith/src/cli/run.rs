@@ -58,7 +58,7 @@ pub fn run(
             if json {
                 #[derive(serde::Serialize)]
                 struct RunOutput<'a> {
-                    receipt: &'a tirith_core::receipt::Receipt,
+                    receipt: tirith_core::receipt::PublicReceipt,
                     verdict: Option<&'a tirith_core::verdict::Verdict>,
                     analysis_complete: bool,
                     refused: bool,
@@ -66,7 +66,11 @@ pub fn run(
                     exit_code: Option<i32>,
                 }
                 let out = RunOutput {
-                    receipt: &result.receipt,
+                    // Public DTO: the stored receipt's URL userinfo is redacted
+                    // and local-machine metadata (cwd) omitted, so a
+                    // credential-bearing Git remote cannot reach logs or agent
+                    // context through this JSON (repo-0420).
+                    receipt: result.receipt.public_view(),
                     verdict: result.verdict.as_ref(),
                     analysis_complete: result.analysis_complete,
                     refused: result.refused,

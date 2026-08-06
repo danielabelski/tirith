@@ -582,8 +582,12 @@ pub fn daemon_foreground(json: bool) -> i32 {
         // Audit + stderr warn. Silent-failure fix: a swallowed audit-write failure left
         // `tirith last-trigger <event_id>` empty, so match the result and warn on failure.
         let event_id = uuid::Uuid::new_v4().to_string();
+        // repo-0368: redact with the ACTIVE policy's custom patterns, not an
+        // empty list — otherwise dlp_custom_patterns values persist (and may be
+        // uploaded) in audit evidence.
+        let dlp = tirith_core::policy::Policy::discover_partial(None).dlp_custom_patterns;
         if let Err(e) =
-            tirith_core::audit::log_verdict(&verdict, &text, None, Some(event_id.clone()), &[])
+            tirith_core::audit::log_verdict(&verdict, &text, None, Some(event_id.clone()), &dlp)
         {
             eprintln!("tirith clipboard daemon: audit log write failed (event_id={event_id}): {e}");
         }
@@ -744,32 +748,41 @@ fn analyze_as_paste(
     // threshold as `tirith paste`. A fresh snapshot is fine (clipboard analysis is rare).
     let policy = tirith_core::policy::Policy::discover_partial(None);
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+    // repo-0368: every consumer of this verdict (the ScanEnvelope JSON surface
+    // and the audit path) serializes it directly, so DLP redaction must happen
+    // HERE with the active policy's custom patterns — not with an empty
+    // pattern list at the sink.
+    tirith_core::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     verdict
 }
 
 /// Read a file with a hard byte cap. Errors map to a CLI exit code.
 fn read_file_capped(path: &Path) -> Result<String, i32> {
-    let meta = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) => {
+    // repo-0367: stat-then-read raced the path and followed symlinks — a
+    // zero-length-reported device or a post-stat FIFO swap could block or
+    // allocate past the advertised cap. One no-follow, regular-file-only,
+    // capped read instead.
+    let bytes = match tirith_core::util::read_text_no_follow_capped(path, MAX_COPY_BYTES) {
+        Ok(b) => b,
+        Err(tirith_core::util::OpenRegularError::TooLarge) => {
             eprintln!(
-                "tirith clipboard copy: failed to stat {}: {e}",
+                "tirith clipboard copy: {} exceeds {} bytes — refusing (the clipboard isn't a blob store)",
+                path.display(),
+                MAX_COPY_BYTES
+            );
+            return Err(1);
+        }
+        Err(_) => {
+            eprintln!(
+                "tirith clipboard copy: failed to read {} (not a regular, safely-readable file)",
                 path.display()
             );
             return Err(1);
         }
     };
-    if meta.len() > MAX_COPY_BYTES {
+    String::from_utf8(bytes).map_err(|_| {
         eprintln!(
-            "tirith clipboard copy: {} exceeds {} bytes — refusing (the clipboard isn't a blob store)",
-            path.display(),
-            MAX_COPY_BYTES
-        );
-        return Err(1);
-    }
-    fs::read_to_string(path).map_err(|e| {
-        eprintln!(
-            "tirith clipboard copy: failed to read {}: {e}",
+            "tirith clipboard copy: {} is not valid UTF-8",
             path.display()
         );
         1

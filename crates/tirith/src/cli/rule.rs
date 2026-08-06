@@ -346,15 +346,25 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
     }
 
     if errors.is_empty() {
-        eprintln!("tirith rule validate: {source} — {total} custom rule(s), all valid");
+        eprintln!(
+            "tirith rule validate: {} — {total} custom rule(s), all valid",
+            super::sanitize_for_human_output(&source, false)
+        );
         0
     } else {
         eprintln!(
-            "tirith rule validate: {source} — {} error(s) in {total} custom rule(s):",
+            "tirith rule validate: {} — {} error(s) in {total} custom rule(s):",
+            super::sanitize_for_human_output(&source, false),
             errors.len()
         );
         for e in &errors {
-            eprintln!("  custom_rules.{}: {}", e.rule, e.message);
+            // repo-0417: rule ids and messages are policy-derived (attacker-
+            // controlled in a repo-scoped policy) — sanitize before rendering.
+            eprintln!(
+                "  custom_rules.{}: {}",
+                super::sanitize_for_human_output(&e.rule, false),
+                super::sanitize_for_human_output(&e.message, false)
+            );
         }
         eprintln!();
         eprintln!("(for whole-policy-file checks, run `tirith policy validate`)");
@@ -439,10 +449,22 @@ fn explain_policy(policy: &Policy, rule_id: &str, json: bool) -> i32 {
         return 0;
     }
 
-    println!("Custom rule: {}", rule.id);
-    println!("  title:    {}", rule.title);
+    // repo-0417: every policy-derived value is attacker-controlled for a
+    // repo-scoped policy — identifiers/titles single-line, the description
+    // re-indented multiline, so injected newlines cannot forge top-level rows.
+    println!(
+        "Custom rule: {}",
+        super::sanitize_for_human_output(&rule.id, false)
+    );
+    println!(
+        "  title:    {}",
+        super::sanitize_for_human_output(&rule.title, false)
+    );
     if !rule.description.is_empty() {
-        println!("  detail:   {}", rule.description);
+        println!(
+            "  detail:   {}",
+            super::sanitize_for_human_output(&rule.description, true)
+        );
     }
     println!("  severity: {}", rule.severity);
     match rule.action {
@@ -456,11 +478,14 @@ fn explain_policy(policy: &Policy, rule_id: &str, json: bool) -> i32 {
             action_name(effective)
         ),
     }
-    println!("  context:  {}", runtime_contexts.join(", "));
+    println!(
+        "  context:  {}",
+        super::sanitize_for_human_output(&runtime_contexts.join(", "), false)
+    );
     println!();
     if let Some(pattern) = &rule.pattern {
         println!("  matcher:  regex");
-        println!("    {pattern}");
+        println!("    {}", super::sanitize_for_human_output(pattern, false));
     } else if let Some(when) = &rule.when {
         println!("  matcher:  when-clause (semantic predicates)");
         print_clause(when, 2);
@@ -696,7 +721,12 @@ fn print_clause(clause: &WhenClause, indent: usize) {
             println!("{pad}not:");
             print_clause(c, indent + 1);
         }
-        leaf => println!("{pad}{}", leaf_to_line(leaf)),
+        // Predicate values come from the (possibly repo-controlled) policy —
+        // sanitize the rendered line (repo-0417).
+        leaf => println!(
+            "{pad}{}",
+            super::sanitize_for_human_output(&leaf_to_line(leaf), false)
+        ),
     }
 }
 

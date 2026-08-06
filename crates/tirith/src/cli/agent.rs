@@ -560,16 +560,38 @@ pub(crate) fn policy_init_for_root(
     let tirith_dir = repo_root.join(".tirith");
     let example_path = tirith_dir.join("agent-policy.yaml.example");
 
-    if example_path.exists() && !force {
-        report_error(
-            json,
-            "tirith agent policy init",
-            &format!(
-                "{} already exists (use --force to overwrite)",
-                example_path.display()
-            ),
-        );
-        return 1;
+    // Symlink-hardened (repo-0355): the output path is derived beneath a
+    // possibly-hostile repo, so every repo-controlled path component is
+    // rejected when symlinked and the publish goes through a root-confined
+    // atomic no-follow writer (`util::ContainedAtomicFile`), never
+    // `std::fs::write` (which follows a planted symlink at the final component
+    // AND a symlinked `.tirith` dir, overwriting/creating a file outside the
+    // repo). `symlink_metadata` (lstat) is used for the friendly pre-check so a
+    // DANGLING symlink — invisible to `exists()` — is refused here rather than
+    // followed into an external create.
+    if let Ok(meta) = std::fs::symlink_metadata(&example_path) {
+        if meta.file_type().is_symlink() {
+            report_error(
+                json,
+                "tirith agent policy init",
+                &format!(
+                    "refusing to write through symlinked path {}",
+                    super::sanitize_for_human_output(&example_path.display().to_string(), false)
+                ),
+            );
+            return 1;
+        }
+        if !force {
+            report_error(
+                json,
+                "tirith agent policy init",
+                &format!(
+                    "{} already exists (use --force to overwrite)",
+                    example_path.display()
+                ),
+            );
+            return 1;
+        }
     }
 
     // Build the scaffold from the audit log (when available).
@@ -618,22 +640,47 @@ pub(crate) fn policy_init_for_root(
         origins,
     };
 
-    if let Err(e) = std::fs::create_dir_all(&tirith_dir) {
-        report_error(
-            json,
-            "tirith agent policy init",
-            &format!("failed to create {}: {e}", tirith_dir.display()),
-        );
-        return 1;
-    }
-
     let yaml_body = render_agent_policy_scaffold_yaml(&scaffold);
-    if let Err(e) = std::fs::write(&example_path, &yaml_body) {
-        report_error(
-            json,
-            "tirith agent policy init",
-            &format!("failed to write {}: {e}", example_path.display()),
-        );
+
+    // Bind the destination beneath the repo root through retained directory
+    // capabilities: `prepare` creates `.tirith` when missing WITHOUT following
+    // attacker-controlled symlinks and rejects any symlinked repo-controlled
+    // component (a symlinked `.tirith` escaping the repo, or a symlinked final
+    // component), closing the check/use gap the friendly pre-check above
+    // cannot.
+    let contained =
+        match tirith_core::util::ContainedAtomicFile::prepare(repo_root, &example_path, true) {
+            Ok(c) => c,
+            Err(e) => {
+                report_error(
+                    json,
+                    "tirith agent policy init",
+                    &format!(
+                        "refusing to write {} through a symlinked or escaping path: {e}",
+                        super::sanitize_for_human_output(
+                            &example_path.display().to_string(),
+                            false
+                        )
+                    ),
+                );
+                return 1;
+            }
+        };
+
+    // Atomic same-directory publish that never follows a final-component
+    // symlink; `overwrite = force` preserves no-clobber unless --force, and a
+    // file planted after the pre-check surfaces as AlreadyExists rather than
+    // being silently clobbered.
+    if let Err(e) = contained.write_atomic(yaml_body.as_bytes(), force) {
+        let message = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "{} already exists (use --force to overwrite)",
+                example_path.display()
+            )
+        } else {
+            format!("failed to write {}: {e}", example_path.display())
+        };
+        report_error(json, "tirith agent policy init", &message);
         return 1;
     }
 
@@ -1843,6 +1890,74 @@ mod tests {
         assert_eq!(code, 0);
         let body = fs::read_to_string(&example_path).unwrap();
         assert!(!body.contains("SENTINEL"));
+    }
+
+    /// repo-0355: a SYMLINKED `.tirith` directory escaping the repo must be
+    /// refused — even with --force — and nothing may be created at the
+    /// external target.
+    #[cfg(unix)]
+    #[test]
+    fn policy_init_refuses_symlinked_tirith_dir() {
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".tirith")).unwrap();
+
+        let code = policy_init_for_root(repo.path(), None, true, false);
+        assert_eq!(code, 1, "symlinked .tirith must be refused");
+        assert!(
+            !outside.path().join("agent-policy.yaml.example").exists(),
+            "no file may be created outside the repo"
+        );
+    }
+
+    /// repo-0355: a DANGLING symlink at the final component is invisible to
+    /// `exists()`; without --force the old code followed it and CREATED an
+    /// external file. Both modes must now refuse, and the target must not
+    /// appear.
+    #[cfg(unix)]
+    #[test]
+    fn policy_init_refuses_dangling_symlink_at_final_component() {
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("victim.yaml");
+        let tirith_dir = repo.path().join(".tirith");
+        fs::create_dir_all(&tirith_dir).unwrap();
+        let example_path = tirith_dir.join("agent-policy.yaml.example");
+        std::os::unix::fs::symlink(&victim, &example_path).unwrap();
+
+        let code = policy_init_for_root(repo.path(), None, false, false);
+        assert_eq!(code, 1, "dangling symlink must be refused without --force");
+        assert!(
+            !victim.exists(),
+            "no external file may be created through the dangling symlink"
+        );
+
+        let code = policy_init_for_root(repo.path(), None, true, false);
+        assert_eq!(code, 1, "a symlink is refused even with --force");
+        assert!(!victim.exists());
+    }
+
+    /// repo-0355: --force must NOT write through a symlink planted at the
+    /// final component pointing at an EXISTING external file — the write is
+    /// refused and the external target's bytes survive.
+    #[cfg(unix)]
+    #[test]
+    fn policy_init_force_does_not_follow_symlink_to_external_file() {
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("victim.yaml");
+        fs::write(&victim, "SENTINEL: do not overwrite\n").unwrap();
+        let tirith_dir = repo.path().join(".tirith");
+        fs::create_dir_all(&tirith_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, tirith_dir.join("agent-policy.yaml.example")).unwrap();
+
+        let code = policy_init_for_root(repo.path(), None, true, false);
+        assert_eq!(code, 1, "--force must refuse a symlinked output path");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "SENTINEL: do not overwrite\n",
+            "external target must be untouched"
+        );
     }
 
     #[test]

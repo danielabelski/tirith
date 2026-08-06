@@ -69,9 +69,14 @@ pub fn write_last_trigger(
         let redacted_findings =
             tirith_core::redact::redacted_findings(&verdict.findings, custom_patterns);
 
+        // repo-0391: the persisted record is later printed verbatim by
+        // `tirith why` / `tirith trust last`. Redaction removes secrets but
+        // not terminal controls / deceptive Unicode, so scrub every stored
+        // string before it reaches disk — the store must not become a
+        // deferred terminal-injection channel.
         let findings = match redacted_findings
             .iter()
-            .map(serde_json::to_value)
+            .map(|f| serde_json::to_value(f).map(sanitize_stored_json))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(findings) => findings,
@@ -137,11 +142,36 @@ pub fn write_last_trigger(
 
 fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
     let scrubbed = tirith_core::redact::redact_command_text(cmd, custom_patterns);
+    let scrubbed = tirith_core::mcp::output_filter::sanitize_for_display(&scrubbed);
     let prefix = truncate_bytes(&scrubbed, 80);
     if prefix.len() == scrubbed.len() {
         scrubbed
     } else {
         format!("{prefix}...")
+    }
+}
+
+/// Recursively strip terminal-control/deceptive content from every string in
+/// a stored JSON value (repo-0391).
+fn sanitize_stored_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            serde_json::Value::String(tirith_core::mcp::output_filter::sanitize_for_display(&s))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sanitize_stored_json).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| {
+                    (
+                        tirith_core::mcp::output_filter::sanitize_for_display(&k),
+                        sanitize_stored_json(v),
+                    )
+                })
+                .collect(),
+        ),
+        other => other,
     }
 }
 

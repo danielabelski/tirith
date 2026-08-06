@@ -605,7 +605,12 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
     };
 
     if safe_for_agent {
-        let redactor = StreamingLogRedactor::new(ShareAudience::Llm, &customer_patterns, true);
+        // repo-0394: the flag promises hostname redaction; the `Llm` preset is
+        // secrets-only and deliberately keeps `.corp`/`.internal`/`.local`
+        // names. `PublicPaste` is the preset that actually strips internal
+        // hostnames (plus home paths and RFC1918 addresses).
+        let redactor =
+            StreamingLogRedactor::new(ShareAudience::PublicPaste, &customer_patterns, true);
         let result = read_redacted_records(&mut reader, redactor, |record| {
             secret_count += record.total_redactions();
             escape_count += record.escape_count;

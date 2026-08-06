@@ -219,15 +219,21 @@ fn print_human_audit(report: &PathAuditReport) {
     for e in &report.findings {
         match e.risk {
             PathDirRisk::DuplicateCommand => {
+                // repo-0404: command names and PATH entries are filesystem-derived
+                // and can carry terminal controls — sanitize before rendering.
                 eprintln!(
                     "  [{}] {} (shadowed copy in {})",
                     risk_label(e.risk),
-                    e.command,
-                    e.dir
+                    super::sanitize_for_human_output(&e.command, false),
+                    super::sanitize_for_human_output(&e.dir, false)
                 );
             }
             _ => {
-                eprintln!("  [{}] {}", risk_label(e.risk), e.dir);
+                eprintln!(
+                    "  [{}] {}",
+                    risk_label(e.risk),
+                    super::sanitize_for_human_output(&e.dir, false)
+                );
             }
         }
     }
@@ -235,11 +241,12 @@ fn print_human_audit(report: &PathAuditReport) {
 }
 
 fn print_human_which(cmd: &str, hits: &[std::path::PathBuf], secure: bool, insecure: bool) {
+    let cmd_display = super::sanitize_for_human_output(cmd, false);
     if hits.is_empty() {
-        eprintln!("tirith path which: `{cmd}` not found on $PATH.");
+        eprintln!("tirith path which: `{cmd_display}` not found on $PATH.");
         return;
     }
-    eprintln!("tirith path which `{cmd}`:");
+    eprintln!("tirith path which `{cmd_display}`:");
     for (i, h) in hits.iter().enumerate() {
         let sys = if path_audit::is_system_path(h) {
             " [system]"
@@ -247,16 +254,19 @@ fn print_human_which(cmd: &str, hits: &[std::path::PathBuf], secure: bool, insec
             ""
         };
         let marker = if i == 0 { "→" } else { " " };
-        eprintln!("  {marker} {}{sys}", h.display());
+        eprintln!(
+            "  {marker} {}{sys}",
+            super::sanitize_for_human_output(&h.display().to_string(), false)
+        );
     }
     if secure {
         if insecure {
             eprintln!(
-                "\n--secure: FAIL — `{cmd}` resolves to a non-system binary ({}).",
-                hits[0].display()
+                "\n--secure: FAIL — `{cmd_display}` resolves to a non-system binary ({}).",
+                super::sanitize_for_human_output(&hits[0].display().to_string(), false)
             );
         } else {
-            eprintln!("\n--secure: ok — `{cmd}` resolves to a system binary.");
+            eprintln!("\n--secure: ok — `{cmd_display}` resolves to a system binary.");
         }
     }
 }
