@@ -612,7 +612,7 @@ fn rewrite_pipe_to_shell(
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        let _ = (encoded_url, sink_args, interpreter);
+        let _ = (encoded_url, sink_args);
         None
     }
 }
