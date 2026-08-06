@@ -48,6 +48,30 @@ fn windows_path_discovery_accepts_a_secure_user_owned_install() {
 }
 
 #[test]
+fn windows_path_discovery_accepts_trusted_ownership_without_further_provenance() {
+    // The Windows collector derives `secure_user_install` from the same
+    // ownership facts the gate above already requires, so this branch is
+    // reached whenever that gate passes: an unsigned PATH executable outside a
+    // protected root is accepted on owner-chain evidence alone. Pin that so
+    // narrowing it — which would refuse unsigned user-local installs — has to
+    // be a deliberate change rather than a silent one.
+    let facts = WindowsTrustFacts {
+        leaf_owner: WindowsOwnerClass::CurrentUser,
+        owner_chain_trusted: true,
+        secure_user_install: true,
+        protected_install_root: false,
+        authenticode_trusted: false,
+        broad_write_access: false,
+    };
+    let provenance = evaluate_windows_trust(WindowsExecutableSource::PathSearch, facts).unwrap();
+    assert_eq!(provenance, WindowsTrustProvenance::SecureUserInstall);
+    assert!(
+        !windows_provenance_is_system_helper_approved(provenance),
+        "a security-sensitive helper must not inherit owner-chain-only acceptance"
+    );
+}
+
+#[test]
 fn windows_path_discovery_rejects_unknown_unsigned_provenance() {
     let facts = WindowsTrustFacts {
         leaf_owner: WindowsOwnerClass::Other,
