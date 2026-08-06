@@ -164,6 +164,20 @@ pub struct WindowsTrustFacts {
     /// Every owner from the executable through its ancestor chain is recognized.
     pub owner_chain_trusted: bool,
     /// ACL and owner evidence establish a protected current-user install tree.
+    ///
+    /// The Windows collector derives this from the SAME ownership facts
+    /// [`evaluate_windows_trust`] already requires before any source-specific
+    /// branch runs (`owner_chain_trusted` plus a recognized `leaf_owner`), so at
+    /// the `PathSearch` fallback it is true whenever that gate passed. In other
+    /// words, an unsigned PATH executable outside a protected root is accepted
+    /// on owner-chain evidence alone. `windows_provenance_is_system_helper_approved`
+    /// still excludes [`WindowsTrustProvenance::SecureUserInstall`], so a
+    /// security-sensitive helper does not inherit that acceptance. Narrowing
+    /// this to independent install-tree evidence would refuse user-local
+    /// installs (scoop, cargo, `%LOCALAPPDATA%\Programs`) that carry no
+    /// signature, so it is a deliberate compatibility decision, not a cleanup.
+    /// `windows_path_discovery_accepts_trusted_ownership_without_further_provenance`
+    /// pins the current contract.
     pub secure_user_install: bool,
     /// Path is under a canonical Windows or Program Files root.
     pub protected_install_root: bool,
