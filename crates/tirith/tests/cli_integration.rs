@@ -3447,8 +3447,23 @@ fn bash_hook_startup_gate_degrade_persists() {
     // skipping user config that might set _TIRITH_BASH_LOADED.
     let script =
         format!("_TIRITH_TEST_FAIL_HEALTH=1; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\"");
+    // The hook pins its executable with `type -P tirith` and disables itself
+    // when that finds nothing, which would short-circuit the health gate under
+    // test. Put the binary under test on PATH.
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_tirith"))
+        .parent()
+        .expect("built binary directory");
+    let path_with_bin = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut entries = vec![bin_dir.to_path_buf()];
+            entries.extend(std::env::split_paths(&existing));
+            std::env::join_paths(entries).expect("PATH with the built binary")
+        }
+        None => bin_dir.as_os_str().to_os_string(),
+    };
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-i", "-c", &script])
+        .env("PATH", &path_with_bin)
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("TIRITH_BASH_MODE")
         .env_remove("SSH_CONNECTION")
@@ -3476,6 +3491,7 @@ fn bash_hook_startup_gate_degrade_persists() {
     );
     let out2 = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script2])
+        .env("PATH", &path_with_bin)
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("_TIRITH_BASH_LOADED")
         .output()
