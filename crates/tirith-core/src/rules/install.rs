@@ -519,7 +519,7 @@ fn redirect_targets_sources_list(raw: &str, shell: ShellType) -> bool {
 /// from being reinterpreted as a nested output option; unknown short options
 /// are conservatively treated like booleans because an accepted future flag
 /// must not reopen this execution-boundary bypass.
-fn collect_command_option_values(
+pub(crate) fn collect_command_option_values(
     args: &[String],
     shell: ShellType,
     long: &str,
