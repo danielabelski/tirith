@@ -537,8 +537,12 @@ impl AclGuard {
                 }
                 let ace = pace as *mut ACCESS_ALLOWED_ACE;
                 // The ACE's SID begins in-line at `SidStart`.
-                let ace_sid =
-                    PSID(std::ptr::addr_of_mut!((*ace).SidStart) as *mut core::ffi::c_void);
+                // SAFETY: `ace` names a live allow ACE inside the DACL, so
+                // taking the address of its in-line Sid field reads no memory
+                // and stays inside that allocation.
+                let ace_sid = PSID(
+                    unsafe { std::ptr::addr_of_mut!((*ace).SidStart) } as *mut core::ffi::c_void,
+                );
                 // SAFETY: both SIDs are valid; EqualSid reads only.
                 let is_ours = unsafe { EqualSid(ace_sid, self.container_sid) }.is_ok();
                 if is_ours {
