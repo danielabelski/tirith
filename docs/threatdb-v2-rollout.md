@@ -87,7 +87,7 @@ then remove unreferenced data:
    undoing the rollback — a `waiting` run re-publishes the moment a reviewer
    approves it. Filter on "not completed" rather than an allowlist of states, so
    no non-terminal status is missed. List and cancel them first:
-   `gh run list --workflow threatdb.yml --json databaseId,status --jq '.[] | select(.status != "completed") | .databaseId'`, then `gh run cancel <id>` for each.
+   `gh run list --workflow threatdb.yml --limit 100 --json databaseId,status --jq '.[] | select(.status != "completed") | .databaseId'`, then `gh run cancel <id>` for each.
 3. Dispatch `threatdb.yml` after the variable change and wait for it to complete.
    A disabled run publishes the next signed v1 generation, preserves the newest
    authenticated generation as the non-discovery `threatdb-baseline-v2.json`,
