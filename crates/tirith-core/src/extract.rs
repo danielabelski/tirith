@@ -2468,9 +2468,9 @@ fn find_powershell_delimiter_close(input: &str, open: usize) -> Option<usize> {
         }
         if ch == '`' {
             index += ch.len_utf8();
-            let Some(escaped) = input.get(index..).and_then(|suffix| suffix.chars().next()) else {
-                return None;
-            };
+            let escaped = input
+                .get(index..)
+                .and_then(|suffix| suffix.chars().next())?;
             if escaped != '\n' && escaped != '\r' {
                 token_class = PowerShellLexTokenClass::Generic;
             }
@@ -3213,11 +3213,7 @@ fn posix_heredoc_specs(
             continue;
         }
         if bytes.get(index..index + 2) != Some(b"<<") {
-            if matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|') {
-                word_start = true;
-            } else {
-                word_start = false;
-            }
+            word_start = matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|');
             index += 1;
             continue;
         }
@@ -10024,6 +10020,9 @@ fn powershell_segment_has_explicit_parent_dispatch_mutation(segment: &tokenize::
 /// consumers. Audit the join before claiming completeness: a child that calls
 /// a known dispatch name needs the caller's state, while a child mutation may
 /// affect the current scope but is not propagated back by the body IR.
+// Each parameter is a distinct piece of the caller's dispatch state that the
+// recursive walk threads through unchanged.
+#[allow(clippy::too_many_arguments)]
 fn powershell_body_crosses_dispatch_state(
     raw: &str,
     functions: &[PowerShellFunctionDefinition],
