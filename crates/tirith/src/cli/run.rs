@@ -529,6 +529,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn live_run_entrypoint_enforces_wall_output_and_preserves_under_limit_execution() {
+        // Live execution requires the operator to confirm on the controlling
+        // terminal; a CI job has none, and the confirmation gate is deliberate.
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_err()
+        {
+            eprintln!("skipping live `tirith run` regression: no controlling terminal");
+            return;
+        }
+
         crate::cli::test_harness::with_fake_env(false, |home, _| {
             use crate::cli::test_harness::EnvGuard;
 

@@ -7705,17 +7705,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn supervised_stdin_deadline_kills_descendant_holding_pipes() {
+    fn supervised_stdin_reaps_descendant_holding_pipes_without_waiting() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pid_file = temp.path().join("descendant.pid");
         let mut spec = supervised_shell_spec();
-        spec.resources.wall_clock_seconds = Some(1);
+        spec.resources.wall_clock_seconds = Some(5);
         spec.filesystem.write_roots.push(temp.path().to_path_buf());
         let body = format!("/bin/sleep 30 & printf '%s' $! > '{}'", pid_file.display());
         let args = vec!["-c".to_string(), body];
-        let refused = supervised_shell_run(&spec, &args, b"")
-            .expect_err("descendant-retained pipe must not defeat the deadline");
-        assert!(refused.reason.contains("wall-clock limit"), "{refused}");
+        // The direct child exits immediately while its descendant still holds
+        // the inherited pipes. The supervisor anchors on the direct exit rather
+        // than pipe EOF, so the run must finish well inside the deadline instead
+        // of stalling for the descendant's 30 seconds.
+        let started = Instant::now();
+        let captured = supervised_shell_run(&spec, &args, b"")
+            .expect("direct-child exit must complete without waiting for descendant pipe EOF");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "supervisor waited on the descendant-held pipe"
+        );
+        assert_eq!(captured.outcome.exit_code, 0);
         let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
             .expect("descendant pid")
             .trim()
