@@ -697,6 +697,16 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                         state.osc_pending_st = false;
                         state.osc_start_offset = (chunk_start_offset + byte_idx).saturating_sub(1);
                     }
+                    b'P' | b'_' => {
+                        // ESC P / ESC _ are the 7-bit DCS / APC introducers, the
+                        // exact equivalents of C1 0x90 / 0x9F handled above.
+                        // Without this a stream ending in an unterminated
+                        // `ESC P` left the phase Idle, so finalize_scan_state
+                        // reported no truncated control for a terminal that is
+                        // in fact wedged in DCS mode.
+                        state.phase = OutputPhase::InStringControl;
+                        state.osc_pending_st = false;
+                    }
                     b'\\' => {
                         // Standalone `\e\\` (ST in idle context) — no-op.
                         state.phase = OutputPhase::Idle;
