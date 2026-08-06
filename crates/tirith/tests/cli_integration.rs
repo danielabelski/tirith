@@ -1979,6 +1979,13 @@ fn capability_cache_body(verdict: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn bash_hook_startup_gate_degrade_persists() {
+    // Enter mode needs bind -x and the health gate this exercises; macOS ships
+    // bash 3.2, where the hook legitimately never enters enter mode.
+    if bash_major_version().map(|v| v < 5).unwrap_or(true) {
+        eprintln!("skipping bash enter-mode test: requires bash >= 5");
+        return;
+    }
+
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
 
     let hook = format!(
