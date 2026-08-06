@@ -669,12 +669,31 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     // after binding, and doing that to the host's real /bin/bash would replace
     // the system shell for everything that runs afterwards.
     let interpreter_dir = tempfile::tempdir().expect("private interpreter fixture");
+    // The resolver walks every ancestor, so state the fixture directory's mode
+    // rather than inheriting whatever the temp root and umask produce.
+    fs::set_permissions(interpreter_dir.path(), fs::Permissions::from_mode(0o700))
+        .expect("private fixture directory");
     let interpreter_path = interpreter_dir.path().join("bash");
     fs::copy("/bin/bash", &interpreter_path).expect("copy system bash into the fixture");
     fs::set_permissions(&interpreter_path, fs::Permissions::from_mode(0o755))
         .expect("make the interpreter copy executable");
     let interpreter = TrustedExecutable::from_absolute(&interpreter_path, &[])
-        .expect("resolve the copied interpreter")
+        .unwrap_or_else(|error| {
+            let modes: Vec<String> = interpreter_path
+                .ancestors()
+                .map(|ancestor| {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let mode = fs::metadata(ancestor)
+                        .map(|meta| format!("{:o}", meta.mode() & 0o7777))
+                        .unwrap_or_else(|error| error.to_string());
+                    format!("{}={mode}", ancestor.display())
+                })
+                .collect();
+            panic!(
+                "resolve the copied interpreter: {error}; modes: {}",
+                modes.join(" ")
+            )
+        })
         .bind_content()
         .expect("bind exact interpreter bytes before launch");
 
