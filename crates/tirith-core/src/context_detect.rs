@@ -220,17 +220,29 @@ pub fn detect_provider(provider: Provider) -> Result<ProviderContext, ContextDet
         return Err(ContextDetectFailure::NotConfigured);
     }
     let now = Instant::now();
+    {
+        let guard = match provider_cache().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((captured_at, result)) = guard.get(&provider) {
+            if now.duration_since(*captured_at) < Duration::from_secs(CACHE_TTL_SECS) {
+                return result.clone();
+            }
+        }
+    }
+    // The lock is NOT held across `detect_single`: it spawns a cloud CLI and can
+    // block for the whole SHELL_OUT_TIMEOUT, and this runs on the
+    // command-analysis path. Holding it would stall every other caller,
+    // including callers for a different provider, for that entire interval.
+    // Two threads racing a cold entry both shell out and store the same answer,
+    // which is harmless.
+    let result = detect_single(provider);
     let mut guard = match provider_cache().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some((captured_at, result)) = guard.get(&provider) {
-        if now.duration_since(*captured_at) < Duration::from_secs(CACHE_TTL_SECS) {
-            return result.clone();
-        }
-    }
-    let result = detect_single(provider);
-    guard.insert(provider, (now, result.clone()));
+    guard.insert(provider, (Instant::now(), result.clone()));
     result
 }
 
