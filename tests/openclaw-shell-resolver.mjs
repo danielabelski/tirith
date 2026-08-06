@@ -415,7 +415,10 @@ try {
   );
   process.chdir(fakeTirithDir);
   process.env.TIRITH_BIN = process.execPath;
-  process.env.TIRITH_TEST_EXPECTED_TOKENIZER = "posix";
+  // Same platform contract the resolver assertion above checks: the runner's
+  // own gateway is PowerShell on Windows and POSIX elsewhere.
+  process.env.TIRITH_TEST_EXPECTED_TOKENIZER =
+    process.platform === "win32" ? "powershell" : "posix";
   delete process.env.TIRITH_SHELL;
   const allowed = beforeToolCall(
     { toolName: "exec", params: { command: "ls -la" } },
