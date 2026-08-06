@@ -9456,23 +9456,24 @@ fn prompt_status_warm_cache_is_faster_than_cold() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("home")).unwrap();
 
-    // Cold call (also seeds the cache).
-    let cold_start = Instant::now();
-    let cold_out = prompt_status_cmd(dir.path())
-        .args(["prompt-status", "--short"])
-        .output()
-        .expect("failed to run tirith");
-    let cold = cold_start.elapsed();
-    assert_eq!(cold_out.status.code(), Some(0));
+    let run_once = || {
+        let start = Instant::now();
+        let out = prompt_status_cmd(dir.path())
+            .args(["prompt-status", "--short"])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(out.status.code(), Some(0));
+        start.elapsed()
+    };
 
-    // Warm call — same temp env, cache file now exists.
-    let warm_start = Instant::now();
-    let warm_out = prompt_status_cmd(dir.path())
-        .args(["prompt-status", "--short"])
-        .output()
-        .expect("failed to run tirith");
-    let warm = warm_start.elapsed();
-    assert_eq!(warm_out.status.code(), Some(0));
+    // Cold call (also seeds the cache).
+    let cold = run_once();
+
+    // Warm calls — same temp env, cache file now exists. A shared CI runner can
+    // deschedule any single process for hundreds of milliseconds, so take the
+    // best of several samples: cache effectiveness is a claim about the work
+    // performed, not about the worst scheduling luck of one sample.
+    let warm = (0..5).map(|_| run_once()).min().expect("one warm sample");
 
     // The cache file must exist after the cold call (in state_dir on
     // macOS, in XDG_RUNTIME_DIR on Linux).
