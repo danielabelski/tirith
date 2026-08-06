@@ -168,7 +168,7 @@ impl UrlLike {
 /// the hostname rules depend on.
 pub fn extract_raw_host(url_str: &str) -> Option<String> {
     let after_scheme = {
-        let idx = url_str.find("://")?;
+        let idx = leading_scheme_separator(url_str)?;
         &url_str[idx + 3..]
     };
 
@@ -185,6 +185,21 @@ pub fn extract_raw_host(url_str: &str) -> Option<String> {
     let host = extract_host_from_hostport(host_part);
 
     Some(host.to_string())
+}
+
+/// Return the `://` byte offset only when it terminates a syntactically valid
+/// URI scheme that begins at byte zero. An embedded `://` in an SCP remote path
+/// is data, not a scheme delimiter (`git@host://path`).
+fn leading_scheme_separator(raw: &str) -> Option<usize> {
+    let idx = raw.find("://")?;
+    let scheme = &raw[..idx];
+    let mut chars = scheme.chars();
+    if !chars.next().is_some_and(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    chars
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+        .then_some(idx)
 }
 
 /// Split userinfo from authority on the LAST unencoded `@` (so `user%40name@host`
@@ -269,14 +284,11 @@ pub fn parse_url(raw: &str) -> UrlLike {
 
 /// Try to parse as SCP-style reference: `[user@]host:path`.
 fn try_parse_scp(raw: &str) -> Option<UrlLike> {
-    if raw.contains("://") {
+    if leading_scheme_separator(raw).is_some() {
         return None;
     }
 
     let (user_host, path) = raw.split_once(':')?;
-    if path.starts_with("//") {
-        return None; // scheme-relative URL, not SCP
-    }
 
     let (user, host) = if let Some((u, h)) = user_host.split_once('@') {
         (Some(u.to_string()), h)
@@ -432,6 +444,23 @@ mod tests {
         assert!(matches!(u, UrlLike::Scp { .. }));
         assert_eq!(u.host(), Some("github.com"));
         assert_eq!(u.path(), Some("user/repo.git"));
+    }
+
+    #[test]
+    fn scp_remote_path_may_contain_scheme_delimiters() {
+        let raw = "git@evil.example://github.com/org/repo.git";
+        let parsed = parse_url(raw);
+        assert!(matches!(parsed, UrlLike::Scp { .. }));
+        assert_eq!(parsed.host(), Some("evil.example"));
+        assert_eq!(parsed.path(), Some("//github.com/org/repo.git"));
+        assert_eq!(extract_raw_host(raw), None);
+    }
+
+    #[test]
+    fn a_real_leading_scheme_is_not_parsed_as_scp() {
+        let parsed = parse_url("HTTPS://example.com/a:b");
+        assert!(matches!(parsed, UrlLike::Standard { .. }));
+        assert_eq!(parsed.host(), Some("example.com"));
     }
 
     #[test]

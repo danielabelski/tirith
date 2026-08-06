@@ -3406,6 +3406,7 @@ dependencies = [
  "unicode-script",
  "url",
  "uuid",
+ "walkdir",
  "windows",
  "windows-sys 0.61.2",
  "zip",

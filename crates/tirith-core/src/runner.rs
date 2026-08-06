@@ -3,8 +3,6 @@
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-#[cfg(target_os = "linux")]
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
@@ -43,8 +41,596 @@ pub type ScriptExecutor = Box<dyn Fn(&str, &std::path::Path) -> Result<i32, Stri
 /// the legacy path callback, this API can receive only the runner-constructed
 /// immutable reviewed object. The legacy alias remains source-compatible but is
 /// refused for live execution.
-pub type VerifiedScriptExecutor =
-    Box<dyn for<'script> Fn(&ScriptInvocation, ReviewedScript<'script>) -> Result<i32, String>>;
+pub type VerifiedScriptExecutor = Box<
+    dyn for<'script> Fn(
+        &ScriptInvocation,
+        ReviewedScript<'script>,
+        &mut ExecutionAuthorizer,
+    ) -> Result<i32, String>,
+>;
+
+/// One-shot capability handed only to the trusted stopped-target controller.
+/// It owns the session gate and can durably authorize exactly one kernel
+/// exec-stop transition; dropping it leaves the target unauthorized.
+pub struct ExecutionAuthorizer {
+    gate: Option<crate::execution_state::ExecutionGate>,
+    #[cfg(target_os = "linux")]
+    evidence_id: String,
+    #[cfg(target_os = "linux")]
+    controller_id: String,
+    phase: KernelExecPhase,
+    #[cfg(target_os = "linux")]
+    channel: Option<TargetLaunchStatusPipe>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum KernelExecPhase {
+    Fresh,
+    Armed,
+    Confirming,
+    Complete,
+    Failed,
+}
+
+#[cfg(target_os = "linux")]
+pub const TARGET_EXEC_OBSERVED: u8 = b'O';
+#[cfg(target_os = "linux")]
+pub const TARGET_ACK_RESUME: u8 = b'A';
+
+/// Phase-aware failure from the Linux kernel exec-stop handshake. A successful
+/// ACK is irreversible: the tracee may run before the guard can publish its
+/// terminal resume status, so every later failure must remain distinguishable
+/// from a pre-exec refusal.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelExecConfirmationError {
+    BeforeAck(String),
+    AfterAck(String),
+}
+
+#[cfg(target_os = "linux")]
+impl KernelExecConfirmationError {
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::BeforeAck(reason) | Self::AfterAck(reason) => reason,
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, pattern: &str) -> bool {
+        self.reason().contains(pattern)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for KernelExecConfirmationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for KernelExecConfirmationError {}
+#[cfg(target_os = "linux")]
+pub const TARGET_LAUNCH_RESUMED: u8 = b'R';
+#[cfg(target_os = "linux")]
+pub const TARGET_LAUNCH_ERROR: u8 = b'E';
+#[cfg(target_os = "linux")]
+const TARGET_EXEC_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Owning, non-clone arm token for the two child-side launch descriptors. Its
+/// borrowed descriptors remain valid only while this token is alive, and
+/// confirmation consumes it before the core waits for terminal proof.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct KernelExecArm {
+    controller_id: String,
+    status_writer: std::fs::File,
+    ack_guard: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl KernelExecArm {
+    pub fn launch_status_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.status_writer.as_fd()
+    }
+
+    pub fn launch_ack_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.ack_guard.as_fd()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct TargetLaunchStatusPipe {
+    status_reader: std::fs::File,
+    ack_parent: Option<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl TargetLaunchStatusPipe {
+    fn create(
+        spec: &mut crate::capsule::CapsuleSpec,
+        controller_id: String,
+    ) -> Result<(Self, KernelExecArm), String> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let limit = spec.resources.max_open_files.unwrap_or(256).min(256) as i32;
+        if limit <= 4 {
+            return Err(
+                "target-exec status/authorization descriptors cannot fit below the capsule fd limit"
+                    .to_string(),
+            );
+        }
+
+        let mut status_descriptors = [0i32; 2];
+        if unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(format!(
+                "create target-exec status channel: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: pipe2 returned two uniquely owned descriptors.
+        let status_reader_low = unsafe { std::fs::File::from_raw_fd(status_descriptors[0]) };
+        let status_writer = unsafe { std::fs::File::from_raw_fd(status_descriptors[1]) };
+        let status_reader =
+            relocate_parent_endpoint(status_reader_low, limit, "target-exec status reader")?;
+
+        let mut ack_descriptors = [0i32; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ack_descriptors.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(format!(
+                "create target-exec authorization channel: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: socketpair returned two uniquely owned descriptors.
+        let ack_guard = unsafe { std::fs::File::from_raw_fd(ack_descriptors[0]) };
+        let ack_parent_low = unsafe { std::fs::File::from_raw_fd(ack_descriptors[1]) };
+        let ack_parent =
+            relocate_parent_endpoint(ack_parent_low, limit, "target-exec authorization writer")?;
+
+        let status_writer_fd = status_writer.as_raw_fd();
+        let ack_guard_fd = ack_guard.as_raw_fd();
+        if status_writer_fd < 3
+            || status_writer_fd >= limit
+            || ack_guard_fd < 3
+            || ack_guard_fd >= limit
+            || status_writer_fd == ack_guard_fd
+            || spec.handles.extra_unix_fds.contains(&status_writer_fd)
+            || spec.handles.extra_unix_fds.contains(&ack_guard_fd)
+        {
+            return Err(
+                "target-exec status/authorization descriptors are not distinct non-stdio descriptors within the capsule fd limit"
+                    .to_string(),
+            );
+        }
+        spec.handles.extra_unix_fds.push(status_writer_fd);
+        spec.handles.extra_unix_fds.push(ack_guard_fd);
+        Ok((
+            Self {
+                status_reader,
+                ack_parent: Some(ack_parent),
+            },
+            KernelExecArm {
+                controller_id,
+                status_writer,
+                ack_guard,
+            },
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn relocate_parent_endpoint(
+    endpoint: std::fs::File,
+    minimum: std::os::fd::RawFd,
+    label: &str,
+) -> Result<std::fs::File, String> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let relocated = unsafe { libc::fcntl(endpoint.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
+    if relocated < 0 {
+        return Err(format!(
+            "relocate parent-only {label} above capsule fd limit: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returned a new uniquely owned descriptor. Drop
+    // the original low endpoint immediately so only child-owned descriptors
+    // consume the capsule's scarce below-limit slots.
+    let relocated = unsafe { std::fs::File::from_raw_fd(relocated) };
+    drop(endpoint);
+    Ok(relocated)
+}
+
+impl ExecutionAuthorizer {
+    fn new(gate: crate::execution_state::ExecutionGate) -> Self {
+        #[cfg(target_os = "linux")]
+        let controller_id = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            gate: Some(gate),
+            #[cfg(target_os = "linux")]
+            evidence_id: format!("kernel-stop-{controller_id}"),
+            #[cfg(target_os = "linux")]
+            controller_id,
+            phase: KernelExecPhase::Fresh,
+            #[cfg(target_os = "linux")]
+            channel: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn arm_linux_capsule(
+        &mut self,
+        spec: &mut crate::capsule::CapsuleSpec,
+    ) -> Result<KernelExecArm, String> {
+        if self.phase != KernelExecPhase::Fresh || self.gate.is_none() || self.channel.is_some() {
+            self.phase = KernelExecPhase::Failed;
+            return Err("kernel exec-stop controller cannot be armed twice".to_string());
+        }
+        if let Err(error) = self
+            .gate
+            .as_mut()
+            .expect("fresh kernel authorizer retains its gate")
+            .begin_kernel_launch_window()
+        {
+            self.phase = KernelExecPhase::Failed;
+            return Err(error);
+        }
+        let (channel, arm) = match TargetLaunchStatusPipe::create(spec, self.controller_id.clone())
+        {
+            Ok(created) => created,
+            Err(error) => {
+                self.phase = KernelExecPhase::Failed;
+                return Err(error);
+            }
+        };
+        self.channel = Some(channel);
+        self.phase = KernelExecPhase::Armed;
+        Ok(arm)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn confirm_linux_capsule(
+        &mut self,
+        arm: KernelExecArm,
+        remaining_budget: std::time::Duration,
+        abort_target: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), KernelExecConfirmationError> {
+        if self.phase != KernelExecPhase::Armed {
+            self.phase = KernelExecPhase::Failed;
+            let error = "kernel exec-stop controller is not armed".to_string();
+            return match abort_target() {
+                Ok(()) => Err(KernelExecConfirmationError::BeforeAck(error)),
+                Err(cleanup) => Err(KernelExecConfirmationError::BeforeAck(format!(
+                    "{error}; target abort failed: {cleanup}"
+                ))),
+            };
+        }
+        if arm.controller_id != self.controller_id {
+            self.phase = KernelExecPhase::Failed;
+            let error = "kernel exec-stop arm token belongs to a different controller".to_string();
+            return match abort_target() {
+                Ok(()) => Err(KernelExecConfirmationError::BeforeAck(error)),
+                Err(cleanup) => Err(KernelExecConfirmationError::BeforeAck(format!(
+                    "{error}; target abort failed: {cleanup}"
+                ))),
+            };
+        }
+        self.phase = KernelExecPhase::Confirming;
+        let channel = self
+            .channel
+            .take()
+            .ok_or_else(|| "kernel exec-stop channel disappeared before confirmation".to_string());
+        let gate = self
+            .gate
+            .take()
+            .ok_or_else(|| "kernel exec-stop gate disappeared before confirmation".to_string());
+        // Closing the parent copies of the child endpoints is part of entering
+        // confirmation: EOF now reflects the actual capsule guard, not a stale
+        // raw descriptor retained by the CLI.
+        drop(arm);
+        let result = match (channel, gate) {
+            (Ok(channel), Ok(gate)) => confirm_linux_kernel_exec(
+                channel,
+                gate,
+                &self.evidence_id,
+                remaining_budget,
+                abort_target,
+            ),
+            (channel, gate) => {
+                // Keep whichever channel/gate still exists alive until target
+                // cleanup has completed. In particular, never release the
+                // stable session lock while an unconfirmed child may run.
+                let error = channel
+                    .as_ref()
+                    .err()
+                    .cloned()
+                    .or_else(|| gate.as_ref().err().cloned())
+                    .unwrap_or_else(|| "kernel exec-stop controller lost ownership".to_string());
+                let abort = abort_target();
+                drop(channel);
+                drop(gate);
+                match abort {
+                    Ok(()) => Err(KernelExecConfirmationError::BeforeAck(error)),
+                    Err(cleanup) => Err(KernelExecConfirmationError::BeforeAck(format!(
+                        "{error}; target abort failed: {cleanup}"
+                    ))),
+                }
+            }
+        };
+        self.phase = if result.is_ok() {
+            KernelExecPhase::Complete
+        } else {
+            KernelExecPhase::Failed
+        };
+        result
+    }
+
+    fn completed(&self) -> bool {
+        self.phase == KernelExecPhase::Complete && self.gate.is_none()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_linux_kernel_exec(
+    channel: TargetLaunchStatusPipe,
+    gate: crate::execution_state::ExecutionGate,
+    evidence_id: &str,
+    remaining_budget: std::time::Duration,
+    abort_target: impl FnOnce() -> Result<(), String>,
+) -> Result<(), KernelExecConfirmationError> {
+    let now = std::time::Instant::now();
+    let Some(requested_deadline) = now.checked_add(remaining_budget.min(TARGET_EXEC_MAX_WAIT))
+    else {
+        let error = "target-exec confirmation deadline is outside the platform range".to_string();
+        return match abort_target() {
+            Ok(()) => Err(KernelExecConfirmationError::BeforeAck(error)),
+            Err(cleanup) => Err(KernelExecConfirmationError::BeforeAck(format!(
+                "{error}; target abort failed: {cleanup}"
+            ))),
+        };
+    };
+    let deadline = requested_deadline.min(gate.deadline());
+    let stopped_evidence_id = evidence_id.to_string();
+    let resumed_evidence_id = evidence_id.replacen("kernel-stop-", "kernel-resumed-", 1);
+    confirm_linux_kernel_exec_until(
+        channel,
+        deadline,
+        Some(gate),
+        |gate| {
+            let gate_ref = gate
+                .as_mut()
+                .ok_or_else(|| "kernel execution gate was already transferred".to_string())?;
+            gate_ref.promote_kernel_exec_stopped(stopped_evidence_id)?;
+            let gate = gate
+                .take()
+                .expect("successful stopped promotion retains the execution gate");
+            Ok(crate::execution_state::KernelExecutionPermit::from_stopped_gate(gate))
+        },
+        |permit| permit.promote_resumed(resumed_evidence_id).map(|_| ()),
+        abort_target,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_linux_kernel_exec_until<AuthorizationState, Permit>(
+    mut channel: TargetLaunchStatusPipe,
+    deadline: std::time::Instant,
+    mut authorization_state: AuthorizationState,
+    authorize: impl FnOnce(&mut AuthorizationState) -> Result<Permit, String>,
+    finalize: impl FnOnce(&mut Permit) -> Result<(), String>,
+    abort_target: impl FnOnce() -> Result<(), String>,
+) -> Result<(), KernelExecConfirmationError> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    let mut authorize = Some(authorize);
+    let mut finalize = Some(finalize);
+    let mut permit = None;
+    let mut observed = false;
+    let mut resumed = false;
+    let mut ack_sent = false;
+    let mut status = [0u8; 1];
+    let protocol = (|| -> Result<(), String> {
+        if std::time::Instant::now() >= deadline {
+            return Err("target-exec authorization budget expired before observation".to_string());
+        }
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(
+                    "contained target did not complete authorization before the launch deadline"
+                        .to_string(),
+                );
+            }
+            let remaining = deadline - now;
+            let timeout_ms = remaining
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32;
+            let mut descriptor = libc::pollfd {
+                fd: channel.status_reader.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+            let polled = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if polled < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("poll target-exec status channel: {error}"));
+            }
+            if polled == 0 {
+                return Err(
+                    "contained target did not cross exec before the launch deadline".to_string(),
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("contained target status arrived after the launch deadline".to_string());
+            }
+            match channel.status_reader.read(&mut status) {
+                Ok(0) if resumed => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(
+                            "contained target completed after the launch deadline".to_string()
+                        );
+                    }
+                    let permit = permit.as_mut().ok_or_else(|| {
+                        "target resumed without a durable stopped permit".to_string()
+                    })?;
+                    finalize.take().expect("kernel exec finalizer is one-shot")(permit)?;
+                    return Ok(());
+                }
+                Ok(0) => {
+                    return Err(
+                        "contained launcher exited before completing target-exec authorization"
+                            .to_string(),
+                    )
+                }
+                Ok(_) => match status[0] {
+                    TARGET_EXEC_OBSERVED if !observed => {
+                        ensure_no_kernel_status_is_queued(
+                            channel.status_reader.as_raw_fd(),
+                            deadline,
+                        )?;
+                        if std::time::Instant::now() >= deadline {
+                            return Err("target-exec authorization exceeded the launch deadline"
+                                .to_string());
+                        }
+                        let stopped_permit =
+                            authorize.take().expect(
+                                "kernel exec authorization is consumed only after OBSERVED",
+                            )(&mut authorization_state)?;
+                        // The stable-lock owner must move into the outer permit
+                        // slot before any later deadline, ordering, channel, or
+                        // ACK operation can fail. The abort callback therefore
+                        // always runs while either `authorization_state` or
+                        // `permit` still owns the lock.
+                        permit = Some(stopped_permit);
+                        if std::time::Instant::now() >= deadline {
+                            return Err("target-exec authorization exceeded the launch deadline"
+                                .to_string());
+                        }
+                        ensure_no_kernel_status_is_queued(
+                            channel.status_reader.as_raw_fd(),
+                            deadline,
+                        )?;
+                        let ack_parent = channel.ack_parent.take().ok_or_else(|| {
+                            "target-exec authorization channel was already consumed".to_string()
+                        })?;
+                        send_kernel_ack_until(ack_parent.as_raw_fd(), deadline)?;
+                        drop(ack_parent);
+                        ack_sent = true;
+                        observed = true;
+                    }
+                    TARGET_LAUNCH_ERROR => {
+                        return Err("contained target reported an exec failure".to_string())
+                    }
+                    TARGET_EXEC_OBSERVED => {
+                        return Err(
+                            "contained target reported duplicate exec observation".to_string()
+                        )
+                    }
+                    TARGET_LAUNCH_RESUMED if observed && !resumed => resumed = true,
+                    TARGET_LAUNCH_RESUMED => {
+                        return Err("contained target reported out-of-order or duplicate resume"
+                            .to_string())
+                    }
+                    _ => return Err("contained target reported an invalid exec status".to_string()),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("read target-exec status channel: {error}")),
+            }
+        }
+    })();
+
+    if let Err(mut error) = protocol {
+        // `authorize` owns the fresh gate before OBSERVED; `permit` owns it
+        // after the unresolved transition. Both remain in this outer scope
+        // until the abort callback has killed and reaped the child tree.
+        if let Err(cleanup) = abort_target() {
+            error = format!("{error}; target abort failed: {cleanup}");
+        }
+        return Err(if ack_sent {
+            KernelExecConfirmationError::AfterAck(error)
+        } else {
+            KernelExecConfirmationError::BeforeAck(error)
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_kernel_status_is_queued(
+    fd: std::os::fd::RawFd,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "target-exec status ordering check exceeded the launch deadline".to_string(),
+            );
+        }
+        let mut queued = 0i32;
+        if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } == 0 {
+            if queued != 0 {
+                return Err(
+                    "contained target advanced its exec status before parent authorization"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("inspect target-exec status ordering: {error}"));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_kernel_ack_until(
+    fd: std::os::fd::RawFd,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let ack = [TARGET_ACK_RESUME];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("target-exec ACK exceeded the launch deadline".to_string());
+        }
+        let sent = unsafe {
+            libc::send(
+                fd,
+                ack.as_ptr().cast::<libc::c_void>(),
+                ack.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent == 1 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if sent < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(format!(
+            "authorize stopped target resume without SIGPIPE: {error}"
+        ));
+    }
+}
 
 /// Exact bytes approved by the runner and the immutable descriptor that backs
 /// file-mode execution. Construction is private to this module: executors can
@@ -214,12 +800,19 @@ struct DownloadedBytes {
 
 struct ScriptReview {
     interpreter: String,
+    analysis_shell: Option<crate::tokenize::ShellType>,
     legacy: script_analysis::ScriptAnalysis,
     analysis_complete: bool,
     incomplete_reason: Option<&'static str>,
     raw_verdict: Option<Verdict>,
     effective_verdict: Option<Verdict>,
     policy: Option<crate::policy::Policy>,
+}
+
+struct ConfirmedScriptReview {
+    review: ScriptReview,
+    prepared: crate::execution_state::PreparedExecution,
+    bypass_honored: bool,
 }
 
 struct ExecutionFile {
@@ -387,9 +980,7 @@ fn download_bounded(
     let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let redirect_list_clone = redirect_list.clone();
 
-    let client = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .dns_resolver(crate::ssrf_guard::fetch_resolver())
+    let client = crate::ssrf_guard::fetch_client_builder()
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if let Ok(mut list) = redirect_list_clone.lock() {
                 list.push(attempt.url().to_string());
@@ -494,6 +1085,25 @@ fn review_script_bytes(
     cwd: Option<&Path>,
     forced_interpreter: Option<&str>,
 ) -> Result<ScriptReview, String> {
+    let session_id = crate::session::resolve_session_id();
+    review_script_bytes_for_session(
+        content,
+        will_execute,
+        interactive,
+        cwd,
+        forced_interpreter,
+        &session_id,
+    )
+}
+
+fn review_script_bytes_for_session(
+    content: &[u8],
+    will_execute: bool,
+    interactive: bool,
+    cwd: Option<&Path>,
+    forced_interpreter: Option<&str>,
+    session_id: &str,
+) -> Result<ScriptReview, String> {
     let content_str = match std::str::from_utf8(content) {
         Ok(text) => text.to_string(),
         Err(_) if will_execute => {
@@ -507,6 +1117,7 @@ fn review_script_bytes(
             return Ok(ScriptReview {
                 legacy: script_analysis::analyze(&lossy, &interpreter),
                 interpreter,
+                analysis_shell: None,
                 analysis_complete: false,
                 incomplete_reason: Some("invalid-utf8"),
                 raw_verdict: None,
@@ -530,6 +1141,7 @@ fn review_script_bytes(
         return Ok(ScriptReview {
             legacy: script_analysis::analyze(&content_str, &interpreter),
             interpreter,
+            analysis_shell: None,
             analysis_complete: false,
             incomplete_reason: Some("unsupported-interpreter"),
             raw_verdict: None,
@@ -578,17 +1190,17 @@ fn review_script_bytes(
         );
     }
     raw_verdict.agent_origin = Some(crate::agent_origin::resolve_cli_origin(interactive));
-    let session_id = crate::session::resolve_session_id();
-    let effective_verdict = crate::escalation::post_process_verdict(
+    let effective_verdict = crate::escalation::post_process_verdict_for_verification(
         &raw_verdict,
         &policy,
         &content_str,
-        &session_id,
+        session_id,
         crate::escalation::CallerContext::Cli,
     );
     Ok(ScriptReview {
         legacy: script_analysis::analyze(&content_str, &interpreter),
         interpreter,
+        analysis_shell: Some(shell),
         analysis_complete: true,
         incomplete_reason: None,
         raw_verdict: Some(raw_verdict),
@@ -666,15 +1278,161 @@ fn raw_audit_fields(review: &ScriptReview) -> Option<(String, Vec<String>)> {
 
 fn redacted_result_verdict(review: &ScriptReview) -> Option<Verdict> {
     review.effective_verdict.as_ref().map(|effective| {
-        let mut display = effective.clone();
         let custom_patterns = review
             .policy
             .as_ref()
             .map(|policy| policy.dlp_custom_patterns.as_slice())
             .unwrap_or(&[]);
-        display.findings = crate::redact::redacted_findings(&display.findings, custom_patterns);
-        display
+        redacted_verdict(effective, custom_patterns)
     })
+}
+
+fn redacted_verdict(verdict: &Verdict, custom_patterns: &[String]) -> Verdict {
+    let mut display = verdict.clone();
+    display.findings = crate::redact::redacted_findings(&display.findings, custom_patterns);
+    display
+}
+
+fn audit_complete_review(
+    review: &ScriptReview,
+    effective: &Verdict,
+    audit_subject: &str,
+    require_durable_bypass_audit: bool,
+) -> Result<(), String> {
+    let Some(policy) = review.policy.as_ref() else {
+        return Ok(());
+    };
+    let Some((raw_action, raw_rule_ids)) = raw_audit_fields(review) else {
+        return Ok(());
+    };
+    let audit_result = if require_durable_bypass_audit {
+        crate::audit::log_verdict_with_raw_required(
+            effective,
+            audit_subject,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+            &policy.dlp_custom_patterns,
+            Some(raw_action),
+            Some(raw_rule_ids),
+        )
+    } else {
+        crate::audit::log_verdict_with_raw(
+            effective,
+            audit_subject,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+            &policy.dlp_custom_patterns,
+            Some(raw_action),
+            Some(raw_rule_ids),
+        )
+    };
+    enforce_required_bypass_audit(require_durable_bypass_audit, audit_result)
+}
+
+fn prepare_confirmed_script_review(
+    content: &[u8],
+    interactive: bool,
+    cwd: Option<&Path>,
+    interpreter: &str,
+    bypass_requested: bool,
+    surface_allows_bypass: bool,
+    session_id: &str,
+) -> Result<ConfirmedScriptReview, String> {
+    // The interpreter is forced to the exact value selected before confirmation;
+    // the immutable downloaded bytes are supplied directly again. No cache path
+    // or remote object is reopened for the authoritative decision.
+    let mut review = review_script_bytes_for_session(
+        content,
+        true,
+        interactive,
+        cwd,
+        Some(interpreter),
+        session_id,
+    )?;
+    if review.interpreter != interpreter {
+        return Err("fresh execution analysis changed the selected interpreter".to_string());
+    }
+    let policy = review
+        .policy
+        .clone()
+        .ok_or_else(|| "fresh live analysis has no complete policy".to_string())?;
+    let policy_allows_bypass = if interactive {
+        policy.allow_bypass_env
+    } else {
+        policy.allow_bypass_env_noninteractive
+    };
+    let bypass_available = surface_allows_bypass && policy_allows_bypass;
+    // Carry only the request/availability facts into strict preparation. The
+    // honored fact depends on the authoritative strict-session verdict, which
+    // can differ from this read-only review while confirmation is pending.
+    for verdict in [
+        review.raw_verdict.as_mut(),
+        review.effective_verdict.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        verdict.bypass_requested = bypass_requested;
+        verdict.bypass_available = bypass_available;
+        verdict.bypass_honored = false;
+    }
+    let raw_verdict = review
+        .raw_verdict
+        .as_ref()
+        .ok_or_else(|| "fresh live analysis has no complete raw verdict".to_string())?;
+    let shell = review
+        .analysis_shell
+        .ok_or_else(|| "fresh live analysis has no complete command analyzer".to_string())?;
+    let content_text = std::str::from_utf8(content)
+        .map_err(|_| "live execution content changed from validated UTF-8".to_string())?;
+    let prepared = crate::execution_state::prepare_execution(
+        raw_verdict,
+        &policy,
+        content_text,
+        session_id,
+        crate::escalation::CallerContext::Cli,
+        shell,
+        crate::execution_state::DEFAULT_DRAFT_TTL,
+        crate::execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
+    )?;
+    let (prepared, bypass_honored) =
+        prepared.reapply_runner_bypass(bypass_requested, bypass_available)?;
+    for verdict in [
+        review.raw_verdict.as_mut(),
+        review.effective_verdict.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        verdict.bypass_requested = bypass_requested;
+        verdict.bypass_available = bypass_available;
+        verdict.bypass_honored = bypass_honored;
+    }
+    // Keep the review internally consistent for downstream audit helpers: the
+    // strict prepared verdict is the final effective verdict, including any
+    // session-only escalation that occurred during confirmation.
+    review.effective_verdict = Some(prepared.verdict().clone());
+    Ok(ConfirmedScriptReview {
+        review,
+        prepared,
+        bypass_honored,
+    })
+}
+
+fn read_tty_confirmation(tty: &fs::File, prompt: &str) -> Result<bool, String> {
+    let mut tty_writer = io::BufWriter::new(tty);
+    write!(tty_writer, "{prompt}").map_err(|error| format!("tty write: {error}"))?;
+    tty_writer
+        .flush()
+        .map_err(|error| format!("tty flush: {error}"))?;
+    drop(tty_writer);
+
+    let mut reader = io::BufReader::new(tty);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|error| format!("tty read: {error}"))?;
+    Ok(response_line.trim().eq_ignore_ascii_case("y"))
 }
 
 fn present_complete_verdict(verdict: &Verdict, writer: impl io::Write) -> Result<(), String> {
@@ -706,7 +1464,7 @@ fn materialize_execution_file(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (content, expected_sha256);
-        return Err("exact content-bound script execution is supported only on Linux".to_string());
+        Err("exact content-bound script execution is supported only on Linux".to_string())
     }
 
     #[cfg(target_os = "linux")]
@@ -790,51 +1548,6 @@ fn verify_script_seals(file: &std::fs::File) -> Result<(), String> {
         return Err("reviewed script descriptor is missing required immutable seals".to_string());
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn spawn_bound_reviewed_script(
-    invocation: &ScriptInvocation,
-    reviewed_script: ReviewedScript<'_>,
-) -> Result<std::process::Child, String> {
-    use std::os::unix::process::CommandExt as _;
-
-    let program = invocation.resolved_executable.as_ref().ok_or_else(|| {
-        "script execution reached launch without a trusted interpreter identity".to_string()
-    })?;
-    program
-        .verify_identity()
-        .map_err(|error| format!("trusted script interpreter changed before launch: {error}"))?;
-    let interpreter_fd = program.bound_launch_fd().ok_or_else(|| {
-        "script execution requires a sealed content-bound interpreter descriptor".to_string()
-    })?;
-    let script_fd = reviewed_script.sealed_fd();
-    let mut command = Command::new(format!("/proc/self/fd/{interpreter_fd}"));
-    command
-        .arg0(program.invocation_path())
-        .args(&invocation.args)
-        .arg(format!("/proc/self/fd/{script_fd}"))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("LANG", "C")
-        .env("LC_ALL", "C")
-        .env(
-            "TERM",
-            std::env::var_os("TERM").unwrap_or_else(|| "dumb".into()),
-        );
-    // Keep the interpreter descriptor CLOEXEC: Linux resolves the native ELF
-    // image through /proc before the successful exec closes that descriptor.
-    // Only the immutable script descriptor must survive into the interpreter so
-    // it can open the exact reviewed bytes named in argv.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(script_fd, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command.spawn().map_err(|error| format!("execute: {error}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -947,6 +1660,12 @@ fn run_impl(
                 .to_string(),
         );
     }
+    if !opts.no_exec && verified_executor.is_none() {
+        return Err(
+            "live script execution requires the trusted kernel exec-stop controller; refusing before download"
+                .to_string(),
+        );
+    }
     let resolved_pipe_executable = if let Some(requested) = requested_pipe_invocation.as_ref() {
         if verified_executor.is_none() {
             return Err(
@@ -1053,7 +1772,7 @@ fn run_impl(
     }
 
     let bypass_requested = std::env::var("TIRITH").ok().as_deref() == Some("0");
-    let bypass_honored = if let Some(policy) = review.policy.clone() {
+    let preview_bypass_honored = if let Some(policy) = review.policy.clone() {
         // A generated `safe_command` is an enforcement boundary, not a user
         // request to weaken policy. Preserve `bypass_requested` for audit, but
         // make bypass unavailable for the typed stdin runner surface.
@@ -1099,47 +1818,20 @@ fn run_impl(
         git_branch: None,
     };
 
-    if let (Some(_), Some(effective), Some(policy)) = (
-        review.raw_verdict.as_ref(),
-        review.effective_verdict.as_ref(),
-        review.policy.as_ref(),
-    ) {
-        let (raw_action, raw_rule_ids) = raw_audit_fields(&review)
-            .expect("raw verdict is present when the complete effective verdict is present");
-        let audit_subject = format!("downloaded-script sha256:{sha256}");
-        let audit_result = if bypass_honored && !opts.no_exec {
-            crate::audit::log_verdict_with_raw_required(
-                effective,
-                &audit_subject,
-                None,
-                Some(uuid::Uuid::new_v4().to_string()),
-                &policy.dlp_custom_patterns,
-                Some(raw_action),
-                Some(raw_rule_ids),
-            )
-        } else {
-            crate::audit::log_verdict_with_raw(
-                effective,
-                &audit_subject,
-                None,
-                Some(uuid::Uuid::new_v4().to_string()),
-                &policy.dlp_custom_patterns,
-                Some(raw_action),
-                Some(raw_rule_ids),
-            )
-        };
-        enforce_required_bypass_audit(bypass_honored && !opts.no_exec, audit_result)?;
-    }
-    let result_verdict = redacted_result_verdict(&review);
-    if let Some(display) = result_verdict.as_ref() {
+    let audit_subject = format!("downloaded-script sha256:{sha256}");
+    let preview_result_verdict = redacted_result_verdict(&review);
+    if let Some(display) = preview_result_verdict.as_ref() {
         present_complete_verdict(display, std::io::stderr().lock())?;
     }
 
     if opts.no_exec {
+        if let Some(effective) = review.effective_verdict.as_ref() {
+            audit_complete_review(&review, effective, &audit_subject, false)?;
+        }
         receipt.save().map_err(|e| format!("save receipt: {e}"))?;
         return Ok(RunResult {
             receipt,
-            verdict: result_verdict,
+            verdict: preview_result_verdict,
             analysis_complete: review.analysis_complete,
             refused: false,
             executed: false,
@@ -1158,16 +1850,19 @@ fn run_impl(
     // `tirith run` has no approval-completion flow. Its local y/N confirmation
     // is not a substitute for the policy approval contract, and TIRITH=0 may not
     // bypass it. Refuse before the generic prompt and before materialization.
-    if approval_required || (blocked && !bypass_honored) {
+    if approval_required || (blocked && !preview_bypass_honored) {
         if approval_required {
             eprintln!(
                 "tirith: execution refused: policy approval is required and this runner has no approval-completion flow"
             );
         }
+        if let Some(effective) = review.effective_verdict.as_ref() {
+            audit_complete_review(&review, effective, &audit_subject, false)?;
+        }
         receipt.save().map_err(|e| format!("save receipt: {e}"))?;
         return Ok(RunResult {
             receipt,
-            verdict: result_verdict,
+            verdict: preview_result_verdict,
             analysis_complete: review.analysis_complete,
             refused: true,
             executed: false,
@@ -1186,9 +1881,9 @@ fn run_impl(
     if !invocation.args.is_empty() {
         eprintln!("tirith: interpreter argv: {:?}", invocation.args);
     }
-    if bypass_honored {
+    if preview_bypass_honored {
         eprintln!(
-            "tirith: blocking body verdict explicitly bypassed via TIRITH=0 (audited with raw findings)"
+            "tirith: preview blocking verdict is eligible for explicit TIRITH=0 bypass; the final decision will be re-audited after confirmation"
         );
     }
 
@@ -1198,22 +1893,25 @@ fn run_impl(
         .open("/dev/tty")
         .map_err(|_| "cannot open /dev/tty for confirmation")?;
 
-    let mut tty_writer = io::BufWriter::new(&tty);
-    write!(tty_writer, "Execute this script? [y/N] ").map_err(|e| format!("tty write: {e}"))?;
-    tty_writer.flush().map_err(|e| format!("tty flush: {e}"))?;
-
-    let mut reader = io::BufReader::new(&tty);
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .map_err(|e| format!("tty read: {e}"))?;
-
-    if !response_line.trim().eq_ignore_ascii_case("y") {
+    let displayed_effective = review
+        .effective_verdict
+        .as_ref()
+        .ok_or_else(|| "live execution has no complete displayed verdict".to_string())?
+        .clone();
+    let warnings_acknowledged =
+        matches!(displayed_effective.action, Action::Warn | Action::WarnAck);
+    let prompt = if warnings_acknowledged {
+        "Execute this script and acknowledge the displayed warnings? [y/N] "
+    } else {
+        "Execute this script? [y/N] "
+    };
+    if !read_tty_confirmation(&tty, prompt)? {
         eprintln!("tirith: execution cancelled");
+        audit_complete_review(&review, &displayed_effective, &audit_subject, false)?;
         receipt.save().map_err(|e| format!("save receipt: {e}"))?;
         return Ok(RunResult {
             receipt,
-            verdict: result_verdict,
+            verdict: preview_result_verdict,
             analysis_complete: review.analysis_complete,
             refused: false,
             executed: false,
@@ -1223,34 +1921,100 @@ fn run_impl(
 
     receipt.save().map_err(|e| format!("save receipt: {e}"))?;
 
+    // Confirmation is never an authorization of the preview snapshot. Re-run
+    // the complete engine over the exact immutable bytes and selected
+    // interpreter, reload policy/live state, and freeze a fresh strict decision.
+    let session_id = crate::session::resolve_session_id();
+    let surface_allows_bypass = requested_pipe_invocation.is_none();
+    let ConfirmedScriptReview {
+        review: final_review,
+        prepared,
+        bypass_honored: final_bypass_honored,
+    } = prepare_confirmed_script_review(
+        &content,
+        opts.interactive,
+        cwd.as_deref(),
+        &invocation.interpreter,
+        bypass_requested,
+        surface_allows_bypass,
+        &session_id,
+    )?;
+    let final_policy = final_review
+        .policy
+        .as_ref()
+        .expect("confirmed complete analysis retains its frozen policy");
+    let final_result_verdict =
+        redacted_verdict(prepared.verdict(), &final_policy.dlp_custom_patterns);
+    present_complete_verdict(&final_result_verdict, std::io::stderr().lock())?;
+    audit_complete_review(
+        &final_review,
+        prepared.verdict(),
+        &audit_subject,
+        prepared.verdict().bypass_honored,
+    )?;
+    if (prepared.verdict().action == Action::Block && !prepared.verdict().bypass_honored)
+        || prepared.verdict().requires_approval == Some(true)
+    {
+        return Ok(RunResult {
+            receipt,
+            verdict: Some(final_result_verdict),
+            analysis_complete: final_review.analysis_complete,
+            refused: true,
+            executed: false,
+            exit_code: Some(Action::Block.exit_code()),
+        });
+    }
+    if final_bypass_honored {
+        eprintln!(
+            "tirith: final blocking body verdict explicitly bypassed via TIRITH=0 (durably audited with raw findings)"
+        );
+    }
+    let prepared = if prepared.requires_warn_ack() {
+        match prepared.bind_runner_confirmation(&displayed_effective, warnings_acknowledged) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                eprintln!("tirith: execution refused: {error}");
+                return Ok(RunResult {
+                    receipt,
+                    verdict: Some(final_result_verdict),
+                    analysis_complete: final_review.analysis_complete,
+                    refused: true,
+                    executed: false,
+                    exit_code: Some(Action::Block.exit_code()),
+                });
+            }
+        }
+    } else {
+        prepared
+    };
     // Never execute the stable content-addressed cache path. Materialize the
     // reviewed in-memory bytes into a fully sealed anonymous descriptor and
-    // verify its digest through that still-open descriptor before launch.
+    // verify its digest through that still-open descriptor before acquiring the
+    // session gate. The gate's bounded promotion window is reserved for the
+    // trusted spawn plus stopped-target authorization protocol, not local
+    // content materialization.
     let execution = materialize_execution_file(&cache_dir, &content, &sha256)?;
     let execution_bytes = execution.read_verified(content.len(), &sha256)?;
     let reviewed_script = execution.reviewed(&execution_bytes);
-    let exit_code = if let Some(exec) = verified_executor {
-        Some(exec(&invocation, reviewed_script)?)
-    } else {
-        if invocation.input_mode != ScriptInputMode::File {
-            return Err("forced stdin execution requires the capsule executor".to_string());
-        }
-        #[cfg(not(target_os = "linux"))]
-        return Err("exact content-bound script execution is supported only on Linux".to_string());
-        #[cfg(target_os = "linux")]
-        let mut child = spawn_bound_reviewed_script(&invocation, reviewed_script)?;
-        #[cfg(target_os = "linux")]
-        let waited = child.wait();
-        #[cfg(target_os = "linux")]
-        let status = waited.map_err(|e| format!("execute wait: {e}"))?;
-        #[cfg(target_os = "linux")]
-        status.code()
-    };
+    let draft = prepared.into_authorizable_draft()?;
+    let gate = crate::execution_state::ExecutionGate::acquire(
+        draft,
+        crate::execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
+    )?;
+    let mut authorizer = ExecutionAuthorizer::new(gate);
+    let exec = verified_executor.expect("live executor checked before download");
+    let exit_code = Some(exec(&invocation, reviewed_script, &mut authorizer)?);
+    if !authorizer.completed() {
+        return Err(
+            "trusted executor returned without completing observed -> durable commit -> ACK -> resumed -> EOF authorization"
+                .to_string(),
+        );
+    }
 
     Ok(RunResult {
         receipt,
-        verdict: result_verdict,
-        analysis_complete: review.analysis_complete,
+        verdict: Some(final_result_verdict),
+        analysis_complete: final_review.analysis_complete,
         refused: false,
         executed: true,
         exit_code,
@@ -1331,6 +2095,464 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
 
+    #[cfg(target_os = "linux")]
+    fn target_test_channel(
+        spec: &mut crate::capsule::CapsuleSpec,
+    ) -> (TargetLaunchStatusPipe, std::fs::File, std::fs::File) {
+        let (channel, arm) =
+            TargetLaunchStatusPipe::create(spec, "test-kernel-controller".to_string())
+                .expect("target launch test channel");
+        let status_writer = arm
+            .status_writer
+            .try_clone()
+            .expect("clone guard status endpoint");
+        let ack_guard = arm
+            .ack_guard
+            .try_clone()
+            .expect("clone guard authorization endpoint");
+        drop(arm);
+        (channel, status_writer, ack_guard)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_accepts_only_observed_ack_resumed_eof() {
+        use std::io::{Read as _, Write as _};
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut status_writer, mut ack_guard) = target_test_channel(&mut spec);
+        let guard = std::thread::spawn(move || {
+            status_writer
+                .write_all(&[TARGET_EXEC_OBSERVED])
+                .expect("report stopped exec");
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack).expect("read one-shot ACK");
+            assert_eq!(ack, [TARGET_ACK_RESUME]);
+            status_writer
+                .write_all(&[TARGET_LAUNCH_RESUMED])
+                .expect("report resumed target");
+        });
+        let authorized = std::sync::atomic::AtomicBool::new(false);
+        confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            (),
+            |_| {
+                authorized.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .expect("ordered terminal handshake");
+        guard.join().expect("guard protocol thread");
+        assert!(authorized.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_rejects_invalid_duplicate_and_out_of_order_status() {
+        use std::io::{Read as _, Write as _};
+
+        for sequence in [vec![b'X'], vec![TARGET_LAUNCH_RESUMED]] {
+            let mut spec = crate::capsule::CapsuleSpec::locked_down();
+            let (channel, mut writer, ack_guard) = target_test_channel(&mut spec);
+            drop(ack_guard);
+            let guard = std::thread::spawn(move || writer.write_all(&sequence));
+            let refusal = confirm_linux_kernel_exec_until(
+                channel,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                (),
+                |_| Ok(()),
+                |_| Ok(()),
+                || Ok(()),
+            )
+            .expect_err("invalid status sequence must fail closed");
+            assert!(
+                refusal.contains("invalid")
+                    || refusal.contains("out-of-order")
+                    || refusal.contains("duplicate"),
+                "{refusal}"
+            );
+            guard
+                .join()
+                .expect("status writer thread")
+                .expect("write invalid status fixture");
+        }
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut writer, mut ack_guard) = target_test_channel(&mut spec);
+        let guard = std::thread::spawn(move || {
+            writer.write_all(&[TARGET_EXEC_OBSERVED])?;
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            assert_eq!(ack, [TARGET_ACK_RESUME]);
+            writer.write_all(&[TARGET_EXEC_OBSERVED])
+        });
+        let refusal = confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            (),
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .expect_err("duplicate OBSERVED after an ACK must fail closed");
+        assert!(refusal.contains("duplicate"), "{refusal}");
+        guard
+            .join()
+            .expect("duplicate-observation thread")
+            .expect("write duplicate observation");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_never_acks_after_authorizer_deadline() {
+        use std::io::{Read as _, Write as _};
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut status_writer, mut ack_guard) = target_test_channel(&mut spec);
+        status_writer
+            .write_all(&[TARGET_EXEC_OBSERVED])
+            .expect("queue OBSERVED before deadline starts");
+        let guard = std::thread::spawn(move || {
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            drop(status_writer);
+            Ok::<Vec<u8>, std::io::Error>(ack)
+        });
+        let refusal = confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+            (),
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .expect_err("expired authorization must not resume the target");
+        assert!(refusal.contains("exceeded"), "{refusal}");
+        assert!(
+            guard
+                .join()
+                .expect("guard deadline thread")
+                .expect("read closed ACK")
+                .is_empty(),
+            "an ACK was sent after the monotonic deadline"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_authorizer_failure_sends_no_ack() {
+        use std::io::{Read as _, Write as _};
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut status_writer, mut ack_guard) = target_test_channel(&mut spec);
+        status_writer
+            .write_all(&[TARGET_EXEC_OBSERVED])
+            .expect("queue stopped exec observation");
+        let guard = std::thread::spawn(move || {
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            drop(status_writer);
+            Ok::<Vec<u8>, std::io::Error>(ack)
+        });
+        let refusal = confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            (),
+            |_| Err::<(), _>("injected durable commit failure".to_string()),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .expect_err("failed parent authorization must keep the target stopped");
+        assert!(refusal.contains("durable commit failure"), "{refusal}");
+        assert!(
+            guard
+                .join()
+                .expect("authorizer failure guard thread")
+                .expect("read ACK EOF")
+                .is_empty(),
+            "parent sent ACK after authorization failure"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_abort_precedes_drop_of_gate_retained_by_failed_authorizer() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct AuthorizationStateDrop(Arc<AtomicBool>);
+        impl Drop for AuthorizationStateDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut status_writer, mut ack_guard) = target_test_channel(&mut spec);
+        status_writer
+            .write_all(&[TARGET_EXEC_OBSERVED])
+            .expect("queue stopped exec observation");
+        let guard = std::thread::spawn(move || {
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            drop(status_writer);
+            Ok::<Vec<u8>, std::io::Error>(ack)
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        let abort_dropped = Arc::clone(&dropped);
+        let refusal = confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            AuthorizationStateDrop(Arc::clone(&dropped)),
+            |_| Err::<(), _>("injected durable commit failure".to_string()),
+            |_| Ok(()),
+            || {
+                assert!(
+                    !abort_dropped.load(Ordering::SeqCst),
+                    "stable-lock gate dropped before target cleanup"
+                );
+                Ok(())
+            },
+        )
+        .expect_err("failed authorization must abort while retaining the gate");
+        assert!(refusal.contains("durable commit failure"), "{refusal}");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            guard
+                .join()
+                .expect("authorizer failure guard thread")
+                .expect("read ACK EOF")
+                .is_empty(),
+            "parent sent ACK after authorization failure"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_abort_runs_before_the_stable_lock_permit_is_dropped() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct PermitDrop(Arc<AtomicBool>);
+        impl Drop for PermitDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut status_writer, mut ack_guard) = target_test_channel(&mut spec);
+        let guard = std::thread::spawn(move || {
+            status_writer.write_all(&[TARGET_EXEC_OBSERVED])?;
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            assert_eq!(ack, [TARGET_ACK_RESUME]);
+            status_writer.write_all(b"X")
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let abort_dropped = Arc::clone(&dropped);
+        let abort_called = Arc::clone(&aborted);
+        let permit_dropped = Arc::clone(&dropped);
+        let refusal = confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            (),
+            |_| Ok(PermitDrop(permit_dropped)),
+            |_| Ok(()),
+            || {
+                assert!(
+                    !abort_dropped.load(Ordering::SeqCst),
+                    "stable-lock permit dropped before target cleanup"
+                );
+                abort_called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("invalid post-ACK status must abort the target");
+        assert!(matches!(&refusal, KernelExecConfirmationError::AfterAck(_)));
+        assert!(refusal.contains("invalid"), "{refusal}");
+        assert!(aborted.load(Ordering::SeqCst));
+        assert!(dropped.load(Ordering::SeqCst));
+        guard
+            .join()
+            .expect("abort-order guard thread")
+            .expect("write invalid post-ACK status");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_types_post_ack_eof_as_executed() {
+        use std::io::{Read as _, Write as _};
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut status_writer, mut ack_guard) = target_test_channel(&mut spec);
+        let guard = std::thread::spawn(move || {
+            status_writer.write_all(&[TARGET_EXEC_OBSERVED])?;
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            assert_eq!(ack, [TARGET_ACK_RESUME]);
+            // Drop without RESUMED: the authorized target may already have run.
+            Ok::<(), std::io::Error>(())
+        });
+        let refusal = confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            (),
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .expect_err("post-ACK EOF must remain phase typed");
+        assert!(matches!(&refusal, KernelExecConfirmationError::AfterAck(_)));
+        assert!(refusal.contains("exited before completing"), "{refusal}");
+        guard
+            .join()
+            .expect("post-ACK EOF guard thread")
+            .expect("write observation and read ACK");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_handshake_rejects_resume_prequeued_before_ack() {
+        use std::io::{Read as _, Write as _};
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut status_writer, mut ack_guard) = target_test_channel(&mut spec);
+        status_writer
+            .write_all(&[TARGET_EXEC_OBSERVED, TARGET_LAUNCH_RESUMED])
+            .expect("prequeue causally invalid status");
+        let guard = std::thread::spawn(move || {
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack)?;
+            drop(status_writer);
+            Ok::<Vec<u8>, std::io::Error>(ack)
+        });
+        let refusal = confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            (),
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .expect_err("RESUMED queued before ACK must fail closed");
+        assert!(refusal.contains("before parent authorization"), "{refusal}");
+        assert!(
+            guard
+                .join()
+                .expect("causal-order guard thread")
+                .expect("read ACK EOF")
+                .is_empty(),
+            "causally invalid guard received ACK"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_closed_ack_reader_returns_error_without_sigpipe() {
+        use std::io::Write as _;
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        let (channel, mut status_writer, ack_guard) = target_test_channel(&mut spec);
+        let guard = std::thread::spawn(move || {
+            drop(ack_guard);
+            status_writer.write_all(&[TARGET_EXEC_OBSERVED])
+        });
+        let refusal = confirm_linux_kernel_exec_until(
+            channel,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            (),
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .expect_err("closed ACK peer must fail closed");
+        assert!(refusal.contains("without SIGPIPE"), "{refusal}");
+        guard
+            .join()
+            .expect("closed-ACK thread")
+            .expect("write OBSERVED");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_channels_reject_an_insufficient_fd_budget() {
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        spec.resources.max_open_files = Some(3);
+        let refusal =
+            TargetLaunchStatusPipe::create(&mut spec, "test-insufficient-fd-budget".to_string())
+                .expect_err("protocol channels must fit below the capsule fd limit");
+        assert!(refusal.contains("fd limit"), "{refusal}");
+        assert!(spec.handles.extra_unix_fds.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_parent_endpoints_do_not_consume_the_dense_child_fd_budget() {
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let mut source = tempfile::tempfile().expect("dense-fd source");
+        source
+            .write_all(b"fd-shape")
+            .expect("write dense-fd source");
+        let mut dense = Vec::new();
+        loop {
+            let descriptor = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(descriptor >= 0, "fill dense child descriptor range");
+            // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+            dense.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) });
+            if descriptor >= 91 {
+                break;
+            }
+        }
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        spec.resources.max_open_files = Some(96);
+        let (channel, arm) =
+            TargetLaunchStatusPipe::create(&mut spec, "test-dense-fd-controller".to_string())
+                .expect("protocol uses exactly two low child descriptors");
+        let status_fd = arm.status_writer.as_raw_fd();
+        let ack_fd = arm.ack_guard.as_raw_fd();
+        assert!((3..96).contains(&status_fd));
+        assert!((3..96).contains(&ack_fd));
+        assert_ne!(status_fd, ack_fd);
+        assert!(channel.status_reader.as_raw_fd() >= 96);
+        assert!(
+            channel
+                .ack_parent
+                .as_ref()
+                .expect("parent ACK endpoint")
+                .as_raw_fd()
+                >= 96
+        );
+
+        let first = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        assert!((3..96).contains(&first));
+        // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+        let first = unsafe { std::os::fd::OwnedFd::from_raw_fd(first) };
+        let second = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        assert!((3..96).contains(&second));
+        // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+        let second = unsafe { std::os::fd::OwnedFd::from_raw_fd(second) };
+        let full_shape = [status_fd, ack_fd, first.as_raw_fd(), second.as_raw_fd()];
+        for (index, descriptor) in full_shape.iter().enumerate() {
+            assert!(
+                !full_shape[index + 1..].contains(descriptor),
+                "full child FD shape collided: {full_shape:?}"
+            );
+        }
+    }
+
     #[test]
     fn execution_transport_rejects_http_without_pin() {
         let err = validate_download_request(
@@ -1395,6 +2617,127 @@ mod tests {
         assert_eq!(
             review.raw_verdict.unwrap().action,
             crate::verdict::Action::Block
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_review_reloads_policy_and_makes_the_fresh_prepared_verdict_authoritative() {
+        struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl EnvRestore {
+            fn set(&mut self, name: &'static str, value: Option<&std::ffi::OsStr>) {
+                self.0.push((name, std::env::var_os(name)));
+                // SAFETY: this test owns the crate-wide environment mutex.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (name, previous) in self.0.drain(..).rev() {
+                    // SAFETY: the environment mutex remains held until this guard drops.
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let isolated = tempfile::tempdir().expect("isolated fresh runner decision");
+        let policy_dir = isolated.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).expect("create policy directory");
+        let mut environment = EnvRestore(Vec::new());
+        let config_home = isolated.path().join("config");
+        let cache_home = isolated.path().join("cache");
+        let data_home = isolated.path().join("data");
+        let state_home = isolated.path().join("state");
+        environment.set("HOME", Some(isolated.path().as_os_str()));
+        environment.set("XDG_CONFIG_HOME", Some(config_home.as_os_str()));
+        environment.set("XDG_CACHE_HOME", Some(cache_home.as_os_str()));
+        environment.set("XDG_DATA_HOME", Some(data_home.as_os_str()));
+        environment.set("XDG_STATE_HOME", Some(state_home.as_os_str()));
+        environment.set("TIRITH_POLICY_ROOT", Some(isolated.path().as_os_str()));
+        environment.set("TIRITH_SERVER_URL", None);
+        environment.set("TIRITH_API_KEY", None);
+        environment.set("TIRITH", None);
+        environment.set("TIRITH_LOG", Some(std::ffi::OsStr::new("0")));
+
+        let policy_path = policy_dir.join("policy.yaml");
+        std::fs::write(
+            &policy_path,
+            "severity_overrides:\n  dotfile_overwrite: MEDIUM\nstrict_warn: false\n",
+        )
+        .expect("write preview policy");
+        let content = b"#!/bin/bash\necho reviewed > ~/.bashrc\n";
+        let session_id = "runner_fresh_policy";
+        let preview = review_script_bytes_for_session(
+            content,
+            true,
+            true,
+            Some(isolated.path()),
+            Some("bash"),
+            session_id,
+        )
+        .expect("preview analysis");
+        assert_eq!(
+            preview
+                .effective_verdict
+                .as_ref()
+                .expect("preview verdict")
+                .action,
+            Action::Warn
+        );
+        let preview_policy_hash = preview
+            .policy
+            .as_ref()
+            .expect("preview policy")
+            .execution_identity_hash()
+            .expect("preview policy identity");
+        assert!(
+            !crate::session_warnings::session_state_path(session_id)
+                .expect("preview session path")
+                .exists(),
+            "read-only preview must not materialize warning history"
+        );
+
+        std::fs::write(
+            &policy_path,
+            "severity_overrides:\n  dotfile_overwrite: MEDIUM\naction_overrides:\n  dotfile_overwrite: block\nstrict_warn: false\n",
+        )
+        .expect("replace policy while confirmation is pending");
+        let confirmed = prepare_confirmed_script_review(
+            content,
+            true,
+            Some(isolated.path()),
+            "bash",
+            false,
+            true,
+            session_id,
+        )
+        .expect("fresh post-confirmation decision");
+        assert_eq!(confirmed.review.interpreter, "bash");
+        assert_eq!(confirmed.prepared.verdict().action, Action::Block);
+        let final_policy_hash = confirmed
+            .review
+            .policy
+            .as_ref()
+            .expect("fresh policy")
+            .execution_identity_hash()
+            .expect("fresh policy identity");
+        assert_ne!(preview_policy_hash, final_policy_hash);
+        assert!(
+            confirmed.prepared.into_authorizable_draft().is_err(),
+            "the fresh blocking decision, not the preview, controls authorization"
         );
     }
 
@@ -1658,7 +3001,7 @@ mod tests {
                 interpreter: PipeInterpreter::Sh,
                 args: Vec::new(),
             },
-            Box::new(|_, _| panic!("macOS refusal must happen before interpreter execution")),
+            Box::new(|_, _, _| panic!("macOS refusal must happen before interpreter execution")),
         ) {
             Ok(_) => panic!("macOS stdin execution must fail closed"),
             Err(error) => error,
@@ -1919,7 +3262,7 @@ mod tests {
                 interpreter: PipeInterpreter::Bash,
                 args: Vec::new(),
             },
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 called.store(true, Ordering::Release);
                 panic!("blocked reviewed body reached the executor")
             }),
@@ -2043,7 +3386,7 @@ mod tests {
                 expected_sha256: Some(expected_sha256),
                 exec_fn: None,
             },
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 called.store(true, Ordering::Release);
                 panic!("pending approval reached the executor")
             }),

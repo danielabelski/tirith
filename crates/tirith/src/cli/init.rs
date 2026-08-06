@@ -1,7 +1,6 @@
 #[cfg(unix)]
 use libc;
-use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::assets;
 
@@ -11,6 +10,31 @@ fn posix_single_quote(path: &str) -> String {
 
 fn powershell_single_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "''"))
+}
+
+/// Render an exact Nushell string literal. Nushell's single-quoted strings do
+/// not support embedded apostrophes or escapes, so paths are always emitted as
+/// double-quoted literals with every special/control character encoded.
+pub(crate) fn nushell_string_literal(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            control if control.is_control() => {
+                use std::fmt::Write as _;
+                write!(quoted, "\\u{{{:x}}}", control as u32)
+                    .expect("writing to a String cannot fail");
+            }
+            ordinary => quoted.push(ordinary),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Warn if another `tirith` binary shadows us on PATH.
@@ -164,10 +188,21 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
         }
         "nushell" | "nu" => {
             if let Some(dir) = &hook_dir {
-                println!(
-                    "source {}",
-                    posix_single_quote(&dir.join("lib/nushell-hook.nu").display().to_string())
-                );
+                let hook_path = dir.join("lib/nushell-hook.nu");
+                if !hook_path.is_file() {
+                    eprintln!(
+                        "tirith: resolved nushell hook is missing or not a file: {}",
+                        hook_path.display()
+                    );
+                    return 1;
+                }
+                let Some(hook_path) = hook_path.to_str() else {
+                    eprintln!(
+                        "tirith: resolved nushell hook path is not valid UTF-8 and cannot be emitted without changing its identity"
+                    );
+                    return 1;
+                };
+                println!("source {}", nushell_string_literal(hook_path));
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -471,10 +506,12 @@ pub fn find_hook_dir_readonly() -> Option<PathBuf> {
         }
     }
 
-    // Check if hooks were previously materialized, but do not create them.
+    // Check if hooks were previously materialized, but do not create or trust a
+    // presence-only bundle. Every byte and the exact version frame must match
+    // the currently embedded assets.
     if let Some(data_dir) = tirith_core::policy::data_dir() {
         let shell_dir = data_dir.join("shell");
-        if shell_dir.join("lib").exists() {
+        if materialized_hooks_match_at(&data_dir).unwrap_or(false) {
             return Some(shell_dir);
         }
     }
@@ -485,73 +522,161 @@ pub fn find_hook_dir_readonly() -> Option<PathBuf> {
 /// Write embedded hook files to the user data dir, returning the shell dir.
 fn materialize_hooks() -> Option<PathBuf> {
     let data_dir = tirith_core::policy::data_dir()?;
-    let shell_dir = data_dir.join("shell");
-    let lib_dir = shell_dir.join("lib");
-    let version_path = shell_dir.join(".hooks-version");
-    let current_version = env!("CARGO_PKG_VERSION");
-
-    // Re-materialize if required files are missing or the version changed.
-    let required_files = [
-        shell_dir.join("tirith.sh"),
-        lib_dir.join("zsh-hook.zsh"),
-        lib_dir.join("bash-hook.bash"),
-        lib_dir.join("fish-hook.fish"),
-        lib_dir.join("powershell-hook.ps1"),
-        lib_dir.join("nushell-hook.nu"),
-    ];
-    let version_matches = fs::read_to_string(&version_path)
-        .ok()
-        .map(|v| v.trim() == current_version)
-        .unwrap_or(false);
-    let needs_write = !required_files.iter().all(|p| p.exists()) || !version_matches;
-
-    if needs_write {
-        if let Err(e) = fs::create_dir_all(&lib_dir) {
-            eprintln!(
-                "tirith: failed to create hook directory {}: {e}",
-                lib_dir.display()
-            );
-            return None;
-        }
-
-        let hook_files: Vec<(PathBuf, &str)> = vec![
-            (shell_dir.join("tirith.sh"), assets::TIRITH_SH),
-            (lib_dir.join("zsh-hook.zsh"), assets::ZSH_HOOK),
-            (lib_dir.join("bash-hook.bash"), assets::BASH_HOOK),
-            (lib_dir.join("fish-hook.fish"), assets::FISH_HOOK),
-            (lib_dir.join("powershell-hook.ps1"), assets::POWERSHELL_HOOK),
-            (lib_dir.join("nushell-hook.nu"), assets::NUSHELL_HOOK),
-        ];
-        for (path, content) in &hook_files {
-            if let Err(e) = fs::write(path, content) {
-                eprintln!("tirith: failed to write hook {}: {e}", path.display());
-                return None;
+    match materialize_hooks_at(&data_dir) {
+        Ok((shell_dir, wrote)) => {
+            if wrote {
+                eprintln!(
+                    "tirith: materialized shell hooks to {}",
+                    shell_dir.display()
+                );
             }
+            Some(shell_dir)
         }
-        if let Err(e) = fs::write(&version_path, format!("{current_version}\n")) {
-            eprintln!("tirith: failed to write hook version file: {e}");
-            return None;
+        Err(error) => {
+            eprintln!("tirith: failed to materialize shell hooks: {error}");
+            None
         }
+    }
+}
 
-        eprintln!(
-            "tirith: materialized shell hooks to {}",
-            shell_dir.display()
-        );
+fn expected_materialized_files<'a>(
+    shell_dir: &Path,
+    version: &'a [u8],
+) -> Vec<(PathBuf, &'a [u8])> {
+    let lib_dir = shell_dir.join("lib");
+    vec![
+        (shell_dir.join("tirith.sh"), assets::TIRITH_SH.as_bytes()),
+        (lib_dir.join("zsh-hook.zsh"), assets::ZSH_HOOK.as_bytes()),
+        (lib_dir.join("bash-hook.bash"), assets::BASH_HOOK.as_bytes()),
+        (lib_dir.join("fish-hook.fish"), assets::FISH_HOOK.as_bytes()),
+        (
+            lib_dir.join("powershell-hook.ps1"),
+            assets::POWERSHELL_HOOK.as_bytes(),
+        ),
+        (
+            lib_dir.join("nushell-hook.nu"),
+            assets::NUSHELL_HOOK.as_bytes(),
+        ),
+        (shell_dir.join(".hooks-version"), version),
+    ]
+}
+
+fn prepared_file_matches(
+    destination: &tirith_core::util::ContainedAtomicFile,
+    path: &Path,
+    expected: &[u8],
+) -> Result<bool, String> {
+    let cap = u64::try_from(expected.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    match destination.read_capped(cap) {
+        Ok(observed) => Ok(observed == expected),
+        Err(tirith_core::util::OpenRegularError::NotFound)
+        | Err(tirith_core::util::OpenRegularError::TooLarge) => Ok(false),
+        Err(tirith_core::util::OpenRegularError::NotRegularFile) => Err(format!(
+            "refusing non-regular materialized hook destination {}",
+            path.display()
+        )),
+        Err(tirith_core::util::OpenRegularError::Io(error)) => Err(format!(
+            "could not read materialized hook {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn materialized_hooks_match_at(data_dir: &Path) -> Result<bool, String> {
+    let shell_dir = data_dir.join("shell");
+    let version = format!("{}\n", env!("CARGO_PKG_VERSION"));
+    for (path, expected) in expected_materialized_files(&shell_dir, version.as_bytes()) {
+        let destination =
+            match tirith_core::util::ContainedAtomicFile::prepare(data_dir, &path, false) {
+                Ok(destination) => destination,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(format!(
+                        "could not bind materialized hook {}: {error}",
+                        path.display()
+                    ))
+                }
+            };
+        if !prepared_file_matches(&destination, &path, expected)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Materialize through retained directory capabilities. All destinations are
+/// prepared before the first write and each file is published atomically, but
+/// the group is not transactional: a later failure can leave earlier files
+/// published. Any error denotes failed materialization, successful completion
+/// verifies every file, and the version is attempted last.
+fn materialize_hooks_at(data_dir: &Path) -> Result<(PathBuf, bool), String> {
+    let shell_dir = data_dir.join("shell");
+    let version = format!("{}\n", env!("CARGO_PKG_VERSION"));
+    let expected_files = expected_materialized_files(&shell_dir, version.as_bytes());
+    let mut prepared = Vec::with_capacity(expected_files.len());
+
+    for (path, expected) in expected_files {
+        let destination = tirith_core::util::ContainedAtomicFile::prepare(data_dir, &path, true)
+            .map_err(|error| {
+                format!(
+                    "could not bind materialized hook destination {}: {error}",
+                    path.display()
+                )
+            })?;
+        prepared.push((path, expected, destination));
     }
 
-    Some(shell_dir)
+    let mut needs_write = false;
+    for (path, expected, destination) in &prepared {
+        if !prepared_file_matches(destination, path, expected)? {
+            needs_write = true;
+        }
+    }
+    if !needs_write {
+        return Ok((shell_dir, false));
+    }
+
+    for (path, expected, destination) in &prepared {
+        destination.write_atomic(expected, true).map_err(|error| {
+            format!(
+                "failed to write materialized hook {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    for (path, expected, destination) in &prepared {
+        if !prepared_file_matches(destination, path, expected)? {
+            return Err(format!(
+                "materialized hook did not verify after publication: {}",
+                path.display()
+            ));
+        }
+    }
+
+    Ok((shell_dir, true))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_shell_name, posix_single_quote, powershell_single_quote,
+        materialize_hooks_at, materialized_hooks_match_at, normalize_shell_name,
+        nushell_string_literal, posix_single_quote, powershell_single_quote,
         prompt_status_snippet_for,
     };
     use std::path::Path;
 
     fn prompt_status_snippet(shell: &str) -> String {
         prompt_status_snippet_for(shell, Path::new("/opt/Tirith Bin/tirith"))
+    }
+
+    #[test]
+    fn nushell_literal_quotes_apostrophe_hash_backslash_quote_and_controls() {
+        assert_eq!(
+            nushell_string_literal("/tmp/it's \\quoted\" #hook\n\t\u{001f}"),
+            "\"/tmp/it's \\\\quoted\\\" #hook\\n\\t\\u{1f}\""
+        );
     }
 
     #[test]
@@ -703,5 +828,125 @@ mod tests {
             !s.contains("PROMPT_COMMAND"),
             "nushell snippet must not suggest a runnable prompt closure (always reads off); got: {s}"
         );
+    }
+
+    #[test]
+    fn materialized_hooks_require_and_repair_exact_asset_and_version_bytes() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (shell_dir, wrote) = materialize_hooks_at(data_dir.path()).unwrap();
+        assert!(wrote);
+        assert_eq!(
+            std::fs::read(shell_dir.join("tirith.sh")).unwrap(),
+            crate::assets::TIRITH_SH.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(shell_dir.join("lib/zsh-hook.zsh")).unwrap(),
+            crate::assets::ZSH_HOOK.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(shell_dir.join("lib/bash-hook.bash")).unwrap(),
+            crate::assets::BASH_HOOK.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(shell_dir.join("lib/fish-hook.fish")).unwrap(),
+            crate::assets::FISH_HOOK.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(shell_dir.join("lib/powershell-hook.ps1")).unwrap(),
+            crate::assets::POWERSHELL_HOOK.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(shell_dir.join("lib/nushell-hook.nu")).unwrap(),
+            crate::assets::NUSHELL_HOOK.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(shell_dir.join(".hooks-version")).unwrap(),
+            format!("{}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+        assert!(materialized_hooks_match_at(data_dir.path()).unwrap());
+
+        std::fs::write(shell_dir.join("lib/zsh-hook.zsh"), b"tampered\n").unwrap();
+        std::fs::write(
+            shell_dir.join(".hooks-version"),
+            format!("{}\n", env!("CARGO_PKG_VERSION")),
+        )
+        .unwrap();
+        assert!(!materialized_hooks_match_at(data_dir.path()).unwrap());
+        let (_, repaired) = materialize_hooks_at(data_dir.path()).unwrap();
+        assert!(repaired);
+        assert_eq!(
+            std::fs::read(shell_dir.join("lib/zsh-hook.zsh")).unwrap(),
+            crate::assets::ZSH_HOOK.as_bytes()
+        );
+
+        std::fs::write(shell_dir.join(".hooks-version"), env!("CARGO_PKG_VERSION")).unwrap();
+        assert!(!materialized_hooks_match_at(data_dir.path()).unwrap());
+        let (_, repaired_version) = materialize_hooks_at(data_dir.path()).unwrap();
+        assert!(repaired_version);
+        assert_eq!(
+            std::fs::read(shell_dir.join(".hooks-version")).unwrap(),
+            format!("{}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+        let (_, rewrote_current_bundle) = materialize_hooks_at(data_dir.path()).unwrap();
+        assert!(!rewrote_current_bundle);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_hooks_reject_symlinked_lib_directory_without_external_write() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let shell_dir = data_dir.path().join("shell");
+        std::fs::create_dir(&shell_dir).unwrap();
+        symlink(outside.path(), shell_dir.join("lib")).unwrap();
+
+        let error = materialize_hooks_at(data_dir.path()).unwrap_err();
+        assert!(error.contains("could not bind materialized hook destination"));
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+        assert!(!shell_dir.join("tirith.sh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_hooks_reject_symlinked_leaf_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let lib_dir = data_dir.path().join("shell/lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        symlink(&sentinel, lib_dir.join("zsh-hook.zsh")).unwrap();
+
+        let error = materialize_hooks_at(data_dir.path()).unwrap_err();
+        assert!(error.contains("could not bind materialized hook destination"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert!(!data_dir.path().join("shell/tirith.sh").exists());
+    }
+
+    #[test]
+    fn materialized_hooks_reject_non_directory_parents_and_non_regular_leaves() {
+        let file_shell_root = tempfile::tempdir().unwrap();
+        std::fs::write(file_shell_root.path().join("shell"), b"not a directory").unwrap();
+        let shell_error = materialize_hooks_at(file_shell_root.path()).unwrap_err();
+        assert!(shell_error.contains("could not bind materialized hook destination"));
+
+        let file_lib_root = tempfile::tempdir().unwrap();
+        let shell_dir = file_lib_root.path().join("shell");
+        std::fs::create_dir(&shell_dir).unwrap();
+        std::fs::write(shell_dir.join("lib"), b"not a directory").unwrap();
+        let lib_error = materialize_hooks_at(file_lib_root.path()).unwrap_err();
+        assert!(lib_error.contains("could not bind materialized hook destination"));
+        assert!(!shell_dir.join("tirith.sh").exists());
+
+        let directory_leaf_root = tempfile::tempdir().unwrap();
+        let directory_leaf = directory_leaf_root.path().join("shell/lib/zsh-hook.zsh");
+        std::fs::create_dir_all(&directory_leaf).unwrap();
+        let leaf_error = materialize_hooks_at(directory_leaf_root.path()).unwrap_err();
+        assert!(leaf_error.contains("refusing non-regular materialized hook destination"));
+        assert!(!directory_leaf_root.path().join("shell/tirith.sh").exists());
     }
 }

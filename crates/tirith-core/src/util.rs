@@ -6,6 +6,11 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Duration;
 
+mod contained_fs;
+
+#[doc(hidden)]
+pub use contained_fs::ContainedAtomicFile;
+
 /// Why [`open_regular_capped`] refused to hand back a usable reader.
 #[derive(Debug)]
 pub enum OpenRegularError {
@@ -126,8 +131,10 @@ pub fn open_write_no_follow(path: &Path, truncate: bool) -> std::io::Result<File
 /// On unix a symlinked final component yields `ELOOP`, mapped to
 /// [`OpenRegularError::NotRegularFile`] (it is, by intent, not a regular file we
 /// will read). `O_NONBLOCK` is also set so a FIFO open returns immediately. On
-/// non-unix we `symlink_metadata`-reject a symlink, then delegate to
-/// [`open_regular_capped`].
+/// Windows the file is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and the OPEN
+/// handle's attributes are checked, so a final symlink/junction is rejected
+/// without a metadata-to-open race. Other non-unix targets retain the portable
+/// `symlink_metadata` fallback.
 ///
 /// NOTE: as with [`open_write_no_follow`], `O_NOFOLLOW` only guards the FINAL
 /// component; pair with [`canonical_within`] to also reject intermediate-dir
@@ -157,7 +164,31 @@ pub fn open_read_no_follow_capped(path: &Path, cap: u64) -> Result<File, OpenReg
         };
         check_regular_capped(file, cap)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(OpenRegularError::NotFound)
+            }
+            Err(error) => return Err(OpenRegularError::Io(error)),
+        };
+        let metadata = file.metadata().map_err(OpenRegularError::Io)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(OpenRegularError::NotRegularFile);
+        }
+        check_regular_capped(file, cap)
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         if std::fs::symlink_metadata(path)
             .map(|m| m.file_type().is_symlink())
@@ -451,7 +482,9 @@ pub enum ShellTimeoutOutcome {
     SpawnError(String),
     /// `try_wait()` errored after spawn succeeded.
     WaitError(String),
-    /// Deadline elapsed; the child was killed and reaped.
+    /// Supervised process-group/Job or capture-worker cleanup was not proven.
+    CleanupError(String),
+    /// Deadline elapsed; the field reports whether bounded cleanup completed.
     Timeout { cleanup_succeeded: bool },
     /// Captured output exceeded the caller's explicit bound.
     OutputLimitExceeded { cleanup_succeeded: bool },
@@ -459,8 +492,8 @@ pub enum ShellTimeoutOutcome {
 
 /// Compatibility adapter for the migrated core callers. The dangerous program
 /// string is gone: callers must resolve a [`TrustedExecutable`] first. Capture,
-/// timeout, environment clearing, and process-tree cleanup are owned by the
-/// shared supervisor.
+/// timeout, environment clearing, and process-group/Job cleanup are owned by
+/// the shared supervisor.
 pub fn run_trusted_with_timeout(
     program: &crate::trusted_child::TrustedExecutable,
     args: &[&str],
@@ -481,6 +514,7 @@ pub fn run_trusted_with_timeout(
         }
         ChildOutcome::SpawnError(reason) => ShellTimeoutOutcome::SpawnError(reason),
         ChildOutcome::WaitError(reason) => ShellTimeoutOutcome::WaitError(reason),
+        ChildOutcome::CleanupError(reason) => ShellTimeoutOutcome::CleanupError(reason),
         ChildOutcome::Timeout { cleanup_succeeded } => {
             ShellTimeoutOutcome::Timeout { cleanup_succeeded }
         }
@@ -539,50 +573,18 @@ pub fn fsync_parent_dir_logged(path: &Path, context: &str) {
     }
 }
 
-/// Create `dir` (and any missing ancestors) and, ONLY when THIS call actually
-/// created `dir`, fsync its parent so the new directory entry is crash-durable.
+/// Create `dir` and any missing ancestors without following attacker-controlled
+/// directory symlinks. Each component is opened relative to a retained parent
+/// descriptor/handle before traversal continues, so replacing a checked parent
+/// cannot redirect a later mkdir. Newly-created entries are made durable before
+/// descent; durability failures retain the historical log-and-continue contract.
 ///
-/// The "did we create it" signal is `create_dir`'s own result, NOT a separate
-/// `exists()` probe, so there is no `exists()`-then-`create_dir_all` TOCTOU where
-/// a concurrent removal in that window would leave the freshly re-created entry
-/// unsynced. An already-present `dir` costs a single `mkdir` syscall (EEXIST) and
-/// no fsync. Like [`fsync_parent_dir_logged`], the fsync is best-effort (logged,
-/// not propagated) and a no-op on non-unix; this does NOT recursively fsync a
-/// fully fresh ancestor chain (higher ancestors normally pre-exist).
+/// Unix permits only root-owned symlink aliases in a non-writable root-owned
+/// parent (for example macOS `/var -> private/var`). User-writable symlink
+/// components are refused. Windows retains no-reparse handles and verifies each
+/// opened child's final identity against its held parent.
 pub fn create_dir_durable(dir: &Path) -> std::io::Result<()> {
-    fn require_real_directory(dir: &Path) -> std::io::Result<()> {
-        let metadata = std::fs::symlink_metadata(dir)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!(
-                    "{} exists but is not a non-symlink directory",
-                    dir.display()
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    match std::fs::create_dir(dir) {
-        // We created the leaf: make its new entry in the parent durable.
-        Ok(()) => {
-            require_real_directory(dir)?;
-            fsync_parent_dir_logged(dir, "durable dir create");
-            Ok(())
-        }
-        // Already present: accept only a real directory. `create_dir` reports
-        // AlreadyExists for regular files and directory symlinks as well.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => require_real_directory(dir),
-        // Ancestors missing (or a transient error): create the whole chain. Success
-        // means we created `dir`, so fsync; otherwise propagate the original error.
-        Err(_) => {
-            std::fs::create_dir_all(dir)?;
-            require_real_directory(dir)?;
-            fsync_parent_dir_logged(dir, "durable dir create");
-            Ok(())
-        }
-    }
+    contained_fs::create_dir_all_durable(dir)
 }
 
 /// Resolve the effective atomic-rewrite target for `path` (CodeRabbit R13b).
@@ -1270,6 +1272,23 @@ mod write_file_atomic_tests {
         assert!(
             super::create_dir_durable(&link).is_err(),
             "an existing directory symlink must not be accepted as a durable directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_durable_rejects_intermediate_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("linked-parent");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let escaped_child = link.join("nested").join("leaf");
+        super::create_dir_durable(&escaped_child)
+            .expect_err("an intermediate directory symlink must be rejected");
+        assert!(
+            !outside.path().join("nested").exists(),
+            "secure traversal must not create anything through the link target"
         );
     }
 

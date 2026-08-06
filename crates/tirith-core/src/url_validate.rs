@@ -56,6 +56,18 @@ pub fn validate_server_url(url: &str) -> Result<(), String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Server, &resolve_host).map(|_| ())
 }
 
+/// Hermetic server-URL preflight seam for tests that must model the validation
+/// DNS answer independently from the connect-time resolver answer.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn validate_server_url_with_resolver_for_test(
+    url: &str,
+    resolver: &TestHostResolver<'_>,
+) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    validate_parsed_url_with_resolver(&parsed, UrlValidationMode::Server, resolver, None)
+}
+
 /// Validate a fetch/cloaking URL: allows http/https but blocks embedded
 /// credentials and non-public destinations (after DNS resolution).
 pub fn validate_fetch_url(url: &str) -> Result<url::Url, String> {

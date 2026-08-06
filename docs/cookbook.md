@@ -187,7 +187,7 @@ use the command emitted by `check --suggest` when preserving an original stdin
 pipeline matters:
 
 ```bash
-tirith run --capsule https://example.com/install.sh
+tirith run https://example.com/install.sh
 ```
 
 Download and inspect only (no execution):
@@ -202,9 +202,9 @@ Pin to a known hash:
 tirith run --sha256 abc123... https://example.com/install.sh
 ```
 
-There is no pager step in `tirith run`; use `--no-exec` to stop after analysis,
-or `tirith fetch <url> --save <path>` for explicit file review. `--capsule` refuses execution if
-the host backend cannot meet its required coverage. Download and DNS resolution
+There is no pager step in `tirith run`; live execution is contained and fail-closed by default.
+Use `--no-exec` to stop after analysis, or `tirith fetch <url> --save <path>` for explicit file review.
+`--capsule` remains accepted as a legacy spelling but does not change that default. Download and DNS resolution
 happen before the interpreter capsule, so containment is not a separate claim
 about the pre-execution resolver path.
 
@@ -241,11 +241,12 @@ tirith install --yes cargo ripgrep
 tirith install url https://get.example-tool.sh
 ```
 
-`tirith install` is pre-execution install-**risk analysis** plus a recorded
-transaction. It does **not** sandbox or isolate the install — the real
-install runs with your full privileges. The checkpoint is a before/after
-record (`tirith checkpoint diff <id>`), not an automatic rollback. Runtime
-sandboxing is an explicit tirith non-goal.
+`tirith install` package-manager forms are pre-execution install-**risk
+analysis** plus a recorded transaction. They do **not** sandbox or isolate the
+package-manager process, which runs with your full privileges. The checkpoint
+is a before/after record (`tirith checkpoint diff <id>`), not an automatic
+rollback. The `url` form is different: reviewed script bytes use Tirith's
+contained runner and fail closed when the required containment is unavailable.
 
 ### Using vet (external, cross-platform)
 

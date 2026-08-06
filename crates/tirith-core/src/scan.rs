@@ -87,6 +87,12 @@ pub enum CoverageGapKind {
     /// The file could not be opened or read (absent during a race, non-regular,
     /// symlinked final component, or a mid-read I/O error).
     Unreadable,
+    /// The selected directory tree could not be completely enumerated: opening
+    /// a root/subtree directory, reading one of its entries, or classifying an
+    /// entry's metadata failed. Unlike an unreadable individual file, this gap
+    /// is intrinsically security-relevant because the failed operation hides an
+    /// unknown set of paths whose kinds cannot be determined.
+    EnumerationFailed,
     /// The file was read only partially before being abandoned (reserved for the
     /// archive/streaming paths in later PRs; not produced by the generic scan).
     Truncated,
@@ -130,11 +136,31 @@ pub enum CoverageGapKind {
 }
 
 impl CoverageGapKind {
+    /// Every typed coverage-gap reason. Security-enforcing consumers use this in
+    /// exhaustive contract tests so a gap kind cannot be silently omitted from
+    /// fail-closed install behavior.
+    pub const ALL: [Self; 13] = [
+        Self::Oversized,
+        Self::Unreadable,
+        Self::EnumerationFailed,
+        Self::Truncated,
+        Self::Panicked,
+        Self::Unsupported,
+        Self::HashBudgetExceeded,
+        Self::EntryCountCapped,
+        Self::TotalBytesCapped,
+        Self::CompressionRatioExceeded,
+        Self::MemberTooLarge,
+        Self::UnsupportedCompression,
+        Self::NativeTruncated,
+    ];
+
     /// A short stable wire token for JSON/SARIF.
     pub fn as_str(self) -> &'static str {
         match self {
             CoverageGapKind::Oversized => "oversized",
             CoverageGapKind::Unreadable => "unreadable",
+            CoverageGapKind::EnumerationFailed => "enumeration_failed",
             CoverageGapKind::Truncated => "truncated",
             CoverageGapKind::Panicked => "panicked",
             CoverageGapKind::Unsupported => "unsupported",
@@ -897,7 +923,35 @@ fn collect_files(
     include_patterns: &[String],
     exclude_patterns: &[String],
 ) -> CollectedFiles {
-    if path.is_file() {
+    // Preserve absence as an ordinary unreadable optional-path outcome for core
+    // discovery callers, but do not let a root metadata failure collapse into
+    // `Path::is_file`/`is_dir`'s lossy `false`: that failure means we could not
+    // determine what tree was hidden and is therefore an enumeration gap. The
+    // CLI separately rejects a missing explicitly requested target as a hard
+    // operational error before entering this collector.
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let gap = if error.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("tirith: scan: path does not exist: {}", path.display());
+                unreadable_gap(path)
+            } else {
+                eprintln!(
+                    "tirith: scan: cannot inspect requested path {}: {error}",
+                    path.display()
+                );
+                enumeration_gap(path)
+            };
+            return CollectedFiles {
+                text_candidates: Vec::new(),
+                linked_text_candidates: Vec::new(),
+                artifact_candidates: Vec::new(),
+                coverage_gaps: vec![gap],
+            };
+        }
+    };
+
+    if metadata.is_file() {
         // A directly-named single file is classified too, so pointing the walk at
         // a `.so` surfaces it as an artifact candidate rather than scanning it as
         // text. (The `scan --file` / `scan <file>` CLI paths handle a directly
@@ -924,8 +978,11 @@ fn collect_files(
         };
     }
 
-    if !path.is_dir() {
-        eprintln!("tirith: scan: path does not exist: {}", path.display());
+    if !metadata.is_dir() {
+        eprintln!(
+            "tirith: scan: path is not a regular file or directory: {}",
+            path.display()
+        );
         return CollectedFiles {
             text_candidates: Vec::new(),
             linked_text_candidates: Vec::new(),
@@ -989,7 +1046,7 @@ fn collect_files_recursive(
         Ok(e) => e,
         Err(e) => {
             eprintln!("tirith: scan: cannot read directory {}: {e}", dir.display());
-            collected.coverage_gaps.push(unreadable_gap(dir));
+            collected.coverage_gaps.push(enumeration_gap(dir));
             return;
         }
     };
@@ -1002,7 +1059,7 @@ fn collect_files_recursive(
                     "tirith: scan: error reading entry in {}: {e}",
                     dir.display()
                 );
-                collected.coverage_gaps.push(unreadable_gap(dir));
+                collected.coverage_gaps.push(enumeration_gap(dir));
                 continue;
             }
         };
@@ -1021,7 +1078,7 @@ fn collect_files_recursive(
                     "tirith: scan: cannot stat entry {}: {e} (skipped)",
                     path.display()
                 );
-                collected.coverage_gaps.push(unreadable_gap(&path));
+                collected.coverage_gaps.push(enumeration_gap(&path));
                 continue;
             }
         };
@@ -1102,6 +1159,17 @@ fn unreadable_gap(path: &Path) -> CoverageGap {
     CoverageGap {
         location: SubjectLocation::from_path(path.to_path_buf()),
         kind: CoverageGapKind::Unreadable,
+        sha256: None,
+    }
+}
+
+/// Record failure to enumerate a directory tree. The path may look entirely
+/// benign (or may be the parent directory when `ReadDir` cannot yield an entry),
+/// so consumers must classify this by operation rather than by extension.
+fn enumeration_gap(path: &Path) -> CoverageGap {
+    CoverageGap {
+        location: SubjectLocation::from_path(path.to_path_buf()),
+        kind: CoverageGapKind::EnumerationFailed,
         sha256: None,
     }
 }
@@ -1488,7 +1556,16 @@ fn assemble_analysis_incomplete_findings(
         if !gap_is_security_relevant(gap) {
             continue;
         }
-        let action = policy.scan.action_for_gap_kind(gap.kind);
+        let configured_action = policy.scan.action_for_gap_kind(gap.kind);
+        // Enumeration failure hides paths before their kinds can be known. It
+        // therefore cannot be made to read as clean through an ordinary
+        // unreadable-file Ignore policy; floor this intrinsically relevant gap
+        // at Warn while retaining Fail when configured.
+        let action = if gap.kind == CoverageGapKind::EnumerationFailed {
+            configured_action.max(GapAction::Warn)
+        } else {
+            configured_action
+        };
         if action == GapAction::Ignore {
             continue;
         }
@@ -1502,16 +1579,26 @@ fn assemble_analysis_incomplete_findings(
             Some(hash) => format!("{} ({}); sha256={hash}", location, gap.kind.as_str()),
             None => format!("{} ({})", location, gap.kind.as_str()),
         };
-        findings.push(Finding {
-            rule_id: RuleId::AnalysisIncomplete,
-            severity,
-            title: "Scan coverage incomplete".to_string(),
-            description: format!(
+        let description = if gap.kind == CoverageGapKind::EnumerationFailed {
+            format!(
+                "The selected directory tree could not be completely enumerated at: {}. \
+                 Unknown paths may be hidden below this location, so the result is not \
+                 provably clean.",
+                location
+            )
+        } else {
+            format!(
                 "A security-relevant file was not fully analyzed ({}): {}. \
                  The result is not provably clean for this file.",
                 gap.kind.as_str(),
                 location
-            ),
+            )
+        };
+        findings.push(Finding {
+            rule_id: RuleId::AnalysisIncomplete,
+            severity,
+            title: "Scan coverage incomplete".to_string(),
+            description,
             evidence: vec![Evidence::Text { detail }],
             human_view: None,
             agent_view: None,
@@ -1525,10 +1612,16 @@ fn assemble_analysis_incomplete_findings(
 /// Whether a single coverage gap is SECURITY-relevant: a priority/config file, a
 /// security-extension file (`.so`/`.pth`/...), a lockfile/workflow, OR a
 /// [`CoverageGapKind::HashBudgetExceeded`] gap (a giant file is suspicious on its
-/// own, so the hash budget can never hide a payload from `require_complete`).
+/// own, so the hash budget can never hide a payload from `require_complete`), OR
+/// a [`CoverageGapKind::EnumerationFailed`] gap (the failed walk means the path
+/// kinds hidden below it are unknown).
 pub fn gap_is_security_relevant(gap: &CoverageGap) -> bool {
-    // A file too big to even hash is security relevant no matter the extension.
-    if gap.kind == CoverageGapKind::HashBudgetExceeded {
+    // A file too big to even hash and a failed directory enumeration are security
+    // relevant no matter what the visible path is named.
+    if matches!(
+        gap.kind,
+        CoverageGapKind::HashBudgetExceeded | CoverageGapKind::EnumerationFailed
+    ) {
         return true;
     }
     let Some(path) = gap.primary_path() else {
@@ -1590,6 +1683,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_dir_failure_is_an_intrinsically_relevant_enumeration_gap() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let ordinary_named_path = root.path().join("ordinary-not-a-directory");
+        std::fs::write(&ordinary_named_path, "not a directory").unwrap();
+
+        let mut collected = CollectedFiles {
+            text_candidates: Vec::new(),
+            linked_text_candidates: Vec::new(),
+            artifact_candidates: Vec::new(),
+            coverage_gaps: Vec::new(),
+        };
+        collect_files_recursive(
+            root.path(),
+            &ordinary_named_path,
+            true,
+            &[],
+            &[],
+            &[],
+            &mut collected,
+        );
+
+        assert_eq!(collected.coverage_gaps.len(), 1);
+        let gap = &collected.coverage_gaps[0];
+        assert_eq!(gap.kind, CoverageGapKind::EnumerationFailed);
+        assert_eq!(gap.primary_path(), Some(ordinary_named_path.as_path()));
+        assert!(
+            gap_is_security_relevant(gap),
+            "enumeration relevance must not depend on the visible path kind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_metadata_failure_is_an_intrinsically_relevant_enumeration_gap() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let loop_path = root.path().join("ordinary-root");
+        std::os::unix::fs::symlink("ordinary-root", &loop_path).unwrap();
+
+        let result = scan_tree(&loop_path, None);
+
+        assert_eq!(result.scanned_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.coverage_gaps.len(), 1);
+        assert_eq!(
+            result.coverage_gaps[0].kind,
+            CoverageGapKind::EnumerationFailed
+        );
+        assert!(gap_is_security_relevant(&result.coverage_gaps[0]));
+    }
+
+    #[test]
+    fn enumeration_gap_cannot_be_silenced_by_unreadable_ignore() {
+        let gap = enumeration_gap(Path::new("ordinary-directory"));
+        let mut policy = crate::policy::Policy::default();
+        policy.scan.unreadable_file_action = Some(crate::policy::GapAction::Ignore);
+
+        let findings = build_analysis_incomplete_findings(&[gap], &policy);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::AnalysisIncomplete
+        );
+        assert_eq!(findings[0].severity, Severity::Medium);
+    }
+
     #[cfg(unix)]
     #[test]
     fn unreadable_subtree_is_recorded_without_hiding_readable_siblings() {
@@ -1618,7 +1778,7 @@ mod tests {
         );
         assert!(
             result.coverage_gaps.iter().any(|gap| {
-                gap.kind == CoverageGapKind::Unreadable
+                gap.kind == CoverageGapKind::EnumerationFailed
                     && gap.primary_path() == Some(unreadable.as_path())
             }),
             "the unreadable subtree must be an explicit gap: {:?}",

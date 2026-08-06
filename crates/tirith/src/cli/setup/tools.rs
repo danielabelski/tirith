@@ -3,10 +3,14 @@
 
 use super::fs_helpers;
 use super::merge;
-use super::run_impl::{copy_gateway_config, Scope, SetupOpts};
+use super::run_impl::{
+    copy_gateway_config, path_to_utf8, publish_codex_gateway_config, retire_codex_gateway_config,
+    Scope, SetupOpts,
+};
 #[cfg(unix)]
 use super::zshenv;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 fn offer_zshenv_guard_for_opts(opts: &SetupOpts) -> Result<(), String> {
@@ -21,22 +25,378 @@ fn offer_zshenv_guard_for_opts(opts: &SetupOpts) -> Result<(), String> {
 }
 
 fn codex_mcp_get_reports_missing(stderr: &str) -> bool {
-    let stderr = stderr.to_lowercase();
-    stderr.contains("not found")
-        || stderr.contains("does not exist")
-        || stderr.contains("no mcp server named")
+    let stderr = stderr.trim().trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        stderr.as_str(),
+        "error: mcp server tirith-gateway not found"
+            | "mcp server tirith-gateway not found"
+            | "tirith-gateway does not exist"
+            | "error: no mcp server named 'tirith-gateway' found"
+            | "no mcp server named 'tirith-gateway' found"
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RestorableCodexMcpRegistration {
+    command: String,
+    args: Vec<String>,
+}
+
+impl RestorableCodexMcpRegistration {
+    /// Normalize the complete effective Codex registration into the exact
+    /// subset that `codex mcp add NAME -- COMMAND ARGS...` can recreate. Refuse
+    /// forced mutation before removal when any effective field cannot be
+    /// restored through that CLI surface.
+    fn from_effective(value: &Value) -> Result<Self, String> {
+        let registration = value
+            .as_object()
+            .ok_or_else(|| "registration is not a JSON object".to_string())?;
+        const REGISTRATION_FIELDS: &[&str] = &[
+            "auth_status",
+            "disabled_reason",
+            "enabled",
+            "name",
+            "startup_timeout_sec",
+            "tool_timeout_sec",
+            "transport",
+        ];
+        if let Some(field) = registration
+            .keys()
+            .find(|key| !REGISTRATION_FIELDS.contains(&key.as_str()))
+        {
+            return Err(format!("unsupported registration field {field:?}"));
+        }
+        if registration.get("name").and_then(Value::as_str) != Some("tirith-gateway") {
+            return Err("registration name is not tirith-gateway".into());
+        }
+        if registration.get("enabled").and_then(Value::as_bool) != Some(true) {
+            return Err("registration is not enabled".into());
+        }
+        for field in ["disabled_reason", "startup_timeout_sec", "tool_timeout_sec"] {
+            if registration
+                .get(field)
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(format!("registration field {field:?} is not restorable"));
+            }
+        }
+
+        let transport = registration
+            .get("transport")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "registration transport is not an object".to_string())?;
+        const TRANSPORT_FIELDS: &[&str] = &["args", "command", "cwd", "env", "env_vars", "type"];
+        if let Some(field) = transport
+            .keys()
+            .find(|key| !TRANSPORT_FIELDS.contains(&key.as_str()))
+        {
+            return Err(format!("unsupported transport field {field:?}"));
+        }
+        if transport.get("type").and_then(Value::as_str) != Some("stdio") {
+            return Err("registration transport is not stdio".into());
+        }
+        if transport.get("cwd").is_some_and(|value| !value.is_null()) {
+            return Err("registration cwd override is not restorable".into());
+        }
+        if transport.get("env").is_some_and(|value| {
+            !value.is_null() && !value.as_object().is_some_and(serde_json::Map::is_empty)
+        }) {
+            return Err("registration environment is not restorable".into());
+        }
+        if transport
+            .get("env_vars")
+            .is_some_and(|value| !value.is_null() && !value.as_array().is_some_and(Vec::is_empty))
+        {
+            return Err("registration inherited environment is not restorable".into());
+        }
+
+        let command = transport
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "registration command is not a string".to_string())?
+            .to_string();
+        let args = transport
+            .get("args")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "registration args are not an array".to_string())?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| "registration arg is not a string".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { command, args })
+    }
+
+    fn add_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "mcp".to_string(),
+            "add".to_string(),
+            "tirith-gateway".to_string(),
+            "--".to_string(),
+            self.command.clone(),
+        ];
+        args.extend(self.args.iter().cloned());
+        args
+    }
+
+    fn managed_gateway_config_path(&self) -> Option<PathBuf> {
+        if self.args.len() != 8
+            || self.args[0] != "gateway"
+            || self.args[1] != "run"
+            || self.args[2] != "--upstream-bin"
+            || self.args[3] != self.command
+            || self.args[4] != "--upstream-arg"
+            || self.args[5] != "mcp-server"
+            || self.args[6] != "--config"
+        {
+            return None;
+        }
+        Some(PathBuf::from(&self.args[7]))
+    }
 }
 
 fn codex_mcp_config_matches(value: &Value, expected_command: &str, expected_args: &[&str]) -> bool {
-    // Codex CLI 0.x exposed command/args at the top level; current versions
-    // nest them under `transport`. Accept either shape.
-    let config = value.get("transport").unwrap_or(value);
-    let command = config.get("command").and_then(Value::as_str);
-    let args: Option<Vec<&str>> = config
-        .get("args")
-        .and_then(Value::as_array)
-        .and_then(|values| values.iter().map(Value::as_str).collect());
-    command == Some(expected_command) && args.as_deref() == Some(expected_args)
+    let Ok(registration) = RestorableCodexMcpRegistration::from_effective(value) else {
+        return false;
+    };
+    registration.command == expected_command
+        && registration
+            .args
+            .iter()
+            .map(String::as_str)
+            .eq(expected_args.iter().copied())
+}
+
+fn codex_mcp_output_error(action: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!(
+        "codex mcp {action} failed (exit {}): {}",
+        output.status.code().unwrap_or(-1),
+        stderr.trim()
+    )
+}
+
+fn run_codex_mcp_add<F>(
+    run_cli: &mut F,
+    cwd: &Path,
+    registration: &RestorableCodexMcpRegistration,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    let owned_args = registration.add_args();
+    let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+    let output = run_cli(cwd, "codex", &args)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(codex_mcp_output_error("add", &output))
+    }
+}
+
+fn remove_codex_mcp_registration<F>(
+    run_cli: &mut F,
+    cwd: &Path,
+    allow_missing: bool,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    let output = run_cli(cwd, "codex", &["mcp", "remove", "tirith-gateway"])?;
+    if output.status.success()
+        || (allow_missing
+            && codex_mcp_get_reports_missing(&String::from_utf8_lossy(&output.stderr)))
+    {
+        Ok(())
+    } else {
+        Err(codex_mcp_output_error("remove", &output))
+    }
+}
+
+fn query_codex_mcp_registration<F>(run_cli: &mut F, cwd: &Path) -> Result<Option<Value>, String>
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    let output = run_cli(cwd, "codex", &["mcp", "get", "--json", "tirith-gateway"])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if codex_mcp_get_reports_missing(&stderr) {
+            return Ok(None);
+        }
+        return Err(codex_mcp_output_error("get --json", &output));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("codex mcp get --json returned invalid JSON: {error}"))
+        .map(Some)
+}
+
+fn read_codex_mcp_registration<F>(run_cli: &mut F, cwd: &Path) -> Result<Value, String>
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    query_codex_mcp_registration(run_cli, cwd)?
+        .ok_or_else(|| "codex mcp get --json reported that tirith-gateway is missing".to_string())
+}
+
+fn restore_codex_mcp_registration<F>(
+    run_cli: &mut F,
+    writable_cwd: &Path,
+    previous: &RestorableCodexMcpRegistration,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    if let Some(value) = query_codex_mcp_registration(run_cli, writable_cwd)? {
+        if RestorableCodexMcpRegistration::from_effective(&value)
+            .is_ok_and(|current| &current == previous)
+        {
+            return Ok(());
+        }
+        remove_codex_mcp_registration(run_cli, writable_cwd, true)?;
+    }
+    run_codex_mcp_add(run_cli, writable_cwd, previous)?;
+    let restored_value = read_codex_mcp_registration(run_cli, writable_cwd)?;
+    let restored = RestorableCodexMcpRegistration::from_effective(&restored_value)
+        .map_err(|error| format!("restored registration is not safely verifiable: {error}"))?;
+    if &restored != previous {
+        return Err("restored registration differs from the pre-mutation snapshot".into());
+    }
+    Ok(())
+}
+
+fn remove_new_codex_registration_if_proven<F>(
+    run_cli: &mut F,
+    writable_cwd: &Path,
+    intended: &RestorableCodexMcpRegistration,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    let Some(value) = query_codex_mcp_registration(run_cli, writable_cwd)? else {
+        return Ok(());
+    };
+    let effective = RestorableCodexMcpRegistration::from_effective(&value)
+        .map_err(|error| format!("refusing unsnapshotted removal: {error}"))?;
+    if &effective != intended {
+        return Err(
+            "refusing unsnapshotted removal because the effective registration is not exactly the one this setup attempted to create"
+                .into(),
+        );
+    }
+    remove_codex_mcp_registration(run_cli, writable_cwd, true)?;
+    match query_codex_mcp_registration(run_cli, writable_cwd)? {
+        None => Ok(()),
+        Some(_) => Err("new registration still exists after rollback removal".into()),
+    }
+}
+
+/// Select a canonical filesystem root as a project-neutral Codex working
+/// directory. Codex still loads its user configuration from HOME/CODEX_HOME,
+/// but cannot inherit a `.codex/config.toml` from the caller's repository
+/// hierarchy while setup snapshots or mutates the writable user layer.
+fn codex_isolated_cwd() -> Result<PathBuf, String> {
+    let current = std::env::current_dir().map_err(|error| format!("current_dir: {error}"))?;
+    let root = current
+        .ancestors()
+        .last()
+        .ok_or_else(|| "current directory has no filesystem root".to_string())?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("canonicalize Codex isolation root: {error}"))?;
+    let metadata = std::fs::symlink_metadata(&root)
+        .map_err(|error| format!("inspect Codex isolation root: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("Codex isolation root is not a canonical directory".into());
+    }
+    Ok(root)
+}
+
+fn verify_codex_effective_snapshot<F>(
+    run_cli: &mut F,
+    effective_cwd: &Path,
+    expected: &Option<Value>,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    let actual = query_codex_mcp_registration(run_cli, effective_cwd)?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err("effective registration differs from the pre-mutation snapshot".into())
+    }
+}
+
+fn codex_failure_with_rollback<F>(
+    run_cli: &mut F,
+    writable_cwd: &Path,
+    effective_cwd: &Path,
+    effective_before: &Option<Value>,
+    previous: Option<&RestorableCodexMcpRegistration>,
+    intended: &RestorableCodexMcpRegistration,
+    failure: String,
+) -> String
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    let writable_rollback = if let Some(previous) = previous {
+        restore_codex_mcp_registration(run_cli, writable_cwd, previous).map(|()| {
+            "the previous registration was restored and verified at the writable layer".to_string()
+        })
+    } else {
+        remove_new_codex_registration_if_proven(run_cli, writable_cwd, intended).map(|()| {
+            "the attempted new writable-layer registration was absent or safely removed".to_string()
+        })
+    };
+    let effective_rollback =
+        verify_codex_effective_snapshot(run_cli, effective_cwd, effective_before);
+    match (writable_rollback, effective_rollback) {
+        (Ok(writable_note), Ok(())) => format!(
+            "{failure}; {writable_note}; the caller-visible effective registration was restored and verified"
+        ),
+        (writable, effective) => {
+            let writable = writable
+                .err()
+                .map(|error| format!("writable-layer rollback: {error}"))
+                .unwrap_or_else(|| "writable-layer rollback verified".to_string());
+            let effective = effective
+                .err()
+                .map(|error| format!("effective-state rollback: {error}"))
+                .unwrap_or_else(|| "effective-state rollback verified".to_string());
+            format!(
+                "{failure}; automatic rollback could not prove both required states ({writable}; {effective}). Restore tirith-gateway manually before retrying"
+            )
+        }
+    }
+}
+
+fn codex_failure_after_optional_mutation<F>(
+    run_cli: &mut F,
+    writable_cwd: &Path,
+    effective_cwd: &Path,
+    effective_before: &Option<Value>,
+    mutation_previous: Option<&Option<RestorableCodexMcpRegistration>>,
+    intended: &RestorableCodexMcpRegistration,
+    failure: String,
+) -> String
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+{
+    match mutation_previous {
+        Some(previous) => codex_failure_with_rollback(
+            run_cli,
+            writable_cwd,
+            effective_cwd,
+            effective_before,
+            previous.as_ref(),
+            intended,
+            failure,
+        ),
+        None => failure,
+    }
 }
 
 pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
@@ -137,115 +497,199 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
 }
 
 pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
-    setup_codex_with_runner(opts, fs_helpers::run_cli)
+    setup_codex_with_runner(opts, fs_helpers::run_codex_cli_in_dir)
 }
 
 fn setup_codex_with_runner<F>(opts: &SetupOpts, mut run_cli: F) -> Result<(), String>
 where
-    F: FnMut(&str, &[&str]) -> Result<std::process::Output, String>,
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
 {
-    let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
+    setup_codex_with_runner_and_publisher(opts, &mut run_cli, publish_codex_gateway_config)
+}
 
+fn setup_codex_with_runner_and_publisher<F, P>(
+    opts: &SetupOpts,
+    mut run_cli: F,
+    publish_gateway: P,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &str, &[&str]) -> Result<std::process::Output, String>,
+    P: FnOnce(bool) -> Result<PathBuf, String>,
+{
+    let gateway_path = publish_gateway(opts.dry_run)?;
     if opts.update_configs {
         eprintln!();
-        eprintln!("tirith: Codex gateway config refreshed");
+        eprintln!("tirith: Codex gateway generation published");
         return Ok(());
     }
 
-    let gw_path_str = gateway_path.display().to_string();
+    // Publish and byte-verify an immutable generation before any registration
+    // can make it live. Later failures may leave an unused content-addressed
+    // file, but no active registration can point to stale or missing bytes.
+    let gw_path_str = path_to_utf8(&gateway_path, "Codex gateway")?;
     let tirith_bin = &opts.tirith_bin;
-    let add_args: Vec<&str> = vec![
-        "mcp",
-        "add",
-        "tirith-gateway",
-        "--",
-        tirith_bin,
-        "gateway",
-        "run",
-        "--upstream-bin",
-        tirith_bin,
-        "--upstream-arg",
-        "mcp-server",
-        "--config",
-        &gw_path_str,
-    ];
+    let intended = RestorableCodexMcpRegistration {
+        command: tirith_bin.clone(),
+        args: vec![
+            "gateway".to_string(),
+            "run".to_string(),
+            "--upstream-bin".to_string(),
+            tirith_bin.clone(),
+            "--upstream-arg".to_string(),
+            "mcp-server".to_string(),
+            "--config".to_string(),
+            gw_path_str,
+        ],
+    };
+    let expected_args: Vec<&str> = intended.args.iter().map(String::as_str).collect();
+    let add_args = intended.add_args();
 
+    let effective_cwd = std::env::current_dir().map_err(|error| format!("current_dir: {error}"))?;
+    let writable_cwd = codex_isolated_cwd()?;
+    let mut effective_before: Option<Value> = None;
+    let mut mutation_previous: Option<Option<RestorableCodexMcpRegistration>> = None;
     if opts.dry_run {
         eprintln!("[dry-run] would run: codex {}", add_args.join(" "));
         eprintln!("  (cannot check existing registrations in dry-run mode)");
     } else {
-        let get_out = run_cli("codex", &["mcp", "get", "tirith-gateway"])?;
-
-        let exists = if get_out.status.success() {
-            true
-        } else {
-            let stderr = String::from_utf8_lossy(&get_out.stderr);
-            if codex_mcp_get_reports_missing(&stderr) {
-                false
-            } else {
-                return Err(format!(
-                    "codex mcp get failed unexpectedly: {}",
-                    stderr.trim()
-                ));
-            }
-        };
+        // Snapshot the caller-visible effective state and the writable user
+        // layer independently. The isolated root cwd prevents a project Codex
+        // config from masking the layer that `mcp remove/add` actually mutates.
+        effective_before = query_codex_mcp_registration(&mut run_cli, &effective_cwd).map_err(
+            |error| {
+                format!(
+                    "cannot query the caller-visible tirith-gateway state before mutation; no registration changes were made: {error}"
+                )
+            },
+        )?;
+        let writable_value = query_codex_mcp_registration(&mut run_cli, &writable_cwd).map_err(|error| {
+            format!(
+                "cannot query tirith-gateway from the isolated user configuration scope for a safe pre-mutation snapshot; no registration changes were made: {error}"
+            )
+        })?;
+        if effective_before != writable_value {
+            return Err(
+                "the caller-visible tirith-gateway registration differs from the isolated writable user layer, indicating a higher-precedence project registration; no registration changes were made. Remove or reconcile the project entry before retrying"
+                    .into(),
+            );
+        }
+        let exists = writable_value.is_some();
 
         if exists && !opts.force {
-            // Drift detection: compare existing registration's command+args
-            // with what we would write, via `codex mcp get --json`.
-            let json_out = run_cli("codex", &["mcp", "get", "--json", "tirith-gateway"]);
-            let expected_args: Vec<&str> = vec![
-                "gateway",
-                "run",
-                "--upstream-bin",
-                tirith_bin,
-                "--upstream-arg",
-                "mcp-server",
-                "--config",
-                &gw_path_str,
-            ];
-            let config_matches = match json_out {
-                Ok(ref out) if out.status.success() => {
-                    match serde_json::from_slice::<Value>(&out.stdout) {
-                        Ok(val) => Some(codex_mcp_config_matches(
-                            &val,
-                            tirith_bin,
-                            expected_args.as_slice(),
-                        )),
-                        Err(_) => None,
-                    }
-                }
-                _ => None,
-            };
-            match config_matches {
-                Some(true) => {
-                    eprintln!("tirith: tirith-gateway already registered with codex, up to date");
-                }
-                Some(false) => {
-                    return Err(
-                        "tirith-gateway registered with codex but config differs — use --force to update".into(),
-                    );
-                }
-                None => {
-                    return Err(
-                        "cannot verify tirith-gateway config with codex — use --force to re-register".into(),
-                    );
-                }
+            let config_matches = writable_value.as_ref().is_some_and(|value| {
+                codex_mcp_config_matches(value, tirith_bin, expected_args.as_slice())
+            });
+            if config_matches {
+                eprintln!("tirith: tirith-gateway already registered with codex, up to date");
+            } else {
+                return Err(
+                    "tirith-gateway registered with codex but config differs — use --force to update"
+                        .into(),
+                );
             }
         } else {
+            let previous = writable_value
+                .as_ref()
+                .map(RestorableCodexMcpRegistration::from_effective)
+                .transpose()
+                .map_err(|error| {
+                    format!(
+                        "cannot safely replace the existing tirith-gateway registration because its complete effective state cannot be restored; no registration changes were made: {error}"
+                    )
+                })?;
+
             if exists {
-                let _ = run_cli("codex", &["mcp", "remove", "tirith-gateway"]);
+                if let Err(error) =
+                    remove_codex_mcp_registration(&mut run_cli, &writable_cwd, false)
+                {
+                    return Err(codex_failure_with_rollback(
+                        &mut run_cli,
+                        &writable_cwd,
+                        &effective_cwd,
+                        &effective_before,
+                        previous.as_ref(),
+                        &intended,
+                        error,
+                    ));
+                }
             }
-            let add_out = run_cli("codex", &add_args)?;
-            if !add_out.status.success() {
-                let stderr = String::from_utf8_lossy(&add_out.stderr);
-                return Err(format!(
-                    "codex mcp add failed (exit {}): {}",
-                    add_out.status.code().unwrap_or(-1),
-                    stderr.trim()
+            if let Err(error) = run_codex_mcp_add(&mut run_cli, &writable_cwd, &intended) {
+                return Err(codex_failure_with_rollback(
+                    &mut run_cli,
+                    &writable_cwd,
+                    &effective_cwd,
+                    &effective_before,
+                    previous.as_ref(),
+                    &intended,
+                    error,
                 ));
             }
+
+            // Prove the exact writable-layer result first, then independently
+            // prove the effective result in the caller's original repository.
+            for (scope, cwd) in [
+                ("isolated writable layer", writable_cwd.as_path()),
+                ("caller-visible effective state", effective_cwd.as_path()),
+            ] {
+                let verification =
+                    read_codex_mcp_registration(&mut run_cli, cwd).and_then(|value| {
+                        let effective = RestorableCodexMcpRegistration::from_effective(&value)
+                            .map_err(|error| format!("{scope} registration is unsafe: {error}"))?;
+                        if effective == intended {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                            "{scope} registration differs from the intended command and arguments"
+                        ))
+                        }
+                    });
+                if let Err(error) = verification {
+                    return Err(codex_failure_with_rollback(
+                        &mut run_cli,
+                        &writable_cwd,
+                        &effective_cwd,
+                        &effective_before,
+                        previous.as_ref(),
+                        &intended,
+                        format!(
+                            "codex did not report the complete expected tirith-gateway configuration after registration: {error}"
+                        ),
+                    ));
+                }
+            }
+            mutation_previous = Some(previous);
             eprintln!("tirith: registered tirith-gateway with codex");
+        }
+    }
+
+    #[cfg(unix)]
+    if let Err(error) = offer_zshenv_guard_for_opts(opts) {
+        return Err(codex_failure_after_optional_mutation(
+            &mut run_cli,
+            &writable_cwd,
+            &effective_cwd,
+            &effective_before,
+            mutation_previous.as_ref(),
+            &intended,
+            format!("zshenv guard setup failed after Codex registration: {error}"),
+        ));
+    }
+
+    if !opts.dry_run {
+        if let Some(previous_gateway) = mutation_previous
+            .as_ref()
+            .and_then(Option::as_ref)
+            .and_then(RestorableCodexMcpRegistration::managed_gateway_config_path)
+        {
+            if let Err(error) = retire_codex_gateway_config(&previous_gateway, &gateway_path) {
+                // Registration already points at the byte-verified new
+                // generation. Never roll it back to an artifact whose
+                // retirement may have begun; retain/report the old artifact
+                // when cleanup cannot be proven.
+                eprintln!(
+                    "tirith: WARNING: could not retire previous Codex gateway generation: {error}"
+                );
+            }
         }
     }
 
@@ -254,9 +698,6 @@ where
     {
         eprintln!("tirith: WARNING: {e}");
     }
-
-    #[cfg(unix)]
-    offer_zshenv_guard_for_opts(opts)?;
 
     eprintln!();
     eprintln!("tirith: Codex setup complete");
@@ -305,7 +746,7 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
         Scope::Project => "hooks/tirith-hook.sh".to_string(),
         Scope::User => {
             let h = home.join(".cursor").join("hooks").join("tirith-hook.sh");
-            h.display().to_string()
+            path_to_utf8(&h, "Cursor hook")?
         }
     };
     merge::merge_hooks_json(
@@ -323,7 +764,7 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
         true, // Cursor requires "version": 1
     )?;
 
-    let gw_path_str = gateway_path.display().to_string();
+    let gw_path_str = path_to_utf8(&gateway_path, "Cursor gateway")?;
     let mcp_json_path = target.join("mcp.json");
     merge::merge_mcp_json(
         &mcp_json_path,
@@ -384,7 +825,7 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
 
     // VS Code uses "servers" as the top-level key (not "mcpServers") and
     // requires "type": "stdio" — see merge_mcp_json_with_key callsite.
-    let gw_path_str = gateway_path.display().to_string();
+    let gw_path_str = path_to_utf8(&gateway_path, "VS Code gateway")?;
     let mcp_json_path = cwd.join(".vscode").join("mcp.json");
     merge::merge_mcp_json_with_key(
         &mcp_json_path,
@@ -466,9 +907,10 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
         }
         Scope::User => {
             let abs = hooks_dir.join("tirith-security-guard-gemini.py");
+            let abs = path_to_utf8(&abs, "Gemini hook")?;
             format!(
                 "python3 {}",
-                super::shell_profile::shell_quote(&abs.display().to_string(), "bash")
+                super::shell_profile::shell_quote(&abs, "bash")
             )
         }
     };
@@ -648,7 +1090,7 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
 
     // Windsurf is user-global, so hooks.json references an absolute path.
     let hooks_json_path = target.join("hooks.json");
-    let hook_cmd = hooks_dir.join("tirith-hook.sh").display().to_string();
+    let hook_cmd = path_to_utf8(&hooks_dir.join("tirith-hook.sh"), "Windsurf hook")?;
     merge::merge_hooks_json(
         &hooks_json_path,
         &home,
@@ -663,7 +1105,7 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
         false, // Windsurf doesn't require "version" key
     )?;
 
-    let gw_path_str = gateway_path.display().to_string();
+    let gw_path_str = path_to_utf8(&gateway_path, "Windsurf gateway")?;
     let mcp_json_path = target.join("mcp_config.json");
     merge::merge_mcp_json(
         &mcp_json_path,
@@ -802,7 +1244,8 @@ pub fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
     // resolution). tools=["*"] keeps default tool access; includeMcpJson keeps
     // the user's MCP servers.
     let agent_path = agents_dir.join("tirith-security.json");
-    let quoted = super::shell_profile::shell_quote(&hook_path.display().to_string(), "bash");
+    let hook_path_text = path_to_utf8(&hook_path, "Kiro hook")?;
+    let quoted = super::shell_profile::shell_quote(&hook_path_text, "bash");
     let command = format!("python3 {quoted}");
     let agent = serde_json::json!({
         "description": "Tirith security guard: intercepts execute_bash tool calls and blocks dangerous commands.",
@@ -957,12 +1400,23 @@ mod tests {
         assert!(!codex_mcp_get_reports_missing(
             "permission denied reading codex config"
         ));
+        assert!(!codex_mcp_get_reports_missing(
+            "codex config file not found"
+        ));
+        assert!(!codex_mcp_get_reports_missing(
+            "MCP server another-name not found"
+        ));
     }
 
     #[test]
     fn codex_mcp_config_matches_current_transport_shape() {
         let value = json!({
             "name": "tirith-gateway",
+            "enabled": true,
+            "disabled_reason": null,
+            "startup_timeout_sec": null,
+            "tool_timeout_sec": null,
+            "auth_status": "unsupported",
             "transport": {
                 "type": "stdio",
                 "command": "tirith",
@@ -971,7 +1425,10 @@ mod tests {
                     "--upstream-bin", "tirith",
                     "--upstream-arg", "mcp-server",
                     "--config", "/Users/example/.config/tirith/gateway.yaml"
-                ]
+                ],
+                "env": null,
+                "env_vars": [],
+                "cwd": null
             }
         });
         let expected_args = [
@@ -988,19 +1445,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_mcp_config_matches_legacy_top_level_shape() {
+    fn codex_mcp_config_rejects_incomplete_legacy_shape() {
         let value = json!({
             "command": "tirith",
             "args": ["gateway", "run"]
         });
         let expected_args = ["gateway", "run"];
-        assert!(codex_mcp_config_matches(&value, "tirith", &expected_args));
+        assert!(!codex_mcp_config_matches(&value, "tirith", &expected_args));
     }
 
     #[test]
     fn codex_mcp_config_rejects_drift() {
         let value = json!({
             "name": "tirith-gateway",
+            "enabled": true,
             "transport": {
                 "type": "stdio",
                 "command": "tirith",
@@ -1009,6 +1467,61 @@ mod tests {
         });
         let expected_args = ["gateway", "run", "--config", "/new/path.yaml"];
         assert!(!codex_mcp_config_matches(&value, "tirith", &expected_args));
+    }
+
+    #[test]
+    fn codex_mcp_config_rejects_disabled_or_poisoned_registration() {
+        let expected_args = ["gateway", "run"];
+        let baseline = json!({
+            "name": "tirith-gateway",
+            "enabled": true,
+            "disabled_reason": null,
+            "startup_timeout_sec": null,
+            "tool_timeout_sec": null,
+            "auth_status": "unsupported",
+            "transport": {
+                "type": "stdio",
+                "command": "tirith",
+                "args": expected_args,
+                "env": null,
+                "env_vars": [],
+                "cwd": null
+            }
+        });
+        assert!(codex_mcp_config_matches(
+            &baseline,
+            "tirith",
+            &expected_args
+        ));
+
+        for (field, value) in [
+            ("enabled", json!(false)),
+            ("startup_timeout_sec", json!(0)),
+            ("tool_timeout_sec", json!(0)),
+            ("unexpected", json!(true)),
+        ] {
+            let mut poisoned = baseline.clone();
+            poisoned[field] = value;
+            assert!(
+                !codex_mcp_config_matches(&poisoned, "tirith", &expected_args),
+                "accepted poisoned outer field {field}"
+            );
+        }
+
+        for (field, value) in [
+            ("type", json!("streamable_http")),
+            ("env", json!({"TIRITH_GATEWAY_DEPTH": "1"})),
+            ("env_vars", json!(["TIRITH_GATEWAY_DEPTH"])),
+            ("cwd", json!("/tmp/attacker")),
+            ("unexpected", json!(true)),
+        ] {
+            let mut poisoned = baseline.clone();
+            poisoned["transport"][field] = value;
+            assert!(
+                !codex_mcp_config_matches(&poisoned, "tirith", &expected_args),
+                "accepted poisoned transport field {field}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1026,6 +1539,84 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn codex_stdio_config(command: &str, args: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "name": "tirith-gateway",
+            "enabled": true,
+            "disabled_reason": null,
+            "startup_timeout_sec": null,
+            "tool_timeout_sec": null,
+            "auth_status": "unsupported",
+            "transport": {
+                "type": "stdio",
+                "command": command,
+                "args": args,
+                "env": null,
+                "env_vars": [],
+                "cwd": null
+            }
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn expected_codex_gateway_path() -> PathBuf {
+        super::super::run_impl::codex_gateway_config_location()
+            .unwrap()
+            .1
+    }
+
+    #[cfg(unix)]
+    fn codex_gateway_path_for_bytes(parent: &Path, bytes: &[u8]) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        parent.join(format!("gateway-sha256-{digest}.yaml"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_rejects_non_utf8_gateway_path_before_cli_mutation() {
+        use std::os::unix::ffi::OsStringExt;
+
+        with_fake_env(false, |home, _cwd| {
+            let config_name = std::ffi::OsString::from_vec(b"config-\xff".to_vec());
+            let config_root = home.join(config_name);
+            let gateway_path = config_root.join("tirith").join("gateway-test.yaml");
+            let mut opts = opts_for(Scope::User);
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let mut called = false;
+            let error = setup_codex_with_runner_and_publisher(
+                &opts,
+                |_cwd, _command, _args| {
+                    called = true;
+                    panic!("Codex CLI must not run for an unrepresentable gateway path")
+                },
+                |dry_run| {
+                    super::super::run_impl::publish_codex_gateway_config_at(
+                        &config_root,
+                        &gateway_path,
+                        dry_run,
+                    )
+                },
+            )
+            .unwrap_err();
+
+            assert!(error.contains("not valid UTF-8"), "{error}");
+            assert!(error.contains("cannot be persisted"), "{error}");
+            assert!(!called, "Codex mutation/query ran before path rejection");
+            assert!(
+                !config_root.exists(),
+                "gateway publication touched the filesystem before path rejection"
+            );
+        });
+    }
+
+    #[cfg(unix)]
     #[test]
     fn setup_codex_registers_when_current_cli_reports_missing_server() {
         with_fake_env(false, |home, _cwd| {
@@ -1039,19 +1630,53 @@ mod tests {
             let mut opts = opts_for(Scope::User);
             opts.tirith_bin = "/bin/tirith".to_string();
 
+            let expected_gateway = expected_codex_gateway_path();
+            let verified_config = serde_json::to_vec(&json!({
+                "name": "tirith-gateway",
+                "enabled": true,
+                "disabled_reason": null,
+                "startup_timeout_sec": null,
+                "tool_timeout_sec": null,
+                "auth_status": "unsupported",
+                "transport": {
+                    "type": "stdio",
+                    "command": "/bin/tirith",
+                    "args": [
+                        "gateway", "run", "--upstream-bin", "/bin/tirith",
+                        "--upstream-arg", "mcp-server", "--config",
+                        expected_gateway.display().to_string()
+                    ],
+                    "env": null,
+                    "env_vars": [],
+                    "cwd": null
+                }
+            }))
+            .unwrap();
+
             let mut calls = Vec::<Vec<String>>::new();
-            setup_codex_with_runner(&opts, |command, args| {
+            let mut json_gets = 0usize;
+            setup_codex_with_runner(&opts, |_cwd, command, args| {
                 assert_eq!(command, "codex");
                 calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
-                if args == ["mcp", "get", "tirith-gateway"] {
-                    return Ok(process_output(
-                        1,
-                        Vec::new(),
-                        b"Error: No MCP server named 'tirith-gateway' found.\n".to_vec(),
-                    ));
-                }
                 if args.starts_with(&["mcp", "add", "tirith-gateway"]) {
+                    assert_eq!(
+                        std::fs::read_to_string(&expected_gateway).unwrap(),
+                        crate::assets::GATEWAY_YAML,
+                        "registration must not become live before the immutable gateway bytes publish"
+                    );
                     return Ok(process_output(0, Vec::new(), Vec::new()));
+                }
+                if args == ["mcp", "get", "--json", "tirith-gateway"] {
+                    json_gets += 1;
+                    return if json_gets <= 2 {
+                        Ok(process_output(
+                            1,
+                            Vec::new(),
+                            b"Error: No MCP server named 'tirith-gateway' found.\n".to_vec(),
+                        ))
+                    } else {
+                        Ok(process_output(0, verified_config.clone(), Vec::new()))
+                    };
                 }
                 panic!("unexpected codex args: {args:?}");
             })
@@ -1060,12 +1685,15 @@ mod tests {
             assert!(
                 calls
                     .iter()
-                    .any(|args| args == &["mcp", "get", "tirith-gateway"]),
-                "should probe for existing registration; calls: {calls:?}"
+                    .filter(|args| {
+                        args.as_slice() == ["mcp", "get", "--json", "tirith-gateway"]
+                    })
+                    .count()
+                    == 4,
+                "should snapshot both scopes and verify both scopes; calls: {calls:?}"
             );
             // Full mcp add invocation (catches argument drift, not just
             // "add was called"). Gateway path is XDG-deterministic above.
-            let expected_gateway = xdg.join("tirith/gateway.yaml");
             let expected_add = vec![
                 "mcp".to_string(),
                 "add".to_string(),
@@ -1091,6 +1719,673 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn setup_codex_publishes_new_generation_before_registration_and_retires_old_after_success() {
+        with_fake_env(false, |home, _project_cwd| {
+            let xdg = home.join(".config");
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let gateway_parent = xdg.join("tirith");
+            std::fs::create_dir_all(&gateway_parent).unwrap();
+            let old_bytes = b"version: 1\nrules: []\n";
+            let old_gateway = codex_gateway_path_for_bytes(&gateway_parent, old_bytes);
+            std::fs::write(&old_gateway, old_bytes).unwrap();
+            let current_gateway = expected_codex_gateway_path();
+            assert_ne!(old_gateway, current_gateway);
+
+            let old_gateway_arg = old_gateway.display().to_string();
+            let previous = codex_stdio_config(
+                "/opt/old-tirith",
+                &[
+                    "gateway",
+                    "run",
+                    "--upstream-bin",
+                    "/opt/old-tirith",
+                    "--upstream-arg",
+                    "mcp-server",
+                    "--config",
+                    old_gateway_arg.as_str(),
+                ],
+            );
+            let current_gateway_arg = current_gateway.display().to_string();
+            let intended = codex_stdio_config(
+                "/bin/tirith",
+                &[
+                    "gateway",
+                    "run",
+                    "--upstream-bin",
+                    "/bin/tirith",
+                    "--upstream-arg",
+                    "mcp-server",
+                    "--config",
+                    current_gateway_arg.as_str(),
+                ],
+            );
+            let mut json_gets = 0usize;
+            setup_codex_with_runner(&opts, |_cwd, command, args| {
+                assert_eq!(command, "codex");
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] => {
+                        json_gets += 1;
+                        let value = if json_gets <= 2 {
+                            previous.clone()
+                        } else {
+                            intended.clone()
+                        };
+                        Ok(process_output(0, value, Vec::new()))
+                    }
+                    ["mcp", "remove", "tirith-gateway"] => {
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    ["mcp", "add", "tirith-gateway", ..] => {
+                        assert!(
+                            old_gateway.exists(),
+                            "old generation retired before success"
+                        );
+                        assert_eq!(
+                            std::fs::read_to_string(&current_gateway).unwrap(),
+                            crate::assets::GATEWAY_YAML,
+                            "new generation must be complete before registration"
+                        );
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    _ => panic!("unexpected codex args: {args:?}"),
+                }
+            })
+            .unwrap();
+
+            assert_eq!(json_gets, 4);
+            assert!(!old_gateway.exists(), "old generation was not retired");
+            assert_eq!(
+                std::fs::read_to_string(current_gateway).unwrap(),
+                crate::assets::GATEWAY_YAML
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_publication_failure_precedes_every_registration_call() {
+        with_fake_env(false, |home, _cwd| {
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &home.join(".config"));
+            let gateway = expected_codex_gateway_path();
+            std::fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+            std::fs::write(&gateway, "tampered bytes at digest-derived path").unwrap();
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let error = setup_codex_with_runner(&opts, |_cwd, _command, args| {
+                panic!("registration CLI called after failed gateway publication: {args:?}")
+            })
+            .unwrap_err();
+
+            assert!(
+                error.contains("content-addressed gateway generation"),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(gateway).unwrap(),
+                "tampered bytes at digest-derived path"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_refuses_project_masking_before_user_layer_mutation() {
+        with_fake_env(true, |home, project_cwd| {
+            let project_cwd = project_cwd.expect("test requested an isolated project cwd");
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &home.join(".config"));
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let project = codex_stdio_config("/project/poisoned-tirith", &["mcp-server"]);
+            let user = codex_stdio_config("/opt/user-tirith", &["mcp-server"]);
+            let isolated = codex_isolated_cwd().unwrap();
+            let mut calls = Vec::<(PathBuf, Vec<String>)>::new();
+            let error = setup_codex_with_runner(&opts, |cwd, command, args| {
+                assert_eq!(command, "codex");
+                calls.push((
+                    cwd.to_path_buf(),
+                    args.iter().map(|arg| (*arg).to_string()).collect(),
+                ));
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] if cwd == project_cwd => {
+                        Ok(process_output(0, project.clone(), Vec::new()))
+                    }
+                    ["mcp", "get", "--json", "tirith-gateway"] if cwd == isolated.as_path() => {
+                        Ok(process_output(0, user.clone(), Vec::new()))
+                    }
+                    _ => panic!(
+                        "mutation attempted while project config masked user layer: {args:?}"
+                    ),
+                }
+            })
+            .unwrap_err();
+
+            assert!(
+                error.contains("higher-precedence project registration"),
+                "{error}"
+            );
+            assert_eq!(
+                calls.len(),
+                2,
+                "only the two read-only snapshots are allowed"
+            );
+            assert!(calls
+                .iter()
+                .all(|(_, args)| args == &["mcp", "get", "--json", "tirith-gateway"]));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_rolls_back_user_layer_when_identical_project_mask_survives_update() {
+        with_fake_env(true, |home, project_cwd| {
+            let project_cwd = project_cwd.expect("test requested an isolated project cwd");
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &home.join(".config"));
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let previous = codex_stdio_config("/opt/old-tirith", &["mcp-server"]);
+            let gateway = expected_codex_gateway_path().display().to_string();
+            let intended = codex_stdio_config(
+                "/bin/tirith",
+                &[
+                    "gateway",
+                    "run",
+                    "--upstream-bin",
+                    "/bin/tirith",
+                    "--upstream-arg",
+                    "mcp-server",
+                    "--config",
+                    gateway.as_str(),
+                ],
+            );
+            let isolated = codex_isolated_cwd().unwrap();
+            let mut writable_gets = 0usize;
+            let mut effective_gets = 0usize;
+            let mut removes = 0usize;
+            let error = setup_codex_with_runner(&opts, |cwd, command, args| {
+                assert_eq!(command, "codex");
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] if cwd == project_cwd => {
+                        effective_gets += 1;
+                        Ok(process_output(0, previous.clone(), Vec::new()))
+                    }
+                    ["mcp", "get", "--json", "tirith-gateway"] if cwd == isolated.as_path() => {
+                        writable_gets += 1;
+                        let value = match writable_gets {
+                            1 | 4 => previous.clone(),
+                            2 | 3 => intended.clone(),
+                            _ => panic!("unexpected writable JSON read {writable_gets}"),
+                        };
+                        Ok(process_output(0, value, Vec::new()))
+                    }
+                    ["mcp", "remove", "tirith-gateway"] if cwd == isolated.as_path() => {
+                        removes += 1;
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    args if args.starts_with(&["mcp", "add", "tirith-gateway"])
+                        && cwd == isolated.as_path() =>
+                    {
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    _ => panic!("unexpected codex call in masked rollback: {cwd:?} {args:?}"),
+                }
+            })
+            .unwrap_err();
+
+            assert!(error.contains("caller-visible effective state"), "{error}");
+            assert!(
+                error.contains("previous registration was restored"),
+                "{error}"
+            );
+            assert!(
+                error.contains("effective registration was restored"),
+                "{error}"
+            );
+            assert_eq!(writable_gets, 4);
+            assert_eq!(effective_gets, 3);
+            assert_eq!(removes, 2);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_aborts_on_unrelated_not_found_without_mutation() {
+        with_fake_env(false, |home, _cwd| {
+            let xdg = home.join(".config");
+            let gateway = xdg.join("tirith/gateway.yaml");
+            std::fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+            std::fs::write(&gateway, "old gateway bytes").unwrap();
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let mut calls = Vec::<Vec<String>>::new();
+            let error = setup_codex_with_runner(&opts, |_cwd, command, args| {
+                assert_eq!(command, "codex");
+                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] => Ok(process_output(
+                        1,
+                        Vec::new(),
+                        b"codex config file not found".to_vec(),
+                    )),
+                    _ => panic!("mutation attempted after unrelated query error: {args:?}"),
+                }
+            })
+            .unwrap_err();
+
+            assert!(error.contains("caller-visible"), "{error}");
+            assert!(
+                error.contains("no registration changes were made"),
+                "{error}"
+            );
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(gateway).unwrap(),
+                "old gateway bytes"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_does_not_remove_unsnapshotted_registration_without_exact_proof() {
+        with_fake_env(false, |home, _cwd| {
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &home.join(".config"));
+            let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
+            let mut opts = opts_for(Scope::User);
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let poisoned = serde_json::to_vec(&json!({
+                "name": "tirith-gateway",
+                "enabled": false,
+                "transport": {
+                    "type": "stdio",
+                    "command": "/bin/tirith",
+                    "args": []
+                }
+            }))
+            .unwrap();
+            let effective_cwd = std::env::current_dir().unwrap();
+            let writable_cwd = codex_isolated_cwd().unwrap();
+            assert_ne!(effective_cwd, writable_cwd);
+            let mut effective_gets = 0usize;
+            let mut writable_gets = 0usize;
+            let mut calls = Vec::<Vec<String>>::new();
+            let result = setup_codex_with_runner(&opts, |cwd, command, args| {
+                assert_eq!(command, "codex");
+                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
+                match args {
+                    ["mcp", "add", "tirith-gateway", ..] => {
+                        assert_eq!(cwd, writable_cwd);
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    ["mcp", "get", "--json", "tirith-gateway"] => {
+                        if cwd == effective_cwd {
+                            effective_gets += 1;
+                            Ok(process_output(
+                                1,
+                                Vec::new(),
+                                b"Error: No MCP server named 'tirith-gateway' found.".to_vec(),
+                            ))
+                        } else {
+                            assert_eq!(cwd, writable_cwd);
+                            writable_gets += 1;
+                            if writable_gets == 1 {
+                                Ok(process_output(
+                                    1,
+                                    Vec::new(),
+                                    b"Error: No MCP server named 'tirith-gateway' found.".to_vec(),
+                                ))
+                            } else {
+                                Ok(process_output(0, poisoned.clone(), Vec::new()))
+                            }
+                        }
+                    }
+                    _ => panic!("unexpected codex args: {args:?}"),
+                }
+            });
+
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("did not report the complete expected"),
+                "{error}"
+            );
+            assert!(error.contains("refusing unsnapshotted removal"), "{error}");
+            assert_eq!(effective_gets, 2);
+            assert_eq!(writable_gets, 3);
+            assert!(!calls
+                .iter()
+                .any(|args| args == &["mcp", "remove", "tirith-gateway"]));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_force_restores_existing_registration_after_add_runner_error() {
+        with_fake_env(false, |home, _cwd| {
+            let xdg = home.join(".config");
+            let gateway = xdg.join("tirith/gateway.yaml");
+            std::fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+            std::fs::write(&gateway, "old gateway bytes").unwrap();
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+            let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let previous = codex_stdio_config("/opt/old-tirith", &["mcp-server"]);
+            let mut json_gets = 0usize;
+            let mut calls = Vec::<Vec<String>>::new();
+            let result = setup_codex_with_runner(&opts, |_cwd, command, args| {
+                assert_eq!(command, "codex");
+                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] => {
+                        json_gets += 1;
+                        match json_gets {
+                            1 | 2 | 4 | 5 => Ok(process_output(0, previous.clone(), Vec::new())),
+                            3 => Ok(process_output(
+                                1,
+                                Vec::new(),
+                                b"No MCP server named 'tirith-gateway' found.".to_vec(),
+                            )),
+                            _ => panic!("unexpected JSON read {json_gets}"),
+                        }
+                    }
+                    ["mcp", "remove", "tirith-gateway"] => {
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    ["mcp", "add", "tirith-gateway", "--", "/bin/tirith", ..] => {
+                        Err("simulated add spawn failure".into())
+                    }
+                    args if args
+                        == [
+                            "mcp",
+                            "add",
+                            "tirith-gateway",
+                            "--",
+                            "/opt/old-tirith",
+                            "mcp-server",
+                        ] =>
+                    {
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    _ => panic!("unexpected codex args: {args:?}"),
+                }
+            });
+
+            let error = result.unwrap_err();
+            assert!(error.contains("simulated add spawn failure"), "{error}");
+            assert!(
+                error.contains("previous registration was restored"),
+                "{error}"
+            );
+            assert!(calls.iter().any(|args| {
+                args == &[
+                    "mcp",
+                    "add",
+                    "tirith-gateway",
+                    "--",
+                    "/opt/old-tirith",
+                    "mcp-server",
+                ]
+            }));
+            assert_eq!(
+                std::fs::read_to_string(gateway).unwrap(),
+                "old gateway bytes",
+                "gateway bytes must not publish before registration succeeds"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_force_restores_existing_registration_after_verification_mismatch() {
+        with_fake_env(false, |home, _cwd| {
+            let xdg = home.join(".config");
+            let gateway = xdg.join("tirith/gateway.yaml");
+            std::fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+            std::fs::write(&gateway, "old gateway bytes").unwrap();
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+            let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let previous = codex_stdio_config("/opt/old-tirith", &["mcp-server"]);
+            let poisoned = codex_stdio_config("/bin/tirith", &["gateway", "run"]);
+            let mut json_gets = 0usize;
+            let mut calls = Vec::<Vec<String>>::new();
+            let result = setup_codex_with_runner(&opts, |_cwd, command, args| {
+                assert_eq!(command, "codex");
+                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] => {
+                        json_gets += 1;
+                        let config = match json_gets {
+                            1 | 2 | 5 | 6 => previous.clone(),
+                            3 | 4 => poisoned.clone(),
+                            _ => panic!("unexpected JSON read {json_gets}"),
+                        };
+                        Ok(process_output(0, config, Vec::new()))
+                    }
+                    ["mcp", "remove", "tirith-gateway"] => {
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    ["mcp", "add", "tirith-gateway", ..] => {
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    _ => panic!("unexpected codex args: {args:?}"),
+                }
+            });
+
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("did not report the complete expected"),
+                "{error}"
+            );
+            assert!(
+                error.contains("previous registration was restored"),
+                "{error}"
+            );
+            assert_eq!(
+                json_gets, 6,
+                "both snapshots, failed writable verification, rollback inspection, writable restore verification, effective restore verification"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|args| args.as_slice() == ["mcp", "remove", "tirith-gateway"])
+                    .count(),
+                2,
+                "replacement removal plus rollback cleanup"
+            );
+            assert_eq!(
+                std::fs::read_to_string(gateway).unwrap(),
+                "old gateway bytes",
+                "gateway bytes must remain unchanged on verification rollback"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_restores_registration_and_gateway_after_zshenv_failure() {
+        with_fake_env(false, |home, _cwd| {
+            let xdg = home.join(".config");
+            let gateway = xdg.join("tirith/gateway.yaml");
+            std::fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+            std::fs::write(&gateway, "old gateway bytes").unwrap();
+            std::fs::write(
+                home.join(".zshenv"),
+                "# BEGIN tirith-guard v1\ncorrupted without end\n",
+            )
+            .unwrap();
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.install_zshenv = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let previous = codex_stdio_config("/opt/old-tirith", &["mcp-server"]);
+            let gateway_string = expected_codex_gateway_path().display().to_string();
+            let intended = codex_stdio_config(
+                "/bin/tirith",
+                &[
+                    "gateway",
+                    "run",
+                    "--upstream-bin",
+                    "/bin/tirith",
+                    "--upstream-arg",
+                    "mcp-server",
+                    "--config",
+                    gateway_string.as_str(),
+                ],
+            );
+            let mut json_gets = 0usize;
+            let mut removes = 0usize;
+            let result = setup_codex_with_runner(&opts, |_cwd, command, args| {
+                assert_eq!(command, "codex");
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] => {
+                        json_gets += 1;
+                        let config = match json_gets {
+                            1 | 2 | 6 | 7 => previous.clone(),
+                            3..=5 => intended.clone(),
+                            _ => panic!("unexpected JSON read {json_gets}"),
+                        };
+                        Ok(process_output(0, config, Vec::new()))
+                    }
+                    ["mcp", "remove", "tirith-gateway"] => {
+                        removes += 1;
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    ["mcp", "add", "tirith-gateway", ..] => {
+                        Ok(process_output(0, Vec::new(), Vec::new()))
+                    }
+                    _ => panic!("unexpected codex args: {args:?}"),
+                }
+            });
+
+            let error = result.unwrap_err();
+            assert!(error.contains("zshenv guard setup failed"), "{error}");
+            assert!(
+                error.contains("previous registration was restored"),
+                "{error}"
+            );
+            assert_eq!(json_gets, 7);
+            assert_eq!(removes, 2);
+            assert_eq!(
+                std::fs::read_to_string(gateway).unwrap(),
+                "old gateway bytes"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join(".zshenv")).unwrap(),
+                "# BEGIN tirith-guard v1\ncorrupted without end\n"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_force_refuses_unrestorable_registration_before_remove() {
+        with_fake_env(false, |home, _cwd| {
+            let xdg = home.join(".config");
+            let gateway = xdg.join("tirith/gateway.yaml");
+            std::fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+            std::fs::write(&gateway, "old gateway bytes").unwrap();
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+            let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let mut previous: Value =
+                serde_json::from_slice(&codex_stdio_config("/opt/old-tirith", &["mcp-server"]))
+                    .unwrap();
+            previous["transport"]["env"] = json!({"SECRET": "value"});
+            let previous = serde_json::to_vec(&previous).unwrap();
+            let mut calls = Vec::<Vec<String>>::new();
+            let result = setup_codex_with_runner(&opts, |_cwd, command, args| {
+                assert_eq!(command, "codex");
+                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] => {
+                        Ok(process_output(0, previous.clone(), Vec::new()))
+                    }
+                    _ => panic!("mutation attempted for unrestorable config: {args:?}"),
+                }
+            });
+
+            let error = result.unwrap_err();
+            assert!(error.contains("cannot be restored"), "{error}");
+            assert!(!calls
+                .iter()
+                .any(|args| { matches!(args.get(1).map(String::as_str), Some("remove" | "add")) }));
+            assert_eq!(
+                std::fs::read_to_string(gateway).unwrap(),
+                "old gateway bytes",
+                "gateway bytes must remain unchanged when snapshot is unrestorable"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_codex_force_restores_snapshot_after_remove_failure() {
+        with_fake_env(false, |home, _cwd| {
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &home.join(".config"));
+            let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
+            let mut opts = opts_for(Scope::User);
+            opts.force = true;
+            opts.tirith_bin = "/bin/tirith".to_string();
+
+            let previous = codex_stdio_config("/opt/old-tirith", &["mcp-server"]);
+            let mut removes = 0usize;
+            let result = setup_codex_with_runner(&opts, |_cwd, command, args| {
+                assert_eq!(command, "codex");
+                match args {
+                    ["mcp", "get", "--json", "tirith-gateway"] => {
+                        Ok(process_output(0, previous.clone(), Vec::new()))
+                    }
+                    ["mcp", "remove", "tirith-gateway"] => {
+                        removes += 1;
+                        Ok(process_output(
+                            1,
+                            Vec::new(),
+                            b"simulated remove failure".to_vec(),
+                        ))
+                    }
+                    _ => panic!("unexpected codex args: {args:?}"),
+                }
+            });
+
+            let error = result.unwrap_err();
+            assert!(error.contains("simulated remove failure"), "{error}");
+            assert!(
+                error.contains("previous registration was restored"),
+                "{error}"
+            );
+            assert_eq!(
+                removes, 1,
+                "rollback must recognize the unchanged snapshot without a second removal"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn setup_codex_accepts_current_transport_json_as_up_to_date() {
         with_fake_env(false, |home, _cwd| {
             let xdg = home.join(".config");
@@ -1101,9 +2396,14 @@ mod tests {
             let mut opts = opts_for(Scope::User);
             opts.tirith_bin = "/bin/tirith".to_string();
 
-            let expected_gateway = xdg.join("tirith/gateway.yaml");
+            let expected_gateway = expected_codex_gateway_path();
             let config = serde_json::to_vec(&json!({
                 "name": "tirith-gateway",
+                "enabled": true,
+                "disabled_reason": null,
+                "startup_timeout_sec": null,
+                "tool_timeout_sec": null,
+                "auth_status": "unsupported",
                 "transport": {
                     "type": "stdio",
                     "command": "/bin/tirith",
@@ -1111,18 +2411,18 @@ mod tests {
                         "gateway", "run", "--upstream-bin", "/bin/tirith",
                         "--upstream-arg", "mcp-server", "--config",
                         expected_gateway.display().to_string()
-                    ]
+                    ],
+                    "env": null,
+                    "env_vars": [],
+                    "cwd": null
                 }
             }))
             .unwrap();
             let mut calls = Vec::<Vec<String>>::new();
-            setup_codex_with_runner(&opts, |command, args| {
+            setup_codex_with_runner(&opts, |_cwd, command, args| {
                 assert_eq!(command, "codex");
                 calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
                 match args {
-                    ["mcp", "get", "tirith-gateway"] => {
-                        Ok(process_output(0, b"tirith-gateway\n".to_vec(), Vec::new()))
-                    }
                     ["mcp", "get", "--json", "tirith-gateway"] => {
                         Ok(process_output(0, config.clone(), Vec::new()))
                     }
@@ -1131,9 +2431,6 @@ mod tests {
             })
             .unwrap();
 
-            assert!(calls
-                .iter()
-                .any(|args| args == &["mcp", "get", "tirith-gateway"]));
             assert!(calls
                 .iter()
                 .any(|args| args == &["mcp", "get", "--json", "tirith-gateway"]));

@@ -28,9 +28,9 @@ pub use self::run_impl::run;
 mod run_impl {
     use super::fs_helpers;
     use etcetera::BaseStrategy;
-    #[cfg(unix)]
-    use std::path::Path;
-    use std::path::PathBuf;
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::path::{Path, PathBuf};
 
     /// All tools recognized by `tirith setup`.
     const KNOWN_TOOLS: &[&str] = &[
@@ -73,7 +73,9 @@ mod run_impl {
         pub install_zshenv: bool,
         pub dry_run: bool,
         pub force: bool,
-        /// `"tirith"` (portable) when on PATH, or absolute path as fallback.
+        /// A validated absolute invocation path for the current executable:
+        /// preferably its stable package-manager alias, otherwise its canonical
+        /// target. Setup never persists a bare command name.
         pub tirith_bin: String,
         /// When true, only refresh embedded hook scripts and gateway config.
         /// Skips MCP registration, shell profile installation, and zshenv setup.
@@ -225,34 +227,101 @@ mod run_impl {
         }
     }
 
-    /// Resolve the tirith binary path for generated configs/hooks: portable `"tirith"` if
-    /// on PATH, else absolute `current_exe()` + warning, else hard error (placeholder in dry-run).
-    fn resolve_tirith_bin(dry_run: bool) -> Result<String, String> {
-        if is_on_path("tirith") {
-            return Ok("tirith".into());
-        }
+    /// Resolve the tirith binary path for generated configs/hooks. Prefer a
+    /// stable absolute PATH alias (for example Homebrew's `bin/tirith`) only
+    /// when it currently resolves to the exact executable identity that entered
+    /// setup. This lets package-manager upgrades retarget the stable alias
+    /// without leaving generated configuration pinned to a removed version.
+    fn resolve_tirith_bin(_dry_run: bool) -> Result<String, String> {
+        let current = tirith_core::trusted_child::TrustedExecutable::current().map_err(|error| {
+            format!(
+                "running tirith executable could not be validated for generated security configuration: {error}"
+            )
+        })?;
+        let stable_alias = stable_current_alias_on_path(&current);
+        choose_generated_tirith_bin(Some(&current), stable_alias.as_ref())
+    }
 
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(name) = exe.file_name() {
-                if name == "tirith" {
-                    let abs = exe.display().to_string();
-                    eprintln!(
-                        "tirith: WARNING: tirith is not on PATH — using absolute path {abs} in generated configs. \
-                         Run `tirith setup <tool> --force` after adding tirith to PATH to switch to portable mode."
-                    );
-                    return Ok(abs);
+    fn choose_generated_tirith_bin(
+        current: Option<&tirith_core::trusted_child::TrustedExecutable>,
+        stable_alias: Option<&tirith_core::trusted_child::TrustedExecutable>,
+    ) -> Result<String, String> {
+        if let Some(current) = current {
+            current.revalidate().map_err(|error| {
+                format!("running tirith executable changed during setup validation: {error}")
+            })?;
+
+            if let Some(alias) = stable_alias {
+                let freshly_resolved_alias =
+                    tirith_core::trusted_child::TrustedExecutable::from_absolute(
+                        alias.invocation_path(),
+                        &[],
+                    )
+                    .ok();
+                let alias_is_current = alias.invocation_path().is_absolute()
+                    && alias.path() == current.path()
+                    && alias.revalidate().is_ok();
+                let freshly_resolves_to_current = freshly_resolved_alias
+                    .as_ref()
+                    .is_some_and(|fresh| fresh.path() == current.path());
+                let current_identity_is_still_valid = current.revalidate().is_ok();
+                if alias_is_current
+                    && freshly_resolves_to_current
+                    && current_identity_is_still_valid
+                {
+                    // A non-UTF-8 alias cannot be persisted exactly. It is safe
+                    // to ignore it and use the canonical target when that target
+                    // has a lossless text representation.
+                    if let Some(alias) = alias.invocation_path().to_str() {
+                        return Ok(alias.to_owned());
+                    }
                 }
             }
+            return path_to_utf8(current.path(), "running tirith executable");
         }
 
-        if dry_run {
-            eprintln!(
-                "tirith: WARNING: tirith not found — previewing with portable name 'tirith' (actual setup would fail)"
-            );
-            Ok("tirith".into())
-        } else {
-            Err("tirith binary not found — ensure tirith is installed and on PATH".into())
-        }
+        Err(
+            "running tirith executable could not be validated for generated security configuration"
+                .into(),
+        )
+    }
+
+    fn stable_current_alias_on_path(
+        current: &tirith_core::trusted_child::TrustedExecutable,
+    ) -> Option<tirith_core::trusted_child::TrustedExecutable> {
+        let path_value = std::env::var_os("PATH")?;
+        let candidate = tirith_core::trusted_child::TrustedExecutable::resolve_on_path(
+            "tirith",
+            &path_value,
+            &tirith_core::trusted_child::ambient_denied_roots(),
+        )
+        .ok()?;
+        let selected_parent = candidate.invocation_path().parent()?;
+        let current_dir = std::env::current_dir().ok()?;
+        let selected_path_entry = std::env::split_paths(&path_value).find(|directory| {
+            let absolute = if directory.is_absolute() {
+                directory.clone()
+            } else {
+                current_dir.join(directory)
+            };
+            absolute == selected_parent
+        })?;
+        (selected_path_entry.is_absolute()
+            && candidate.invocation_path().is_absolute()
+            && candidate.path() == current.path())
+        .then_some(candidate)
+    }
+
+    /// Convert a native path only at a text-based configuration boundary.
+    /// Lossy conversion can change the executable or file identity that setup
+    /// validated, so paths that cannot be represented exactly must fail closed.
+    pub(super) fn path_to_utf8(path: &Path, role: &str) -> Result<String, String> {
+        path.to_str().map(str::to_owned).ok_or_else(|| {
+            format!(
+                "{role} path is not valid UTF-8 and cannot be persisted without changing its identity: {}",
+                path.display()
+            )
+        })
     }
 
     /// Resolve a tirith path suitable for `~/.zshenv`. `.zshenv` runs before PATH setup
@@ -261,59 +330,40 @@ mod run_impl {
     #[cfg(unix)]
     pub(super) fn resolve_tirith_bin_for_zshenv(
         tirith_bin: &str,
-        dry_run: bool,
+        _dry_run: bool,
     ) -> Result<String, String> {
-        choose_zshenv_tirith_bin(
-            find_executable_on_path("tirith"),
-            current_tirith_exe(),
-            tirith_bin,
-            dry_run,
-        )
-    }
-
-    /// Pure-function core of [`resolve_tirith_bin_for_zshenv`], taking the candidate
-    /// sources as inputs so it is unit-testable without process-global state.
-    #[cfg(unix)]
-    fn choose_zshenv_tirith_bin(
-        path_candidate: Option<PathBuf>,
-        current_exe: Option<PathBuf>,
-        tirith_bin: &str,
-        dry_run: bool,
-    ) -> Result<String, String> {
-        if let Some(path) = path_candidate {
-            // If the PATH entry is a `#!` wrapper (e.g. the npm JS launcher), prefer the
-            // running native binary the wrapper exec'd into (npm shadow-detection bug class).
-            if is_script_wrapper(&path) {
-                if let Some(exe) = current_exe {
-                    return Ok(exe.display().to_string());
-                }
-            }
-            return Ok(path.display().to_string());
-        }
-        if let Some(exe) = current_exe {
-            return Ok(exe.display().to_string());
-        }
-        if Path::new(tirith_bin).is_absolute() {
-            return Ok(tirith_bin.to_string());
-        }
-        if dry_run {
-            eprintln!(
-                "tirith: WARNING: tirith not found — previewing zshenv guard with portable name 'tirith' (actual setup would fail)"
-            );
-            Ok("tirith".into())
-        } else {
-            Err("tirith binary not found — ensure tirith is installed and on PATH before installing zshenv guard".into())
-        }
-    }
-
-    #[cfg(unix)]
-    fn current_tirith_exe() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        if exe.file_name()? == "tirith" {
-            Some(exe)
+        let current = tirith_core::trusted_child::TrustedExecutable::current().map_err(|error| {
+            format!("running tirith executable could not be validated for zshenv enforcement: {error}")
+        })?;
+        let stable_alias = if Path::new(tirith_bin).is_absolute() {
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(
+                Path::new(tirith_bin),
+                &tirith_core::trusted_child::ambient_denied_roots(),
+            )
+            .ok()
         } else {
             None
+        };
+        choose_generated_tirith_bin(Some(&current), stable_alias.as_ref())
+    }
+
+    /// Test seam for the fail-closed zshenv fallback behavior when no validated
+    /// executable identity is available.
+    #[cfg(all(test, unix))]
+    fn choose_zshenv_tirith_bin(
+        _path_candidate: Option<PathBuf>,
+        current_exe: Option<PathBuf>,
+        _tirith_bin: &str,
+        _dry_run: bool,
+    ) -> Result<String, String> {
+        // The running executable is the only candidate whose identity was
+        // established by the invocation that entered setup. Never let a
+        // repository-prepended PATH replace it with an unrelated native binary
+        // that would then be baked into every non-interactive zsh invocation.
+        if let Some(exe) = current_exe {
+            return path_to_utf8(&exe, "running tirith executable for zshenv");
         }
+        Err("running tirith executable could not be validated for zshenv enforcement".into())
     }
 
     #[cfg(unix)]
@@ -340,19 +390,6 @@ mod run_impl {
         metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
     }
 
-    #[cfg(unix)]
-    fn is_script_wrapper(path: &Path) -> bool {
-        // `read` not `read_exact`: a 1-byte file is not a wrapper but read_exact errors on it.
-        use std::io::Read;
-        let Ok(mut file) = std::fs::File::open(path) else {
-            return false;
-        };
-        let mut bytes = [0u8; 2];
-        file.read(&mut bytes)
-            .map(|n| n == 2 && &bytes == b"#!")
-            .unwrap_or(false)
-    }
-
     /// Check that a binary is available on PATH.
     /// In dry-run mode, warn but don't fail.
     fn check_binary_on_path(name: &str, dry_run: bool) -> Result<(), String> {
@@ -374,30 +411,135 @@ mod run_impl {
     fn is_on_path(name: &str) -> bool {
         #[cfg(unix)]
         {
-            std::process::Command::new("sh")
-                .args(["-c", &format!("command -v '{name}' >/dev/null 2>&1")])
-                .status()
-                .is_ok_and(|s| s.success())
+            if name == "zsh" {
+                return super::zshenv::trusted_zsh_executable().is_ok();
+            }
+            // Inspect PATH entries directly. Invoking a PATH-resolved shell to
+            // ask it about another executable would run attacker-controlled
+            // code before setup establishes the requested guard.
+            find_executable_on_path(name).is_some()
         }
         #[cfg(not(unix))]
         {
-            std::process::Command::new("where.exe")
-                .arg(name)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
+            // Resolve the requested executable itself through the trusted-path
+            // policy. Invoking ambient `where.exe` would execute a second,
+            // repository-searchable program before setup installs any guard.
+            tirith_core::trusted_child::resolve_ambient(name).is_ok()
         }
+    }
+
+    fn gateway_config_location() -> Result<(PathBuf, PathBuf), String> {
+        let base = etcetera::choose_base_strategy()
+            .map_err(|e| format!("could not determine config directory: {e}"))?;
+        let config_root = base.config_dir();
+        let gateway_path = config_root.join("tirith").join("gateway.yaml");
+        Ok((config_root, gateway_path))
+    }
+
+    /// Return the immutable, content-addressed gateway path used by Codex.
+    /// A registration never points at the legacy mutable `gateway.yaml`, so a
+    /// future setup can publish and validate a new generation before making it
+    /// live.
+    pub(crate) fn codex_gateway_config_location() -> Result<(PathBuf, PathBuf), String> {
+        let (config_root, legacy_path) = gateway_config_location()?;
+        let digest = Sha256::digest(crate::assets::GATEWAY_YAML.as_bytes());
+        let mut digest_hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(&mut digest_hex, "{byte:02x}");
+        }
+        let gateway_path = legacy_path
+            .parent()
+            .ok_or_else(|| "gateway config path has no parent".to_string())?
+            .join(format!("gateway-sha256-{digest_hex}.yaml"));
+        Ok((config_root, gateway_path))
+    }
+
+    /// Publish and then re-read Codex's content-addressed gateway generation.
+    /// Existing content at the same digest-derived name is never overwritten:
+    /// different bytes indicate tampering or a hash collision and fail closed.
+    pub(crate) fn publish_codex_gateway_config(dry_run: bool) -> Result<PathBuf, String> {
+        let (config_root, gateway_path) = codex_gateway_config_location()?;
+        publish_codex_gateway_config_at(&config_root, &gateway_path, dry_run)
+    }
+
+    pub(super) fn publish_codex_gateway_config_at(
+        config_root: &Path,
+        gateway_path: &Path,
+        dry_run: bool,
+    ) -> Result<PathBuf, String> {
+        // Codex persists this path as text in its registration. Reject an
+        // unrepresentable identity before transactional_update can create any
+        // parent or generation file.
+        path_to_utf8(gateway_path, "Codex gateway")?;
+        let content = crate::assets::GATEWAY_YAML;
+        let outcome = fs_helpers::transactional_update(
+            gateway_path,
+            config_root,
+            dry_run,
+            |snapshot| {
+                match snapshot.text(gateway_path)? {
+                    Some(existing) if existing == content => {
+                        Ok(fs_helpers::FileUpdate::unchanged())
+                    }
+                    Some(_) => Err(format!(
+                        "content-addressed gateway generation {} exists with different bytes; refusing to overwrite it",
+                        gateway_path.display()
+                    )),
+                    None => {
+                        if dry_run {
+                            eprintln!(
+                                "[dry-run] would publish immutable gateway config {} ({} bytes)",
+                                gateway_path.display(),
+                                content.len()
+                            );
+                        }
+                        Ok(fs_helpers::FileUpdate::write_text(content.to_string(), 0o644))
+                    }
+                }
+            },
+        )?;
+        if !dry_run {
+            let published = fs_helpers::read_to_string_scoped(gateway_path, config_root)?;
+            if published.as_deref() != Some(content) {
+                return Err(format!(
+                    "published gateway generation {} could not be verified byte-for-byte",
+                    gateway_path.display()
+                ));
+            }
+        }
+        if let Some(annotation) = outcome.completion_annotation() {
+            eprintln!(
+                "tirith: published immutable gateway config {}{annotation}",
+                gateway_path.display()
+            );
+        }
+        Ok(gateway_path.to_path_buf())
+    }
+
+    /// Retire only a prior Tirith-managed content-addressed generation. Legacy
+    /// `gateway.yaml` remains shared by other integrations and is deliberately
+    /// not removed here.
+    pub(crate) fn retire_codex_gateway_config(
+        previous: &Path,
+        current: &Path,
+    ) -> Result<(), String> {
+        if previous == current {
+            return Ok(());
+        }
+        let (config_root, managed_current) = codex_gateway_config_location()?;
+        let managed_parent = managed_current
+            .parent()
+            .ok_or_else(|| "Codex gateway path has no parent".to_string())?;
+        if previous.parent() != Some(managed_parent) {
+            return Ok(());
+        }
+        fs_helpers::retire_codex_gateway_generation(previous, &config_root)
     }
 
     /// Copy the embedded gateway config to `~/.config/tirith/gateway.yaml`.
     /// Returns the absolute path to the written file.
     pub(crate) fn copy_gateway_config(force: bool, dry_run: bool) -> Result<PathBuf, String> {
-        let base = etcetera::choose_base_strategy()
-            .map_err(|e| format!("could not determine config directory: {e}"))?;
-        let config_root = base.config_dir();
-        let config_dir = config_root.join("tirith");
-        let gateway_path = config_dir.join("gateway.yaml");
+        let (config_root, gateway_path) = gateway_config_location()?;
 
         let content = crate::assets::GATEWAY_YAML;
 
@@ -532,13 +674,168 @@ mod run_impl {
 
         #[cfg(unix)]
         #[test]
-        fn zshenv_resolver_prefers_executable_path_over_portable_name() {
+        fn generated_tirith_bin_is_canonical_absolute_current_identity() {
+            let dir = tempfile::tempdir().unwrap();
+            let current_path = dir.path().join("installed").join("tirith");
+            write_executable(&current_path, "trusted current executable");
+            let current =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&current_path, &[])
+                    .unwrap();
+
+            let resolved = choose_generated_tirith_bin(Some(&current), None).unwrap();
+            assert_eq!(resolved, current.path().display().to_string());
+            assert!(Path::new(&resolved).is_absolute());
+            assert_ne!(resolved, "tirith");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn generated_tirith_bin_rejects_non_utf8_executable_identity() {
+            use std::os::unix::ffi::OsStringExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let name = std::ffi::OsString::from_vec(b"tirith-\xff".to_vec());
+            let current_path = dir.path().join(name);
+            write_executable(&current_path, "trusted current executable");
+            let current =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&current_path, &[])
+                    .unwrap();
+
+            let error = choose_generated_tirith_bin(Some(&current), None).unwrap_err();
+            assert!(error.contains("not valid UTF-8"), "{error}");
+            assert!(error.contains("cannot be persisted"), "{error}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn generated_config_path_rejects_non_utf8_identity_without_filesystem_fixture() {
+            use std::os::unix::ffi::OsStringExt;
+
+            // APFS rejects invalid UTF-8 names before a real-file fixture can
+            // reach the persistence boundary. A synthetic native path tests
+            // that boundary portably across Unix hosts.
+            let path = PathBuf::from(std::ffi::OsString::from_vec(
+                b"/tmp/tirith-generated-\xff".to_vec(),
+            ));
+            let error = path_to_utf8(&path, "running tirith executable").unwrap_err();
+            assert!(error.contains("not valid UTF-8"), "{error}");
+            assert!(error.contains("cannot be persisted"), "{error}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn generated_tirith_bin_prefers_validated_stable_alias() {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let current_path = dir.path().join("installed").join("tirith");
+            let path_spelling = dir.path().join("path-bin").join("tirith");
+            write_executable(&current_path, "trusted current executable");
+            std::fs::create_dir_all(path_spelling.parent().unwrap()).unwrap();
+            symlink(&current_path, &path_spelling).unwrap();
+            let current =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&current_path, &[])
+                    .unwrap();
+            let candidate =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&path_spelling, &[])
+                    .unwrap();
+
+            assert_eq!(candidate.path(), current.path());
+            let resolved = choose_generated_tirith_bin(Some(&current), Some(&candidate)).unwrap();
+            assert_eq!(resolved, path_spelling.display().to_string());
+            assert!(Path::new(&resolved).is_absolute());
+            assert_ne!(resolved, "tirith");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn generated_tirith_bin_stable_alias_survives_upgrade_retarget() {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let v1 = dir.path().join("versions/v1/tirith");
+            let v2 = dir.path().join("versions/v2/tirith");
+            let stable = dir.path().join("bin/tirith");
+            write_executable(&v1, "trusted current executable v1");
+            write_executable(&v2, "trusted current executable v2");
+            std::fs::create_dir_all(stable.parent().unwrap()).unwrap();
+            symlink(&v1, &stable).unwrap();
+
+            let current_v1 =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&v1, &[]).unwrap();
+            let alias_v1 =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&stable, &[]).unwrap();
+            let persisted_v1 =
+                choose_generated_tirith_bin(Some(&current_v1), Some(&alias_v1)).unwrap();
+            assert_eq!(persisted_v1, stable.display().to_string());
+
+            std::fs::remove_file(&stable).unwrap();
+            symlink(&v2, &stable).unwrap();
+            let current_v2 =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&v2, &[]).unwrap();
+            let alias_v2 =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&stable, &[]).unwrap();
+            let persisted_v2 =
+                choose_generated_tirith_bin(Some(&current_v2), Some(&alias_v2)).unwrap();
+
+            assert_eq!(persisted_v2, persisted_v1);
+            assert_ne!(persisted_v2, current_v2.path().display().to_string());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn generated_tirith_bin_ignores_non_utf8_alias_when_canonical_is_utf8() {
+            use std::os::unix::ffi::OsStringExt;
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let current_path = dir.path().join("installed/tirith");
+            write_executable(&current_path, "trusted current executable");
+            let alias_name = std::ffi::OsString::from_vec(b"tirith-\xff".to_vec());
+            let alias_path = dir.path().join("bin").join(alias_name);
+            std::fs::create_dir_all(alias_path.parent().unwrap()).unwrap();
+            symlink(&current_path, &alias_path).unwrap();
+            let current =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&current_path, &[])
+                    .unwrap();
+            let alias =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&alias_path, &[])
+                    .unwrap();
+
+            let resolved = choose_generated_tirith_bin(Some(&current), Some(&alias)).unwrap();
+            assert_eq!(resolved, current.path().display().to_string());
+        }
+
+        #[test]
+        fn generated_tirith_bin_never_falls_back_to_bare_name() {
+            assert!(choose_generated_tirith_bin(None, None).is_err());
+            assert!(
+                resolve_tirith_bin(true).is_ok(),
+                "the running test binary is valid"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn binary_check_never_executes_current_directory_where_exe() {
+            use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+            with_fake_env(true, |_home, cwd| {
+                let cwd = cwd.unwrap();
+                std::fs::copy(std::env::current_exe().unwrap(), cwd.join("where.exe")).unwrap();
+                let _path = EnvGuard::set("PATH", Path::new(""));
+
+                assert!(!is_on_path("tirith-definitely-missing-tool.exe"));
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_rejects_path_only_candidate_without_current_identity() {
             let dir = tempfile::tempdir().unwrap();
             let tirith = dir.path().join("tirith");
             write_executable(&tirith, "");
-            let resolved =
-                choose_zshenv_tirith_bin(Some(tirith.clone()), None, "tirith", false).unwrap();
-            assert_eq!(resolved, tirith.display().to_string());
+            assert!(choose_zshenv_tirith_bin(Some(tirith), None, "tirith", false).is_err());
         }
 
         #[cfg(unix)]
@@ -557,17 +854,43 @@ mod run_impl {
 
         #[cfg(unix)]
         #[test]
-        fn zshenv_resolver_keeps_absolute_fallback() {
-            let resolved =
-                choose_zshenv_tirith_bin(None, None, "/opt/custom/bin/tirith", false).unwrap();
-            assert_eq!(resolved, "/opt/custom/bin/tirith");
+        fn zshenv_resolver_rejects_non_utf8_executable_identity() {
+            use std::os::unix::ffi::OsStringExt;
+
+            let path = PathBuf::from(std::ffi::OsString::from_vec(
+                b"/tmp/tirith-zshenv-\xff".to_vec(),
+            ));
+            let error = choose_zshenv_tirith_bin(None, Some(path), "tirith", false).unwrap_err();
+            assert!(error.contains("not valid UTF-8"), "{error}");
+            assert!(error.contains("cannot be persisted"), "{error}");
         }
 
         #[cfg(unix)]
         #[test]
-        fn zshenv_resolver_allows_portable_name_in_dry_run() {
-            let resolved = choose_zshenv_tirith_bin(None, None, "tirith", true).unwrap();
-            assert_eq!(resolved, "tirith");
+        fn zshenv_resolver_ignores_poisoned_native_path_when_current_exe_is_known() {
+            let dir = tempfile::tempdir().unwrap();
+            let attacker = dir.path().join("repo-bin").join("tirith");
+            let current = dir.path().join("installed").join("tirith");
+            write_executable(&attacker, "native attacker placeholder");
+            write_executable(&current, "trusted current executable placeholder");
+
+            let resolved = choose_zshenv_tirith_bin(
+                Some(attacker.clone()),
+                Some(current.clone()),
+                "tirith",
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(resolved, current.display().to_string());
+            assert_ne!(resolved, attacker.display().to_string());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zshenv_resolver_rejects_unvalidated_absolute_fallback() {
+            assert!(choose_zshenv_tirith_bin(None, None, "/opt/custom/bin/tirith", false).is_err());
+            assert!(choose_zshenv_tirith_bin(None, None, "tirith", true).is_err());
         }
 
         #[cfg(unix)]

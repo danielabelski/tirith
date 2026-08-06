@@ -212,6 +212,15 @@ explicit non-goals.
   shell, calls `exec` directly, or runs without the hook loaded is not covered.
   MCP protection is advisory (the agent must call the tirith MCP tools), not
   enforced.
+- **Execution-evidence grades:** a Linux launch is confirmed only after its
+  stopped `exec` transition, durable state update, authorized resume, and
+  terminal launcher proof all complete. A gateway call is confirmed only by an
+  exact correlated result. Shell observations and forwarded gateway calls that
+  time out or are cancelled remain conservative unresolved evidence, never
+  confirmed execution. Strict shell receipts are available for interactive
+  bash, zsh, and fish; PowerShell remains preflight-only. Native Linux launcher
+  behavior must be verified by Linux CI or a native Linux host; neither portable
+  source/unit coverage nor a macOS build can substitute.
 
 ---
 
@@ -306,11 +315,15 @@ Tirith protects AI coding agents at every layer, from the configs they read to t
 
 ### Shell hooks, passive command interception
 
-When AI agents execute shell commands (Claude Code, Codex, Cursor, etc.), tirith's shell hooks intercept every command before it runs. No agent-side configuration needed, if the hook is active in the shell, all commands are guarded:
+When an AI agent executes through a hooked interactive shell (Claude Code,
+Codex, Cursor, etc.), tirith's shell hook checks that interactive command before
+the shell accepts it. This does not cover a non-interactive shell, a direct
+`exec`, or an agent process that never loaded the hook:
 
 - **Blocks dangerous commands**: homograph URLs, pipe-to-shell, insecure downloads
 - **Blocks malicious paste**: ANSI injection, bidi attacks, hidden multiline in pasted content
-- **Works with every agent**: any tool that spawns a shell inherits tirith protection
+- **Agent-independent interactive gate**: no agent-specific integration is
+  needed when that agent actually uses the protected interactive shell
 - **Zero agent modification**: the agent doesn't know tirith exists until a command is blocked
 
 Use `tirith setup <tool>` for one-command configuration (see [AI Agent Integrations](#ai-agent-integrations)).
@@ -331,7 +344,7 @@ Run `tirith mcp-server` or use `tirith setup <tool> --with-mcp` to register tiri
 
 ### MCP server governance
 
-`tirith mcp lock` captures every MCP server a repository declares, across `.mcp.json` / `mcp.json` / `mcp_settings.json` and the IDE config variants (`.vscode/`, `.cursor/`, `.windsurf/`, `.cline/`, `.amazonq/`, `.continue/`, `.kiro/`), into a deterministic lockfile at `.tirith/mcp.lock`. Each server is recorded with its transport (a remote URL, or a local command + args), declared tools, coverage metadata, and a content hash; servers are sorted by name/source so the lockfile is diff-friendly. Ambiguous or credential-bearing declarations are refused instead of copied into source control. Discovery is repo-local only and touches no network. (`tirith mcp` is a separate command group from `tirith mcp-server`, which runs tirith *as* an MCP server.)
+`tirith mcp lock` captures every MCP server a repository declares, across `.mcp.json` / `mcp.json` / `mcp_settings.json` and the IDE config variants (`.vscode/`, `.cursor/`, `.windsurf/`, `.cline/`, `.amazonq/`, `.continue/`, `.kiro/`), into a deterministic lockfile at `.tirith/mcp.lock`. Each server is recorded with its transport (a remote URL, or a local command + args), declared tools, coverage metadata, and a content hash; servers are sorted by name/source so the lockfile is diff-friendly. Ambiguous or credential-bearing declarations are refused instead of copied into source control. Environment values and URL userinfo are represented only by fixed presence markers, never by raw values or deterministic hashes: adding/removing a variable or userinfo still drifts, while secret rotation intentionally does not. V7 lockfiles require one explicit re-lock to migrate to this v8 privacy model. Discovery is repo-local only and touches no network. (`tirith mcp` is a separate command group from `tirith mcp-server`, which runs tirith *as* an MCP server.)
 
 `tirith mcp verify` is the gating companion: it rebuilds the current inventory against the committed lockfile and exits 1 on drift or incomplete/rejected config coverage (0 match, 2 on usage errors like a missing lockfile). `tirith mcp diff` reports the same drift informationally (always exit 0, 2 only on usage errors, so a consumer can tell "no drift" from "could not check"). Drift also surfaces through `tirith scan` as `mcp_server_drift` (Medium or High), so a pre-commit hook or CI catches an MCP-surface change the way it catches an un-pinned action. `verify` / `diff` never print env values or URL userinfos, only the names of what changed.
 
@@ -497,7 +510,10 @@ eval "$(tirith init --shell bash)"   # add to ~/.bashrc
 
 ### Windows
 
-All core features work on Windows including detection, scanning, webhooks, policy management, and audit uploads. Shell hooks support PowerShell. Daemon mode and `tirith setup` are Unix-only for now.
+Windows supports detection, scanning, webhooks, policy management, audit
+uploads, and `tirith setup`. The PowerShell hook provides PSReadLine preflight
+interception, but it does not claim a strict post-accept execution receipt.
+Live remote-script execution and daemon mode remain unavailable on Windows.
 
 **Scoop:**
 
@@ -558,9 +574,9 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 
 | Shell | Hook type | Tested on |
 |-------|-----------|-----------|
-| zsh | preexec + paste widget | 5.8+ |
+| zsh | accept-line + paste widgets | 5.8+ |
 | bash | preexec (two modes) | 5.0+ |
-| fish | fish_preexec event | 3.5+ |
+| fish | Enter-key + paste handlers | 3.5+ |
 | PowerShell | PSReadLine handler | 7.0+ |
 
 Bash uses enter mode when a capability self-test has proven it works for your bash, and preexec otherwise. `tirith setup` / `tirith doctor` run the self-test; the shell hook reads its cached verdict at startup. See [troubleshooting](docs/troubleshooting.md#bash-enter-mode-vs-preexec-mode) for details on the modes, the self-test, and SSH fallback behavior.
@@ -575,12 +591,38 @@ Bash uses enter mode when a capability self-test has proven it works for your ba
 | bash **enter mode** | **Reliable blocking.** Binds Enter; can stop a command before bash commits to running it. Used by default only where a capability self-test (`tirith doctor --simulate-enter`) has proven `bind -x` delivery works for the running bash. |
 | bash **preexec + `TIRITH_BASH_PREEXEC_ENFORCE=1`** | **Conditional blocking.** Uses `shopt -s extdebug`; blocks when bash's `history` can provide a trustworthy whole-line view. Downgrades to warn-only when history is filtered (`HISTCONTROL=ignorespace/ignoredups/ignoreboth`, any `HISTIGNORE`, or `set +o history`) or an alias / command substitution / `eval` makes the typed line drift from `BASH_COMMAND`. |
 | bash **preexec** (no enforce flag) | Warn-only. Prints a DETECTED banner on risky commands; does not block. The fallback when the enter-mode self-test has not proven delivery works. |
-| zsh, fish, powershell | Reliable blocking via native preexec hooks. |
+| zsh, fish | Reliable blocking in their Enter/accept-line handlers, before the native shell handoff. Notification-only preexec events are not treated as authorization gates. |
+| PowerShell | Reliable PSReadLine preflight blocking; no strict execution receipt. |
 | nushell | Warn-only (does not currently support command interception). |
 
 For guaranteed line-level blocking on bash, run `tirith doctor --simulate-enter`, if delivery works, enter mode is enabled. Where it does not, use preexec enforce for "blocks when possible; tells you honestly when it can't."
 
-**Nix / Home-Manager:** tirith must be in your `$PATH`, the shell hooks call `tirith` by name at runtime. Adding it to `initContent` alone is not enough.
+Interactive bash, zsh, and fish use a protocol-v3 execution receipt after the
+preflight decision. At hook load, they resolve and pin one absolute Tirith
+executable and register a one-time capability bound to the live shell process,
+shell family, session, user, and executable identity. A receipt then moves
+through `Prepared`, `Armed`, `Consuming`, and a terminal
+`Committed`/`Conflict`/`Discarded` state. This improves attribution and replay
+resistance, but shell evidence is deliberately recorded as unresolved rather
+than proof that every command component executed. Tirith itself owns any
+approval or warning-acknowledgement prompt before returning an armed receipt;
+the hook cannot attach those facts later. Zsh and fish consume the armed
+receipt synchronously in the same line-acceptance handler and hand the command
+to the native shell only after that transition succeeds. PowerShell has
+preflight blocking without this strict receipt protocol.
+
+A nested shell receives its own process-bound capability even when it inherits
+the session ID. Re-sourcing the hook in the same process never mints another
+bearer. If `exec` replaces a live shell without changing its PID/start identity,
+the replacement cannot recover the deliberately non-exported bearer and runs in
+visibly degraded legacy mode; start a fresh terminal or child shell to restore
+strict receipts. `exec "$SHELL"` is not a receipt-protocol restart because it
+preserves that process identity.
+
+**Nix / Home-Manager:** tirith must be in your `$PATH` when the hook is sourced.
+Bash, zsh, and fish then pin that resolved executable for the shell session;
+restart the shell after replacing or upgrading the binary. Adding it to
+`initContent` alone is not enough.
 
 ```nix
 home.packages = [ pkgs.tirith ];
@@ -725,7 +767,7 @@ The everyday commands:
 | `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds remediation and, when verified, a narrow mechanical rewrite) |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
 | `tirith scan [path]` | Scan files, directories, and configs (`--profile`, `--format sarif`, `--ci`) |
-| `tirith run [--capsule] <url>` | Inspect a remote script (`--no-exec` on Unix); live execution is Linux-only, uses the exact reviewed bytes from a sealed anonymous descriptor, and `--capsule` fails closed |
+| `tirith run [--capsule] <url>` | Inspect a remote script (`--no-exec` on Unix); Linux live execution is contained and fail-closed by default, using the exact reviewed bytes from a sealed anonymous descriptor (`--capsule` is a legacy compatibility spelling) |
 | `tirith fix -- <cmd>` | Interactively apply a verified fail-closed pipe-runner rewrite when available; otherwise show guidance |
 | `tirith score <url>` / `diff <url>` | Break down a URL's trust signals, or show where suspicious characters hide |
 | `tirith explain --rule <id>` / `why` | Rule docs and remediation, or explain the last trigger |

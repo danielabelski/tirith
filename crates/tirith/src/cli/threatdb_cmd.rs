@@ -143,44 +143,101 @@ struct IndexAsset {
 }
 
 /// Signed multi-asset v2 index (`threatdb-index-v2.json`). The top-level
-/// `signature` covers the canonical payload (the `sequence` plus the `assets`
-/// array, alphabetical compact keys, the signature field excluded), mirroring
-/// [`Manifest::canonical_payload`] and the `jq -cS` signing step so the same key
-/// and discipline apply. Old clients never fetch this and only ever see v1.
+/// `signature` covers the canonical payload (`manifest_version`, `sequence`, and
+/// the `assets` array; alphabetical compact keys; only `signature` excluded),
+/// mirroring [`Manifest::canonical_payload`] and the `jq -cS` signing step so the
+/// same key and discipline apply. Old clients never fetch this and only see v1.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct IndexV2 {
-    // Read in `verify_signature` to fail-closed on a schema we don't understand:
-    // a future `manifest_version` (e.g. 3) is rejected so an old client never
-    // silently accepts an index shape it cannot reason about, and falls back to
-    // v1 instead. Excluded from `canonical_payload`, so it is NOT covered by the
-    // signature; rejecting it here is a parse/shape gate, not an authenticity one.
-    #[serde(default = "default_manifest_version")]
+    // Schema v2 moved this field into the signed canonical payload. It must be
+    // present: accepting an absent/defaulted value would recreate an unsigned
+    // downgrade/suppression control.
     manifest_version: u64,
     sequence: u64,
     assets: Vec<IndexAsset>,
     signature: String,
 }
 
-/// Highest `manifest_version` of the v2 index this build understands. A higher
-/// value means the publisher moved to a schema this client predates; the client
-/// rejects it and falls back to the legacy v1 manifest. Bump this in lockstep
-/// with any change to the published index shape.
-const MAX_MANIFEST_VERSION: u64 = 1;
-
-/// Default `manifest_version` when the field is absent. The first published v2
-/// indexes always carry `manifest_version: 1`, but an absent field is treated as
-/// 1 (the original schema) rather than 0 so a hand-rolled or legacy index without
-/// the key is still accepted.
-fn default_manifest_version() -> u64 {
-    1
-}
+/// Exact signed generation-index schema this client understands. Schema v1 kept
+/// `manifest_version` outside the signature and is deliberately not accepted by
+/// this client; both old and new clients safely use the independently signed v1
+/// manifest while publishers move to schema v2.
+const SIGNED_MANIFEST_VERSION: u64 = 2;
 
 impl IndexV2 {
-    /// Canonical payload for signature verification: `{assets, sequence}` with
-    /// keys sorted, no whitespace, the `signature` field excluded, and each
-    /// asset object itself emitted with alphabetical compact keys (skipping an
-    /// absent `min_tirith_version`). Mirrors the `jq -cS` discipline that signs
-    /// the legacy manifest, so the same Ed25519 key verifies both.
+    /// Validate the signed document as one complete immutable generation. Signed
+    /// schema v2 requires exactly one legacy asset and one v2 asset; accepting a partial
+    /// array would turn the index back into two independently advancing pointers.
+    fn validate_generation(&self) -> Result<(), String> {
+        if self.assets.len() != 2 {
+            return Err(format!(
+                "v2 index must contain exactly one v1 and one v2 asset, got {}",
+                self.assets.len()
+            ));
+        }
+        for format in [1u32, 2u32] {
+            let count = self
+                .assets
+                .iter()
+                .filter(|asset| asset.format == format)
+                .count();
+            if count != 1 {
+                return Err(format!(
+                    "v2 index must contain exactly one format-v{format} asset, got {count}"
+                ));
+            }
+        }
+        for (index, asset) in self.assets.iter().enumerate() {
+            for other in self.assets.iter().skip(index + 1) {
+                if asset.filename == other.filename {
+                    return Err(format!(
+                        "v2 index assets must have distinct filenames, duplicate {:?}",
+                        asset.filename
+                    ));
+                }
+                if asset.url == other.url {
+                    return Err(format!(
+                        "v2 index assets must have distinct URLs, duplicate {:?}",
+                        asset.url
+                    ));
+                }
+            }
+        }
+        for asset in &self.assets {
+            if asset.size == 0 || asset.size > MAX_INDEX_ASSET_SIZE {
+                return Err(format!(
+                    "format-v{} asset has invalid size {}",
+                    asset.format, asset.size
+                ));
+            }
+            if asset.sha256.len() != 64
+                || !asset.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "format-v{} asset has an invalid SHA-256",
+                    asset.format
+                ));
+            }
+            let parsed = url::Url::parse(&asset.url).map_err(|error| {
+                format!("format-v{} asset URL is invalid: {error}", asset.format)
+            })?;
+            let url_filename = parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next_back());
+            if url_filename != Some(asset.filename.as_str()) {
+                return Err(format!(
+                    "format-v{} asset filename does not match its signed URL",
+                    asset.format
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical payload for signature verification:
+    /// `{assets, manifest_version, sequence}` with keys sorted, no whitespace,
+    /// only `signature` excluded, and each asset object emitted with alphabetical
+    /// compact keys (skipping an absent `min_tirith_version`).
     fn canonical_payload(&self) -> String {
         // Build each asset as a sorted-key map so the serialized form is
         // deterministic regardless of struct field order.
@@ -202,24 +259,18 @@ impl IndexV2 {
             .collect();
         let mut top = serde_json::Map::new();
         top.insert("assets".to_string(), serde_json::Value::Array(assets));
+        top.insert(
+            "manifest_version".to_string(),
+            serde_json::json!(self.manifest_version),
+        );
         top.insert("sequence".to_string(), serde_json::json!(self.sequence));
         serde_json::Value::Object(top).to_string()
     }
 
-    /// Verify the index's top-level Ed25519 signature against the pinned key,
-    /// after rejecting any `manifest_version` newer than this build understands.
-    /// The version check is fail-closed and runs FIRST: it is not covered by the
-    /// signature (it is excluded from `canonical_payload`), so an attacker cannot
-    /// use it to bypass verification, but a legitimately newer publisher schema
-    /// must make an old client fall back to v1 rather than misread the index.
-    fn verify_signature(&self) -> Result<(), String> {
-        if self.manifest_version > MAX_MANIFEST_VERSION {
-            return Err(format!(
-                "v2 index manifest_version {} is newer than this build supports (max {}); falling back to v1",
-                self.manifest_version, MAX_MANIFEST_VERSION
-            ));
-        }
-
+    /// Verify with an explicit key. Authenticating the canonical payload happens
+    /// before interpreting `manifest_version`, so an unsigned version mutation
+    /// cannot suppress a valid primary candidate and force a downgrade.
+    fn verify_signature_with_key(&self, verify_key: &VerifyingKey) -> Result<(), String> {
         let sig_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &self.signature)
                 .map_err(|e| format!("invalid v2 index signature encoding: {e}"))?;
@@ -232,13 +283,18 @@ impl IndexV2 {
         }
         let signature = Signature::from_slice(&sig_bytes)
             .map_err(|e| format!("invalid v2 index signature: {e}"))?;
-        let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
-            .map_err(|e| format!("invalid embedded public key: {e}"))?;
         let payload = self.canonical_payload();
         use ed25519_dalek::Verifier;
         verify_key
             .verify(payload.as_bytes(), &signature)
-            .map_err(|_| "v2 index signature verification failed".to_string())
+            .map_err(|_| "v2 index signature verification failed".to_string())?;
+        if self.manifest_version != SIGNED_MANIFEST_VERSION {
+            return Err(format!(
+                "v2 index manifest_version {} is unsupported (expected signed schema {}); falling back to v1",
+                self.manifest_version, SIGNED_MANIFEST_VERSION
+            ));
+        }
+        self.validate_generation()
     }
 
     /// Select the best compatible asset: the highest `format <= MAX_FORMAT_VERSION`
@@ -354,8 +410,10 @@ fn do_update(force: bool) -> Result<(), String> {
 /// - `Err(_)`: the index could not be fetched / verified / parsed, also a
 ///   fall-back trigger (the caller logs and continues to legacy).
 fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
+    // `fetch_index_v2` returns only a signature- and schema-validated candidate;
+    // an invalid primary has already caused the independently published release
+    // candidate to be tried.
     let index = fetch_index_v2()?;
-    index.verify_signature()?;
 
     let current_tirith_version = env!("CARGO_PKG_VERSION");
     let asset = match index.select_asset(current_tirith_version) {
@@ -369,26 +427,17 @@ fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
         }
     };
 
-    // Rollback protection against the index `sequence`, mirroring the legacy
-    // manifest `version` check. The DB-internal `from_bytes` rollback check
-    // below is the hard enforcement; this is the early, friendly one.
-    if !force {
-        if let Some(db) = ThreatDb::cached() {
-            let current_seq = db.build_sequence();
-            if index.sequence < current_seq {
-                return Err(format!(
-                    "rollback protection: v2 index sequence {} < current {}",
-                    index.sequence, current_seq
-                ));
-            }
-            if index.sequence == current_seq {
-                eprintln!(
-                    "tirith: threat DB is already up to date (v2 index sequence {})",
-                    index.sequence
-                );
-                return Ok(UpdateOutcome::AlreadyCurrent);
-            }
-        }
+    // Currentness is `(sequence, format)`, not sequence alone. The v1 manifest
+    // is published before the v2 pointer, so a client can legitimately have v1
+    // sequence N when the index for the same generation becomes visible; that
+    // client must still install v2. The reverse format switch is equally real.
+    let current = ThreatDb::cached().map(|db| (db.build_sequence(), db.stats().format_version));
+    if !index_install_needed(index.sequence, asset.format, current, force)? {
+        eprintln!(
+            "tirith: threat DB is already up to date (v2 index sequence {}, format v{})",
+            index.sequence, asset.format
+        );
+        return Ok(UpdateOutcome::AlreadyCurrent);
     }
 
     if asset.size > MAX_DB_SIZE {
@@ -414,8 +463,39 @@ fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
         ));
     }
 
-    install_primary_db(data, asset.format, index.sequence, force)?;
+    let equal_sequence_format_switch = !force
+        && current
+            .is_some_and(|(sequence, format)| sequence == index.sequence && format != asset.format);
+    install_primary_db(
+        data,
+        asset.format,
+        index.sequence,
+        force || equal_sequence_format_switch,
+    )?;
+    if asset.format == 1 {
+        retire_primary_v2()?;
+    }
     Ok(UpdateOutcome::Installed)
+}
+
+fn index_install_needed(
+    index_sequence: u64,
+    selected_format: u32,
+    current: Option<(u64, u32)>,
+    force: bool,
+) -> Result<bool, String> {
+    if force {
+        return Ok(true);
+    }
+    let Some((current_sequence, current_format)) = current else {
+        return Ok(true);
+    };
+    if index_sequence < current_sequence {
+        return Err(format!(
+            "rollback protection: v2 index sequence {index_sequence} < current {current_sequence}"
+        ));
+    }
+    Ok(index_sequence > current_sequence || selected_format != current_format)
 }
 
 /// Legacy single-asset update: fetch `threatdb-manifest.json`, verify, download,
@@ -426,24 +506,14 @@ fn do_update_legacy(force: bool) -> Result<UpdateOutcome, String> {
 
     manifest.verify_signature()?;
 
-    // Rollback protection: reject a manifest older than the installed DB unless --force.
-    if !force {
-        if let Some(db) = ThreatDb::cached() {
-            let current_seq = db.build_sequence();
-            if manifest.version < current_seq {
-                return Err(format!(
-                    "rollback protection: manifest version {} < current {}",
-                    manifest.version, current_seq
-                ));
-            }
-            if manifest.version == current_seq {
-                eprintln!(
-                    "tirith: threat DB is already up to date (version {})",
-                    manifest.version
-                );
-                return Ok(UpdateOutcome::AlreadyCurrent);
-            }
-        }
+    let current = ThreatDb::cached().map(|db| (db.build_sequence(), db.stats().format_version));
+    let install_needed = legacy_install_needed(manifest.version, current, force)?;
+    if !install_needed {
+        eprintln!(
+            "tirith: threat DB is already up to date (version {})",
+            manifest.version
+        );
+        return Ok(UpdateOutcome::AlreadyCurrent);
     }
 
     eprintln!(
@@ -461,9 +531,44 @@ fn do_update_legacy(force: bool) -> Result<UpdateOutcome, String> {
         ));
     }
 
-    // The legacy manifest only ever points at v1; install to the v1 path.
-    install_primary_db(data, 1, manifest.version, force)?;
+    // The legacy manifest only ever points at v1. An equal-sequence v2 -> v1
+    // channel retirement is allowed after both signatures and the exact DB
+    // sequence have been checked; it is not a rollback. Only after the v1 bytes
+    // are durably installed do we durably remove the v2 cache. If retirement
+    // fails, return an error before refreshing the process cache so stale v2 is
+    // never silently reported as rolled back.
+    let equal_sequence_format_switch = !force
+        && current.is_some_and(|(sequence, format)| sequence == manifest.version && format == 2);
+    install_primary_db(
+        data,
+        1,
+        manifest.version,
+        force || equal_sequence_format_switch,
+    )?;
+    retire_primary_v2()?;
     Ok(UpdateOutcome::Installed)
+}
+
+/// Decide whether a verified legacy manifest needs installation. Equality is
+/// current only when the effective DB is already v1. If the effective DB is v2,
+/// the equal-sequence v1 asset must still be installed before retiring v2.
+fn legacy_install_needed(
+    manifest_version: u64,
+    current: Option<(u64, u32)>,
+    force: bool,
+) -> Result<bool, String> {
+    if force {
+        return Ok(true);
+    }
+    let Some((current_sequence, current_format)) = current else {
+        return Ok(true);
+    };
+    if manifest_version < current_sequence {
+        return Err(format!(
+            "rollback protection: manifest version {manifest_version} < current {current_sequence}"
+        ));
+    }
+    Ok(manifest_version > current_sequence || current_format == 2)
 }
 
 /// The on-disk path a primary DB of `format` installs to: a v2 asset goes to
@@ -494,6 +599,12 @@ fn install_primary_db(data: Vec<u8>, format: u32, version: u64, force: bool) -> 
             "DB format mismatch: index/manifest declared format {format} but the downloaded file is format {stamped}"
         ));
     }
+    if db.build_sequence() != version {
+        return Err(format!(
+            "DB sequence mismatch: index/manifest declared {version} but the downloaded file is sequence {}",
+            db.build_sequence()
+        ));
+    }
 
     let dest = primary_db_dest(format)?;
     atomic_write(&dest, &data)?;
@@ -507,6 +618,41 @@ fn install_primary_db(data: Vec<u8>, format: u32, version: u64, force: bool) -> 
     eprintln!(
         "tirith: threat DB updated to v{version} (format v{format}, {total_entries} entries)"
     );
+    Ok(())
+}
+
+/// Remove the v2 primary only after a verified v1 replacement is durable. The
+/// deletion is idempotent, but every other filesystem error is fatal. On Unix,
+/// syncing the containing directory makes the unlink survive a completed call
+/// across a crash/power loss instead of allowing stale v2 to reappear.
+fn retire_primary_v2() -> Result<(), String> {
+    let v2_path = ThreatDb::default_path_v2()
+        .ok_or_else(|| "cannot determine v2 data path for retirement".to_string())?;
+    if ThreatDb::default_path().as_ref() == Some(&v2_path) {
+        return Err("refusing to retire v2 because it aliases the v1 data path".to_string());
+    }
+    let parent = v2_path
+        .parent()
+        .ok_or_else(|| "cannot determine v2 data directory".to_string())?;
+    let removed = match std::fs::remove_file(&v2_path) {
+        Ok(()) => true,
+        // Still sync the directory: this may be the retry after an earlier
+        // unlink succeeded but its directory sync failed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "failed to retire local v2 threat DB {}: {error}",
+                v2_path.display()
+            ));
+        }
+    };
+    sync_parent_directory(parent)?;
+    if removed {
+        eprintln!(
+            "tirith: retired local v2 threat DB after verified legacy install ({})",
+            v2_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1398,40 +1544,66 @@ fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-/// Fetch the signed v2 index, trying the primary raw URL then the release-asset
-/// fallback. Bounded to [`MAX_MANIFEST_SIZE`]. A signature-invalid or
-/// unparseable index is an `Err`, which the caller treats as "fall back to the
-/// legacy manifest".
+/// Fetch and authenticate the signed v2 index, trying the primary raw URL and
+/// then the independently published release-asset fallback. A candidate is not
+/// selected merely because its JSON parsed: signature, signed schema version,
+/// and generation shape all have to validate first.
 fn fetch_index_v2() -> Result<IndexV2, String> {
-    match fetch_index_v2_from(INDEX_V2_URL_PRIMARY) {
-        Ok(idx) => {
-            // If the primary index is at or below the installed DB, try the fallback in
-            // case it's ahead (the release index can lag the raw path). Mirrors the legacy
-            // fetch_manifest stale-primary handling: without it the v2 path gets stuck on a
-            // stale primary and returns AlreadyCurrent while a newer DB is live on the
-            // fallback release. The caller verifies the signature on whatever we return.
-            if let Some(db) = ThreatDb::cached() {
-                if idx.sequence <= db.build_sequence() {
-                    eprintln!(
-                        "tirith: primary v2 index is stale (seq {} <= current v{}), trying fallback...",
-                        idx.sequence,
-                        db.build_sequence()
-                    );
-                    if let Ok(fallback) = fetch_index_v2_from(INDEX_V2_URL_FALLBACK) {
-                        if fallback.sequence > db.build_sequence() {
-                            return Ok(fallback);
-                        }
-                    }
+    let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
+        .map_err(|error| format!("invalid embedded public key: {error}"))?;
+    fetch_index_v2_with(fetch_index_v2_from, &verify_key)
+}
+
+fn fetch_verified_index_candidate<F>(
+    fetch: &mut F,
+    url: &str,
+    verify_key: &VerifyingKey,
+) -> Result<IndexV2, String>
+where
+    F: FnMut(&str) -> Result<IndexV2, String>,
+{
+    let index = fetch(url)?;
+    index.verify_signature_with_key(verify_key)?;
+    Ok(index)
+}
+
+/// Candidate-selection core, split from HTTP so the primary-invalid/fallback-
+/// valid security boundary is directly regression-testable with signed fixtures.
+fn fetch_index_v2_with<F>(mut fetch: F, verify_key: &VerifyingKey) -> Result<IndexV2, String>
+where
+    F: FnMut(&str) -> Result<IndexV2, String>,
+{
+    let primary = fetch_verified_index_candidate(&mut fetch, INDEX_V2_URL_PRIMARY, verify_key);
+    let fallback = fetch_verified_index_candidate(&mut fetch, INDEX_V2_URL_FALLBACK, verify_key);
+    match (primary, fallback) {
+        (Ok(primary), Ok(fallback)) => match primary.sequence.cmp(&fallback.sequence) {
+            std::cmp::Ordering::Greater => Ok(primary),
+            std::cmp::Ordering::Less => Ok(fallback),
+            std::cmp::Ordering::Equal => {
+                if primary.canonical_payload() != fallback.canonical_payload() {
+                    return Err(format!(
+                        "v2 index equivocation: primary and fallback both claim sequence {} with different signed generations",
+                        primary.sequence
+                    ));
                 }
+                Ok(primary)
             }
-            Ok(idx)
+        },
+        (Ok(primary), Err(fallback_err)) => {
+            eprintln!(
+                "tirith: v2 index fallback unavailable or invalid ({fallback_err}); using verified primary"
+            );
+            Ok(primary)
         }
-        Err(primary_err) => {
-            eprintln!("tirith: v2 index primary unavailable ({primary_err}), trying fallback...");
-            fetch_index_v2_from(INDEX_V2_URL_FALLBACK).map_err(|fallback_err| {
-                format!("v2 index fetch failed: primary: {primary_err}; fallback: {fallback_err}")
-            })
+        (Err(primary_err), Ok(fallback)) => {
+            eprintln!(
+                "tirith: v2 index primary unavailable or invalid ({primary_err}); using verified fallback"
+            );
+            Ok(fallback)
         }
+        (Err(primary_err), Err(fallback_err)) => Err(format!(
+            "v2 index fetch/verification failed: primary: {primary_err}; fallback: {fallback_err}"
+        )),
     }
 }
 
@@ -1467,7 +1639,8 @@ fn fetch_index_v2_from(url: &str) -> Result<IndexV2, String> {
     serde_json::from_str::<IndexV2>(&body).map_err(|e| format!("invalid v2 index JSON: {e}"))
 }
 
-/// Atomic write: write to a temp file in the same dir, then rename.
+/// Durable atomic write: write and sync a temp file in the same directory,
+/// rename it into place, then sync the containing directory on Unix.
 fn atomic_write(dest: &PathBuf, data: &[u8]) -> Result<(), String> {
     let parent = dest
         .parent()
@@ -1480,10 +1653,35 @@ fn atomic_write(dest: &PathBuf, data: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("failed to write temp file: {e}"))?;
     tmp.flush()
         .map_err(|e| format!("failed to flush temp file: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("failed to sync temp file: {e}"))?;
 
-    tmp.persist(dest)
+    let persisted = tmp
+        .persist(dest)
         .map_err(|e| format!("failed to rename temp file: {e}"))?;
+    persisted
+        .sync_all()
+        .map_err(|e| format!("failed to sync installed file: {e}"))?;
+    sync_parent_directory(parent)?;
 
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "failed to sync containing directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
     Ok(())
 }
 
@@ -2692,7 +2890,7 @@ mod tests {
     /// canonical payload with `key` and fill the signature in.
     fn signed_index_v2(sequence: u64, assets: Vec<IndexAsset>, key: &SigningKey) -> IndexV2 {
         let mut idx = IndexV2 {
-            manifest_version: 1,
+            manifest_version: SIGNED_MANIFEST_VERSION,
             sequence,
             assets,
             signature: String::new(),
@@ -2706,14 +2904,50 @@ mod tests {
     }
 
     fn asset(format: u32, min: Option<&str>) -> IndexAsset {
+        let filename = format!("tirith-threatdb-v{format}.dat");
         IndexAsset {
             format,
-            filename: format!("tirith-threatdb-v{format}.dat"),
-            url: format!("https://example.com/db-v{format}.dat"),
+            url: format!("https://example.com/{filename}"),
+            filename,
             sha256: "00".repeat(32),
             size: 1024,
             min_tirith_version: min.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn generation_index_requires_one_matching_asset_per_format() {
+        let key = SigningKey::from_bytes(&[2u8; 32]);
+        let valid = signed_index_v2(1, vec![asset(1, None), asset(2, Some("0.3.4"))], &key);
+        assert!(valid.validate_generation().is_ok());
+
+        let partial = signed_index_v2(1, vec![asset(2, Some("0.3.4"))], &key);
+        assert!(partial.validate_generation().is_err());
+
+        let mut mismatched = asset(2, Some("0.3.4"));
+        mismatched.filename = "different.dat".to_string();
+        let mismatched = signed_index_v2(1, vec![asset(1, None), mismatched], &key);
+        assert!(mismatched.validate_generation().is_err());
+
+        let mut duplicate_name_v1 = asset(1, None);
+        duplicate_name_v1.filename = "shared.dat".to_string();
+        duplicate_name_v1.url = "https://example.com/shared.dat?format=1".to_string();
+        let mut duplicate_name_v2 = asset(2, Some("0.3.4"));
+        duplicate_name_v2.filename = "shared.dat".to_string();
+        duplicate_name_v2.url = "https://example.com/shared.dat?format=2".to_string();
+        let duplicate_names = signed_index_v2(1, vec![duplicate_name_v1, duplicate_name_v2], &key);
+        assert!(duplicate_names
+            .validate_generation()
+            .unwrap_err()
+            .contains("distinct filenames"));
+
+        let mut duplicate_url_v2 = asset(2, Some("0.3.4"));
+        duplicate_url_v2.url = asset(1, None).url;
+        let duplicate_urls = signed_index_v2(1, vec![asset(1, None), duplicate_url_v2], &key);
+        assert!(duplicate_urls
+            .validate_generation()
+            .unwrap_err()
+            .contains("distinct URLs"));
     }
 
     #[test]
@@ -2725,8 +2959,12 @@ mod tests {
         assert!(!payload.contains(' '));
         assert!(!payload.contains("signature"));
         let pos_assets = payload.find("\"assets\"").unwrap();
+        let pos_version = payload.find("\"manifest_version\"").unwrap();
         let pos_sequence = payload.find("\"sequence\"").unwrap();
-        assert!(pos_assets < pos_sequence, "assets before sequence");
+        assert!(
+            pos_assets < pos_version && pos_version < pos_sequence,
+            "top-level keys are alphabetical"
+        );
         // Per-asset keys are alphabetical: filename, format, min_tirith_version,
         // sha256, size, url.
         let a = payload.find("\"filename\"").unwrap();
@@ -2793,6 +3031,7 @@ mod tests {
             .collect();
         let value = serde_json::json!({
             "sequence": idx.sequence,
+            "manifest_version": idx.manifest_version,
             "assets": assets,
         });
         let sorted = sort_json_keys(&value);
@@ -2812,6 +3051,10 @@ mod tests {
         // assets and sequence (the signed fields survive a parse).
         let reparsed: serde_json::Value = serde_json::from_str(&idx.canonical_payload()).unwrap();
         assert_eq!(reparsed["sequence"], serde_json::json!(idx.sequence));
+        assert_eq!(
+            reparsed["manifest_version"],
+            serde_json::json!(idx.manifest_version)
+        );
         assert_eq!(
             reparsed["assets"].as_array().unwrap().len(),
             idx.assets.len()
@@ -2876,9 +3119,16 @@ mod tests {
             .verifying_key()
             .verify(idx.canonical_payload().as_bytes(), &signature)
             .is_ok());
-        // A tampered sequence breaks verification (payload changed).
+        // Tampering with either the sequence or schema version changes the
+        // authenticated payload.
         let mut tampered = idx.clone();
         tampered.sequence = 8;
+        assert!(key
+            .verifying_key()
+            .verify(tampered.canonical_payload().as_bytes(), &signature)
+            .is_err());
+        let mut tampered = idx.clone();
+        tampered.manifest_version += 1;
         assert!(key
             .verifying_key()
             .verify(tampered.canonical_payload().as_bytes(), &signature)
@@ -2887,44 +3137,116 @@ mod tests {
 
     #[test]
     fn verify_signature_rejects_unknown_manifest_version() {
-        // A future manifest_version (3 > MAX_MANIFEST_VERSION) must be rejected
-        // fail-closed, even though the field is excluded from canonical_payload
-        // (and thus not covered by the signature). An old client must fall back
-        // to v1 rather than silently accept a schema it predates. Sign the index
-        // with a valid test key so the ONLY thing that can make verify fail is the
-        // manifest_version gate, then flip it to 3 and confirm the error.
+        // A genuinely signed future schema is authenticated first, then rejected
+        // because this client cannot safely interpret it.
         let key = SigningKey::from_bytes(&[6u8; 32]);
-        let mut idx = signed_index_v2(7, vec![asset(2, None)], &key);
-        assert!(idx.manifest_version <= MAX_MANIFEST_VERSION);
-        idx.manifest_version = 3;
+        let mut idx = signed_index_v2(7, vec![asset(1, None), asset(2, None)], &key);
+        idx.manifest_version = SIGNED_MANIFEST_VERSION + 1;
+        use ed25519_dalek::Signer;
+        idx.signature = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            key.sign(idx.canonical_payload().as_bytes()).to_bytes(),
+        );
         let err = idx
-            .verify_signature()
+            .verify_signature_with_key(&key.verifying_key())
             .expect_err("an unknown manifest_version must be rejected");
         assert!(
             err.contains("manifest_version"),
             "error must name manifest_version, got: {err}"
         );
 
-        // The exact supported version still passes the gate (it then proceeds to
-        // the signature check, which succeeds against the embedded key only in
-        // production; here it suffices that the gate itself does not reject it).
-        idx.manifest_version = MAX_MANIFEST_VERSION;
-        let err = idx.verify_signature().unwrap_err();
+        // Mutating only the version of a valid schema-v2 document fails at the
+        // signature boundary, before the unsupported-version interpretation.
+        let mut tampered = signed_index_v2(7, vec![asset(1, None), asset(2, None)], &key);
+        tampered.manifest_version += 1;
+        let err = tampered
+            .verify_signature_with_key(&key.verifying_key())
+            .unwrap_err();
         assert!(
-            !err.contains("manifest_version"),
-            "the supported manifest_version must pass the version gate, got: {err}"
+            err.contains("signature verification failed"),
+            "unsigned version mutation must fail authenticity first, got: {err}"
         );
     }
 
     #[test]
     fn index_v2_verify_signature_rejects_garbage() {
+        let key = SigningKey::from_bytes(&[13u8; 32]);
         let idx = IndexV2 {
-            manifest_version: 1,
+            manifest_version: SIGNED_MANIFEST_VERSION,
             sequence: 1,
             assets: vec![asset(1, None)],
             signature: "not-base64-or-too-short".to_string(),
         };
-        assert!(idx.verify_signature().is_err());
+        assert!(idx.verify_signature_with_key(&key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn invalid_primary_index_uses_valid_release_fallback() {
+        let key = SigningKey::from_bytes(&[12u8; 32]);
+        let fallback = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        let mut primary = fallback.clone();
+        primary.sequence = 8;
+        // Keep the fallback signature on the mutated primary: its JSON parses,
+        // but authentication must fail and trigger the second candidate.
+
+        let selected = fetch_index_v2_with(
+            |url| {
+                if url == INDEX_V2_URL_PRIMARY {
+                    Ok(primary.clone())
+                } else if url == INDEX_V2_URL_FALLBACK {
+                    Ok(fallback.clone())
+                } else {
+                    Err(format!("unexpected URL: {url}"))
+                }
+            },
+            &key.verifying_key(),
+        )
+        .expect("a valid release index must survive an invalid primary");
+        assert_eq!(selected.sequence, 9);
+        assert!(selected
+            .verify_signature_with_key(&key.verifying_key())
+            .is_ok());
+    }
+
+    #[test]
+    fn fresh_client_chooses_newest_verified_discovery_surface() {
+        let key = SigningKey::from_bytes(&[14u8; 32]);
+        let primary = signed_index_v2(8, vec![asset(1, None), asset(2, None)], &key);
+        let fallback = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        let selected = fetch_index_v2_with(
+            |url| {
+                if url == INDEX_V2_URL_PRIMARY {
+                    Ok(primary.clone())
+                } else {
+                    Ok(fallback.clone())
+                }
+            },
+            &key.verifying_key(),
+        )
+        .expect("a replayed older primary must not outrank the release pointer");
+        assert_eq!(selected.sequence, 9);
+    }
+
+    #[test]
+    fn equal_sequence_discovery_equivocation_fails_closed() {
+        let key = SigningKey::from_bytes(&[15u8; 32]);
+        let primary = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        let mut alternate_v2 = asset(2, None);
+        alternate_v2.filename = "tirith-threatdb-v2-alternate.dat".to_string();
+        alternate_v2.url = "https://example.com/tirith-threatdb-v2-alternate.dat".to_string();
+        let fallback = signed_index_v2(9, vec![asset(1, None), alternate_v2], &key);
+        let error = fetch_index_v2_with(
+            |url| {
+                if url == INDEX_V2_URL_PRIMARY {
+                    Ok(primary.clone())
+                } else {
+                    Ok(fallback.clone())
+                }
+            },
+            &key.verifying_key(),
+        )
+        .expect_err("one sequence cannot identify two signed generations");
+        assert!(error.contains("equivocation"), "{error}");
     }
 
     #[test]
@@ -3041,6 +3363,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_equal_sequence_v2_requires_install_and_retirement() {
+        assert!(legacy_install_needed(8, Some((8, 2)), false).unwrap());
+        assert!(!legacy_install_needed(8, Some((8, 1)), false).unwrap());
+        assert!(legacy_install_needed(9, Some((8, 2)), false).unwrap());
+        assert!(legacy_install_needed(7, Some((8, 2)), false).is_err());
+        assert!(legacy_install_needed(7, Some((8, 2)), true).unwrap());
+    }
+
+    #[test]
+    fn index_equal_sequence_format_changes_are_not_already_current() {
+        // Rollout race: v1 N can arrive through the legacy manifest before the
+        // complete-generation pointer for v2 N becomes visible.
+        assert!(index_install_needed(8, 2, Some((8, 1)), false).unwrap());
+        // Compatibility-floor/retirement direction: selecting v1 N while v2 N
+        // is cached must install v1 and drive the v2 retirement path.
+        assert!(index_install_needed(8, 1, Some((8, 2)), false).unwrap());
+        assert!(!index_install_needed(8, 2, Some((8, 2)), false).unwrap());
+        assert!(!index_install_needed(8, 1, Some((8, 1)), false).unwrap());
+        assert!(index_install_needed(9, 2, Some((8, 2)), false).unwrap());
+        assert!(index_install_needed(7, 2, Some((8, 2)), false).is_err());
+    }
+
+    #[test]
+    fn retiring_v2_cache_preserves_v1_and_is_idempotent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_path = tmp.path().join("tirith-threatdb.dat");
+        let v2_path = tmp.path().join("tirith-threatdb-v2.dat");
+        std::fs::write(&v1_path, b"verified-v1-placeholder").unwrap();
+        std::fs::write(&v2_path, b"stale-v2-placeholder").unwrap();
+        let _path_guard = EnvGuard::set("TIRITH_THREATDB_PATH", &v1_path);
+
+        retire_primary_v2().expect("v2 retirement succeeds");
+        assert_eq!(std::fs::read(&v1_path).unwrap(), b"verified-v1-placeholder");
+        assert!(!v2_path.exists());
+        retire_primary_v2().expect("already-retired v2 is a successful no-op");
+    }
+
+    #[test]
     fn build_format_stamps_distinct_version_per_format() {
         // The format-mismatch guard in install_primary_db compares the blob's
         // stamped version against the declared format; confirm a writer stamps
@@ -3059,8 +3420,9 @@ mod tests {
     // ---- v2 index publish contract (DB-D) --------------------------------
     //
     // These pin the byte-for-byte agreement between the canonical payload the
-    // release workflow signs (.github/workflows/threatdb.yml, "Generate signed
-    // v2 index") and the payload this client reconstructs in
+    // compiler emits and the release workflow validates
+    // (.github/workflows/threatdb.yml, "Validate compiler-generated signed
+    // generation index") and the payload this client reconstructs in
     // `IndexV2::canonical_payload()`. The two constants below are the LITERAL
     // `jq -cS` output of that workflow step (captured by running its exact jq
     // filter). If `canonical_payload()` ever diverges from this shape, the
@@ -3084,28 +3446,30 @@ mod tests {
         "\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
         "\"size\":8192,",
         "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-v2-7-1.dat\"}",
-        "],\"sequence\":7}"
+        "],\"manifest_version\":2,\"sequence\":7}"
     );
 
-    /// Exact workflow `jq -cS` canonical payload for a single-asset index with
-    /// NO `min_tirith_version` (the absent-Option case).
+    /// Canonical complete-generation payload whose v2 asset has no
+    /// `min_tirith_version` (the absent-Option case).
     const WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN: &str = concat!(
         "{\"assets\":[",
         "{\"filename\":\"tirith-threatdb-7-1.dat\",\"format\":1,",
         "\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
         "\"size\":4096,",
-        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-7-1.dat\"}",
-        "],\"sequence\":7}"
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-7-1.dat\"},",
+        "{\"filename\":\"tirith-threatdb-v2-7-1.dat\",\"format\":2,",
+        "\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+        "\"size\":8192,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-v2-7-1.dat\"}",
+        "],\"manifest_version\":2,\"sequence\":7}"
     );
 
     /// The published `threatdb-index-v2.json` is exactly the signed canonical
-    /// payload with a top-level `manifest_version` and `signature` injected (the
-    /// workflow derives it via `. + {manifest_version, signature}`). This mirrors
-    /// that derivation so a parsed-then-reconstructed payload can be checked.
+    /// payload with only the top-level `signature` injected. `manifest_version`
+    /// is already in the canonical payload and therefore authenticated.
     fn published_index_json(canonical_payload: &str, signature: &str) -> String {
         let mut value: serde_json::Value = serde_json::from_str(canonical_payload).unwrap();
         let obj = value.as_object_mut().unwrap();
-        obj.insert("manifest_version".to_string(), serde_json::json!(1));
         obj.insert(
             "signature".to_string(),
             serde_json::Value::String(signature.to_string()),
@@ -3115,8 +3479,8 @@ mod tests {
 
     #[test]
     fn workflow_v2_index_payload_matches_client_canonical_with_min() {
-        // Parse the PUBLISHED index (workflow payload + injected manifest_version
-        // + signature), exactly as the client receives it over the wire.
+        // Parse the PUBLISHED index (signed payload + signature), exactly as the
+        // client receives it over the wire.
         let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN, "AA==");
         let index: IndexV2 = serde_json::from_str(&published).unwrap();
 
@@ -3126,6 +3490,7 @@ mod tests {
             WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN,
             "client canonical_payload() must be byte-identical to the workflow's jq -cS output"
         );
+        assert!(index.validate_generation().is_ok());
 
         // And a signature made over canonical_payload() verifies. The pinned
         // production key can't be self-signed in a test, so sign + verify against
@@ -3158,8 +3523,9 @@ mod tests {
         let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN, "AA==");
         let index: IndexV2 = serde_json::from_str(&published).unwrap();
 
-        // The single asset must have NO min floor after parsing.
-        assert!(index.assets[0].min_tirith_version.is_none());
+        assert_eq!(index.assets.len(), 2);
+        assert!(index.assets[1].min_tirith_version.is_none());
+        assert!(index.validate_generation().is_ok());
         assert_eq!(
             index.canonical_payload(),
             WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN,

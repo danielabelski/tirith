@@ -1,9 +1,10 @@
 //! Runtime containment capsule — portable type layer (Stack E, unit E1).
 //!
-//! This module holds **types only**: the [`Capsule`] trait, the [`CapsuleSpec`]
-//! that describes what to contain, the per-capability [`CapsuleCoverage`] honesty
-//! ledger, the policy sub-structs ([`NetworkPolicy`], [`FilesystemPolicy`],
-//! [`EnvironmentPolicy`], [`ResourceLimits`], [`HandlePolicy`]), the
+//! This module holds the portable policy layer: the [`Capsule`] trait, the
+//! [`CapsuleSpec`] that describes what to contain, the per-capability
+//! [`CapsuleCoverage`] honesty ledger, the policy sub-structs ([`NetworkPolicy`],
+//! [`FilesystemPolicy`], [`EnvironmentPolicy`], [`ResourceLimits`],
+//! [`HandlePolicy`]), authenticated/canonical filesystem-root validation, the
 //! [`deny_default_paths`] baseline, and the always-degraded [`NoOpCapsule`]. The
 //! OS-specific backends (Landlock/seccomp on Linux, Seatbelt on macOS,
 //! AppContainer/Job Objects on Windows) arrive in E2-E4; the async egress broker
@@ -42,7 +43,8 @@
 //! types only carry the policy; they assert nothing about enforcement.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -259,9 +261,12 @@ impl NetworkPolicy {
 
 /// Filesystem containment intent: the read/write roots the child is confined to.
 ///
-/// Paths are additive allow-lists layered over [`deny_default_paths`] (the
-/// sensitive subtrees denied unless explicitly re-granted). The backend turns
-/// these into Landlock rules / Seatbelt allow clauses / AppContainer ACLs.
+/// Paths are additive allow-lists layered over [`deny_default_paths`]. Backends
+/// that cannot prove a deny rule overrides a covering allow MUST reject an
+/// overlapping policy through [`canonicalize_and_validate_filesystem_policy`]
+/// before launch; an allow root is never an implicit re-grant of a denied root.
+/// The backend turns validated roots into Landlock rules / Seatbelt allow clauses
+/// / AppContainer ACLs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemPolicy {
     /// Roots the child may read from (recursively).
@@ -285,6 +290,257 @@ impl FilesystemPolicy {
             write_roots: Vec::new(),
             deny_roots: deny_default_paths(),
         }
+    }
+}
+
+/// A filesystem policy could not be canonicalized into an unambiguous set of
+/// allow and deny roots. Capsule backends surface this as degraded filesystem
+/// coverage and refuse an enforcing launch before changing process state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemPolicyError {
+    message: String,
+}
+
+impl FilesystemPolicyError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for FilesystemPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FilesystemPolicyError {}
+
+/// Canonicalize every filesystem-policy root and reject any allow/deny overlap.
+///
+/// Landlock v1, the emitted Seatbelt profile, and the AppContainer ACL grant plan
+/// all express positive recursive grants but have no independently-proven deny
+/// carve-out that overrides a covering grant. For those backends, accepting an
+/// allowed parent of a denied credential path would silently erase the deny.
+/// This shared gate therefore:
+///
+/// - resolves relative paths against the current directory;
+/// - lexically removes `.` / `..` without permitting traversal above a root;
+/// - canonicalizes the longest existing prefix, resolving symlinks and junctions
+///   even when the final requested path does not exist yet;
+/// - deduplicates equivalent roots; and
+/// - rejects equal roots or containment in either direction between an allow root
+///   and a deny root.
+///
+/// The returned policy, rather than the caller's original spelling, is what a
+/// backend must apply. This closes a validate-one-path/use-an-alias gap.
+pub fn canonicalize_and_validate_filesystem_policy(
+    policy: &FilesystemPolicy,
+) -> Result<FilesystemPolicy, FilesystemPolicyError> {
+    let read_roots = canonicalize_root_set(&policy.read_roots, "read")?;
+    let write_roots = canonicalize_root_set(&policy.write_roots, "write")?;
+    let deny_roots = canonicalize_root_set(&policy.deny_roots, "deny")?;
+
+    for (allow_kind, allow_roots) in [("read", &read_roots), ("write", &write_roots)] {
+        for allow in allow_roots {
+            for deny in &deny_roots {
+                if paths_overlap(allow, deny) {
+                    return Err(FilesystemPolicyError::new(format!(
+                        "{allow_kind} allow root {} overlaps deny root {}; this backend cannot prove an explicit deny carve-out",
+                        allow.display(),
+                        deny.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(FilesystemPolicy {
+        read_roots,
+        write_roots,
+        deny_roots,
+    })
+}
+
+fn canonicalize_root_set(
+    roots: &[PathBuf],
+    root_kind: &str,
+) -> Result<Vec<PathBuf>, FilesystemPolicyError> {
+    let mut canonical: Vec<PathBuf> = Vec::with_capacity(roots.len());
+    for (index, root) in roots.iter().enumerate() {
+        let root = canonicalize_policy_root(root, root_kind, index)?;
+        if !canonical
+            .iter()
+            .any(|existing| paths_equivalent(existing, &root))
+        {
+            canonical.push(root);
+        }
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_policy_root(
+    root: &Path,
+    root_kind: &str,
+    index: usize,
+) -> Result<PathBuf, FilesystemPolicyError> {
+    if root.as_os_str().is_empty() {
+        return Err(FilesystemPolicyError::new(format!(
+            "{root_kind} root #{index} is empty; a required root could not be resolved"
+        )));
+    }
+    if root.as_os_str().to_string_lossy().contains('\0') {
+        return Err(FilesystemPolicyError::new(format!(
+            "{root_kind} root #{index} contains an interior NUL"
+        )));
+    }
+
+    let absolute = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                FilesystemPolicyError::new(format!(
+                    "cannot resolve relative {root_kind} root {}: current directory is unavailable ({error})",
+                    root.display()
+                ))
+            })?
+            .join(root)
+    };
+    let absolute = lexically_normalize_absolute(&absolute, root_kind, index)?;
+
+    // The policy frequently names credential files/directories that do not exist
+    // yet. Resolve the closest existing ancestor so aliases in any existing prefix
+    // are still collapsed, then append the missing suffix verbatim.
+    let mut probe = absolute.clone();
+    let mut missing_suffix: Vec<OsString> = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&probe) {
+            Ok(metadata) => {
+                if !missing_suffix.is_empty() && !metadata.is_dir() {
+                    return Err(FilesystemPolicyError::new(format!(
+                        "{root_kind} root {} descends through non-directory {}",
+                        root.display(),
+                        probe.display()
+                    )));
+                }
+                let mut resolved = std::fs::canonicalize(&probe).map_err(|error| {
+                    FilesystemPolicyError::new(format!(
+                        "cannot canonicalize {root_kind} root {} at existing prefix {}: {error}",
+                        root.display(),
+                        probe.display()
+                    ))
+                })?;
+                for component in missing_suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return lexically_normalize_absolute(&resolved, root_kind, index);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                let Some(component) = probe.file_name().map(OsStr::to_os_string) else {
+                    return Err(FilesystemPolicyError::new(format!(
+                        "cannot find an existing ancestor for {root_kind} root {}",
+                        root.display()
+                    )));
+                };
+                missing_suffix.push(component);
+                if !probe.pop() {
+                    return Err(FilesystemPolicyError::new(format!(
+                        "cannot find an existing ancestor for {root_kind} root {}",
+                        root.display()
+                    )));
+                }
+            }
+            Err(error) => {
+                return Err(FilesystemPolicyError::new(format!(
+                    "cannot inspect {root_kind} root {} at {}: {error}",
+                    root.display(),
+                    probe.display()
+                )));
+            }
+        }
+    }
+}
+
+fn lexically_normalize_absolute(
+    path: &Path,
+    root_kind: &str,
+    index: usize,
+) -> Result<PathBuf, FilesystemPolicyError> {
+    if !path.is_absolute() {
+        return Err(FilesystemPolicyError::new(format!(
+            "{root_kind} root #{index} did not resolve to an absolute path: {}",
+            path.display()
+        )));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(FilesystemPolicyError::new(format!(
+                        "{root_kind} root #{index} traverses above its filesystem root: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    Ok(normalized)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    path_is_within(left, right) || path_is_within(right, left)
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    path_is_within(left, right) && path_is_within(right, left)
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let mut path_components = path.components();
+    for root_component in root.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        if !policy_component_eq(path_component.as_os_str(), root_component.as_os_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn policy_component_eq(left: &OsStr, right: &OsStr) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn policy_component_eq(left: &OsStr, right: &OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+
+    let left: Vec<u16> = left.encode_wide().collect();
+    let right: Vec<u16> = right.encode_wide().collect();
+    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+    else {
+        return false;
+    };
+    // SAFETY: both buffers remain live for their explicit lengths and the API does
+    // not require NUL termination when a non-negative length is supplied.
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
     }
 }
 
@@ -651,16 +907,25 @@ impl Capsule for NoOpCapsule {
 /// legitimate tools, so the policy targets the high-value credential / key
 /// stores specifically.
 ///
-/// Paths are anchored under the real user HOME (resolved via the `home` crate's
-/// equivalent in core, `crate::policy`-style home lookup is avoided here to keep
-/// the function pure; the backend resolves `~` when it applies the rules). Each
-/// entry is HOME-relative; an empty HOME yields an empty list (the backend then
-/// relies on its other confinement).
+/// Paths are anchored under the authenticated process user's OS account home, not
+/// mutable `HOME` / `USERPROFILE`. Unix resolves the effective UID with
+/// `getpwuid_r`; Windows asks the Known Folder API for `FOLDERID_Profile` using the
+/// current process token. The home and every deny root are canonicalized before
+/// they enter the policy so a symlink/junction alias cannot bypass overlap checks.
+///
+/// This compatibility wrapper cannot return an error. If the authenticated home
+/// cannot be resolved, it returns one empty poison root; the shared policy validator
+/// rejects that marker, making every enforcing backend fail closed instead of
+/// silently dropping the credential denies. New fallible callers may use
+/// [`try_deny_default_paths`] to retain the lookup error.
 pub fn deny_default_paths() -> Vec<PathBuf> {
-    let home = match home_dir() {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
+    try_deny_default_paths().unwrap_or_else(|_| vec![PathBuf::new()])
+}
+
+/// Fallible form of [`deny_default_paths`], preserving authenticated-home lookup
+/// and canonicalization errors for callers that can propagate them directly.
+pub fn try_deny_default_paths() -> Result<Vec<PathBuf>, FilesystemPolicyError> {
+    let home = authenticated_home_dir()?;
     // Known credential / key / token stores. Kept tight on purpose.
     let relative = [
         ".aws",
@@ -677,21 +942,160 @@ pub fn deny_default_paths() -> Vec<PathBuf> {
         ".config/gh",
         ".cargo/credentials.toml",
     ];
-    relative.iter().map(|r| home.join(r)).collect()
+    canonicalize_root_set(
+        &relative
+            .iter()
+            .map(|relative| home.join(relative))
+            .collect::<Vec<_>>(),
+        "deny",
+    )
 }
 
-/// Resolve the real user home directory without pulling extra deps: prefer the
-/// platform env var, matching how the rest of tirith-core finds HOME. Returns
-/// `None` when unset (CI/sandbox), which makes [`deny_default_paths`] empty.
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
+#[cfg(unix)]
+fn authenticated_home_dir() -> Result<PathBuf, FilesystemPolicyError> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const FALLBACK_BUFFER_BYTES: usize = 16 * 1024;
+    const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+
+    // SAFETY: sysconf and geteuid take no pointers and have no preconditions.
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut capacity = if suggested > 0 {
+        usize::try_from(suggested)
+            .unwrap_or(FALLBACK_BUFFER_BYTES)
+            .clamp(FALLBACK_BUFFER_BYTES, MAX_BUFFER_BYTES)
+    } else {
+        FALLBACK_BUFFER_BYTES
+    };
+    // SAFETY: geteuid has no preconditions and identifies the process credentials
+    // that the capsule launch will actually run under.
+    let effective_uid = unsafe { libc::geteuid() };
+
+    loop {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; capacity];
+        // SAFETY: all output pointers and the writable buffer live for the call;
+        // getpwuid_r writes at most buffer.len() bytes and initializes `record` only
+        // on a successful lookup with a non-null result pointer.
+        let status = unsafe {
+            libc::getpwuid_r(
+                effective_uid,
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && capacity < MAX_BUFFER_BYTES {
+            capacity = capacity.saturating_mul(2).min(MAX_BUFFER_BYTES);
+            continue;
+        }
+        if status != 0 {
+            return Err(FilesystemPolicyError::new(format!(
+                "cannot resolve effective UID {effective_uid} home with getpwuid_r: OS error {status}"
+            )));
+        }
+        if result.is_null() {
+            return Err(FilesystemPolicyError::new(format!(
+                "effective UID {effective_uid} has no account database entry"
+            )));
+        }
+        // SAFETY: successful non-null getpwuid_r initialized `record`; pw_dir points
+        // into `buffer`, which remains alive through the copy below.
+        let record = unsafe { record.assume_init() };
+        if record.pw_dir.is_null() {
+            return Err(FilesystemPolicyError::new(format!(
+                "effective UID {effective_uid} account entry has no home directory"
+            )));
+        }
+        // SAFETY: POSIX specifies a NUL-terminated pw_dir on successful lookup.
+        let bytes = unsafe { CStr::from_ptr(record.pw_dir) }.to_bytes();
+        if bytes.is_empty() {
+            return Err(FilesystemPolicyError::new(format!(
+                "effective UID {effective_uid} account entry has an empty home directory"
+            )));
+        }
+        return canonicalize_authenticated_home(Path::new(OsStr::from_bytes(bytes)));
     }
-    #[cfg(not(windows))]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn authenticated_home_dir() -> Result<PathBuf, FilesystemPolicyError> {
+    use ::windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use ::windows::Win32::Security::TOKEN_QUERY;
+    use ::windows::Win32::System::Com::CoTaskMemFree;
+    use ::windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use ::windows::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    use std::os::windows::ffi::OsStringExt as _;
+
+    struct ProcessToken(HANDLE);
+
+    impl Drop for ProcessToken {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper owns the handle returned by OpenProcessToken.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
     }
+
+    let mut token = HANDLE::default();
+    // SAFETY: `token` is a valid out-pointer and the pseudo process handle remains
+    // valid for the duration of the call.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.map_err(|error| {
+        FilesystemPolicyError::new(format!("cannot open current process token: {error}"))
+    })?;
+    let token = ProcessToken(token);
+
+    // SAFETY: the fixed known-folder ID and owned process token are valid, and
+    // Windows owns the returned allocation until CoTaskMemFree below.
+    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_Profile, KF_FLAG_DEFAULT, Some(token.0)) }
+        .map_err(|error| {
+            FilesystemPolicyError::new(format!(
+                "cannot resolve the process-token profile directory: {error}"
+            ))
+        })?;
+    // SAFETY: a successful call returned a valid NUL-terminated allocation.
+    let home = OsString::from_wide(unsafe { raw.as_wide() });
+    // SAFETY: SHGetKnownFolderPath transfers exactly one COM task allocation.
+    unsafe { CoTaskMemFree(Some(raw.as_ptr().cast())) };
+    canonicalize_authenticated_home(Path::new(&home))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn authenticated_home_dir() -> Result<PathBuf, FilesystemPolicyError> {
+    Err(FilesystemPolicyError::new(
+        "authenticated home lookup is unsupported on this platform",
+    ))
+}
+
+fn canonicalize_authenticated_home(home: &Path) -> Result<PathBuf, FilesystemPolicyError> {
+    if home.as_os_str().is_empty() || !home.is_absolute() {
+        return Err(FilesystemPolicyError::new(
+            "the OS account database returned an empty or relative home directory",
+        ));
+    }
+    let canonical = std::fs::canonicalize(home).map_err(|error| {
+        FilesystemPolicyError::new(format!(
+            "cannot canonicalize authenticated home {}: {error}",
+            home.display()
+        ))
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        FilesystemPolicyError::new(format!(
+            "cannot inspect authenticated home {}: {error}",
+            canonical.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(FilesystemPolicyError::new(format!(
+            "authenticated home {} is not a directory",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 fn default_true() -> bool {
@@ -930,13 +1334,194 @@ mod tests {
 
     #[test]
     fn filesystem_deny_by_default_seeds_deny_roots() {
-        // With HOME set, deny_by_default carries the sensitive subtrees.
-        // (When HOME is unset the list is empty; either way read/write start bare.)
+        // The OS-authenticated account home, not HOME, seeds the sensitive roots.
+        // A lookup failure produces a poison root that every backend rejects.
         let fs = FilesystemPolicy::deny_by_default();
         assert!(fs.read_roots.is_empty());
         assert!(fs.write_roots.is_empty());
         // deny_roots mirrors deny_default_paths().
         assert_eq!(fs.deny_roots, deny_default_paths());
+    }
+
+    #[test]
+    fn filesystem_policy_rejects_exact_equivalent_allow_and_deny_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sensitive = temp.path().join("sensitive");
+        std::fs::create_dir(&sensitive).expect("create sensitive directory");
+        let equivalent = temp.path().join("unused").join("..").join("sensitive");
+        let policy = FilesystemPolicy {
+            read_roots: vec![equivalent],
+            write_roots: Vec::new(),
+            deny_roots: vec![sensitive],
+        };
+
+        let error = canonicalize_and_validate_filesystem_policy(&policy)
+            .expect_err("equivalent allow and deny roots must be rejected");
+        assert!(error.to_string().contains("overlaps deny root"));
+    }
+
+    #[test]
+    fn filesystem_policy_rejects_allow_parent_of_deny_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let denied = temp.path().join("credentials");
+        std::fs::create_dir(&denied).expect("create denied directory");
+        let policy = FilesystemPolicy {
+            read_roots: vec![temp.path().to_path_buf()],
+            write_roots: Vec::new(),
+            deny_roots: vec![denied],
+        };
+
+        assert!(canonicalize_and_validate_filesystem_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn filesystem_policy_rejects_unresolved_empty_deny_root() {
+        let policy = FilesystemPolicy {
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+            deny_roots: vec![PathBuf::new()],
+        };
+
+        let error = canonicalize_and_validate_filesystem_policy(&policy)
+            .expect_err("unresolved deny marker must fail closed");
+        assert!(error.to_string().contains("deny root #0 is empty"));
+    }
+
+    #[test]
+    fn filesystem_policy_rejects_deny_parent_of_allow_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let allowed = temp.path().join("credentials").join("public");
+        std::fs::create_dir_all(&allowed).expect("create allowed directory");
+        let policy = FilesystemPolicy {
+            read_roots: Vec::new(),
+            write_roots: vec![allowed],
+            deny_roots: vec![temp.path().join("credentials")],
+        };
+
+        assert!(canonicalize_and_validate_filesystem_policy(&policy).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_policy_rejects_symlink_alias_of_covering_allow_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real = temp.path().join("real-home");
+        let denied = real.join(".ssh");
+        std::fs::create_dir_all(&denied).expect("create denied directory");
+        let alias = temp.path().join("home-alias");
+        symlink(&real, &alias).expect("create home symlink");
+        let policy = FilesystemPolicy {
+            read_roots: vec![alias],
+            write_roots: Vec::new(),
+            deny_roots: vec![denied],
+        };
+
+        assert!(canonicalize_and_validate_filesystem_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn filesystem_policy_preserves_canonical_disjoint_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let allowed = temp.path().join("allowed");
+        let denied = temp.path().join("denied");
+        std::fs::create_dir(&allowed).expect("create allowed directory");
+        std::fs::create_dir(&denied).expect("create denied directory");
+        let policy = FilesystemPolicy {
+            read_roots: vec![allowed.clone(), allowed.clone()],
+            write_roots: Vec::new(),
+            deny_roots: vec![denied.clone()],
+        };
+
+        let validated = canonicalize_and_validate_filesystem_policy(&policy)
+            .expect("disjoint roots must remain representable");
+        assert_eq!(
+            validated.read_roots,
+            vec![std::fs::canonicalize(allowed).expect("canonical allowed")]
+        );
+        assert_eq!(
+            validated.deny_roots,
+            vec![std::fs::canonicalize(denied).expect("canonical denied")]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_policy_compares_missing_windows_suffixes_case_insensitively() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let policy = FilesystemPolicy {
+            read_roots: vec![temp.path().join("CREDENTIALS")],
+            write_roots: Vec::new(),
+            deny_roots: vec![temp.path().join("credentials")],
+        };
+
+        assert!(
+            canonicalize_and_validate_filesystem_policy(&policy).is_err(),
+            "Windows path aliases that differ only in case must overlap"
+        );
+    }
+
+    const AUTH_HOME_CHILD_MARKER: &str = "TIRITH_TEST_AUTH_HOME_CHILD";
+    const AUTH_HOME_EXPECTED: &str = "TIRITH_TEST_AUTH_HOME_EXPECTED";
+    const AUTH_HOME_SPOOF: &str = "TIRITH_TEST_AUTH_HOME_SPOOF";
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn authenticated_home_spoof_probe_child() {
+        let Some(expected) = std::env::var_os(AUTH_HOME_EXPECTED) else {
+            return;
+        };
+        if std::env::var_os(AUTH_HOME_CHILD_MARKER).is_none() {
+            return;
+        }
+        let spoof = PathBuf::from(
+            std::env::var_os(AUTH_HOME_SPOOF).expect("child spoof path must be provided"),
+        );
+        let resolved = authenticated_home_dir().expect("authenticated home must resolve");
+        assert_eq!(resolved, PathBuf::from(expected));
+        assert_ne!(resolved, spoof);
+        for denied in try_deny_default_paths().expect("default denies must resolve") {
+            assert!(
+                !denied.starts_with(&spoof),
+                "deny root followed spoofed HOME/USERPROFILE: {}",
+                denied.display()
+            );
+        }
+        eprintln!("tirith-authenticated-home-spoof-probe-ran");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn authenticated_home_ignores_environment_spoof() {
+        let expected = authenticated_home_dir().expect("authenticated home must resolve");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spoof = std::fs::canonicalize(temp.path()).expect("canonical spoof directory");
+        assert_ne!(expected, spoof, "test spoof must differ from account home");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "capsule::tests::authenticated_home_spoof_probe_child",
+                "--nocapture",
+            ])
+            .env(AUTH_HOME_CHILD_MARKER, "1")
+            .env(AUTH_HOME_EXPECTED, &expected)
+            .env(AUTH_HOME_SPOOF, &spoof)
+            .env("HOME", &spoof)
+            .env("USERPROFILE", &spoof)
+            .output()
+            .expect("run isolated environment-spoof probe");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "child probe failed: {combined}");
+        assert!(
+            combined.contains("tirith-authenticated-home-spoof-probe-ran"),
+            "child probe did not execute: {combined}"
+        );
     }
 
     #[test]

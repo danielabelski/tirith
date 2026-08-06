@@ -1,7 +1,7 @@
 //! Filesystem helpers for `tirith setup` — atomic writes, hook scripts,
 //! directory validation, CLI subprocess runner, and backup management.
 
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -202,9 +202,12 @@ struct StableFileState {
 type CleanupFailures = Rc<RefCell<Vec<String>>>;
 
 #[cfg(test)]
+type BackupRetirementTestHook = RefCell<Option<Box<dyn FnMut(&Path)>>>;
+
+#[cfg(test)]
 thread_local! {
     static SCRUB_FAILURE_TEST_HOOK: RefCell<Option<&'static str>> = const { RefCell::new(None) };
-    static BACKUP_RETIREMENT_TEST_HOOK: RefCell<Option<Box<dyn FnMut(&Path)>>> = RefCell::new(None);
+    static BACKUP_RETIREMENT_TEST_HOOK: BackupRetirementTestHook = RefCell::new(None);
 }
 
 fn inject_scrub_failure(_label: &str) -> Result<(), String> {
@@ -2041,13 +2044,88 @@ pub fn validate_target_dir(dir: &Path, scope_root: Option<&Path>) -> Result<(), 
     Ok(())
 }
 
-/// Run a CLI subprocess through the shared trusted, bounded supervisor.
-pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String> {
+/// Retire an obsolete content-addressed Codex gateway generation after its
+/// registration has been replaced successfully. The exact old inode is moved
+/// to an unpredictable provenance-bound tombstone through a held parent
+/// capability, scrubbed, and left available to the bounded setup temp pool.
+pub fn retire_codex_gateway_generation(path: &Path, scope_root: &Path) -> Result<(), String> {
+    let lock = PlatformTransaction::lock(path, scope_root)?;
+    let transaction = PlatformTransaction::begin(path, scope_root, lock)?;
+    let snapshot = transaction.read_snapshot()?;
+    let Some(bytes) = snapshot.bytes.as_deref() else {
+        return Ok(());
+    };
+    let digest = Sha256::digest(bytes);
+    let expected_name = format!("gateway-sha256-{}.yaml", hex_bytes(&digest));
+    if path.file_name() != Some(OsStr::new(&expected_name)) {
+        return Err(format!(
+            "{} is not named for its exact gateway content; refusing retirement",
+            path.display()
+        ));
+    }
+    transaction.validate_snapshot(&snapshot)?;
+    let expected_state = stable_state_from_snapshot(&snapshot)
+        .ok_or_else(|| "gateway retirement snapshot has no stable file state".to_string())?;
+    if expected_state.owner != unsafe { libc::geteuid() } || expected_state.links != 1 {
+        return Err(format!(
+            "{} is not a single-link current-user file; refusing retirement",
+            path.display()
+        ));
+    }
+    let (mut file, state) = open_stable_file_at_with_access(
+        &transaction.parent.dir,
+        &transaction.parent.name,
+        libc::O_RDWR,
+    )?
+    .ok_or_else(|| format!("{} disappeared before retirement", path.display()))?;
+    if state != expected_state {
+        return Err(format!("{} changed before retirement", path.display()));
+    }
+
+    let mut retired_name = tombstone_name(&state);
+    move_no_replace(
+        &transaction.parent.dir,
+        &transaction.parent.name,
+        &retired_name,
+    )
+    .map_err(|error| format!("retire gateway generation {}: {error}", path.display()))?;
+    if stable_state_at(&transaction.parent.dir, &retired_name)?.as_ref() != Some(&state)
+        || stable_state_at(&transaction.parent.dir, &transaction.parent.name)?.is_some()
+    {
+        let _ = move_no_replace(
+            &transaction.parent.dir,
+            &retired_name,
+            &transaction.parent.name,
+        );
+        return Err(format!(
+            "could not prove the exact identity retired from {}",
+            path.display()
+        ));
+    }
+    scrub_guard_file(&mut file, "retired Codex gateway generation")?;
+    normalize_tombstone_name(&transaction.parent.dir, &mut retired_name, &file)?;
+    transaction
+        .parent
+        .dir
+        .sync_all()
+        .map_err(|error| format!("sync retired gateway generation: {error}"))?;
+    Ok(())
+}
+
+/// Run Codex with an explicitly selected project working directory. Codex's
+/// global `-C` option preserves its project/user configuration semantics while the
+/// supervised child itself keeps a loader-safe working directory on Windows.
+pub fn run_codex_cli_in_dir(
+    cwd: &Path,
+    cmd: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     let executable = tirith_core::trusted_child::resolve_ambient(cmd)
         .map_err(|error| format!("{cmd} not found or untrusted: {error}"))?;
-    run_cli_with(
+    let scoped_args = codex_scoped_args(cwd, args);
+    run_cli_bounded(
         &executable,
-        args,
+        &scoped_args,
         tirith_core::trusted_child::ChildLimits::new(
             std::time::Duration::from_secs(30),
             4 * 1024 * 1024,
@@ -2056,14 +2134,22 @@ pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String>
     )
 }
 
-fn run_cli_with(
+fn codex_scoped_args(cwd: &Path, args: &[&str]) -> Vec<OsString> {
+    let mut scoped = Vec::with_capacity(args.len() + 2);
+    scoped.push(OsString::from("-C"));
+    scoped.push(cwd.as_os_str().to_os_string());
+    scoped.extend(args.iter().map(|arg| OsString::from(*arg)));
+    scoped
+}
+
+fn run_cli_bounded<S: AsRef<OsStr>>(
     executable: &tirith_core::trusted_child::TrustedExecutable,
-    args: &[&str],
+    args: &[S],
     limits: tirith_core::trusted_child::ChildLimits,
 ) -> Result<std::process::Output, String> {
     use tirith_core::trusted_child::{ChildOutcome, ChildSpec};
 
-    let mut spec = ChildSpec::new(args, limits).inherit_env(&[
+    let mut spec = ChildSpec::new(args.iter().map(AsRef::as_ref), limits).inherit_env(&[
         "HOME",
         "USER",
         "LOGNAME",
@@ -2092,6 +2178,7 @@ fn run_cli_with(
         }),
         ChildOutcome::SpawnError(reason) => Err(format!("failed to start: {reason}")),
         ChildOutcome::WaitError(reason) => Err(format!("wait failed: {reason}")),
+        ChildOutcome::CleanupError(reason) => Err(format!("process-tree cleanup failed: {reason}")),
         ChildOutcome::Timeout {
             cleanup_succeeded: true,
         } => Err("timed out after 30s — check installation".into()),
@@ -2163,7 +2250,7 @@ mod tests {
         let shell =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
                 .unwrap();
-        let output = run_cli_with(
+        let output = run_cli_bounded(
             &shell,
             &["-c", "printf setup-ok"],
             tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(2), 64, 64),
@@ -2178,13 +2265,25 @@ mod tests {
         let shell =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
                 .unwrap();
-        let error = run_cli_with(
+        let error = run_cli_bounded(
             &shell,
             &["-c", "printf 12345"],
             tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(2), 4, 64),
         )
         .unwrap_err();
         assert!(error.contains("output limit"));
+    }
+
+    #[test]
+    fn codex_scope_uses_cli_cd_without_mutating_child_cwd() {
+        let args = codex_scoped_args(Path::new("/tmp/codex-scope"), &["mcp", "list", "--json"]);
+        assert_eq!(
+            args,
+            ["-C", "/tmp/codex-scope", "mcp", "list", "--json"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2341,6 +2440,52 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!outside.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn transaction_parent_swap_stays_bound_to_the_retained_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = root.path().join("hooks");
+        let retained_parent = root.path().join("hooks-held");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.json");
+        fs::write(&path, "before").unwrap();
+        let outside_path = outside.path().join("config.json");
+        fs::write(&outside_path, "outside-sentinel").unwrap();
+
+        let outcome = transactional_update_with_hook(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("after".into(), 0o600)),
+            |stage| {
+                if stage == TestStage::PublicationReady {
+                    fs::rename(&parent, &retained_parent).unwrap();
+                    std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, TransactionOutcome::Written);
+        assert_eq!(
+            fs::read_to_string(retained_parent.join("config.json")).unwrap(),
+            "after"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_path).unwrap(),
+            "outside-sentinel"
+        );
+        let outside_entries = fs::read_dir(outside.path())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            outside_entries.len(),
+            1,
+            "no temporary or backup artifact may be created through the replacement symlink"
+        );
     }
 
     #[test]

@@ -832,7 +832,11 @@ scan:
     lock.servers[0].descriptors_approved = true;
     let lock_dir = repo.path().join(".tirith");
     // .tirith already exists from make_repo (it holds policy.yaml).
-    fs::write(lock_dir.join("mcp.lock"), lock.render()).unwrap();
+    fs::write(
+        lock_dir.join("mcp.lock"),
+        lock.render().expect("render MCP lockfile"),
+    )
+    .unwrap();
 
     let verdict = scan_config_file(&repo, ".tirith/mcp.lock");
     let drift_findings: Vec<&_> = verdict

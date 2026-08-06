@@ -519,6 +519,7 @@ fn build_suggestion(
 
 /// Shell interpreters whose stdin invocation contract is represented by
 /// [`crate::runner::PipeInterpreter`].
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn pipe_interpreter(name: &str) -> Option<crate::runner::PipeInterpreter> {
     name.parse().ok()
 }
@@ -576,16 +577,21 @@ fn rewrite_pipe_to_shell(
         return None;
     }
     let sink_cmd = decode_shell_literal(sink.command.as_deref()?, shell)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let interpreter = pipe_interpreter(&sink_cmd)?;
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = &sink_cmd;
 
     let source_args = decode_literal_words(&source.args, shell)?;
     let url = supported_fetch_url(&source_cmd, &source_args)?;
     let sink_args = decode_literal_words(&sink.args, shell)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if !crate::runner::pipe_interpreter_args_supported(interpreter, &sink_args) {
         return None;
     }
 
     let encoded_url = encode_shell_literal(&url, shell)?;
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         let path = trusted_runner?.to_str()?;
@@ -606,7 +612,7 @@ fn rewrite_pipe_to_shell(
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        let _ = (encoded_url, sink_args, interpreter);
+        let _ = (encoded_url, sink_args);
         None
     }
 }

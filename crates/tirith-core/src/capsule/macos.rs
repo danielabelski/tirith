@@ -29,10 +29,10 @@
 //!
 //! - filesystem: `(allow file-read* (subpath "<root>"))` for each read root and
 //!   `(allow file-read* file-write* (subpath "<root>"))` for each write root,
-//!   over the `(deny default)` base. The sensitive subtrees in
-//!   [`crate::capsule::deny_default_paths`] are denied for free by the default
-//!   deny unless a grant explicitly covers them (the locked-down default grants
-//!   nothing, so they stay denied).
+//!   over the `(deny default)` base. The shared canonical policy gate proves the
+//!   sensitive subtrees in [`crate::capsule::deny_default_paths`] are disjoint from
+//!   every positive grant; a covering grant is refused before launch because this
+//!   profile has no independently-proven deny carve-out.
 //! - network: `(deny network*)` for a [`NetworkPolicy::DenyAll`] spec; for an
 //!   [`NetworkPolicy::AllowListedDomains`] spec, `(deny network*)` with a single
 //!   carve-out `(allow network-outbound (remote ip "localhost:*"))` so the child
@@ -62,8 +62,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use super::{
-    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, FilesystemPolicy, NetworkPolicy,
-    ResourceLimitSupport,
+    canonicalize_and_validate_filesystem_policy, CapabilityLevel, Capsule, CapsuleCoverage,
+    CapsuleSpec, FilesystemPolicy, NetworkPolicy, ResourceLimitSupport,
 };
 
 /// The stable backend identifier reported in receipts and `tirith doctor`.
@@ -155,8 +155,9 @@ fn path_is_executable_file(path: &Path) -> bool {
 }
 
 /// Derive the coverage the backend can honestly claim for `spec`, given the
-/// `sandbox-exec` probe. **Pure** (no syscalls / spawns), so every branch of the
-/// honesty contract is unit-testable on any platform.
+/// `sandbox-exec` probe. It performs only read-only canonicalization and SBPL path
+/// representation checks (no process spawn), so every branch of the honesty
+/// contract remains unit-testable.
 ///
 /// Rules:
 /// - If `sandbox-exec` is **not** usable, every flag is `false` (degraded; the
@@ -211,12 +212,15 @@ pub fn derive_coverage(spec: &CapsuleSpec, probe: &SeatbeltProbe) -> CapsuleCove
         // Degraded, never NoOp-success: nothing is enforced.
         return CapsuleCoverage::NONE;
     }
+    let filesystem_policy_valid = validated_seatbelt_filesystem(&spec.filesystem).is_ok();
     // Report the aggregate bit only when the wrapper enforces every requested
     // dimension. A supported CPU limit cannot hide an unsupported process, output,
     // or wall-clock limit.
     CapsuleCoverage {
-        fs_read_enforced: true,
-        fs_write_enforced: true,
+        // Positive SBPL grants cannot safely carve out a denied descendant. Do not
+        // claim FS enforcement if canonical overlap or path representation fails.
+        fs_read_enforced: filesystem_policy_valid,
+        fs_write_enforced: filesystem_policy_valid,
         exec_limited: true,
         // `(deny network*)` denies raw sockets; the allow-list carve-out is
         // localhost-only, so raw public egress is denied in both modes.
@@ -239,6 +243,9 @@ pub enum SeatbeltError {
     /// The requested containment level cannot be honored by E3's backend (an
     /// allow-listed-domains spec, which needs the CLI-crate broker wired in E5).
     Unsupported(String),
+    /// The canonical filesystem policy is ambiguous or cannot be represented by
+    /// this positive-grant Seatbelt profile.
+    InvalidFilesystemPolicy(String),
     /// A path could not be represented safely in an SBPL string (e.g. it is not
     /// valid UTF-8, or contains a character the profile cannot quote).
     UnrepresentablePath(String),
@@ -251,6 +258,9 @@ impl std::fmt::Display for SeatbeltError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SeatbeltError::Unsupported(m) => write!(f, "unsupported containment: {m}"),
+            SeatbeltError::InvalidFilesystemPolicy(m) => {
+                write!(f, "invalid filesystem policy: {m}")
+            }
             SeatbeltError::UnrepresentablePath(m) => write!(f, "unrepresentable path: {m}"),
             SeatbeltError::NulInArgument(m) => write!(f, "argument contains NUL: {m}"),
         }
@@ -259,9 +269,10 @@ impl std::fmt::Display for SeatbeltError {
 
 impl std::error::Error for SeatbeltError {}
 
-/// Build the Seatbelt SBPL profile for `spec`. **Pure** — returns the profile text
-/// the E5 wrapper hands to `sandbox-exec -p`. The profile is `(deny default)` plus
-/// the spec's grants; see the module docs for the exact shape.
+/// Build the Seatbelt SBPL profile for `spec`. It performs read-only root
+/// canonicalization and returns the profile text the E5 wrapper hands to
+/// `sandbox-exec -p`; it does not spawn or mutate process state. The profile is
+/// `(deny default)` plus the spec's grants; see the module docs for the exact shape.
 ///
 /// Errors when a read/write root cannot be represented as an SBPL `subpath` string
 /// (non-UTF-8 path or a path containing a double-quote / backslash that SBPL string
@@ -273,6 +284,10 @@ impl std::error::Error for SeatbeltError {}
 /// question answered by [`derive_coverage`] / [`available_coverage`], which keep
 /// `domain_proxy_enforced` false until E5 wires the broker.
 pub fn sandbox_profile(spec: &CapsuleSpec) -> Result<String, SeatbeltError> {
+    // Validate before constructing a launch artifact and emit exactly the canonical
+    // roots that were checked. Seatbelt grants are positive and cannot be assumed to
+    // honor a separate deny beneath a covering allow.
+    let filesystem = validated_seatbelt_filesystem(&spec.filesystem)?;
     let mut p = String::new();
     // SBPL version header + default-deny. `(version 1)` is the stable SBPL dialect
     // `sandbox-exec` accepts.
@@ -285,7 +300,7 @@ pub fn sandbox_profile(spec: &CapsuleSpec) -> Result<String, SeatbeltError> {
     p.push_str(SANDBOX_BASE_EXEC_ALLOW);
 
     // Filesystem grants over the default deny.
-    push_filesystem_rules(&mut p, &spec.filesystem)?;
+    push_filesystem_rules(&mut p, &filesystem)?;
 
     // Network policy.
     match &spec.network {
@@ -308,6 +323,38 @@ pub fn sandbox_profile(spec: &CapsuleSpec) -> Result<String, SeatbeltError> {
     }
 
     Ok(p)
+}
+
+fn validated_seatbelt_filesystem(
+    filesystem: &FilesystemPolicy,
+) -> Result<FilesystemPolicy, SeatbeltError> {
+    // Reject an unencodable caller spelling before any filesystem lookup or
+    // canonicalization. Otherwise a quote/backslash path whose existing prefix
+    // cannot be resolved can be misclassified as an invalid policy even though
+    // the primary failure is that SBPL cannot represent the requested grant.
+    // Re-check the canonical roots below so aliases introduced while resolving
+    // the policy must also remain representable.
+    for root in filesystem
+        .read_roots
+        .iter()
+        .chain(&filesystem.write_roots)
+        .chain(&filesystem.deny_roots)
+    {
+        sbpl_path_literal(root)?;
+    }
+    let canonical = canonicalize_and_validate_filesystem_policy(filesystem)
+        .map_err(|error| SeatbeltError::InvalidFilesystemPolicy(error.to_string()))?;
+    // Validate every requested root, including implicit deny roots, before claiming
+    // that this policy can be faithfully represented by the profile backend.
+    for root in canonical
+        .read_roots
+        .iter()
+        .chain(&canonical.write_roots)
+        .chain(&canonical.deny_roots)
+    {
+        sbpl_path_literal(root)?;
+    }
+    Ok(canonical)
 }
 
 /// The minimal read-only system allowances every contained child needs just to
@@ -381,8 +428,9 @@ fn sbpl_path_literal(path: &Path) -> Result<String, SeatbeltError> {
 }
 
 /// Build the full `sandbox-exec` argv for a contained launch:
-/// `[/usr/bin/sandbox-exec, -p, <profile>, --, <prog>, <arg>...]`. **Pure** — the
-/// E5 wrapper feeds this to a `Command`/`posix_spawn`. Refuses an allow-listed
+/// `[/usr/bin/sandbox-exec, -p, <profile>, --, <prog>, <arg>...]`. Building performs
+/// only read-only policy validation; the E5 wrapper feeds the result to a
+/// `Command`/`posix_spawn`. Refuses an allow-listed
 /// spec (E3 has no verified broker-pinned egress backend; consistent with
 /// [`derive_coverage`] reporting that level degraded) and rejects a program/arg
 /// with an interior NUL.
@@ -517,6 +565,38 @@ mod tests {
     }
 
     #[test]
+    fn derive_coverage_does_not_claim_fs_for_overlapping_deny_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let denied = temp.path().join(".ssh");
+        std::fs::create_dir(&denied).expect("create denied root");
+        let mut spec = CapsuleSpec::locked_down();
+        spec.filesystem.read_roots = vec![temp.path().to_path_buf()];
+        spec.filesystem.deny_roots = vec![denied];
+        let probe = SeatbeltProbe {
+            sandbox_exec_usable: true,
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(!coverage.fs_read_enforced);
+        assert!(!coverage.fs_write_enforced);
+        assert!(coverage.is_degraded_against(&spec.required_coverage()));
+    }
+
+    #[test]
+    fn derive_coverage_does_not_claim_fs_for_unrepresentable_deny_root() {
+        let mut spec = CapsuleSpec::locked_down();
+        spec.filesystem.deny_roots = vec![PathBuf::from("/tmp/credential\"store")];
+        let probe = SeatbeltProbe {
+            sandbox_exec_usable: true,
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(!coverage.fs_read_enforced);
+        assert!(!coverage.fs_write_enforced);
+        assert!(sandbox_profile(&spec).is_err());
+    }
+
+    #[test]
     fn derive_coverage_locked_down_is_degraded_on_unenforced_resource_dimensions() {
         // The wrapper delivers filesystem, network, env, handle, and its supported
         // rlimits, but locked_down also requests process/output/wall dimensions it
@@ -613,17 +693,41 @@ mod tests {
 
     #[test]
     fn profile_emits_read_and_write_subpaths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let read = temp.path().join("read-data");
+        let write = temp.path().join("build-out");
+        std::fs::create_dir(&read).expect("create read root");
+        std::fs::create_dir(&write).expect("create write root");
         let mut spec = CapsuleSpec::locked_down();
-        spec.filesystem.read_roots.push(PathBuf::from("/opt/data"));
-        spec.filesystem
-            .write_roots
-            .push(PathBuf::from("/tmp/build-out"));
+        spec.filesystem.read_roots.push(read.clone());
+        spec.filesystem.write_roots.push(write.clone());
         let profile = sandbox_profile(&spec).expect("profile");
-        assert!(profile.contains("(allow file-read* (subpath \"/opt/data\"))"));
+        let read = std::fs::canonicalize(read).expect("canonical read root");
+        let write = std::fs::canonicalize(write).expect("canonical write root");
+        assert!(profile.contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            read.display()
+        )));
         assert!(
-            profile.contains("(allow file-read* file-write* (subpath \"/tmp/build-out\"))"),
+            profile.contains(&format!(
+                "(allow file-read* file-write* (subpath \"{}\"))",
+                write.display()
+            )),
             "write root must imply read+write: {profile}"
         );
+    }
+
+    #[test]
+    fn profile_refuses_covering_allow_before_launch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let denied = temp.path().join("credentials");
+        std::fs::create_dir(&denied).expect("create denied root");
+        let mut spec = CapsuleSpec::locked_down();
+        spec.filesystem.read_roots = vec![temp.path().to_path_buf()];
+        spec.filesystem.deny_roots = vec![denied];
+
+        let error = sandbox_profile(&spec).expect_err("overlap must fail closed");
+        assert!(matches!(error, SeatbeltError::InvalidFilesystemPolicy(_)));
     }
 
     #[test]

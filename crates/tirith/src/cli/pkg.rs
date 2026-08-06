@@ -41,14 +41,16 @@
 use std::path::{Path, PathBuf};
 
 use tirith_core::artifact::install::{
-    installed_distribution_names, rebind_for_install, verify_post_install_record,
-    DigestInstallPlan, InstallCommand, InstallError, InstallPlanDigest, InstallPlanInputs,
+    installed_distribution_identities, installed_distribution_names, rebind_for_install,
+    verify_post_install_record, DigestInstallPlan, ExpectedInstalledDistribution, InstallCommand,
+    InstallError, InstallPlanDigest, InstallPlanInputs,
 };
 use tirith_core::artifact::quarantine::{QuarantineError, QuarantineStore, QuarantineTransaction};
 use tirith_core::artifact::resolver::{
-    enroll_resolver_tool, resolve_into_quarantine_with_artifact_origins,
-    validate_resolver_request_with_artifact_origins, ResolvedSet, ResolverError, ResolverRequest,
-    ResolverTools,
+    enroll_resolver_tool, resolve_into_quarantine_with_bound_tools,
+    validate_resolver_request_with_artifact_origins, BoundResolverTools, ResolvedSet,
+    ResolverError, ResolverRequest, ResolverTools, PIP_TREE_BINDING_VERSION, PIP_TREE_MAX_BYTES,
+    PIP_TREE_MAX_FILES, PIP_TREE_MAX_FILE_BYTES, PIP_TREE_MAX_PATH_BYTES,
 };
 use tirith_core::policy::Policy;
 use tirith_core::receipt::ArtifactScanReceipt;
@@ -56,7 +58,8 @@ use tirith_core::threatdb::ThreatDb;
 
 use crate::cli::capsule::{self, DegradedPolicy};
 use crate::cli::pkg_install::{
-    record_install_receipt, run_contained_install, EnvironmentCheckpoint, ResolverProvenance,
+    build_install_receipt, run_contained_install, ContainedInstallError, EnvironmentCheckpoint,
+    InstallTargetBinding, ResolverProvenance,
 };
 
 /// tirith-owned options that no package manager interprets. If one of these appears
@@ -196,63 +199,112 @@ pub fn run(action: PkgAction) -> i32 {
 // ---------------------------------------------------------------------------
 
 /// Refuse a non-pip ecosystem (only Python is enforced in v1) and refuse a
-/// misplaced tirith-owned flag in the requirement list. Returns `Some(exit_code)`
-/// when the caller should stop, `None` to proceed.
-fn precheck(ecosystem: Ecosystem, requirements: &[String]) -> Option<i32> {
+/// misplaced tirith-owned flag in the requirement list. The check is presentation-
+/// free so `--json` callers can emit one structured document without a preceding
+/// human diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PkgPrecheckFailure {
+    exit_code: i32,
+    reason: String,
+}
+
+fn precheck(ecosystem: Ecosystem, requirements: &[String]) -> Option<PkgPrecheckFailure> {
     if ecosystem != Ecosystem::Pip {
-        eprintln!(
-            "tirith pkg: only `pip` is enforced in this version; `{}` is not yet supported \
+        return Some(PkgPrecheckFailure {
+            exit_code: 2,
+            reason: format!(
+                "only `pip` is enforced in this version; `{}` is not yet supported \
              (npm / cargo resolve-and-inspect lives behind hidden experimental flags and cannot \
              install). Use `tirith install {}` for analysis-only.",
-            ecosystem.label(),
-            ecosystem.label()
-        );
-        return Some(2);
+                ecosystem.label(),
+                ecosystem.label()
+            ),
+        });
     }
     if let Some(flag) = requirements
         .iter()
         .find(|a| MISPLACED_TIRITH_FLAGS.contains(&a.as_str()))
     {
-        eprintln!(
-            "tirith pkg: `{flag}` is a tirith option and must come before the requirement list \
+        return Some(PkgPrecheckFailure {
+            exit_code: 2,
+            reason: format!(
+                "`{flag}` is a tirith option and must come before the requirement list \
              (e.g. `tirith pkg install pip {flag} requests==2.31.0`). After the ecosystem, \
              arguments are package requirements, so a misplaced `{flag}` would not affect tirith."
-        );
-        return Some(2);
+            ),
+        });
     }
     if requirements.is_empty() {
-        eprintln!(
-            "tirith pkg: no requirements given. try: tirith pkg install pip requests==2.31.0"
-        );
-        return Some(2);
+        return Some(PkgPrecheckFailure {
+            exit_code: 2,
+            reason: "no requirements given. try: tirith pkg install pip requests==2.31.0 --target .tirith-pkg"
+                .to_string(),
+        });
     }
     None
 }
 
-/// The interpreter + target environment an install/approve binds to. The target
-/// environment is where pip installs (a `--target` dir or the resolved
-/// interpreter's prefix); the interpreter is the resolved `python` the contained
-/// `python -m pip` runs.
+fn report_pkg_precheck_failure(
+    command: &'static str,
+    failure: &PkgPrecheckFailure,
+    json: bool,
+) -> i32 {
+    if json {
+        let value = serde_json::json!({
+            "success": false,
+            "command": command,
+            "error_phase": "precheck",
+            "target_executed": false,
+            "target_published": false,
+            "reason": failure.reason.as_str(),
+        });
+        let _ = write_json_document(std::io::stdout().lock(), &value);
+    } else {
+        eprintln!(
+            "tirith pkg: {}",
+            crate::cli::sanitize_for_human_output(&failure.reason, false)
+        );
+    }
+    failure.exit_code
+}
+
+/// The interpreter + explicit dedicated target an install/approve binds to. The
+/// target is never inferred from the interpreter prefix; enforcing installs require
+/// a new `--target` directory whose canonical parent already exists.
+#[derive(Debug)]
 struct InstallTarget {
     interpreter: PathBuf,
     environment: PathBuf,
     extra_read_roots: Vec<PathBuf>,
+    /// Retains the exact canonical parent identity selected before resolution.
+    /// Checkpoint creation uses this descriptor rather than reopening the path.
+    binding: InstallTargetBinding,
 }
 
 impl InstallTarget {
-    /// Derive the install target from the resolved tools and an optional explicit
-    /// `--target` directory. When `--target` is given, that directory is the write
-    /// root (pip's `--target` semantics); otherwise the interpreter's prefix (its
-    /// parent's parent, the venv root) is used. The interpreter's prefix is always
-    /// granted READ so the interpreter can start.
-    fn derive(tools: &ResolverTools, target: Option<PathBuf>) -> Self {
-        Self::derive_from_interpreter(tools.python.clone(), target)
-    }
+    /// Bind an explicit, dedicated pip target. Inferring a write root from
+    /// `<python>/../..` can select `/usr`, `/opt/homebrew`, or another shared
+    /// installation prefix and make rollback copy an enormous unrelated tree.
+    fn derive_from_interpreter(
+        interpreter: PathBuf,
+        target: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let target = target.ok_or_else(|| {
+            "an explicit --target is required for enforcing installs; choose a new dedicated directory whose parent already exists"
+                .to_string()
+        })?;
+        let binding = InstallTargetBinding::bind(&target)
+            .map_err(|error| format!("cannot bind --target parent and final component: {error}"))?;
+        let environment = binding.target().to_path_buf();
+        if is_broad_install_target(&environment) {
+            return Err(format!(
+                "refusing broad/shared install target {}; choose a new dedicated package directory",
+                environment.display()
+            ));
+        }
 
-    fn derive_from_interpreter(interpreter: PathBuf, target: Option<PathBuf>) -> Self {
         // The interpreter prefix: `<prefix>/bin/python` -> `<prefix>`. Best-effort;
-        // a non-standard layout just grants the interpreter's own directory as a read
-        // root, which is still correct (it is where the interpreter lives).
+        // it is READ-only launch support and never becomes the install destination.
         let prefix = interpreter
             .parent()
             .and_then(|p| p.parent())
@@ -263,12 +315,39 @@ impl InstallTarget {
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| PathBuf::from("/"))
             });
-        let environment = target.unwrap_or_else(|| prefix.clone());
-        InstallTarget {
+        Ok(InstallTarget {
             interpreter,
             environment,
             extra_read_roots: vec![prefix],
-        }
+            binding,
+        })
+    }
+}
+
+fn is_broad_install_target(path: &Path) -> bool {
+    if path.parent().is_none() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        [
+            "/bin",
+            "/etc",
+            "/lib",
+            "/lib64",
+            "/opt",
+            "/opt/homebrew",
+            "/System",
+            "/Library",
+            "/usr",
+            "/usr/local",
+        ]
+        .iter()
+        .any(|root| path == Path::new(root))
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -282,6 +361,9 @@ struct PreparedPlan {
     target: InstallTarget,
     digest: InstallPlanDigest,
     txn: QuarantineTransaction,
+    /// Retains the exact resolver and interpreter identities, including Linux
+    /// sealed executable descriptors, through the offline install and receipt.
+    tools: BoundResolverTools,
     /// Retained so the transaction's lease (and temp tree) outlive the install.
     _store: QuarantineStore,
 }
@@ -309,8 +391,13 @@ fn prepare_plan(
     // quarantine creation, broker binding, DNS, or child execution.
     validate_resolver_request_with_artifact_origins(&request, artifact_origin)
         .map_err(PrepareError::Resolver)?;
-    let tools = ResolverTools::discover(&request.allowances).map_err(PrepareError::Resolver)?;
-    let target = InstallTarget::derive(&tools, target);
+    let discovered =
+        ResolverTools::discover(&request.allowances).map_err(PrepareError::Resolver)?;
+    // Bind the target parent and final component before any resolver/version child
+    // runs, so approval authority cannot race with tool probing or network resolve.
+    let target = InstallTarget::derive_from_interpreter(discovered.python.clone(), target)
+        .map_err(PrepareError::Target)?;
+    let tools = BoundResolverTools::bind(&discovered).map_err(PrepareError::Resolver)?;
 
     // A fresh quarantine transaction under the real data dir. The id is a
     // timestamp-derived component; the store validates it.
@@ -322,7 +409,7 @@ fn prepare_plan(
 
     // D2: resolve + download + ingest into the quarantine (re-hashing on the way in).
     let resolved =
-        resolve_into_quarantine_with_artifact_origins(&request, &tools, &txn, artifact_origin)
+        resolve_into_quarantine_with_bound_tools(&request, &tools, &txn, artifact_origin)
             .map_err(PrepareError::Resolver)?;
 
     // The live threat DB sequence the plan binds to. `cached()` is the same DB the
@@ -343,14 +430,17 @@ fn prepare_plan(
     )
     .map_err(PrepareError::Install)?;
 
-    // The capsule backend that WOULD run this install, probed without spawning, so
-    // the digest binds the backend + the required coverage the spec demands.
-    let backend = capsule::select_backend(&plan.spec);
+    // The backend id is compile-target stable. Probe it with a target-free spec:
+    // the approved target does not exist yet by contract, and filesystem-root
+    // canonicalization belongs after EnvironmentCheckpoint has mkdirat-created and
+    // retained that exact target. The digest separately binds plan.required_coverage.
+    let backend = capsule::select_backend(&tirith_core::capsule::CapsuleSpec::locked_down());
 
     let digest = build_plan_digest(
         &plan,
         &resolved,
         &target,
+        &tools,
         policy,
         backend.backend_id,
         expiry,
@@ -362,6 +452,7 @@ fn prepare_plan(
         target,
         digest,
         txn,
+        tools,
         _store: store,
     })
 }
@@ -374,6 +465,7 @@ fn build_plan_digest(
     plan: &DigestInstallPlan,
     resolved: &ResolvedSet,
     target: &InstallTarget,
+    tools: &BoundResolverTools,
     policy: &Policy,
     capsule_backend: &str,
     expiry: String,
@@ -389,6 +481,7 @@ fn build_plan_digest(
     // path. A dummy InstallCommand suffices since the path is dropped anyway.
     let install_command_semantics = InstallCommand {
         approved_requirements_path: PathBuf::from("approved.txt"),
+        target_environment: target.environment.clone(),
     }
     .pip_install_args_without_requirements_path();
 
@@ -396,7 +489,23 @@ fn build_plan_digest(
         artifact_sha256,
         normalized_packages,
         interpreter: target.interpreter.clone(),
+        interpreter_sha256: tools.python_sha256().to_string(),
+        resolver: tools.uv().path().to_path_buf(),
+        resolver_sha256: tools.uv_sha256().to_string(),
+        resolver_version: tools.uv_version().to_string(),
+        package_manager_version: tools.pip_version().to_string(),
+        pip_tree_root: tools.pip_tree().root().to_path_buf(),
+        pip_tree_sha256: tools.pip_tree().sha256().to_string(),
+        pip_tree_binding_version: PIP_TREE_BINDING_VERSION,
+        pip_tree_max_files: PIP_TREE_MAX_FILES,
+        pip_tree_max_bytes: PIP_TREE_MAX_BYTES,
+        pip_tree_max_file_bytes: PIP_TREE_MAX_FILE_BYTES,
+        pip_tree_max_path_bytes: PIP_TREE_MAX_PATH_BYTES,
+        pip_tree_files: tools.pip_tree().files(),
+        pip_tree_bytes: tools.pip_tree().bytes(),
         target_environment: target.environment.clone(),
+        target_parent_identity: target.binding.parent_identity(),
+        target_component: target.binding.target_component().to_string(),
         platform_tags,
         install_command_semantics,
         policy_projection_hash: policy.security_projection_hash(),
@@ -468,6 +577,7 @@ enum PrepareError {
     Resolver(ResolverError),
     Quarantine(QuarantineError),
     Install(InstallError),
+    Target(String),
 }
 
 impl std::fmt::Display for PrepareError {
@@ -476,6 +586,7 @@ impl std::fmt::Display for PrepareError {
             PrepareError::Resolver(e) => write!(f, "resolve failed: {e}"),
             PrepareError::Quarantine(e) => write!(f, "quarantine error: {e}"),
             PrepareError::Install(e) => write!(f, "{e}"),
+            PrepareError::Target(reason) => write!(f, "unsafe install target: {reason}"),
         }
     }
 }
@@ -522,8 +633,8 @@ fn run_approve(
     artifact_origin: &[String],
     json: bool,
 ) -> i32 {
-    if let Some(code) = precheck(ecosystem, requirements) {
-        return code;
+    if let Some(failure) = precheck(ecosystem, requirements) {
+        return report_pkg_precheck_failure("approve", &failure, json);
     }
     let cwd = std::env::current_dir()
         .ok()
@@ -582,8 +693,9 @@ fn run_approve(
                 eprintln!("  capsule:      {}", prepared.digest.capsule_backend);
                 eprintln!("  expires:      {}", prepared.digest.expiry);
                 eprintln!(
-                    "  run: tirith pkg install {} {}",
+                    "  run: tirith pkg install {} --target {} {}",
                     ecosystem.label(),
+                    prepared.target.environment.display(),
                     requirements.join(" ")
                 );
             }
@@ -611,8 +723,8 @@ fn run_install(
     allow_degraded: bool,
     json: bool,
 ) -> i32 {
-    if let Some(code) = precheck(ecosystem, requirements) {
-        return code;
+    if let Some(failure) = precheck(ecosystem, requirements) {
+        return report_pkg_precheck_failure("install", &failure, json);
     }
     let cwd = std::env::current_dir()
         .ok()
@@ -634,8 +746,14 @@ fn run_install(
     ) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("tirith pkg install: {e}");
-            return 1;
+            return report_install_failure(
+                "plan_preparation",
+                &e.to_string(),
+                false,
+                false,
+                json,
+                1,
+            );
         }
     };
 
@@ -646,71 +764,128 @@ fn run_install(
         match approval_status(&prepared.digest) {
             ApprovalStatus::Valid => {}
             ApprovalStatus::Missing => {
-                eprintln!(
-                    "tirith pkg install: no matching approval for this plan.\n  \
-                     plan digest: {}\n  \
-                     run `tirith pkg approve {} {}` first, or pass --yes to install unattended.",
-                    prepared.digest.plan_digest,
-                    ecosystem.label(),
-                    requirements.join(" ")
+                return report_install_failure(
+                    "approval",
+                    &format!(
+                        "no matching approval for plan {}; run `tirith pkg approve {} {}` first, or pass --yes to install unattended",
+                        prepared.digest.plan_digest,
+                        ecosystem.label(),
+                        requirements.join(" ")
+                    ),
+                    false,
+                    false,
+                    json,
+                    1,
                 );
-                return 1;
             }
             ApprovalStatus::Expired => {
-                eprintln!(
-                    "tirith pkg install: the approval for this plan has expired.\n  \
-                     plan digest: {}\n  re-run `tirith pkg approve` (the situation may have changed).",
-                    prepared.digest.plan_digest
+                return report_install_failure(
+                    "approval",
+                    &format!(
+                        "the approval for plan {} has expired; re-run `tirith pkg approve`",
+                        prepared.digest.plan_digest
+                    ),
+                    false,
+                    false,
+                    json,
+                    1,
                 );
-                return 1;
             }
         }
     }
 
-    // The contained install (D4), fail-closed by default. `--allow-degraded` opts a
-    // best-effort run on a host without a containing backend (still recorded
-    // honestly: the receipt's coverage shows what was actually enforced).
+    // The contained install (D4) always fails closed. `--allow-degraded` remains a
+    // compatibility flag but cannot weaken the enforcing package path; analysis-only
+    // execution is a separate command.
     let degraded_policy = if allow_degraded {
         DegradedPolicy::AllowDegraded
     } else {
         DegradedPolicy::FailClosed
     };
 
-    let installed_names = installed_distribution_names(&prepared.resolved);
-    // Snapshot the complete target before pip gets write access. The checkpoint
-    // remains live through RECORD verification and mandatory signed-receipt
-    // recording; every failed gate below restores it.
-    let mut environment_checkpoint = match EnvironmentCheckpoint::begin(
-        &prepared.target.environment,
-    ) {
+    let installed_distributions = installed_distribution_identities(&prepared.resolved);
+    // Atomically create and retain the new dedicated target before pip gets write
+    // access. The narrow journal remains live through RECORD verification and
+    // mandatory signed-receipt recording; every safely recoverable failed gate
+    // removes only this newly created target.
+    let mut environment_checkpoint = match EnvironmentCheckpoint::begin(&prepared.target.binding) {
         Ok(checkpoint) => checkpoint,
         Err(e) => {
-            eprintln!(
-                "tirith pkg install: cannot checkpoint target environment {}: {e}; refusing before pip runs",
-                prepared.target.environment.display()
+            return report_install_failure(
+                "target_checkpoint",
+                &format!(
+                    "cannot checkpoint target environment {}: {e}; refusing before pip runs",
+                    prepared.target.environment.display()
+                ),
+                false,
+                false,
+                json,
+                1,
             );
-            return 1;
         }
     };
+    let target_handle = match environment_checkpoint.try_clone_target_handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            let rollback = environment_checkpoint.rollback();
+            return report_install_failure(
+                "target_capability",
+                &format!(
+                    "cannot retain exact target capability: {error}; rollback result: {rollback:?}"
+                ),
+                false,
+                environment_checkpoint.publication_crossed(),
+                json,
+                1,
+            );
+        }
+    };
+    let target_install_path = environment_checkpoint.install_path().to_path_buf();
     let outcome = match run_contained_install_with_policy(
         &prepared.plan,
-        prepared.txn.dir(),
-        &prepared.target.interpreter,
+        &prepared.txn,
+        &prepared.tools,
         &prepared.target.environment,
-        &installed_names,
+        &target_install_path,
+        target_handle,
+        &installed_distributions,
         &policy,
+        json,
         degraded_policy,
     ) {
         Ok(o) => o,
         Err(e) => {
-            if let Err(rollback_error) = environment_checkpoint.rollback() {
-                eprintln!(
-                    "tirith pkg install: {e}; CRITICAL: failed to restore target environment {}: {rollback_error}",
-                    prepared.target.environment.display()
-                );
+            if matches!(
+                &e,
+                ContainedInstallError::CapsuleExecutedTerminated {
+                    termination: capsule::CapsuleTermination {
+                        cleanup_confirmed: false,
+                        ..
+                    },
+                    ..
+                }
+            ) {
+                // The target definitely executed and its process tree is not proven
+                // gone. Do not let Drop delete or rename files underneath a possibly
+                // live process; retain the fail-closed journal for manual recovery.
+                std::mem::forget(environment_checkpoint);
+                report_contained_install_error(&e, json);
                 return 1;
             }
-            eprintln!("tirith pkg install: {e}");
+            if let Err(rollback_error) = environment_checkpoint.rollback() {
+                return report_install_failure(
+                    "rollback_after_contained_failure",
+                    &format!(
+                        "{e}; failed to remove private target environment {}: {rollback_error}",
+                        prepared.target.environment.display()
+                    ),
+                    matches!(e, ContainedInstallError::CapsuleExecutedTerminated { .. }),
+                    environment_checkpoint.publication_crossed(),
+                    json,
+                    1,
+                );
+            }
+            report_contained_install_error(&e, json);
             return 1;
         }
     };
@@ -720,8 +895,8 @@ fn run_install(
     // already refuses creds-in-URL; we record the fixed command shape).
     let provenance = ResolverProvenance {
         resolver_command: "uv pip compile --generate-hashes --no-build".to_string(),
-        resolver_version: String::new(),
-        package_manager_version: String::new(),
+        resolver_version: prepared.tools.uv_version().to_string(),
+        package_manager_version: prepared.tools.pip_version().to_string(),
     };
     let artifact_sha256: Vec<String> = prepared
         .resolved
@@ -735,86 +910,279 @@ fn run_install(
     // install did not produce a trustworthy environment).
     let verdict = enforcing_install_verdict(&outcome);
 
-    // D6: record the tamper-evident receipt. Ed25519 is MANDATORY for `pkg install`
-    // (require_signature = true): an unsigned audit log fails the record closed.
-    let recorded = record_install_receipt(
+    // D6 phase 1: while the target is still private and rollback-safe, record a
+    // signed receipt for the exact contained execution + RECORD verdict. This is
+    // deliberately NOT publication proof.
+    let private_receipt =
+        build_install_receipt(&outcome, &policy, &provenance, artifact_sha256, &verdict);
+    let private_receipt_id = private_receipt.receipt_id.clone();
+    let private_recorded = private_receipt.record_private_signed();
+    let private_report = InstallReport::from_recorded_ref(
         &outcome,
-        &policy,
-        &provenance,
-        artifact_sha256,
-        &verdict,
-        true,
+        private_recorded.as_ref().map(|proof| proof.recorded()),
+        false,
     );
 
-    let install_succeeded = InstallReport::from_outcome(&outcome, &recorded).success;
-    if install_succeeded {
-        environment_checkpoint.commit();
-    } else if let Err(rollback_error) = environment_checkpoint.rollback() {
-        eprintln!(
-            "tirith pkg install: CRITICAL: failed to restore target environment {} after a failed enforcing gate: {rollback_error}",
-            prepared.target.environment.display()
+    if !private_report.ready_for_publication() {
+        if let Err(rollback_error) = environment_checkpoint.rollback() {
+            return report_install_transaction_failure(
+                "private_rollback",
+                &format!(
+                    "failed to remove the private target after an enforcing gate failed: {rollback_error}"
+                ),
+                environment_checkpoint.publication_crossed(),
+                &private_receipt_id,
+                None,
+                "private_verified",
+                json,
+            );
+        }
+        return report_install_outcome(
+            &prepared.digest,
+            &outcome,
+            private_recorded.map(|proof| proof.into_recorded()),
+            false,
+            json,
         );
-        return 1;
+    }
+    let private_recorded = match private_recorded {
+        Ok(proof) => proof,
+        Err(error) => {
+            // `ready_for_publication` above rejects every receipt error. Retain a
+            // defensive fail-closed branch in case that reporting invariant ever
+            // changes.
+            let _ = environment_checkpoint.rollback();
+            return report_install_outcome(&prepared.digest, &outcome, Err(error), false, json);
+        }
+    };
+
+    // D6 phase 2: publish the exact held private target with NOREPLACE, verify its
+    // public identity, fsync the parent, and durably mark it published-but-awaiting
+    // its linked receipt. A pre-rename failure is rollback-safe; any post-rename
+    // failure remains PublishedUnconfirmed and must never be auto-rolled back.
+    if let Err(publish_error) = environment_checkpoint.publish_verified() {
+        let crossed = environment_checkpoint.publication_crossed();
+        let rollback_detail = if crossed {
+            String::new()
+        } else {
+            match environment_checkpoint.rollback() {
+                Ok(()) => "; private rollback confirmed".to_string(),
+                Err(error) => format!("; private rollback was not confirmed: {error}"),
+            }
+        };
+        return report_install_transaction_failure(
+            "target_publication",
+            &format!("{publish_error}{rollback_detail}"),
+            crossed,
+            &private_receipt_id,
+            None,
+            "private_verified",
+            json,
+        );
     }
 
-    report_install_outcome(&prepared.digest, &outcome, recorded, json)
+    let committed_receipt = match private_recorded.prepare_committed() {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return report_install_transaction_failure(
+                "committed_receipt_build",
+                &error.to_string(),
+                true,
+                &private_receipt_id,
+                None,
+                "private_verified",
+                json,
+            )
+        }
+    };
+    let committed_receipt_id = committed_receipt.receipt_id().to_string();
+    let committed_recorded = match committed_receipt.record_signed() {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            return report_install_transaction_failure(
+                "committed_receipt",
+                &error.to_string(),
+                true,
+                &private_receipt_id,
+                Some(&committed_receipt_id),
+                "private_verified",
+                json,
+            )
+        }
+    };
+
+    // Only the linked, signed committed receipt lets the checkpoint transition
+    // from PublishedUnconfirmed to Committed and release its recovery journal.
+    let committed_recorded = match environment_checkpoint.confirm_committed(committed_recorded) {
+        Ok(recorded) => Ok(recorded),
+        Err(error) => {
+            return report_install_transaction_failure(
+                "commit_confirmation",
+                &error.to_string(),
+                true,
+                &private_receipt_id,
+                Some(&committed_receipt_id),
+                "committed",
+                json,
+            )
+        }
+    };
+
+    report_install_outcome(&prepared.digest, &outcome, committed_recorded, true, json)
 }
 
-/// Run the contained install honoring the chosen degraded policy. A thin wrapper so
-/// the `--allow-degraded` path and the default fail-closed path share the D4 +
-/// D5 [`run_contained_install`] call; the policy is threaded into the capsule launch
-/// indirectly via [`run_contained_install`] (which is FailClosed). For the
-/// `AllowDegraded` path we call the capsule directly is overkill; instead we keep
-/// `run_contained_install` (FailClosed) for the default and document that
-/// `--allow-degraded` is plumbed by the gateway/temp-run seams. Here, to keep the
-/// enforcing surface honest, `--allow-degraded` is accepted but still routes through
-/// the fail-closed installer unless explicitly degraded, matching the plan's
-/// "enforcing surfaces fail closed under degraded coverage unless policy permits".
+/// Compatibility wrapper for the historical `--allow-degraded` flag. Enforcing
+/// package installs now always use the same capability-bound, fail-closed D4/D5
+/// path; the flag cannot select an uncontained execution branch.
 #[allow(clippy::too_many_arguments)]
 fn run_contained_install_with_policy(
     plan: &DigestInstallPlan,
-    transaction_dir: &Path,
-    interpreter: &Path,
+    transaction: &QuarantineTransaction,
+    tools: &BoundResolverTools,
     target_environment: &Path,
-    installed_names: &[String],
+    target_install_path: &Path,
+    target_handle: std::fs::File,
+    installed_distributions: &[ExpectedInstalledDistribution],
     policy: &Policy,
+    json: bool,
     degraded_policy: DegradedPolicy,
-) -> Result<crate::cli::pkg_install::ContainedInstallOutcome, String> {
-    match degraded_policy {
-        DegradedPolicy::FailClosed => run_contained_install(
-            plan,
-            transaction_dir,
-            interpreter,
-            target_environment,
-            installed_names,
-            policy,
-        )
-        .map_err(|e| e.to_string()),
-        DegradedPolicy::AllowDegraded => {
-            // The plan's enforcing-surface rule: `pkg install` fails closed under
-            // degraded coverage UNLESS policy permits it. `--allow-degraded` is the
-            // operator-explicit override; it still goes through the same installer
-            // (which is fail-closed), so on a host that genuinely cannot contain, the
-            // operator is told to use the analysis path instead of getting a silent
-            // uncontained install. We surface the refusal rather than running
-            // uncontained.
-            run_contained_install(
-                plan,
-                transaction_dir,
-                interpreter,
-                target_environment,
-                installed_names,
-                policy,
-            )
-            .map_err(|e| {
-                format!(
-                    "{e}\n  (--allow-degraded does not weaken the containment requirement for an \
-                     enforcing install; use `tirith install pip` for an analysis-only run on this \
-                     host)"
-                )
-            })
+) -> Result<crate::cli::pkg_install::ContainedInstallOutcome, ContainedInstallError> {
+    let _ = degraded_policy;
+    run_contained_install(
+        plan,
+        transaction,
+        tools,
+        target_environment,
+        target_install_path,
+        target_handle,
+        installed_distributions,
+        policy,
+        json,
+    )
+}
+
+fn report_contained_install_error(error: &ContainedInstallError, json: bool) {
+    if !json {
+        eprintln!("tirith pkg install: {error}");
+        return;
+    }
+    let value = contained_install_error_json(error);
+    let _ = write_json_document(std::io::stdout().lock(), &value);
+}
+
+fn contained_install_error_json(error: &ContainedInstallError) -> serde_json::Value {
+    match error {
+        ContainedInstallError::CapsuleRefused { backend_id, reason } => serde_json::json!({
+            "success": false,
+            "error_phase": "refused_before_exec",
+            "target_executed": false,
+            "backend": backend_id,
+            "reason": reason,
+        }),
+        ContainedInstallError::CapsuleExecutedTerminated {
+            backend_id,
+            termination,
+        } => serde_json::json!({
+            "success": false,
+            "error_phase": "executed_then_terminated",
+            "target_executed": true,
+            "backend": backend_id,
+            "termination_kind": format!("{:?}", termination.kind),
+            "reason": termination.reason,
+            "cleanup_confirmed": termination.cleanup_confirmed,
+        }),
+        other => serde_json::json!({
+            "success": false,
+            "error_phase": "pre_exec_input_binding",
+            "target_executed": false,
+            "reason": other.to_string(),
+        }),
+    }
+}
+
+fn install_failure_json(
+    phase: &'static str,
+    reason: &str,
+    target_executed: bool,
+    target_published: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "success": false,
+        "error_phase": phase,
+        "target_executed": target_executed,
+        "target_published": target_published,
+        "reason": reason,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_install_failure(
+    phase: &'static str,
+    reason: &str,
+    target_executed: bool,
+    target_published: bool,
+    json: bool,
+    exit_code: i32,
+) -> i32 {
+    if json {
+        let value = install_failure_json(phase, reason, target_executed, target_published);
+        let _ = write_json_document(std::io::stdout().lock(), &value);
+    } else {
+        eprintln!(
+            "tirith pkg install: {}: {}",
+            crate::cli::sanitize_for_human_output(phase, false),
+            crate::cli::sanitize_for_human_output(reason, false)
+        );
+    }
+    exit_code
+}
+
+/// Emit one terminal-safe human diagnostic or one parseable JSON document for a
+/// checkpoint/receipt failure after the contained target has executed. Child
+/// output is suppressed in JSON mode, so this remains the command's sole stdout
+/// document even when pip produced arbitrary bytes.
+#[allow(clippy::too_many_arguments)]
+fn report_install_transaction_failure(
+    phase: &'static str,
+    reason: &str,
+    target_published: bool,
+    private_receipt_id: &str,
+    committed_receipt_id: Option<&str>,
+    receipt_publication_state: &'static str,
+    json: bool,
+) -> i32 {
+    if json {
+        let value = serde_json::json!({
+            "success": false,
+            "error_phase": phase,
+            "target_executed": true,
+            "target_published": target_published,
+            "receipt_publication_state": receipt_publication_state,
+            "private_receipt_id": private_receipt_id,
+            "committed_receipt_id": committed_receipt_id,
+            "reason": reason,
+        });
+        let _ = write_json_document(std::io::stdout().lock(), &value);
+    } else {
+        eprintln!(
+            "tirith pkg install: {}: {}",
+            crate::cli::sanitize_for_human_output(phase, false),
+            crate::cli::sanitize_for_human_output(reason, false)
+        );
+        eprintln!(
+            "  publication: {}",
+            if target_published {
+                "published but not fully confirmed; recovery journal retained"
+            } else {
+                "not published"
+            }
+        );
+        eprintln!("  private receipt: {private_receipt_id}");
+        if let Some(receipt_id) = committed_receipt_id {
+            eprintln!("  committed receipt: {receipt_id}");
         }
     }
+    1
 }
 
 /// A synthesized Block verdict for a `pkg install` whose pip run exited non-zero:
@@ -871,6 +1239,7 @@ fn enforcing_install_verdict(
 struct InstallReport {
     install_ok: bool,
     post_blocked: bool,
+    publication_committed: bool,
     success: bool,
     /// RECORD-listed files whose on-disk bytes did not match (the install-time tamper
     /// signal). `hash_mismatches > 0` makes the enforcing install fail closed (IM8), so a
@@ -901,6 +1270,18 @@ impl InstallReport {
             tirith_core::receipt::RecordedReceipt,
             tirith_core::receipt::ReceiptError,
         >,
+        publication_committed: bool,
+    ) -> Self {
+        Self::from_recorded_ref(outcome, recorded.as_ref(), publication_committed)
+    }
+
+    fn from_recorded_ref(
+        outcome: &crate::cli::pkg_install::ContainedInstallOutcome,
+        recorded: Result<
+            &tirith_core::receipt::RecordedReceipt,
+            &tirith_core::receipt::ReceiptError,
+        >,
+        publication_committed: bool,
     ) -> Self {
         let install_ok = outcome.exit_code == 0;
         let post_blocked = outcome
@@ -935,19 +1316,31 @@ impl InstallReport {
             .post_install
             .as_ref()
             .is_some_and(|post| post.is_complete() && post.hash_mismatches == 0);
-        let success = install_ok && !post_blocked && recorded.is_ok() && verification_complete;
+        let receipt_signed = recorded.is_ok_and(|receipt| receipt.signed);
+        let success = install_ok
+            && !post_blocked
+            && receipt_signed
+            && verification_complete
+            && publication_committed;
         let (receipt_path, signed, anchor_warning, receipt_error) = match recorded {
-            Ok(r) => (
+            Ok(r) if r.signed => (
                 Some(r.path.display().to_string()),
-                r.signed,
+                true,
                 r.anchor_warning.clone(),
                 None,
+            ),
+            Ok(r) => (
+                Some(r.path.display().to_string()),
+                false,
+                r.anchor_warning.clone(),
+                Some("mandatory install receipt was not signed".to_string()),
             ),
             Err(e) => (None, false, None, Some(e.to_string())),
         };
         InstallReport {
             install_ok,
             post_blocked,
+            publication_committed,
             success,
             hash_mismatches,
             distributions_not_found,
@@ -969,6 +1362,17 @@ impl InstallReport {
             && self.records_missing == 0
     }
 
+    /// Every enforcing gate that must pass while the checkpoint is still private.
+    /// Publication is deliberately excluded so callers can decide whether to cross
+    /// the irreversible rename only after the signed private receipt exists.
+    fn ready_for_publication(&self) -> bool {
+        self.install_ok
+            && !self.post_blocked
+            && self.signed
+            && self.receipt_error.is_none()
+            && self.record_integrity_clean()
+    }
+
     fn to_json(
         &self,
         digest: &InstallPlanDigest,
@@ -981,6 +1385,12 @@ impl InstallReport {
             "exit_code": outcome.exit_code,
             "capsule_backend": outcome.backend_id,
             "coverage": outcome.coverage_summary,
+            "target_executed": true,
+            "target_published": self.publication_committed,
+            "receipt_publication_state": if self.publication_committed { "committed" } else { "private_verified" },
+            "capsule_termination_kind": outcome.termination.as_ref().map(|termination| format!("{:?}", termination.kind)),
+            "capsule_termination_reason": outcome.termination.as_ref().map(|termination| termination.reason.as_str()),
+            "capsule_cleanup_confirmed": outcome.termination.as_ref().map(|termination| termination.cleanup_confirmed),
             "receipt_path": self.receipt_path,
             "receipt_signed": self.signed,
             "receipt_anchor_warning": self.anchor_warning,
@@ -994,33 +1404,37 @@ impl InstallReport {
     }
 }
 
+/// Serialize exactly one JSON value followed by one newline. Keeping JSON output
+/// behind a writer seam lets the package-install regression prove that arbitrary
+/// contained-child bytes cannot create a second document or corrupt this one.
+fn write_json_document(
+    mut writer: impl std::io::Write,
+    value: &serde_json::Value,
+) -> std::io::Result<()> {
+    serde_json::to_writer_pretty(&mut writer, value).map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")
+}
+
 /// Report the install outcome + receipt status, returning the process exit code.
 fn report_install_outcome(
     digest: &InstallPlanDigest,
     outcome: &crate::cli::pkg_install::ContainedInstallOutcome,
     recorded: Result<tirith_core::receipt::RecordedReceipt, tirith_core::receipt::ReceiptError>,
+    publication_committed: bool,
     json: bool,
 ) -> i32 {
-    let report = InstallReport::from_outcome(outcome, &recorded);
+    let report = InstallReport::from_outcome(outcome, &recorded, publication_committed);
 
     if json {
         let out = report.to_json(digest, outcome);
-        let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
-        println!();
+        let _ = write_json_document(std::io::stdout().lock(), &out);
     } else if report.success {
-        // `success` implies hash_mismatches == 0 (a mismatch fails closed, IM8). Claim
-        // "verified" only when there is also no missing RECORD; a coverage gap
-        // (records_missing) is a non-fatal warning, not a tamper signal, so the install
-        // still succeeds but is not called fully verified.
-        if report.record_integrity_clean() {
-            eprintln!("tirith pkg install: install complete and verified");
-        } else {
-            eprintln!(
-                "tirith pkg install: install complete; {} RECORD(s) could not be located \
-                 (coverage gap, not a tamper signal)",
-                report.records_missing
-            );
-        }
+        // A successful enforcing install necessarily has complete RECORD coverage,
+        // no mismatch, a signed linked receipt, and confirmed publication.
+        debug_assert!(report.record_integrity_clean());
+        debug_assert!(report.signed);
+        debug_assert!(report.publication_committed);
+        eprintln!("tirith pkg install: install complete and verified");
         eprintln!("  plan digest: {}", digest.plan_digest);
         eprintln!("  capsule:     {}", outcome.backend_id);
         eprintln!("  coverage:    {}", outcome.coverage_summary);
@@ -1046,6 +1460,12 @@ fn report_install_outcome(
         eprintln!("tirith pkg install: install did NOT complete cleanly");
         if !report.install_ok {
             eprintln!("  pip exit code: {}", outcome.exit_code);
+        }
+        if let Some(termination) = &outcome.termination {
+            eprintln!(
+                "  capsule terminated the executed target: {} (cleanup confirmed={})",
+                termination.reason, termination.cleanup_confirmed
+            );
         }
         if report.post_blocked {
             eprintln!("  post-install RECORD verification blocked the install");
@@ -1343,6 +1763,7 @@ fn approval_status(digest: &InstallPlanDigest) -> ApprovalStatus {
         return ApprovalStatus::Missing;
     };
     let now = chrono::Utc::now().to_rfc3339();
+    let mut saw_expired_match = false;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "json") {
@@ -1363,11 +1784,16 @@ fn approval_status(digest: &InstallPlanDigest) -> ApprovalStatus {
             continue;
         }
         if record.digest.is_expired_at(&now) {
-            return ApprovalStatus::Expired;
+            saw_expired_match = true;
+            continue;
         }
         return ApprovalStatus::Valid;
     }
-    ApprovalStatus::Missing
+    if saw_expired_match {
+        ApprovalStatus::Expired
+    } else {
+        ApprovalStatus::Missing
+    }
 }
 
 /// Whether two plan digests bind the SAME install situation ignoring the expiry
@@ -1378,7 +1804,23 @@ fn same_plan_modulo_expiry(a: &InstallPlanDigest, b: &InstallPlanDigest) -> bool
     a.artifact_sha256 == b.artifact_sha256
         && a.normalized_packages == b.normalized_packages
         && a.interpreter == b.interpreter
+        && a.interpreter_sha256 == b.interpreter_sha256
+        && a.resolver == b.resolver
+        && a.resolver_sha256 == b.resolver_sha256
+        && a.resolver_version == b.resolver_version
+        && a.package_manager_version == b.package_manager_version
+        && a.pip_tree_root == b.pip_tree_root
+        && a.pip_tree_sha256 == b.pip_tree_sha256
+        && a.pip_tree_binding_version == b.pip_tree_binding_version
+        && a.pip_tree_max_files == b.pip_tree_max_files
+        && a.pip_tree_max_bytes == b.pip_tree_max_bytes
+        && a.pip_tree_max_file_bytes == b.pip_tree_max_file_bytes
+        && a.pip_tree_max_path_bytes == b.pip_tree_max_path_bytes
+        && a.pip_tree_files == b.pip_tree_files
+        && a.pip_tree_bytes == b.pip_tree_bytes
         && a.target_environment == b.target_environment
+        && a.target_parent_identity == b.target_parent_identity
+        && a.target_component == b.target_component
         && a.platform_tags == b.platform_tags
         && a.install_command_semantics == b.install_command_semantics
         && a.policy_projection_hash == b.policy_projection_hash
@@ -1395,15 +1837,32 @@ mod tests {
 
     /// A digest for tests, with a given expiry, built from fixed inputs so two
     /// digests differ only where a test changes them.
-    fn digest_with_expiry(expiry: &str) -> InstallPlanDigest {
-        InstallPlanDigest::new(InstallPlanInputs {
+    fn plan_inputs_with_expiry(expiry: &str) -> InstallPlanInputs {
+        InstallPlanInputs {
             artifact_sha256: vec!["a".repeat(64)],
             normalized_packages: vec!["requests".to_string()],
             interpreter: PathBuf::from("/venv/bin/python"),
+            interpreter_sha256: "b".repeat(64),
+            resolver: PathBuf::from("/usr/bin/uv"),
+            resolver_sha256: "c".repeat(64),
+            resolver_version: "uv 1.2.3".to_string(),
+            package_manager_version: "24.0".to_string(),
+            pip_tree_root: PathBuf::from("/usr/lib/python3/site-packages/pip"),
+            pip_tree_sha256: "d".repeat(64),
+            pip_tree_binding_version: PIP_TREE_BINDING_VERSION,
+            pip_tree_max_files: PIP_TREE_MAX_FILES,
+            pip_tree_max_bytes: PIP_TREE_MAX_BYTES,
+            pip_tree_max_file_bytes: PIP_TREE_MAX_FILE_BYTES,
+            pip_tree_max_path_bytes: PIP_TREE_MAX_PATH_BYTES,
+            pip_tree_files: 100,
+            pip_tree_bytes: 10_000,
             target_environment: PathBuf::from("/venv"),
+            target_parent_identity: "linux-devino-v1:1:2".to_string(),
+            target_component: "venv".to_string(),
             platform_tags: vec!["py3-none-any".to_string()],
             install_command_semantics: InstallCommand {
                 approved_requirements_path: PathBuf::from("approved.txt"),
+                target_environment: PathBuf::from("/venv"),
             }
             .pip_install_args_without_requirements_path(),
             policy_projection_hash: "deadbeef".repeat(8),
@@ -1411,15 +1870,25 @@ mod tests {
             capsule_backend: "landlock-seccomp".to_string(),
             required_coverage: CapsuleSpec::locked_down().required_coverage(),
             expiry: expiry.to_string(),
-        })
+        }
+    }
+
+    fn digest_with_expiry(expiry: &str) -> InstallPlanDigest {
+        InstallPlanDigest::new(plan_inputs_with_expiry(expiry))
     }
 
     // ── precheck / misplaced-flag guard ─────────────────────────────────────
 
     #[test]
     fn precheck_refuses_non_pip_ecosystem() {
-        assert_eq!(precheck(Ecosystem::Npm, &["lodash".to_string()]), Some(2));
-        assert_eq!(precheck(Ecosystem::Cargo, &["serde".to_string()]), Some(2));
+        assert_eq!(
+            precheck(Ecosystem::Npm, &["lodash".to_string()]).map(|failure| failure.exit_code),
+            Some(2)
+        );
+        assert_eq!(
+            precheck(Ecosystem::Cargo, &["serde".to_string()]).map(|failure| failure.exit_code),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1429,7 +1898,7 @@ mod tests {
         for flag in MISPLACED_TIRITH_FLAGS {
             let reqs = vec!["requests".to_string(), flag.to_string()];
             assert_eq!(
-                precheck(Ecosystem::Pip, &reqs),
+                precheck(Ecosystem::Pip, &reqs).map(|failure| failure.exit_code),
                 Some(2),
                 "trailing {flag} must be refused"
             );
@@ -1438,7 +1907,10 @@ mod tests {
 
     #[test]
     fn precheck_refuses_empty_requirements() {
-        assert_eq!(precheck(Ecosystem::Pip, &[]), Some(2));
+        assert_eq!(
+            precheck(Ecosystem::Pip, &[]).map(|failure| failure.exit_code),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1547,22 +2019,9 @@ mod tests {
         ApprovalRecord::from_digest(&approved).save().unwrap();
 
         // A DIFFERENT install: a different interpreter. Build it by hand.
-        let other = InstallPlanDigest::new(InstallPlanInputs {
-            artifact_sha256: vec!["a".repeat(64)],
-            normalized_packages: vec!["requests".to_string()],
-            interpreter: PathBuf::from("/attacker/python"), // changed
-            target_environment: PathBuf::from("/venv"),
-            platform_tags: vec!["py3-none-any".to_string()],
-            install_command_semantics: InstallCommand {
-                approved_requirements_path: PathBuf::from("approved.txt"),
-            }
-            .pip_install_args_without_requirements_path(),
-            policy_projection_hash: "deadbeef".repeat(8),
-            threat_db_sequence: 3,
-            capsule_backend: "landlock-seccomp".to_string(),
-            required_coverage: CapsuleSpec::locked_down().required_coverage(),
-            expiry: String::new(),
-        });
+        let mut other_inputs = plan_inputs_with_expiry("");
+        other_inputs.interpreter = PathBuf::from("/attacker/python");
+        let other = InstallPlanDigest::new(other_inputs);
         assert!(!same_plan_modulo_expiry(&approved, &other));
         // No matching approval for the changed situation.
         assert_eq!(approval_status(&other), ApprovalStatus::Missing);
@@ -1579,22 +2038,9 @@ mod tests {
         ApprovalRecord::from_digest(&approved).save().unwrap();
 
         // Install plan now bound to DB sequence 4 (a newer DB) -> not authorised.
-        let install_digest = InstallPlanDigest::new(InstallPlanInputs {
-            artifact_sha256: vec!["a".repeat(64)],
-            normalized_packages: vec!["requests".to_string()],
-            interpreter: PathBuf::from("/venv/bin/python"),
-            target_environment: PathBuf::from("/venv"),
-            platform_tags: vec!["py3-none-any".to_string()],
-            install_command_semantics: InstallCommand {
-                approved_requirements_path: PathBuf::from("approved.txt"),
-            }
-            .pip_install_args_without_requirements_path(),
-            policy_projection_hash: "deadbeef".repeat(8),
-            threat_db_sequence: 4, // advanced
-            capsule_backend: "landlock-seccomp".to_string(),
-            required_coverage: CapsuleSpec::locked_down().required_coverage(),
-            expiry: String::new(),
-        });
+        let mut install_inputs = plan_inputs_with_expiry("");
+        install_inputs.threat_db_sequence = 4;
+        let install_digest = InstallPlanDigest::new(install_inputs);
         assert_eq!(approval_status(&install_digest), ApprovalStatus::Missing);
     }
 
@@ -1629,25 +2075,82 @@ mod tests {
         assert!(v.findings.is_empty());
     }
 
-    // ── install target derivation ───────────────────────────────────────────
-
     #[test]
-    fn install_target_uses_explicit_target_dir() {
-        let t = InstallTarget::derive_from_interpreter(
-            PathBuf::from("/opt/py/bin/python3"),
-            Some(PathBuf::from("/work/.venv")),
-        );
-        assert_eq!(t.interpreter, PathBuf::from("/opt/py/bin/python3"));
-        assert_eq!(t.environment, PathBuf::from("/work/.venv"));
-        // The interpreter prefix is a read root.
-        assert!(t.extra_read_roots.contains(&PathBuf::from("/opt/py")));
+    fn contained_install_error_json_distinguishes_execution_phase() {
+        let refused = ContainedInstallError::CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "coverage unavailable".to_string(),
+        };
+        let refused_json = contained_install_error_json(&refused);
+        assert_eq!(refused_json["target_executed"], false);
+        assert_eq!(refused_json["error_phase"], "refused_before_exec");
+
+        let executed = ContainedInstallError::CapsuleExecutedTerminated {
+            backend_id: "landlock-seccomp",
+            termination: capsule::CapsuleTermination {
+                kind: capsule::CapsuleTerminationKind::CleanupFailure,
+                reason: "tree still live".to_string(),
+                cleanup_confirmed: false,
+            },
+        };
+        let executed_json = contained_install_error_json(&executed);
+        assert_eq!(executed_json["target_executed"], true);
+        assert_eq!(executed_json["error_phase"], "executed_then_terminated");
+        assert_eq!(executed_json["cleanup_confirmed"], false);
     }
 
     #[test]
-    fn install_target_defaults_to_interpreter_prefix() {
-        let t = InstallTarget::derive_from_interpreter(PathBuf::from("/opt/py/bin/python3"), None);
-        // No --target: the interpreter prefix is the environment.
-        assert_eq!(t.environment, PathBuf::from("/opt/py"));
+    fn install_outcome_json_preserves_cleanup_confirmed_termination() {
+        let mut outcome = outcome_with_post(128, 0, 0);
+        outcome.termination = Some(capsule::CapsuleTermination {
+            kind: capsule::CapsuleTerminationKind::WallClock,
+            reason: "wall deadline exceeded".to_string(),
+            cleanup_confirmed: true,
+        });
+        let recorded = Err(tirith_core::receipt::ReceiptError::Io(
+            std::io::Error::other("not recorded after terminated install"),
+        ));
+        let report = InstallReport::from_outcome(&outcome, &recorded, true);
+        let json = report.to_json(&digest_with_expiry(""), &outcome);
+        assert_eq!(json["target_executed"], true);
+        assert_eq!(json["capsule_termination_kind"], "WallClock");
+        assert_eq!(json["capsule_cleanup_confirmed"], true);
+        assert_eq!(json["success"], false);
+    }
+
+    // ── install target derivation ───────────────────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_target_uses_explicit_target_dir() {
+        let parent = tempfile::tempdir().unwrap();
+        let requested = parent.path().join("dedicated-target");
+        let t = InstallTarget::derive_from_interpreter(
+            PathBuf::from("/opt/py/bin/python3"),
+            Some(requested.clone()),
+        )
+        .unwrap();
+        assert_eq!(t.interpreter, PathBuf::from("/opt/py/bin/python3"));
+        assert_eq!(
+            t.environment,
+            parent
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("dedicated-target")
+        );
+        // The interpreter prefix is a read root.
+        assert!(t.extra_read_roots.contains(&PathBuf::from("/opt/py")));
+        assert!(!requested.exists(), "derivation must not create the target");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_target_never_defaults_to_interpreter_prefix() {
+        let error =
+            InstallTarget::derive_from_interpreter(PathBuf::from("/opt/py/bin/python3"), None)
+                .expect_err("enforcing installs require an explicit dedicated target");
+        assert!(error.contains("explicit --target is required"));
     }
 
     // ── install reporting (IM7 / IM8) ───────────────────────────────────────
@@ -1699,6 +2202,7 @@ mod tests {
                 env_isolated: true,
                 handles_isolated: true,
             },
+            termination: None,
             bound_db_sequence: 7,
             approved_requirements_path: PathBuf::from("/q/txn/approved.txt"),
             post_install: Some(PostInstallIntegrity {
@@ -1721,17 +2225,18 @@ mod tests {
     }
 
     #[test]
-    fn install_report_anchor_warning_is_surfaced_not_claimed_tamper_evident() {
-        // IM7: an unsigned saved-but-unanchored receipt (anchor_warning = Some) must
-        // NOT be reported as tamper-evident/chained; the warning must reach --json.
+    fn install_report_unsigned_anchor_is_surfaced_and_fails_closed() {
+        // IM7/D6: an unsigned saved-but-unanchored receipt must not be reported as
+        // tamper-evident/chained and cannot authorize publication. The warning and
+        // mandatory-signature failure both reach JSON.
         let outcome = outcome_with_post(0, 0, 0);
         let recorded = Ok(recorded_ok(
             false,
             Some("audit log lock unavailable on this platform".to_string()),
         ));
-        let report = InstallReport::from_outcome(&outcome, &recorded);
-        // The install still succeeds (the anchor degrade is non-fatal for unsigned).
-        assert!(report.success);
+        let report = InstallReport::from_outcome(&outcome, &recorded, true);
+        assert!(!report.success);
+        assert!(!report.ready_for_publication());
         assert_eq!(
             report.anchor_warning.as_deref(),
             Some("audit log lock unavailable on this platform")
@@ -1745,6 +2250,10 @@ mod tests {
             serde_json::json!("audit log lock unavailable on this platform")
         );
         assert_eq!(json["receipt_signed"], serde_json::json!(false));
+        assert_eq!(
+            json["receipt_error"],
+            serde_json::json!("mandatory install receipt was not signed")
+        );
     }
 
     #[test]
@@ -1752,11 +2261,101 @@ mod tests {
         // The normal path: a signed, fully-anchored, clean-RECORD install.
         let outcome = outcome_with_post(0, 0, 0);
         let recorded = Ok(recorded_ok(true, None));
-        let report = InstallReport::from_outcome(&outcome, &recorded);
+        let report = InstallReport::from_outcome(&outcome, &recorded, true);
         assert!(report.success);
         assert!(report.signed);
         assert!(report.anchor_warning.is_none());
         assert!(report.record_integrity_clean());
+    }
+
+    #[test]
+    fn private_verified_report_is_ready_but_cannot_claim_success() {
+        let outcome = outcome_with_post(0, 0, 0);
+        let recorded = Ok(recorded_ok(true, None));
+        let report = InstallReport::from_outcome(&outcome, &recorded, false);
+
+        assert!(report.ready_for_publication());
+        assert!(report.record_integrity_clean());
+        assert!(!report.publication_committed);
+        assert!(!report.success);
+
+        let json = report.to_json(&digest_with_expiry(""), &outcome);
+        assert_eq!(json["target_published"], false);
+        assert_eq!(json["receipt_publication_state"], "private_verified");
+        assert_eq!(json["success"], false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pkg_json_is_one_document_with_benign_or_hostile_child_streams_suppressed() {
+        let cases: &[(&[u8], &[u8], &str)] = &[
+            (
+                b"PIP_BENIGN_STDOUT_SENTINEL\n",
+                b"PIP_BENIGN_STDERR_SENTINEL\n",
+                "PIP_BENIGN_",
+            ),
+            (
+                b"PIP_HOSTILE_STDOUT_SENTINEL\x1b]52;c;Zm9yZ2Vk\x07",
+                b"PIP_HOSTILE_STDERR_SENTINEL\n",
+                "PIP_HOSTILE_",
+            ),
+        ];
+
+        for &(child_stdout, child_stderr, forbidden_marker) in cases {
+            // This is the same suppression/action seam used after the real bounded
+            // child is drained: hostile output still changes the typed outcome,
+            // while neither hostile nor benign stream bytes are presented.
+            let suppressed = capsule::test_suppress_bound_child_output(child_stdout, child_stderr);
+            let mut outcome = outcome_with_post(suppressed.exit_code, 0, 0);
+            outcome.backend_id = suppressed.backend_id;
+            outcome.coverage = suppressed.coverage;
+            outcome.termination = suppressed.termination;
+            if outcome.exit_code != 0 {
+                outcome.post_install = None;
+            }
+
+            let recorded = Ok(recorded_ok(true, None));
+            let report = InstallReport::from_outcome(&outcome, &recorded, outcome.exit_code == 0);
+            let value = report.to_json(&digest_with_expiry(""), &outcome);
+            let mut rendered = Vec::new();
+            write_json_document(&mut rendered, &value).unwrap();
+
+            let text = String::from_utf8(rendered.clone()).unwrap();
+            assert!(
+                !text.contains(forbidden_marker),
+                "contained child bytes must not enter the JSON envelope"
+            );
+            let mut documents =
+                serde_json::Deserializer::from_slice(&rendered).into_iter::<serde_json::Value>();
+            let parsed = documents
+                .next()
+                .expect("one JSON document")
+                .expect("the sole document is parseable");
+            assert!(
+                documents.next().is_none(),
+                "JSON mode must emit exactly one document"
+            );
+            assert_eq!(parsed, value);
+        }
+    }
+
+    #[test]
+    fn early_pkg_json_failure_is_exactly_one_document() {
+        let early = install_failure_json(
+            "target_checkpoint",
+            "PIP_EARLY_FAILURE_SENTINEL",
+            false,
+            false,
+        );
+        let mut rendered = Vec::new();
+        write_json_document(&mut rendered, &early).unwrap();
+        let mut documents =
+            serde_json::Deserializer::from_slice(&rendered).into_iter::<serde_json::Value>();
+        assert_eq!(documents.next().unwrap().unwrap(), early);
+        assert!(
+            documents.next().is_none(),
+            "an early --json failure must also be exactly one document"
+        );
     }
 
     #[test]
@@ -1767,7 +2366,7 @@ mod tests {
         // is still surfaced for the audit trail.
         let outcome = outcome_with_post(0, 2, 0);
         let recorded = Ok(recorded_ok(true, None));
-        let report = InstallReport::from_outcome(&outcome, &recorded);
+        let report = InstallReport::from_outcome(&outcome, &recorded, true);
         assert!(
             !report.success,
             "a RECORD hash mismatch must fail the enforcing install closed (IM8)"
@@ -1787,7 +2386,7 @@ mod tests {
         // success.
         let outcome = outcome_with_post(0, 0, 1);
         let recorded = Ok(recorded_ok(true, None));
-        let report = InstallReport::from_outcome(&outcome, &recorded);
+        let report = InstallReport::from_outcome(&outcome, &recorded, true);
         assert!(
             !report.success,
             "a missing RECORD must fail the enforcing install closed"
@@ -1809,7 +2408,7 @@ mod tests {
         post.distributions_not_found = 1;
         let recorded = Ok(recorded_ok(true, None));
 
-        let report = InstallReport::from_outcome(&outcome, &recorded);
+        let report = InstallReport::from_outcome(&outcome, &recorded, true);
         assert!(!report.success);
         assert!(report.post_blocked);
         assert!(!report.record_integrity_clean());
@@ -1843,7 +2442,7 @@ mod tests {
         // makes the whole install report a failure (success=false, exit 1).
         let outcome = outcome_with_post(0, 0, 0);
         let recorded = Err(tirith_core::receipt::ReceiptError::SignatureRequiredButUnavailable);
-        let report = InstallReport::from_outcome(&outcome, &recorded);
+        let report = InstallReport::from_outcome(&outcome, &recorded, true);
         assert!(!report.success, "an unrecordable receipt fails the install");
         assert!(report.receipt_error.is_some());
 

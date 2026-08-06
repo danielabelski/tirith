@@ -22,7 +22,7 @@ use tirith_core::mcp::response_inspect::{self, InspectOutcome, ResponseKind, Res
 use tirith_core::mcp::types::{ContentItem, JsonRpcError, JsonRpcResponse, ToolCallResult};
 use tirith_core::policy::GatewayProfile;
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{Action, Finding, Severity, Verdict};
+use tirith_core::verdict::{Action, Finding, Severity};
 
 /// Per-run gateway options (CLI surface). M7 ch4: `filter_output` (opt-in,
 /// default `false`) routes every guarded-tool response's `result.content`
@@ -545,19 +545,27 @@ enum Direction {
     UpstreamToClient,
 }
 
-/// Lifecycle state of a pending request. `Active` is in-flight; the two tombstone
-/// states mark a request that will never be legitimately answered but whose key
-/// must linger so a late/forbidden response is still caught.
+/// Lifecycle of one proxy-identified request. Entries are never removed while a
+/// response is being processed: a non-Clone lease moves the payload out only
+/// after `Active`/`TimedOut`/`Cancelled` becomes `Responding`, and an explicit
+/// finish transition leaves a proxy-id tombstone behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingState {
-    /// Forwarded and awaiting its response within the deadline.
+    /// Proxy id and original-id ownership are reserved, but no transport
+    /// attempt can occur yet. The response deadline starts only after strict
+    /// unresolved recording and execution-permit attachment complete.
+    Reserved,
     Active,
-    /// Explicitly cancelled (e.g. `notifications/cancelled`); a response is no
-    /// longer expected and any that arrives is treated as late.
-    #[allow(dead_code)]
+    Responding,
+    Completed,
     Cancelled,
-    /// The deadline elapsed with no response. A response after this is "late".
     TimedOut,
+    /// Upstream effects may have happened but strict durable confirmation could
+    /// not be established. The gateway shuts down and this state is never reused.
+    CommitUnknown,
+    /// Confirmation was definitely not published (invalid/rejected, or the
+    /// retry window closed). The unresolved observation remains conservative.
+    ConfirmationFailed,
 }
 
 /// What a matched response should do, given the state the entry was in.
@@ -571,7 +579,7 @@ enum ResponseDisposition {
 }
 
 /// Per-entry payload carried from the forward decision to the response handler.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingPayload {
     /// Warn findings to prepend to the response content (empty for allow-forwards).
     findings: Vec<Finding>,
@@ -592,56 +600,40 @@ struct PendingPayload {
     /// cache when the response arrives: a later `tools/list` replacement must not
     /// erase or swap the contract for an already-running call.
     tool_contract: Option<ToolCallPermit>,
-    /// W7: provisional command state to commit only when a matching upstream
-    /// response confirms that this guarded request completed. Passthrough
-    /// requests carry `None`; notifications have no response lifecycle and are
-    /// intentionally never recorded as confirmed executions.
-    execution: Option<PendingExecution>,
+    /// Opaque strict-state continuation. Its constructor has already durably
+    /// recorded the forward as unresolved; only a complete response carrying
+    /// this entry's random proxy id can upgrade it to confirmed.
+    execution: Option<tirith_core::execution_state::GatewayExecutionPermit>,
 }
 
-/// Everything needed to finalize typed session events after an upstream response.
-#[derive(Debug, Clone)]
-struct PendingExecution {
-    verdict: Verdict,
-    policy: tirith_core::policy::Policy,
-    command: String,
-    session_id: String,
-}
-
-impl PendingExecution {
-    fn record(&self) {
-        tirith_core::escalation::record_executed_verdict_events(
-            &self.verdict,
-            &self.policy,
-            &self.command,
-            &self.session_id,
-        );
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingEntry {
     state: PendingState,
-    payload: PendingPayload,
+    original_id: Value,
+    payload: Option<PendingPayload>,
     /// When the entry was registered (Active). Drives the Active -> TimedOut
     /// deadline.
     created: Instant,
+    /// Logical response deadline. Authorization semantics consult this directly;
+    /// the periodic sweep is only a memory-maintenance optimization.
+    active_until: Instant,
     /// When the entry last changed state. Drives tombstone-retention GC.
     state_changed: Instant,
 }
 
 /// Outcome of registering a forwarded request.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegisterOutcome {
-    /// The id was free; a fresh `Active` entry was installed.
     Registered,
-    /// An `Active` entry for `(direction, id)` already exists: a duplicate
-    /// in-flight id. The caller must reject the second request, never forward it.
     DuplicateActive,
-    /// A retained timeout/cancellation tombstone owns the id. Reuse is refused
-    /// until the late response retires it or bounded retention GC expires it;
-    /// otherwise an old response could consume the new request's contract.
     DuplicateTombstone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestRegistrationError {
+    Duplicate(RegisterOutcome),
+    Unavailable(&'static str),
 }
 
 impl RegisterOutcome {
@@ -654,95 +646,376 @@ impl RegisterOutcome {
     }
 }
 
-/// A response matched against the pending table: the disposition to apply and the
-/// payload that was registered with the request.
-#[derive(Debug, Clone)]
+/// Registration result containing the internal id and the exact canonical bytes
+/// to write upstream. The client-supplied id is retained only in the table.
+#[derive(Debug)]
+struct RegisteredRequest {
+    proxy_id: String,
+    upstream_line: Vec<u8>,
+}
+
+/// Non-Clone response lease. The table retains a `Responding` entry while the
+/// payload is validated and its strict execution transition is committed.
+#[derive(Debug)]
 struct MatchedPending {
+    key: (Direction, String),
+    original_id: Value,
     disposition: ResponseDisposition,
     payload: PendingPayload,
 }
 
-/// Tombstone-tracked pending-request table keyed by `(Direction, json-rpc id)`.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseMatch {
+    Lease,
+    Responding,
+    Terminal,
+    Unknown,
+}
+
+/// Tombstone-tracked table keyed by random internal proxy ids. A separate owner
+/// map rejects concurrent reuse of an exact client id, but terminal transitions
+/// release that owner so a later request receives an unrelated proxy id. A late
+/// old response can therefore never bind to the newer request.
+#[derive(Debug)]
 struct PendingRequests {
-    map: HashMap<(Direction, Value), PendingEntry>,
+    map: HashMap<(Direction, String), PendingEntry>,
+    original_owners: HashMap<(Direction, Value), String>,
+    pending_timeout: Duration,
+    tombstone_retention: Duration,
+}
+
+impl Default for PendingRequests {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PendingRequests {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
+            original_owners: HashMap::new(),
+            pending_timeout: Duration::from_millis(default_pending_timeout_ms()),
+            tombstone_retention: Duration::from_millis(default_tombstone_retention_ms()),
         }
     }
 
-    /// Register a forwarded request as `Active`. A pre-existing `Active` entry for
-    /// the same `(direction, id)` is a duplicate in-flight id and is left
-    /// untouched (`DuplicateActive`). A pre-existing tombstone is also retained
-    /// (`DuplicateTombstone`) until its late response or retention GC retires it.
-    fn register(
+    fn with_lifecycle(
+        pending_timeout: Duration,
+        tombstone_retention: Duration,
+    ) -> Result<Self, &'static str> {
+        let now = Instant::now();
+        now.checked_add(pending_timeout)
+            .and_then(|deadline| deadline.checked_add(tombstone_retention))
+            .ok_or("pending_lifecycle_deadline_overflow")?;
+        Ok(Self {
+            map: HashMap::new(),
+            original_owners: HashMap::new(),
+            pending_timeout,
+            tombstone_retention,
+        })
+    }
+
+    fn register_request(
         &mut self,
         direction: Direction,
-        id: Value,
+        request: &Value,
         payload: PendingPayload,
-    ) -> RegisterOutcome {
-        let key = (direction, id);
-        if let Some(existing) = self.map.get(&key) {
-            return match existing.state {
-                PendingState::Active => RegisterOutcome::DuplicateActive,
-                PendingState::Cancelled | PendingState::TimedOut => {
-                    RegisterOutcome::DuplicateTombstone
-                }
-            };
+    ) -> Result<RegisteredRequest, RequestRegistrationError> {
+        let original_id =
+            request
+                .get("id")
+                .cloned()
+                .ok_or(RequestRegistrationError::Unavailable(
+                    "pending_request_id_missing",
+                ))?;
+        let owner_key = (direction, original_id.clone());
+        if let Some(proxy_id) = self.original_owners.get(&owner_key) {
+            let outcome = self
+                .map
+                .get(&(direction, proxy_id.clone()))
+                .map(|entry| match entry.state {
+                    PendingState::Reserved | PendingState::Active | PendingState::Responding => {
+                        RegisterOutcome::DuplicateActive
+                    }
+                    PendingState::Completed
+                    | PendingState::Cancelled
+                    | PendingState::TimedOut
+                    | PendingState::CommitUnknown
+                    | PendingState::ConfirmationFailed => RegisterOutcome::DuplicateTombstone,
+                })
+                .unwrap_or(RegisterOutcome::DuplicateTombstone);
+            return Err(RequestRegistrationError::Duplicate(outcome));
         }
+
+        let proxy_id = loop {
+            let candidate = format!("tirith-{}", uuid::Uuid::new_v4().simple());
+            if !self.map.contains_key(&(direction, candidate.clone())) {
+                break candidate;
+            }
+        };
+        let mut rewritten = request.clone();
+        let object = rewritten
+            .as_object_mut()
+            .ok_or(RequestRegistrationError::Unavailable(
+                "pending_request_not_object",
+            ))?;
+        object.insert("id".to_string(), Value::String(proxy_id.clone()));
+        let upstream_line = serde_json::to_vec(&rewritten).map_err(|_| {
+            RequestRegistrationError::Unavailable("pending_request_serialize_failed")
+        })?;
         let now = Instant::now();
+        let key = (direction, proxy_id.clone());
         self.map.insert(
-            key,
+            key.clone(),
             PendingEntry {
-                state: PendingState::Active,
-                payload,
+                state: PendingState::Reserved,
+                original_id: original_id.clone(),
+                payload: Some(payload),
                 created: now,
+                active_until: now,
                 state_changed: now,
             },
         );
-        RegisterOutcome::Registered
+        self.original_owners.insert(owner_key, proxy_id.clone());
+        Ok(RegisteredRequest {
+            proxy_id,
+            upstream_line,
+        })
     }
 
-    /// Match an incoming response (travelling the opposite way to its request) to
-    /// a pending entry and retire it. `request_direction` is the direction the
-    /// original request was keyed under (the opposite of the response's travel
-    /// direction). `None` means the id is unknown (no entry) -> caller audits and,
-    /// in strict mode, blocks. A matched `Active` entry yields `Live`; a matched
-    /// tombstone yields `Late`. Either way the entry is removed (retired on the
-    /// matching response).
-    fn take_for_response(
+    fn attach_execution(
+        &mut self,
+        direction: Direction,
+        proxy_id: &str,
+        execution: tirith_core::execution_state::GatewayExecutionPermit,
+    ) -> Result<(), &'static str> {
+        let entry = self
+            .map
+            .get_mut(&(direction, proxy_id.to_string()))
+            .ok_or("pending_proxy_missing_before_forward")?;
+        if entry.state != PendingState::Reserved {
+            return Err("pending_proxy_not_active_before_forward");
+        }
+        let payload = entry
+            .payload
+            .as_mut()
+            .ok_or("pending_payload_missing_before_forward")?;
+        if payload.execution.is_some() {
+            return Err("pending_execution_already_attached");
+        }
+        payload.execution = Some(execution);
+        self.activate_for_forward(direction, proxy_id)
+    }
+
+    fn activate_for_forward(
+        &mut self,
+        direction: Direction,
+        proxy_id: &str,
+    ) -> Result<(), &'static str> {
+        let entry = self
+            .map
+            .get_mut(&(direction, proxy_id.to_string()))
+            .ok_or("pending_proxy_missing_before_transport")?;
+        if entry.state != PendingState::Reserved {
+            return Err("pending_proxy_not_reserved_before_transport");
+        }
+        let now = Instant::now();
+        let active_until = now
+            .checked_add(self.pending_timeout)
+            .ok_or("pending_lifecycle_deadline_overflow")?;
+        active_until
+            .checked_add(self.tombstone_retention)
+            .ok_or("pending_lifecycle_deadline_overflow")?;
+        entry.created = now;
+        entry.active_until = active_until;
+        entry.state_changed = now;
+        entry.state = PendingState::Active;
+        Ok(())
+    }
+
+    fn begin_response(
         &mut self,
         request_direction: Direction,
-        id: &Value,
-    ) -> Option<MatchedPending> {
-        let key = (request_direction, id.clone());
-        let entry = self.map.remove(&key)?;
+        response_id: &Value,
+    ) -> (ResponseMatch, Option<MatchedPending>) {
+        self.begin_response_at(request_direction, response_id, Instant::now())
+    }
+
+    fn begin_response_at(
+        &mut self,
+        request_direction: Direction,
+        response_id: &Value,
+        now: Instant,
+    ) -> (ResponseMatch, Option<MatchedPending>) {
+        let Value::String(proxy_id) = response_id else {
+            return (ResponseMatch::Unknown, None);
+        };
+        let key = (request_direction, proxy_id.clone());
+        let Some(entry) = self.map.get_mut(&key) else {
+            return (ResponseMatch::Unknown, None);
+        };
+        if entry.state == PendingState::Active && now >= entry.active_until {
+            entry.state = PendingState::TimedOut;
+            // Timeout retention begins at the logical deadline, not whenever a
+            // delayed sweep happened to observe it.
+            entry.state_changed = entry.active_until;
+        }
+        if matches!(
+            entry.state,
+            PendingState::Completed | PendingState::Cancelled | PendingState::TimedOut
+        ) && entry
+            .state_changed
+            .checked_add(self.tombstone_retention)
+            .is_none_or(|retire_at| now >= retire_at)
+        {
+            return (ResponseMatch::Terminal, None);
+        }
         let disposition = match entry.state {
             PendingState::Active => ResponseDisposition::Live,
-            PendingState::Cancelled | PendingState::TimedOut => ResponseDisposition::Late,
+            PendingState::TimedOut | PendingState::Cancelled => ResponseDisposition::Late,
+            PendingState::Responding => return (ResponseMatch::Responding, None),
+            PendingState::Reserved
+            | PendingState::Completed
+            | PendingState::CommitUnknown
+            | PendingState::ConfirmationFailed => return (ResponseMatch::Terminal, None),
         };
-        Some(MatchedPending {
-            disposition,
-            payload: entry.payload,
-        })
+        let Some(payload) = entry.payload.take() else {
+            return (ResponseMatch::Responding, None);
+        };
+        entry.state = PendingState::Responding;
+        entry.state_changed = now;
+        (
+            ResponseMatch::Lease,
+            Some(MatchedPending {
+                key,
+                original_id: entry.original_id.clone(),
+                disposition,
+                payload,
+            }),
+        )
+    }
+
+    fn finish_response(
+        &mut self,
+        matched: &MatchedPending,
+        terminal: PendingState,
+    ) -> Result<(), &'static str> {
+        if !matches!(
+            terminal,
+            PendingState::Completed
+                | PendingState::CommitUnknown
+                | PendingState::ConfirmationFailed
+        ) {
+            return Err("pending_response_finished_with_nonterminal_state");
+        }
+        let entry = self
+            .map
+            .get_mut(&matched.key)
+            .ok_or("pending_response_entry_disappeared")?;
+        if entry.state != PendingState::Responding || entry.payload.is_some() {
+            return Err("pending_response_lease_lost_exclusivity");
+        }
+        entry.state = terminal;
+        entry.state_changed = Instant::now();
+        Ok(())
+    }
+
+    /// Remove a registration only while no transport write has been attempted.
+    /// This is the sole early-release path for the original-id owner.
+    fn discard_before_forward(&mut self, direction: Direction, proxy_id: &str) -> bool {
+        let key = (direction, proxy_id.to_string());
+        let Some(entry) = self.map.get(&key) else {
+            return false;
+        };
+        if !matches!(entry.state, PendingState::Reserved | PendingState::Active) {
+            return false;
+        }
+        let original_id = entry.original_id.clone();
+        self.map.remove(&key);
+        let owner_key = (direction, original_id);
+        if self.original_owners.get(&owner_key) == Some(&key.1) {
+            self.original_owners.remove(&owner_key);
+        }
+        true
+    }
+
+    /// A write error cannot prove that zero upstream bytes were consumed.
+    /// Retain the owner indefinitely; the gateway shuts down immediately.
+    fn mark_transport_unknown(&mut self, direction: Direction, proxy_id: &str) -> bool {
+        let key = (direction, proxy_id.to_string());
+        let Some(entry) = self.map.get_mut(&key) else {
+            return false;
+        };
+        if entry.state != PendingState::Active {
+            return false;
+        }
+        entry.state = PendingState::CommitUnknown;
+        entry.state_changed = Instant::now();
+        true
+    }
+
+    fn cancel_by_original(
+        &mut self,
+        direction: Direction,
+        notification: &Value,
+    ) -> Result<Vec<u8>, &'static str> {
+        if notification.get("id").is_some()
+            || notification.get("method").and_then(Value::as_str) != Some("notifications/cancelled")
+        {
+            return Err("cancellation_notification_shape_invalid");
+        }
+        let request_id = notification
+            .get("params")
+            .and_then(Value::as_object)
+            .and_then(|params| params.get("requestId"))
+            .ok_or("cancellation_request_id_missing")?;
+        validate_jsonrpc_id(request_id).map_err(|_| "cancellation_request_id_invalid")?;
+        let owner_key = (direction, request_id.clone());
+        let proxy_id = self
+            .original_owners
+            .get(&owner_key)
+            .cloned()
+            .ok_or("cancellation_request_unknown")?;
+        let key = (direction, proxy_id.clone());
+        let entry = self.map.get_mut(&key).ok_or("cancellation_owner_missing")?;
+        let now = Instant::now();
+        if entry.state == PendingState::Active && now >= entry.active_until {
+            entry.state = PendingState::TimedOut;
+            entry.state_changed = entry.active_until;
+        }
+        if entry.state != PendingState::Active {
+            return Err("cancellation_request_not_active");
+        }
+        let mut rewritten = notification.clone();
+        rewritten
+            .get_mut("params")
+            .and_then(Value::as_object_mut)
+            .expect("validated cancellation params")
+            .insert("requestId".to_string(), Value::String(proxy_id));
+        let bytes =
+            serde_json::to_vec(&rewritten).map_err(|_| "cancellation_request_serialize_failed")?;
+        entry.state = PendingState::Cancelled;
+        entry.state_changed = now;
+        Ok(bytes)
     }
 
     /// Transition every `Active` entry whose deadline has elapsed to `TimedOut`.
     /// This NEVER deletes — the tombstone keeps the key alive so a late response
-    /// is still matched (`take_for_response` -> `Late`). Returns the count
+    /// is still matched by its proxy id as `Late`. Returns the count
     /// transitioned (for the audit trail).
     fn time_out_expired(&mut self, deadline: Duration) -> usize {
-        let now = Instant::now();
+        self.time_out_expired_at(deadline, Instant::now())
+    }
+
+    fn time_out_expired_at(&mut self, deadline: Duration, now: Instant) -> usize {
         let mut n = 0;
         for entry in self.map.values_mut() {
-            if entry.state == PendingState::Active && now.duration_since(entry.created) >= deadline
-            {
+            let active_until = entry.created.checked_add(deadline).unwrap_or(now);
+            if entry.state == PendingState::Active && now >= active_until {
                 entry.state = PendingState::TimedOut;
-                entry.state_changed = now;
+                entry.active_until = active_until;
+                entry.state_changed = entry.active_until;
                 n += 1;
             }
         }
@@ -754,11 +1027,33 @@ impl PendingRequests {
     /// path touches them). Bounds memory while keeping late-response detection
     /// effective for the retention window.
     fn gc_tombstones(&mut self, retention: Duration) {
-        let now = Instant::now();
-        self.map.retain(|_, entry| {
-            entry.state == PendingState::Active
-                || now.duration_since(entry.state_changed) < retention
+        self.gc_tombstones_at(retention, Instant::now());
+    }
+
+    fn gc_tombstones_at(&mut self, retention: Duration, now: Instant) {
+        self.tombstone_retention = retention;
+        let mut removed_owners = Vec::new();
+        self.map.retain(|(direction, proxy_id), entry| {
+            let retain = matches!(
+                entry.state,
+                PendingState::Reserved
+                    | PendingState::Active
+                    | PendingState::Responding
+                    | PendingState::CommitUnknown
+            ) || entry
+                .state_changed
+                .checked_add(retention)
+                .is_some_and(|retire_at| now < retire_at);
+            if !retain {
+                removed_owners.push(((*direction, entry.original_id.clone()), proxy_id.clone()));
+            }
+            retain
         });
+        for (owner_key, proxy_id) in removed_owners {
+            if self.original_owners.get(&owner_key) == Some(&proxy_id) {
+                self.original_owners.remove(&owner_key);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -767,8 +1062,62 @@ impl PendingRequests {
     }
 
     #[cfg(test)]
+    fn proxy_for_original(&self, direction: Direction, id: &Value) -> Option<&str> {
+        self.original_owners
+            .get(&(direction, id.clone()))
+            .map(String::as_str)
+    }
+
+    #[cfg(test)]
+    fn proxy_for_any_original(&self, direction: Direction, id: &Value) -> Option<&str> {
+        self.proxy_for_original(direction, id).or_else(|| {
+            self.map
+                .iter()
+                .find_map(|((entry_direction, proxy_id), entry)| {
+                    (*entry_direction == direction && &entry.original_id == id)
+                        .then_some(proxy_id.as_str())
+                })
+        })
+    }
+
+    #[cfg(test)]
+    fn entry_for_original(&self, direction: Direction, id: &Value) -> Option<&PendingEntry> {
+        let proxy_id = self.proxy_for_any_original(direction, id)?;
+        self.map.get(&(direction, proxy_id.to_string()))
+    }
+
+    #[cfg(test)]
+    fn register(
+        &mut self,
+        direction: Direction,
+        id: Value,
+        payload: PendingPayload,
+    ) -> RegisterOutcome {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "test/pending"
+        });
+        match self.register_request(direction, &request, payload) {
+            Ok(registered) => self
+                .activate_for_forward(direction, &registered.proxy_id)
+                .map(|()| RegisterOutcome::Registered)
+                .unwrap_or(RegisterOutcome::DuplicateTombstone),
+            Err(RequestRegistrationError::Duplicate(outcome)) => outcome,
+            Err(RequestRegistrationError::Unavailable(_)) => RegisterOutcome::DuplicateTombstone,
+        }
+    }
+
+    #[cfg(test)]
     fn state_of(&self, direction: Direction, id: &Value) -> Option<PendingState> {
-        self.map.get(&(direction, id.clone())).map(|e| e.state)
+        self.entry_for_original(direction, id)
+            .map(|entry| entry.state)
+    }
+
+    #[cfg(test)]
+    fn take_for_response(&mut self, direction: Direction, id: &Value) -> Option<MatchedPending> {
+        let proxy_id = self.proxy_for_any_original(direction, id)?.to_string();
+        self.begin_response(direction, &Value::String(proxy_id)).1
     }
 }
 
@@ -1201,7 +1550,7 @@ fn spawn_upstream_capsuled(
             );
             Ok(child)
         }
-        Err(refused) => Err(refused.reason),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -1439,7 +1788,7 @@ fn spawn_bound_upstream(
             );
             child
         })
-        .map_err(|refused| refused.reason);
+        .map_err(|error| error.to_string());
     }
 
     Command::new(program)
@@ -1525,12 +1874,34 @@ fn output_protections_required(filter_flag: bool, profile: Option<GatewayProfile
     filter_flag || matches!(profile, Some(GatewayProfile::Secure))
 }
 
+fn require_gateway_runtime_support() -> Result<(), &'static str> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(
+            "gateway run requires the Unix strict execution-state backend; this platform is unsupported and no upstream process was started",
+        )
+    }
+}
+
 pub fn run_gateway_with_options(
     upstream_bin: &str,
     upstream_args: &[String],
     config_path: &str,
     options: GatewayOptions,
 ) -> i32 {
+    // Guard the capability before reading config, discovering policy, or
+    // spawning the upstream. In particular, Windows must not start a proxy that
+    // accepts requests only to reject every guarded call when strict execution
+    // state is unavailable.
+    if let Err(error) = require_gateway_runtime_support() {
+        eprintln!("tirith gateway: {error}");
+        return 1;
+    }
+
     let depth: u32 = std::env::var("TIRITH_GATEWAY_DEPTH")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1829,7 +2200,17 @@ pub fn run_gateway_with_options(
     // tombstones past the retention window. One entry per guarded forward carries
     // both the warn findings (augment) and the filter flag (M7 ch4), replacing the
     // two earlier id->Instant maps.
-    let pending: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(PendingRequests::new()));
+    let pending_deadline = Duration::from_millis(config.policy.pending_timeout_ms);
+    let tombstone_retention = Duration::from_millis(config.policy.tombstone_retention_ms);
+    let pending_table = match PendingRequests::with_lifecycle(pending_deadline, tombstone_retention)
+    {
+        Ok(table) => table,
+        Err(reason) => {
+            eprintln!("tirith gateway: invalid pending-request lifecycle: {reason}");
+            return 1;
+        }
+    };
+    let pending: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(pending_table));
 
     // C2 — tool-schema cache, shared between Thread 1 (validates `tools/call`
     // arguments against the cached `inputSchema`) and Thread 2 (populates it from
@@ -1925,7 +2306,7 @@ pub fn run_gateway_with_options(
                 break;
             }
             match read_bounded_line(&mut reader, max_bytes) {
-                Ok(Some(line)) => {
+                Ok(BoundedRead::Frame(line)) => {
                     // C1 — a response to a client->upstream request is matched
                     // under `Direction::ClientToUpstream`. A `Live` match applies
                     // the output filter (a block short-circuits warn-augmentation)
@@ -1962,14 +2343,30 @@ pub fn run_gateway_with_options(
                         break;
                     }
                 }
-                Ok(None) => {
+                Ok(BoundedRead::Eof) => {
                     // Upstream EOF: signal shutdown, else main hangs (Thread 1's
                     // sender keeps the channel alive while it blocks on stdin).
                     sd2.store(true, Ordering::Relaxed);
                     break;
                 }
-                Err(n) => {
-                    eprintln!("tirith gateway: upstream message exceeds max_message_bytes ({n} > {max_bytes}), terminating");
+                Ok(BoundedRead::Incomplete(line)) => {
+                    eprintln!(
+                        "tirith gateway: upstream stdout ended with an incomplete JSON-RPC frame ({} bytes); terminating",
+                        line.len()
+                    );
+                    sd2.store(true, Ordering::Release);
+                    break;
+                }
+                Err(BoundedReadError::TooLong { observed_at_least }) => {
+                    eprintln!("tirith gateway: upstream message exceeds max_message_bytes ({observed_at_least} > {max_bytes}), terminating");
+                    sd2.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Err(BoundedReadError::Io {
+                    source,
+                    partial_len,
+                }) => {
+                    eprintln!("tirith gateway: upstream stdout read failed after {partial_len} frame bytes: {source}; terminating");
                     sd2.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -1985,16 +2382,27 @@ pub fn run_gateway_with_options(
                 break;
             }
             match read_bounded_line(&mut reader, max_bytes) {
-                Ok(Some(line)) => {
-                    let sanitized = tirith_core::mcp::output_filter::sanitize_for_display(
-                        &String::from_utf8_lossy(&line),
-                    );
-                    eprintln!("[upstream] {sanitized}");
+                Ok(BoundedRead::Frame(line)) => {
+                    eprintln!("{}", render_upstream_stderr_line(&line));
                 }
-                Ok(None) => break,
-                Err(_) => {
+                Ok(BoundedRead::Incomplete(line)) => {
+                    eprintln!("{}", render_upstream_stderr_line(&line));
+                    break;
+                }
+                Ok(BoundedRead::Eof) => break,
+                Err(BoundedReadError::TooLong { .. }) => {
                     eprintln!(
                         "tirith gateway: upstream stderr line exceeded max_message_bytes; terminating"
+                    );
+                    sd3.store(true, Ordering::Release);
+                    break;
+                }
+                Err(BoundedReadError::Io {
+                    source,
+                    partial_len,
+                }) => {
+                    eprintln!(
+                        "tirith gateway: upstream stderr read failed after {partial_len} bytes: {source}; terminating"
                     );
                     sd3.store(true, Ordering::Release);
                     break;
@@ -2020,15 +2428,31 @@ pub fn run_gateway_with_options(
                 break;
             }
             let raw_line = match read_bounded_line(&mut reader, max_bytes) {
-                Ok(Some(line)) => line,
-                Ok(None) => {
+                Ok(BoundedRead::Frame(line)) => line,
+                Ok(BoundedRead::Eof) => {
                     // Client stdin EOF — normal shutdown.
                     cd1.store(true, Ordering::Relaxed);
                     sd1.store(true, Ordering::Relaxed);
                     break;
                 }
-                Err(n) => {
-                    eprintln!("tirith gateway: client message exceeds max_message_bytes ({n} > {max_bytes}), terminating");
+                Ok(BoundedRead::Incomplete(line)) => {
+                    eprintln!(
+                        "tirith gateway: client stdin ended with an incomplete JSON-RPC frame ({} bytes); terminating",
+                        line.len()
+                    );
+                    sd1.store(true, Ordering::Release);
+                    break;
+                }
+                Err(BoundedReadError::TooLong { observed_at_least }) => {
+                    eprintln!("tirith gateway: client message exceeds max_message_bytes ({observed_at_least} > {max_bytes}), terminating");
+                    sd1.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Err(BoundedReadError::Io {
+                    source,
+                    partial_len,
+                }) => {
+                    eprintln!("tirith gateway: client stdin read failed after {partial_len} frame bytes: {source}; terminating");
                     sd1.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -2050,7 +2474,7 @@ pub fn run_gateway_with_options(
                 Err(error) => {
                     let reason = error.reason();
                     write_server_message_audit("block", "invalid", &[], reason);
-                    let _ = tx1.send(build_client_json_boundary_error(reason));
+                    let _ = tx1.send(build_client_json_boundary_error(reason, None));
                     None
                 }
                 Ok((Value::Array(ref arr), _)) => {
@@ -2059,7 +2483,10 @@ pub fn run_gateway_with_options(
                     None
                 }
                 Ok((ref val, _)) if !val.is_object() => {
-                    let _ = tx1.send(build_client_json_boundary_error("jsonrpc_object_required"));
+                    let _ = tx1.send(build_client_json_boundary_error(
+                        "jsonrpc_object_required",
+                        None,
+                    ));
                     None
                 }
                 Ok((ref obj, _))
@@ -2104,8 +2531,6 @@ pub fn run_gateway_with_options(
     let mut stdout = io::stdout().lock();
     let mut last_sweep = Instant::now();
     // C1 — deadline/retention from the gateway policy (default 30s / 60s).
-    let pending_deadline = Duration::from_millis(config.policy.pending_timeout_ms);
-    let tombstone_retention = Duration::from_millis(config.policy.tombstone_retention_ms);
     loop {
         match output_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
@@ -2220,8 +2645,28 @@ fn process_object(
     if direction == Direction::ClientToUpstream {
         if let Err(reason) = validate_client_jsonrpc_message(obj) {
             write_server_message_audit("block", "client", &[], reason);
-            let _ = output_tx.send(build_client_json_boundary_error(reason));
+            let _ = output_tx.send(build_client_json_boundary_error(reason, Some(obj)));
             return Ok(());
+        }
+
+        // Cancellation carries a client-visible request id, but the upstream
+        // only knows Tirith's random proxy id. Resolve and rewrite the exact
+        // current owner atomically before the guarded/schema split. The single
+        // client reader preserves request-before-cancellation FIFO; a
+        // cancellation queued during synchronous analysis is best-effort and is
+        // processed immediately after that analysis completes.
+        if obj.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+            let rewritten = match pending.lock() {
+                Ok(mut table) => table.cancel_by_original(direction, obj),
+                Err(_) => Err("cancellation_pending_table_unavailable"),
+            };
+            return match rewritten {
+                Ok(rewritten) => forward(upstream, &rewritten),
+                Err(reason) => {
+                    write_pending_lifecycle_audit(reason, 1);
+                    Ok(())
+                }
+            };
         }
     }
 
@@ -2271,7 +2716,7 @@ fn process_object(
                     }
                 };
             match register_passthrough_request(obj, pending, direction, tool_permit) {
-                Ok(Some(outcome)) if outcome.duplicate_reason().is_some() => {
+                Err(RequestRegistrationError::Duplicate(outcome)) => {
                     if let Some(id @ (Value::String(_) | Value::Number(_) | Value::Null)) =
                         obj.get("id")
                     {
@@ -2282,8 +2727,7 @@ fn process_object(
                     }
                     return Ok(());
                 }
-                Ok(_) => {}
-                Err(reason) => {
+                Err(RequestRegistrationError::Unavailable(reason)) => {
                     write_pending_lifecycle_audit(reason, 1);
                     if let Some(id @ (Value::String(_) | Value::Number(_) | Value::Null)) =
                         obj.get("id")
@@ -2301,6 +2745,18 @@ fn process_object(
                     }
                     return Ok(());
                 }
+                Ok(Some(registered)) => {
+                    return match forward(upstream, &registered.upstream_line) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            if let Ok(mut table) = pending.lock() {
+                                table.mark_transport_unknown(direction, &registered.proxy_id);
+                            }
+                            Err(error)
+                        }
+                    };
+                }
+                Ok(None) => {}
             }
             forward(upstream, raw_line)
         }
@@ -2324,33 +2780,12 @@ fn process_object(
             schema_cache,
             tool_permit,
         ),
-        GuardedResult::GuardedNotification {
-            command,
-            tool_name,
-            shell,
-        } => handle_guarded_notification(
-            &command,
-            &tool_name,
-            shell,
-            raw_line,
-            config,
-            upstream,
-            schema_cache,
-            tool_permit,
-        ),
-        GuardedResult::ExtractionFailed { id, tool_name } => handle_extraction_failed(
-            id,
-            &tool_name,
-            raw_line,
-            config,
-            upstream,
-            output_tx,
-            pending,
-            direction,
-            filter_output,
-            schema_cache,
-            tool_permit,
-        ),
+        GuardedResult::GuardedNotification { command, tool_name } => {
+            handle_guarded_notification(&command, &tool_name)
+        }
+        GuardedResult::ExtractionFailed { id, tool_name } => {
+            handle_extraction_failed(id, &tool_name, output_tx)
+        }
         GuardedResult::NotificationExtractionFailed { tool_name } => {
             handle_notification_extraction_failed(&tool_name)
         }
@@ -2657,31 +3092,84 @@ fn handle_guarded_call(
             raw_verdict.agent_origin = Some(tirith_core::agent_origin::AgentOrigin::Gateway);
 
             let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();
-            let raw_rule_ids_vec: Vec<String>;
-            let session_id = tirith_core::session::resolve_session_id();
-
-            let effective = if raw_verdict.bypass_honored {
-                raw_rule_ids_vec = vec![];
-                raw_verdict
+            let raw_rule_ids_vec: Vec<String> = if raw_verdict.bypass_honored {
+                Vec::new()
             } else {
-                raw_rule_ids_vec = raw_verdict
+                raw_verdict
                     .findings
                     .iter()
-                    .map(|f| f.rule_id.to_string())
-                    .collect();
-                tirith_core::escalation::post_process_verdict(
-                    &raw_verdict,
-                    &engine_policy,
-                    command,
-                    &session_id,
-                    tirith_core::escalation::CallerContext::Gateway,
-                )
+                    .map(|finding| finding.rule_id.to_string())
+                    .collect()
             };
-            let should_deny = match effective.action {
-                Action::Block => true,
-                Action::Warn | Action::WarnAck => config.policy.warn_action == "deny",
-                Action::Allow => false,
+            let session_id = tirith_core::session::resolve_session_id();
+            let completion_window = match Duration::from_millis(config.policy.pending_timeout_ms)
+                .checked_add(Duration::from_millis(config.policy.tombstone_retention_ms))
+            {
+                Some(window) => window,
+                None => {
+                    write_pending_lifecycle_audit("pending_lifecycle_deadline_overflow", 1);
+                    let _ = output_tx.send(
+                        build_fail_mode_deny(
+                            id,
+                            "pending lifecycle deadline overflow",
+                            elapsed,
+                            true,
+                            false,
+                        )
+                        .into_bytes(),
+                    );
+                    return Ok(());
+                }
             };
+            let prepared = match tirith_core::execution_state::prepare_execution(
+                &raw_verdict,
+                &engine_policy,
+                command,
+                &session_id,
+                tirith_core::escalation::CallerContext::Gateway,
+                shell,
+                tirith_core::execution_state::DEFAULT_DRAFT_TTL,
+                tirith_core::execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    write_audit_with_raw(
+                        "block",
+                        "strict_state_unavailable",
+                        &raw_rule_ids_vec,
+                        None,
+                        tool_name,
+                        &hash,
+                        elapsed,
+                        true,
+                        false,
+                        Some(&raw_decision_str),
+                        Some(&raw_rule_ids_vec),
+                        Some(&session_id),
+                    );
+                    eprintln!(
+                        "tirith gateway: guarded request denied because strict execution state could not be prepared: {error}"
+                    );
+                    let _ = output_tx.send(
+                        build_fail_mode_deny(
+                            id,
+                            "strict execution state unavailable",
+                            elapsed,
+                            true,
+                            false,
+                        )
+                        .into_bytes(),
+                    );
+                    return Ok(());
+                }
+            };
+            let effective = prepared.verdict().clone();
+            let should_deny = effective.requires_approval == Some(true)
+                || match effective.action {
+                    Action::Block | Action::WarnAck => true,
+                    Action::Warn => config.policy.warn_action == "deny",
+                    Action::Allow => false,
+                };
 
             let rule_ids: Vec<String> = effective
                 .findings
@@ -2735,11 +3223,25 @@ fn handle_guarded_call(
                             return Ok(());
                         }
                     };
-                // C1 — register the forward as `Active` BEFORE writing upstream
-                // (else a fast upstream could reply before the entry exists and
-                // Thread 2 would miss it). One entry per guarded forward carries
-                // the warn findings (augment) and the filter flag (M7 ch4). A
-                // duplicate in-flight id is rejected, never forwarded.
+                let request: Value = match serde_json::from_slice(raw_line) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        eprintln!(
+                            "tirith gateway: canonical guarded request could not be reparsed: {error}"
+                        );
+                        let _ = output_tx.send(
+                            build_fail_mode_deny(
+                                id,
+                                "canonical guarded request unavailable",
+                                elapsed,
+                                true,
+                                false,
+                            )
+                            .into_bytes(),
+                        );
+                        return Ok(());
+                    }
+                };
                 let payload = PendingPayload {
                     findings: effective.findings.clone(),
                     filter: filter_output,
@@ -2749,15 +3251,10 @@ fn handle_guarded_call(
                     // C2 — record the tool so the response can validate its
                     // `structuredContent` against the cached `outputSchema`.
                     tool_contract: tool_permit.clone(),
-                    execution: Some(PendingExecution {
-                        verdict: effective.clone(),
-                        policy: engine_policy.clone(),
-                        command: command.to_string(),
-                        session_id: session_id.clone(),
-                    }),
+                    execution: None,
                 };
-                let outcome = match pending.lock() {
-                    Ok(mut table) => table.register(direction, id.clone(), payload),
+                let registered = match pending.lock() {
+                    Ok(mut table) => table.register_request(direction, &request, payload),
                     Err(e) => {
                         // A poisoned table means a panicked sibling thread; fail
                         // closed by denying rather than forwarding untracked.
@@ -2775,23 +3272,106 @@ fn handle_guarded_call(
                         return Ok(());
                     }
                 };
-                if let Some(reason) = outcome.duplicate_reason() {
-                    // Duplicate active id: reject the second request. The first is
-                    // still in-flight under the same key; forwarding this one would
-                    // let two requests collide on a single id (and its response).
-                    write_audit(
-                        "block",
-                        reason,
-                        &[],
-                        None,
-                        tool_name,
-                        &hash,
-                        elapsed,
-                        false,
-                        false,
-                    );
+                let registered = match registered {
+                    Ok(registered) => registered,
+                    Err(RequestRegistrationError::Duplicate(outcome)) => {
+                        let reason = outcome
+                            .duplicate_reason()
+                            .unwrap_or("pending_registration_failed");
+                        // Duplicate active id: reject the second request. The first is
+                        // still in-flight under the same key; forwarding this one would
+                        // let two requests collide on a single id (and its response).
+                        write_audit(
+                            "block",
+                            reason,
+                            &[],
+                            None,
+                            tool_name,
+                            &hash,
+                            elapsed,
+                            false,
+                            false,
+                        );
+                        let _ = output_tx.send(
+                            build_duplicate_request_id_response(id, elapsed, outcome).into_bytes(),
+                        );
+                        return Ok(());
+                    }
+                    Err(RequestRegistrationError::Unavailable(reason)) => {
+                        write_pending_lifecycle_audit(reason, 1);
+                        let _ = output_tx.send(
+                            build_fail_mode_deny(
+                                id,
+                                "pending registration unavailable",
+                                elapsed,
+                                true,
+                                false,
+                            )
+                            .into_bytes(),
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let execution =
+                    match tirith_core::execution_state::GatewayExecutionPermit::record_forwarded(
+                        prepared,
+                        registered.proxy_id.clone(),
+                        completion_window,
+                        tirith_core::execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
+                    ) {
+                        Ok(execution) => execution,
+                        Err(error) => {
+                            if let Ok(mut table) = pending.lock() {
+                                table.discard_before_forward(direction, &registered.proxy_id);
+                            }
+                            write_audit(
+                                "block",
+                                "strict_forward_record_failed",
+                                &rule_ids,
+                                max_sev.as_deref(),
+                                tool_name,
+                                &hash,
+                                elapsed,
+                                true,
+                                false,
+                            );
+                            eprintln!(
+                            "tirith gateway: guarded request denied before transport because its unresolved forward could not be recorded: {error}"
+                        );
+                            let _ = output_tx.send(
+                                build_fail_mode_deny(
+                                    id,
+                                    "strict forward record failed",
+                                    elapsed,
+                                    true,
+                                    false,
+                                )
+                                .into_bytes(),
+                            );
+                            return Ok(());
+                        }
+                    };
+                let attached = pending
+                    .lock()
+                    .map_err(|_| "pending table unavailable before guarded forward")
+                    .and_then(|mut table| {
+                        table.attach_execution(direction, &registered.proxy_id, execution)
+                    });
+                if let Err(reason) = attached {
+                    if let Ok(mut table) = pending.lock() {
+                        table.discard_before_forward(direction, &registered.proxy_id);
+                    }
+                    eprintln!("tirith gateway: {reason}");
                     let _ = output_tx.send(
-                        build_duplicate_request_id_response(id, elapsed, outcome).into_bytes(),
+                        build_fail_mode_deny(
+                            id,
+                            "pending execution attachment failed",
+                            elapsed,
+                            true,
+                            false,
+                        )
+                        .into_bytes(),
                     );
                     return Ok(());
                 }
@@ -2801,100 +3381,50 @@ fn handle_guarded_call(
                 } else {
                     "allow"
                 };
-                write_audit_with_raw(
-                    decision,
-                    "forwarded",
-                    &rule_ids,
-                    max_sev.as_deref(),
-                    tool_name,
-                    &hash,
-                    elapsed,
-                    false,
-                    false,
-                    Some(&raw_decision_str),
-                    Some(&raw_rule_ids_vec),
-                    Some(&session_id),
-                );
-
-                // On forward failure Thread 1 shuts down; the pending table is
-                // cleaned up when the Arcs drop, so no explicit removal is needed.
-                forward(upstream, raw_line)
+                match forward(upstream, &registered.upstream_line) {
+                    Ok(()) => {
+                        write_audit_with_raw(
+                            decision,
+                            "forwarded",
+                            &rule_ids,
+                            max_sev.as_deref(),
+                            tool_name,
+                            &hash,
+                            elapsed,
+                            false,
+                            false,
+                            Some(&raw_decision_str),
+                            Some(&raw_rule_ids_vec),
+                            Some(&session_id),
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        if let Ok(mut table) = pending.lock() {
+                            table.mark_transport_unknown(direction, &registered.proxy_id);
+                        }
+                        Err(error)
+                    }
+                }
             }
         }
         Err(_) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            if config.policy.fail_mode == "open" {
-                let _permit_guard =
-                    match acquire_current_tool_permit(schema_cache, tool_permit.as_ref()) {
-                        Ok(guard) => guard,
-                        Err(reason) => {
-                            reject_stale_tool_permit_id(
-                                Some(&id),
-                                tool_permit.as_ref(),
-                                reason,
-                                output_tx,
-                            );
-                            return Ok(());
-                        }
-                    };
-                let payload = PendingPayload {
-                    findings: Vec::new(),
-                    filter: filter_output,
-                    inspect_kind: None,
-                    tool_contract: tool_permit.clone(),
-                    execution: None,
-                };
-                let outcome = match pending.lock() {
-                    Ok(mut table) => table.register(direction, id.clone(), payload),
-                    Err(e) => {
-                        eprintln!(
-                            "tirith gateway: pending table mutex poisoned on timeout register: {e}"
-                        );
-                        reject_stale_tool_permit_id(
-                            Some(&id),
-                            tool_permit.as_ref(),
-                            "pending_table_unavailable",
-                            output_tx,
-                        );
-                        return Ok(());
-                    }
-                };
-                if outcome.duplicate_reason().is_some() {
-                    let _ = output_tx.send(
-                        build_duplicate_request_id_response(id, elapsed, outcome).into_bytes(),
-                    );
-                    return Ok(());
-                }
-                write_audit(
-                    "allow",
-                    "forwarded",
-                    &[],
-                    None,
-                    tool_name,
-                    &hash,
-                    elapsed,
-                    true,
-                    true,
-                );
-                forward(upstream, raw_line)
-            } else {
-                write_audit(
-                    "block",
-                    "denied",
-                    &[],
-                    None,
-                    tool_name,
-                    &hash,
-                    elapsed,
-                    true,
-                    true,
-                );
-                let _ = output_tx.send(
-                    build_fail_mode_deny(id, "analysis timed out", elapsed, true, true)
-                        .into_bytes(),
-                );
-                Ok(())
-            }
+            write_audit(
+                "block",
+                "denied_without_execution_draft",
+                &[],
+                None,
+                tool_name,
+                &hash,
+                elapsed,
+                true,
+                true,
+            );
+            let _ = output_tx.send(
+                build_fail_mode_deny(id, "analysis timed out", elapsed, true, true).into_bytes(),
+            );
+            Ok(())
         }
     }
 }
@@ -2902,271 +3432,38 @@ fn handle_guarded_call(
 fn handle_extraction_failed(
     id: Value,
     tool_name: &str,
-    raw_line: &[u8],
-    config: &CompiledConfig,
-    upstream: &mut impl Write,
     output_tx: &mpsc::Sender<Vec<u8>>,
-    pending: &Mutex<PendingRequests>,
-    direction: Direction,
-    filter_output: bool,
-    schema_cache: &Mutex<ToolSchemaCache>,
-    tool_permit: Option<ToolCallPermit>,
 ) -> io::Result<()> {
-    if config.policy.fail_mode == "open" {
-        let _permit_guard = match acquire_current_tool_permit(schema_cache, tool_permit.as_ref()) {
-            Ok(guard) => guard,
-            Err(reason) => {
-                reject_stale_tool_permit_id(Some(&id), tool_permit.as_ref(), reason, output_tx);
-                return Ok(());
-            }
-        };
-        let payload = PendingPayload {
-            findings: Vec::new(),
-            filter: filter_output,
-            inspect_kind: None,
-            tool_contract: tool_permit,
-            execution: None,
-        };
-        let outcome = match pending.lock() {
-            Ok(mut table) => table.register(direction, id.clone(), payload),
-            Err(e) => {
-                eprintln!(
-                    "tirith gateway: pending table mutex poisoned on extraction-failure register: {e}"
-                );
-                let _ = output_tx.send(
-                    build_fail_mode_deny(id, "pending table unavailable", 0.0, true, false)
-                        .into_bytes(),
-                );
-                return Ok(());
-            }
-        };
-        if outcome.duplicate_reason().is_some() {
-            let _ =
-                output_tx.send(build_duplicate_request_id_response(id, 0.0, outcome).into_bytes());
-            return Ok(());
-        }
-        write_audit(
-            "allow",
-            "forwarded",
-            &[],
-            None,
-            tool_name,
-            "",
-            0.0,
-            true,
-            false,
-        );
-        forward(upstream, raw_line)
-    } else {
-        write_audit(
-            "block",
-            "denied",
-            &[],
-            None,
-            tool_name,
-            "",
-            0.0,
-            true,
-            false,
-        );
-        let _ = output_tx.send(
-            build_fail_mode_deny(id, "command extraction failed", 0.0, true, false).into_bytes(),
-        );
-        Ok(())
-    }
+    write_audit(
+        "block",
+        "denied_without_execution_draft",
+        &[],
+        None,
+        tool_name,
+        "",
+        0.0,
+        true,
+        false,
+    );
+    let _ = output_tx
+        .send(build_fail_mode_deny(id, "command extraction failed", 0.0, true, false).into_bytes());
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_guarded_notification(
-    command: &str,
-    tool_name: &str,
-    shell: ShellType,
-    raw_line: &[u8],
-    config: &CompiledConfig,
-    upstream: &mut impl Write,
-    schema_cache: &Mutex<ToolSchemaCache>,
-    tool_permit: Option<ToolCallPermit>,
-) -> io::Result<()> {
-    let start = std::time::Instant::now();
+fn handle_guarded_notification(command: &str, tool_name: &str) -> io::Result<()> {
     let hash = cmd_hash_prefix(command);
-
-    let (tx, rx) = mpsc::channel();
-    let cmd_owned = command.to_string();
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
-    let cwd_for_thread = cwd.clone();
-    thread::spawn(move || {
-        let ctx = AnalysisContext {
-            input: cmd_owned,
-            shell,
-            scan_context: ScanContext::Exec,
-            raw_bytes: None,
-            interactive: true,
-            cwd: cwd_for_thread,
-            file_path: None,
-            repo_root: None,
-            is_config_override: false,
-            clipboard_html: None,
-            card_ref: None,
-            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
-        };
-        let _ = tx.send(engine::analyze_returning_policy(&ctx));
-    });
-
-    let timeout = Duration::from_millis(config.policy.timeout_ms);
-    match rx.recv_timeout(timeout) {
-        Ok((mut raw_verdict, engine_policy)) => {
-            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-
-            // M4 item 8 — same Gateway origin attribution as the request path
-            // (bypass skips post-processing here too).
-            raw_verdict.agent_origin = Some(tirith_core::agent_origin::AgentOrigin::Gateway);
-
-            let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();
-            let raw_rule_ids_vec: Vec<String>;
-            let session_id = tirith_core::session::resolve_session_id();
-
-            let effective = if raw_verdict.bypass_honored {
-                raw_rule_ids_vec = vec![];
-                raw_verdict
-            } else {
-                raw_rule_ids_vec = raw_verdict
-                    .findings
-                    .iter()
-                    .map(|f| f.rule_id.to_string())
-                    .collect();
-                tirith_core::escalation::post_process_verdict(
-                    &raw_verdict,
-                    &engine_policy,
-                    command,
-                    &session_id,
-                    tirith_core::escalation::CallerContext::Gateway,
-                )
-            };
-            // A JSON-RPC notification has no response, so the gateway cannot
-            // confirm completion. Keep its W7 events provisional only; unlike the
-            // request path, there is no pending-response record to finalize.
-
-            let should_deny = match effective.action {
-                Action::Block => true,
-                Action::Warn | Action::WarnAck => config.policy.warn_action == "deny",
-                Action::Allow => false,
-            };
-
-            let rule_ids: Vec<String> = effective
-                .findings
-                .iter()
-                .map(|f| f.rule_id.to_string())
-                .collect();
-            let max_sev = effective
-                .findings
-                .iter()
-                .map(|f| f.severity)
-                .max()
-                .map(|s| s.to_string());
-
-            if should_deny {
-                let decision = if effective.action == Action::Block {
-                    "block"
-                } else {
-                    "warn"
-                };
-                write_audit_with_raw(
-                    decision,
-                    "dropped_notification",
-                    &rule_ids,
-                    max_sev.as_deref(),
-                    tool_name,
-                    &hash,
-                    elapsed,
-                    false,
-                    false,
-                    Some(&raw_decision_str),
-                    Some(&raw_rule_ids_vec),
-                    Some(&session_id),
-                );
-                Ok(())
-            } else {
-                let _permit_guard = match acquire_current_tool_permit(
-                    schema_cache,
-                    tool_permit.as_ref(),
-                ) {
-                    Ok(guard) => guard,
-                    Err(reason) => {
-                        write_schema_audit("input_schema", "block", tool_name, reason);
-                        eprintln!(
-                            "tirith gateway: dropping no-id call for {tool_name:?}: its validated contract changed before forward"
-                        );
-                        return Ok(());
-                    }
-                };
-                let decision = if effective.action == Action::Warn {
-                    "warn"
-                } else {
-                    "allow"
-                };
-                write_audit_with_raw(
-                    decision,
-                    "forwarded_notification",
-                    &rule_ids,
-                    max_sev.as_deref(),
-                    tool_name,
-                    &hash,
-                    elapsed,
-                    false,
-                    false,
-                    Some(&raw_decision_str),
-                    Some(&raw_rule_ids_vec),
-                    Some(&session_id),
-                );
-                forward(upstream, raw_line)
-            }
-        }
-        Err(_) => {
-            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            if config.policy.fail_mode == "open" {
-                let _permit_guard = match acquire_current_tool_permit(
-                    schema_cache,
-                    tool_permit.as_ref(),
-                ) {
-                    Ok(guard) => guard,
-                    Err(reason) => {
-                        write_schema_audit("input_schema", "block", tool_name, reason);
-                        eprintln!(
-                            "tirith gateway: dropping no-id call for {tool_name:?}: its validated contract changed before forward"
-                        );
-                        return Ok(());
-                    }
-                };
-                write_audit(
-                    "allow",
-                    "forwarded_notification",
-                    &[],
-                    None,
-                    tool_name,
-                    &hash,
-                    elapsed,
-                    true,
-                    true,
-                );
-                forward(upstream, raw_line)
-            } else {
-                write_audit(
-                    "block",
-                    "dropped_notification",
-                    &[],
-                    None,
-                    tool_name,
-                    &hash,
-                    elapsed,
-                    true,
-                    true,
-                );
-                Ok(())
-            }
-        }
-    }
+    write_audit(
+        "block",
+        "dropped_notification_no_confirmation_channel",
+        &[],
+        None,
+        tool_name,
+        &hash,
+        0.0,
+        true,
+        false,
+    );
+    Ok(())
 }
 
 fn handle_notification_extraction_failed(tool_name: &str) -> io::Result<()> {
@@ -3208,7 +3505,6 @@ enum GuardedResult {
     GuardedNotification {
         command: String,
         tool_name: String,
-        shell: ShellType,
     },
     Guarded {
         id: Value,
@@ -3268,11 +3564,7 @@ fn check_guarded(obj: &Value, config: &CompiledConfig) -> GuardedResult {
 
     match obj.get("id") {
         None => match extracted_command() {
-            Some(command) => GuardedResult::GuardedNotification {
-                command,
-                tool_name,
-                shell: guard.shell,
-            },
+            Some(command) => GuardedResult::GuardedNotification { command, tool_name },
             None => GuardedResult::NotificationExtractionFailed { tool_name },
         },
         Some(Value::String(_)) | Some(Value::Number(_)) | Some(Value::Null) => {
@@ -3453,14 +3745,19 @@ fn build_invalid_id_request_response() -> String {
     .unwrap_or_default()
 }
 
-fn build_client_json_boundary_error(reason: &'static str) -> Vec<u8> {
+fn build_client_json_boundary_error(reason: &'static str, message: Option<&Value>) -> Vec<u8> {
     let code = if reason == "malformed_json" {
         -32700
     } else {
         -32600
     };
+    let id = message
+        .and_then(|message| message.get("id"))
+        .filter(|id| validate_jsonrpc_id(id).is_ok())
+        .cloned()
+        .unwrap_or(Value::Null);
     serde_json::to_vec(&JsonRpcResponse::err(
-        Value::Null,
+        id,
         JsonRpcError {
             code,
             message: "Tirith rejected an ambiguous or malformed JSON-RPC message".to_string(),
@@ -3497,6 +3794,21 @@ fn is_jsonrpc_response(parsed: &Value) -> bool {
     obj.contains_key("result") ^ obj.contains_key("error")
 }
 
+const MAX_JSONRPC_ID_BYTES: usize = 256;
+
+/// JSON-RPC allows string, number, or null ids. Bound their canonical wire size
+/// before they become hash-map keys, audit data, or response-correlation input.
+fn validate_jsonrpc_id(id: &Value) -> Result<(), &'static str> {
+    if !matches!(id, Value::String(_) | Value::Number(_) | Value::Null) {
+        return Err("jsonrpc_id_invalid");
+    }
+    let encoded = serde_json::to_vec(id).map_err(|_| "jsonrpc_id_invalid")?;
+    if encoded.len() > MAX_JSONRPC_ID_BYTES {
+        return Err("jsonrpc_id_too_large");
+    }
+    Ok(())
+}
+
 /// Validate the complete client-side JSON-RPC envelope before any upstream
 /// effect. MCP uses object-shaped params, scalar/null ids, and JSON-RPC 2.0.
 /// Requests/notifications (`method`) and responses (`result` xor `error`) are
@@ -3510,9 +3822,7 @@ fn validate_client_jsonrpc_message(message: &Value) -> Result<(), &'static str> 
     }
 
     if let Some(id) = object.get("id") {
-        if !matches!(id, Value::String(_) | Value::Number(_) | Value::Null) {
-            return Err("jsonrpc_id_invalid");
-        }
+        validate_jsonrpc_id(id)?;
     }
 
     let has_method = object.contains_key("method");
@@ -3535,6 +3845,12 @@ fn validate_client_jsonrpc_message(message: &Value) -> Result<(), &'static str> 
         {
             return Err("jsonrpc_params_invalid");
         }
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params"))
+        {
+            return Err("jsonrpc_unknown_top_level_member");
+        }
         return Ok(());
     }
 
@@ -3543,6 +3859,15 @@ fn validate_client_jsonrpc_message(message: &Value) -> Result<(), &'static str> 
     // requests, but validating the reverse direction keeps the boundary total.)
     if !object.contains_key("id") || has_result == has_error || object.contains_key("params") {
         return Err("jsonrpc_response_shape_invalid");
+    }
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "result" | "error"))
+    {
+        return Err("jsonrpc_unknown_top_level_member");
+    }
+    if let Some(error) = object.get("error") {
+        validate_jsonrpc_error_shape(error)?;
     }
     Ok(())
 }
@@ -3556,9 +3881,7 @@ fn validate_server_jsonrpc_message(message: &Value) -> Result<(), &'static str> 
         return Err("jsonrpc_version_required");
     }
     if let Some(id) = object.get("id") {
-        if !matches!(id, Value::String(_) | Value::Number(_) | Value::Null) {
-            return Err("jsonrpc_id_invalid");
-        }
+        validate_jsonrpc_id(id)?;
     }
 
     let has_method = object.contains_key("method");
@@ -3596,6 +3919,9 @@ fn validate_server_jsonrpc_message(message: &Value) -> Result<(), &'static str> 
         .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "result" | "error"))
     {
         return Err("jsonrpc_unknown_top_level_member");
+    }
+    if let Some(error) = object.get("error") {
+        validate_jsonrpc_error_shape(error)?;
     }
     Ok(())
 }
@@ -3746,7 +4072,7 @@ fn register_passthrough_request(
     pending: &Mutex<PendingRequests>,
     direction: Direction,
     tool_contract: Option<ToolCallPermit>,
-) -> Result<Option<RegisterOutcome>, &'static str> {
+) -> Result<Option<RegisteredRequest>, RequestRegistrationError> {
     if !is_jsonrpc_request_with_id(obj) {
         return Ok(None);
     }
@@ -3773,10 +4099,12 @@ fn register_passthrough_request(
     // response must traverse the tool-output boundary, even when its tool name
     // is not selected by `guarded_tools`.
     let filter = direction == Direction::ClientToUpstream && method == Some("tools/call");
-    let mut table = pending.lock().map_err(|_| "pending_register_poisoned")?;
-    Ok(Some(table.register(
+    let mut table = pending
+        .lock()
+        .map_err(|_| RequestRegistrationError::Unavailable("pending_register_poisoned"))?;
+    let registered = table.register_request(
         direction,
-        id.clone(),
+        obj,
         PendingPayload {
             findings: Vec::new(),
             filter,
@@ -3784,7 +4112,11 @@ fn register_passthrough_request(
             tool_contract,
             execution: None,
         },
-    )))
+    )?;
+    table
+        .activate_for_forward(direction, &registered.proxy_id)
+        .map_err(RequestRegistrationError::Unavailable)?;
+    Ok(Some(registered))
 }
 
 /// C1 — handle one upstream->client message. A notification is inspected under
@@ -3814,21 +4146,18 @@ fn handle_upstream_response(
 ) -> Option<Vec<u8>> {
     let (mut parsed, mut line) = match parse_canonical_json_message(&line) {
         Ok(parsed) => parsed,
-        // MCP stdout is JSON-RPC. Preserve the historical passthrough only for
-        // unhardened compatibility; hardened output policy must not forward an
-        // unparseable server-controlled line that it could not inspect.
-        Err(_) if filter_output || fail_mode_closed => {
+        // MCP stdout is a JSON-RPC trust boundary in every profile. Partial,
+        // malformed, or duplicate-key server bytes never become downstream
+        // protocol messages.
+        Err(_) => {
             write_server_message_audit("block", "invalid", &[], "unparseable_jsonrpc_message");
             return None;
         }
-        Err(_) => return Some(line),
     };
 
-    if filter_output || fail_mode_closed {
-        if let Err(reason) = validate_server_jsonrpc_message(&parsed) {
-            write_server_message_audit("block", "invalid", &[], reason);
-            return None;
-        }
+    if let Err(reason) = validate_server_jsonrpc_message(&parsed) {
+        write_server_message_audit("block", "invalid", &[], reason);
+        return None;
     }
 
     // Notifications / server-initiated requests are not responses, but their
@@ -3843,24 +4172,11 @@ fn handle_upstream_response(
             schema_cache,
         );
     }
-    if parsed.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        if filter_output || fail_mode_closed {
-            write_server_message_audit("block", "invalid", &[], "malformed_jsonrpc_message");
-            return None;
-        }
-        return Some(line);
-    }
     let resp_id = match parsed.get("id") {
         Some(id @ (Value::String(_) | Value::Number(_) | Value::Null)) => id.clone(),
         _ => {
-            // A result/error envelope without an id cannot be correlated. It remains
-            // compatible in legacy mode, but hardened mode drops the missing or
-            // invalid id instead of routing it around every response policy.
-            if filter_output || fail_mode_closed {
-                write_server_message_audit("block", "invalid", &[], "response_missing_id");
-                return None;
-            }
-            return Some(line);
+            write_server_message_audit("block", "invalid", &[], "response_missing_id");
+            return None;
         }
     };
 
@@ -3868,302 +4184,353 @@ fn handle_upstream_response(
     // response is dropped without consuming a pending slot and without emitting
     // a forged keyed reply. Content inspection happens only after a Live match,
     // so an unknown id cannot manufacture a client-visible response.
-    if filter_output || fail_mode_closed {
-        if let Some(error) = parsed.get("error") {
-            if let Err(reason) = validate_jsonrpc_error_shape(error) {
-                write_server_message_audit("block", "error", &[], reason);
+    if let Some(error) = parsed.get("error") {
+        if let Err(reason) = validate_jsonrpc_error_shape(error) {
+            write_server_message_audit("block", "error", &[], reason);
+            return None;
+        }
+    }
+
+    let (response_match, matched) = match pending.lock() {
+        Ok(mut table) => table.begin_response(request_direction, &resp_id),
+        Err(e) => {
+            eprintln!("tirith gateway: pending table mutex poisoned on response match: {e}");
+            // A poisoned table destroys the request/response ownership proof.
+            // Never forward a response whose correlation cannot be established.
+            return None;
+        }
+    };
+
+    match response_match {
+        ResponseMatch::Unknown => {
+            write_pending_lifecycle_audit("unknown_response_id", 1);
+            // The id is attacker-controlled and has no client-owned request.
+            // Emitting either the raw response or a synthetic keyed envelope
+            // would create a client-visible message for an unowned id.
+            return None;
+        }
+        ResponseMatch::Responding => {
+            write_pending_lifecycle_audit("duplicate_response_while_responding", 1);
+            return None;
+        }
+        ResponseMatch::Terminal => {
+            write_pending_lifecycle_audit("duplicate_response_for_terminal_proxy", 1);
+            return None;
+        }
+        ResponseMatch::Lease => {}
+    }
+
+    let Some(mut m) = matched else {
+        write_pending_lifecycle_audit("response_lease_missing", 1);
+        shutdown.store(true, Ordering::Release);
+        return None;
+    };
+    let upstream_response = line.clone();
+
+    // A result is execution confirmation only after the core validates the full
+    // response against the random proxy id and durably upgrades the exact
+    // unresolved forward. Any commit failure withholds the response and shuts
+    // the gateway down in an explicit unknown state.
+    if parsed.get("result").is_some() {
+        if let Some(execution) = m.payload.execution.as_mut() {
+            let mut retry_delay = Duration::from_millis(10);
+            let promotion = loop {
+                match execution.promote_completed_response(
+                    &upstream_response,
+                    tirith_core::execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
+                ) {
+                    Ok(outcome) => break Ok(outcome),
+                    Err(tirith_core::execution_state::GatewayCompletionError::Retryable(error))
+                        if execution.completion_window_open() =>
+                    {
+                        write_pending_lifecycle_audit("execution_commit_retry", 1);
+                        eprintln!(
+                            "tirith gateway: retrying known-uncommitted gateway completion: {error}"
+                        );
+                        thread::sleep(retry_delay);
+                        retry_delay = retry_delay
+                            .checked_mul(2)
+                            .unwrap_or(Duration::from_millis(250))
+                            .min(Duration::from_millis(250));
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            if let Err(error) = promotion {
+                let (event, terminal) = match error {
+                    tirith_core::execution_state::GatewayCompletionError::CommitUnknown(_) => {
+                        ("execution_commit_unknown", PendingState::CommitUnknown)
+                    }
+                    tirith_core::execution_state::GatewayCompletionError::InvalidResponse(_)
+                    | tirith_core::execution_state::GatewayCompletionError::Rejected(_)
+                    | tirith_core::execution_state::GatewayCompletionError::Retryable(_) => (
+                        "execution_confirmation_failed",
+                        PendingState::ConfirmationFailed,
+                    ),
+                };
+                eprintln!(
+                    "tirith gateway: durable gateway completion failed; withholding response and shutting down: {error}"
+                );
+                write_pending_lifecycle_audit(event, 1);
+                if let Ok(mut table) = pending.lock() {
+                    let _ = table.finish_response(&m, terminal);
+                }
+                shutdown.store(true, Ordering::Release);
                 return None;
             }
         }
     }
 
-    let matched = match pending.lock() {
-        Ok(mut table) => table.take_for_response(request_direction, &resp_id),
-        Err(e) => {
-            eprintln!("tirith gateway: pending table mutex poisoned on response match: {e}");
-            // A poisoned table destroys the request/response contract. Any
-            // hardened output posture must drop the unverifiable response;
-            // forwarding here would bypass the output filter merely because
-            // the configured policy fail mode is open. Preserve passthrough
-            // only for the explicitly unhardened legacy mode.
-            return if filter_output || fail_mode_closed {
-                None
-            } else {
-                Some(line)
-            };
+    // From this point onward all client-visible bytes use the exact original id;
+    // the random proxy id never escapes downstream.
+    let resp_id = m.original_id.clone();
+    if let Some(object) = parsed.as_object_mut() {
+        object.insert("id".to_string(), resp_id.clone());
+    } else {
+        if let Ok(mut table) = pending.lock() {
+            let _ = table.finish_response(&m, PendingState::CommitUnknown);
         }
+        shutdown.store(true, Ordering::Release);
+        return None;
+    }
+    line = match serde_json::to_vec(&parsed) {
+        Ok(line) => line,
+        Err(_) => build_error_envelope_block(resp_id.clone(), "response_id_restore_failed"),
     };
 
-    match matched {
-        Some(m) => {
-            // A structurally valid error is inspected only after correlation.
-            // This consumes exactly one Live request contract: unsafe content is
-            // replaced with one safe envelope, while a clean/sanitized error is
-            // forwarded canonically. Tombstones follow the Late policy below.
-            if m.disposition == ResponseDisposition::Live
-                && (filter_output || fail_mode_closed)
-                && parsed.get("error").is_some()
-            {
-                let inspection = {
-                    let error = parsed
-                        .get_mut("error")
-                        .expect("presence checked immediately above");
-                    inspect_and_sanitize_error(error, filter_ctx)
-                };
-                match inspection {
-                    Ok((rule_ids, changed)) => {
-                        write_server_message_audit(
-                            if changed || !rule_ids.is_empty() {
-                                "warn"
-                            } else {
-                                "allow"
-                            },
-                            "error",
-                            &rule_ids,
-                            "inspected_after_correlation",
-                        );
-                        line = match serde_json::to_vec(&parsed) {
-                            Ok(bytes) => bytes,
-                            Err(_) => {
-                                write_server_message_audit(
-                                    "block",
-                                    "error",
-                                    &rule_ids,
-                                    "error_reserialize_failed",
-                                );
-                                return Some(build_error_envelope_block(
-                                    resp_id,
-                                    "error_reserialize_failed",
-                                ));
-                            }
-                        };
-                    }
-                    Err(reason) => {
-                        write_server_message_audit("block", "error", &[], reason);
-                        return Some(build_error_envelope_block(resp_id, reason));
-                    }
+    let processed = (|| -> Option<Vec<u8>> {
+        // A structurally valid error is inspected only after correlation.
+        // This consumes exactly one Live request contract: unsafe content is
+        // replaced with one safe envelope, while a clean/sanitized error is
+        // forwarded canonically. Tombstones follow the Late policy below.
+        if m.disposition == ResponseDisposition::Live
+            && (filter_output || fail_mode_closed)
+            && parsed.get("error").is_some()
+        {
+            let inspection = {
+                let error = parsed
+                    .get_mut("error")
+                    .expect("presence checked immediately above");
+                inspect_and_sanitize_error(error, filter_ctx)
+            };
+            match inspection {
+                Ok((rule_ids, changed)) => {
+                    write_server_message_audit(
+                        if changed || !rule_ids.is_empty() {
+                            "warn"
+                        } else {
+                            "allow"
+                        },
+                        "error",
+                        &rule_ids,
+                        "inspected_after_correlation",
+                    );
+                    line = match serde_json::to_vec(&parsed) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            write_server_message_audit(
+                                "block",
+                                "error",
+                                &rule_ids,
+                                "error_reserialize_failed",
+                            );
+                            return Some(build_error_envelope_block(
+                                resp_id,
+                                "error_reserialize_failed",
+                            ));
+                        }
+                    };
+                }
+                Err(reason) => {
+                    write_server_message_audit("block", "error", &[], reason);
+                    return Some(build_error_envelope_block(resp_id, reason));
                 }
             }
+        }
 
-            // A matching response carrying `result` is the gateway's first
-            // confirmation that the forwarded tool request was processed. A
-            // JSON-RPC `error` only proves protocol-level rejection and must not
-            // create executed history. Commit before response filtering (which can
-            // replace/drop presentation bytes but cannot undo upstream effects).
-            // Tool-level `isError` still arrives inside `result` and is committed:
-            // the tool ran and may have produced partial effects. Late result
-            // responses confirm processing too.
-            if parsed.get("result").is_some() {
-                if let Some(execution) = &m.payload.execution {
-                    execution.record();
+        match m.disposition {
+            ResponseDisposition::Live => {
+                // C4 — a listing/reading response (tools/list, resources/list,
+                // resources/read, resources/templates/list, prompts/list,
+                // prompts/get): inspect + filter it through `response_inspect`
+                // (under `--filter-output`), mirroring the C2 tool-call path.
+                // A passthrough never carries warn findings, so this branch is
+                // self-contained.
+                if let (true, Some(kind)) = (filter_output, m.payload.inspect_kind) {
+                    let id = resp_id.clone();
+                    return Some(apply_response_inspection(
+                        parsed,
+                        line,
+                        &id,
+                        kind,
+                        fail_mode_closed,
+                        filter_ctx,
+                        descriptor_lock,
+                        descriptor_approval,
+                        shutdown,
+                        schema_cache,
+                    ));
                 }
-            }
-            match m.disposition {
-                ResponseDisposition::Live => {
-                    // C4 — a listing/reading response (tools/list, resources/list,
-                    // resources/read, resources/templates/list, prompts/list,
-                    // prompts/get): inspect + filter it through `response_inspect`
-                    // (under `--filter-output`), mirroring the C2 tool-call path.
-                    // A passthrough never carries warn findings, so this branch is
-                    // self-contained.
-                    if let (true, Some(kind)) = (filter_output, m.payload.inspect_kind) {
-                        let id = resp_id.clone();
-                        return Some(apply_response_inspection(
-                            parsed,
-                            line,
-                            &id,
-                            kind,
-                            fail_mode_closed,
-                            filter_ctx,
-                            descriptor_lock,
-                            descriptor_approval,
-                            shutdown,
-                            schema_cache,
-                        ));
-                    }
 
-                    // C2 — a `tools/call` response: validate `result.structuredContent`
-                    // against the tool's cached `outputSchema` BEFORE the output filter.
-                    // A structured output that violates a VALID outputSchema is blocked
-                    // (a server returning off-contract structured data is a tampering /
-                    // confused-deputy signal). Only under `--filter-output`, and only
-                    // when the request recorded a tool name (a `tools/call`).
-                    if filter_output {
-                        if let Some(contract) = m.payload.tool_contract.as_ref() {
-                            let tool_name = contract.tool_name.as_str();
-                            if let Some(result) = parsed.get("result") {
-                                if let Some(why) = check_response_output_schema(contract, result) {
-                                    eprintln!(
+                // C2 — a `tools/call` response: validate `result.structuredContent`
+                // against the tool's cached `outputSchema` BEFORE the output filter.
+                // A structured output that violates a VALID outputSchema is blocked
+                // (a server returning off-contract structured data is a tampering /
+                // confused-deputy signal). Only under `--filter-output`, and only
+                // when the request recorded a tool name (a `tools/call`).
+                if filter_output {
+                    if let Some(contract) = m.payload.tool_contract.as_ref() {
+                        let tool_name = contract.tool_name.as_str();
+                        if let Some(result) = parsed.get("result") {
+                            if let Some(why) = check_response_output_schema(contract, result) {
+                                eprintln!(
                                     "tirith gateway: tool {tool_name:?} structuredContent violates \
                                      outputSchema: {why}"
                                 );
+                                write_schema_audit(
+                                    "output_schema",
+                                    "block",
+                                    tool_name,
+                                    "structured_content_invalid",
+                                );
+                                return Some(
+                                    build_schema_block(
+                                        resp_id.clone(),
+                                        &format!(
+                                            "Tirith: tool {tool_name:?} structured output violates \
+                                             its outputSchema"
+                                        ),
+                                        "output_schema_invalid",
+                                    )
+                                    .into_bytes(),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // On-time response: filter the body (if requested), then augment
+                // residual content with any warn findings. A block from the filter
+                // short-circuits augmentation (the filtered bytes are returned).
+                let after_filter = if filter_output && m.payload.filter {
+                    apply_output_filter_to_response(parsed.clone(), fail_mode_closed, filter_ctx)
+                } else if filter_output && parsed.get("result").is_some() {
+                    // Known typed listing/reading families returned above;
+                    // every other result (notably initialize.instructions and
+                    // completion text) still crosses a recursive text/output
+                    // boundary before it reaches the client or model.
+                    Some(inspect_and_sanitize_generic_result(
+                        parsed.clone(),
+                        resp_id.clone(),
+                        filter_ctx,
+                    ))
+                } else {
+                    None
+                };
+                match after_filter {
+                    Some(filtered) => {
+                        // repo-0058: schema validation before filtering is
+                        // necessary but not sufficient. Sanitization can
+                        // change key/value identity, so validate the exact
+                        // serialized result that will be forwarded as the
+                        // final transformation gate.
+                        if let Some(contract) = m.payload.tool_contract.as_ref() {
+                            let tool_name = contract.tool_name.as_str();
+                            let filtered_value: Value = match serde_json::from_slice(&filtered) {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    eprintln!(
+                                        "tirith gateway: filtered response for tool \
+                                             {tool_name:?} could not be reparsed: {e}"
+                                    );
                                     write_schema_audit(
                                         "output_schema",
                                         "block",
                                         tool_name,
-                                        "structured_content_invalid",
+                                        "filtered_response_unparseable",
                                     );
                                     return Some(
                                         build_schema_block(
                                             resp_id.clone(),
                                             &format!(
-                                            "Tirith: tool {tool_name:?} structured output violates \
-                                             its outputSchema"
-                                        ),
-                                            "output_schema_invalid",
+                                                "Tirith: filtered output for tool \
+                                                     {tool_name:?} could not be validated"
+                                            ),
+                                            "output_schema_invalid_after_sanitization",
+                                        )
+                                        .into_bytes(),
+                                    );
+                                }
+                            };
+                            if let Some(result) = filtered_value.get("result") {
+                                if let Some(why) = check_response_output_schema(contract, result) {
+                                    eprintln!(
+                                        "tirith gateway: sanitized output for tool \
+                                             {tool_name:?} violates outputSchema: {why}"
+                                    );
+                                    write_schema_audit(
+                                        "output_schema",
+                                        "block",
+                                        tool_name,
+                                        "sanitized_structured_content_invalid",
+                                    );
+                                    return Some(
+                                        build_schema_block(
+                                            resp_id.clone(),
+                                            &format!(
+                                                "Tirith: sanitized output for tool \
+                                                     {tool_name:?} violates its outputSchema"
+                                            ),
+                                            "output_schema_invalid_after_sanitization",
                                         )
                                         .into_bytes(),
                                     );
                                 }
                             }
                         }
+                        // Re-augment the filtered bytes (warn findings still apply
+                        // to whatever content survived the filter).
+                        Some(augment_response_bytes(filtered, &m.payload.findings))
                     }
-
-                    // On-time response: filter the body (if requested), then augment
-                    // residual content with any warn findings. A block from the filter
-                    // short-circuits augmentation (the filtered bytes are returned).
-                    let after_filter = if filter_output && m.payload.filter {
-                        apply_output_filter_to_response(
-                            parsed.clone(),
-                            fail_mode_closed,
-                            filter_ctx,
-                        )
-                    } else if filter_output && parsed.get("result").is_some() {
-                        // Known typed listing/reading families returned above;
-                        // every other result (notably initialize.instructions and
-                        // completion text) still crosses a recursive text/output
-                        // boundary before it reaches the client or model.
-                        Some(inspect_and_sanitize_generic_result(
-                            parsed.clone(),
+                    None => Some(augment_response_bytes(line, &m.payload.findings)),
+                }
+            }
+            ResponseDisposition::Late => {
+                // Late response after a timeout/cancel tombstone. Per policy:
+                // fail-closed blocks (replace with a deny envelope keyed to the
+                // same id), fail-open drops. Either way the raw upstream bytes are
+                // never forwarded unfiltered — this is the anti-"delete-then-allow"
+                // guarantee.
+                write_pending_lifecycle_audit("late_response_after_timeout", 1);
+                if fail_mode_closed {
+                    Some(
+                        build_fail_mode_deny(
                             resp_id.clone(),
-                            filter_ctx,
-                        ))
-                    } else {
-                        None
-                    };
-                    match after_filter {
-                        Some(filtered) => {
-                            // repo-0058: schema validation before filtering is
-                            // necessary but not sufficient. Sanitization can
-                            // change key/value identity, so validate the exact
-                            // serialized result that will be forwarded as the
-                            // final transformation gate.
-                            if let Some(contract) = m.payload.tool_contract.as_ref() {
-                                let tool_name = contract.tool_name.as_str();
-                                let filtered_value: Value = match serde_json::from_slice(&filtered)
-                                {
-                                    Ok(value) => value,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "tirith gateway: filtered response for tool \
-                                             {tool_name:?} could not be reparsed: {e}"
-                                        );
-                                        write_schema_audit(
-                                            "output_schema",
-                                            "block",
-                                            tool_name,
-                                            "filtered_response_unparseable",
-                                        );
-                                        return Some(
-                                            build_schema_block(
-                                                resp_id.clone(),
-                                                &format!(
-                                                    "Tirith: filtered output for tool \
-                                                     {tool_name:?} could not be validated"
-                                                ),
-                                                "output_schema_invalid_after_sanitization",
-                                            )
-                                            .into_bytes(),
-                                        );
-                                    }
-                                };
-                                if let Some(result) = filtered_value.get("result") {
-                                    if let Some(why) =
-                                        check_response_output_schema(contract, result)
-                                    {
-                                        eprintln!(
-                                            "tirith gateway: sanitized output for tool \
-                                             {tool_name:?} violates outputSchema: {why}"
-                                        );
-                                        write_schema_audit(
-                                            "output_schema",
-                                            "block",
-                                            tool_name,
-                                            "sanitized_structured_content_invalid",
-                                        );
-                                        return Some(
-                                            build_schema_block(
-                                                resp_id.clone(),
-                                                &format!(
-                                                    "Tirith: sanitized output for tool \
-                                                     {tool_name:?} violates its outputSchema"
-                                                ),
-                                                "output_schema_invalid_after_sanitization",
-                                            )
-                                            .into_bytes(),
-                                        );
-                                    }
-                                }
-                            }
-                            // Re-augment the filtered bytes (warn findings still apply
-                            // to whatever content survived the filter).
-                            Some(augment_response_bytes(filtered, &m.payload.findings))
-                        }
-                        None => Some(augment_response_bytes(line, &m.payload.findings)),
-                    }
-                }
-                ResponseDisposition::Late => {
-                    // Late response after a timeout/cancel tombstone. Per policy:
-                    // fail-closed blocks (replace with a deny envelope keyed to the
-                    // same id), fail-open drops. Either way the raw upstream bytes are
-                    // never forwarded unfiltered — this is the anti-"delete-then-allow"
-                    // guarantee.
-                    write_pending_lifecycle_audit("late_response_after_timeout", 1);
-                    if fail_mode_closed {
-                        Some(
-                            build_fail_mode_deny(
-                                resp_id.clone(),
-                                "response arrived after analysis deadline",
-                                0.0,
-                                true,
-                                true,
-                            )
-                            .into_bytes(),
+                            "response arrived after analysis deadline",
+                            0.0,
+                            true,
+                            true,
                         )
-                    } else {
-                        None
-                    }
+                        .into_bytes(),
+                    )
+                } else {
+                    None
                 }
             }
         }
-        None => {
-            // Unknown id: no outstanding request matches this response. A fabricated
-            // / unsolicited upstream response is the threat. Audit; strict-block
-            // under fail-closed. With explicit output protection, fail-open still
-            // drops an uncorrelated attacker message because there is no request
-            // contract under which it can be inspected. Only the legacy,
-            // unhardened compatibility path forwards it.
-            write_pending_lifecycle_audit("unknown_response_id", 1);
-            if (filter_output || fail_mode_closed) && parsed.get("error").is_some() {
-                // Never fabricate a response for an unsolicited error id.
-                None
-            } else if fail_mode_closed {
-                Some(
-                    build_fail_mode_deny(
-                        resp_id.clone(),
-                        "response id has no matching outstanding request",
-                        0.0,
-                        true,
-                        false,
-                    )
-                    .into_bytes(),
-                )
-            } else if filter_output {
-                None
-            } else {
-                Some(line)
-            }
-        }
+    })();
+
+    let finished = pending
+        .lock()
+        .map_err(|_| "pending table unavailable while finishing response")
+        .and_then(|mut table| table.finish_response(&m, PendingState::Completed));
+    if let Err(reason) = finished {
+        eprintln!("tirith gateway: {reason}; withholding response and shutting down");
+        write_pending_lifecycle_audit("response_finish_unknown", 1);
+        shutdown.store(true, Ordering::Release);
+        None
+    } else {
+        processed
     }
 }
 
@@ -4831,7 +5198,7 @@ fn persist_descriptor_approval(
     let lock_path = approval.repo_root.join(".tirith").join("mcp.lock");
     let original = tirith_core::util::read_text_no_follow_capped(
         &lock_path,
-        tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE as u64,
+        tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE,
     )
     .map_err(|_| "could not read current lockfile")?;
     if original.len() > tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE as usize {
@@ -4883,14 +5250,16 @@ fn persist_descriptor_approval(
     }
     let current_bytes = tirith_core::util::read_text_no_follow_capped(
         &lock_path,
-        tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE as u64,
+        tirith_core::mcp_lock::MCP_CONFIG_MAX_SIZE,
     )
     .map_err(|_| "could not re-read current lockfile")?;
     if current_bytes != original {
         return Err("MCP lockfile changed during descriptor approval");
     }
 
-    let rendered = lock.render();
+    let rendered = lock
+        .render()
+        .map_err(|_| "MCP lockfile contains data that is unsafe to persist")?;
     super::write_file_atomic_contained(&approval.repo_root, &lock_path, rendered.as_bytes(), true)
         .map_err(|_| "atomic contained MCP lock write failed")?;
 
@@ -5360,6 +5729,12 @@ fn inspect_and_sanitize_error(
 
 fn validate_jsonrpc_error_shape(error: &Value) -> Result<(), &'static str> {
     let object = error.as_object().ok_or("malformed_error_object")?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "code" | "message" | "data"))
+    {
+        return Err("malformed_error_unknown_member");
+    }
     if object.get("code").and_then(Value::as_i64).is_none() {
         return Err("malformed_error_code");
     }
@@ -5584,24 +5959,60 @@ fn terminate_completed_approval_child(child: &mut crate::cli::capsule::ManagedCh
     let _ = child.wait();
 }
 
+/// Render one untrusted upstream stderr frame as exactly one terminal row. The
+/// shared display sanitizer strips OSC/CSI and deceptive Unicode; the CLI
+/// single-line policy additionally removes CR/LF so the fixed prefix cannot be
+/// followed by a forged Tirith-looking row.
+fn render_upstream_stderr_line(line: &[u8]) -> String {
+    format!(
+        "[upstream] {}",
+        super::sanitize_for_human_output(&String::from_utf8_lossy(line), false)
+    )
+}
+
+/// Result of reading one JSONL transport frame. Only `Frame` may enter the
+/// protocol parser; a final unterminated fragment is never promoted to a
+/// message merely because the peer closed the stream.
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedRead {
+    Frame(Vec<u8>),
+    Eof,
+    Incomplete(Vec<u8>),
+}
+
+#[derive(Debug)]
+enum BoundedReadError {
+    TooLong {
+        observed_at_least: usize,
+    },
+    Io {
+        source: io::Error,
+        partial_len: usize,
+    },
+}
+
 /// Bounded line reader: `fill_buf`/`consume` in chunks so an oversize line never
-/// allocates past `limit`.
-fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>, usize> {
+/// allocates past `limit`. Callers terminate the transport on an oversize frame,
+/// so this function deliberately does not perform an unbounded drain/resync.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    limit: usize,
+) -> Result<BoundedRead, BoundedReadError> {
     let mut buf = Vec::with_capacity(std::cmp::min(limit, 8192));
     loop {
         let available = match reader.fill_buf() {
             Ok([]) => {
                 if buf.is_empty() {
-                    return Ok(None);
+                    return Ok(BoundedRead::Eof);
                 }
-                return Ok(Some(buf));
+                return Ok(BoundedRead::Incomplete(buf));
             }
             Ok(b) => b,
-            Err(_) => {
-                if buf.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(buf));
+            Err(source) => {
+                return Err(BoundedReadError::Io {
+                    source,
+                    partial_len: buf.len(),
+                })
             }
         };
 
@@ -5609,33 +6020,21 @@ fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<V
             let total = buf.len() + pos;
             if total > limit {
                 reader.consume(pos + 1);
-                return Err(total);
+                return Err(BoundedReadError::TooLong {
+                    observed_at_least: total,
+                });
             }
             buf.extend_from_slice(&available[..pos]);
             reader.consume(pos + 1);
-            return Ok(Some(buf));
+            return Ok(BoundedRead::Frame(buf));
         }
 
         let avail_len = available.len();
         if buf.len() + avail_len > limit {
-            // Oversize line: drop the chunk and drain to the next newline so the
-            // reader resyncs for the following message.
-            reader.consume(avail_len);
             let total = buf.len() + avail_len;
-            loop {
-                match reader.fill_buf() {
-                    Ok([]) => return Err(total),
-                    Ok(b) => {
-                        if let Some(pos) = b.iter().position(|&c| c == b'\n') {
-                            reader.consume(pos + 1);
-                            return Err(total);
-                        }
-                        let len = b.len();
-                        reader.consume(len);
-                    }
-                    Err(_) => return Err(total),
-                }
-            }
+            return Err(BoundedReadError::TooLong {
+                observed_at_least: total,
+            });
         }
 
         buf.extend_from_slice(available);
@@ -5646,6 +6045,20 @@ fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_runtime_capability_matches_strict_state_backend() {
+        #[cfg(unix)]
+        assert_eq!(require_gateway_runtime_support(), Ok(()));
+
+        #[cfg(not(unix))]
+        assert_eq!(
+            require_gateway_runtime_support(),
+            Err(
+                "gateway run requires the Unix strict execution-state backend; this platform is unsupported and no upstream process was started"
+            )
+        );
+    }
 
     #[test]
     fn client_json_boundary_forwards_only_reserialized_inspected_bytes() {
@@ -6280,14 +6693,17 @@ guarded_tools:
         let data = b"hello\nworld\n";
         let mut reader = io::BufReader::new(&data[..]);
         assert_eq!(
-            read_bounded_line(&mut reader, 100).unwrap().unwrap(),
-            b"hello"
+            read_bounded_line(&mut reader, 100).unwrap(),
+            BoundedRead::Frame(b"hello".to_vec())
         );
         assert_eq!(
-            read_bounded_line(&mut reader, 100).unwrap().unwrap(),
-            b"world"
+            read_bounded_line(&mut reader, 100).unwrap(),
+            BoundedRead::Frame(b"world".to_vec())
         );
-        assert!(read_bounded_line(&mut reader, 100).unwrap().is_none());
+        assert_eq!(
+            read_bounded_line(&mut reader, 100).unwrap(),
+            BoundedRead::Eof
+        );
     }
 
     #[test]
@@ -6302,8 +6718,8 @@ guarded_tools:
         let data = b"12345\n";
         let mut reader = io::BufReader::new(&data[..]);
         assert_eq!(
-            read_bounded_line(&mut reader, 5).unwrap().unwrap(),
-            b"12345"
+            read_bounded_line(&mut reader, 5).unwrap(),
+            BoundedRead::Frame(b"12345".to_vec())
         );
     }
 
@@ -6312,17 +6728,64 @@ guarded_tools:
         let data = b"hello";
         let mut reader = io::BufReader::new(&data[..]);
         assert_eq!(
-            read_bounded_line(&mut reader, 100).unwrap().unwrap(),
-            b"hello"
+            read_bounded_line(&mut reader, 100).unwrap(),
+            BoundedRead::Incomplete(b"hello".to_vec())
         );
+    }
+
+    struct ErrorAfter {
+        bytes: &'static [u8],
+        offset: usize,
+    }
+
+    impl io::Read for ErrorAfter {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.offset == self.bytes.len() {
+                return Err(io::Error::other("injected read failure"));
+            }
+            let count = output.len().min(self.bytes.len() - self.offset);
+            output[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn test_bounded_read_io_failure_is_never_eof_or_a_frame() {
+        for bytes in [&b""[..], &b"partial"[..]] {
+            let mut reader = io::BufReader::new(ErrorAfter { bytes, offset: 0 });
+            let error = read_bounded_line(&mut reader, 100).expect_err("read must fail");
+            assert!(matches!(error, BoundedReadError::Io { .. }));
+        }
     }
 
     #[test]
     fn test_bounded_read_preserves_invalid_utf8() {
         let data: &[u8] = &[0x80, 0x81, 0x82, b'\n'];
         let mut reader = io::BufReader::new(data);
-        let line = read_bounded_line(&mut reader, 100).unwrap().unwrap();
-        assert_eq!(line, &[0x80, 0x81, 0x82]);
+        let line = read_bounded_line(&mut reader, 100).unwrap();
+        assert_eq!(line, BoundedRead::Frame(vec![0x80, 0x81, 0x82]));
+    }
+
+    #[test]
+    fn test_upstream_stderr_sink_strips_osc52_csi_and_carriage_return() {
+        let data = b"safe\x1b]52;c;YXR0YWNr\x07\x1b[2J\rFORGED\n";
+        let mut reader = io::BufReader::new(&data[..]);
+        let line = match read_bounded_line(&mut reader, 100).unwrap() {
+            BoundedRead::Frame(line) => line,
+            other => panic!("expected one complete stderr frame, got {other:?}"),
+        };
+
+        let rendered = render_upstream_stderr_line(&line);
+        assert_eq!(rendered, "[upstream] safeFORGED");
+        assert_eq!(rendered.lines().count(), 1);
+        assert_eq!(rendered.matches("[upstream] ").count(), 1);
+        for forbidden in ['\x1b', '\x07', '\r', '\n'] {
+            assert!(
+                !rendered.contains(forbidden),
+                "terminal-control byte survived the upstream stderr sink: {rendered:?}"
+            );
+        }
     }
 
     #[test]
@@ -6654,29 +7117,121 @@ policy:
     }
 
     #[test]
+    fn test_not_guarded_duplicate_id_is_denied_before_second_forward() {
+        let config = test_config();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let pending = Mutex::new(PendingRequests::new());
+        let schema_cache = Mutex::new(ToolSchemaCache::new());
+        let mut upstream = Vec::new();
+
+        let first = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "duplicate-passthrough",
+            "method": "initialize",
+            "params": {}
+        });
+        let first_raw = serde_json::to_vec(&first).unwrap();
+        process_object(
+            &first,
+            &first_raw,
+            &config,
+            &mut upstream,
+            &tx,
+            &pending,
+            Direction::ClientToUpstream,
+            false,
+            &schema_cache,
+        )
+        .expect("first passthrough request must be forwarded");
+        let after_first = upstream.clone();
+
+        let duplicate = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "duplicate-passthrough",
+            "method": "ping",
+            "params": {}
+        });
+        let duplicate_raw = serde_json::to_vec(&duplicate).unwrap();
+        process_object(
+            &duplicate,
+            &duplicate_raw,
+            &config,
+            &mut upstream,
+            &tx,
+            &pending,
+            Direction::ClientToUpstream,
+            false,
+            &schema_cache,
+        )
+        .expect("duplicate passthrough request must be denied locally");
+
+        assert_eq!(
+            upstream, after_first,
+            "the duplicate NotGuarded request must never reach the second upstream write"
+        );
+        let forwarded: Vec<&[u8]> = upstream
+            .split(|byte| *byte == b'\n')
+            .filter(|frame| !frame.is_empty())
+            .collect();
+        assert_eq!(forwarded.len(), 1, "only the first request may be sent");
+        let forwarded: Value = serde_json::from_slice(forwarded[0]).unwrap();
+        assert_eq!(forwarded["method"], "initialize");
+
+        let response: Value = serde_json::from_slice(&rx.recv().unwrap()).unwrap();
+        assert_eq!(response["id"], "duplicate-passthrough");
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["reason"],
+            "duplicate_active_id"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one local denial is expected"
+        );
+    }
+
+    #[test]
     fn test_client_jsonrpc_boundary_blocks_invalid_unguarded_messages_before_write() {
         let config = test_config();
 
-        for invalid in [
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": {"smuggled": 7},
-                "method": "tools/call",
-                "params": {"name": "UnGuarded", "arguments": {}}
-            }),
-            serde_json::json!({"id": 1, "method": "initialize", "params": {}}),
-            serde_json::json!({
-                "jsonrpc": "1.0", "id": 1, "method": "initialize", "params": {}
-            }),
-            serde_json::json!({
-                "jsonrpc": "2.0", "id": 1, "method": 17, "params": {}
-            }),
-            serde_json::json!({
-                "jsonrpc": "2.0", "id": 1, "method": "ping", "result": {}
-            }),
-            serde_json::json!({
-                "jsonrpc": "2.0", "id": 1, "method": "ping", "params": []
-            }),
+        for (invalid, expected_reply_id) in [
+            (
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": {"smuggled": 7},
+                    "method": "tools/call",
+                    "params": {"name": "UnGuarded", "arguments": {}}
+                }),
+                Value::Null,
+            ),
+            (
+                serde_json::json!({"id": "missing-version", "method": "initialize", "params": {}}),
+                Value::from("missing-version"),
+            ),
+            (
+                serde_json::json!({
+                    "jsonrpc": "1.0", "id": 41, "method": "initialize", "params": {}
+                }),
+                Value::from(41),
+            ),
+            (
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": null, "method": 17, "params": {}
+                }),
+                Value::Null,
+            ),
+            (
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "ping", "result": {}
+                }),
+                Value::from(1),
+            ),
+            (
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "ping", "params": []
+                }),
+                Value::from(1),
+            ),
         ] {
             let raw = serde_json::to_vec(&invalid).unwrap();
             let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -6704,6 +7259,7 @@ policy:
             assert_eq!(pending.lock().unwrap().len(), 0);
             let reply: Value = serde_json::from_slice(&rx.recv().unwrap()).unwrap();
             assert_eq!(reply["error"]["code"], -32600);
+            assert_eq!(reply["id"], expected_reply_id);
         }
     }
 
@@ -6735,7 +7291,21 @@ policy:
                 &schema_cache,
             )
             .unwrap();
-            assert_eq!(upstream, [raw.as_slice(), b"\n"].concat());
+            if valid.get("id").is_some() {
+                let forwarded: Value = serde_json::from_slice(
+                    upstream
+                        .strip_suffix(b"\n")
+                        .expect("forwarded request has JSONL terminator"),
+                )
+                .unwrap();
+                assert!(forwarded["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("tirith-") && id.len() == 39));
+                assert_eq!(forwarded["method"], valid["method"]);
+                assert_eq!(forwarded["params"], valid["params"]);
+            } else {
+                assert_eq!(upstream, [raw.as_slice(), b"\n"].concat());
+            }
         }
     }
 
@@ -7021,6 +7591,31 @@ policy:
         assert_eq!(outcome, RegisterOutcome::Registered);
     }
 
+    /// Existing response-policy tests name the client-visible id. Production
+    /// sends a random proxy id upstream, so rewrite the fixture to that internal
+    /// id before exercising the handler; the returned bytes must restore the
+    /// original id.
+    fn proxy_response_fixture(line: &[u8], pending: &Mutex<PendingRequests>) -> Vec<u8> {
+        let Ok(mut parsed) = serde_json::from_slice::<Value>(line) else {
+            return line.to_vec();
+        };
+        let Some(original_id) = parsed.get("id").cloned() else {
+            return line.to_vec();
+        };
+        let proxy_id = pending.lock().ok().and_then(|table| {
+            table
+                .proxy_for_any_original(Direction::ClientToUpstream, &original_id)
+                .map(str::to_string)
+        });
+        let Some(proxy_id) = proxy_id else {
+            return line.to_vec();
+        };
+        if let Some(object) = parsed.as_object_mut() {
+            object.insert("id".to_string(), Value::String(proxy_id));
+        }
+        serde_json::to_vec(&parsed).unwrap_or_else(|_| line.to_vec())
+    }
+
     /// Run `handle_upstream_response` with `filter_output` matching the entry and
     /// NO descriptor-lock baseline (C1 drift detection off) and a fresh, empty
     /// schema cache (C2 off — nothing populated).
@@ -7032,8 +7627,9 @@ policy:
     ) -> Option<Vec<u8>> {
         let schema_cache = Mutex::new(ToolSchemaCache::new());
         let shutdown = AtomicBool::new(false);
+        let line = proxy_response_fixture(line, pending);
         handle_upstream_response(
-            line.to_vec(),
+            line,
             pending,
             Direction::ClientToUpstream,
             filter_output,
@@ -7055,8 +7651,9 @@ policy:
     ) -> Option<Vec<u8>> {
         let schema_cache = Mutex::new(ToolSchemaCache::new());
         let shutdown = AtomicBool::new(false);
+        let line = proxy_response_fixture(line, pending);
         handle_upstream_response(
-            line.to_vec(),
+            line,
             pending,
             Direction::ClientToUpstream,
             /*filter_output=*/ true,
@@ -7080,8 +7677,9 @@ policy:
         schema_cache: &Mutex<ToolSchemaCache>,
     ) -> Option<Vec<u8>> {
         let shutdown = AtomicBool::new(false);
+        let line = proxy_response_fixture(line, pending);
         handle_upstream_response(
-            line.to_vec(),
+            line,
             pending,
             Direction::ClientToUpstream,
             /*filter_output=*/ true,
@@ -7104,8 +7702,9 @@ policy:
         fail_mode_closed: bool,
     ) -> Option<Vec<u8>> {
         let shutdown = AtomicBool::new(false);
+        let line = proxy_response_fixture(line, pending);
         handle_upstream_response(
-            line.to_vec(),
+            line,
             pending,
             Direction::ClientToUpstream,
             /*filter_output=*/ true,
@@ -7119,7 +7718,205 @@ policy:
     }
 
     #[test]
-    fn poisoned_pending_table_drops_under_output_protection_even_fail_open() {
+    fn response_arriving_during_upstream_write_matches_registered_proxy() {
+        struct ResponseDuringWrite<'a> {
+            pending: &'a Mutex<PendingRequests>,
+            original_id: Value,
+            response: Option<Vec<u8>>,
+        }
+
+        impl Write for ResponseDuringWrite<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.response.is_none() {
+                    let proxy_id = self
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .proxy_for_original(Direction::ClientToUpstream, &self.original_id)
+                        .expect("request registered before first upstream write")
+                        .to_string();
+                    let upstream_response = serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": proxy_id,
+                        "result": {"ok": true}
+                    }))
+                    .unwrap();
+                    let schema_cache = Mutex::new(ToolSchemaCache::new());
+                    let shutdown = AtomicBool::new(false);
+                    self.response = handle_upstream_response(
+                        upstream_response,
+                        self.pending,
+                        Direction::ClientToUpstream,
+                        false,
+                        true,
+                        &output_filter::OutputFilterContext::default(),
+                        None,
+                        None,
+                        &shutdown,
+                        &schema_cache,
+                    );
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "during-write",
+            "method": "ping",
+            "params": {}
+        });
+        let raw = serde_json::to_vec(&request).unwrap();
+        let pending = Mutex::new(PendingRequests::new());
+        let (tx, _rx) = mpsc::channel();
+        let schema_cache = Mutex::new(ToolSchemaCache::new());
+        let mut writer = ResponseDuringWrite {
+            pending: &pending,
+            original_id: Value::from("during-write"),
+            response: None,
+        };
+        process_object(
+            &request,
+            &raw,
+            &test_config(),
+            &mut writer,
+            &tx,
+            &pending,
+            Direction::ClientToUpstream,
+            false,
+            &schema_cache,
+        )
+        .expect("forward while response races the write");
+        let response: Value = serde_json::from_slice(
+            writer
+                .response
+                .as_deref()
+                .expect("racing response matched the registered proxy"),
+        )
+        .unwrap();
+        assert_eq!(response["id"], "during-write");
+        assert_eq!(response["result"]["ok"], true);
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .state_of(Direction::ClientToUpstream, &Value::from("during-write")),
+            Some(PendingState::Completed)
+        );
+    }
+
+    #[test]
+    fn proxy_ids_restore_exact_string_number_and_null_ids_once() {
+        for original_id in [Value::from("request-1"), Value::from(17), Value::Null] {
+            let pending = Mutex::new(PendingRequests::new());
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": original_id.clone(),
+                "method": "ping",
+                "params": {}
+            });
+            let registered = pending
+                .lock()
+                .unwrap()
+                .register_request(
+                    Direction::ClientToUpstream,
+                    &request,
+                    PendingPayload {
+                        findings: Vec::new(),
+                        filter: false,
+                        inspect_kind: None,
+                        tool_contract: None,
+                        execution: None,
+                    },
+                )
+                .expect("request registration");
+            pending
+                .lock()
+                .unwrap()
+                .activate_for_forward(Direction::ClientToUpstream, &registered.proxy_id)
+                .expect("activate exact proxy before transport");
+            assert!(registered.proxy_id.starts_with("tirith-"));
+            assert_ne!(Value::String(registered.proxy_id.clone()), original_id);
+            let upstream_response = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": registered.proxy_id,
+                "result": {"ok": true}
+            }))
+            .unwrap();
+            let schema_cache = Mutex::new(ToolSchemaCache::new());
+            let shutdown = AtomicBool::new(false);
+            let first = handle_upstream_response(
+                upstream_response.clone(),
+                &pending,
+                Direction::ClientToUpstream,
+                false,
+                true,
+                &output_filter::OutputFilterContext::default(),
+                None,
+                None,
+                &shutdown,
+                &schema_cache,
+            )
+            .expect("first exact proxy response");
+            let first: Value = serde_json::from_slice(&first).unwrap();
+            assert_eq!(first["id"], original_id);
+            assert!(handle_upstream_response(
+                upstream_response,
+                &pending,
+                Direction::ClientToUpstream,
+                false,
+                true,
+                &output_filter::OutputFilterContext::default(),
+                None,
+                None,
+                &shutdown,
+                &schema_cache,
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn guarded_notifications_are_denied_even_when_fail_mode_is_open() {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "Bash", "arguments": {"command": "printf side-effect"}}
+        });
+        let raw = serde_json::to_vec(&request).unwrap();
+        let pending = Mutex::new(PendingRequests::new());
+        let schema_cache = Mutex::new(ToolSchemaCache::new());
+        let (tx, rx) = mpsc::channel();
+        let mut upstream = Vec::new();
+        let mut config = test_config();
+        config.policy.fail_mode = "open".to_string();
+        config.policy.warn_action = "forward".to_string();
+        process_object(
+            &request,
+            &raw,
+            &config,
+            &mut upstream,
+            &tx,
+            &pending,
+            Direction::ClientToUpstream,
+            false,
+            &schema_cache,
+        )
+        .expect("guarded notification denial");
+        assert!(upstream.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "notifications have no reply channel"
+        );
+        assert_eq!(pending.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn poisoned_pending_table_always_drops_unverifiable_responses() {
         let pending = Mutex::new(PendingRequests::new());
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = pending.lock().unwrap();
@@ -7137,10 +7934,9 @@ policy:
             run_upstream(&response, &pending, true, false).is_none(),
             "explicit output protection must not forward an uncorrelated response"
         );
-        assert_eq!(
-            run_upstream(&response, &pending, false, false),
-            Some(response),
-            "only the explicitly unhardened legacy mode preserves passthrough"
+        assert!(
+            run_upstream(&response, &pending, false, false).is_none(),
+            "a poisoned ownership table must never forward an unverifiable response"
         );
     }
 
@@ -7158,10 +7954,12 @@ policy:
         let _ = register_passthrough_request(&req, &pending, Direction::ClientToUpstream, None);
         let table = pending.lock().unwrap();
         let entry = table
-            .map
-            .get(&(Direction::ClientToUpstream, Value::from(5)))
+            .entry_for_original(Direction::ClientToUpstream, &Value::from(5))
             .expect("tools/list request registered");
-        assert_eq!(entry.payload.inspect_kind, Some(ResponseKind::ToolsList));
+        assert_eq!(
+            entry.payload.as_ref().unwrap().inspect_kind,
+            Some(ResponseKind::ToolsList)
+        );
     }
 
     #[test]
@@ -7174,10 +7972,9 @@ policy:
         let _ = register_passthrough_request(&req, &pending, Direction::ClientToUpstream, None);
         let table = pending.lock().unwrap();
         let entry = table
-            .map
-            .get(&(Direction::ClientToUpstream, Value::from(6)))
+            .entry_for_original(Direction::ClientToUpstream, &Value::from(6))
             .expect("ping request registered");
-        assert_eq!(entry.payload.inspect_kind, None);
+        assert_eq!(entry.payload.as_ref().unwrap().inspect_kind, None);
     }
 
     #[test]
@@ -7209,8 +8006,14 @@ policy:
         );
         assert_eq!(v["error"]["data"]["decision"], "block");
         assert_eq!(v["error"]["data"]["surface"], "tools/list");
-        // Entry retired on the matching response.
-        assert_eq!(pending.lock().unwrap().len(), 0);
+        // The payload is retired, but a completed proxy-id tombstone remains so
+        // a duplicate result cannot produce a second client response.
+        let table = pending.lock().unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.state_of(Direction::ClientToUpstream, &Value::from(8)),
+            Some(PendingState::Completed)
+        );
     }
 
     #[test]
@@ -7327,7 +8130,7 @@ policy:
         let lock_dir = repo.path().join(".tirith");
         std::fs::create_dir_all(&lock_dir).unwrap();
         let lock_path = lock_dir.join(tirith_core::mcp_lock::MCP_LOCK_FILENAME);
-        std::fs::write(&lock_path, lock.render()).unwrap();
+        std::fs::write(&lock_path, lock.render().expect("render MCP lockfile")).unwrap();
 
         let approval = DescriptorApprovalContext {
             repo_root: repo.path().to_path_buf(),
@@ -7373,7 +8176,7 @@ policy:
         let lock_dir = repo.path().join(".tirith");
         std::fs::create_dir_all(&lock_dir).unwrap();
         let lock_path = lock_dir.join(tirith_core::mcp_lock::MCP_LOCK_FILENAME);
-        std::fs::write(&lock_path, lock.render()).unwrap();
+        std::fs::write(&lock_path, lock.render().expect("render MCP lockfile")).unwrap();
         let before = std::fs::read(&lock_path).unwrap();
 
         let approval = DescriptorApprovalContext {
@@ -7845,8 +8648,12 @@ policy:
             .as_str()
             .unwrap()
             .contains("Tirith warnings"));
-        // Entry retired on the matching response.
-        assert_eq!(pending.lock().unwrap().len(), 0);
+        let table = pending.lock().unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.state_of(Direction::ClientToUpstream, &Value::from(42)),
+            Some(PendingState::Completed)
+        );
     }
 
     #[test]
@@ -7914,7 +8721,13 @@ policy:
             v.get("error").is_none(),
             "block path must NOT emit a JSON-RPC error envelope"
         );
-        assert_eq!(pending.lock().unwrap().len(), 0);
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .state_of(Direction::ClientToUpstream, &Value::from(42)),
+            Some(PendingState::Completed)
+        );
     }
 
     #[test]
@@ -7973,7 +8786,17 @@ policy:
             &schema_cache,
         )
         .unwrap();
-        assert_eq!(upstream, [raw.as_slice(), b"\n"].concat());
+        let forwarded: Value = serde_json::from_slice(
+            upstream
+                .strip_suffix(b"\n")
+                .expect("forwarded request has JSONL terminator"),
+        )
+        .unwrap();
+        assert!(forwarded["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("tirith-") && id.len() == 39));
+        assert_eq!(forwarded["method"], "tools/call");
+        assert_eq!(forwarded["params"], request["params"]);
 
         let response = serde_json::json!({
             "jsonrpc": "2.0",
@@ -8013,16 +8836,14 @@ policy:
             let request = serde_json::json!({
                 "jsonrpc": "2.0", "id": 702, "method": "initialize", "params": {}
             });
-            assert_eq!(
-                register_passthrough_request(
-                    &request,
-                    &pending,
-                    Direction::ClientToUpstream,
-                    None,
-                )
-                .unwrap(),
-                Some(RegisterOutcome::Registered)
-            );
+            assert!(register_passthrough_request(
+                &request,
+                &pending,
+                Direction::ClientToUpstream,
+                None,
+            )
+            .unwrap()
+            .is_some());
             let response = serde_json::json!({
                 "jsonrpc": "2.0", "id": 702, "error": malformed_error
             });
@@ -8069,7 +8890,13 @@ policy:
         .expect("unsafe error receives safe block");
         let blocked: Value = serde_json::from_slice(&blocked).unwrap();
         assert_eq!(blocked["error"]["code"], -32006);
-        assert_eq!(pending.lock().unwrap().len(), 0);
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .state_of(Direction::ClientToUpstream, &Value::from(703)),
+            Some(PendingState::Completed)
+        );
         assert!(
             run_upstream(
                 &serde_json::to_vec(&unsafe_response).unwrap(),
@@ -8105,7 +8932,13 @@ policy:
         .expect("clean error forwards");
         let forwarded: Value = serde_json::from_slice(&forwarded).unwrap();
         assert_eq!(forwarded["error"]["message"], "clean failure");
-        assert_eq!(pending.lock().unwrap().len(), 0);
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .state_of(Direction::ClientToUpstream, &Value::from(705)),
+            Some(PendingState::Completed)
+        );
     }
 
     #[test]
@@ -8163,7 +8996,13 @@ policy:
         .expect("benign initialization result forwards after sanitization");
         let value: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(value["result"]["instructions"], "hello");
-        assert_eq!(pending.lock().unwrap().len(), 0);
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .state_of(Direction::ClientToUpstream, &Value::from(704)),
+            Some(PendingState::Completed)
+        );
     }
 
     #[test]
@@ -9294,14 +10133,20 @@ policy:
         // Pre-seed an Active entry for id=9.
         register_filter(&pending, Value::from(9));
         let mut upstream = Vec::new();
-        let raw = b"{}";
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "Bash", "arguments": {"command": "ls"}}
+        }))
+        .unwrap();
         let schema_cache = Mutex::new(ToolSchemaCache::new());
         let res = handle_guarded_call(
             Value::from(9),
             "ls",
             "Bash",
             ShellType::Posix,
-            raw,
+            &raw,
             &config,
             &mut upstream,
             &tx,
@@ -9351,6 +10196,281 @@ policy:
             "must be a tombstone, not removed"
         );
         assert_eq!(table.len(), 1, "tombstone key must still be present");
+    }
+
+    #[test]
+    fn reserved_request_does_not_expire_and_activation_starts_a_fresh_deadline() {
+        let pending_timeout = Duration::from_secs(5);
+        let retention = Duration::from_secs(7);
+        let mut table = PendingRequests::with_lifecycle(pending_timeout, retention).unwrap();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "reserved",
+            "method": "tools/call",
+            "params": {"name": "Bash", "arguments": {"command": "pwd"}}
+        });
+        let registered = table
+            .register_request(
+                Direction::ClientToUpstream,
+                &request,
+                PendingPayload {
+                    findings: vec![],
+                    filter: false,
+                    inspect_kind: None,
+                    tool_contract: None,
+                    execution: None,
+                },
+            )
+            .expect("reserve request before durable forwarding state is recorded");
+        let key = (Direction::ClientToUpstream, registered.proxy_id.clone());
+        let reserved_at = table.map.get(&key).unwrap().created;
+        let well_after_old_window = reserved_at
+            .checked_add(pending_timeout + retention + Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(
+            table.time_out_expired_at(pending_timeout, well_after_old_window),
+            0,
+            "authorization time must not consume the response timeout"
+        );
+        table.gc_tombstones_at(retention, well_after_old_window);
+        assert_eq!(table.map.get(&key).unwrap().state, PendingState::Reserved);
+
+        table
+            .activate_for_forward(Direction::ClientToUpstream, &registered.proxy_id)
+            .expect("activate immediately before the transport write");
+        let entry = table.map.get(&key).unwrap();
+        assert_eq!(entry.state, PendingState::Active);
+        assert_eq!(
+            entry.active_until,
+            entry.created.checked_add(pending_timeout).unwrap(),
+            "activation must establish a full response window from activation time"
+        );
+    }
+
+    #[test]
+    fn logical_pending_deadlines_do_not_depend_on_sweep_cadence() {
+        let pending_timeout = Duration::from_secs(5);
+        let retention = Duration::from_secs(7);
+        let payload = || PendingPayload {
+            findings: vec![],
+            filter: false,
+            inspect_kind: None,
+            tool_contract: None,
+            execution: None,
+        };
+        let register = |table: &mut PendingRequests, id: &str| {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "ping"
+            });
+            let registered = table
+                .register_request(Direction::ClientToUpstream, &request, payload())
+                .expect("register request");
+            table
+                .activate_for_forward(Direction::ClientToUpstream, &registered.proxy_id)
+                .expect("activate request before transport");
+            registered
+        };
+
+        let mut before = PendingRequests::with_lifecycle(pending_timeout, retention).unwrap();
+        let before_request = register(&mut before, "before");
+        let before_deadline = before
+            .map
+            .get(&(Direction::ClientToUpstream, before_request.proxy_id.clone()))
+            .unwrap()
+            .active_until;
+        let (_, lease) = before.begin_response_at(
+            Direction::ClientToUpstream,
+            &Value::String(before_request.proxy_id),
+            before_deadline
+                .checked_sub(Duration::from_nanos(1))
+                .expect("deadline has a predecessor"),
+        );
+        assert_eq!(lease.unwrap().disposition, ResponseDisposition::Live);
+
+        let mut at_deadline = PendingRequests::with_lifecycle(pending_timeout, retention).unwrap();
+        let deadline_request = register(&mut at_deadline, "deadline");
+        let active_until = at_deadline
+            .map
+            .get(&(
+                Direction::ClientToUpstream,
+                deadline_request.proxy_id.clone(),
+            ))
+            .unwrap()
+            .active_until;
+        let (_, lease) = at_deadline.begin_response_at(
+            Direction::ClientToUpstream,
+            &Value::String(deadline_request.proxy_id),
+            active_until,
+        );
+        assert_eq!(lease.unwrap().disposition, ResponseDisposition::Late);
+
+        let mut expired = PendingRequests::with_lifecycle(pending_timeout, retention).unwrap();
+        let expired_request = register(&mut expired, "expired");
+        let active_until = expired
+            .map
+            .get(&(
+                Direction::ClientToUpstream,
+                expired_request.proxy_id.clone(),
+            ))
+            .unwrap()
+            .active_until;
+        let retire_at = active_until.checked_add(retention).unwrap();
+        let (classification, lease) = expired.begin_response_at(
+            Direction::ClientToUpstream,
+            &Value::String(expired_request.proxy_id.clone()),
+            retire_at,
+        );
+        assert_eq!(classification, ResponseMatch::Terminal);
+        assert!(lease.is_none());
+        assert!(expired
+            .map
+            .get(&(
+                Direction::ClientToUpstream,
+                expired_request.proxy_id.clone()
+            ))
+            .unwrap()
+            .payload
+            .is_some());
+
+        // One delayed maintenance pass beyond both logical deadlines performs
+        // timeout and exact owner+proxy collection without extending retention.
+        assert_eq!(
+            expired.time_out_expired_at(pending_timeout, retire_at),
+            0,
+            "lazy response classification already timed the entry out"
+        );
+        expired.gc_tombstones_at(retention, retire_at);
+        assert!(!expired
+            .map
+            .contains_key(&(Direction::ClientToUpstream, expired_request.proxy_id)));
+        assert!(expired
+            .proxy_for_original(Direction::ClientToUpstream, &Value::from("expired"))
+            .is_none());
+    }
+
+    #[test]
+    fn client_cancellation_rewrites_exact_owner_and_retains_tombstone() {
+        let config = test_config();
+        let pending = Mutex::new(PendingRequests::new());
+        let schema_cache = Mutex::new(ToolSchemaCache::new());
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>();
+        let mut upstream = Vec::new();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cancel-me",
+            "method": "ping",
+            "params": {}
+        });
+        let request_bytes = serde_json::to_vec(&request).unwrap();
+        process_object(
+            &request,
+            &request_bytes,
+            &config,
+            &mut upstream,
+            &tx,
+            &pending,
+            Direction::ClientToUpstream,
+            false,
+            &schema_cache,
+        )
+        .unwrap();
+        let proxy_id = pending
+            .lock()
+            .unwrap()
+            .proxy_for_original(Direction::ClientToUpstream, &Value::from("cancel-me"))
+            .unwrap()
+            .to_string();
+
+        let cancellation = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": "cancel-me", "reason": "user stopped it"}
+        });
+        let cancellation_bytes = serde_json::to_vec(&cancellation).unwrap();
+        process_object(
+            &cancellation,
+            &cancellation_bytes,
+            &config,
+            &mut upstream,
+            &tx,
+            &pending,
+            Direction::ClientToUpstream,
+            false,
+            &schema_cache,
+        )
+        .unwrap();
+
+        let frames: Vec<Value> = upstream
+            .split(|byte| *byte == b'\n')
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| serde_json::from_slice(frame).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["id"], proxy_id);
+        assert_eq!(frames[1]["params"]["requestId"], proxy_id);
+        assert_eq!(frames[1]["params"]["reason"], "user stopped it");
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .state_of(Direction::ClientToUpstream, &Value::from("cancel-me")),
+            Some(PendingState::Cancelled)
+        );
+
+        let mut table = pending.lock().unwrap();
+        assert_eq!(
+            table.register(
+                Direction::ClientToUpstream,
+                Value::from("cancel-me"),
+                PendingPayload {
+                    findings: vec![],
+                    filter: false,
+                    inspect_kind: None,
+                    tool_contract: None,
+                    execution: None,
+                }
+            ),
+            RegisterOutcome::DuplicateTombstone
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_client_cancellation_is_dropped() {
+        let config = test_config();
+        let pending = Mutex::new(PendingRequests::new());
+        let schema_cache = Mutex::new(ToolSchemaCache::new());
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>();
+        for cancellation in [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {}
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": "unknown"}
+            }),
+        ] {
+            let raw = serde_json::to_vec(&cancellation).unwrap();
+            let mut upstream = Vec::new();
+            process_object(
+                &cancellation,
+                &raw,
+                &config,
+                &mut upstream,
+                &tx,
+                &pending,
+                Direction::ClientToUpstream,
+                false,
+                &schema_cache,
+            )
+            .unwrap();
+            assert!(upstream.is_empty());
+        }
     }
 
     #[test]
@@ -9411,9 +10531,9 @@ policy:
     }
 
     #[test]
-    fn test_unknown_response_id_strict_blocks_fail_closed() {
-        // A response whose id matches no outstanding request is strict-blocked under
-        // fail-closed (a fabricated upstream response).
+    fn test_unknown_response_id_is_dropped_without_forging_a_client_envelope() {
+        // The unknown id is attacker-controlled. Neither the raw response nor a
+        // synthetic keyed denial may create a client-visible message for it.
         let pending = Mutex::new(PendingRequests::new());
         let upstream = serde_json::json!({
             "jsonrpc": "2.0",
@@ -9421,12 +10541,7 @@ policy:
             "result": {"content": [{"type": "text", "text": "fabricated"}], "isError": false}
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        let out = run_upstream(&line, &pending, true, /*fail_mode_closed=*/ true)
-            .expect("strict-block emits a deny envelope");
-        let v: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["id"], 999);
-        let text = v["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("no matching outstanding request"));
+        assert!(run_upstream(&line, &pending, true, /*fail_mode_closed=*/ true).is_none());
     }
 
     #[test]
@@ -9445,7 +10560,7 @@ policy:
     }
 
     #[test]
-    fn test_unknown_response_id_forwarded_only_in_legacy_unhardened_mode() {
+    fn test_unknown_response_id_is_dropped_in_legacy_unhardened_mode_too() {
         let pending = Mutex::new(PendingRequests::new());
         let upstream = serde_json::json!({
             "jsonrpc": "2.0",
@@ -9453,9 +10568,7 @@ policy:
             "result": {"content": [{"type": "text", "text": "legacy"}], "isError": false}
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        let out = run_upstream(&line, &pending, false, /*fail_mode_closed=*/ false)
-            .expect("legacy fail-open preserves compatibility");
-        assert_eq!(out, line);
+        assert!(run_upstream(&line, &pending, false, /*fail_mode_closed=*/ false).is_none());
     }
 
     #[test]
@@ -9536,18 +10649,22 @@ policy:
         table.register(Direction::ClientToUpstream, Value::from("t1"), payload());
         table.register(Direction::ClientToUpstream, Value::from("t2"), payload());
         assert_eq!(table.time_out_expired(Duration::from_millis(0)), 2);
-        // A retained tombstone owns its id until GC; it cannot be overwritten by
-        // a fresh request whose response could be confused with the old one.
+        // The timed-out proxy and its original-id ownership remain inseparable
+        // until atomic GC. Reuse before then must be rejected.
         assert_eq!(
             table.register(Direction::ClientToUpstream, Value::from("t1"), payload()),
             RegisterOutcome::DuplicateTombstone
         );
 
-        // Retention 0 -> every tombstone is collected, after which the id is free.
+        // Retention 0 atomically collects each proxy tombstone and exact owner.
         table.gc_tombstones(Duration::from_millis(0));
         assert_eq!(
             table.register(Direction::ClientToUpstream, Value::from("t1"), payload()),
             RegisterOutcome::Registered
+        );
+        assert_eq!(
+            table.register(Direction::ClientToUpstream, Value::from("t1"), payload()),
+            RegisterOutcome::DuplicateActive
         );
         assert_eq!(
             table.state_of(Direction::ClientToUpstream, &Value::from("t1")),
@@ -9586,16 +10703,25 @@ policy:
             RegisterOutcome::Registered
         );
         assert_eq!(table.time_out_expired(Duration::from_millis(0)), 1);
+        let old_proxy = table
+            .proxy_for_any_original(Direction::ClientToUpstream, &id)
+            .unwrap()
+            .to_string();
         assert_eq!(
             table.register(Direction::ClientToUpstream, id.clone(), payload(None)),
             RegisterOutcome::DuplicateTombstone,
-            "a new unprotected request must not replace the old protected tombstone"
+            "reuse must remain blocked while the old proxy can still receive a late response"
         );
         let late = table
-            .take_for_response(Direction::ClientToUpstream, &id)
+            .begin_response(
+                Direction::ClientToUpstream,
+                &Value::String(old_proxy.clone()),
+            )
+            .1
             .expect("old late response remains correlated");
         assert_eq!(late.disposition, ResponseDisposition::Late);
         assert_eq!(late.payload.tool_contract, Some(old_contract));
+        assert_eq!(late.key.1, old_proxy);
     }
 
     #[test]
@@ -9854,16 +10980,13 @@ policy:
     }
 
     #[test]
-    fn test_unhardened_server_output_retains_malformed_passthrough() {
+    fn test_unhardened_server_output_still_drops_malformed_protocol_bytes() {
         let pending = Mutex::new(PendingRequests::new());
         let raw = b"not json";
-        assert_eq!(
-            run_upstream(raw, &pending, false, false),
-            Some(raw.to_vec())
-        );
+        assert!(run_upstream(raw, &pending, false, false).is_none());
         let malformed = serde_json::json!({"jsonrpc": "2.0", "params": {"data": "legacy"}});
         let line = serde_json::to_vec(&malformed).unwrap();
-        assert_eq!(run_upstream(&line, &pending, false, false), Some(line));
+        assert!(run_upstream(&line, &pending, false, false).is_none());
     }
 
     #[test]

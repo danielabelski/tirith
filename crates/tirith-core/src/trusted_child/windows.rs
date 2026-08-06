@@ -8,9 +8,9 @@
 //! process is resumed only after its inherited Job membership is verified.
 
 use super::{
-    evaluate_windows_trust, spawn_reader, windows_access_mask_grants_replacement, CaptureStream,
-    ChildOutcome, ChildSpec, ReaderMessage, WindowsExecutableSource, WindowsOwnerClass,
-    WindowsTrustFacts,
+    evaluate_windows_trust, spawn_reader, windows_access_mask_grants_replacement, CaptureState,
+    CaptureStream, ChildOutcome, ChildSpec, ReaderMessage, WindowsExecutableSource,
+    WindowsOwnerClass, WindowsTrustFacts, WindowsTrustProvenance,
 };
 use std::ffi::{c_void, OsStr};
 use std::fs::File;
@@ -69,7 +69,8 @@ use windows_sys::Win32::System::Threading::{
 
 /// Bounded post-termination verification allowance. The runtime deadline never
 /// turns into an unbounded cleanup wait; failure to empty the Job within this
-/// allowance is surfaced via `cleanup_succeeded: false`.
+/// allowance becomes `CleanupError`, or `cleanup_succeeded: false` for the
+/// structured timeout/output-limit outcomes.
 const CLEANUP_WAIT: Duration = Duration::from_secs(2);
 
 pub(super) fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -103,7 +104,7 @@ fn os_str_eq_ignore_case(left: &OsStr, right: &OsStr) -> bool {
 pub(super) fn validate_executable(
     path: &Path,
     source: WindowsExecutableSource,
-) -> Result<(), String> {
+) -> Result<WindowsTrustProvenance, String> {
     let native_image = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -177,9 +178,7 @@ pub(super) fn validate_executable(
         protected_install_root,
         authenticode_trusted: authenticode_trusted(path)?,
     };
-    evaluate_windows_trust(source, facts)
-        .map(|_| ())
-        .map_err(str::to_string)
+    evaluate_windows_trust(source, facts).map_err(str::to_string)
 }
 
 /// PATH inherited by a trusted child can itself select DLLs, interpreter
@@ -643,77 +642,196 @@ pub(super) fn run(executable: &super::TrustedExecutable, spec: &ChildSpec) -> Ch
         Err(error) => return ChildOutcome::SpawnError(error),
     };
     let (sender, receiver) = mpsc::channel();
-    spawn_reader(
-        child.stdout.take().expect("launched child owns stdout"),
+    let mut reader_workers = Vec::with_capacity(2);
+    reader_workers.push((
         CaptureStream::Stdout,
-        spec.limits.stdout_bytes,
-        sender.clone(),
-    );
-    spawn_reader(
-        child.stderr.take().expect("launched child owns stderr"),
+        spawn_reader(
+            child.stdout.take().expect("launched child owns stdout"),
+            CaptureStream::Stdout,
+            spec.limits.stdout_bytes,
+            sender.clone(),
+        ),
+    ));
+    reader_workers.push((
         CaptureStream::Stderr,
-        spec.limits.stderr_bytes,
-        sender,
-    );
+        spawn_reader(
+            child.stderr.take().expect("launched child owns stderr"),
+            CaptureStream::Stderr,
+            spec.limits.stderr_bytes,
+            sender,
+        ),
+    ));
 
     let deadline = Instant::now() + spec.limits.timeout;
-    let mut status = None;
-    let mut stdout = None;
-    let mut stderr = None;
+    let mut capture = CaptureState::default();
     loop {
         while let Ok(message) = receiver.try_recv() {
-            match message {
-                ReaderMessage::Complete(CaptureStream::Stdout, bytes) => stdout = Some(bytes),
-                ReaderMessage::Complete(CaptureStream::Stderr, bytes) => stderr = Some(bytes),
-                ReaderMessage::Limit(stream) => {
-                    return ChildOutcome::OutputLimitExceeded {
-                        stream,
-                        cleanup_succeeded: child.terminate_tree(),
-                    };
-                }
+            let cause = match &message {
+                ReaderMessage::Complete(..) => None,
+                ReaderMessage::Limit(stream) => Some(WindowsFinishCause::OutputLimit(*stream)),
                 ReaderMessage::Error(stream, reason) => {
-                    let _ = child.terminate_tree();
-                    return ChildOutcome::WaitError(format!("read {stream:?}: {reason}"));
+                    Some(WindowsFinishCause::ReaderError(*stream, reason.clone()))
                 }
+            };
+            if let Err(error) = capture.record(message) {
+                return finish_windows_run(
+                    WindowsFinishContext {
+                        child: &mut child,
+                        receiver: &receiver,
+                        workers: &mut reader_workers,
+                        capture: &mut capture,
+                    },
+                    WindowsFinishCause::WaitError(error),
+                );
+            }
+            if let Some(cause) = cause {
+                return finish_windows_run(
+                    WindowsFinishContext {
+                        child: &mut child,
+                        receiver: &receiver,
+                        workers: &mut reader_workers,
+                        capture: &mut capture,
+                    },
+                    cause,
+                );
             }
         }
 
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(exit) => status = exit,
-                Err(error) => {
-                    let _ = child.terminate_tree();
-                    return ChildOutcome::WaitError(error);
-                }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The direct process has completed, but a Job descendant may
+                // still own a captured pipe. Empty the Job immediately, then
+                // drain and join both readers under one cleanup deadline.
+                return finish_windows_run(
+                    WindowsFinishContext {
+                        child: &mut child,
+                        receiver: &receiver,
+                        workers: &mut reader_workers,
+                        capture: &mut capture,
+                    },
+                    WindowsFinishCause::DirectExit(status),
+                );
             }
-        }
-        if let Some(exit_status) = status {
-            match (stdout.take(), stderr.take()) {
-                (Some(stdout_bytes), Some(stderr_bytes)) => {
-                    if !child.finish_completed_tree() {
-                        return ChildOutcome::WaitError(
-                            "child exited but descendant Job cleanup failed".to_string(),
-                        );
-                    }
-                    return ChildOutcome::Completed {
-                        status: exit_status,
-                        stdout: stdout_bytes,
-                        stderr: stderr_bytes,
-                    };
-                }
-                (pending_stdout, pending_stderr) => {
-                    stdout = pending_stdout;
-                    stderr = pending_stderr;
-                }
+            Ok(None) => {}
+            Err(error) => {
+                return finish_windows_run(
+                    WindowsFinishContext {
+                        child: &mut child,
+                        receiver: &receiver,
+                        workers: &mut reader_workers,
+                        capture: &mut capture,
+                    },
+                    WindowsFinishCause::WaitError(error),
+                );
             }
         }
         if Instant::now() >= deadline {
-            return ChildOutcome::Timeout {
-                cleanup_succeeded: child.terminate_tree(),
-            };
+            return finish_windows_run(
+                WindowsFinishContext {
+                    child: &mut child,
+                    receiver: &receiver,
+                    workers: &mut reader_workers,
+                    capture: &mut capture,
+                },
+                WindowsFinishCause::Timeout,
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+enum WindowsFinishCause {
+    DirectExit(std::process::ExitStatus),
+    Timeout,
+    OutputLimit(CaptureStream),
+    ReaderError(CaptureStream, String),
+    WaitError(String),
+}
+
+struct WindowsFinishContext<'a> {
+    child: &'a mut WindowsChild,
+    receiver: &'a mpsc::Receiver<ReaderMessage>,
+    workers: &'a mut Vec<(CaptureStream, std::thread::JoinHandle<()>)>,
+    capture: &'a mut CaptureState,
+}
+
+fn finish_windows_run(
+    context: WindowsFinishContext<'_>,
+    cause: WindowsFinishCause,
+) -> ChildOutcome {
+    let cleanup_deadline = Instant::now() + CLEANUP_WAIT;
+    let tree_cleanup_succeeded = match &cause {
+        WindowsFinishCause::DirectExit(_) => context.child.finish_completed_tree(cleanup_deadline),
+        WindowsFinishCause::Timeout
+        | WindowsFinishCause::OutputLimit(_)
+        | WindowsFinishCause::ReaderError(..)
+        | WindowsFinishCause::WaitError(_) => context.child.terminate_tree(cleanup_deadline),
+    };
+    let reader_cleanup = super::finish_reader_workers(
+        context.receiver,
+        context.workers,
+        context.capture,
+        cleanup_deadline,
+    );
+    let cleanup_succeeded = tree_cleanup_succeeded && reader_cleanup.is_ok();
+
+    let output_limit = match &cause {
+        WindowsFinishCause::OutputLimit(stream) => Some(*stream),
+        _ => context.capture.first_limit(),
+    };
+    if let Some(stream) = output_limit {
+        return ChildOutcome::OutputLimitExceeded {
+            stream,
+            cleanup_succeeded,
+        };
+    }
+    if matches!(&cause, WindowsFinishCause::Timeout) {
+        return ChildOutcome::Timeout { cleanup_succeeded };
+    }
+
+    if !cleanup_succeeded {
+        let mut reasons = Vec::new();
+        match &cause {
+            WindowsFinishCause::ReaderError(stream, reason) => {
+                reasons.push(format!("read {stream:?}: {reason}"));
+            }
+            WindowsFinishCause::WaitError(reason) => reasons.push(format!("wait failed: {reason}")),
+            WindowsFinishCause::DirectExit(_)
+            | WindowsFinishCause::Timeout
+            | WindowsFinishCause::OutputLimit(_) => {}
+        }
+        if !tree_cleanup_succeeded {
+            reasons.push("descendant Job cleanup failed".to_string());
+        }
+        if let Err(reason) = &reader_cleanup {
+            reasons.push(reason.clone());
+        }
+        return ChildOutcome::CleanupError(reasons.join("; "));
+    }
+
+    match cause {
+        WindowsFinishCause::ReaderError(stream, reason) => {
+            return ChildOutcome::WaitError(format!("read {stream:?}: {reason}"));
+        }
+        WindowsFinishCause::WaitError(reason) => return ChildOutcome::WaitError(reason),
+        WindowsFinishCause::DirectExit(status) => {
+            if let Some((stream, reason)) = context.capture.first_error() {
+                return ChildOutcome::WaitError(format!("read {stream:?}: {reason}"));
+            }
+            let Some((stdout, stderr)) = context.capture.take_completed() else {
+                return ChildOutcome::CleanupError(
+                    "capture workers completed without two bounded output buffers".to_string(),
+                );
+            };
+            return ChildOutcome::Completed {
+                status,
+                stdout,
+                stderr,
+            };
+        }
+        WindowsFinishCause::Timeout | WindowsFinishCause::OutputLimit(_) => {}
+    }
+    ChildOutcome::CleanupError("Windows supervisor reached an invalid terminal state".to_string())
 }
 
 struct WindowsChild {
@@ -913,25 +1031,26 @@ impl WindowsChild {
         }
     }
 
-    fn terminate_tree(&mut self) -> bool {
+    fn terminate_tree(&mut self, deadline: Instant) -> bool {
         if matches!(self.active_processes(), Ok(0)) {
             return true;
         }
         // SAFETY: job/process handles remain valid for both calls.
         let terminated = unsafe { TerminateJobObject(self.job.0, 1) } != 0;
-        terminated && self.wait_for_empty_job()
+        terminated && self.wait_for_empty_job(deadline)
     }
 
-    fn finish_completed_tree(&mut self) -> bool {
+    fn finish_completed_tree(&mut self, deadline: Instant) -> bool {
         match self.active_processes() {
             Ok(0) => true,
-            Ok(_) => self.terminate_tree(),
-            Err(_) => false,
+            // A failed accounting query is not a reason to skip containment:
+            // still attempt bounded Job termination, which independently
+            // reports whether every member disappeared.
+            Ok(_) | Err(_) => self.terminate_tree(deadline),
         }
     }
 
-    fn wait_for_empty_job(&self) -> bool {
-        let deadline = Instant::now() + CLEANUP_WAIT;
+    fn wait_for_empty_job(&self, deadline: Instant) -> bool {
         loop {
             match self.active_processes() {
                 Ok(0) => return true,

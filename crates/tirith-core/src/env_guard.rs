@@ -619,9 +619,9 @@ fn is_pipe_to_interpreter_shape(cmd: &str, shell: ShellType) -> bool {
         // would otherwise be the wrapper word. `resolve_wrapped_command` returns
         // the lowercased base name (or `None` when the wrapper chain has no
         // command word, e.g. bare `sudo`).
-        let source_fetches = crate::extract::resolve_wrapped_command(source)
+        let source_fetches = crate::extract::resolve_wrapped_command_for_shell(source, shell)
             .is_some_and(|(name, _)| is_url_fetch_command(&name));
-        let sink_is_shell = crate::extract::resolve_wrapped_command(sink)
+        let sink_is_shell = crate::extract::resolve_wrapped_command_for_shell(sink, shell)
             .is_some_and(|(name, _)| is_shell_interpreter(&name));
         matches!(sink.preceding_separator.as_deref(), Some("|") | Some("|&"))
             && source_fetches

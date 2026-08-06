@@ -24,13 +24,17 @@
 //! invariant 2). Analysis-only surfaces may opt to run degraded with an honest
 //! banner instead.
 //!
-//! ## Two launch shapes
+//! ## Three launch shapes
 //!
-//! Consumers need one of two things, so this module offers both on top of the same
-//! backend selection + fail-closed gate:
+//! Consumers need one of three things, so this module offers all three on top of
+//! the same backend selection + fail-closed gate:
 //!
-//! - [`run_to_completion`]: build the contained child, inherit stdio, wait, return
-//!   its exit code. Used by `tirith run`, `temp-run --capsule`, and D4's install.
+//! - [`run_to_completion_os`]: build the contained child, inherit stdio, wait, return
+//!   its exit code. Used by `tirith run` and `temp-run --capsule`.
+//! - [`run_to_completion_bound_inputs`]: execute a content-bound program against
+//!   immutable named inputs and a held writable target. This is the production D4
+//!   `pkg install` seam. Its enforcing execution is x86_64 Linux-only; every other
+//!   platform or architecture refuses before the package interpreter starts.
 //! - [`spawn_piped`]: build the contained child with piped stdin/stdout/stderr and
 //!   hand back a [`ManagedChild`] the caller bridges (the MCP gateway needs to sit
 //!   between the client and the upstream server). Linux and macOS support
@@ -45,12 +49,14 @@
 //! caller that did not permit degradation never reaches a spawn at all.
 
 use std::ffi::{OsStr, OsString};
-#[cfg(target_os = "linux")]
-use std::io::Read;
 use std::io::Write as _;
+#[cfg(target_os = "linux")]
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd as _;
 use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::{mpsc, Arc};
 #[cfg(target_os = "linux")]
@@ -69,8 +75,6 @@ use tirith_core::trusted_child::TrustedExecutable;
 /// bound again at the stdin launch boundary so no other caller can make the
 /// writer retain or block on an unbounded payload.
 pub const SCRIPT_STDIN_MAX_BYTES: usize = 10 * 1024 * 1024;
-#[cfg(target_os = "linux")]
-const TARGET_EXEC_MAX_WAIT: Duration = Duration::from_secs(5);
 
 /// Resource contract for the supervised stdin execution surface. Linux is the
 /// only platform that currently executes this contract: the OS backend owns CPU,
@@ -130,9 +134,12 @@ impl SelectedBackend {
 
 /// How a launch should treat a backend that cannot fully satisfy the spec.
 ///
-/// **Invariant (enforcing surfaces must hold):** an *enforcing* surface — one that
-/// promises containment (`pkg install`, the contained MCP gateway,
+/// **Invariant (enforcing surfaces using this policy must hold):** an *enforcing*
+/// surface — one that promises containment (the contained MCP gateway or
 /// `tirith run --require-capsule`) — must ALWAYS pass [`Self::FailClosed`].
+/// `pkg install` instead uses [`run_to_completion_bound_inputs`], whose API has no
+/// degraded mode and refuses unsupported or insufficiently covered hosts before
+/// package execution.
 /// [`Self::AllowDegraded`] runs the program fully uncontained on a degraded host
 /// and is reserved for best-effort, explicitly-not-a-boundary surfaces
 /// (`temp-run --capsule`) that print an honest banner. An enforcing surface that
@@ -141,7 +148,7 @@ impl SelectedBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DegradedPolicy {
     /// Enforcing surface: refuse to run if coverage is degraded (the default for
-    /// `pkg install`, the contained gateway, `tirith run --require-capsule`).
+    /// the contained gateway and `tirith run --require-capsule`).
     FailClosed,
     /// Analysis surface: run the program even under degraded/NoOp coverage, but
     /// the caller is expected to print an honest banner. Used by
@@ -164,7 +171,7 @@ impl DegradedPolicy {
 /// surface would have failed closed before here). In a debug build this trips a
 /// `debug_assert!`; the structural fail-closed check upstream already guarantees an
 /// enforcing caller never reaches a degraded run in release. Centralizing the guard
-/// here means every degraded-run path (`run_to_completion` and `spawn_piped`)
+/// here means every degraded-run path (`run_to_completion_os` and `spawn_piped`)
 /// asserts the same contract, so a future enforcing surface that mis-wires its
 /// policy is caught in tests rather than silently running an attacker's code
 /// uncontained.
@@ -189,12 +196,42 @@ pub struct CapsuleOutcome {
     /// Whether the run proceeded under degraded coverage (only possible with
     /// [`DegradedPolicy::AllowDegraded`]).
     pub degraded: bool,
+    /// A parent-enforced policy termination that happened after the target crossed
+    /// its authenticated exec boundary. `None` means the target reached its own
+    /// ordinary exit status. Keeping this on the successful outcome prevents a
+    /// wall/output kill from being misreported as a pre-exec refusal.
+    pub termination: Option<CapsuleTermination>,
 }
+
+/// Why a target that definitely started was terminated by the parent-owned
+/// capsule supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum CapsuleTerminationKind {
+    WallClock,
+    OutputLimit,
+    OutputPolicy,
+    SupervisionIo,
+    Presentation,
+    CleanupFailure,
+}
+
+/// Typed post-exec termination evidence. The reason is bounded, parent-generated
+/// text; `cleanup_confirmed` records whether the complete owned process tree was
+/// proven gone before launch resources were released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapsuleTermination {
+    pub kind: CapsuleTerminationKind,
+    pub reason: String,
+    pub cleanup_confirmed: bool,
+}
+
+/// Compatibility name used by capability-bound callers.
+pub type CapsuleExecutionOutcome = CapsuleOutcome;
 
 impl CapsuleOutcome {
     /// A compact, secret-free description of the coverage actually achieved, for a
-    /// receipt or an audit line (D4's `ArtifactScanReceipt` records the capsule
-    /// backend + coverage). Reads the [`CapsuleCoverage`] flags into a stable
+    /// receipt or an audit line. Reads the [`CapsuleCoverage`] flags into a stable
     /// string so a downstream record need not depend on the struct shape.
     pub fn coverage_summary(&self) -> String {
         let c = &self.coverage;
@@ -223,9 +260,998 @@ pub struct CapsuleRefused {
     pub reason: String,
 }
 
+/// Failure phase for capability-bound enforcing launches. Pre-exec refusal and a
+/// failure after authenticated target resume must never collapse into one error:
+/// callers need to know whether attacker-controlled code ran.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum CapsuleExecutionError {
+    RefusedBeforeExec(CapsuleRefused),
+    ExecutedTerminated {
+        backend_id: &'static str,
+        termination: CapsuleTermination,
+    },
+}
+
+impl From<CapsuleRefused> for CapsuleExecutionError {
+    fn from(value: CapsuleRefused) -> Self {
+        Self::RefusedBeforeExec(value)
+    }
+}
+
+impl std::fmt::Display for CapsuleExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RefusedBeforeExec(refused) => write!(f, "{refused}"),
+            Self::ExecutedTerminated {
+                backend_id,
+                termination,
+            } => write!(
+                f,
+                "[{backend_id}] target executed, then capsule supervision terminated it: {} (cleanup confirmed={})",
+                termination.reason, termination.cleanup_confirmed
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapsuleExecutionError {}
+
+/// One immutable launch plan with canonicalized filesystem roots. The same
+/// effective spelling is serialized into the child, closing
+/// validate-in-one-cwd/apply-in-another gaps.
+/// Output and wall time are removed only from `backend_spec`; the opaque parent
+/// limits below must be installed before `reported_selected` may be exposed.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct PreparedCapsulePlan {
+    effective_spec: CapsuleSpec,
+    backend_spec: CapsuleSpec,
+    backend_selected: SelectedBackend,
+    reported_selected: SelectedBackend,
+    #[cfg(target_os = "linux")]
+    limits: SupervisedLimits,
+}
+
+/// One immutable input capability for a package launch. `name` is a single safe
+/// filename component (wheel names retain `.whl`; the control file is exactly
+/// `approved.txt`). The held source is copied and re-hashed into a fully sealed
+/// anonymous file before any child is spawned.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct BoundLaunchInput {
+    pub name: String,
+    pub source: std::fs::File,
+    pub expected_sha256: String,
+}
+
+/// Held target directory identity for capability-bound writes.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct BoundLaunchDirectory {
+    /// Canonical path represented in the finalized write policy/receipt.
+    pub policy_root: std::path::PathBuf,
+    /// Canonical path currently naming the retained capability. This may be a
+    /// private pending-install directory before an atomic publish.
+    pub visible_path: std::path::PathBuf,
+    pub handle: std::fs::File,
+}
+
+/// Typed argv expansion for a bound-input package launch. Numeric descriptor
+/// slots stay private to the capsule layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundLaunchArg {
+    Literal(OsString),
+    InputName(String),
+    TargetDirectory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundOutputPresentation {
+    ForwardSanitized,
+    Suppress,
+}
+
+/// Parent-owned ephemeral directory paired with exact root and parent-directory
+/// capabilities opened immediately after creation. Large contents are cleaned
+/// only beneath the retained root descriptor; final root removal is one
+/// non-recursive unlink relative to the held parent after an identity check.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct HeldEphemeralDirectory {
+    guard: Option<tempfile::TempDir>,
+    handle: std::fs::File,
+    parent: std::fs::File,
+    name: std::ffi::CString,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldEphemeralDirectory {
+    fn from_tempdir(
+        guard: tempfile::TempDir,
+        backend_id: &'static str,
+        label: &str,
+    ) -> Result<Self, CapsuleRefused> {
+        Self::from_tempdir_with_hook(guard, backend_id, label, || {})
+    }
+
+    fn from_tempdir_with_hook<F>(
+        guard: tempfile::TempDir,
+        backend_id: &'static str,
+        label: &str,
+        after_initial_identity: F,
+    ) -> Result<Self, CapsuleRefused>
+    where
+        F: FnOnce(),
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let prepared = (|| {
+            let initial =
+                std::fs::symlink_metadata(guard.path()).map_err(|error| CapsuleRefused {
+                    backend_id,
+                    reason: format!("inspect newly-created parent-owned {label}: {error}"),
+                })?;
+            if !initial.is_dir() || initial.file_type().is_symlink() {
+                return Err(CapsuleRefused {
+                    backend_id,
+                    reason: format!("newly-created parent-owned {label} is not a directory"),
+                });
+            }
+            let parent_path = guard.path().parent().ok_or_else(|| CapsuleRefused {
+                backend_id,
+                reason: format!("parent-owned {label} directory has no parent"),
+            })?;
+            let basename = guard.path().file_name().ok_or_else(|| CapsuleRefused {
+                backend_id,
+                reason: format!("parent-owned {label} directory has no basename"),
+            })?;
+            let name = std::ffi::CString::new(basename.as_bytes()).map_err(|_| CapsuleRefused {
+                backend_id,
+                reason: format!("parent-owned {label} basename contains NUL"),
+            })?;
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let parent = options.open(parent_path).map_err(|error| CapsuleRefused {
+                backend_id,
+                reason: format!("open parent-owned {label} parent capability: {error}"),
+            })?;
+            after_initial_identity();
+            let root_fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if root_fd < 0 {
+                return Err(CapsuleRefused {
+                    backend_id,
+                    reason: format!(
+                        "open parent-owned {label} root relative to held parent: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                });
+            }
+            // SAFETY: openat returned a fresh owned descriptor.
+            let handle = unsafe { std::fs::File::from_raw_fd(root_fd) };
+            let held = handle.metadata().map_err(|error| CapsuleRefused {
+                backend_id,
+                reason: format!("inspect parent-owned {label} capability: {error}"),
+            })?;
+            let mut visible = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    visible.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(CapsuleRefused {
+                    backend_id,
+                    reason: format!(
+                        "inspect parent-owned {label} name relative to held parent: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                });
+            }
+            // SAFETY: fstatat initialized the structure on success.
+            let visible = unsafe { visible.assume_init() };
+            if !held.is_dir()
+                || visible.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || initial.dev() != held.dev()
+                || initial.ino() != held.ino()
+                || visible.st_dev as u64 != held.dev()
+                || visible.st_ino as u64 != held.ino()
+            {
+                return Err(CapsuleRefused {
+                    backend_id,
+                    reason: format!(
+                        "parent-owned {label} name does not identify its newly-created retained directory capability"
+                    ),
+                });
+            }
+            Ok((handle, parent, name, held.dev(), held.ino()))
+        })();
+
+        match prepared {
+            Ok((handle, parent, name, device, inode)) => Ok(Self {
+                guard: Some(guard),
+                handle,
+                parent,
+                name,
+                device,
+                inode,
+            }),
+            Err(error) => {
+                // Never let TempDir's pathname-recursive destructor run on an
+                // unverified name during constructor failure.
+                let _ = guard.keep();
+                Err(error)
+            }
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.guard
+            .as_ref()
+            .expect("held ephemeral directory is not used after preservation")
+            .path()
+    }
+
+    fn handle(&self) -> &std::fs::File {
+        &self.handle
+    }
+
+    fn remove_capability_relative_contents(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        remove_owned_directory_contents(self.handle.as_raw_fd())
+    }
+
+    fn visible_root_matches_held_identity(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fstatat initialized the structure on success.
+        let stat = unsafe { stat.assume_init() };
+        Ok(stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && stat.st_dev as u64 == self.device
+            && stat.st_ino as u64 == self.inode)
+    }
+
+    fn preserve(mut self) {
+        if let Some(guard) = self.guard.take() {
+            let _ = guard.keep();
+        }
+    }
+
+    fn cleanup_with_hook<F>(&mut self, after_identity_check: F) -> std::io::Result<()>
+    where
+        F: FnOnce(),
+    {
+        // Disarm TempDir's pathname-recursive destructor first. Potentially large
+        // contents are removed only through the retained root capability. The
+        // final pathname operation is a non-recursive rmdir relative to the held
+        // parent, so a post-check replacement can never trigger recursive deletion.
+        let Some(guard) = self.guard.take() else {
+            return Ok(());
+        };
+        let _ = guard.keep();
+        self.remove_capability_relative_contents()?;
+        if !self.visible_root_matches_held_identity()? {
+            return Err(std::io::Error::other(
+                "visible ephemeral root no longer identifies the retained capability",
+            ));
+        }
+        after_identity_check();
+        use std::os::fd::AsRawFd as _;
+        if unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HeldEphemeralDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup_with_hook(|| {}) {
+            eprintln!(
+                "tirith capsule: capability-relative ephemeral-directory cleanup failed; preserving residue: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn remove_owned_directory_contents(directory_fd: i32) -> std::io::Result<()> {
+    remove_owned_directory_contents_confined_with_hook(directory_fd, |_, _, _| {})
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owned_directory_contents_confined_with_hook<F>(
+    directory_fd: i32,
+    mut hook: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(i32, &std::ffi::CStr, bool) + Send + 'static,
+{
+    use std::os::fd::AsRawFd as _;
+
+    // Landlock applies to the calling thread.  Run the destructive walk in a
+    // dedicated worker so `..` can never escape the retained root after an
+    // attacker rename, without permanently restricting the CLI's main thread.
+    // The worker is iterative and owns only a constant number of descriptors.
+    let root = duplicate_cleanup_capability(directory_fd)?;
+    std::thread::Builder::new()
+        .name("tirith-cleanup".to_string())
+        .spawn(move || {
+            tirith_core::capsule::linux::restrict_cleanup_thread_to_directory(root.as_raw_fd())?;
+            remove_owned_directory_contents_with_hook(root.as_raw_fd(), &mut hook)
+        })
+        .map_err(|error| std::io::Error::other(format!("spawn cleanup worker: {error}")))?
+        .join()
+        .map_err(|_| std::io::Error::other("cleanup worker panicked"))?
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn preflight_owned_directory_cleanup(directory_fd: i32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let root = duplicate_cleanup_capability(directory_fd)?;
+    std::thread::Builder::new()
+        .name("tirith-cleanup-preflight".to_string())
+        .spawn(move || {
+            tirith_core::capsule::linux::restrict_cleanup_thread_to_directory(root.as_raw_fd())?;
+            let reopened = open_cleanup_directory(root.as_raw_fd())?;
+            let identity = cleanup_fd_identity(reopened.as_raw_fd())?;
+            if identity.file_type != libc::S_IFDIR {
+                return Err(std::io::Error::other(
+                    "cleanup confinement root is not a directory",
+                ));
+            }
+            match open_cleanup_parent(reopened.as_raw_fd()) {
+                Ok(_) => Err(std::io::Error::other(
+                    "cleanup confinement unexpectedly permits traversal above its root",
+                )),
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(std::io::Error::other(format!(
+                    "prove cleanup confinement denies traversal above its root: {error}"
+                ))),
+            }
+        })
+        .map_err(|error| std::io::Error::other(format!("spawn cleanup preflight: {error}")))?
+        .join()
+        .map_err(|_| std::io::Error::other("cleanup preflight panicked"))?
+}
+
+#[cfg(target_os = "linux")]
+struct CleanupDirectoryStream(*mut libc::DIR);
+
+#[cfg(target_os = "linux")]
+impl CleanupDirectoryStream {
+    fn open(directory_fd: i32) -> std::io::Result<Self> {
+        let independent = unsafe {
+            libc::openat(
+                directory_fd,
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if independent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(independent) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(independent);
+            }
+            return Err(error);
+        }
+        Ok(Self(stream))
+    }
+
+    fn next_entry(&mut self) -> std::io::Result<Option<CleanupObservedEntry>> {
+        loop {
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                let errno = unsafe { *libc::__errno_location() };
+                return if errno == 0 {
+                    Ok(None)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                };
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                let inode = unsafe { (*entry).d_ino as u64 };
+                if inode == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "cleanup directory entry lacks an inode identity",
+                    ));
+                }
+                return CleanupName::new(name).map(|name| {
+                    Some(CleanupObservedEntry {
+                        name,
+                        inode,
+                        file_type: cleanup_dirent_file_type(unsafe { (*entry).d_type }),
+                    })
+                });
+            }
+        }
+    }
+
+    fn position(&mut self) -> std::io::Result<libc::c_long> {
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let position = unsafe { libc::telldir(self.0) };
+        let errno = unsafe { *libc::__errno_location() };
+        if position == -1 && errno != 0 {
+            Err(std::io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(position)
+        }
+    }
+
+    /// Resume a Linux directory stream from a token returned by `telldir` for
+    /// the same retained directory identity. The token is only a performance
+    /// hint: every apparent EOF is followed by a complete stream from offset
+    /// zero, so a stale token cannot authorize deletion or hide residue.
+    fn seek(&mut self, position: libc::c_long) {
+        unsafe {
+            libc::seekdir(self.0, position);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CleanupDirectoryStream {
+    fn drop(&mut self) {
+        unsafe {
+            libc::closedir(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CleanupIdentity {
+    device: u64,
+    inode: u64,
+    file_type: libc::mode_t,
+    mount_id: u64,
+}
+
+#[cfg(target_os = "linux")]
+const CLEANUP_NAME_CAPACITY: usize = 256;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct CleanupName {
+    bytes: [u8; CLEANUP_NAME_CAPACITY],
+    len: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl CleanupName {
+    fn new(name: &std::ffi::CStr) -> std::io::Result<Self> {
+        let source = name.to_bytes();
+        if source.len() >= CLEANUP_NAME_CAPACITY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cleanup directory entry exceeds Linux NAME_MAX",
+            ));
+        }
+        let mut bytes = [0_u8; CLEANUP_NAME_CAPACITY];
+        bytes[..source.len()].copy_from_slice(source);
+        Ok(Self {
+            bytes,
+            len: source.len() as u16,
+        })
+    }
+
+    fn as_c_str(&self) -> &std::ffi::CStr {
+        let end = usize::from(self.len) + 1;
+        // SAFETY: new() copied bytes from a CStr and the zero-initialized slot
+        // immediately after them is the sole terminator in this slice.
+        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(&self.bytes[..end]) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct CleanupObservedEntry {
+    name: CleanupName,
+    inode: u64,
+    file_type: Option<libc::mode_t>,
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_dirent_file_type(entry_type: libc::c_uchar) -> Option<libc::mode_t> {
+    match entry_type {
+        libc::DT_BLK => Some(libc::S_IFBLK),
+        libc::DT_CHR => Some(libc::S_IFCHR),
+        libc::DT_DIR => Some(libc::S_IFDIR),
+        libc::DT_FIFO => Some(libc::S_IFIFO),
+        libc::DT_LNK => Some(libc::S_IFLNK),
+        libc::DT_REG => Some(libc::S_IFREG),
+        libc::DT_SOCK => Some(libc::S_IFSOCK),
+        libc::DT_UNKNOWN => None,
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct CleanupFrame {
+    child_name: CleanupName,
+    parent_identity: CleanupIdentity,
+    resume_position: libc::c_long,
+}
+
+/// Parent state is kept only for the active ancestry, with an explicit ceiling
+/// so a hostile descriptor-built tree cannot turn cleanup into an allocator/OOM
+/// attack. Directory streams themselves are never retained across descent.
+#[cfg(target_os = "linux")]
+const CLEANUP_MAX_DEPTH: usize = 16_384;
+
+#[cfg(target_os = "linux")]
+fn push_cleanup_frame(
+    frames: &mut Vec<CleanupFrame>,
+    child_name: CleanupName,
+    parent_identity: CleanupIdentity,
+    resume_position: libc::c_long,
+) -> std::io::Result<()> {
+    if frames.len() >= CLEANUP_MAX_DEPTH {
+        return Err(std::io::Error::other(format!(
+            "cleanup directory depth exceeds the {CLEANUP_MAX_DEPTH}-component resource limit"
+        )));
+    }
+    frames.try_reserve(1).map_err(|error| {
+        std::io::Error::other(format!("reserve cleanup ancestry frame: {error}"))
+    })?;
+    frames.push(CleanupFrame {
+        child_name,
+        parent_identity,
+        resume_position,
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owned_directory_contents_with_hook<F>(
+    directory_fd: i32,
+    hook: &mut F,
+) -> std::io::Result<()>
+where
+    F: FnMut(i32, &std::ffi::CStr, bool),
+{
+    use std::os::fd::AsRawFd as _;
+
+    if unsafe { libc::fchmod(directory_fd, 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let root_identity = cleanup_fd_identity(directory_fd)?;
+    let root = open_cleanup_directory(directory_fd)?;
+    let mut current = open_cleanup_directory(root.as_raw_fd())?;
+    let mut current_identity = root_identity;
+    let mut stream = CleanupDirectoryStream::open(current.as_raw_fd())?;
+    let mut resumed_from_hint = false;
+    let mut frames = Vec::<CleanupFrame>::new();
+
+    loop {
+        let observed_current = cleanup_fd_identity(current.as_raw_fd())?;
+        if observed_current != current_identity
+            || observed_current.file_type != libc::S_IFDIR
+            || observed_current.mount_id != root_identity.mount_id
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cleanup current directory no longer identifies its retained capability",
+            ));
+        }
+
+        let next_entry = match stream.next_entry() {
+            Ok(entry) => {
+                resumed_from_hint = false;
+                entry
+            }
+            Err(_) if resumed_from_hint => {
+                // A cookie invalidated by directory mutation is never fatal on
+                // its own. Retry once from zero; an error from the fresh stream
+                // is authoritative and is propagated.
+                stream = CleanupDirectoryStream::open(current.as_raw_fd())?;
+                resumed_from_hint = false;
+                stream.next_entry()?
+            }
+            Err(error) => return Err(error),
+        };
+        let observed = match next_entry {
+            Some(observed) => observed,
+            None => {
+                // Mutation while iterating a directory may invalidate or skip a
+                // cursor. Never trust apparent EOF: only a new stream from zero
+                // may prove the retained directory empty.
+                let mut complete = CleanupDirectoryStream::open(current.as_raw_fd())?;
+                match complete.next_entry()? {
+                    Some(observed) => {
+                        stream = complete;
+                        observed
+                    }
+                    None => {
+                        if current_identity == root_identity {
+                            if !frames.is_empty() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "cleanup traversal reached its root with unresolved ancestry",
+                                ));
+                            }
+                            return Ok(());
+                        }
+                        let frame = frames.last().copied().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "cleanup traversal lost its retained ancestry frame",
+                            )
+                        })?;
+                        let parent = open_cleanup_parent(current.as_raw_fd())?;
+                        let parent_identity = cleanup_fd_identity(parent.as_raw_fd())?;
+                        if parent_identity.file_type != libc::S_IFDIR
+                            || parent_identity.mount_id != root_identity.mount_id
+                            || parent_identity != frame.parent_identity
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "cleanup parent no longer identifies the retained traversal capability",
+                            ));
+                        }
+                        ensure_cleanup_name_identity(
+                            parent.as_raw_fd(),
+                            frame.child_name.as_c_str(),
+                            current_identity,
+                        )?;
+                        hook(parent.as_raw_fd(), frame.child_name.as_c_str(), true);
+                        ensure_cleanup_name_identity(
+                            parent.as_raw_fd(),
+                            frame.child_name.as_c_str(),
+                            current_identity,
+                        )?;
+                        if CleanupDirectoryStream::open(current.as_raw_fd())?
+                            .next_entry()?
+                            .is_some()
+                        {
+                            return Err(std::io::Error::other(
+                                "cleanup directory changed after its empty check",
+                            ));
+                        }
+                        unlink_cleanup_name(
+                            parent.as_raw_fd(),
+                            frame.child_name.as_c_str(),
+                            libc::AT_REMOVEDIR,
+                        )?;
+                        ensure_cleanup_directory_unlinked(current.as_raw_fd())?;
+                        let _ = frames
+                            .pop()
+                            .expect("validated cleanup frame must remain present");
+                        current = parent;
+                        current_identity = parent_identity;
+                        stream = CleanupDirectoryStream::open(current.as_raw_fd())?;
+                        stream.seek(frame.resume_position);
+                        resumed_from_hint = true;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let handle = open_cleanup_entry(current.as_raw_fd(), observed.name.as_c_str())?;
+        let identity = cleanup_fd_identity(handle.as_raw_fd())?;
+        if identity.inode != observed.inode
+            || observed
+                .file_type
+                .is_some_and(|file_type| file_type != identity.file_type)
+        {
+            return Err(std::io::Error::other(
+                "cleanup entry changed between directory observation and capability capture",
+            ));
+        }
+        if identity.mount_id != root_identity.mount_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cleanup refuses to cross a mount boundary",
+            ));
+        }
+        ensure_cleanup_name_identity(current.as_raw_fd(), observed.name.as_c_str(), identity)?;
+
+        if identity.file_type == libc::S_IFDIR {
+            let resume_position = stream.position()?;
+            // Reserve ancestry before chmod/open side effects. The parent stream
+            // is then dropped; only the opaque resume hint and exact identities
+            // cross the descent.
+            push_cleanup_frame(
+                &mut frames,
+                observed.name,
+                current_identity,
+                resume_position,
+            )?;
+            make_owned_directory_traversable(handle.as_raw_fd())?;
+            let child_directory = open_cleanup_directory(handle.as_raw_fd())?;
+            if cleanup_fd_identity(child_directory.as_raw_fd())? != identity {
+                return Err(std::io::Error::other(
+                    "cleanup child directory no longer identifies its captured capability",
+                ));
+            }
+            ensure_cleanup_name_identity(current.as_raw_fd(), observed.name.as_c_str(), identity)?;
+            current = child_directory;
+            current_identity = identity;
+            stream = CleanupDirectoryStream::open(current.as_raw_fd())?;
+            resumed_from_hint = false;
+            continue;
+        }
+
+        let previous_links = cleanup_fd_link_count(handle.as_raw_fd())?;
+        hook(current.as_raw_fd(), observed.name.as_c_str(), false);
+        ensure_cleanup_name_identity(current.as_raw_fd(), observed.name.as_c_str(), identity)?;
+        unlink_cleanup_name(current.as_raw_fd(), observed.name.as_c_str(), 0)?;
+        ensure_cleanup_link_decrement(handle.as_raw_fd(), previous_links)?;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn duplicate_cleanup_capability(fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returned a fresh owned descriptor.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_cleanup_entry(
+    parent_fd: i32,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh owned descriptor.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_cleanup_directory(directory_fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+
+    let fd = unsafe {
+        libc::openat(
+            directory_fd,
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh owned descriptor.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_cleanup_parent(directory_fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+
+    let fd = unsafe {
+        libc::openat(
+            directory_fd,
+            c"..".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh owned descriptor.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the structure on success.
+    let stat = unsafe { stat.assume_init() };
+    let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    if unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID,
+            statx.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: statx initialized the structure on success.
+    let statx = unsafe { statx.assume_init() };
+    let required = libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID;
+    if statx.stx_mask & required != required
+        || statx.stx_ino != stat.st_ino as u64
+        || (statx.stx_mode as libc::mode_t) & libc::S_IFMT != stat.st_mode & libc::S_IFMT
+    {
+        return Err(std::io::Error::other(
+            "cleanup descriptor identity lacks exact inode/type/mount evidence",
+        ));
+    }
+    Ok(CleanupIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        file_type: stat.st_mode & libc::S_IFMT,
+        mount_id: statx.stx_mnt_id,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_fd_link_count(fd: i32) -> std::io::Result<u64> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the structure on success.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.st_nlink as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_cleanup_link_decrement(fd: i32, previous: u64) -> std::io::Result<()> {
+    let expected = previous
+        .checked_sub(1)
+        .ok_or_else(|| std::io::Error::other("cleanup entry had no removable link"))?;
+    let observed = cleanup_fd_link_count(fd)?;
+    if observed != expected {
+        return Err(std::io::Error::other(format!(
+            "retained cleanup entry link count changed unexpectedly: expected {expected}, observed {observed}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_cleanup_name_identity(
+    parent_fd: i32,
+    name: &std::ffi::CStr,
+    expected: CleanupIdentity,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let observed = open_cleanup_entry(parent_fd, name)?;
+    if cleanup_fd_identity(observed.as_raw_fd())? != expected {
+        return Err(std::io::Error::other(
+            "cleanup entry name no longer identifies the retained child capability",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_cleanup_name(parent_fd: i32, name: &std::ffi::CStr, flags: i32) -> std::io::Result<()> {
+    if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), flags) } == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_cleanup_directory_unlinked(directory_fd: i32) -> std::io::Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(directory_fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the structure on success.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_nlink != 0 {
+        return Err(std::io::Error::other(
+            "retained cleanup directory was not unlinked from its parent",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn make_owned_directory_traversable(path_fd: i32) -> std::io::Result<()> {
+    // The proc magic-link names this already-open O_PATH descriptor's exact
+    // inode. It is used only to normalize mode, never as traversal or deletion
+    // authority. This works on supported pre-fchmodat2 kernels and avoids an
+    // architecture-specific raw syscall number.
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(
+        format!("/proc/self/fd/{path_fd}"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct HeldTempHome {
+    directory: HeldEphemeralDirectory,
+    child_capability: Option<BoundDirectoryFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldTempHome {
+    fn path(&self) -> &std::path::Path {
+        self.directory.path()
+    }
+
+    fn take_child_capability(&mut self) -> Result<BoundDirectoryFd, CapsuleRefused> {
+        self.child_capability.take().ok_or_else(|| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "temporary-HOME directory capability was already transferred".to_string(),
+        })
+    }
+
+    fn preserve(self) {
+        self.directory.preserve();
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 struct PreparedContainedCommand {
     command: Command,
+    #[cfg(target_os = "linux")]
+    temp_home: Option<HeldTempHome>,
+    #[cfg(not(target_os = "linux"))]
     temp_home: Option<tempfile::TempDir>,
     #[cfg(target_os = "linux")]
     owns_process_group: bool,
@@ -253,9 +1279,140 @@ impl std::ops::DerefMut for PreparedContainedCommand {
 /// its owned process group.
 pub struct ManagedChild {
     child: Child,
+    #[cfg(target_os = "linux")]
+    _temp_home: Option<HeldTempHome>,
+    #[cfg(not(target_os = "linux"))]
     _temp_home: Option<tempfile::TempDir>,
     #[cfg(target_os = "linux")]
     process_group: Option<u32>,
+    #[cfg(target_os = "linux")]
+    supervision: Option<ManagedSupervision>,
+}
+
+#[cfg(target_os = "linux")]
+struct ManagedSupervision {
+    active: Arc<AtomicBool>,
+    total_output: Arc<AtomicUsize>,
+    output_cap: usize,
+    termination: Arc<AtomicU8>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+    process_group: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ManagedOutputLimit {
+    active: Arc<AtomicBool>,
+    total_output: Arc<AtomicUsize>,
+    output_cap: usize,
+    termination: Arc<AtomicU8>,
+    process_group: u32,
+}
+
+/// A gateway child output pipe that enforces the capsule's single combined
+/// stdout+stderr byte budget while preserving ordinary `Read` semantics.
+pub struct ManagedChildOutput<R> {
+    inner: R,
+    #[cfg(target_os = "linux")]
+    limit: Option<ManagedOutputLimit>,
+}
+
+impl<R: std::io::Read> std::io::Read for ManagedChildOutput<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        #[cfg(target_os = "linux")]
+        if count != 0 {
+            if let Some(limit) = &self.limit {
+                if !reserve_combined_output(&limit.total_output, count, limit.output_cap) {
+                    if limit.active.load(Ordering::Acquire) {
+                        let _ = limit.termination.compare_exchange(
+                            0,
+                            2,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        let _ = signal_process_group(limit.process_group, libc::SIGKILL);
+                    }
+                    return Err(std::io::Error::other(format!(
+                        "contained child exceeded the {}-byte combined-output limit",
+                        limit.output_cap
+                    )));
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ManagedSupervision {
+    fn start(process_group: u32, limits: SupervisedLimits) -> std::io::Result<Self> {
+        let active = Arc::new(AtomicBool::new(true));
+        let termination = Arc::new(AtomicU8::new(0));
+        let watchdog_active = Arc::clone(&active);
+        let watchdog_termination = Arc::clone(&termination);
+        let timeout = limits.timeout;
+        let watchdog = std::thread::Builder::new()
+            .name("tirith-capsule-wall-watchdog".to_string())
+            .spawn(move || {
+                let deadline = Instant::now().checked_add(timeout);
+                loop {
+                    if !watchdog_active.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(deadline) = deadline else {
+                        let _ = watchdog_termination.compare_exchange(
+                            0,
+                            1,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        let _ = signal_process_group(process_group, libc::SIGKILL);
+                        return;
+                    };
+                    let now = Instant::now();
+                    if now >= deadline {
+                        if watchdog_active.load(Ordering::Acquire) {
+                            let _ = watchdog_termination.compare_exchange(
+                                0,
+                                1,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                            let _ = signal_process_group(process_group, libc::SIGKILL);
+                        }
+                        return;
+                    }
+                    std::thread::park_timeout(deadline - now);
+                }
+            })?;
+        Ok(Self {
+            active,
+            total_output: Arc::new(AtomicUsize::new(0)),
+            output_cap: limits.combined_output_bytes,
+            termination,
+            watchdog: Some(watchdog),
+            process_group,
+        })
+    }
+
+    fn output_limit(&self) -> ManagedOutputLimit {
+        ManagedOutputLimit {
+            active: Arc::clone(&self.active),
+            total_output: Arc::clone(&self.total_output),
+            output_cap: self.output_cap,
+            termination: Arc::clone(&self.termination),
+            process_group: self.process_group,
+        }
+    }
+
+    fn stop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.thread().unpark();
+            let _ = watchdog.join();
+        }
+    }
 }
 
 impl ManagedChild {
@@ -265,6 +1422,8 @@ impl ManagedChild {
             _temp_home: None,
             #[cfg(target_os = "linux")]
             process_group: None,
+            #[cfg(target_os = "linux")]
+            supervision: None,
         }
     }
 
@@ -276,12 +1435,26 @@ impl ManagedChild {
         self.child.stdin.take()
     }
 
-    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.stdout.take()
+    pub fn take_stdout(&mut self) -> Option<ManagedChildOutput<std::process::ChildStdout>> {
+        self.child.stdout.take().map(|inner| ManagedChildOutput {
+            inner,
+            #[cfg(target_os = "linux")]
+            limit: self
+                .supervision
+                .as_ref()
+                .map(ManagedSupervision::output_limit),
+        })
     }
 
-    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.stderr.take()
+    pub fn take_stderr(&mut self) -> Option<ManagedChildOutput<std::process::ChildStderr>> {
+        self.child.stderr.take().map(|inner| ManagedChildOutput {
+            inner,
+            #[cfg(target_os = "linux")]
+            limit: self
+                .supervision
+                .as_ref()
+                .map(ManagedSupervision::output_limit),
+        })
     }
 
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -316,6 +1489,9 @@ impl ManagedChild {
 
     #[cfg(target_os = "linux")]
     fn finish_owned_tree(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(supervision) = self.supervision.as_mut() {
+            supervision.stop();
+        }
         let process_group = self
             .process_group
             .expect("owned-tree finalization requires an active group");
@@ -330,7 +1506,9 @@ impl ManagedChild {
             // Never remove a filesystem root while membership is unconfirmed.
             // Leaking this private directory is safer than making it available
             // for reuse while a former capsule descendant may still hold it.
-            std::mem::forget(self._temp_home.take());
+            if let Some(home) = self._temp_home.take() {
+                home.preserve();
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "contained child reap or process-group disappearance was not confirmed",
@@ -343,6 +1521,10 @@ impl ManagedChild {
 impl Drop for ManagedChild {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
+        if let Some(supervision) = self.supervision.as_mut() {
+            supervision.stop();
+        }
+        #[cfg(target_os = "linux")]
         if let Some(process_group) = self.process_group {
             // No public API can reap the direct child without finalizing this
             // group first. Signal while that unreaped leader still reserves its
@@ -350,7 +1532,9 @@ impl Drop for ManagedChild {
             let signalled = signal_process_group(process_group, libc::SIGKILL).is_ok();
             let reaped = self.child.wait().is_ok();
             if !(signalled && reaped && wait_for_process_group_disappearance(process_group)) {
-                std::mem::forget(self._temp_home.take());
+                if let Some(home) = self._temp_home.take() {
+                    home.preserve();
+                }
             }
             self.process_group = None;
         }
@@ -428,6 +1612,8 @@ impl PreparedContainedCommand {
             _temp_home: self.temp_home,
             #[cfg(target_os = "linux")]
             process_group,
+            #[cfg(target_os = "linux")]
+            supervision: None,
         })
     }
 }
@@ -537,36 +1723,802 @@ fn shortfall_reason(backend_id: &str, sel: &SelectedBackend) -> String {
     )
 }
 
-/// Run `program` + `args` inside a capsule and wait for it, inheriting the
-/// parent's stdio. This is the run-to-completion shape used by `tirith run`,
-/// `temp-run --capsule`, and D4's package install.
-///
-/// On [`DegradedPolicy::FailClosed`] a degraded/NoOp backend returns
-/// `Err(CapsuleRefused)` BEFORE spawning anything (fail-closed). On
-/// [`DegradedPolicy::AllowDegraded`] a degraded backend still runs the program
-/// (uncontained or partially contained) and reports `degraded = true`.
-///
-/// `cwd` (when `Some`) is the child's working directory. `extra_env` is applied on
-/// top of the backend's environment handling (used by callers like the gateway to
-/// set `TIRITH_GATEWAY_DEPTH`); on a contained Unix backend the environment is
-/// otherwise scrubbed per the spec's [`tirith_core::capsule::EnvironmentPolicy`].
-pub fn run_to_completion(
+/// Run a contained child with its working directory bound to an already-open,
+/// caller-verified directory capability. This is a retained compatibility seam,
+/// not the production package installer: `pkg install` uses
+/// [`run_to_completion_bound_inputs`]. Linux inherits the directory fd into the
+/// trusted capsule launcher, Windows retains a no-delete-sharing directory handle,
+/// and macOS refuses because Seatbelt cannot bind a pathname grant to the held
+/// vnode. There is no degraded/uncontained fallback for this launch shape.
+#[allow(dead_code)]
+pub fn run_to_completion_bound_directory(
     spec: &CapsuleSpec,
     program: &str,
     args: &[String],
-    cwd: Option<&std::path::Path>,
+    directory_path: &std::path::Path,
+    directory_handle: std::fs::File,
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
-    let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
-    run_to_completion_os(
-        spec,
-        OsStr::new(program),
-        &args_os,
-        cwd,
-        extra_env,
-        degraded,
-    )
+    #[cfg(target_os = "linux")]
+    {
+        if degraded != DegradedPolicy::FailClosed {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "a capability-bound directory launch never permits degraded execution"
+                    .to_string(),
+            });
+        }
+        let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        return linux_run_to_completion_bound_directory_supervised(
+            spec,
+            OsStr::new(program),
+            &args_os,
+            directory_path,
+            directory_handle,
+            extra_env,
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let sel = select_backend(spec);
+        if !std::path::Path::new(program).is_absolute() {
+            return Err(CapsuleRefused {
+                backend_id: sel.backend_id,
+                reason: "a capability-bound working directory requires an absolute executable path"
+                    .to_string(),
+            });
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (args, directory_path, directory_handle, extra_env, degraded);
+            Err(CapsuleRefused {
+                backend_id: sel.backend_id,
+                reason: "capability-bound package installation is unavailable on macOS because Seatbelt cannot bind a filesystem grant to the held transaction vnode"
+                    .to_string(),
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            if sel.is_degraded() || degraded != DegradedPolicy::FailClosed {
+                return Err(CapsuleRefused {
+                    backend_id: sel.backend_id,
+                    reason: if sel.is_degraded() {
+                        shortfall_reason(sel.backend_id, &sel)
+                    } else {
+                        "a capability-bound directory launch never permits degraded execution"
+                            .to_string()
+                    },
+                });
+            }
+
+            let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+
+            #[cfg(target_os = "windows")]
+            {
+                // Keeping this handle alive is load-bearing: it was opened without delete
+                // sharing, so every absolute transaction path remains attached to the same
+                // directory identity until the contained process has exited.
+                let _directory_handle = directory_handle;
+                return run_to_completion_os(
+                    spec,
+                    OsStr::new(program),
+                    &args_os,
+                    Some(directory_path),
+                    extra_env,
+                    DegradedPolicy::FailClosed,
+                );
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = (directory_path, directory_handle, extra_env, args_os);
+                Err(CapsuleRefused {
+                    backend_id: sel.backend_id,
+                    reason: "capability-bound directory launch is unsupported on this platform"
+                        .to_string(),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run_to_completion_bound_directory_supervised(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    directory_path: &std::path::Path,
+    directory_handle: std::fs::File,
+    extra_env: &[(String, String)],
+) -> Result<CapsuleOutcome, CapsuleRefused> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !program.as_encoded_bytes().starts_with(b"/") {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "a capability-bound working directory requires an absolute executable path"
+                .to_string(),
+        });
+    }
+    reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
+    let canonical_root = directory_path
+        .canonicalize()
+        .map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!(
+                "canonicalize capability-bound directory {}: {error}",
+                directory_path.display()
+            ),
+        })?;
+    let path_metadata = std::fs::metadata(&canonical_root).map_err(|error| CapsuleRefused {
+        backend_id: "landlock-seccomp",
+        reason: format!(
+            "inspect capability-bound directory {}: {error}",
+            canonical_root.display()
+        ),
+    })?;
+    let handle_metadata = directory_handle
+        .metadata()
+        .map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("inspect capability-bound directory descriptor: {error}"),
+        })?;
+    if !path_metadata.is_dir()
+        || !handle_metadata.is_dir()
+        || path_metadata.dev() != handle_metadata.dev()
+        || path_metadata.ino() != handle_metadata.ino()
+    {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "capability-bound pathname does not identify the retained directory"
+                .to_string(),
+        });
+    }
+
+    let mut launch_spec = spec.clone();
+    let bound_directory =
+        reserve_bound_directory_fd(&launch_spec, directory_handle.as_raw_fd(), &canonical_root)?;
+    launch_spec
+        .handles
+        .extra_unix_fds
+        .push(bound_directory.inherited);
+    let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
+    let mut proof = LinuxLaunchProof::create(&mut launch_spec)?;
+    let plan = supervised_stdin_plan(&launch_spec, 0)?;
+    if plan
+        .backend_spec
+        .filesystem
+        .read_roots
+        .iter()
+        .filter(|root| *root == &canonical_root)
+        .count()
+        != 1
+    {
+        return Err(CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!(
+                "capability-bound directory {} must be one exact canonical read grant",
+                canonical_root.display()
+            ),
+        });
+    }
+    let mut command = linux_contained_command_os_with_options(
+        &plan.backend_spec,
+        program,
+        args,
+        None,
+        &plan.backend_selected,
+        None,
+        temp_home.as_mut(),
+        None,
+        None,
+        Some(proof.status_fd),
+        Some(proof.ack_fd),
+        Some(proof.coverage_fd),
+        proof.take_child_fds(),
+        Some(bound_directory),
+        None,
+    )?;
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let launch_started = Instant::now();
+    let mut child = command.spawn().map_err(|error| CapsuleRefused {
+        backend_id: plan.backend_selected.backend_id,
+        reason: format!("capability-bound capsule launch failed: {error}"),
+    })?;
+    drop(command);
+    let child_pid = child.id();
+    let Some(deadline) = launch_started.checked_add(plan.limits.timeout) else {
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        return Err(CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!(
+                "capsule wall deadline is outside the platform range; child-tree cleanup succeeded={cleanup}"
+            ),
+        });
+    };
+    let mut achieved = match proof.confirm_coverage(deadline) {
+        Ok(coverage) => coverage,
+        Err(reason) => {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+            });
+        }
+    };
+    if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        return Err(CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!(
+                "launcher reported achieved coverage below the canonical backend plan; child-tree cleanup succeeded={cleanup}"
+            ),
+        });
+    }
+    match proof.confirm_target_exec(deadline) {
+        Ok(()) => {}
+        Err(TargetExecConfirmationError::BeforeAck(reason)) => {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+            });
+        }
+        Err(TargetExecConfirmationError::AfterAck(reason)) => {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Ok(terminated_outcome(
+                plan.backend_selected.backend_id,
+                achieved,
+                post_ack_confirmation_termination(reason, cleanup),
+            ));
+        }
+    }
+    achieved.resource_limits_enforced = plan.effective_spec.resources.any_set();
+    let mut remaining = plan.limits;
+    remaining.timeout = deadline.saturating_duration_since(Instant::now());
+    if remaining.timeout.is_zero() {
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        return Ok(terminated_outcome(
+            plan.backend_selected.backend_id,
+            achieved,
+            CapsuleTermination {
+                kind: if cleanup {
+                    CapsuleTerminationKind::WallClock
+                } else {
+                    CapsuleTerminationKind::CleanupFailure
+                },
+                reason: format!(
+                    "bound target exhausted its wall budget after authenticated exec; child-tree cleanup succeeded={cleanup}"
+                ),
+                cleanup_confirmed: cleanup,
+            },
+        ));
+    }
+    match supervise_inherited_stdin_child(child, remaining, &mut temp_home) {
+        Ok(output) => Ok(forward_bounded_child_output(
+            CapsuleOutcome {
+                exit_code: output.status.code().unwrap_or(128),
+                backend_id: plan.backend_selected.backend_id,
+                coverage: achieved,
+                degraded: false,
+                termination: None,
+            },
+            &output.stdout,
+            &output.stderr,
+            BoundOutputPresentation::ForwardSanitized,
+        )),
+        Err(reason) => {
+            let termination = supervision_termination(reason);
+            eprintln!("tirith: {}", termination.reason);
+            Ok(terminated_outcome(
+                plan.backend_selected.backend_id,
+                achieved,
+                termination,
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_bound_target_policy(
+    spec: &CapsuleSpec,
+    target_policy_root: &std::path::Path,
+) -> Result<(tirith_core::capsule::FilesystemPolicy, std::path::PathBuf), CapsuleRefused> {
+    let normalize_one = |root: &std::path::Path, label: &str| {
+        tirith_core::capsule::canonicalize_and_validate_filesystem_policy(
+            &tirith_core::capsule::FilesystemPolicy {
+                read_roots: Vec::new(),
+                write_roots: vec![root.to_path_buf()],
+                deny_roots: Vec::new(),
+            },
+        )
+        .map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("normalize {label} {}: {error}", root.display()),
+        })
+        .map(|policy| {
+            policy
+                .write_roots
+                .into_iter()
+                .next()
+                .expect("one write root normalizes to one root")
+        })
+    };
+    let requested_target_policy =
+        normalize_one(target_policy_root, "approved package target policy root")?;
+    let mut incoming_matches = 0usize;
+    for root in &spec.filesystem.write_roots {
+        if normalize_one(root, "incoming package write root")? == requested_target_policy {
+            incoming_matches += 1;
+        }
+    }
+    if incoming_matches != 1 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!(
+                "approved package target policy root must appear exactly once before capability binding (found {incoming_matches})"
+            ),
+        });
+    }
+    let filesystem =
+        tirith_core::capsule::canonicalize_and_validate_filesystem_policy(&spec.filesystem)
+            .map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("normalize bound-input filesystem policy: {error}"),
+            })?;
+    Ok((filesystem, requested_target_policy))
+}
+
+/// Production `pkg install` seam: execute a content-bound program against immutable
+/// named inputs and one held writable target directory. x86_64 Linux constructs a
+/// private user+mount namespace in the hidden launcher, exposes only sealed
+/// bind-mounted input names, installs the target Landlock WRITE rule from the
+/// retained directory descriptor, and proves achieved coverage plus target exec
+/// before reporting execution. Other operating systems refuse explicitly;
+/// non-x86_64 Linux cannot provide the required deny-all seccomp coverage and
+/// therefore fails closed before the package interpreter starts.
+pub fn run_to_completion_bound_inputs(
+    spec: &CapsuleSpec,
+    program: &TrustedExecutable,
+    args: &[BoundLaunchArg],
+    inputs: Vec<BoundLaunchInput>,
+    target: BoundLaunchDirectory,
+    extra_env: &[(String, String)],
+    output_presentation: BoundOutputPresentation,
+) -> Result<CapsuleExecutionOutcome, CapsuleExecutionError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            spec,
+            program,
+            args,
+            inputs,
+            target,
+            extra_env,
+            output_presentation,
+        );
+        Err(CapsuleRefused {
+            backend_id: select_backend(spec).backend_id,
+            reason: "capability-bound sealed-input execution is supported only on Linux"
+                .to_string(),
+        }
+        .into())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+        reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
+        let bound_program = program.bind_content().map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("bind package executor to immutable content: {error}"),
+        })?;
+        bound_program
+            .verify_identity()
+            .map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("package executor changed before launch: {error}"),
+            })?;
+        let program_source = bound_program
+            .bound_launch_fd()
+            .ok_or_else(|| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "bound-input execution requires a sealed executor descriptor".to_string(),
+            })?;
+
+        let target_policy_root = target.policy_root;
+        if !target_policy_root.is_absolute() {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "package target policy root must be absolute: {}",
+                    target_policy_root.display()
+                ),
+            }
+            .into());
+        }
+        let target_visible_root =
+            target
+                .visible_path
+                .canonicalize()
+                .map_err(|error| CapsuleRefused {
+                    backend_id: "landlock-seccomp",
+                    reason: format!(
+                        "canonicalize package target {}: {error}",
+                        target.visible_path.display()
+                    ),
+                })?;
+        if target_visible_root != target.visible_path || !target_visible_root.is_absolute() {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "package target must be an absolute canonical path: {} -> {}",
+                    target.visible_path.display(),
+                    target_visible_root.display()
+                ),
+            }
+            .into());
+        }
+        let target_path_metadata =
+            std::fs::metadata(&target_visible_root).map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "inspect package target {}: {error}",
+                    target_visible_root.display()
+                ),
+            })?;
+        let target_handle_metadata = target.handle.metadata().map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("inspect held package target descriptor: {error}"),
+        })?;
+        if !target_path_metadata.is_dir()
+            || !target_handle_metadata.is_dir()
+            || target_path_metadata.dev() != target_handle_metadata.dev()
+            || target_path_metadata.ino() != target_handle_metadata.ino()
+        {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason:
+                    "package target pathname does not identify the retained directory capability"
+                        .to_string(),
+            }
+            .into());
+        }
+        let staging_base = std::path::Path::new("/tmp")
+            .canonicalize()
+            .map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("resolve fixed sealed-input staging root /tmp: {error}"),
+            })?;
+        let staging_base_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&staging_base)
+            .map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "open sealed-input cleanup preflight root {}: {error}",
+                    staging_base.display()
+                ),
+            })?;
+        preflight_owned_directory_cleanup(staging_base_handle.as_raw_fd()).map_err(|error| {
+            CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "prove capability-confined cleanup before creating sealed-input staging: {error}"
+                ),
+            }
+        })?;
+
+        validate_bound_launch_inputs(&inputs)?;
+        let input_names = inputs
+            .iter()
+            .map(|input| input.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut target_placeholders = 0usize;
+        let mut expanded_args = Vec::with_capacity(args.len());
+        for arg in args {
+            match arg {
+                BoundLaunchArg::Literal(value) => expanded_args.push(value.clone()),
+                BoundLaunchArg::InputName(name) => {
+                    if !input_names.contains(name) {
+                        return Err(CapsuleRefused {
+                            backend_id: "landlock-seccomp",
+                            reason: format!("argv references unknown sealed input {name:?}"),
+                        }
+                        .into());
+                    }
+                    expanded_args.push(OsString::from(name));
+                }
+                BoundLaunchArg::TargetDirectory => {
+                    target_placeholders += 1;
+                    // Filled after the target descriptor has a reserved child slot.
+                    expanded_args.push(OsString::new());
+                }
+            }
+        }
+        if target_placeholders != 1 {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "bound-input argv requires exactly one TargetDirectory placeholder (found {target_placeholders})"
+                ),
+            }
+            .into());
+        }
+
+        let staging = tempfile::Builder::new()
+            .prefix("tirith-bound-inputs-")
+            .tempdir_in(&staging_base)
+            .map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("create private sealed-input mountpoint: {error}"),
+            })?;
+        std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("secure private sealed-input mountpoint: {error}"),
+            },
+        )?;
+        let staging = HeldEphemeralDirectory::from_tempdir(
+            staging,
+            "landlock-seccomp",
+            "sealed-input staging",
+        )?;
+        let staging_root = staging
+            .path()
+            .canonicalize()
+            .map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("canonicalize private sealed-input mountpoint: {error}"),
+            })?;
+
+        let mut launch_spec = spec.clone();
+        let (filesystem, requested_target_policy) =
+            normalize_bound_target_policy(spec, &target_policy_root)?;
+        launch_spec.filesystem = filesystem;
+        launch_spec.filesystem.read_roots.push(staging_root.clone());
+        let bound_staging_directory =
+            reserve_bound_directory_fd(&launch_spec, staging.handle().as_raw_fd(), &staging_root)?;
+        launch_spec
+            .handles
+            .extra_unix_fds
+            .push(bound_staging_directory.inherited);
+        // Keep the approved final root as the logical policy/receipt identity,
+        // but install its Landlock rule from the descriptor that was verified
+        // against the private pending directory. The child receives the visible
+        // path only to attest the descriptor; it is never added as a path grant.
+        let bound_target_directory = reserve_bound_directory_fd(
+            &launch_spec,
+            target.handle.as_raw_fd(),
+            &requested_target_policy,
+        )?;
+        launch_spec
+            .handles
+            .extra_unix_fds
+            .push(bound_target_directory.inherited);
+        for (template, expanded) in args.iter().zip(&mut expanded_args) {
+            if matches!(template, BoundLaunchArg::TargetDirectory) {
+                *expanded = OsString::from(format!(
+                    "/proc/self/fd/{}",
+                    bound_target_directory.inherited
+                ));
+            }
+        }
+
+        let mut bound_inputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let sealed = seal_bound_launch_input(input)?;
+            let descriptor = reserve_bound_target_fd(&launch_spec, sealed.0.as_raw_fd())?;
+            launch_spec
+                .handles
+                .extra_unix_fds
+                .push(descriptor.inherited);
+            bound_inputs.push(BoundInputFd {
+                name: sealed.1,
+                descriptor,
+            });
+        }
+        let bound_executor = reserve_bound_target_fd(&launch_spec, program_source)?;
+        launch_spec
+            .handles
+            .extra_unix_fds
+            .push(bound_executor.inherited);
+        let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
+        let mut proof = LinuxLaunchProof::create(&mut launch_spec)?;
+        let plan = supervised_stdin_plan(&launch_spec, 0)?;
+        let mut command = linux_contained_command_os_with_options(
+            &plan.backend_spec,
+            bound_program.launch_path().as_os_str(),
+            &expanded_args,
+            None,
+            &plan.backend_selected,
+            Some(bound_program.invocation_path().as_os_str()),
+            temp_home.as_mut(),
+            Some(bound_executor),
+            None,
+            Some(proof.status_fd),
+            Some(proof.ack_fd),
+            Some(proof.coverage_fd),
+            proof.take_child_fds(),
+            None,
+            Some(BoundInputLaunch {
+                staging: bound_staging_directory,
+                inputs: bound_inputs,
+                target: bound_target_directory,
+                target_visible_root,
+            }),
+        )?;
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        bound_program
+            .verify_identity()
+            .map_err(|error| CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!("package executor changed before capsule spawn: {error}"),
+            })?;
+
+        let launch_started = Instant::now();
+        let mut child = command.spawn().map_err(|error| CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!("capability-bound capsule launch failed: {error}"),
+        })?;
+        drop(command);
+        let child_pid = child.id();
+        let Some(deadline) = launch_started.checked_add(plan.limits.timeout) else {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            if !cleanup {
+                staging.preserve();
+            }
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!(
+                    "capsule wall deadline is outside the platform range; child-tree cleanup succeeded={cleanup}"
+                ),
+            }
+            .into());
+        };
+        let mut achieved = match proof.confirm_coverage(deadline) {
+            Ok(coverage) => coverage,
+            Err(reason) => {
+                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+                if !cleanup {
+                    staging.preserve();
+                }
+                return Err(CapsuleRefused {
+                    backend_id: plan.backend_selected.backend_id,
+                    reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+                }
+                .into());
+            }
+        };
+        if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            if !cleanup {
+                staging.preserve();
+            }
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!(
+                    "launcher reported achieved coverage below the canonical backend plan; child-tree cleanup succeeded={cleanup}"
+                ),
+            }
+            .into());
+        }
+        match proof.confirm_target_exec(deadline) {
+            Ok(()) => {}
+            Err(TargetExecConfirmationError::BeforeAck(reason)) => {
+                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+                if !cleanup {
+                    staging.preserve();
+                }
+                return Err(CapsuleRefused {
+                    backend_id: plan.backend_selected.backend_id,
+                    reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+                }
+                .into());
+            }
+            Err(TargetExecConfirmationError::AfterAck(reason)) => {
+                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+                if !cleanup {
+                    staging.preserve();
+                }
+                return Err(CapsuleExecutionError::ExecutedTerminated {
+                    backend_id: plan.backend_selected.backend_id,
+                    termination: post_ack_confirmation_termination(reason, cleanup),
+                });
+            }
+        }
+        achieved.resource_limits_enforced = plan.effective_spec.resources.any_set();
+        let mut remaining = plan.limits;
+        remaining.timeout = deadline.saturating_duration_since(Instant::now());
+        if remaining.timeout.is_zero() {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            if !cleanup {
+                staging.preserve();
+            }
+            let termination = CapsuleTermination {
+                kind: if cleanup {
+                    CapsuleTerminationKind::WallClock
+                } else {
+                    CapsuleTerminationKind::CleanupFailure
+                },
+                reason: format!(
+                    "bound target exhausted the wall budget after authenticated exec; child-tree cleanup succeeded={cleanup}"
+                ),
+                cleanup_confirmed: cleanup,
+            };
+            return if cleanup {
+                Ok(terminated_outcome(
+                    plan.backend_selected.backend_id,
+                    achieved,
+                    termination,
+                ))
+            } else {
+                Err(CapsuleExecutionError::ExecutedTerminated {
+                    backend_id: plan.backend_selected.backend_id,
+                    termination,
+                })
+            };
+        }
+        match supervise_inherited_stdin_child(child, remaining, &mut temp_home) {
+            Ok(output) => Ok(forward_bounded_child_output(
+                CapsuleOutcome {
+                    exit_code: output.status.code().unwrap_or(128),
+                    backend_id: plan.backend_selected.backend_id,
+                    coverage: achieved,
+                    degraded: false,
+                    termination: None,
+                },
+                &output.stdout,
+                &output.stderr,
+                output_presentation,
+            )),
+            Err(reason) => {
+                let termination = supervision_termination(reason);
+                if !termination.cleanup_confirmed {
+                    staging.preserve();
+                    Err(CapsuleExecutionError::ExecutedTerminated {
+                        backend_id: plan.backend_selected.backend_id,
+                        termination,
+                    })
+                } else {
+                    eprintln!("tirith: {}", termination.reason);
+                    Ok(terminated_outcome(
+                        plan.backend_selected.backend_id,
+                        achieved,
+                        termination,
+                    ))
+                }
+            }
+        }
+    }
 }
 
 /// Run a contained process with exact caller-supplied bytes on stdin while
@@ -574,12 +2526,17 @@ pub fn run_to_completion(
 /// surface accepts only an already-validated absolute executable and has no
 /// degraded mode: any containment or supervision shortfall refuses before the
 /// target is launched.
+// Keep every authorization and containment input explicit at this security
+// boundary so call sites cannot accidentally conflate script, cwd, or env state.
+#[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 pub fn run_to_completion_with_stdin(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
     target_argv0: tirith_core::runner::PipeInterpreter,
     args: &[String],
     input: &[u8],
+    authorizer: &mut tirith_core::runner::ExecutionAuthorizer,
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
@@ -589,6 +2546,7 @@ pub fn run_to_completion_with_stdin(
         target_argv0,
         args,
         input,
+        Some(authorizer),
         cwd,
         extra_env,
     )?;
@@ -598,12 +2556,17 @@ pub fn run_to_completion_with_stdin(
 /// Execute file-mode script bytes only through their fully sealed anonymous
 /// descriptor. The interpreter is likewise content-bound; neither executable
 /// input is reopened through an attacker-replaceable pathname.
+// Keep every authorization and containment input explicit at this security
+// boundary so call sites cannot accidentally conflate script, cwd, or env state.
+#[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 pub fn run_to_completion_with_reviewed_file(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
     target_argv0: &OsStr,
     args: &[String],
     reviewed_script: tirith_core::runner::ReviewedScript<'_>,
+    authorizer: &mut tirith_core::runner::ExecutionAuthorizer,
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
@@ -613,30 +2576,30 @@ pub fn run_to_completion_with_reviewed_file(
         target_argv0,
         args,
         reviewed_script,
+        Some(authorizer),
         cwd,
         extra_env,
     )?;
     forward_captured_outcome(captured)
 }
 
+#[cfg(unix)]
 fn forward_captured_outcome(
-    captured: CapturedCapsuleOutcome,
+    mut captured: CapturedCapsuleOutcome,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     let forwardable = sanitize_and_analyze_captured_output(&captured.stdout, &captured.stderr);
-    std::io::stdout()
+    let presentation = std::io::stdout()
         .lock()
         .write_all(&forwardable.stdout)
-        .map_err(|error| CapsuleRefused {
-            backend_id: captured.outcome.backend_id,
-            reason: format!("forward contained child stdout: {error}"),
-        })?;
-    std::io::stderr()
-        .lock()
-        .write_all(&forwardable.stderr)
-        .map_err(|error| CapsuleRefused {
-            backend_id: captured.outcome.backend_id,
-            reason: format!("forward contained child stderr: {error}"),
-        })?;
+        .and_then(|()| std::io::stderr().lock().write_all(&forwardable.stderr));
+    if let Err(error) = presentation {
+        captured.outcome.exit_code = 125;
+        captured.outcome.termination = Some(CapsuleTermination {
+            kind: CapsuleTerminationKind::Presentation,
+            reason: format!("forward contained child output: {error}"),
+            cleanup_confirmed: true,
+        });
+    }
     Ok(apply_captured_output_action(
         captured.outcome,
         forwardable.blocked,
@@ -666,43 +2629,80 @@ struct BoundTargetFd {
     _blockers: Vec<std::os::fd::OwnedFd>,
 }
 
+/// A duplicate of a caller-verified directory capability reserved below the
+/// capsule's RLIMIT_NOFILE ceiling. The trusted Unix launcher inherits it,
+/// enters it with `fchdir`, rebases the matching filesystem grant to that exact
+/// identity, then arms close-on-exec before the target starts.
+#[derive(Debug)]
 #[cfg(target_os = "linux")]
-struct TargetLaunchStatusPipe {
+struct BoundDirectoryFd {
+    inherited: i32,
+    original_root: std::path::PathBuf,
+    _reservation: std::os::fd::OwnedFd,
+    _blockers: Vec<std::os::fd::OwnedFd>,
+}
+
+#[derive(Debug)]
+#[cfg(target_os = "linux")]
+struct BoundInputFd {
+    name: String,
+    descriptor: BoundTargetFd,
+}
+
+#[derive(Debug)]
+#[cfg(target_os = "linux")]
+struct BoundInputLaunch {
+    staging: BoundDirectoryFd,
+    inputs: Vec<BoundInputFd>,
+    target: BoundDirectoryFd,
+    target_visible_root: std::path::PathBuf,
+}
+
+/// Parent-owned proof channels for one Linux launcher. The child endpoint files
+/// are moved into the `Command` pre-exec closure, while the parent endpoints stay
+/// here until they have observed both applied coverage and terminal target-exec
+/// proof. No selected/preflight coverage is reported as achieved without this.
+#[derive(Debug)]
+#[cfg(target_os = "linux")]
+struct LinuxLaunchProof {
     status_reader: std::fs::File,
-    status_writer: std::fs::File,
-    ack_guard: std::fs::File,
     ack_parent: Option<std::fs::File>,
+    coverage_reader: std::fs::File,
+    status_fd: i32,
+    ack_fd: i32,
+    coverage_fd: i32,
+    child_fds: Option<Vec<BoundTargetFd>>,
+}
+
+/// The target-exec protocol has one irreversible boundary: once the parent has
+/// successfully written `TARGET_ACK_RESUME`, the traced target may run before
+/// the launcher can publish its terminal `TARGET_LAUNCH_RESUMED` status. Keep
+/// that phase in the type so an EOF or malformed status after ACK can never be
+/// reported to a caller as a pre-exec refusal.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetExecConfirmationError {
+    BeforeAck(String),
+    AfterAck(String),
 }
 
 #[cfg(target_os = "linux")]
-impl TargetLaunchStatusPipe {
+impl LinuxLaunchProof {
     fn create(spec: &mut CapsuleSpec) -> Result<Self, CapsuleRefused> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
-        let mut status_descriptors = [0i32; 2];
-        if unsafe { libc::pipe2(status_descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!(
-                    "create target-exec status channel: {}",
-                    std::io::Error::last_os_error()
-                ),
-            });
-        }
-        // SAFETY: pipe2 returned two uniquely owned descriptors.
-        let status_reader = unsafe { std::fs::File::from_raw_fd(status_descriptors[0]) };
-        let status_writer = unsafe { std::fs::File::from_raw_fd(status_descriptors[1]) };
+        let (status_reader, status_writer) = create_cloexec_pipe("target-exec status")?;
+        let status = reserve_bound_target_fd(spec, status_writer.as_raw_fd())?;
+        drop(status_writer);
+        spec.handles.extra_unix_fds.push(status.inherited);
 
-        // A socketpair lets the outer parent send ACK_RESUME with MSG_NOSIGNAL.
-        // Tirith restores SIGPIPE=SIG_DFL, so a plain pipe write after a guard
-        // failure could otherwise terminate the trusted supervisor.
-        let mut ack_descriptors = [0i32; 2];
+        let mut ack_fds = [0i32; 2];
         if unsafe {
             libc::socketpair(
                 libc::AF_UNIX,
                 libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
                 0,
-                ack_descriptors.as_mut_ptr(),
+                ack_fds.as_mut_ptr(),
             )
         } != 0
         {
@@ -714,218 +2714,241 @@ impl TargetLaunchStatusPipe {
                 ),
             });
         }
-        // SAFETY: socketpair returned two uniquely owned descriptors.
-        let ack_guard = unsafe { std::fs::File::from_raw_fd(ack_descriptors[0]) };
-        let ack_parent = unsafe { std::fs::File::from_raw_fd(ack_descriptors[1]) };
+        // SAFETY: socketpair returned two fresh owned descriptors.
+        let ack_guard = unsafe { std::fs::File::from_raw_fd(ack_fds[0]) };
+        let ack_parent = unsafe { std::fs::File::from_raw_fd(ack_fds[1]) };
+        let ack = reserve_bound_target_fd(spec, ack_guard.as_raw_fd())?;
+        drop(ack_guard);
+        spec.handles.extra_unix_fds.push(ack.inherited);
 
-        let status_writer_fd = status_writer.as_raw_fd();
-        let ack_guard_fd = ack_guard.as_raw_fd();
-        let limit = spec.resources.max_open_files.unwrap_or(256).min(256) as i32;
-        if status_writer_fd < 3
-            || status_writer_fd >= limit
-            || ack_guard_fd < 3
-            || ack_guard_fd >= limit
-            || status_writer_fd == ack_guard_fd
-        {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: "target-exec status/authorization descriptors are not distinct non-stdio descriptors within the capsule fd limit"
-                    .to_string(),
-            });
-        }
-        spec.handles.extra_unix_fds.push(status_writer_fd);
-        spec.handles.extra_unix_fds.push(ack_guard_fd);
+        let (coverage_reader, coverage_writer) = create_cloexec_pipe("achieved coverage")?;
+        let coverage = reserve_bound_target_fd(spec, coverage_writer.as_raw_fd())?;
+        drop(coverage_writer);
+        spec.handles.extra_unix_fds.push(coverage.inherited);
+
         Ok(Self {
             status_reader,
-            status_writer,
-            ack_guard,
             ack_parent: Some(ack_parent),
+            coverage_reader,
+            status_fd: status.inherited,
+            ack_fd: ack.inherited,
+            coverage_fd: coverage.inherited,
+            child_fds: Some(vec![status, ack, coverage]),
         })
     }
 
-    fn status_writer_fd(&self) -> i32 {
-        use std::os::fd::AsRawFd as _;
-        self.status_writer.as_raw_fd()
+    fn take_child_fds(&mut self) -> Vec<BoundTargetFd> {
+        self.child_fds
+            .take()
+            .expect("Linux launch proof child descriptors are moved exactly once")
     }
 
-    fn ack_guard_fd(&self) -> i32 {
-        use std::os::fd::AsRawFd as _;
-        self.ack_guard.as_raw_fd()
+    fn confirm_coverage(&mut self, deadline: Instant) -> Result<CapsuleCoverage, String> {
+        read_achieved_coverage_until(&mut self.coverage_reader, deadline)
     }
 
-    fn wait_for_target_exec(self, timeout: Duration) -> Result<(), String> {
-        self.wait_for_target_exec_with_authorizer(timeout, || Ok(()))
-    }
-
-    /// Wait under one monotonic deadline while the tracee remains stopped at
-    /// PTRACE_EVENT_EXEC, invoke the parent-owned authorization seam, ACK once,
-    /// and accept only the terminal RESUMED+EOF sequence. A future durable
-    /// execution-event commit can be placed in `authorize` without moving the
-    /// untrusted target's resume boundary.
-    fn wait_for_target_exec_with_authorizer(
-        mut self,
-        timeout: Duration,
-        authorize: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
+    fn confirm_target_exec(mut self, deadline: Instant) -> Result<(), TargetExecConfirmationError> {
         use std::os::fd::AsRawFd as _;
-
-        drop(self.status_writer);
-        drop(self.ack_guard);
-        let Some(deadline) = Instant::now().checked_add(timeout) else {
-            return Err("target-exec confirmation deadline is outside the platform range".into());
+        use tirith_core::runner::{
+            TARGET_ACK_RESUME, TARGET_EXEC_OBSERVED, TARGET_LAUNCH_ERROR, TARGET_LAUNCH_RESUMED,
         };
-        let mut authorize = Some(authorize);
-        let mut observed = false;
-        let mut resumed = false;
-        let mut status = [0u8; 1];
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(
-                    "contained target did not cross exec before the launch deadline".into(),
-                );
+
+        match read_protocol_byte_until(&mut self.status_reader, deadline, "target-exec observation")
+            .map_err(TargetExecConfirmationError::BeforeAck)?
+        {
+            Some(TARGET_EXEC_OBSERVED) => {}
+            Some(TARGET_LAUNCH_ERROR) => {
+                return Err(TargetExecConfirmationError::BeforeAck(
+                    "contained target reported an exec failure".to_string(),
+                ))
             }
-            let remaining = deadline - now;
-            let timeout_ms = remaining
-                .as_millis()
-                .saturating_add(1)
-                .min(i32::MAX as u128) as i32;
-            let mut descriptor = libc::pollfd {
-                fd: self.status_reader.as_raw_fd(),
-                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                revents: 0,
-            };
-            let polled = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-            if polled < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(format!("poll target-exec status channel: {error}"));
+            Some(other) => {
+                return Err(TargetExecConfirmationError::BeforeAck(format!(
+                    "contained target reported invalid pre-authorization status {other}"
+                )))
             }
-            if polled == 0 {
-                return Err(
-                    "contained target did not cross exec before the launch deadline".into(),
-                );
+            None => {
+                return Err(TargetExecConfirmationError::BeforeAck(
+                    "contained launcher exited before target-exec observation".to_string(),
+                ))
             }
-            if Instant::now() >= deadline {
-                return Err(
-                    "contained target did not complete authorization before the launch deadline"
-                        .into(),
-                );
+        }
+        let ack = self.ack_parent.take().ok_or_else(|| {
+            TargetExecConfirmationError::BeforeAck(
+                "target-exec authorization endpoint was already consumed".to_string(),
+            )
+        })?;
+        send_launch_ack_until(ack.as_raw_fd(), deadline, TARGET_ACK_RESUME)
+            .map_err(TargetExecConfirmationError::BeforeAck)?;
+        drop(ack);
+        match read_protocol_byte_until(&mut self.status_reader, deadline, "target-exec resume")
+            .map_err(TargetExecConfirmationError::AfterAck)?
+        {
+            Some(TARGET_LAUNCH_RESUMED) => {}
+            Some(TARGET_LAUNCH_ERROR) => {
+                return Err(TargetExecConfirmationError::AfterAck(
+                    "contained target failed after authorization ACK".to_string(),
+                ))
             }
-            match self.status_reader.read(&mut status) {
-                Ok(0) if resumed => return Ok(()),
-                Ok(0) => {
-                    return Err(
-                        "contained launcher exited before completing target-exec authorization"
-                            .to_string(),
-                    )
-                }
-                Ok(count) => {
-                    for byte in &status[..count] {
-                        match *byte {
-                            crate::cli::capsule_child::TARGET_EXEC_OBSERVED if !observed => {
-                                // OBSERVED must be causally before ACK. A queued
-                                // RESUMED byte proves the guard advanced before
-                                // authorization, even if byte-at-a-time reads
-                                // would otherwise make the sequence look valid.
-                                ensure_no_status_is_queued(self.status_reader.as_raw_fd())?;
-                                authorize
-                                    .take()
-                                    .expect("target-exec authorizer is one-shot")(
-                                )?;
-                                if Instant::now() >= deadline {
-                                    return Err(
-                                        "target-exec authorization exceeded the launch deadline"
-                                            .to_string(),
-                                    );
-                                }
-                                ensure_no_status_is_queued(self.status_reader.as_raw_fd())?;
-                                let ack = [crate::cli::capsule_child::TARGET_ACK_RESUME];
-                                let ack_parent = self.ack_parent.take().ok_or_else(|| {
-                                    "target-exec authorization channel was already consumed"
-                                        .to_string()
-                                })?;
-                                let sent = unsafe {
-                                    libc::send(
-                                        ack_parent.as_raw_fd(),
-                                        ack.as_ptr().cast::<libc::c_void>(),
-                                        ack.len(),
-                                        libc::MSG_NOSIGNAL,
-                                    )
-                                };
-                                if sent != 1 {
-                                    let error = std::io::Error::last_os_error();
-                                    return Err(format!(
-                                        "authorize stopped target resume without SIGPIPE: {error}"
-                                    ));
-                                }
-                                drop(ack_parent);
-                                observed = true;
-                            }
-                            crate::cli::capsule_child::TARGET_LAUNCH_ERROR => {
-                                return Err("contained target reported an exec failure".to_string())
-                            }
-                            crate::cli::capsule_child::TARGET_EXEC_OBSERVED => {
-                                return Err("contained target reported duplicate exec observation"
-                                    .to_string());
-                            }
-                            crate::cli::capsule_child::TARGET_LAUNCH_RESUMED
-                                if observed && !resumed =>
-                            {
-                                resumed = true;
-                            }
-                            crate::cli::capsule_child::TARGET_LAUNCH_RESUMED => {
-                                return Err(
-                                    "contained target reported out-of-order or duplicate resume"
-                                        .to_string(),
-                                );
-                            }
-                            _ => {
-                                return Err(
-                                    "contained target reported an invalid exec status".to_string()
-                                )
-                            }
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(format!("read target-exec status channel: {error}")),
+            Some(other) => {
+                return Err(TargetExecConfirmationError::AfterAck(format!(
+                    "contained target reported invalid post-authorization status {other}"
+                )))
             }
+            None => {
+                return Err(TargetExecConfirmationError::AfterAck(
+                    "contained launcher exited before target resume proof".to_string(),
+                ))
+            }
+        }
+        if read_protocol_byte_until(&mut self.status_reader, deadline, "target-exec EOF")
+            .map_err(TargetExecConfirmationError::AfterAck)?
+            .is_some()
+        {
+            return Err(TargetExecConfirmationError::AfterAck(
+                "contained launcher appended data after target resume proof".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_achieved_coverage_until(
+    reader: &mut std::fs::File,
+    deadline: Instant,
+) -> Result<CapsuleCoverage, String> {
+    let version = read_protocol_byte_until(reader, deadline, "achieved-coverage version")?
+        .ok_or_else(|| "capsule launcher exited before reporting achieved coverage".to_string())?;
+    if version != crate::cli::capsule_child::ACHIEVED_COVERAGE_VERSION {
+        return Err(format!(
+            "capsule launcher reported unsupported achieved-coverage version {version}"
+        ));
+    }
+    let flags = read_protocol_byte_until(reader, deadline, "achieved-coverage flags")?
+        .ok_or_else(|| "capsule launcher truncated its achieved-coverage record".to_string())?;
+    if read_protocol_byte_until(reader, deadline, "achieved-coverage terminator")?.is_some() {
+        return Err("capsule launcher appended data to its achieved-coverage record".to_string());
+    }
+    Ok(CapsuleCoverage {
+        fs_read_enforced: flags & (1 << 0) != 0,
+        fs_write_enforced: flags & (1 << 1) != 0,
+        exec_limited: flags & (1 << 2) != 0,
+        network_raw_denied: flags & (1 << 3) != 0,
+        domain_proxy_enforced: flags & (1 << 4) != 0,
+        resource_limits_enforced: flags & (1 << 5) != 0,
+        env_isolated: flags & (1 << 6) != 0,
+        handles_isolated: flags & (1 << 7) != 0,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn create_cloexec_pipe(label: &str) -> Result<(std::fs::File, std::fs::File), CapsuleRefused> {
+    use std::os::fd::FromRawFd as _;
+    let mut descriptors = [0i32; 2];
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!(
+                "create {label} channel: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    // SAFETY: pipe2 returned two fresh owned descriptors.
+    Ok(unsafe {
+        (
+            std::fs::File::from_raw_fd(descriptors[0]),
+            std::fs::File::from_raw_fd(descriptors[1]),
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn create_coverage_proof(
+    spec: &mut CapsuleSpec,
+) -> Result<(std::fs::File, i32, BoundTargetFd), CapsuleRefused> {
+    use std::os::fd::AsRawFd as _;
+    let (reader, writer) = create_cloexec_pipe("achieved coverage")?;
+    let child = reserve_bound_target_fd(spec, writer.as_raw_fd())?;
+    drop(writer);
+    let inherited = child.inherited;
+    spec.handles.extra_unix_fds.push(inherited);
+    Ok((reader, inherited, child))
+}
+
+#[cfg(target_os = "linux")]
+fn read_protocol_byte_until(
+    file: &mut std::fs::File,
+    deadline: Instant,
+    label: &str,
+) -> Result<Option<u8>, String> {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!("{label} exceeded the launch deadline"));
+        }
+        let timeout_ms = (deadline - now)
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if polled < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("poll {label}: {error}"));
+        }
+        if polled == 0 {
+            return Err(format!("{label} exceeded the launch deadline"));
+        }
+        let mut byte = [0u8; 1];
+        match file.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(1) => return Ok(Some(byte[0])),
+            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("read {label}: {error}")),
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_no_status_is_queued(fd: i32) -> Result<(), String> {
-    let mut queued = 0i32;
-    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } < 0 {
-        return Err(format!(
-            "inspect target-exec status ordering: {}",
-            std::io::Error::last_os_error()
-        ));
+fn send_launch_ack_until(fd: i32, deadline: Instant, byte: u8) -> Result<(), String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err("target-exec ACK exceeded the launch deadline".to_string());
+        }
+        let sent = unsafe {
+            libc::send(
+                fd,
+                (&byte as *const u8).cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent == 1 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if sent < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(format!("authorize stopped target resume: {error}"));
     }
-    if queued != 0 {
-        return Err(
-            "contained target advanced its exec status before parent authorization".to_string(),
-        );
-    }
-    Ok(())
 }
 
-#[derive(Debug)]
-struct SupervisedPlan {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    backend_spec: CapsuleSpec,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    backend_selected: SelectedBackend,
-    reported_selected: SelectedBackend,
-    #[cfg(target_os = "linux")]
-    limits: SupervisedLimits,
-}
+type SupervisedPlan = PreparedCapsulePlan;
 
 #[derive(Debug)]
+#[cfg(unix)]
 struct CapturedCapsuleOutcome {
     outcome: CapsuleOutcome,
     stdout: Vec<u8>,
@@ -1012,6 +3035,11 @@ fn sanitize_and_analyze_captured_output(stdout: &[u8], stderr: &[u8]) -> Forward
 fn apply_captured_output_action(mut outcome: CapsuleOutcome, blocked: bool) -> CapsuleOutcome {
     if blocked {
         outcome.exit_code = tirith_core::verdict::Action::Block.exit_code();
+        outcome.termination = Some(CapsuleTermination {
+            kind: CapsuleTerminationKind::OutputPolicy,
+            reason: "contained child output was withheld by output policy".to_string(),
+            cleanup_confirmed: true,
+        });
     }
     outcome
 }
@@ -1094,7 +3122,15 @@ fn supervised_stdin_plan(
         });
     }
 
-    let output_u64 = spec
+    let mut effective_spec = spec.clone();
+    effective_spec.filesystem =
+        tirith_core::capsule::canonicalize_and_validate_filesystem_policy(&spec.filesystem)
+            .map_err(|error| CapsuleRefused {
+                backend_id,
+                reason: format!("invalid capsule filesystem policy: {error}"),
+            })?;
+
+    let output_u64 = effective_spec
         .resources
         .max_output_bytes
         .filter(|limit| *limit > 0)
@@ -1107,7 +3143,7 @@ fn supervised_stdin_plan(
         backend_id,
         reason: format!("combined-output limit {output_u64} does not fit this platform"),
     })?;
-    let wall_seconds = spec
+    let wall_seconds = effective_spec
         .resources
         .wall_clock_seconds
         .filter(|limit| *limit > 0)
@@ -1118,24 +3154,24 @@ fn supervised_stdin_plan(
     #[cfg(not(target_os = "linux"))]
     let _ = (combined_output_bytes, wall_seconds);
 
-    let mut backend_spec = spec.clone();
+    let mut backend_spec = effective_spec.clone();
     backend_spec.resources.max_output_bytes = None;
     backend_spec.resources.wall_clock_seconds = None;
     debug_assert_eq!(
         backend_spec.resources.cpu_seconds,
-        spec.resources.cpu_seconds
+        effective_spec.resources.cpu_seconds
     );
     debug_assert_eq!(
         backend_spec.resources.memory_bytes,
-        spec.resources.memory_bytes
+        effective_spec.resources.memory_bytes
     );
     debug_assert_eq!(
         backend_spec.resources.max_processes,
-        spec.resources.max_processes
+        effective_spec.resources.max_processes
     );
     debug_assert_eq!(
         backend_spec.resources.max_open_files,
-        spec.resources.max_open_files
+        effective_spec.resources.max_open_files
     );
 
     let backend_selected = select_backend(&backend_spec);
@@ -1154,7 +3190,7 @@ fn supervised_stdin_plan(
     let reported_selected = SelectedBackend {
         backend_id: backend_selected.backend_id,
         coverage: combined_coverage,
-        required: spec.required_coverage(),
+        required: effective_spec.required_coverage(),
     };
     if reported_selected.is_degraded() {
         return Err(CapsuleRefused {
@@ -1168,6 +3204,7 @@ fn supervised_stdin_plan(
     );
 
     Ok(SupervisedPlan {
+        effective_spec,
         backend_spec,
         backend_selected,
         reported_selected,
@@ -1182,10 +3219,11 @@ fn supervised_stdin_plan(
 
 /// Create a Linux capsule launch's HOME under the fixed sticky `/tmp` root,
 /// verify its ownership/mode, and add that exact canonical directory to the
-/// finalized Landlock read/write policy before coverage is probed or a child is
-/// spawned. The returned guard is deliberately owned by the parent wrapper;
-/// dropping it after success, refusal, timeout, or managed-child cleanup removes
-/// the directory without relying on the untrusted child.
+/// finalized Landlock policy before coverage is probed or a child is spawned.
+/// The returned guard is deliberately owned by the parent wrapper; after a
+/// confirmed shutdown it capability-cleans contents and performs only an
+/// identity-checked non-recursive root unlink, while an unconfirmed shutdown
+/// preserves both root and contents.
 #[cfg(target_os = "linux")]
 const TEMP_HOME_PRIVATE_DIRS: [&str; 5] = [
     ".config",
@@ -1198,8 +3236,8 @@ const TEMP_HOME_PRIVATE_DIRS: [&str; 5] = [
 #[cfg(target_os = "linux")]
 fn create_parent_owned_temp_home(
     spec: &mut CapsuleSpec,
-) -> Result<Option<tempfile::TempDir>, CapsuleRefused> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+) -> Result<Option<HeldTempHome>, CapsuleRefused> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     if !spec.environment.temporary_home {
         return Ok(None);
@@ -1211,6 +3249,22 @@ fn create_parent_owned_temp_home(
             backend_id,
             reason: format!("resolve fixed capsule temp-home root /tmp: {error}"),
         })?;
+    let cleanup_preflight_root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&base)
+        .map_err(|error| CapsuleRefused {
+            backend_id,
+            reason: format!("open cleanup preflight root {}: {error}", base.display()),
+        })?;
+    preflight_owned_directory_cleanup(cleanup_preflight_root.as_raw_fd()).map_err(|error| {
+        CapsuleRefused {
+            backend_id,
+            reason: format!(
+                "prove capability-confined cleanup before creating temporary HOME: {error}"
+            ),
+        }
+    })?;
     let directory = tempfile::Builder::new()
         .prefix("tirith-capsule-")
         .tempdir_in(&base)
@@ -1224,6 +3278,8 @@ fn create_parent_owned_temp_home(
             reason: format!("secure parent-owned capsule temporary HOME: {error}"),
         },
     )?;
+    let directory =
+        HeldEphemeralDirectory::from_tempdir(directory, backend_id, "capsule temporary HOME")?;
     let canonical = directory
         .path()
         .canonicalize()
@@ -1241,12 +3297,14 @@ fn create_parent_owned_temp_home(
             ),
         });
     }
-    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| CapsuleRefused {
-        backend_id,
-        reason: format!("inspect parent-owned capsule temporary HOME: {error}"),
-    })?;
+    let metadata = directory
+        .handle()
+        .metadata()
+        .map_err(|error| CapsuleRefused {
+            backend_id,
+            reason: format!("inspect held parent-owned capsule temporary HOME: {error}"),
+        })?;
     if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o777 != 0o700
     {
@@ -1264,76 +3322,86 @@ fn create_parent_owned_temp_home(
     // permissively-created XDG base. Include `.local` itself so no component in
     // either nested XDG path inherits a permissive umask-derived mode.
     for relative in TEMP_HOME_PRIVATE_DIRS {
-        let expected = canonical.join(relative);
-        std::fs::create_dir_all(&expected).map_err(|error| CapsuleRefused {
-            backend_id,
-            reason: format!(
-                "create parent-owned capsule temporary HOME directory {}: {error}",
-                expected.display()
-            ),
-        })?;
-        std::fs::set_permissions(&expected, std::fs::Permissions::from_mode(0o700)).map_err(
-            |error| CapsuleRefused {
+        create_private_directory_tree_at(directory.handle(), relative).map_err(|error| {
+            CapsuleRefused {
                 backend_id,
                 reason: format!(
-                    "secure parent-owned capsule temporary HOME directory {}: {error}",
-                    expected.display()
+                    "create capability-relative capsule temporary HOME directory {relative}: {error}"
                 ),
-            },
-        )?;
-        let resolved = expected.canonicalize().map_err(|error| CapsuleRefused {
-            backend_id,
-            reason: format!(
-                "resolve parent-owned capsule temporary HOME directory {}: {error}",
-                expected.display()
-            ),
+            }
         })?;
-        if resolved != expected || !resolved.starts_with(&canonical) {
-            return Err(CapsuleRefused {
-                backend_id,
-                reason: format!(
-                    "parent-owned capsule temporary HOME directory escaped its root: {} -> {}",
-                    expected.display(),
-                    resolved.display()
-                ),
-            });
+    }
+    // A Landlock write grant includes read authority. Keep HOME as one write
+    // root so the held descriptor can replace every path-based grant exactly
+    // once without a duplicate read rule reopening the visible pathname.
+    spec.filesystem.read_roots.retain(|root| root != &canonical);
+    if !spec.filesystem.write_roots.contains(&canonical) {
+        spec.filesystem.write_roots.push(canonical.clone());
+    }
+    let child_capability =
+        reserve_bound_directory_fd(spec, directory.handle().as_raw_fd(), &canonical)?;
+    spec.handles.extra_unix_fds.push(child_capability.inherited);
+    Ok(Some(HeldTempHome {
+        directory,
+        child_capability: Some(child_capability),
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_directory_tree_at(root: &std::fs::File, relative: &str) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut parent = root.try_clone()?;
+    for component in relative.split('/') {
+        let component = std::ffi::CString::new(component)
+            .map_err(|_| std::io::Error::other("temporary-HOME component contains NUL"))?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
         }
-        let metadata = std::fs::symlink_metadata(&resolved).map_err(|error| CapsuleRefused {
-            backend_id,
-            reason: format!(
-                "inspect parent-owned capsule temporary HOME directory {}: {error}",
-                resolved.display()
-            ),
-        })?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a fresh descriptor.
+        let child = unsafe { std::fs::File::from_raw_fd(fd) };
+        if unsafe { libc::fchmod(child.as_raw_fd(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let metadata = child.metadata()?;
         if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o777 != 0o700
         {
-            return Err(CapsuleRefused {
-                backend_id,
-                reason: format!(
-                    "parent-owned capsule temporary HOME directory failed canonical directory/uid/mode validation: {}",
-                    resolved.display()
-                ),
-            });
+            return Err(std::io::Error::other(
+                "temporary-HOME child is not an owner-only directory",
+            ));
         }
+        parent = child;
     }
-    if !spec.filesystem.read_roots.contains(&canonical) {
-        spec.filesystem.read_roots.push(canonical.clone());
-    }
-    if !spec.filesystem.write_roots.contains(&canonical) {
-        spec.filesystem.write_roots.push(canonical);
-    }
-    Ok(Some(directory))
+    Ok(())
 }
 
+// This helper deliberately mirrors the public security boundary's explicit
+// inputs; bundling them would obscure the cfg-specific ownership and checks.
+#[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 fn run_to_completion_with_stdin_captured(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
     target_argv0: tirith_core::runner::PipeInterpreter,
     args: &[String],
     input: &[u8],
+    authorizer: Option<&mut tirith_core::runner::ExecutionAuthorizer>,
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
 ) -> Result<CapturedCapsuleOutcome, CapsuleRefused> {
@@ -1342,7 +3410,15 @@ fn run_to_completion_with_stdin_captured(
 
     #[cfg(target_os = "macos")]
     {
-        let _ = (program, target_argv0, args, input, cwd, extra_env);
+        let _ = (
+            program,
+            target_argv0,
+            args,
+            input,
+            authorizer,
+            cwd,
+            extra_env,
+        );
         Err(CapsuleRefused {
             backend_id: plan.reported_selected.backend_id,
             reason: "supervised stdin execution is unavailable on macOS: a descendant can \
@@ -1354,7 +3430,16 @@ fn run_to_completion_with_stdin_captured(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (program, target_argv0, args, input, cwd, extra_env, &plan);
+        let _ = (
+            program,
+            target_argv0,
+            args,
+            input,
+            authorizer,
+            cwd,
+            extra_env,
+            &plan,
+        );
         Err(CapsuleRefused {
             backend_id: plan.reported_selected.backend_id,
             reason: "contained supervised stdin launch is not available on Windows yet; refusing to run uncontained"
@@ -1375,6 +3460,11 @@ fn run_to_completion_with_stdin_captured(
     #[cfg(target_os = "linux")]
     {
         reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
+        let authorizer = authorizer.ok_or_else(|| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "missing core-owned strict execution controller; refusing before launch"
+                .to_string(),
+        })?;
         let mut launch_spec = spec.clone();
         let caller_argv0 = program
             .invocation_path()
@@ -1399,7 +3489,14 @@ fn run_to_completion_with_stdin_captured(
                 "supervised stdin execution requires a sealed content-bound interpreter descriptor"
                     .to_string(),
         })?;
-        let launch_status = TargetLaunchStatusPipe::create(&mut launch_spec)?;
+        let launch_arm = authorizer
+            .arm_linux_capsule(&mut launch_spec)
+            .map_err(|reason| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason,
+            })?;
+        let (mut coverage_reader, coverage_fd, coverage_child) =
+            create_coverage_proof(&mut launch_spec)?;
         let bound_interpreter = reserve_bound_target_fd(&launch_spec, source_fd)?;
         let inherited_fd = bound_interpreter.inherited;
         launch_spec.handles.extra_unix_fds.push(inherited_fd);
@@ -1413,11 +3510,15 @@ fn run_to_completion_with_stdin_captured(
             None,
             &plan.backend_selected,
             Some(caller_argv0),
-            temp_home.as_ref().map(|directory| directory.path()),
+            temp_home.as_mut(),
             Some(bound_interpreter),
             None,
-            Some(launch_status.status_writer_fd()),
-            Some(launch_status.ack_guard_fd()),
+            Some(launch_arm.launch_status_fd().as_raw_fd()),
+            Some(launch_arm.launch_ack_fd().as_raw_fd()),
+            Some(coverage_fd),
+            vec![coverage_child],
+            None,
+            None,
         )?;
         if let Some(directory) = cwd {
             command.current_dir(directory);
@@ -1442,6 +3543,9 @@ fn run_to_completion_with_stdin_captured(
             backend_id: plan.reported_selected.backend_id,
             reason: format!("capsule launch failed: {error}"),
         })?;
+        // Release the parent copy of every child-only reserved descriptor. EOF on
+        // the proof channels must represent the launcher, not this reusable Command.
+        drop(command);
         let child_pid = child.id();
         // Command::spawn performs the first trusted /proc/self/exe transition
         // synchronously. It is not interruptible by this supervisor, but any
@@ -1458,41 +3562,114 @@ fn run_to_completion_with_stdin_captured(
                 ),
             });
         }
-        if let Err(reason) =
-            launch_status.wait_for_target_exec(launch_remaining.min(TARGET_EXEC_MAX_WAIT))
-        {
+        let mut achieved = match read_achieved_coverage_until(
+            &mut coverage_reader,
+            launch_started + plan.limits.timeout,
+        ) {
+            Ok(coverage) => coverage,
+            Err(reason) => {
+                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+                return Err(CapsuleRefused {
+                    backend_id: plan.backend_selected.backend_id,
+                    reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+                });
+            }
+        };
+        if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
             let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
             preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
             return Err(CapsuleRefused {
-                backend_id: plan.reported_selected.backend_id,
-                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!(
+                    "launcher reported achieved coverage below the canonical backend plan; child-tree cleanup succeeded={cleanup}"
+                ),
             });
+        }
+        let authorization_remaining = plan.limits.timeout.saturating_sub(launch_started.elapsed());
+        if authorization_remaining.is_zero() {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!(
+                    "contained target exhausted the wall-clock budget before exec authorization; child-tree cleanup succeeded={cleanup}"
+                ),
+            });
+        }
+        let mut authorization_cleanup = None;
+        let authorization =
+            authorizer.confirm_linux_capsule(launch_arm, authorization_remaining, || {
+                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+                authorization_cleanup = Some(cleanup);
+                if cleanup {
+                    Ok(())
+                } else {
+                    Err("child-tree cleanup was not confirmed".to_string())
+                }
+            });
+        match authorization {
+            Ok(()) => {}
+            Err(tirith_core::runner::KernelExecConfirmationError::BeforeAck(reason)) => {
+                let cleanup = authorization_cleanup.unwrap_or(false);
+                return Err(CapsuleRefused {
+                    backend_id: plan.reported_selected.backend_id,
+                    reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+                });
+            }
+            Err(tirith_core::runner::KernelExecConfirmationError::AfterAck(reason)) => {
+                let cleanup = authorization_cleanup.unwrap_or(false);
+                return Ok(captured_terminated_outcome(
+                    plan.reported_selected.backend_id,
+                    achieved,
+                    post_ack_confirmation_termination(reason, cleanup),
+                ));
+            }
         }
         let mut remaining_limits = plan.limits;
         remaining_limits.timeout = remaining_limits
             .timeout
             .saturating_sub(launch_started.elapsed());
+        achieved.resource_limits_enforced = plan.effective_spec.resources.any_set();
         if remaining_limits.timeout.is_zero() {
             let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
             preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-            return Err(CapsuleRefused {
-                backend_id: plan.reported_selected.backend_id,
+            let termination = CapsuleTermination {
+                kind: if cleanup {
+                    CapsuleTerminationKind::WallClock
+                } else {
+                    CapsuleTerminationKind::CleanupFailure
+                },
                 reason: format!(
                     "contained target consumed the wall-clock budget during launch; child-tree cleanup succeeded={cleanup}"
                 ),
-            });
+                cleanup_confirmed: cleanup,
+            };
+            return Ok(captured_terminated_outcome(
+                plan.backend_selected.backend_id,
+                achieved,
+                termination,
+            ));
         }
-        let supervised = supervise_piped_child(child, input, remaining_limits, &mut temp_home)
-            .map_err(|reason| CapsuleRefused {
-                backend_id: plan.reported_selected.backend_id,
-                reason,
-            })?;
+        let supervised = match supervise_piped_child(child, input, remaining_limits, &mut temp_home)
+        {
+            Ok(supervised) => supervised,
+            Err(reason) => {
+                return Ok(captured_terminated_outcome(
+                    plan.backend_selected.backend_id,
+                    achieved,
+                    supervision_termination(reason),
+                ));
+            }
+        };
         Ok(CapturedCapsuleOutcome {
             outcome: CapsuleOutcome {
                 exit_code: supervised.status.code().unwrap_or(128),
                 backend_id: plan.reported_selected.backend_id,
-                coverage: plan.reported_selected.coverage,
+                coverage: achieved,
                 degraded: false,
+                termination: None,
             },
             stdout: supervised.stdout,
             stderr: supervised.stderr,
@@ -1500,12 +3677,17 @@ fn run_to_completion_with_stdin_captured(
     }
 }
 
+// This helper deliberately mirrors the public security boundary's explicit
+// inputs; bundling them would obscure the cfg-specific ownership and checks.
+#[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 fn run_to_completion_with_reviewed_file_captured(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
     target_argv0: &OsStr,
     args: &[String],
     reviewed_script: tirith_core::runner::ReviewedScript<'_>,
+    authorizer: Option<&mut tirith_core::runner::ExecutionAuthorizer>,
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
 ) -> Result<CapturedCapsuleOutcome, CapsuleRefused> {
@@ -1517,19 +3699,25 @@ fn run_to_completion_with_reviewed_file_captured(
             target_argv0,
             args,
             reviewed_script,
+            authorizer,
             cwd,
             extra_env,
         );
-        return Err(CapsuleRefused {
+        Err(CapsuleRefused {
             backend_id: "unsupported",
             reason: "content-bound reviewed-file capsule execution is supported only on Linux; refusing before launch"
                 .to_string(),
-        });
+        })
     }
 
     #[cfg(target_os = "linux")]
     {
         reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
+        let authorizer = authorizer.ok_or_else(|| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "missing core-owned strict execution controller; refusing before launch"
+                .to_string(),
+        })?;
         let mut launch_spec = spec.clone();
         let caller_argv0 = program
             .invocation_path()
@@ -1556,7 +3744,14 @@ fn run_to_completion_with_reviewed_file_captured(
         let script_source = reviewed_script.sealed_fd();
         validate_reviewed_script_fd(script_source)?;
 
-        let launch_status = TargetLaunchStatusPipe::create(&mut launch_spec)?;
+        let launch_arm = authorizer
+            .arm_linux_capsule(&mut launch_spec)
+            .map_err(|reason| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason,
+            })?;
+        let (mut coverage_reader, coverage_fd, coverage_child) =
+            create_coverage_proof(&mut launch_spec)?;
         let bound_interpreter = reserve_bound_target_fd(&launch_spec, interpreter_source)?;
         let interpreter_inherited = bound_interpreter.inherited;
         launch_spec
@@ -1578,11 +3773,15 @@ fn run_to_completion_with_reviewed_file_captured(
             None,
             &plan.backend_selected,
             Some(caller_argv0),
-            temp_home.as_ref().map(|directory| directory.path()),
+            temp_home.as_mut(),
             Some(bound_interpreter),
             Some(bound_script),
-            Some(launch_status.status_writer_fd()),
-            Some(launch_status.ack_guard_fd()),
+            Some(launch_arm.launch_status_fd().as_raw_fd()),
+            Some(launch_arm.launch_ack_fd().as_raw_fd()),
+            Some(coverage_fd),
+            vec![coverage_child],
+            None,
+            None,
         )?;
         if let Some(directory) = cwd {
             command.current_dir(directory);
@@ -1605,6 +3804,7 @@ fn run_to_completion_with_reviewed_file_captured(
             backend_id: plan.reported_selected.backend_id,
             reason: format!("capsule launch failed: {error}"),
         })?;
+        drop(command);
         let child_pid = child.id();
         // Charge the synchronous trusted launcher transition to the same wall
         // budget before waiting for terminal target-exec proof. Command::spawn
@@ -1620,41 +3820,113 @@ fn run_to_completion_with_reviewed_file_captured(
                 ),
             });
         }
-        if let Err(reason) =
-            launch_status.wait_for_target_exec(launch_remaining.min(TARGET_EXEC_MAX_WAIT))
-        {
+        let mut achieved = match read_achieved_coverage_until(
+            &mut coverage_reader,
+            launch_started + plan.limits.timeout,
+        ) {
+            Ok(coverage) => coverage,
+            Err(reason) => {
+                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+                return Err(CapsuleRefused {
+                    backend_id: plan.backend_selected.backend_id,
+                    reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+                });
+            }
+        };
+        if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
             let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
             preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
             return Err(CapsuleRefused {
-                backend_id: plan.reported_selected.backend_id,
-                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!(
+                    "launcher reported achieved coverage below the canonical backend plan; child-tree cleanup succeeded={cleanup}"
+                ),
             });
+        }
+        let authorization_remaining = plan.limits.timeout.saturating_sub(launch_started.elapsed());
+        if authorization_remaining.is_zero() {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!(
+                    "contained target exhausted the wall-clock budget before exec authorization; child-tree cleanup succeeded={cleanup}"
+                ),
+            });
+        }
+        let mut authorization_cleanup = None;
+        let authorization =
+            authorizer.confirm_linux_capsule(launch_arm, authorization_remaining, || {
+                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+                authorization_cleanup = Some(cleanup);
+                if cleanup {
+                    Ok(())
+                } else {
+                    Err("child-tree cleanup was not confirmed".to_string())
+                }
+            });
+        match authorization {
+            Ok(()) => {}
+            Err(tirith_core::runner::KernelExecConfirmationError::BeforeAck(reason)) => {
+                let cleanup = authorization_cleanup.unwrap_or(false);
+                return Err(CapsuleRefused {
+                    backend_id: plan.reported_selected.backend_id,
+                    reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+                });
+            }
+            Err(tirith_core::runner::KernelExecConfirmationError::AfterAck(reason)) => {
+                let cleanup = authorization_cleanup.unwrap_or(false);
+                return Ok(captured_terminated_outcome(
+                    plan.reported_selected.backend_id,
+                    achieved,
+                    post_ack_confirmation_termination(reason, cleanup),
+                ));
+            }
         }
         let mut remaining_limits = plan.limits;
         remaining_limits.timeout = remaining_limits
             .timeout
             .saturating_sub(launch_started.elapsed());
+        achieved.resource_limits_enforced = plan.effective_spec.resources.any_set();
         if remaining_limits.timeout.is_zero() {
             let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
             preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-            return Err(CapsuleRefused {
-                backend_id: plan.reported_selected.backend_id,
+            let termination = CapsuleTermination {
+                kind: if cleanup {
+                    CapsuleTerminationKind::WallClock
+                } else {
+                    CapsuleTerminationKind::CleanupFailure
+                },
                 reason: format!(
                     "contained target consumed the wall-clock budget during launch; child-tree cleanup succeeded={cleanup}"
                 ),
-            });
+                cleanup_confirmed: cleanup,
+            };
+            return Ok(captured_terminated_outcome(
+                plan.backend_selected.backend_id,
+                achieved,
+                termination,
+            ));
         }
-        let supervised = supervise_piped_child(child, &[], remaining_limits, &mut temp_home)
-            .map_err(|reason| CapsuleRefused {
-                backend_id: plan.reported_selected.backend_id,
-                reason,
-            })?;
+        let supervised = match supervise_piped_child(child, &[], remaining_limits, &mut temp_home) {
+            Ok(supervised) => supervised,
+            Err(reason) => {
+                return Ok(captured_terminated_outcome(
+                    plan.backend_selected.backend_id,
+                    achieved,
+                    supervision_termination(reason),
+                ));
+            }
+        };
         Ok(CapturedCapsuleOutcome {
             outcome: CapsuleOutcome {
                 exit_code: supervised.status.code().unwrap_or(128),
                 backend_id: plan.reported_selected.backend_id,
-                coverage: plan.reported_selected.coverage,
+                coverage: achieved,
                 degraded: false,
+                termination: None,
             },
             stdout: supervised.stdout,
             stderr: supervised.stderr,
@@ -1690,6 +3962,7 @@ fn validate_reviewed_script_fd(fd: i32) -> Result<(), CapsuleRefused> {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct SupervisedChildOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
@@ -1817,11 +4090,13 @@ fn cleanup_supervised_child(
 
 #[cfg(target_os = "linux")]
 fn preserve_temp_home_on_unconfirmed_cleanup(
-    temp_home: &mut Option<tempfile::TempDir>,
+    temp_home: &mut Option<HeldTempHome>,
     cleanup_confirmed: bool,
 ) {
     if !cleanup_confirmed {
-        std::mem::forget(temp_home.take());
+        if let Some(home) = temp_home.take() {
+            home.preserve();
+        }
     }
 }
 
@@ -1830,7 +4105,7 @@ fn cleanup_worker_spawn_failure(
     child: &mut Child,
     child_pid: u32,
     workers: Vec<std::thread::JoinHandle<()>>,
-    temp_home: &mut Option<tempfile::TempDir>,
+    temp_home: &mut Option<HeldTempHome>,
     worker: SupervisedWorkerKind,
     error: std::io::Error,
 ) -> String {
@@ -1851,11 +4126,26 @@ fn supervise_piped_child(
     child: Child,
     input: &[u8],
     limits: SupervisedLimits,
-    temp_home: &mut Option<tempfile::TempDir>,
+    temp_home: &mut Option<HeldTempHome>,
 ) -> Result<SupervisedChildOutput, String> {
     supervise_piped_child_with_worker_hooks(
         child,
-        input,
+        Some(input),
+        limits,
+        temp_home,
+        SupervisedWorkerTestHooks::default(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn supervise_inherited_stdin_child(
+    child: Child,
+    limits: SupervisedLimits,
+    temp_home: &mut Option<HeldTempHome>,
+) -> Result<SupervisedChildOutput, String> {
+    supervise_piped_child_with_worker_hooks(
+        child,
+        None,
         limits,
         temp_home,
         SupervisedWorkerTestHooks::default(),
@@ -1865,12 +4155,12 @@ fn supervise_piped_child(
 #[cfg(target_os = "linux")]
 fn supervise_piped_child_with_worker_hooks(
     mut child: Child,
-    input: &[u8],
+    input: Option<&[u8]>,
     limits: SupervisedLimits,
-    temp_home: &mut Option<tempfile::TempDir>,
+    temp_home: &mut Option<HeldTempHome>,
     worker_hooks: SupervisedWorkerTestHooks,
 ) -> Result<SupervisedChildOutput, String> {
-    if input.len() > limits.stdin_bytes {
+    if input.is_some_and(|input| input.len() > limits.stdin_bytes) {
         let child_pid = child.id();
         let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
         preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
@@ -1901,17 +4191,22 @@ fn supervise_piped_child_with_worker_hooks(
             "contained child stderr was not piped; child-tree cleanup succeeded={cleanup}"
         ));
     };
-    let Some(mut stdin) = child.stdin.take() else {
-        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-        preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
-        return Err(format!(
-            "contained child stdin was not piped; child-tree cleanup succeeded={cleanup}"
-        ));
+    let mut stdin = if input.is_some() {
+        let Some(stdin) = child.stdin.take() else {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
+            return Err(format!(
+                "contained child stdin was not piped; child-tree cleanup succeeded={cleanup}"
+            ));
+        };
+        Some(stdin)
+    } else {
+        None
     };
 
     let (sender, receiver) = mpsc::channel();
     let total = Arc::new(AtomicUsize::new(0));
-    let mut workers = Vec::with_capacity(3);
+    let mut workers = Vec::with_capacity(if input.is_some() { 3 } else { 2 });
     let stdout_worker = match spawn_supervised_reader(
         stdout,
         SupervisedStream::Stdout,
@@ -1954,43 +4249,45 @@ fn supervise_piped_child_with_worker_hooks(
         }
     };
     workers.push(stderr_worker);
-    let owned_input = input.to_vec();
-    let input_sender = sender.clone();
-    let stdin_worker = match spawn_supervised_worker(
-        SupervisedWorkerKind::Stdin,
-        worker_hooks,
-        move || match stdin.write_all(&owned_input) {
-            Ok(()) => {
-                let _ = input_sender.send(SupervisedMessage::InputComplete);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                let _ = input_sender.send(SupervisedMessage::InputComplete);
-            }
-            Err(error) => {
-                let _ = input_sender.send(SupervisedMessage::InputError(error.to_string()));
-            }
-        },
-    ) {
-        Ok(worker) => worker,
-        Err(error) => {
-            return Err(cleanup_worker_spawn_failure(
-                &mut child,
-                child_pid,
-                workers,
-                temp_home,
-                SupervisedWorkerKind::Stdin,
-                error,
-            ));
-        }
-    };
-    workers.push(stdin_worker);
+    if let Some(input) = input {
+        let owned_input = input.to_vec();
+        let input_sender = sender.clone();
+        let mut stdin = stdin.take().expect("piped input retains child stdin");
+        let stdin_worker =
+            match spawn_supervised_worker(SupervisedWorkerKind::Stdin, worker_hooks, move || {
+                match stdin.write_all(&owned_input) {
+                    Ok(()) => {
+                        let _ = input_sender.send(SupervisedMessage::InputComplete);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                        let _ = input_sender.send(SupervisedMessage::InputComplete);
+                    }
+                    Err(error) => {
+                        let _ = input_sender.send(SupervisedMessage::InputError(error.to_string()));
+                    }
+                }
+            }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    return Err(cleanup_worker_spawn_failure(
+                        &mut child,
+                        child_pid,
+                        workers,
+                        temp_home,
+                        SupervisedWorkerKind::Stdin,
+                        error,
+                    ));
+                }
+            };
+        workers.push(stdin_worker);
+    }
     drop(sender);
     let mut workers = Some(workers);
 
     let mut direct_exit_observed = false;
     let mut stdout = None;
     let mut stderr = None;
-    let mut input_complete = false;
+    let mut input_complete = input.is_none();
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -2096,7 +4393,10 @@ fn supervise_piped_child_with_worker_hooks(
             );
             if !cleanup {
                 preserve_temp_home_on_unconfirmed_cleanup(temp_home, false);
-                return Err("contained child exited but descendant cleanup failed".to_string());
+                return Err(
+                    "contained child exited but descendant cleanup failed; child-tree cleanup succeeded=false"
+                        .to_string(),
+                );
             }
             let mut terminal_error = None;
             for message in receiver.try_iter() {
@@ -2133,7 +4433,7 @@ fn supervise_piped_child_with_worker_hooks(
             }
             if !input_complete || stdout.is_none() || stderr.is_none() {
                 return Err(
-                    "contained child exited but its I/O workers did not report complete output"
+                    "contained child exited but its I/O workers did not report complete output; child-tree cleanup succeeded=true"
                         .to_string(),
                 );
             }
@@ -2146,9 +4446,315 @@ fn supervise_piped_child_with_worker_hooks(
     }
 }
 
-/// OS-native variant of [`run_to_completion`]. This is the authoritative launch
-/// path for callers such as `temp-run` that must preserve argument boundaries and
+#[cfg(target_os = "linux")]
+fn supervision_termination(reason: String) -> CapsuleTermination {
+    let cleanup_confirmed = reason.contains("child-tree cleanup succeeded=true");
+    let kind = if !cleanup_confirmed {
+        CapsuleTerminationKind::CleanupFailure
+    } else if reason.contains("wall-clock") || reason.contains("deadline") {
+        CapsuleTerminationKind::WallClock
+    } else if reason.contains("combined-output") {
+        CapsuleTerminationKind::OutputLimit
+    } else {
+        CapsuleTerminationKind::SupervisionIo
+    };
+    CapsuleTermination {
+        kind,
+        reason,
+        cleanup_confirmed,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn post_ack_confirmation_termination(reason: String, cleanup: bool) -> CapsuleTermination {
+    CapsuleTermination {
+        kind: if cleanup {
+            CapsuleTerminationKind::SupervisionIo
+        } else {
+            CapsuleTerminationKind::CleanupFailure
+        },
+        reason: format!(
+            "target authorization ACK was sent, but terminal resume proof failed: {reason}; \
+             child-tree cleanup succeeded={cleanup}"
+        ),
+        cleanup_confirmed: cleanup,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminated_outcome(
+    backend_id: &'static str,
+    coverage: CapsuleCoverage,
+    termination: CapsuleTermination,
+) -> CapsuleOutcome {
+    let exit_code = if termination.kind == CapsuleTerminationKind::WallClock {
+        124
+    } else {
+        125
+    };
+    CapsuleOutcome {
+        exit_code,
+        backend_id,
+        coverage,
+        degraded: false,
+        termination: Some(termination),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn captured_terminated_outcome(
+    backend_id: &'static str,
+    coverage: CapsuleCoverage,
+    termination: CapsuleTermination,
+) -> CapturedCapsuleOutcome {
+    let diagnostic = format!("tirith: {}\n", termination.reason).into_bytes();
+    CapturedCapsuleOutcome {
+        outcome: terminated_outcome(backend_id, coverage, termination),
+        stdout: Vec::new(),
+        stderr: diagnostic,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_child_output_action(
+    outcome: CapsuleOutcome,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> (CapsuleOutcome, ForwardableCapturedOutput) {
+    let forwardable = sanitize_and_analyze_captured_output(stdout, stderr);
+    let outcome = apply_captured_output_action(outcome, forwardable.blocked);
+    (outcome, forwardable)
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_child_output_presentation(
+    outcome: CapsuleOutcome,
+    stdout: &[u8],
+    stderr: &[u8],
+    presentation: BoundOutputPresentation,
+) -> (CapsuleOutcome, Option<ForwardableCapturedOutput>) {
+    let (outcome, forwardable) = bounded_child_output_action(outcome, stdout, stderr);
+    if presentation == BoundOutputPresentation::Suppress {
+        (outcome, None)
+    } else {
+        (outcome, Some(forwardable))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_suppress_bound_child_output(stdout: &[u8], stderr: &[u8]) -> CapsuleOutcome {
+    let (outcome, presented) = bounded_child_output_presentation(
+        CapsuleOutcome {
+            exit_code: 0,
+            backend_id: "landlock-seccomp",
+            coverage: CapsuleCoverage::NONE,
+            degraded: false,
+            termination: None,
+        },
+        stdout,
+        stderr,
+        BoundOutputPresentation::Suppress,
+    );
+    assert!(
+        presented.is_none(),
+        "suppressed package output must never reach the JSON presentation layer"
+    );
+    outcome
+}
+
+#[cfg(target_os = "linux")]
+fn forward_bounded_child_output(
+    outcome: CapsuleOutcome,
+    stdout: &[u8],
+    stderr: &[u8],
+    presentation: BoundOutputPresentation,
+) -> CapsuleOutcome {
+    let (mut outcome, forwardable) =
+        bounded_child_output_presentation(outcome, stdout, stderr, presentation);
+    let Some(forwardable) = forwardable else {
+        return outcome;
+    };
+    let write_result = std::io::stdout()
+        .lock()
+        .write_all(&forwardable.stdout)
+        .and_then(|()| std::io::stderr().lock().write_all(&forwardable.stderr));
+    if let Err(error) = write_result {
+        outcome.exit_code = 125;
+        outcome.termination = Some(CapsuleTermination {
+            kind: CapsuleTerminationKind::Presentation,
+            reason: format!("forward bounded contained-child output: {error}"),
+            cleanup_confirmed: true,
+        });
+    }
+    outcome
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run_to_completion_supervised(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+    degraded: DegradedPolicy,
+) -> Result<CapsuleOutcome, CapsuleRefused> {
+    reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
+    let mut launch_spec = spec.clone();
+    let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
+    let mut proof = LinuxLaunchProof::create(&mut launch_spec)?;
+    let plan = match supervised_stdin_plan(&launch_spec, 0) {
+        Ok(plan) => plan,
+        Err(_error) if degraded == DegradedPolicy::AllowDegraded => {
+            assert_degraded_run_is_permitted(degraded);
+            let selected = select_backend(spec);
+            return uncontained_run_os(program, args, cwd, extra_env, &selected, true);
+        }
+        Err(error) => return Err(error),
+    };
+    let status_fd = proof.status_fd;
+    let ack_fd = proof.ack_fd;
+    let coverage_fd = proof.coverage_fd;
+    let mut command = linux_contained_command_os_with_options(
+        &plan.backend_spec,
+        program,
+        args,
+        None,
+        &plan.backend_selected,
+        None,
+        temp_home.as_mut(),
+        None,
+        None,
+        Some(status_fd),
+        Some(ack_fd),
+        Some(coverage_fd),
+        proof.take_child_fds(),
+        None,
+        None,
+    )?;
+    if let Some(directory) = cwd {
+        command.current_dir(directory);
+    }
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let launch_started = Instant::now();
+    let mut child = command.spawn().map_err(|error| CapsuleRefused {
+        backend_id: plan.backend_selected.backend_id,
+        reason: format!("capsule launch failed: {error}"),
+    })?;
+    drop(command);
+    let child_pid = child.id();
+    let Some(deadline) = launch_started.checked_add(plan.limits.timeout) else {
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        return Err(CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!(
+                "capsule wall deadline is outside the platform range; child-tree cleanup succeeded={cleanup}"
+            ),
+        });
+    };
+    let mut achieved = match proof.confirm_coverage(deadline) {
+        Ok(coverage) => coverage,
+        Err(reason) => {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+            });
+        }
+    };
+    if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        return Err(CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!(
+                "launcher reported achieved coverage below the canonical backend plan; child-tree cleanup succeeded={cleanup}"
+            ),
+        });
+    }
+    match proof.confirm_target_exec(deadline) {
+        Ok(()) => {}
+        Err(TargetExecConfirmationError::BeforeAck(reason)) => {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+            });
+        }
+        Err(TargetExecConfirmationError::AfterAck(reason)) => {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Ok(terminated_outcome(
+                plan.backend_selected.backend_id,
+                achieved,
+                post_ack_confirmation_termination(reason, cleanup),
+            ));
+        }
+    }
+
+    achieved.resource_limits_enforced = plan.effective_spec.resources.any_set();
+    let mut remaining = plan.limits;
+    remaining.timeout = deadline.saturating_duration_since(Instant::now());
+    if remaining.timeout.is_zero() {
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        let termination = CapsuleTermination {
+            kind: if cleanup {
+                CapsuleTerminationKind::WallClock
+            } else {
+                CapsuleTerminationKind::CleanupFailure
+            },
+            reason: format!(
+                "contained target exhausted its wall-clock budget immediately after authenticated exec; child-tree cleanup succeeded={cleanup}"
+            ),
+            cleanup_confirmed: cleanup,
+        };
+        return Ok(terminated_outcome(
+            plan.backend_selected.backend_id,
+            achieved,
+            termination,
+        ));
+    }
+    match supervise_inherited_stdin_child(child, remaining, &mut temp_home) {
+        Ok(output) => Ok(forward_bounded_child_output(
+            CapsuleOutcome {
+                exit_code: output.status.code().unwrap_or(128),
+                backend_id: plan.backend_selected.backend_id,
+                coverage: achieved,
+                degraded: false,
+                termination: None,
+            },
+            &output.stdout,
+            &output.stderr,
+            BoundOutputPresentation::ForwardSanitized,
+        )),
+        Err(reason) => {
+            let termination = supervision_termination(reason);
+            eprintln!("tirith: {}", termination.reason);
+            Ok(terminated_outcome(
+                plan.backend_selected.backend_id,
+                achieved,
+                termination,
+            ))
+        }
+    }
+}
+
+/// Run `program` + `args` inside a capsule and wait for it, inheriting the
+/// parent's stdio. This is the authoritative launch path for callers such as
+/// `tirith run` and `temp-run --capsule`; it preserves argument boundaries and
 /// non-UTF8 Unix bytes exactly. No component is joined or reparsed by a shell.
+///
+/// On [`DegradedPolicy::FailClosed`] a degraded/NoOp backend returns
+/// `Err(CapsuleRefused)` before spawning anything. On
+/// [`DegradedPolicy::AllowDegraded`] a degraded backend still runs the program
+/// (uncontained or partially contained) and reports `degraded = true`.
 pub fn run_to_completion_os(
     spec: &CapsuleSpec,
     program: &OsStr,
@@ -2157,61 +4763,70 @@ pub fn run_to_completion_os(
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
-    let sel = select_backend(spec);
-    let is_degraded = sel.is_degraded();
-
-    if is_degraded && degraded == DegradedPolicy::FailClosed {
-        return Err(CapsuleRefused {
-            backend_id: sel.backend_id,
-            reason: shortfall_reason(sel.backend_id, &sel),
-        });
+    #[cfg(target_os = "linux")]
+    {
+        return linux_run_to_completion_supervised(spec, program, args, cwd, extra_env, degraded);
     }
 
-    // Windows uses its own blocking launcher (no Command shape).
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "linux"))]
     {
-        if !is_degraded {
-            return windows_run_to_completion_os(spec, program, args, &sel);
+        let sel = select_backend(spec);
+        let is_degraded = sel.is_degraded();
+
+        if is_degraded && degraded == DegradedPolicy::FailClosed {
+            return Err(CapsuleRefused {
+                backend_id: sel.backend_id,
+                reason: shortfall_reason(sel.backend_id, &sel),
+            });
         }
-        // Degraded + AllowDegraded on Windows: run uncontained via a plain Command.
-        // An enforcing surface would have failed closed above; assert it here.
-        assert_degraded_run_is_permitted(degraded);
-        return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
-    }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        if is_degraded {
-            // AllowDegraded: run uncontained but honestly flagged. An enforcing
-            // surface would have failed closed above; assert it here.
+        // Windows uses its own blocking launcher (no Command shape).
+        #[cfg(target_os = "windows")]
+        {
+            if !is_degraded {
+                return windows_run_to_completion_os(spec, program, args, &sel);
+            }
+            // Degraded + AllowDegraded on Windows: run uncontained via a plain Command.
+            // An enforcing surface would have failed closed above; assert it here.
             assert_degraded_run_is_permitted(degraded);
             return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
         }
-        #[cfg(target_os = "linux")]
-        reject_linux_loader_control_env(extra_env, "extra environment", sel.backend_id)?;
-        #[cfg(target_os = "macos")]
-        reject_macos_loader_control_env(extra_env, "extra environment", sel.backend_id)?;
-        let mut cmd = build_contained_command_os(spec, program, args, None, &sel)?;
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            if is_degraded {
+                // AllowDegraded: run uncontained but honestly flagged. An enforcing
+                // surface would have failed closed above; assert it here.
+                assert_degraded_run_is_permitted(degraded);
+                return uncontained_run_os(program, args, cwd, extra_env, &sel, true);
+            }
+            #[cfg(target_os = "linux")]
+            reject_linux_loader_control_env(extra_env, "extra environment", sel.backend_id)?;
+            #[cfg(target_os = "macos")]
+            reject_macos_loader_control_env(extra_env, "extra environment", sel.backend_id)?;
+            let mut cmd = build_contained_command_os(spec, program, args, None, &sel)?;
+            if let Some(dir) = cwd {
+                cmd.current_dir(dir);
+            }
+            for (k, v) in extra_env {
+                cmd.env(k, v);
+            }
+            let mut child = cmd.spawn_managed().map_err(|e| CapsuleRefused {
+                backend_id: sel.backend_id,
+                reason: format!("capsule launch failed: {e}"),
+            })?;
+            let status = child.wait().map_err(|e| CapsuleRefused {
+                backend_id: sel.backend_id,
+                reason: format!("waiting for contained child failed: {e}"),
+            })?;
+            Ok(CapsuleOutcome {
+                exit_code: status.code().unwrap_or(128),
+                backend_id: sel.backend_id,
+                coverage: sel.coverage,
+                degraded: false,
+                termination: None,
+            })
         }
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
-        let mut child = cmd.spawn_managed().map_err(|e| CapsuleRefused {
-            backend_id: sel.backend_id,
-            reason: format!("capsule launch failed: {e}"),
-        })?;
-        let status = child.wait().map_err(|e| CapsuleRefused {
-            backend_id: sel.backend_id,
-            reason: format!("waiting for contained child failed: {e}"),
-        })?;
-        Ok(CapsuleOutcome {
-            exit_code: status.code().unwrap_or(128),
-            backend_id: sel.backend_id,
-            coverage: sel.coverage,
-            degraded: false,
-        })
     }
 }
 
@@ -2242,6 +4857,7 @@ fn uncontained_run_os(
         backend_id: sel.backend_id,
         coverage: sel.coverage,
         degraded,
+        termination: None,
     })
 }
 
@@ -2277,7 +4893,7 @@ fn build_contained_command_os(
 /// return the live [`ManagedChild`] for the caller to bridge. Used by the MCP
 /// gateway, which must read/write the child's stdio to proxy the protocol.
 ///
-/// Fail-closed semantics match [`run_to_completion`]: a degraded/NoOp backend
+/// Fail-closed semantics match [`run_to_completion_os`]: a degraded/NoOp backend
 /// under [`DegradedPolicy::FailClosed`] returns `Err` before spawning. Windows
 /// piped-stdio containment is not wired (the E4 `ContainedChild` does not expose
 /// piped handles), so on Windows this fails closed for an enforcing caller and, for
@@ -2291,7 +4907,7 @@ pub fn spawn_piped(
     args: &[String],
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
-) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleRefused> {
+) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleExecutionError> {
     spawn_piped_with_binding(spec, program, args, None, None, extra_env, degraded)
 }
 
@@ -2306,7 +4922,7 @@ pub fn spawn_piped_exact(
     cwd: &std::path::Path,
     environment: &[(String, String)],
     degraded: DegradedPolicy,
-) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleRefused> {
+) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleExecutionError> {
     spawn_piped_with_binding(
         spec,
         program,
@@ -2318,6 +4934,7 @@ pub fn spawn_piped_exact(
     )
 }
 
+#[allow(unreachable_code)]
 fn spawn_piped_with_binding(
     spec: &CapsuleSpec,
     program: &str,
@@ -2326,7 +4943,13 @@ fn spawn_piped_with_binding(
     exact_env: Option<&[(String, String)]>,
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
-) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleRefused> {
+) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleExecutionError> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_spawn_piped_supervised(
+            spec, program, args, cwd, exact_env, extra_env, degraded,
+        );
+    }
     let sel = select_backend(spec);
     let is_degraded = sel.is_degraded();
 
@@ -2341,7 +4964,8 @@ fn spawn_piped_with_binding(
                 reason: "contained piped-stdio launch is not available on Windows yet; \
                          refusing to run the upstream uncontained"
                     .to_string(),
-            });
+            }
+            .into());
         }
         // Only an AllowDegraded caller reaches here (FailClosed returned above).
         assert_degraded_run_is_permitted(degraded);
@@ -2356,7 +4980,8 @@ fn spawn_piped_with_binding(
                 return Err(CapsuleRefused {
                     backend_id: sel.backend_id,
                     reason: shortfall_reason(sel.backend_id, &sel),
-                });
+                }
+                .into());
             }
             // Only an AllowDegraded caller reaches here (FailClosed returned above).
             assert_degraded_run_is_permitted(degraded);
@@ -2393,6 +5018,176 @@ fn spawn_piped_with_binding(
         })?;
         Ok((child, sel, false))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_spawn_piped_supervised(
+    spec: &CapsuleSpec,
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    exact_env: Option<&[(String, String)]>,
+    extra_env: &[(String, String)],
+    degraded: DegradedPolicy,
+) -> Result<(ManagedChild, SelectedBackend, bool), CapsuleExecutionError> {
+    if let Some(environment) = exact_env {
+        reject_linux_loader_control_env(environment, "exact environment", "landlock-seccomp")?;
+    }
+    reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
+    let mut launch_spec = spec.clone();
+    let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
+    let mut proof = LinuxLaunchProof::create(&mut launch_spec)?;
+    let plan = match supervised_stdin_plan(&launch_spec, 0) {
+        Ok(plan) => plan,
+        Err(_error) if degraded == DegradedPolicy::AllowDegraded => {
+            assert_degraded_run_is_permitted(degraded);
+            let selected = select_backend(spec);
+            let child =
+                spawn_uncontained_piped(program, args, cwd, exact_env, extra_env, &selected)?;
+            return Ok((ManagedChild::unmanaged(child), selected, true));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let mut command = linux_contained_command_os_with_options(
+        &plan.backend_spec,
+        OsStr::new(program),
+        &args_os,
+        exact_env,
+        &plan.backend_selected,
+        None,
+        temp_home.as_mut(),
+        None,
+        None,
+        Some(proof.status_fd),
+        Some(proof.ack_fd),
+        Some(proof.coverage_fd),
+        proof.take_child_fds(),
+        None,
+        None,
+    )?;
+    if let Some(directory) = cwd {
+        command.current_dir(directory);
+    }
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let launch_started = Instant::now();
+    let mut child = command.spawn().map_err(|error| CapsuleRefused {
+        backend_id: plan.backend_selected.backend_id,
+        reason: format!("capsule launch failed: {error}"),
+    })?;
+    drop(command);
+    let child_pid = child.id();
+    let Some(deadline) = launch_started.checked_add(plan.limits.timeout) else {
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        return Err(CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!(
+                "capsule wall deadline is outside the platform range; child-tree cleanup succeeded={cleanup}"
+            ),
+        }
+        .into());
+    };
+    // Install the fallible wall watchdog before ACK can resume the target. The
+    // gateway never has to classify supervisor setup or an already-expired wall
+    // budget after attacker-controlled code has started.
+    let mut supervised_limits = plan.limits;
+    supervised_limits.timeout = deadline.saturating_duration_since(Instant::now());
+    if supervised_limits.timeout.is_zero() {
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        return Err(CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!(
+                "gateway launch exhausted its wall budget before target authorization; child-tree cleanup succeeded={cleanup}"
+            ),
+        }
+        .into());
+    }
+    let mut supervision = match ManagedSupervision::start(child_pid, supervised_limits) {
+        Ok(supervision) => supervision,
+        Err(error) => {
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!(
+                    "gateway wall supervisor could not start before target authorization: {error}; child-tree cleanup succeeded={cleanup}"
+                ),
+            }
+            .into());
+        }
+    };
+    let mut achieved = match proof.confirm_coverage(deadline) {
+        Ok(coverage) => coverage,
+        Err(reason) => {
+            supervision.stop();
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+            }
+            .into());
+        }
+    };
+    if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
+        supervision.stop();
+        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        return Err(CapsuleRefused {
+            backend_id: plan.backend_selected.backend_id,
+            reason: format!(
+                "launcher reported achieved coverage below the canonical backend plan; child-tree cleanup succeeded={cleanup}"
+            ),
+        }
+        .into());
+    }
+    match proof.confirm_target_exec(deadline) {
+        Ok(()) => {}
+        Err(TargetExecConfirmationError::BeforeAck(reason)) => {
+            supervision.stop();
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
+            }
+            .into());
+        }
+        Err(TargetExecConfirmationError::AfterAck(reason)) => {
+            supervision.stop();
+            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
+            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            return Err(CapsuleExecutionError::ExecutedTerminated {
+                backend_id: plan.backend_selected.backend_id,
+                termination: post_ack_confirmation_termination(reason, cleanup),
+            });
+        }
+    }
+    achieved.resource_limits_enforced = plan.effective_spec.resources.any_set();
+    let selected = SelectedBackend {
+        backend_id: plan.backend_selected.backend_id,
+        coverage: achieved,
+        required: plan.effective_spec.required_coverage(),
+    };
+    debug_assert!(!selected.is_degraded());
+    Ok((
+        ManagedChild {
+            child,
+            _temp_home: temp_home,
+            process_group: Some(child_pid),
+            supervision: Some(supervision),
+        },
+        selected,
+        false,
+    ))
 }
 
 /// Spawn an uncontained piped child (degraded path). Only reached under
@@ -2526,7 +5321,7 @@ fn linux_contained_command_os(
     sel: &SelectedBackend,
 ) -> Result<PreparedContainedCommand, CapsuleRefused> {
     let mut effective_spec = spec.clone();
-    let temp_home = create_parent_owned_temp_home(&mut effective_spec)?;
+    let mut temp_home = create_parent_owned_temp_home(&mut effective_spec)?;
     let mut prepared = linux_contained_command_os_with_options(
         &effective_spec,
         program,
@@ -2534,9 +5329,13 @@ fn linux_contained_command_os(
         exact_env,
         sel,
         None,
-        temp_home.as_ref().map(|directory| directory.path()),
+        temp_home.as_mut(),
         None,
         None,
+        None,
+        None,
+        None,
+        Vec::new(),
         None,
         None,
     )?;
@@ -2552,11 +5351,15 @@ fn linux_contained_command_os_with_options(
     exact_env: Option<&[(String, String)]>,
     sel: &SelectedBackend,
     target_argv0: Option<&OsStr>,
-    temp_home: Option<&std::path::Path>,
+    temp_home: Option<&mut HeldTempHome>,
     bound_target: Option<BoundTargetFd>,
     bound_script: Option<BoundTargetFd>,
     launch_status_fd: Option<i32>,
     launch_ack_fd: Option<i32>,
+    coverage_status_fd: Option<i32>,
+    extra_bound_fds: Vec<BoundTargetFd>,
+    bound_directory: Option<BoundDirectoryFd>,
+    bound_inputs: Option<BoundInputLaunch>,
 ) -> Result<PreparedContainedCommand, CapsuleRefused> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     if launch_status_fd.is_some() || launch_ack_fd.is_some() {
@@ -2574,6 +5377,13 @@ fn linux_contained_command_os_with_options(
                     .to_string(),
         });
     }
+    let (temp_home_path, bound_temp_home) = match temp_home {
+        Some(home) => (
+            Some(home.path().to_path_buf()),
+            Some(home.take_child_capability()?),
+        ),
+        None => (None, None),
+    };
     let spec_json = serde_json::to_string(spec).map_err(|e| CapsuleRefused {
         backend_id: sel.backend_id,
         reason: format!("cannot serialize capsule spec: {e}"),
@@ -2600,8 +5410,38 @@ fn linux_contained_command_os_with_options(
     if let Some(ack_fd) = launch_ack_fd {
         cmd.arg("--launch-ack-fd").arg(ack_fd.to_string());
     }
-    if let Some(home) = temp_home {
-        cmd.arg("--temp-home").arg(home);
+    if let Some(coverage_fd) = coverage_status_fd {
+        cmd.arg("--coverage-status-fd").arg(coverage_fd.to_string());
+    }
+    if let (Some(home), Some(capability)) = (&temp_home_path, &bound_temp_home) {
+        cmd.arg("--temp-home")
+            .arg(home)
+            .arg("--temp-home-fd")
+            .arg(capability.inherited.to_string());
+    }
+    if let Some(directory) = bound_directory.as_ref() {
+        cmd.arg("--cwd-fd")
+            .arg(directory.inherited.to_string())
+            .arg("--cwd-root")
+            .arg(&directory.original_root);
+    }
+    if let Some(bound) = bound_inputs.as_ref() {
+        cmd.arg("--staging-fd")
+            .arg(bound.staging.inherited.to_string())
+            .arg("--staging-root")
+            .arg(&bound.staging.original_root);
+        for input in &bound.inputs {
+            cmd.arg("--input-fd")
+                .arg(input.descriptor.inherited.to_string())
+                .arg("--input-name")
+                .arg(&input.name);
+        }
+        cmd.arg("--target-dir-fd")
+            .arg(bound.target.inherited.to_string())
+            .arg("--target-dir-root")
+            .arg(&bound.target.original_root)
+            .arg("--target-dir-visible-root")
+            .arg(&bound.target_visible_root);
     }
     cmd.arg("--").arg(program).args(args);
     configure_linux_launcher_environment(&mut cmd, exact_env, sel.backend_id)?;
@@ -2626,6 +5466,36 @@ fn linux_contained_command_os_with_options(
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            if let Some(directory) = bound_directory.as_ref() {
+                let _keep_destination_reserved = (&directory._reservation, &directory._blockers);
+                if libc::fcntl(directory.inherited, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if let Some(home) = bound_temp_home.as_ref() {
+                let _keep_home_reserved = (&home._reservation, &home._blockers);
+                if libc::fcntl(home.inherited, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if let Some(bound) = bound_inputs.as_ref() {
+                let _keep_staging_reserved =
+                    (&bound.staging._reservation, &bound.staging._blockers);
+                if libc::fcntl(bound.staging.inherited, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let _keep_target_reserved = (&bound.target._reservation, &bound.target._blockers);
+                if libc::fcntl(bound.target.inherited, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for input in &bound.inputs {
+                    let descriptor = &input.descriptor;
+                    let _keep_input_reserved = (&descriptor._reservation, &descriptor._blockers);
+                    if libc::fcntl(descriptor.inherited, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
             if let Some(status_fd) = launch_status_fd {
                 if libc::fcntl(status_fd, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -2633,6 +5503,17 @@ fn linux_contained_command_os_with_options(
             }
             if let Some(ack_fd) = launch_ack_fd {
                 if libc::fcntl(ack_fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if let Some(coverage_fd) = coverage_status_fd {
+                if libc::fcntl(coverage_fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            for descriptor in &extra_bound_fds {
+                let _keep_destination_reserved = (&descriptor._reservation, &descriptor._blockers);
+                if libc::fcntl(descriptor.inherited, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -2691,6 +5572,179 @@ fn reserve_bound_target_fd(
             _blockers: blockers,
         });
     }
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_bound_directory_fd(
+    spec: &CapsuleSpec,
+    source: i32,
+    original_root: &std::path::Path,
+) -> Result<BoundDirectoryFd, CapsuleRefused> {
+    let reserved = reserve_bound_target_fd(spec, source)?;
+    Ok(BoundDirectoryFd {
+        inherited: reserved.inherited,
+        original_root: original_root.to_path_buf(),
+        _reservation: reserved._reservation,
+        _blockers: reserved._blockers,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_bound_launch_inputs(inputs: &[BoundLaunchInput]) -> Result<(), CapsuleRefused> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut approved = 0usize;
+    for input in inputs {
+        let name = input.name.as_str();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.as_bytes().contains(&0)
+            || std::path::Path::new(name).components().count() != 1
+            || !std::path::Path::new(name)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("bound input name {name:?} is not one safe filename component"),
+            });
+        }
+        if !names.insert(name.to_string()) {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("duplicate bound input filename {name:?}"),
+            });
+        }
+        if name == "approved.txt" {
+            approved += 1;
+        } else if !name.ends_with(".whl") {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("bound package input {name:?} must retain its .whl filename"),
+            });
+        }
+        if input.expected_sha256.len() != 64
+            || !input
+                .expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("bound input {name:?} has a non-canonical expected SHA-256 digest"),
+            });
+        }
+    }
+    if approved != 1 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!(
+                "bound-input launch requires exactly one approved.txt (found {approved})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn seal_bound_launch_input(
+    mut input: BoundLaunchInput,
+) -> Result<(std::fs::File, String), CapsuleRefused> {
+    use sha2::{Digest as _, Sha256};
+    use std::os::fd::FromRawFd as _;
+
+    input
+        .source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("rewind bound input {:?}: {error}", input.name),
+        })?;
+    let label = std::ffi::CString::new("tirith-bound-input").expect("literal has no NUL");
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            label.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if raw < 0 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!(
+                "create sealed input {:?}: {}",
+                input.name,
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    // SAFETY: memfd_create returned one fresh owned descriptor.
+    let mut sealed = unsafe { std::fs::File::from_raw_fd(raw as i32) };
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input
+            .source
+            .read(&mut buffer)
+            .map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!("read bound input {:?}: {error}", input.name),
+            })?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        sealed
+            .write_all(&buffer[..count])
+            .map_err(|error| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: format!(
+                    "copy bound input {:?} into sealed storage: {error}",
+                    input.name
+                ),
+            })?;
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != input.expected_sha256 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!(
+                "bound input {:?} digest mismatch: expected {}, got {actual}",
+                input.name, input.expected_sha256
+            ),
+        });
+    }
+    if unsafe { libc::fchmod(std::os::fd::AsRawFd::as_raw_fd(&sealed), 0o444) } != 0 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!(
+                "make sealed input {:?} read-only: {}",
+                input.name,
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&sealed);
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, required) } < 0
+        || unsafe { libc::fcntl(fd, libc::F_GET_SEALS) } & required != required
+    {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!(
+                "fully seal bound input {:?}: {}",
+                input.name,
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    sealed
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("rewind sealed bound input {:?}: {error}", input.name),
+        })?;
+    Ok((sealed, input.name))
 }
 
 /// macOS: re-exec the internal capsule launcher, which closes inherited handles,
@@ -3025,6 +6079,7 @@ fn windows_run_to_completion_os(
         backend_id: sel.backend_id,
         coverage: sel.coverage,
         degraded: false,
+        termination: None,
     })
 }
 
@@ -3080,8 +6135,9 @@ pub fn detect_external_helpers() -> Vec<DetectedHelper> {
 pub struct CapsuleDoctorInfo {
     /// The backend selected for this host.
     pub backend_id: &'static str,
-    /// Whether the backend can fully satisfy a locked-down (deny-all) spec — i.e.
-    /// an enforcing surface like `pkg install` would NOT fail closed here.
+    /// Whether the backend can fully satisfy a locked-down (deny-all) spec. This
+    /// alone does not make `pkg install` available: its dedicated bound-input seam
+    /// also requires x86_64 Linux.
     pub deny_all_enforceable: bool,
     /// The individual coverage flags achieved for a locked-down spec.
     pub fs_read_enforced: bool,
@@ -3138,6 +6194,158 @@ mod tests {
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use tirith_core::capsule::NetworkPolicy;
 
+    #[cfg(target_os = "linux")]
+    fn held_test_home(directory: tempfile::TempDir) -> HeldTempHome {
+        HeldTempHome {
+            directory: HeldEphemeralDirectory::from_tempdir(
+                directory,
+                "landlock-seccomp",
+                "test temporary HOME",
+            )
+            .expect("retain test temporary-HOME capability"),
+            child_capability: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn consume_shared_directory_offset(fd: i32) -> usize {
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(duplicate >= 0, "duplicate fixture directory descriptor");
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        assert!(!stream.is_null(), "open fixture directory stream");
+        let mut entries = 0usize;
+        loop {
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                entries += 1;
+            }
+        }
+        assert_eq!(unsafe { libc::closedir(stream) }, 0);
+        entries
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_launch_proof_fixture() -> (LinuxLaunchProof, std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd as _;
+
+        let (status_reader, status_writer) =
+            create_cloexec_pipe("test target-exec status").expect("status pipe");
+        let (coverage_reader, coverage_writer) =
+            create_cloexec_pipe("test achieved coverage").expect("coverage pipe");
+        drop(coverage_writer);
+
+        let mut ack_fds = [0i32; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    ack_fds.as_mut_ptr(),
+                )
+            },
+            0,
+            "ACK socketpair: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: socketpair returned two fresh owned descriptors.
+        let ack_guard = unsafe { std::fs::File::from_raw_fd(ack_fds[0]) };
+        let ack_parent = unsafe { std::fs::File::from_raw_fd(ack_fds[1]) };
+
+        (
+            LinuxLaunchProof {
+                status_reader,
+                ack_parent: Some(ack_parent),
+                coverage_reader,
+                status_fd: -1,
+                ack_fd: -1,
+                coverage_fd: -1,
+                child_fds: Some(Vec::new()),
+            },
+            status_writer,
+            ack_guard,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_confirmation_keeps_pre_ack_eof_as_refusal() {
+        let (proof, status_writer, _ack_guard) = linux_launch_proof_fixture();
+        drop(status_writer);
+
+        let error = proof
+            .confirm_target_exec(Instant::now() + Duration::from_secs(2))
+            .expect_err("EOF before observation must fail");
+        assert!(
+            matches!(&error, TargetExecConfirmationError::BeforeAck(reason) if reason.contains("before target-exec observation")),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_confirmation_keeps_post_ack_eof_and_failure_as_executed() {
+        use std::io::{Read as _, Write as _};
+        use tirith_core::runner::{TARGET_ACK_RESUME, TARGET_EXEC_OBSERVED, TARGET_LAUNCH_ERROR};
+
+        for terminal_status in [None, Some(TARGET_LAUNCH_ERROR)] {
+            let (proof, mut status_writer, mut ack_guard) = linux_launch_proof_fixture();
+            let launcher = std::thread::spawn(move || {
+                status_writer
+                    .write_all(&[TARGET_EXEC_OBSERVED])
+                    .expect("publish exec observation");
+                let mut ack = Vec::new();
+                ack_guard.read_to_end(&mut ack).expect("receive parent ACK");
+                assert_eq!(ack, [TARGET_ACK_RESUME]);
+                if let Some(status) = terminal_status {
+                    status_writer
+                        .write_all(&[status])
+                        .expect("publish injected terminal failure");
+                }
+                // Dropping the writer reproduces a launcher/guard death after
+                // the parent authorized a target that may already be running.
+            });
+
+            let error = proof
+                .confirm_target_exec(Instant::now() + Duration::from_secs(2))
+                .expect_err("post-ACK EOF/failure must fail");
+            assert!(
+                matches!(&error, TargetExecConfirmationError::AfterAck(_)),
+                "{error:?}"
+            );
+            launcher.join().expect("launcher fixture");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_confirmation_accepts_terminal_resume_and_eof() {
+        use std::io::{Read as _, Write as _};
+        use tirith_core::runner::{TARGET_ACK_RESUME, TARGET_EXEC_OBSERVED, TARGET_LAUNCH_RESUMED};
+
+        let (proof, mut status_writer, mut ack_guard) = linux_launch_proof_fixture();
+        let launcher = std::thread::spawn(move || {
+            status_writer
+                .write_all(&[TARGET_EXEC_OBSERVED])
+                .expect("publish exec observation");
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack).expect("receive parent ACK");
+            assert_eq!(ack, [TARGET_ACK_RESUME]);
+            status_writer
+                .write_all(&[TARGET_LAUNCH_RESUMED])
+                .expect("publish resume proof");
+        });
+
+        proof
+            .confirm_target_exec(Instant::now() + Duration::from_secs(2))
+            .expect("valid terminal resume proof");
+        launcher.join().expect("launcher fixture");
+    }
+
     #[test]
     fn captured_terminal_control_is_withheld_and_forces_nonzero_outcome() {
         let forwardable = sanitize_and_analyze_captured_output(
@@ -3155,6 +6363,7 @@ mod tests {
                 backend_id: "test",
                 coverage: CapsuleCoverage::NONE,
                 degraded: false,
+                termination: None,
             },
             forwardable.blocked,
         );
@@ -3188,6 +6397,86 @@ mod tests {
         assert!(forwardable.blocked);
         assert!(forwardable.stdout.is_empty());
         assert!(String::from_utf8_lossy(&forwardable.stderr).contains("output withheld"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_child_output_blocks_hostile_bytes_with_typed_termination() {
+        let (outcome, forwardable) = bounded_child_output_action(
+            CapsuleOutcome {
+                exit_code: 0,
+                backend_id: "landlock-seccomp",
+                coverage: CapsuleCoverage::NONE,
+                degraded: false,
+                termination: None,
+            },
+            b"safe\x1b]52;c;Zm9yZ2Vk\x07tail",
+            b"",
+        );
+
+        assert!(forwardable.blocked);
+        assert!(forwardable.stdout.is_empty());
+        assert_ne!(outcome.exit_code, 0);
+        assert!(matches!(
+            outcome.termination,
+            Some(CapsuleTermination {
+                kind: CapsuleTerminationKind::OutputPolicy,
+                cleanup_confirmed: true,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_child_output_preserves_benign_sanitized_output() {
+        let (outcome, forwardable) = bounded_child_output_action(
+            CapsuleOutcome {
+                exit_code: 0,
+                backend_id: "landlock-seccomp",
+                coverage: CapsuleCoverage::NONE,
+                degraded: false,
+                termination: None,
+            },
+            b"installed\xff\n",
+            b"ordinary warning\n",
+        );
+
+        assert!(!forwardable.blocked);
+        assert!(std::str::from_utf8(&forwardable.stdout).is_ok());
+        assert!(std::str::from_utf8(&forwardable.stderr).is_ok());
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.termination.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_child_output_suppression_emits_no_stream_but_still_blocks() {
+        let (outcome, presented) = bounded_child_output_presentation(
+            CapsuleOutcome {
+                exit_code: 0,
+                backend_id: "landlock-seccomp",
+                coverage: CapsuleCoverage::NONE,
+                degraded: false,
+                termination: None,
+            },
+            b"safe\x1b]52;c;Zm9yZ2Vk\x07tail",
+            b"pip diagnostic",
+            BoundOutputPresentation::Suppress,
+        );
+
+        assert!(
+            presented.is_none(),
+            "JSON mode must not receive pip streams"
+        );
+        assert!(matches!(
+            outcome.termination,
+            Some(CapsuleTermination {
+                kind: CapsuleTerminationKind::OutputPolicy,
+                cleanup_confirmed: true,
+                ..
+            })
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -3249,212 +6538,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn target_exec_handshake_accepts_only_observed_ack_resumed_eof() {
-        let mut spec = CapsuleSpec::locked_down();
-        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("handshake channel");
-        let mut status_writer = channel
-            .status_writer
-            .try_clone()
-            .expect("clone guard status endpoint");
-        let mut ack_guard = channel
-            .ack_guard
-            .try_clone()
-            .expect("clone guard authorization endpoint");
-        let guard = std::thread::spawn(move || {
-            status_writer
-                .write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
-                .expect("report stopped exec");
-            let mut ack = Vec::new();
-            ack_guard.read_to_end(&mut ack).expect("read one-shot ACK");
-            assert_eq!(ack, [crate::cli::capsule_child::TARGET_ACK_RESUME]);
-            status_writer
-                .write_all(&[crate::cli::capsule_child::TARGET_LAUNCH_RESUMED])
-                .expect("report resumed target");
-        });
-        let authorized = std::sync::atomic::AtomicBool::new(false);
-        channel
-            .wait_for_target_exec_with_authorizer(Duration::from_secs(1), || {
-                authorized.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            })
-            .expect("ordered terminal handshake");
-        guard.join().expect("guard protocol thread");
-        assert!(authorized.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn target_exec_handshake_rejects_invalid_duplicate_and_out_of_order_status() {
-        for sequence in [
-            vec![b'X'],
-            vec![crate::cli::capsule_child::TARGET_LAUNCH_RESUMED],
-        ] {
-            let mut spec = CapsuleSpec::locked_down();
-            let channel =
-                TargetLaunchStatusPipe::create(&mut spec).expect("invalid-sequence channel");
-            let mut writer = channel.status_writer.try_clone().expect("clone status");
-            let guard = std::thread::spawn(move || writer.write_all(&sequence));
-            let refusal = channel
-                .wait_for_target_exec(Duration::from_secs(1))
-                .expect_err("invalid status sequence must fail closed");
-            assert!(
-                refusal.contains("invalid")
-                    || refusal.contains("out-of-order")
-                    || refusal.contains("duplicate"),
-                "{refusal}"
-            );
-            guard
-                .join()
-                .expect("status writer thread")
-                .expect("write invalid status fixture");
-        }
-
-        let mut spec = CapsuleSpec::locked_down();
-        let channel =
-            TargetLaunchStatusPipe::create(&mut spec).expect("duplicate-observation channel");
-        let mut writer = channel.status_writer.try_clone().expect("clone status");
-        let mut ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
-        let guard = std::thread::spawn(move || {
-            writer.write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])?;
-            let mut ack = Vec::new();
-            ack_guard.read_to_end(&mut ack)?;
-            assert_eq!(ack, [crate::cli::capsule_child::TARGET_ACK_RESUME]);
-            writer.write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
-        });
-        let refusal = channel
-            .wait_for_target_exec(Duration::from_secs(1))
-            .expect_err("duplicate OBSERVED after an ACK must fail closed");
-        assert!(refusal.contains("duplicate"), "{refusal}");
-        guard
-            .join()
-            .expect("duplicate-observation thread")
-            .expect("write duplicate observation");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn target_exec_handshake_never_acks_after_authorizer_deadline() {
-        let mut spec = CapsuleSpec::locked_down();
-        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("deadline channel");
-        let mut status_writer = channel.status_writer.try_clone().expect("clone status");
-        let mut ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
-        status_writer
-            .write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
-            .expect("queue OBSERVED before deadline starts");
-        let guard = std::thread::spawn(move || {
-            let mut ack = Vec::new();
-            ack_guard.read_to_end(&mut ack)?;
-            drop(status_writer);
-            Ok::<Vec<u8>, std::io::Error>(ack)
-        });
-        let refusal = channel
-            .wait_for_target_exec_with_authorizer(Duration::from_millis(50), || {
-                std::thread::sleep(Duration::from_millis(100));
-                Ok(())
-            })
-            .expect_err("expired authorization must not resume the target");
-        assert!(refusal.contains("exceeded"), "{refusal}");
-        assert!(
-            guard
-                .join()
-                .expect("guard deadline thread")
-                .expect("read closed ACK")
-                .is_empty(),
-            "an ACK was sent after the monotonic deadline"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn target_exec_authorizer_failure_sends_no_ack_and_accepts_no_resume() {
-        let mut spec = CapsuleSpec::locked_down();
-        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("authorizer channel");
-        let mut status_writer = channel.status_writer.try_clone().expect("clone status");
-        let mut ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
-        status_writer
-            .write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
-            .expect("queue stopped exec observation");
-        let guard = std::thread::spawn(move || {
-            let mut ack = Vec::new();
-            ack_guard.read_to_end(&mut ack)?;
-            drop(status_writer);
-            Ok::<Vec<u8>, std::io::Error>(ack)
-        });
-        let refusal = channel
-            .wait_for_target_exec_with_authorizer(Duration::from_secs(1), || {
-                Err("injected durable commit failure".to_string())
-            })
-            .expect_err("failed parent authorization must keep the target stopped");
-        assert!(refusal.contains("durable commit failure"), "{refusal}");
-        assert!(
-            guard
-                .join()
-                .expect("authorizer failure guard thread")
-                .expect("read ACK EOF")
-                .is_empty(),
-            "parent sent ACK after authorization failure"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn target_exec_handshake_rejects_resumed_prequeued_before_ack() {
-        let mut spec = CapsuleSpec::locked_down();
-        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("causal-order channel");
-        let mut status_writer = channel.status_writer.try_clone().expect("clone status");
-        let mut ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
-        status_writer
-            .write_all(&[
-                crate::cli::capsule_child::TARGET_EXEC_OBSERVED,
-                crate::cli::capsule_child::TARGET_LAUNCH_RESUMED,
-            ])
-            .expect("prequeue causally invalid status");
-        let guard = std::thread::spawn(move || {
-            let mut ack = Vec::new();
-            ack_guard.read_to_end(&mut ack)?;
-            drop(status_writer);
-            Ok::<Vec<u8>, std::io::Error>(ack)
-        });
-        let refusal = channel
-            .wait_for_target_exec(Duration::from_secs(1))
-            .expect_err("RESUMED queued before ACK must fail closed");
-        assert!(refusal.contains("before parent authorization"), "{refusal}");
-        assert!(
-            guard
-                .join()
-                .expect("causal-order guard thread")
-                .expect("read ACK EOF")
-                .is_empty(),
-            "causally invalid guard received ACK"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn closed_ack_reader_returns_error_without_sigpipe_terminating_parent() {
-        let mut spec = CapsuleSpec::locked_down();
-        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("closed-ACK channel");
-        let mut status_writer = channel.status_writer.try_clone().expect("clone status");
-        let ack_guard = channel.ack_guard.try_clone().expect("clone ACK guard");
-        let guard = std::thread::spawn(move || {
-            drop(ack_guard);
-            status_writer.write_all(&[crate::cli::capsule_child::TARGET_EXEC_OBSERVED])
-        });
-        // The channel drops its original guard endpoint before processing. The
-        // thread above drops the final peer, so send(MSG_NOSIGNAL) must return an
-        // ordinary error rather than delivering SIGPIPE to Tirith.
-        let refusal = channel
-            .wait_for_target_exec(Duration::from_secs(1))
-            .expect_err("closed ACK peer must fail closed");
-        assert!(refusal.contains("without SIGPIPE"), "{refusal}");
-        guard
-            .join()
-            .expect("closed-ACK thread")
-            .expect("write OBSERVED");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn bound_destination_is_owned_across_dense_fd_command_spawn() {
         use std::io::{Seek as _, Write as _};
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -3511,7 +6594,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn file_shape_reserves_two_objects_and_both_protocol_endpoints_under_fd_pressure() {
+    fn file_shape_reserves_both_content_objects_under_fd_pressure() {
         use std::io::{Seek as _, Write as _};
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::process::CommandExt as _;
@@ -3535,9 +6618,8 @@ mod tests {
 
         let mut spec = CapsuleSpec::locked_down();
         spec.resources.max_open_files = Some(96);
-        let channel = TargetLaunchStatusPipe::create(&mut spec).expect("full protocol channels");
-        let bound_interpreter = reserve_bound_target_fd(&spec, interpreter.as_raw_fd())
-            .expect("reserve interpreter after channels");
+        let bound_interpreter =
+            reserve_bound_target_fd(&spec, interpreter.as_raw_fd()).expect("reserve interpreter");
         let interpreter_fd = bound_interpreter.inherited;
         spec.handles.extra_unix_fds.push(interpreter_fd);
         let bound_script = reserve_bound_target_fd(&spec, script.as_raw_fd())
@@ -3545,9 +6627,7 @@ mod tests {
         let script_fd = bound_script.inherited;
         spec.handles.extra_unix_fds.push(script_fd);
 
-        let status_fd = channel.status_writer_fd();
-        let ack_fd = channel.ack_guard_fd();
-        let internal = [status_fd, ack_fd, interpreter_fd, script_fd];
+        let internal = [interpreter_fd, script_fd];
         for (index, fd) in internal.iter().enumerate() {
             assert!((3..96).contains(fd));
             assert!(
@@ -3560,8 +6640,7 @@ mod tests {
         let shell = format!(
             "i=$(/bin/cat <&{interpreter_fd}); s=$(/bin/cat <&{script_fd}); \
              [ \"$i\" = interpreter ] && [ \"$s\" = script ] && \
-             [ -p /proc/self/fd/{status_fd} ] && [ -S /proc/self/fd/{ack_fd} ] && \
-             printf 'interpreter|script|pipe|socket'"
+             printf 'interpreter|script'"
         );
         let mut command = Command::new("/bin/sh");
         command
@@ -3577,7 +6656,7 @@ mod tests {
                     &bound_script._reservation,
                     &bound_script._blockers,
                 );
-                for fd in [interpreter_fd, script_fd, status_fd, ack_fd] {
+                for fd in [interpreter_fd, script_fd] {
                     if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -3587,21 +6666,20 @@ mod tests {
         }
         let output = command
             .output()
-            .expect("spawn exact four-FD File shape under dense pressure");
+            .expect("spawn exact two-object File shape under dense pressure");
         assert!(
             output.status.success(),
             "full File shape lost an FD: status={:?} stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.stdout, b"interpreter|script|pipe|socket");
-        drop(channel);
+        assert_eq!(output.stdout, b"interpreter|script");
 
         let mut too_small = CapsuleSpec::locked_down();
-        too_small.resources.max_open_files = Some(8);
-        let refusal = TargetLaunchStatusPipe::create(&mut too_small)
-            .expect_err("dense full-shape budget must fail closed deterministically");
-        assert!(refusal.reason.contains("fd limit"), "{refusal}");
+        too_small.resources.max_open_files = Some(3);
+        let refusal = reserve_bound_target_fd(&too_small, interpreter.as_raw_fd())
+            .expect_err("content-object budget must fail closed deterministically");
+        assert!(refusal.reason.contains("RLIMIT_NOFILE"), "{refusal}");
     }
 
     #[cfg(target_os = "linux")]
@@ -3672,18 +6750,453 @@ mod tests {
             .position(|arg| arg == "--temp-home")
             .expect("launcher receives --temp-home");
         assert_eq!(argv[option + 1].as_os_str(), temp_home.as_os_str());
-        assert!(serialized.filesystem.read_roots.contains(&temp_home));
-        assert!(serialized.filesystem.write_roots.contains(&temp_home));
+        let fd_option = argv
+            .iter()
+            .position(|arg| arg == "--temp-home-fd")
+            .expect("launcher receives the paired temporary-HOME capability");
+        let temp_fd = argv[fd_option + 1]
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+            .expect("temporary-HOME descriptor is numeric");
+        assert!(serialized.handles.extra_unix_fds.contains(&temp_fd));
+        assert!(!serialized.filesystem.read_roots.contains(&temp_home));
+        assert_eq!(
+            serialized
+                .filesystem
+                .write_roots
+                .iter()
+                .filter(|root| *root == &temp_home)
+                .count(),
+            1
+        );
 
         drop(prepared);
         assert!(
             !temp_home.exists(),
-            "dropping an unspawned prepared command must remove its temp HOME"
+            "confirmed cleanup removes the unchanged root with one non-recursive unlink"
         );
         assert!(
             private_paths.iter().all(|path| !path.exists()),
-            "dropping the parent guard must recursively remove every advertised XDG directory"
+            "dropping the parent guard must capability-clean every advertised XDG directory"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_logical_target_root_is_normalized_once_without_becoming_path_authority() {
+        let parent = tempfile::tempdir().expect("target parent");
+        let target = parent.path().join("absent-final").join("site-packages");
+        assert!(!target.exists(), "fixture target must remain absent");
+        let mut spec = CapsuleSpec::locked_down();
+        spec.filesystem.read_roots.clear();
+        spec.filesystem.write_roots = vec![target.clone()];
+        spec.filesystem.deny_roots.clear();
+
+        let (filesystem, logical_root) =
+            normalize_bound_target_policy(&spec, &target).expect("normalize absent final root");
+        assert_eq!(logical_root, target);
+        assert_eq!(filesystem.write_roots, vec![target.clone()]);
+        assert!(
+            !target.exists(),
+            "normalization must not create or reopen the final root"
+        );
+
+        spec.filesystem.write_roots.push(target.clone());
+        let duplicate = normalize_bound_target_policy(&spec, &target)
+            .expect_err("duplicate logical target authority must fail");
+        assert!(duplicate.reason.contains("exactly once"), "{duplicate}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_ephemeral_directory_cleans_mode_zero_contents_and_unlinks_unchanged_root() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().expect("ephemeral parent");
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-held-legitimate-")
+            .tempdir_in(parent.path())
+            .expect("held directory");
+        let path = directory.path().to_path_buf();
+        std::fs::create_dir(path.join("cache")).expect("create cached directory");
+        std::fs::write(path.join("cache/data"), b"large cache").expect("create cached data");
+        let mut held = HeldEphemeralDirectory::from_tempdir(
+            directory,
+            "landlock-seccomp",
+            "test ephemeral directory",
+        )
+        .expect("retain directory capability");
+
+        let enumerated = consume_shared_directory_offset(held.handle().as_raw_fd());
+        assert!(enumerated > 0, "fixture must advance getdents to EOF");
+        std::fs::set_permissions(path.join("cache"), std::fs::Permissions::from_mode(0o000))
+            .expect("make nested cache mode zero");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("make held root mode zero");
+        held.cleanup_with_hook(|| {})
+            .expect("descriptor cleanup restores mode and removes mode-zero contents");
+        drop(held);
+
+        assert!(
+            !path.exists(),
+            "cleanup must remove the unchanged empty root non-recursively"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_ephemeral_directory_preserve_is_one_shot_and_non_panicking() {
+        let parent = tempfile::tempdir().expect("ephemeral parent");
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-held-preserve-")
+            .tempdir_in(parent.path())
+            .expect("held directory");
+        let path = directory.path().to_path_buf();
+        let held = HeldEphemeralDirectory::from_tempdir(
+            directory,
+            "landlock-seccomp",
+            "test ephemeral directory",
+        )
+        .expect("retain directory capability");
+
+        held.preserve();
+
+        assert!(
+            path.is_dir(),
+            "preserved directory was unexpectedly removed"
+        );
+        std::fs::remove_dir(&path).expect("remove preserved empty fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_ephemeral_constructor_disarms_tempdir_on_identity_swap_error() {
+        let parent = tempfile::tempdir().expect("ephemeral parent");
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-held-constructor-swap-")
+            .tempdir_in(parent.path())
+            .expect("held directory");
+        let path = directory.path().to_path_buf();
+        let displaced = parent.path().join("constructor-displaced");
+        let marker = path.join("replacement-marker");
+
+        let error = HeldEphemeralDirectory::from_tempdir_with_hook(
+            directory,
+            "landlock-seccomp",
+            "test ephemeral directory",
+            || {
+                std::fs::rename(&path, &displaced).expect("displace constructed directory");
+                std::fs::create_dir(&path).expect("create constructor replacement");
+                std::fs::write(&marker, b"replacement").expect("mark constructor replacement");
+            },
+        )
+        .expect_err("constructor identity swap must fail");
+
+        assert!(error.reason.contains("newly-created retained"), "{error}");
+        assert_eq!(
+            std::fs::read(&marker).expect("replacement survives"),
+            b"replacement"
+        );
+        assert!(displaced.is_dir(), "original directory must be preserved");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_cleanup_rejects_leaf_replacement_before_unlink() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().expect("cleanup root");
+        let victim = root.path().join("victim");
+        let displaced = root.path().join("displaced-victim");
+        std::fs::write(&victim, b"original").expect("create original leaf");
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root.path())
+            .expect("open cleanup root");
+        let mut swapped = false;
+        let error = remove_owned_directory_contents_with_hook(
+            handle.as_raw_fd(),
+            &mut |_, name, is_directory| {
+                if !swapped && !is_directory && name.to_bytes() == b"victim" {
+                    std::fs::rename(&victim, &displaced).expect("displace original leaf");
+                    std::fs::write(&victim, b"replacement").expect("install replacement leaf");
+                    swapped = true;
+                }
+            },
+        )
+        .expect_err("leaf identity replacement must stop cleanup");
+        assert!(
+            error.to_string().contains("no longer identifies"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("replacement survives"),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("original survives"),
+            b"original"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_cleanup_traverses_a_wide_mixed_directory() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().expect("cleanup root");
+        for index in 0..257 {
+            std::fs::write(root.path().join(format!("file-{index:04}")), b"payload")
+                .expect("create wide cleanup entry");
+            std::fs::create_dir(root.path().join(format!("directory-{index:04}")))
+                .expect("create wide cleanup directory");
+        }
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root.path())
+            .expect("open cleanup root");
+
+        remove_owned_directory_contents(handle.as_raw_fd())
+            .expect("cursor traversal removes every wide-directory entry");
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .expect("read cleaned root")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_cleanup_rejects_directory_replacement_before_unlink() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().expect("cleanup root");
+        let victim = root.path().join("victim-dir");
+        let displaced = root.path().join("displaced-victim-dir");
+        std::fs::create_dir(&victim).expect("create original directory");
+        std::fs::write(victim.join("large-payload"), b"payload")
+            .expect("populate original directory");
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root.path())
+            .expect("open cleanup root");
+        let marker = victim.join("replacement-marker");
+        let mut swapped = false;
+        let error = remove_owned_directory_contents_with_hook(
+            handle.as_raw_fd(),
+            &mut |_, name, is_directory| {
+                if !swapped && is_directory && name.to_bytes() == b"victim-dir" {
+                    std::fs::rename(&victim, &displaced).expect("displace original directory");
+                    std::fs::create_dir(&victim).expect("install replacement directory");
+                    std::fs::write(&marker, b"replacement").expect("mark replacement directory");
+                    swapped = true;
+                }
+            },
+        )
+        .expect_err("directory identity replacement must stop cleanup");
+        assert!(
+            error.to_string().contains("no longer identifies"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("replacement survives"),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read_dir(&displaced)
+                .expect("read cleaned displaced original")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confined_descriptor_cleanup_refuses_a_subtree_moved_outside_its_root() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let parent = tempfile::tempdir().expect("cleanup parent");
+        let root = parent.path().join("owned-root");
+        let victim = root.join("victim");
+        let displaced = parent.path().join("displaced-victim");
+        let replacement_marker = victim.join("replacement-marker");
+        std::fs::create_dir_all(&victim).expect("create victim directory");
+        std::fs::write(victim.join("payload"), b"owned payload").expect("create victim payload");
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&root)
+            .expect("open cleanup root");
+
+        let (move_tx, move_rx) = std::sync::mpsc::channel();
+        let (moved_tx, moved_rx) = std::sync::mpsc::channel();
+        let attacker_victim = victim.clone();
+        let attacker_displaced = displaced.clone();
+        let attacker_marker = replacement_marker.clone();
+        let attacker = std::thread::spawn(move || {
+            move_rx.recv().expect("wait for cleanup descent");
+            std::fs::rename(&attacker_victim, &attacker_displaced)
+                .expect("move retained subtree outside cleanup root");
+            std::fs::create_dir(&attacker_victim).expect("install replacement directory");
+            std::fs::write(&attacker_marker, b"replacement").expect("mark replacement directory");
+            moved_tx.send(()).expect("release cleanup worker");
+        });
+
+        let error = remove_owned_directory_contents_confined_with_hook(
+            handle.as_raw_fd(),
+            move |_, name, is_directory| {
+                if !is_directory && name.to_bytes() == b"payload" {
+                    move_tx.send(()).expect("request subtree move");
+                    moved_rx.recv().expect("wait for subtree move");
+                }
+            },
+        )
+        .expect_err("Landlock must stop cleanup after the retained subtree leaves its root");
+        attacker.join().expect("attacker thread");
+
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("payload")).expect("displaced payload survives"),
+            b"owned payload"
+        );
+        assert_eq!(
+            std::fs::read(&replacement_marker).expect("replacement survives"),
+            b"replacement"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confined_descriptor_cleanup_handles_depth_beyond_path_max() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let parent = tempfile::tempdir().expect("cleanup parent");
+        let root = parent.path().join("deep-root");
+        std::fs::create_dir(&root).expect("create cleanup root");
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&root)
+            .expect("open cleanup root");
+        let mut current = open_cleanup_directory(handle.as_raw_fd()).expect("duplicate root fd");
+
+        // 320 components of this width exceed Linux PATH_MAX, but only the
+        // current descriptor is retained while constructing the fixture.
+        for index in 0..320 {
+            let name = std::ffi::CString::new(format!("segment-{index:04}-padding"))
+                .expect("valid component");
+            assert_eq!(
+                unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) },
+                0,
+                "create deep component {index}: {}",
+                std::io::Error::last_os_error()
+            );
+            let next = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            assert!(
+                next >= 0,
+                "open deep component {index}: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: openat returned a fresh owned descriptor.
+            current = unsafe { std::os::fd::OwnedFd::from_raw_fd(next) };
+        }
+        let leaf = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c"payload".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        assert!(
+            leaf >= 0,
+            "create deep leaf: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            libc::close(leaf);
+        }
+        drop(current);
+
+        remove_owned_directory_contents(handle.as_raw_fd())
+            .expect("constant-resource cleanup removes the deep tree");
+        assert_eq!(
+            std::fs::read_dir(&root).expect("read cleaned root").count(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_ephemeral_cleanup_after_disarm_cannot_delete_a_replacement_name() {
+        let parent = tempfile::tempdir().expect("ephemeral parent");
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-held-swapped-")
+            .tempdir_in(parent.path())
+            .expect("held directory");
+        let path = directory.path().to_path_buf();
+        let displaced = parent.path().join("displaced-held-directory");
+        let owned_cache = path.join("owned-cache");
+        std::fs::create_dir(&owned_cache).expect("create owned cached directory");
+        std::fs::write(owned_cache.join("payload"), b"large cache")
+            .expect("create owned cached payload");
+        let mut held = HeldEphemeralDirectory::from_tempdir(
+            directory,
+            "landlock-seccomp",
+            "test ephemeral directory",
+        )
+        .expect("retain directory capability");
+        let marker = path.join("replacement-marker");
+
+        let cleanup_error = held
+            .cleanup_with_hook(|| {
+                // Deterministically replace the visible name after path-based TempDir
+                // cleanup and identity verification but before non-recursive unlink.
+                std::fs::rename(&path, &displaced).expect("displace held directory");
+                std::fs::create_dir(&path).expect("install replacement directory");
+                std::fs::write(&marker, b"replacement").expect("mark replacement directory");
+            })
+            .expect_err("nonempty post-check replacement must make root unlink fail safely");
+        assert!(
+            matches!(
+                cleanup_error.raw_os_error(),
+                Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+            ),
+            "{cleanup_error}"
+        );
+
+        assert_eq!(
+            std::fs::read(&marker).expect("replacement marker survives cleanup"),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read_dir(&displaced)
+                .expect("read capability-cleaned displaced root")
+                .count(),
+            0,
+            "the original held contents must still be cleaned after its name is swapped"
+        );
+        drop(held);
     }
 
     #[cfg(target_os = "linux")]
@@ -3712,8 +7225,9 @@ mod tests {
         let pid = child.id();
         let managed = ManagedChild {
             child,
-            _temp_home: Some(temp_home),
+            _temp_home: Some(held_test_home(temp_home)),
             process_group: Some(pid),
+            supervision: None,
         };
         drop(managed);
 
@@ -3755,8 +7269,9 @@ mod tests {
         let group = child.id();
         let mut managed = ManagedChild {
             child,
-            _temp_home: Some(temp_home),
+            _temp_home: Some(held_test_home(temp_home)),
             process_group: Some(group),
+            supervision: None,
         };
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {
@@ -3831,12 +7346,12 @@ mod tests {
                 .tempdir_in("/tmp")
                 .expect("worker-failure temp HOME");
             let temp_path = temp_home.path().to_path_buf();
-            let mut temp_home = Some(temp_home);
+            let mut temp_home = Some(held_test_home(temp_home));
 
             let started = Instant::now();
             let refusal = supervise_piped_child_with_worker_hooks(
                 child,
-                b"",
+                Some(b""),
                 worker_failure_limits(),
                 &mut temp_home,
                 SupervisedWorkerTestHooks {
@@ -3871,7 +7386,7 @@ mod tests {
             drop(temp_home);
             assert!(
                 !temp_path.exists(),
-                "confirmed cleanup must permit temporary HOME removal"
+                "confirmed cleanup must remove temporary HOME"
             );
         }
     }
@@ -3886,11 +7401,11 @@ mod tests {
             .tempdir_in("/tmp")
             .expect("unconfirmed-cleanup temp HOME");
         let temp_path = temp_home.path().to_path_buf();
-        let mut temp_home = Some(temp_home);
+        let mut temp_home = Some(held_test_home(temp_home));
 
         let refusal = supervise_piped_child_with_worker_hooks(
             child,
-            b"",
+            Some(b""),
             worker_failure_limits(),
             &mut temp_home,
             SupervisedWorkerTestHooks {
@@ -4006,6 +7521,7 @@ mod tests {
                 backend_id: plan.reported_selected.backend_id,
                 coverage: plan.reported_selected.coverage,
                 degraded: false,
+                termination: None,
             },
             stdout: output.stdout,
             stderr: output.stderr,
@@ -4255,6 +7771,7 @@ mod tests {
             tirith_core::runner::PipeInterpreter::Sh,
             &[],
             b"printf remote-bytes\n",
+            None,
             Some(std::path::Path::new("/")),
             &[],
         )
@@ -4364,6 +7881,40 @@ mod tests {
         assert_eq!(argv[separator + 2].as_encoded_bytes(), raw);
     }
 
+    /// Seatbelt grants are pathname-based, so they cannot safely authorize a
+    /// transaction vnode held only by directory fd across a same-UID rename race.
+    /// This retained directory-bound compatibility seam therefore refuses before
+    /// any interpreter spawn; production package installs use the bound-input seam.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_capability_bound_install_refuses_before_spawn() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transaction = temp.path().join("transaction");
+        std::fs::create_dir(&transaction).expect("create transaction");
+        let held = std::fs::File::open(&transaction).expect("hold transaction directory");
+        let marker = temp.path().join("spawned");
+
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = tirith_core::capsule::ResourceLimits::default();
+        spec.filesystem.read_roots.push(transaction.clone());
+        let result = run_to_completion_bound_directory(
+            &spec,
+            "/usr/bin/touch",
+            &[marker.display().to_string()],
+            &transaction,
+            held,
+            &[],
+            DegradedPolicy::FailClosed,
+        );
+        let refusal = result.expect_err("macOS capability-bound launch must fail closed");
+        assert!(
+            refusal.reason.contains("cannot bind a filesystem grant"),
+            "unexpected refusal: {refusal}"
+        );
+        assert!(!marker.exists(), "refusal must occur before target spawn");
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "enforcing capsule surface")]
@@ -4454,10 +8005,10 @@ mod tests {
             },
             handles: HandlePolicy::default(),
             // Keep this env-focused spec fully enforceable on macOS: request only
-            // the dimensions `apply_macos_rlimits` actually applies.
+            // CPU and descriptor limits. Darwin's memory rlimits are not an
+            // enforceable address-space ceiling and are intentionally unclaimed.
             resources: ResourceLimits {
                 cpu_seconds: Some(30),
-                memory_bytes: Some(512 * 1024 * 1024),
                 max_open_files: Some(64),
                 ..ResourceLimits::default()
             },
@@ -4654,6 +8205,7 @@ mod tests {
             backend_id: "test",
             coverage,
             degraded: true,
+            termination: None,
         };
         assert!(outcome.coverage_summary().contains("rlimits=false"));
 
@@ -4768,6 +8320,7 @@ mod tests {
                 handles_isolated: true,
             },
             degraded: false,
+            termination: None,
         };
         let s = outcome.coverage_summary();
         assert!(s.contains("fs_read=true"));

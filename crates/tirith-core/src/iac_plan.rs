@@ -471,7 +471,7 @@ fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, 
     let plan_path_string = plan_path.to_string_lossy().into_owned();
     // The supervisor drains and caps stderr independently from the plan JSON.
     let executable =
-        crate::trusted_child::resolve_ambient(program).map_err(|error| error.to_string())?;
+        crate::trusted_child::resolve_system_helper(program).map_err(|error| error.to_string())?;
     let outcome = run_trusted_with_timeout(
         &executable,
         &["show", "-json", plan_path_string.as_str()],
@@ -509,6 +509,9 @@ fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, 
         ShellTimeoutOutcome::NotFound => Err(format!("{program}: binary not found on PATH")),
         ShellTimeoutOutcome::SpawnError(reason) => Err(reason),
         ShellTimeoutOutcome::WaitError(reason) => Err(reason),
+        ShellTimeoutOutcome::CleanupError(reason) => Err(format!(
+            "{program} show -json process-tree cleanup failed: {reason}"
+        )),
         ShellTimeoutOutcome::Timeout {
             cleanup_succeeded: true,
         } => Err(format!(
@@ -573,6 +576,45 @@ pub fn looks_like_json(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: every caller holds TEST_ENV_LOCK until Drop restores the
+            // previous value.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the owning test still holds TEST_ENV_LOCK.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_marker_executable(path: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let marker = marker.display().to_string().replace('\'', "'\"'\"'");
+        std::fs::write(path, format!("#!/bin/sh\n: > '{marker}'\nexit 97\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     const TF_PLAN_JSON: &str = r#"{
         "format_version": "1.2",
         "terraform_version": "1.5.7",
@@ -604,6 +646,44 @@ mod tests {
             }
         ]
     }"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn terraform_show_rejects_path_shadowed_terraform_and_tofu() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temporary = tempfile::Builder::new()
+            .prefix("tirith-iac-shadow-")
+            .tempdir_in(home::home_dir().expect("test account home"))
+            .unwrap();
+        let shadow_bin = temporary.path().join("shadow-bin");
+        std::fs::create_dir(&shadow_bin).unwrap();
+        let marker = temporary.path().join("iac-renderer-executed");
+        for helper in ["terraform", "tofu"] {
+            write_marker_executable(&shadow_bin.join(helper), &marker);
+        }
+
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![shadow_bin];
+        path_entries.extend(std::env::split_paths(&inherited));
+        let _path = EnvVarGuard::set("PATH", std::env::join_paths(path_entries).unwrap());
+        let plan = temporary.path().join("reviewed.tfplan");
+        std::fs::write(&plan, b"reviewed plan bytes").unwrap();
+
+        for (helper, tool) in [("terraform", PlanTool::Terraform), ("tofu", PlanTool::Tofu)] {
+            let error = run_terraform_show_json(&plan, tool)
+                .expect_err("a first-hit renderer under a same-UID home directory must be refused");
+            assert!(
+                error.contains("untrusted executable") && error.contains(helper),
+                "unexpected {helper} provenance error: {error}"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "plan rendering must not execute PATH-shadowed terraform or tofu"
+        );
+    }
 
     const PULUMI_PLAN_JSON: &str = r#"{
         "steps": [

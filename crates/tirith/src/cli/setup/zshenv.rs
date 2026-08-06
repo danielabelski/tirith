@@ -1,8 +1,13 @@
-use std::process::Command;
+use std::path::PathBuf;
 
 const BEGIN_MARKER: &str = "# BEGIN tirith-guard v1";
 const END_MARKER: &str = "# END tirith-guard";
-const BEGIN_PREFIX: &str = "# BEGIN tirith-guard";
+const TRUSTED_ZSH_SEARCH_DIRS: [&str; 4] = [
+    "/bin",
+    "/usr/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
 
 /// Install or print the zshenv guard for non-interactive `zsh -lc` interception.
 ///
@@ -41,7 +46,7 @@ pub fn offer_zshenv_guard(
             let existing = snapshot.text(&zshenv_path)?.unwrap_or_default();
             let begin_count = existing
                 .lines()
-                .filter(|line| line.starts_with(BEGIN_PREFIX))
+                .filter(|line| *line == BEGIN_MARKER)
                 .count();
             validate_marker_pairing(existing)?;
 
@@ -59,6 +64,14 @@ pub fn offer_zshenv_guard(
                     existing.to_string()
                 }
                 1 if !force => {
+                    let matches = extract_guard_block(existing)
+                        .is_some_and(|block| block == managed_block.as_str());
+                    if !matches {
+                        return Err(format!(
+                            "tirith: tirith-guard block in {} differs from the expected guard — use --force to repair",
+                            zshenv_path.display()
+                        ));
+                    }
                     eprintln!(
                         "tirith: tirith-guard already in {}, up to date",
                         zshenv_path.display()
@@ -117,7 +130,7 @@ pub fn offer_zshenv_guard(
 pub(crate) fn validate_marker_pairing(content: &str) -> Result<(), String> {
     let mut in_block = false;
     for line in content.lines() {
-        if line.starts_with(BEGIN_PREFIX) {
+        if line == BEGIN_MARKER {
             if in_block {
                 return Err(
                     "tirith: corrupted tirith-guard block in ~/.zshenv — nested BEGIN markers, fix manually"
@@ -125,7 +138,7 @@ pub(crate) fn validate_marker_pairing(content: &str) -> Result<(), String> {
                 );
             }
             in_block = true;
-        } else if line.starts_with(END_MARKER) {
+        } else if line == END_MARKER {
             if !in_block {
                 return Err(
                     "tirith: corrupted tirith-guard block in ~/.zshenv — END marker without BEGIN, fix manually"
@@ -144,17 +157,40 @@ pub(crate) fn validate_marker_pairing(content: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Extract one validated managed block as its exact source slice. Pairing and
+/// multiplicity are checked by the caller before this helper is used. Keeping
+/// the original line endings is intentional: a CRLF block or a block missing
+/// its final LF is drift, not an exact match for the generated block.
+fn extract_guard_block(content: &str) -> Option<&str> {
+    let mut block_start = None;
+    let mut offset = 0;
+
+    for source_line in content.split_inclusive('\n') {
+        let line = source_line.strip_suffix('\n').unwrap_or(source_line);
+        match block_start {
+            None if line == BEGIN_MARKER => block_start = Some(offset),
+            Some(start) if line == END_MARKER => {
+                return Some(&content[start..offset + source_line.len()]);
+            }
+            _ => {}
+        }
+        offset += source_line.len();
+    }
+
+    None
+}
+
 /// Remove all lines between BEGIN and END tirith-guard markers (inclusive).
 pub(crate) fn remove_guard_blocks(content: &str) -> String {
     let mut result = Vec::new();
     let mut suppressing = false;
 
     for line in content.lines() {
-        if line.starts_with(BEGIN_PREFIX) {
+        if line == BEGIN_MARKER {
             suppressing = true;
             continue;
         }
-        if line.starts_with(END_MARKER) {
+        if line == END_MARKER {
             suppressing = false;
             continue;
         }
@@ -173,20 +209,60 @@ pub(crate) fn remove_guard_blocks(content: &str) -> String {
 /// Run `zsh -n` on the snippet to validate syntax before writing.
 /// Skipped in dry-run mode (caller is responsible for gating).
 pub(crate) fn validate_zsh_syntax(snippet: &str) -> Result<(), String> {
-    let output = Command::new("zsh")
-        .arg("-n")
-        .arg("-c")
-        .arg(snippet)
-        .output()
-        .map_err(|e| format!("zsh -n failed to start: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "tirith: zshenv guard snippet has invalid zsh syntax (bug in embedded asset): {stderr}"
-        ));
+    let executable = resolve_trusted_zsh()?;
+    let spec = tirith_core::trusted_child::ChildSpec::new(
+        ["-f", "-n", "-c", snippet],
+        tirith_core::trusted_child::ChildLimits::new(
+            std::time::Duration::from_secs(3),
+            64 * 1024,
+            64 * 1024,
+        ),
+    );
+    match tirith_core::trusted_child::run(&executable, &spec) {
+        tirith_core::trusted_child::ChildOutcome::Completed { status, .. }
+            if status.success() =>
+        {
+            Ok(())
+        }
+        tirith_core::trusted_child::ChildOutcome::Completed { stderr, .. } => {
+            let stderr = String::from_utf8_lossy(&stderr);
+            Err(format!(
+                "tirith: zshenv guard snippet has invalid zsh syntax (bug in embedded asset): {stderr}"
+            ))
+        }
+        tirith_core::trusted_child::ChildOutcome::SpawnError(reason) => {
+            Err(format!("trusted zsh syntax check failed to start: {reason}"))
+        }
+        tirith_core::trusted_child::ChildOutcome::WaitError(reason) => {
+            Err(format!("trusted zsh syntax check wait failed: {reason}"))
+        }
+        tirith_core::trusted_child::ChildOutcome::CleanupError(reason) => Err(format!(
+            "trusted zsh syntax check process-tree cleanup failed: {reason}"
+        )),
+        tirith_core::trusted_child::ChildOutcome::Timeout { cleanup_succeeded } => Err(format!(
+            "trusted zsh syntax check timed out (process-tree cleanup succeeded: {cleanup_succeeded})"
+        )),
+        tirith_core::trusted_child::ChildOutcome::OutputLimitExceeded {
+            stream,
+            cleanup_succeeded,
+        } => Err(format!(
+            "trusted zsh syntax check exceeded its {stream:?} limit (process-tree cleanup succeeded: {cleanup_succeeded})"
+        )),
     }
-    Ok(())
+}
+
+/// Resolve zsh only from fixed global system locations, then apply the shared
+/// full lexical-selection and canonical-target provenance policy. The two Nix
+/// roots are global root-managed profiles; per-user Nix profiles are omitted.
+fn resolve_trusted_zsh() -> Result<tirith_core::trusted_child::TrustedExecutable, String> {
+    let search_path = std::env::join_paths(TRUSTED_ZSH_SEARCH_DIRS)
+        .map_err(|error| format!("could not construct trusted zsh search path: {error}"))?;
+    tirith_core::trusted_child::resolve_system_helper_on_path("zsh", &search_path)
+        .map_err(|error| format!("trusted system zsh not found: {error}"))
+}
+
+pub(crate) fn trusted_zsh_executable() -> Result<PathBuf, String> {
+    resolve_trusted_zsh().map(|executable| executable.path().to_path_buf())
 }
 
 #[cfg(test)]
@@ -198,6 +274,22 @@ mod tests {
         let content =
             "some stuff\n# BEGIN tirith-guard v1\nguard code\n# END tirith-guard\nmore stuff\n";
         assert!(validate_marker_pairing(content).is_ok());
+    }
+
+    #[test]
+    fn trusted_zsh_search_is_fixed_to_global_root_managed_profiles() {
+        assert_eq!(
+            TRUSTED_ZSH_SEARCH_DIRS,
+            [
+                "/bin",
+                "/usr/bin",
+                "/run/current-system/sw/bin",
+                "/nix/var/nix/profiles/default/bin",
+            ]
+        );
+        assert!(TRUSTED_ZSH_SEARCH_DIRS
+            .iter()
+            .all(|path| !path.contains("per-user") && !path.contains(".nix-profile")));
     }
 
     #[test]
@@ -234,6 +326,24 @@ mod tests {
     }
 
     #[test]
+    fn prefix_like_comments_are_not_markers_or_removed() {
+        let content =
+            "# BEGIN tirith-guard migration notes\nkeep this\n# END tirith-guard migration notes\n";
+        assert!(validate_marker_pairing(content).is_ok());
+        assert_eq!(remove_guard_blocks(content), content);
+        assert!(extract_guard_block(content).is_none());
+    }
+
+    #[test]
+    fn extract_guard_block_returns_complete_exact_block() {
+        let content = "before\n# BEGIN tirith-guard v1\nexact body\n# END tirith-guard\nafter\n";
+        assert_eq!(
+            extract_guard_block(content),
+            Some("# BEGIN tirith-guard v1\nexact body\n# END tirith-guard\n")
+        );
+    }
+
+    #[test]
     fn remove_single_block() {
         let content = "before\n# BEGIN tirith-guard v1\nguard\n# END tirith-guard\nafter\n";
         let result = remove_guard_blocks(content);
@@ -264,12 +374,8 @@ mod tests {
     #[test]
     fn valid_zsh_syntax() {
         let snippet = "if [[ -n \"${ZSH_EXECUTION_STRING:-}\" ]]; then\n  echo hello\nfi\n";
-        if std::process::Command::new("zsh")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping validate_zsh_syntax test: zsh not found");
+        if trusted_zsh_executable().is_err() {
+            eprintln!("skipping validate_zsh_syntax test: trusted system zsh not found");
             return;
         }
         assert!(validate_zsh_syntax(snippet).is_ok());
@@ -278,15 +384,55 @@ mod tests {
     #[test]
     fn invalid_zsh_syntax() {
         let snippet = "if [[ -n \"${FOO}\" ]]; then\n  # missing fi\n";
-        if std::process::Command::new("zsh")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping validate_zsh_syntax test: zsh not found");
+        if trusted_zsh_executable().is_err() {
+            eprintln!("skipping validate_zsh_syntax test: trusted system zsh not found");
             return;
         }
         assert!(validate_zsh_syntax(snippet).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn syntax_validation_does_not_source_ambient_zdotdir() {
+        use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+        if trusted_zsh_executable().is_err() {
+            eprintln!("skipping validate_zsh_syntax test: trusted system zsh not found");
+            return;
+        }
+        with_fake_env(false, |home, _cwd| {
+            let sentinel = home.join("startup-file-ran");
+            let quoted =
+                super::super::shell_profile::shell_quote(sentinel.to_str().unwrap(), "zsh");
+            std::fs::write(
+                home.join(".zshenv"),
+                format!("print -r -- sourced > {quoted}\n"),
+            )
+            .unwrap();
+            let _zdotdir = EnvGuard::set("ZDOTDIR", home);
+
+            validate_zsh_syntax("if true; then\n  print ok\nfi\n").unwrap();
+            assert!(
+                !sentinel.exists(),
+                "syntax validation executed the ambient .zshenv"
+            );
+        });
+    }
+
+    #[test]
+    fn embedded_guard_has_no_path_resolved_precheck_helpers() {
+        let guard = crate::assets::ZSHENV_GUARD;
+        assert!(!guard.contains("${TIRITH_BIN"));
+        assert!(!guard.contains("$TIRITH_BIN"));
+        assert!(!guard.contains("command -v"));
+        assert!(!guard.contains("mktemp"));
+        assert!(!guard
+            .lines()
+            .any(|line| line.trim_start().starts_with("cat ")));
+        assert!(!guard
+            .lines()
+            .any(|line| line.trim_start().starts_with("rm ")));
+        assert!(guard.contains("builtin print"));
     }
 
     #[cfg(unix)]
@@ -295,10 +441,7 @@ mod tests {
         use crate::cli::test_harness::with_fake_env;
 
         fn zsh_available() -> bool {
-            std::process::Command::new("zsh")
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success())
+            trusted_zsh_executable().is_ok()
         }
 
         fn with_fake_home<F: std::panic::UnwindSafe + FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
@@ -352,11 +495,84 @@ mod tests {
                 let content = std::fs::read_to_string(home.join(".zshenv")).unwrap();
 
                 assert!(content.contains("/usr/local/bin/tirith"));
-                let begin_count = content
-                    .lines()
-                    .filter(|l| l.starts_with(BEGIN_PREFIX))
-                    .count();
+                let begin_count = content.lines().filter(|l| *l == BEGIN_MARKER).count();
                 assert_eq!(begin_count, 1);
+            });
+        }
+
+        #[test]
+        fn install_rejects_drifted_single_block_without_force() {
+            with_fake_home(|home| {
+                let zshenv = home.join(".zshenv");
+                for body in ["", "# guard was removed\n"] {
+                    let drifted = format!("{BEGIN_MARKER}\n{body}{END_MARKER}\n");
+                    std::fs::write(&zshenv, &drifted).unwrap();
+
+                    let error = offer_zshenv_guard(true, false, false, "/opt/tirith")
+                        .expect_err("empty or drifted guard must not be called up to date");
+                    assert!(error.contains("differs from the expected guard"), "{error}");
+                    assert_eq!(std::fs::read_to_string(&zshenv).unwrap(), drifted);
+                }
+            });
+        }
+
+        #[test]
+        fn install_rejects_crlf_managed_block_without_force() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                let zshenv = home.join(".zshenv");
+                offer_zshenv_guard(true, false, false, "/opt/tirith").unwrap();
+                let canonical = std::fs::read_to_string(&zshenv).unwrap();
+                let crlf = canonical.replace('\n', "\r\n");
+                std::fs::write(&zshenv, crlf.as_bytes()).unwrap();
+
+                let error = offer_zshenv_guard(true, false, false, "/opt/tirith")
+                    .expect_err("CRLF managed block must be treated as drift");
+
+                assert!(error.contains("differs from the expected guard"), "{error}");
+                assert_eq!(std::fs::read(&zshenv).unwrap(), crlf.as_bytes());
+            });
+        }
+
+        #[test]
+        fn install_force_repairs_crlf_managed_block_to_canonical_lf() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                let zshenv = home.join(".zshenv");
+                offer_zshenv_guard(true, false, false, "/opt/tirith").unwrap();
+                let canonical = std::fs::read(&zshenv).unwrap();
+                let crlf = String::from_utf8(canonical.clone())
+                    .unwrap()
+                    .replace('\n', "\r\n");
+                std::fs::write(&zshenv, crlf.as_bytes()).unwrap();
+
+                offer_zshenv_guard(true, true, false, "/opt/tirith").unwrap();
+
+                assert_eq!(std::fs::read(&zshenv).unwrap(), canonical);
+            });
+        }
+
+        #[test]
+        fn install_force_repairs_drift_and_preserves_prefix_like_comments() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                let zshenv = home.join(".zshenv");
+                let original = format!(
+                    "# BEGIN tirith-guard migration notes\nkeep this\n# END tirith-guard migration notes\n{BEGIN_MARKER}\n# stale\n{END_MARKER}\n"
+                );
+                std::fs::write(&zshenv, original).unwrap();
+
+                offer_zshenv_guard(true, true, false, "/opt/tirith").unwrap();
+                let repaired = std::fs::read_to_string(&zshenv).unwrap();
+                assert!(repaired.contains("# BEGIN tirith-guard migration notes\nkeep this\n# END tirith-guard migration notes"));
+                assert!(repaired.contains("_tirith_bin=/opt/tirith"));
+                assert!(!repaired.contains("# stale"));
             });
         }
 
@@ -411,10 +627,7 @@ mod tests {
                 offer_zshenv_guard(true, true, false, "tirith").unwrap();
                 let content = std::fs::read_to_string(&zshenv).unwrap();
 
-                let begin_count = content
-                    .lines()
-                    .filter(|l| l.starts_with(BEGIN_PREFIX))
-                    .count();
+                let begin_count = content.lines().filter(|l| *l == BEGIN_MARKER).count();
                 assert_eq!(begin_count, 1);
             });
         }

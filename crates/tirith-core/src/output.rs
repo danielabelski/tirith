@@ -440,6 +440,7 @@ pub fn write_human_auto(verdict: &Verdict, warn_only: bool) -> std::io::Result<(
 /// Advisory output only; never affects exit codes.
 pub fn write_safe_suggestions(
     suggestions: &[SafeSuggestion],
+    custom_patterns: &[String],
     mut w: impl Write,
 ) -> std::io::Result<()> {
     if suggestions.is_empty() {
@@ -452,21 +453,51 @@ pub fn write_safe_suggestions(
         crate::style::bold("tirith: safer alternative", stream)
     )?;
     for s in suggestions {
-        writeln!(w, "  {}", s.rule_id)?;
-        if let Some(cmd) = &s.safe_command {
-            writeln!(w, "    {} {cmd}", crate::style::bold("try:", stream))?;
+        let rule_id = sanitize_suggestion_line(&s.rule_id, custom_patterns);
+        let rationale = sanitize_suggestion_line(&s.rationale, custom_patterns);
+        let remediation = sanitize_suggestion_line(&s.remediation, custom_patterns);
+        writeln!(w, "  {rule_id}")?;
+        if let Some(cmd) = s.safe_command.as_ref() {
+            // Redacting an executable suggestion would create bytes that were
+            // never analyzed. Terminal/layout sanitization has the same identity
+            // consequence. Match the JSON contract and withhold the executable
+            // whenever its safe display projection differs from the verified
+            // bytes; guidance remains available below.
+            let redacted = crate::redact::redact_with_custom(cmd, custom_patterns);
+            let display = sanitize_suggestion_line(cmd, custom_patterns);
+            if redacted == *cmd && display == *cmd {
+                writeln!(w, "    {} {display}", crate::style::bold("try:", stream))?;
+            } else {
+                writeln!(
+                    w,
+                    "    {} executable command omitted because redaction would change the verified bytes",
+                    crate::style::bold("try:", stream)
+                )?;
+            }
         }
-        writeln!(w, "    why: {}", s.rationale)?;
-        if !s.remediation.is_empty() {
+        writeln!(w, "    why: {rationale}")?;
+        if !remediation.is_empty() {
             writeln!(
                 w,
                 "    {} {}",
                 crate::style::bold("fix:", stream),
-                s.remediation
+                remediation
             )?;
         }
     }
     Ok(())
+}
+
+/// Produce one terminal-safe physical line for a suggestion field. Redaction
+/// happens before display sanitization so a malicious custom-pattern match
+/// cannot introduce controls, and layout bytes are rendered visibly rather
+/// than allowing a field to escape its intended line.
+fn sanitize_suggestion_line(value: &str, custom_patterns: &[String]) -> String {
+    let redacted = crate::redact::redact_with_custom(value, custom_patterns);
+    crate::mcp::output_filter::sanitize_for_display(&redacted)
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
 }
 
 /// Write human-readable output without ANSI colors.
@@ -817,7 +848,7 @@ mod tests {
     #[test]
     fn write_safe_suggestions_empty_is_silent() {
         let mut buf = Vec::new();
-        write_safe_suggestions(&[], &mut buf).unwrap();
+        write_safe_suggestions(&[], &[], &mut buf).unwrap();
         assert!(buf.is_empty(), "no suggestions → no output");
     }
 
@@ -1311,7 +1342,7 @@ mod tests {
             remediation: "review before running".to_string(),
         }];
         let mut buf = Vec::new();
-        write_safe_suggestions(&sugg, &mut buf).unwrap();
+        write_safe_suggestions(&sugg, &[], &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("safer alternative"), "{out}");
         assert!(out.contains("try:"), "{out}");
@@ -1320,5 +1351,30 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("fix:"), "{out}");
+    }
+
+    #[test]
+    fn write_safe_suggestions_redacts_and_confines_every_human_field() {
+        let secret = "TENANT-SECRET-42";
+        let suggestions = vec![SafeSuggestion {
+            rule_id: format!("rule\x1b]52;c;YQ==\x07\n{secret}"),
+            safe_command: Some(format!("echo {secret}\x1b[2J\nspoof")),
+            rationale: format!("reason\rspoof\x1b[31m\u{202e} {secret}"),
+            remediation: format!("fix\nspoof\t{secret}"),
+        }];
+        let mut buf = Vec::new();
+        write_safe_suggestions(&suggestions, &[secret.to_string()], &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(!out.contains(secret), "custom secret leaked: {out:?}");
+        assert!(!out.contains('\x1b'), "terminal escape leaked: {out:?}");
+        assert!(!out.contains('\u{202e}'), "bidi control leaked: {out:?}");
+        assert!(out.contains("rule\\n[REDACTED:custom]"), "{out:?}");
+        assert!(
+            out.contains("executable command omitted because redaction would change"),
+            "{out:?}"
+        );
+        assert!(out.contains("reasonspoof"), "{out:?}");
+        assert!(out.contains("fix\\nspoof\\t[REDACTED:custom]"), "{out:?}");
     }
 }

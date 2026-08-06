@@ -1,7 +1,8 @@
 use tirith_core::capsule::windows::command_line_from_parts;
 use tirith_core::trusted_child::{
-    evaluate_windows_trust, windows_access_mask_grants_replacement, WindowsExecutableSource,
-    WindowsOwnerClass, WindowsTrustFacts, WindowsTrustProvenance,
+    evaluate_windows_trust, windows_access_mask_grants_replacement,
+    windows_provenance_is_system_helper_approved, WindowsExecutableSource, WindowsOwnerClass,
+    WindowsTrustFacts, WindowsTrustProvenance,
 };
 
 fn secure_facts() -> WindowsTrustFacts {
@@ -85,6 +86,7 @@ fn windows_explicit_absolute_still_requires_secure_ownership() {
 #[test]
 fn windows_system_candidate_requires_protected_or_signed_provenance() {
     let protected = WindowsTrustFacts {
+        leaf_owner: WindowsOwnerClass::Administrators,
         secure_user_install: false,
         protected_install_root: true,
         ..secure_facts()
@@ -93,6 +95,36 @@ fn windows_system_candidate_requires_protected_or_signed_provenance() {
         evaluate_windows_trust(WindowsExecutableSource::SystemCandidate, protected).unwrap(),
         WindowsTrustProvenance::SystemCandidate
     );
+}
+
+#[test]
+fn windows_current_user_owner_is_not_upgraded_by_a_protected_root_label() {
+    let facts = WindowsTrustFacts {
+        protected_install_root: true,
+        ..secure_facts()
+    };
+    assert_eq!(
+        evaluate_windows_trust(WindowsExecutableSource::PathSearch, facts).unwrap(),
+        WindowsTrustProvenance::SecureUserInstall
+    );
+}
+
+#[test]
+fn windows_system_helper_policy_rejects_same_user_only_provenance() {
+    for approved in [
+        WindowsTrustProvenance::SystemCandidate,
+        WindowsTrustProvenance::Authenticode,
+        WindowsTrustProvenance::ProtectedInstall,
+    ] {
+        assert!(windows_provenance_is_system_helper_approved(approved));
+    }
+    for rejected in [
+        WindowsTrustProvenance::ExplicitAbsolute,
+        WindowsTrustProvenance::CurrentProcess,
+        WindowsTrustProvenance::SecureUserInstall,
+    ] {
+        assert!(!windows_provenance_is_system_helper_approved(rejected));
+    }
 }
 
 #[test]

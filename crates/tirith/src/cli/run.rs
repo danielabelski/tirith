@@ -27,16 +27,13 @@ pub fn run(
 
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
-    // E5: when `--capsule` is set, execute the downloaded script inside the OS
-    // containment capsule. `tirith run` is an enforcing surface here, so a host
-    // whose backend cannot provide the spec's required coverage fails closed
-    // instead of running uncontained. Download/DNS has already occurred under
-    // the fetch validator and is not part of interpreter containment.
-    let verified_executor: Option<tirith_core::runner::VerifiedScriptExecutor> = if capsule {
-        Some(Box::new(capsuled_exec))
-    } else {
-        None
-    };
+    // Every live path now uses the same stopped-target capsule controller. The
+    // legacy `--capsule` spelling remains accepted, but omitting it no longer
+    // falls back to an ordinary spawn that could run before durable execution
+    // state is committed.
+    let _capsule_requested = capsule;
+    let verified_executor: Option<tirith_core::runner::VerifiedScriptExecutor> =
+        Some(Box::new(capsuled_exec));
 
     let opts = RunOptions {
         url: url.to_string(),
@@ -103,24 +100,74 @@ pub fn run(
     }
 }
 
-/// The contained executor for `tirith run --capsule` (E5). Runs the exact typed
+fn reviewed_file_capsule_spec() -> tirith_core::capsule::CapsuleSpec {
+    let spec = tirith_core::capsule::CapsuleSpec::locked_down();
+    #[cfg(test)]
+    let spec = apply_test_capsule_override(spec);
+    spec
+}
+
+fn forced_stdin_capsule_spec() -> tirith_core::capsule::CapsuleSpec {
+    let spec = crate::cli::capsule::supervised_stdin_spec();
+    #[cfg(test)]
+    let spec = apply_test_capsule_override(spec);
+    spec
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestCapsuleOverride {
+    max_output_bytes: u64,
+    wall_clock_seconds: u64,
+    write_root: std::path::PathBuf,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only, thread-local tightening of the live `tirith run` capsule.
+    /// The executor is synchronous, so this reaches the exact production
+    /// `capsuled_exec` function without adding a process environment or CLI
+    /// knob that an untrusted script could influence.
+    static TEST_CAPSULE_OVERRIDE: std::cell::RefCell<Option<TestCapsuleOverride>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn apply_test_capsule_override(
+    mut spec: tirith_core::capsule::CapsuleSpec,
+) -> tirith_core::capsule::CapsuleSpec {
+    TEST_CAPSULE_OVERRIDE.with(|override_cell| {
+        let override_value = override_cell.borrow();
+        let Some(override_value) = override_value.as_ref() else {
+            return;
+        };
+        spec.resources.max_output_bytes = Some(override_value.max_output_bytes);
+        spec.resources.wall_clock_seconds = Some(override_value.wall_clock_seconds);
+        spec.filesystem
+            .write_roots
+            .push(override_value.write_root.clone());
+    });
+    spec
+}
+
+/// The contained executor for every live `tirith run` (E5). `--capsule` is a
+/// legacy compatibility spelling, not an opt-in boundary. Runs the exact typed
 /// interpreter invocation through the locked-down OS capsule. File mode receives
 /// only the inherited sealed reviewed-script descriptor; no downloaded-script
 /// pathname enters argv. Enforcing surface: fail closed when the backend cannot
 /// provide the spec's required coverage.
-fn capsuled_exec(
+pub(crate) fn capsuled_exec(
     invocation: &ScriptInvocation,
     reviewed_script: tirith_core::runner::ReviewedScript<'_>,
+    authorizer: &mut tirith_core::runner::ExecutionAuthorizer,
 ) -> Result<i32, String> {
-    use tirith_core::capsule::CapsuleSpec;
-
     let outcome = match invocation.input_mode {
         ScriptInputMode::File => {
             let program = invocation.resolved_executable.as_ref().ok_or_else(|| {
                 "file execution reached the capsule without a trusted interpreter identity"
                     .to_string()
             })?;
-            let mut spec = CapsuleSpec::locked_down();
+            let mut spec = reviewed_file_capsule_spec();
             let (read_roots, runtime_path) = validated_stdin_runtime(program)?;
             spec.filesystem.read_roots = read_roots;
             spec.environment.allow = ["PATH", "LANG", "TERM"]
@@ -133,6 +180,7 @@ fn capsuled_exec(
                 std::ffi::OsStr::new(&invocation.interpreter),
                 &invocation.args,
                 reviewed_script,
+                authorizer,
                 Some(std::path::Path::new("/")),
                 &[("PATH".to_string(), runtime_path)],
             )
@@ -148,7 +196,7 @@ fn capsuled_exec(
                 .map_err(|error| {
                     format!("forced stdin execution lost its closed interpreter identity: {error}")
                 })?;
-            let mut spec = crate::cli::capsule::supervised_stdin_spec();
+            let mut spec = forced_stdin_capsule_spec();
             let (read_roots, runtime_path) = validated_stdin_runtime(program)?;
             spec.filesystem.read_roots = read_roots;
             // PATH is supplied as explicit, validated child data. It is not
@@ -163,6 +211,7 @@ fn capsuled_exec(
                 target_argv0,
                 &invocation.args,
                 reviewed_script.bytes(),
+                authorizer,
                 // Stdin mode never needs the downloaded file path. A fixed
                 // system-owned cwd avoids inheriting an inaccessible or
                 // attacker-influenced caller directory into the capsule.
@@ -309,6 +358,262 @@ fn root_managed_metadata_is_secure(uid: u32, mode: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    struct TestCapsuleOverrideGuard(Option<super::TestCapsuleOverride>);
+
+    #[cfg(target_os = "linux")]
+    impl TestCapsuleOverrideGuard {
+        fn tighten(
+            max_output_bytes: u64,
+            wall_clock_seconds: u64,
+            write_root: &std::path::Path,
+        ) -> Self {
+            let next = super::TestCapsuleOverride {
+                max_output_bytes,
+                wall_clock_seconds,
+                write_root: write_root.to_path_buf(),
+            };
+            let previous = super::TEST_CAPSULE_OVERRIDE
+                .with(|override_cell| override_cell.replace(Some(next)));
+            Self(previous)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestCapsuleOverrideGuard {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            super::TEST_CAPSULE_OVERRIDE.with(|override_cell| {
+                override_cell.replace(previous);
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ScriptServer {
+        address: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ScriptServer {
+        fn start(body: &[u8]) -> Self {
+            use std::io::{Read as _, Write as _};
+            use std::sync::atomic::Ordering;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind live-run regression server");
+            listener
+                .set_nonblocking(true)
+                .expect("make live-run regression server nonblocking");
+            let address = listener.local_addr().expect("read regression address");
+            let body = body.to_vec();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_server = std::sync::Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !stop_server.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                                .expect("bound regression request read");
+                            let mut request = [0u8; 2048];
+                            let _ = stream.read(&mut request);
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .expect("write regression response head");
+                            stream
+                                .write_all(&body)
+                                .expect("write regression response body");
+                            stream.flush().expect("flush regression response");
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("live-run regression server failed: {error}"),
+                    }
+                }
+            });
+            Self {
+                address,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/script.sh", self.address)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ScriptServer {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("join live-run regression server");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sha256_hex(body: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+
+        Sha256::digest(body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn execute_live_stdin(body: &[u8]) -> tirith_core::runner::RunResult {
+        let server = ScriptServer::start(body);
+        let result = tirith_core::runner::run_with_verified_pipe_executor(
+            tirith_core::runner::RunOptions {
+                url: server.url(),
+                no_exec: false,
+                interactive: true,
+                expected_sha256: Some(sha256_hex(body)),
+                exec_fn: None,
+            },
+            tirith_core::runner::RequestedPipeInvocation {
+                interpreter: tirith_core::runner::PipeInterpreter::Bash,
+                args: Vec::new(),
+            },
+            Box::new(super::capsuled_exec),
+        );
+        drop(server);
+        result.expect("live `tirith run` regression transaction")
+    }
+
+    #[test]
+    fn run_capsule_specs_require_supervised_wall_clock_and_output_limits() {
+        for (surface, spec) in [
+            ("reviewed file", super::reviewed_file_capsule_spec()),
+            ("forced stdin", super::forced_stdin_capsule_spec()),
+        ] {
+            assert_eq!(
+                spec.resources.max_output_bytes,
+                Some(16 * 1024 * 1024),
+                "{surface} execution must carry a combined output ceiling into the supervised launcher"
+            );
+            assert_eq!(
+                spec.resources.wall_clock_seconds,
+                Some(300),
+                "{surface} execution must carry a wall-clock deadline into the supervised launcher"
+            );
+            assert!(
+                spec.required_coverage().resource_limits_enforced,
+                "{surface} execution must fail closed if the requested resource contract is unavailable"
+            );
+        }
+    }
+
+    /// `repo-0418`: exercise the actual content-bound `tirith run` executor,
+    /// including download, policy review, durable authorization, containment,
+    /// and target launch. Delayed marker writes prove a killed descendant did
+    /// not survive either parent-enforced ceiling; the control proves the same
+    /// production entrypoint still permits an ordinary under-limit script.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_run_entrypoint_enforces_wall_output_and_preserves_under_limit_execution() {
+        crate::cli::test_harness::with_fake_env(false, |home, _| {
+            use crate::cli::test_harness::EnvGuard;
+
+            for directory in ["config", "data", "state", "cache"] {
+                std::fs::create_dir_all(home.join(directory))
+                    .expect("create isolated live-run state");
+            }
+            let _config = EnvGuard::set("XDG_CONFIG_HOME", &home.join("config"));
+            let _data = EnvGuard::set("XDG_DATA_HOME", &home.join("data"));
+            let _state = EnvGuard::set("XDG_STATE_HOME", &home.join("state"));
+            let _cache = EnvGuard::set("XDG_CACHE_HOME", &home.join("cache"));
+            let _policy = EnvGuard::set("TIRITH_POLICY_ROOT", home);
+            let _private = EnvGuard::set(
+                "TIRITH_PRIVATE_FETCH_ALLOW",
+                std::path::Path::new("127.0.0.1/32"),
+            );
+            let _no_proxy = EnvGuard::set("NO_PROXY", std::path::Path::new("127.0.0.1,localhost"));
+            let _log = EnvGuard::set("TIRITH_LOG", std::path::Path::new("0"));
+            let _tirith = EnvGuard::remove("TIRITH");
+            let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
+            let _api_key = EnvGuard::remove("TIRITH_API_KEY");
+            let _http_proxy = EnvGuard::remove("HTTP_PROXY");
+            let _https_proxy = EnvGuard::remove("HTTPS_PROXY");
+            let _all_proxy = EnvGuard::remove("ALL_PROXY");
+            let _http_proxy_lower = EnvGuard::remove("http_proxy");
+            let _https_proxy_lower = EnvGuard::remove("https_proxy");
+            let _all_proxy_lower = EnvGuard::remove("all_proxy");
+
+            let marker_root = home.join("markers");
+            std::fs::create_dir(&marker_root).expect("create marker root");
+            let wall_marker = marker_root.join("wall-survivor");
+            let output_marker = marker_root.join("output-survivor");
+            let control_marker = marker_root.join("under-limit-ran");
+
+            let _limits = TestCapsuleOverrideGuard::tighten(1024, 1, &marker_root);
+
+            let wall_script = format!(
+                "#!/bin/bash\n(sleep 2; printf late > '{}') & wait\n",
+                wall_marker.display()
+            );
+            let wall_started = std::time::Instant::now();
+            let wall = execute_live_stdin(wall_script.as_bytes());
+            assert!(wall.executed, "the authenticated target reached execution");
+            assert_eq!(wall.exit_code, Some(124), "wall overage must be typed");
+            assert!(
+                wall_started.elapsed() < std::time::Duration::from_secs(5),
+                "wall-clock supervision did not terminate promptly"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1250));
+            assert!(
+                !wall_marker.exists(),
+                "a wall-clock-terminated descendant survived and wrote a marker"
+            );
+
+            let output_script = format!(
+                "#!/bin/bash\n(sleep 2; printf late > '{}') & while :; do printf '0123456789abcdef'; done\n",
+                output_marker.display()
+            );
+            let output_started = std::time::Instant::now();
+            let output = execute_live_stdin(output_script.as_bytes());
+            assert!(
+                output.executed,
+                "the authenticated target reached execution"
+            );
+            assert_eq!(output.exit_code, Some(125), "output overage must be typed");
+            assert!(
+                output_started.elapsed() < std::time::Duration::from_secs(5),
+                "combined-output supervision did not terminate promptly"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2250));
+            assert!(
+                !output_marker.exists(),
+                "an output-terminated descendant survived and wrote a marker"
+            );
+
+            let control_script = format!(
+                "#!/bin/bash\nprintf ok\nprintf legitimate > '{}'\n",
+                control_marker.display()
+            );
+            let control = execute_live_stdin(control_script.as_bytes());
+            assert!(control.executed);
+            assert_eq!(control.exit_code, Some(0));
+            assert_eq!(
+                std::fs::read(&control_marker).expect("read legitimate marker"),
+                b"legitimate"
+            );
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn root_managed_runtime_metadata_rejects_group_writable_or_non_root_inputs() {

@@ -1,7 +1,7 @@
 //! Windows filesystem helpers for `tirith setup` — the same public API as
 //! `fs_helpers.rs` using held Windows handles and explicit DACL handling.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2131,13 +2131,67 @@ pub fn validate_target_dir(dir: &Path, scope_root: Option<&Path>) -> Result<(), 
     Ok(())
 }
 
-/// Run a CLI subprocess through the shared trusted, bounded supervisor.
-pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String> {
+/// Retire an obsolete content-addressed Codex gateway generation after its
+/// registration has been replaced successfully. Windows deletion is bound to
+/// the exact validated file handle while retained no-reparse parent handles
+/// keep the destination inside the trusted setup root.
+pub fn retire_codex_gateway_generation(path: &Path, scope_root: &Path) -> Result<(), String> {
+    let lock = PlatformTransaction::lock(path, scope_root)?;
+    let transaction = PlatformTransaction::begin(path, scope_root, lock)?;
+    let snapshot = transaction.read_snapshot()?;
+    let Some(bytes) = snapshot.bytes.as_deref() else {
+        return Ok(());
+    };
+    let digest = Sha256::digest(bytes);
+    let expected_name = format!("gateway-sha256-{}.yaml", hex_bytes(&digest));
+    if path.file_name() != Some(OsStr::new(&expected_name)) {
+        return Err(format!(
+            "{} is not named for its exact gateway content; refusing retirement",
+            path.display()
+        ));
+    }
+    let SnapshotGeneration::Present(expected_generation) = &snapshot.generation else {
+        return Err("gateway retirement snapshot has no stable file generation".into());
+    };
+    if expected_generation.reparse_tag.is_some()
+        || !path_rules::attributes_are_safe(expected_generation.attributes, false)
+        || !owner_only_security_descriptor(&expected_generation.security_descriptor)
+    {
+        return Err(format!(
+            "{} is not an owner-only non-reparse file; refusing retirement",
+            path.display()
+        ));
+    }
+    transaction.validate_snapshot(&snapshot)?;
+    let mut cleanup = CleanupCapability::open(&transaction.destination)?;
+    if &cleanup.generation != expected_generation {
+        return Err(format!("{} changed before retirement", path.display()));
+    }
+    cleanup.validate(&transaction.destination)?;
+    cleanup.delete()?;
+    if transaction.read_snapshot()?.bytes.is_some() {
+        return Err(format!(
+            "{} still exists after exact-handle retirement",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Run Codex with an explicitly selected project working directory. Codex's
+/// global `-C` option preserves its project/user configuration semantics while the
+/// supervised child itself keeps a loader-safe working directory on Windows.
+pub fn run_codex_cli_in_dir(
+    cwd: &Path,
+    cmd: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     let executable = tirith_core::trusted_child::resolve_ambient(cmd)
         .map_err(|error| format!("{cmd} not found or untrusted: {error}"))?;
-    run_cli_with(
+    let scoped_args = codex_scoped_args(cwd, args);
+    run_cli_bounded(
         &executable,
-        args,
+        &scoped_args,
         tirith_core::trusted_child::ChildLimits::new(
             std::time::Duration::from_secs(30),
             4 * 1024 * 1024,
@@ -2146,14 +2200,22 @@ pub fn run_cli(cmd: &str, args: &[&str]) -> Result<std::process::Output, String>
     )
 }
 
-fn run_cli_with(
+fn codex_scoped_args(cwd: &Path, args: &[&str]) -> Vec<OsString> {
+    let mut scoped = Vec::with_capacity(args.len() + 2);
+    scoped.push(OsString::from("-C"));
+    scoped.push(cwd.as_os_str().to_os_string());
+    scoped.extend(args.iter().map(|arg| OsString::from(*arg)));
+    scoped
+}
+
+fn run_cli_bounded<S: AsRef<OsStr>>(
     executable: &tirith_core::trusted_child::TrustedExecutable,
-    args: &[&str],
+    args: &[S],
     limits: tirith_core::trusted_child::ChildLimits,
 ) -> Result<std::process::Output, String> {
     use tirith_core::trusted_child::{ChildOutcome, ChildSpec};
 
-    let mut spec = ChildSpec::new(args, limits).inherit_env(&[
+    let mut spec = ChildSpec::new(args.iter().map(AsRef::as_ref), limits).inherit_env(&[
         "HOME",
         "USER",
         "LOGNAME",
@@ -2182,6 +2244,7 @@ fn run_cli_with(
         }),
         ChildOutcome::SpawnError(reason) => Err(format!("failed to start: {reason}")),
         ChildOutcome::WaitError(reason) => Err(format!("wait failed: {reason}")),
+        ChildOutcome::CleanupError(reason) => Err(format!("process-tree cleanup failed: {reason}")),
         ChildOutcome::Timeout {
             cleanup_succeeded: true,
         } => Err("timed out after 30s — check installation".into()),
@@ -3323,7 +3386,7 @@ mod tests {
 
     #[test]
     fn windows_setup_runner_preserves_short_legitimate_output() {
-        let output = run_cli_with(
+        let output = run_cli_bounded(
             &cmd(),
             &["/D", "/S", "/C", "<nul set /p =setup-ok"],
             tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(5), 64, 64),
@@ -3335,12 +3398,21 @@ mod tests {
 
     #[test]
     fn windows_setup_runner_surfaces_output_limit() {
-        let error = run_cli_with(
+        let error = run_cli_bounded(
             &cmd(),
             &["/D", "/S", "/C", "<nul set /p =12345"],
             tirith_core::trusted_child::ChildLimits::new(std::time::Duration::from_secs(5), 4, 64),
         )
         .unwrap_err();
         assert!(error.contains("output limit"));
+    }
+
+    #[test]
+    fn codex_scope_uses_cli_cd_without_mutating_child_cwd() {
+        let cwd = Path::new(r"C:\Users\operator\codex-scope");
+        let args = codex_scoped_args(cwd, &["mcp", "list", "--json"]);
+        assert_eq!(args[0], OsString::from("-C"));
+        assert_eq!(args[1], cwd.as_os_str());
+        assert_eq!(args[2..], ["mcp", "list", "--json"].map(OsString::from));
     }
 }

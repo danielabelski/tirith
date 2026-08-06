@@ -36,7 +36,7 @@
   sandbox or contain the commands a user runs in their shell. The shell hook is a
   detection layer, not a containment boundary. There is one narrow, opt-in
   exception (see "Opt-in runtime containment" below): the Linux-only live
-  `tirith run --capsule`,
+  every live `tirith run` (`--capsule` remains a legacy spelling),
   `tirith temp-run --capsule`, `tirith gateway run --capsule`, and (future) `tirith
   pkg install` surfaces route the program they launch through an OS containment
   capsule. This is an explicit, per-invocation choice for tirith-launched
@@ -45,6 +45,9 @@
 - **Malware detection**: tirith analyzes command structure, not payload content (except via `run`)
 - **Privileged attacker defense**: a root/admin user can bypass tirith trivially
 - **Anti-debugging**: tirith does not resist analysis or reverse engineering
+- **Strict PowerShell execution proof**: the PowerShell hook can block during
+  PSReadLine preflight, but mutable history is not treated as trusted evidence
+  that an accepted command executed
 
 ### `tirith temp-run` is file isolation, NOT a sandbox
 
@@ -69,14 +72,14 @@ anything outside the temp dir (e.g. `$HOME`) exactly as it could if run directly
 LANG, TERM) as a convenience, but a trimmed environment is likewise not a
 security control.
 
-### Opt-in runtime containment (the capsule)
+### Tirith-launched runtime containment (the capsule)
 
-The blanket "no kernel sandboxing" stance has one deliberate, opt-in exception.
+The blanket "no kernel sandboxing" stance has one deliberate, scoped exception.
 tirith ships an OS containment capsule (Landlock + seccomp on Linux, Seatbelt on
 macOS, an AppContainer + Job Object on Windows) that a handful of
 tirith-launched surfaces can route their child process through:
 
-- On Linux, `tirith run --capsule` runs the exact reviewed bytes from a sealed
+- On Linux, every live `tirith run` runs the exact reviewed bytes from a sealed
   anonymous descriptor under containment (deny-network, scrubbed environment,
   resource limits). Live remote-script execution refuses before download on
   every non-Linux host; `--no-exec` remains inspection-only on Unix.
@@ -91,7 +94,7 @@ per-capability coverage ledger and never claims a control it did not apply. The
 loopback egress broker is a broker, NOT the boundary: domain-egress is only
 claimed where the OS backend blocks raw outbound sockets except to the broker.
 Enforcing surfaces (`pkg install`, the contained gateway, and Linux
-`tirith run --capsule`)
+live `tirith run`)
 **fail closed** when the host backend cannot deliver the required containment;
 `temp-run --capsule` is a best-effort hardening that runs uncontained, and says
 so, when no backend is available. `tirith doctor` reports the real per-platform
@@ -100,10 +103,27 @@ arbitrary, non-tirith-launched shell commands remains a non-goal.
 
 ## Trust Boundaries
 
-1. **Shell hook to tirith binary**: the hook passes the command string; tirith trusts the hook to provide the actual command
-2. **tirith binary to analysis engine**: the binary trusts the core library; no sandboxing between components
-3. **Policy files**: tirith trusts YAML policy files found on disk (user-level and org-level)
-4. **Audit log**: append-only with file locking; does not prevent deletion by a local attacker
+1. **Interactive shell hook to Tirith**: preflight still receives the command
+   text selected by the shell hook. Protocol-v3 bash/zsh/fish receipts
+   additionally bind each use to a live parent PID/start identity, effective
+   user, shell family, session, and pinned Tirith executable. Tirith owns any
+   approval or warning acknowledgement before it returns the already-armed
+   bearer. Their durable `ShellBoundaryUnresolved` transition is conservative
+   correlation evidence, not proof that every command component executed.
+   PowerShell has preflight interception without strict receipts.
+2. **Linux launcher to target**: confirmed execution requires a kernel
+   stopped-`exec` observation, a durable stopped-unresolved transition, one
+   exact ACK+EOF, successful detach/resume, terminal `RESUMED`+EOF, and a
+   durable upgrade of that same transition. Failure aborts the process tree
+   before the stable execution-lock owner is dropped.
+3. **Gateway to upstream MCP server**: each guarded request gets an unguessable
+   internal proxy ID. A durably forwarded request is unresolved; only an exact,
+   structurally valid result correlated to that proxy ID upgrades it to
+   confirmed gateway evidence. Timeout, cancellation, partial write, and EOF
+   retain unresolved/tombstoned state rather than claiming execution.
+4. **Tirith binary to analysis engine**: the binary trusts the core library; no sandboxing between components
+5. **Policy files**: tirith trusts YAML policy files found on disk (user-level and org-level)
+6. **Audit log**: append-only with file locking; does not prevent deletion by a local attacker
 
 ## License Tier Verification
 

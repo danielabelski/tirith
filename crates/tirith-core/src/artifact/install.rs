@@ -17,20 +17,21 @@
 //!    past the one the approval was bound to. Any of those refuses the install
 //!    before a single byte is handed to pip.
 //!
-//! 2. **Generate `approved.txt`.** [`approved_requirements_text`] emits one
-//!    `name @ file:///<abs-path>/<file>.whl --hash=sha256:<d>` line per
-//!    materialised wheel. The `name` is the PEP 503-normalised distribution name
-//!    parsed from the validated wheel filename; the URL is the `file://` URL of the
-//!    immutable transaction copy D3 produced; the `--hash` is the approved digest.
-//!    pip is thereby told to install ONLY those local files and to refuse any whose
-//!    content does not hash to the pinned digest.
+//! 2. **Generate `approved.txt`.** [`approved_requirements_text`] emits one local,
+//!    hash-pinned wheel requirement per materialised wheel. Unix uses a strict
+//!    `./<file>.whl` operand that is resolved only after `fchdir` to the retained
+//!    transaction-directory capability; Windows uses an absolute `file://` URL
+//!    while a no-delete-sharing directory handle pins that path. pip is thereby
+//!    told to install only those local files and to refuse any whose content does
+//!    not hash to the approved digest.
 //!
 //! 3. **The pip argv.** [`InstallCommand::pip_install_args`] is exactly the plan's
-//!    pin: `-m pip install --isolated --no-index --no-deps --require-hashes
-//!    --no-cache-dir --no-input --disable-pip-version-check --force-reinstall -r
-//!    approved.txt`. `--force-reinstall` (or a fresh target) is mandatory: without
-//!    it pip SKIPS a package whose version is already installed, so a re-verified
-//!    install of a pinned version would no-op. `--no-index` + the `file://`
+//!    pin: `-I -m pip install --isolated --no-index --no-deps --require-hashes
+//!    --no-cache-dir --no-input --disable-pip-version-check --force-reinstall
+//!    --upgrade --target <dedicated-target> -r <approved.txt>`. `--force-reinstall`
+//!    (or a fresh target) is mandatory: without it pip SKIPS a package whose
+//!    version is already installed, so a re-verified install of a pinned version
+//!    would no-op. `--no-index` + local wheel
 //!    references mean pip never touches the network; `--no-deps` because the
 //!    resolver already produced a transitively-complete, fully-pinned set;
 //!    `--isolated` + `--no-cache-dir` so no ambient pip config or cache can redirect
@@ -43,7 +44,7 @@
 //!    network** [`CapsuleSpec`]: the install needs no outbound traffic once the
 //!    bytes are quarantined, so the source artifact is the only thing pip reads and
 //!    the target environment is the only thing it writes. The transaction directory
-//!    is granted READ (pip reads the `file://` wheels) and the target environment
+//!    is granted READ (pip reads the local wheels) and the target environment
 //!    tree is granted WRITE (pip extracts into it). The credential subtrees stay
 //!    denied, the environment is scrubbed of secrets, and conservative resource
 //!    limits apply.
@@ -52,11 +53,11 @@
 //!
 //! This module is **pure / async-free**: it parses, composes the firewall, builds
 //! the `approved.txt` text, the pip argv, and the spec, and decides whether the
-//! re-bind passes. It does NOT spawn anything. The actual contained launch
-//! (`tirith::cli::capsule::run_to_completion` under
-//! `DegradedPolicy::FailClosed`) lives in the CLI crate (`pkg_install.rs`), because
-//! the capsule launcher needs the OS backends and, on the enforcing path, **fails
-//! closed under degraded coverage**. The grep-test the plan calls for (that the
+//! re-bind passes. It does NOT spawn anything. The actual contained launch through
+//! `tirith::cli::capsule::run_to_completion_bound_inputs` lives in the CLI crate
+//! (`pkg_install.rs`), because the capsule launcher needs the OS backends. Enforcing
+//! execution is x86_64 Linux-only; every other platform or architecture **fails
+//! closed before pip starts**. The grep-test the plan calls for (that the
 //! install-from-digest path NEVER calls the uncontained `ProcessInstallRunner`)
 //! holds by construction here: this module knows nothing about that runner, and the
 //! CLI consumer goes only through the capsule seam.
@@ -105,10 +106,11 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(any(not(unix), test))]
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::firewall::firewall_resolved_set;
+use crate::artifact::firewall::{firewall_resolved_set, FirewallOutcome};
 use crate::artifact::quarantine::QuarantineTransaction;
 use crate::artifact::record::{
     index_distribution_ownership, verify_installed_record, EnvironmentLayout, FileVerification,
@@ -127,6 +129,7 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity, Timings, Verdict};
 /// `%` (so a literal `%` is not read as an escape), and the backslash. The forward
 /// slash is intentionally NOT in the set: it is the path separator and is already
 /// a single safe component boundary by the time we build the URL.
+#[cfg(any(not(unix), test))]
 const FILE_URL_PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -180,9 +183,9 @@ pub enum InstallError {
         /// The number that materialised intact.
         materialized: usize,
     },
-    /// A materialised wheel path could not be turned into a `name @ file://...`
-    /// requirement line (a non-wheel filename slipped through, a path with no file
-    /// name, or a non-absolute path that cannot be a `file://` URL). Fail-closed.
+    /// A materialised wheel path could not be turned into a safe local requirement
+    /// line (a non-wheel filename slipped through, a path had no file name, or the
+    /// Windows path could not form an absolute `file://` URL). Fail-closed.
     BadArtifactPath(String),
 }
 
@@ -220,7 +223,7 @@ impl std::fmt::Display for InstallError {
                  refusing to install an incomplete set"
             ),
             InstallError::BadArtifactPath(p) => {
-                write!(f, "cannot build a file:// requirement for artifact path {p:?}")
+                write!(f, "cannot build a local requirement for artifact path {p:?}")
             }
         }
     }
@@ -228,28 +231,33 @@ impl std::fmt::Display for InstallError {
 
 impl std::error::Error for InstallError {}
 
-/// The exact pip command D4 runs inside the no-network capsule, plus the absolute
-/// path of the `approved.txt` requirements file it reads.
+/// The exact pip command D4 runs inside the no-network capsule, plus the path of
+/// the `approved.txt` requirements file it reads.
 ///
 /// Held as a small value so the CLI consumer can log the argv (secret-free: it is
 /// only flags + the approved.txt path) into the D6 receipt and so the argv is unit
 /// testable without spawning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCommand {
-    /// The absolute path of the generated `approved.txt` the install reads.
+    /// The generated `approved.txt` path. It is descriptor-cwd-relative on Unix
+    /// and absolute beneath a path-pinned directory on Windows.
     pub approved_requirements_path: PathBuf,
+    /// The exact dedicated directory passed to pip's `--target`. Enforcing
+    /// callers bind this directory by capability at launch; the path remains in
+    /// the approval semantics so changing the destination always re-binds.
+    pub target_environment: PathBuf,
 }
 
 impl InstallCommand {
-    /// The `python -m pip install ...` argument vector (everything after the
+    /// The `python -I -m pip install ...` argument vector (everything after the
     /// interpreter path), exactly the plan's pin:
     ///
-    /// `-m pip install --isolated --no-index --no-deps --require-hashes
-    /// --no-cache-dir --no-input --disable-pip-version-check --force-reinstall -r
-    /// <approved.txt>`
+    /// `-I -m pip install --isolated --no-index --no-deps --require-hashes
+    /// --no-cache-dir --no-input --disable-pip-version-check --force-reinstall
+    /// --upgrade --target <dedicated-target> -r <approved.txt>`
     ///
     /// `--force-reinstall` is mandatory so pip does not silently skip a package
-    /// whose version is already installed; `--no-index` + the `file://` references
+    /// whose version is already installed; `--no-index` + the local references
     /// in `approved.txt` keep the install fully offline; `--require-hashes` makes
     /// pip refuse any file whose content does not hash to the pinned digest;
     /// `--no-deps` because the lock is transitively complete; `--isolated` +
@@ -258,7 +266,7 @@ impl InstallCommand {
     /// `--disable-pip-version-check` so pip skips its own network version self-check
     /// (which a deny-all spec would otherwise stall).
     ///
-    /// The interpreter is invoked as `python -m pip` (never a PATH `pip` shim), the
+    /// The interpreter is invoked as `python -I -m pip` (never a PATH `pip` shim), the
     /// same hardening the D2 resolver uses; the caller supplies the resolved
     /// interpreter path as the program and these as its args.
     pub fn pip_install_args(&self) -> Vec<String> {
@@ -276,6 +284,9 @@ impl InstallCommand {
     /// ([`Self::pip_install_args`]) is this plus `-r <path>`.
     pub fn pip_install_args_without_requirements_path(&self) -> Vec<String> {
         vec![
+            // `-I` prevents user-site, PYTHONPATH, and current-directory imports
+            // from changing which root-managed pip tree the approval attested.
+            "-I".to_string(),
             "-m".to_string(),
             "pip".to_string(),
             "install".to_string(),
@@ -287,6 +298,13 @@ impl InstallCommand {
             "--no-input".to_string(),
             "--disable-pip-version-check".to_string(),
             "--force-reinstall".to_string(),
+            // pip target installs otherwise keep pre-existing destination entries
+            // even when `--force-reinstall` is present. The enforcing surface uses
+            // a fresh dedicated target, and keeps this flag pinned as defense in
+            // depth against a target populated after approval.
+            "--upgrade".to_string(),
+            "--target".to_string(),
+            self.target_environment.display().to_string(),
         ]
     }
 }
@@ -299,17 +317,22 @@ impl InstallCommand {
 ///
 /// The CLI consumer writes [`Self::approved_requirements`] to disk inside the
 /// transaction directory, sets [`InstallCommand::approved_requirements_path`] to
-/// that location, and launches `python -m pip` with
+/// that location, and launches `python -I -m pip` with
 /// [`InstallCommand::pip_install_args`] through the capsule under
 /// [`crate::capsule`]'s fail-closed launcher.
 #[derive(Debug, Clone)]
 pub struct DigestInstallPlan {
-    /// The `approved.txt` content: one `name @ file://... --hash=sha256:<d>` line
-    /// per materialised wheel. The caller writes this verbatim.
+    /// The `approved.txt` content: one capability-relative (Unix) or path-pinned
+    /// absolute (Windows) local wheel plus `--hash=sha256:<d>` per materialised
+    /// wheel. The caller writes this verbatim.
     pub approved_requirements: String,
     /// The materialised `*.whl` paths the plan references (the immutable
     /// transaction copies). Parallel to the requirement lines, by input order.
     pub materialized: Vec<PathBuf>,
+    /// Approved lowercase SHA-256 digests parallel to [`Self::materialized`]. The
+    /// Windows launcher re-hashes its read-share-only pinned file handles against
+    /// these values immediately before process creation.
+    pub materialized_sha256: Vec<String>,
     /// The locked-down, deny-all-network capsule spec the install runs under.
     pub spec: crate::capsule::CapsuleSpec,
     /// The threat-DB sequence the (re-validated) plan is bound to, recorded so the
@@ -364,13 +387,10 @@ pub fn rebind_for_install(
     // 2. Re-hash + re-inspect against the freshly-reloaded policy + live DB. The
     //    firewall materialise step re-hashes each blob; a mismatch/missing blob is a
     //    Critical integrity finding and a known-malicious match is Critical too.
-    let outcome = firewall_resolved_set(resolved, txn, policy, live_db);
-    if outcome.is_block() {
-        return Err(InstallError::RebindBlocked {
-            integrity_mismatch: outcome.has_integrity_mismatch(),
-            verdict: Box::new(outcome.verdict),
-        });
-    }
+    let outcome = require_complete_firewall_outcome(
+        firewall_resolved_set(resolved, txn, policy, live_db),
+        policy,
+    )?;
 
     // 3. Completeness: every named artifact must have materialised intact. (A clean
     //    verdict with a shortfall should be impossible, since a missing blob is an
@@ -384,29 +404,64 @@ pub fn rebind_for_install(
     }
 
     // Build the approved.txt text over the just-materialised paths. Each line pairs
-    // the artifact's approved digest with the file:// URL of its immutable copy.
+    // the artifact's approved digest with its capability-safe local reference.
     let approved_requirements = approved_requirements_text(resolved, &outcome.materialized)?;
     let spec = build_install_spec(txn.dir(), target_environment, extra_read_roots);
 
     Ok(DigestInstallPlan {
         approved_requirements,
         materialized: outcome.materialized,
+        materialized_sha256: resolved
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.sha256.to_ascii_lowercase())
+            .collect(),
         spec,
         bound_db_sequence: current_db_sequence,
     })
 }
 
+/// Enforce the install edge independently of the firewall's verdict assembly.
+/// The firewall normally emits a blocking `AnalysisIncomplete` finding for every
+/// typed gap, but this second chokepoint prevents a future caller/finalizer drift
+/// from turning incomplete artifact bytes into a launch-ready plan.
+fn require_complete_firewall_outcome(
+    mut outcome: FirewallOutcome,
+    policy: &Policy,
+) -> Result<FirewallOutcome, InstallError> {
+    let coverage_gaps = outcome.set_inspection.all_coverage_gaps();
+    crate::artifact::enforce_artifact_coverage_floor(
+        &mut outcome.verdict,
+        &coverage_gaps,
+        Some(policy),
+        true,
+    );
+    if outcome.is_block() || !coverage_gaps.is_empty() {
+        return Err(InstallError::RebindBlocked {
+            integrity_mismatch: outcome.has_integrity_mismatch(),
+            verdict: Box::new(outcome.verdict),
+        });
+    }
+    Ok(outcome)
+}
+
 /// Build the `approved.txt` requirements text for a resolved set whose wheels just
 /// materialised at `materialized` (parallel to `resolved.artifacts`).
 ///
-/// Each line is `name @ file:///<abs>/<file>.whl --hash=sha256:<digest>`:
+/// On Unix each line is `./<file>.whl --hash=sha256:<digest>`. The enforcing
+/// launcher enters the transaction through its retained directory descriptor,
+/// so both the requirements file and every wheel are resolved relative to that
+/// exact directory identity rather than reopening an attacker-replaceable absolute
+/// pathname. On Windows the no-delete-sharing directory handle pins the path, so
+/// the line remains `name @ file:///<abs>/<file>.whl --hash=...`.
 ///
 /// * `name` is the PEP 503-normalised distribution name parsed from the validated
 ///   wheel filename ([`crate::artifact::archive::wheel_distribution_name`]). A
 ///   direct-reference requirement needs the project name so pip records the install
 ///   under the right distribution.
-/// * the `file://` URL is the absolute, percent-encoded path of the immutable
-///   transaction copy (the exact bytes D3 verified).
+/// * the Unix `./` path is only consumed with the held-directory cwd binding; the
+///   Windows `file://` URL names the immutable transaction copy pinned by its held
+///   directory handle.
 /// * the `--hash` is the approved sha256 the resolver pinned and the re-hash just
 ///   confirmed.
 ///
@@ -435,11 +490,24 @@ pub fn approved_requirements_text(
         // name from it. A non-wheel name here is a contract violation -> fail closed.
         let dist = crate::artifact::archive::wheel_distribution_name(file_name)
             .ok_or_else(|| InstallError::BadArtifactPath(path.display().to_string()))?;
-        let url = file_url_for(path)?;
-        lines.push_str(&format!(
-            "{dist} @ {url} --hash=sha256:{}\n",
-            artifact.sha256.to_ascii_lowercase()
-        ));
+        #[cfg(unix)]
+        {
+            // Keep the parse above as a defensive wheel/name validation even though
+            // pip derives the distribution name from the relative wheel itself.
+            let _ = dist;
+            lines.push_str(&format!(
+                "./{file_name} --hash=sha256:{}\n",
+                artifact.sha256.to_ascii_lowercase()
+            ));
+        }
+        #[cfg(not(unix))]
+        {
+            let url = file_url_for(path)?;
+            lines.push_str(&format!(
+                "{dist} @ {url} --hash=sha256:{}\n",
+                artifact.sha256.to_ascii_lowercase()
+            ));
+        }
     }
     Ok(lines)
 }
@@ -448,6 +516,7 @@ pub fn approved_requirements_text(
 /// percent-encoded ([`FILE_URL_PATH_ENCODE`]). Refuses a non-absolute path (a
 /// `file://` URL must be absolute). On Windows the leading drive component yields a
 /// `file:///C:/...` form; on Unix a leading `/` yields `file:///...`.
+#[cfg(any(not(unix), test))]
 fn file_url_for(path: &Path) -> Result<String, InstallError> {
     if !path.is_absolute() {
         return Err(InstallError::BadArtifactPath(path.display().to_string()));
@@ -489,7 +558,7 @@ fn file_url_for(path: &Path) -> Result<String, InstallError> {
 /// Build the locked-down, **deny-all network** capsule spec for an install:
 ///
 /// * deny-all network (an install needs no outbound traffic once quarantined),
-/// * READ the transaction directory (pip reads the `file://` wheels there) and the
+/// * READ the transaction directory (pip reads the local wheels there) and the
 ///   `extra_read_roots` an interpreter needs to start,
 /// * WRITE the target environment tree (pip extracts into it; a write root implies
 ///   read),
@@ -511,7 +580,7 @@ pub fn build_install_spec(
     spec.filesystem
         .write_roots
         .push(target_environment.to_path_buf());
-    // Read the transaction dir (the file:// wheels + the approved.txt live here).
+    // Read the transaction dir (the local wheels + approved.txt live here).
     spec.filesystem
         .read_roots
         .push(transaction_dir.to_path_buf());
@@ -580,6 +649,17 @@ impl PostInstallIntegrity {
     }
 }
 
+/// Exact distribution identity expected from one approved wheel. Enforcing
+/// installs carry the version as well as the normalized project name so a clean
+/// stale `.dist-info` directory cannot satisfy verification for a different
+/// wheel version. Analysis-only `verify-env` callers may leave `version` empty by
+/// using [`verify_post_install_record`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExpectedInstalledDistribution {
+    pub name: String,
+    pub version: Option<String>,
+}
+
 /// Verify the installed RECORD of the just-installed distributions in
 /// `target_environment` and fold any integrity problem into a single verdict
 /// (cross-cutting invariant: "installed files verify against installed RECORD").
@@ -615,6 +695,24 @@ pub fn verify_post_install_record(
     installed_names: &[String],
     policy: &Policy,
 ) -> PostInstallIntegrity {
+    let expected: Vec<ExpectedInstalledDistribution> = installed_names
+        .iter()
+        .map(|name| ExpectedInstalledDistribution {
+            name: name.clone(),
+            version: None,
+        })
+        .collect();
+    verify_post_install_record_exact(target_environment, &expected, policy)
+}
+
+/// Version-exact enforcing variant of [`verify_post_install_record`]. Exactly one
+/// `.dist-info` directory must match every expected name/version pair. Missing,
+/// stale-version-only, and duplicate matches are coverage failures.
+pub fn verify_post_install_record_exact(
+    target_environment: &Path,
+    expected_distributions: &[ExpectedInstalledDistribution],
+    policy: &Policy,
+) -> PostInstallIntegrity {
     let mut result = PostInstallIntegrity {
         verdict: crate::escalation::finalize_static_verdict(
             Vec::new(),
@@ -628,20 +726,48 @@ pub fn verify_post_install_record(
         hash_mismatches: 0,
     };
 
-    // Locate the `.dist-info` of each named distribution across every site-packages
-    // root under the target environment. A name with no matching `.dist-info` is a
-    // coverage gap (counted), not a violation.
+    // Locate exactly one `.dist-info` for each approved distribution identity.
     let mut matched: Vec<(PathBuf, PathBuf, DistributionIdentity)> = Vec::new();
+    let mut integrity_signals: Vec<ArtifactSignal> = Vec::new();
     let sites = post_install_site_packages(target_environment);
-    for name in installed_names {
-        match locate_installed_dist_info(&sites, name) {
-            Some((site, dist_info, identity)) => matched.push((site, dist_info, identity)),
-            None => result.distributions_not_found += 1,
+    for expected in expected_distributions {
+        let located = locate_installed_dist_infos(&sites, expected);
+        match located.as_slice() {
+            [only] => matched.push(only.clone()),
+            [] => result.distributions_not_found += 1,
+            duplicates => {
+                result.distributions_not_found += 1;
+                integrity_signals.push(ArtifactSignal {
+                    kind: ArtifactSignalKind::DuplicateOwnedFile,
+                    location: SubjectLocation::installed(target_environment),
+                    evidence: format!(
+                        "expected exactly one installed {}{} but found {} matching .dist-info directories: {}",
+                        expected.name,
+                        expected
+                            .version
+                            .as_deref()
+                            .map(|version| format!("=={version}"))
+                            .unwrap_or_default(),
+                        duplicates.len(),
+                        duplicates
+                            .iter()
+                            .map(|(_, path, _)| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    confidence: crate::artifact::EdgeConfidence::High,
+                });
+            }
         }
     }
 
     if matched.is_empty() {
-        // Nothing of ours was found to verify; the verdict stays the empty Allow.
+        result.verdict = crate::escalation::finalize_static_verdict(
+            post_install_integrity_findings(&integrity_signals),
+            policy,
+            3,
+            Timings::default(),
+        );
         return result;
     }
 
@@ -660,7 +786,6 @@ pub fn verify_post_install_record(
 
     // 2. Per-distribution lenient RECORD verification; collect the signals from the
     //    ordinary (non-editable, non-externally-managed) distributions only.
-    let mut integrity_signals: Vec<ArtifactSignal> = Vec::new();
     for (site, dist_info, identity) in &matched {
         let record_result = verify_installed_record(
             dist_info,
@@ -720,19 +845,49 @@ pub fn verify_post_install_record(
 }
 
 /// The PEP 503-normalised distribution names a resolved set installed, one per
-/// artifact, derived from each validated wheel filename with the SAME normaliser
-/// the resolver's `name @ file://...` line uses (so a `.dist-info` directory name
-/// and an approved distribution name cannot drift). A wheel filename that does not
-/// parse contributes nothing (it could not have produced an approved line either).
+/// artifact, derived from each validated wheel filename with the same normaliser
+/// used while producing its approved local requirement (so a `.dist-info`
+/// directory name and an approved distribution name cannot drift). A wheel
+/// filename that does not parse contributes nothing (it could not have produced an
+/// approved line either).
 pub fn installed_distribution_names(resolved: &ResolvedSet) -> Vec<String> {
-    let mut names: Vec<String> = resolved
-        .artifacts
-        .iter()
-        .filter_map(|a| crate::artifact::archive::wheel_distribution_name(&a.wheel_filename))
+    let mut names: Vec<String> = installed_distribution_identities(resolved)
+        .into_iter()
+        .map(|identity| identity.name)
         .collect();
     names.sort();
     names.dedup();
     names
+}
+
+/// Exact normalized project name and version carried by each approved wheel.
+/// Malformed filenames contribute nothing because they could not have crossed
+/// archive identity validation or produced an approved requirement.
+pub fn installed_distribution_identities(
+    resolved: &ResolvedSet,
+) -> Vec<ExpectedInstalledDistribution> {
+    let mut identities: Vec<ExpectedInstalledDistribution> = resolved
+        .artifacts
+        .iter()
+        .filter_map(|artifact| {
+            let name = crate::artifact::archive::wheel_distribution_name(&artifact.wheel_filename)?;
+            let stem = artifact.wheel_filename.strip_suffix(".whl").or_else(|| {
+                artifact
+                    .wheel_filename
+                    .to_ascii_lowercase()
+                    .ends_with(".whl")
+                    .then_some(&artifact.wheel_filename[..artifact.wheel_filename.len() - 4])
+            })?;
+            let version = stem.split('-').nth(1)?.trim().to_ascii_lowercase();
+            (!version.is_empty()).then_some(ExpectedInstalledDistribution {
+                name,
+                version: Some(version),
+            })
+        })
+        .collect();
+    identities.sort();
+    identities.dedup();
+    identities
 }
 
 /// Discover EVERY installed distribution under a target environment, returning each
@@ -794,6 +949,11 @@ pub fn discover_installed_distributions(
 /// not pull in the broad `ecosystem scan` filesystem walk.
 fn post_install_site_packages(env: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
+    // pip `--target DIR` installs packages and `.dist-info` directories directly
+    // in DIR. Keep that explicit-target layout alongside ordinary venv layouts.
+    if env.is_dir() {
+        found.push(env.to_path_buf());
+    }
     for c in [
         env.join("site-packages"),
         env.join("Lib").join("site-packages"),
@@ -825,17 +985,19 @@ fn post_install_site_packages(env: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Locate the `.dist-info` directory of `name` (PEP 503-normalised) across the
-/// given `site-packages` roots, returning `(site, dist_info_dir, identity)`. A
+/// Locate every `.dist-info` directory matching an exact expected identity across
+/// the given `site-packages` roots, returning `(site, dist_info_dir, identity)`. A
 /// distribution dir is `<project>-<version>.dist-info`; the project part is
 /// normalised with the SAME PEP 503 normaliser used for `name`, so case / `-_.`
 /// spelling differences between the wheel name and the on-disk dir name still
-/// match. The first matching `.dist-info` (sites in order, then sorted dir names)
-/// wins.
-fn locate_installed_dist_info(
+/// match. Enforcing callers require exactly one result; silently taking the first
+/// would let a stale clean version attest different newly installed bytes.
+fn locate_installed_dist_infos(
     sites: &[PathBuf],
-    name: &str,
-) -> Option<(PathBuf, PathBuf, DistributionIdentity)> {
+    expected: &ExpectedInstalledDistribution,
+) -> Vec<(PathBuf, PathBuf, DistributionIdentity)> {
+    let mut matches = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for site in sites {
         let Ok(rd) = std::fs::read_dir(site) else {
             continue;
@@ -853,8 +1015,13 @@ fn locate_installed_dist_info(
         dist_infos.sort();
         for dist_info in dist_infos {
             if let Some((proj, version)) = dist_info_name_version(&dist_info) {
-                if crate::artifact::archive::normalize_project_name(&proj) == name {
-                    return Some((
+                let name_matches =
+                    crate::artifact::archive::normalize_project_name(&proj) == expected.name;
+                let version_matches = expected.version.as_deref().is_none_or(|expected_version| {
+                    version.trim().eq_ignore_ascii_case(expected_version.trim())
+                });
+                if name_matches && version_matches && seen.insert(dist_info.clone()) {
+                    matches.push((
                         site.clone(),
                         dist_info.clone(),
                         DistributionIdentity {
@@ -868,7 +1035,8 @@ fn locate_installed_dist_info(
             }
         }
     }
-    None
+    matches.sort_by(|left, right| left.1.cmp(&right.1));
+    matches
 }
 
 /// Parse `<project>-<version>.dist-info` -> `(project, version)` from the directory
@@ -1031,8 +1199,54 @@ pub struct InstallPlanDigest {
     /// The resolved target interpreter the install runs `python -m pip` with (its
     /// path). A different interpreter is a different operation.
     pub interpreter: String,
+    /// SHA-256 of the exact interpreter bytes retained for the install. A path is
+    /// not a content identity when an explicitly enrolled tool is user-writable.
+    pub interpreter_sha256: String,
+    /// The exact resolver executable used to produce the pinned wheel set.
+    pub resolver: String,
+    /// SHA-256 of the retained resolver executable bytes.
+    pub resolver_sha256: String,
+    /// Exact resolver version captured from the retained executable.
+    #[serde(default)]
+    pub resolver_version: String,
+    /// Exact pip distribution version read from the bound metadata tree.
+    #[serde(default)]
+    pub package_manager_version: String,
+    /// Canonical root-managed pip package directory selected by the interpreter.
+    #[serde(default)]
+    pub pip_tree_root: String,
+    /// Deterministic digest over the pip package and matching dist-info trees.
+    #[serde(default)]
+    pub pip_tree_sha256: String,
+    /// Version of the deterministic pip-tree attestation format.
+    #[serde(default)]
+    pub pip_tree_binding_version: u32,
+    /// Maximum regular-file count accepted by the attestation algorithm.
+    #[serde(default)]
+    pub pip_tree_max_files: u64,
+    /// Maximum aggregate regular-file bytes accepted by the attestation algorithm.
+    #[serde(default)]
+    pub pip_tree_max_bytes: u64,
+    /// Maximum bytes accepted for any one pip-tree regular file.
+    #[serde(default)]
+    pub pip_tree_max_file_bytes: u64,
+    /// Maximum UTF-8 bytes accepted for any pip-tree relative path.
+    #[serde(default)]
+    pub pip_tree_max_path_bytes: u64,
+    /// Actual regular-file count incorporated into the attestation.
+    #[serde(default)]
+    pub pip_tree_files: u64,
+    /// Actual aggregate regular-file bytes incorporated into the attestation.
+    #[serde(default)]
+    pub pip_tree_bytes: u64,
     /// The environment tree pip installs into (its path).
     pub target_environment: String,
+    /// Stable filesystem identity of the already-existing target parent.
+    #[serde(default)]
+    pub target_parent_identity: String,
+    /// Exact ordinary final component created beneath the bound parent.
+    #[serde(default)]
+    pub target_component: String,
     /// The platform tags the resolve targeted (e.g. the wheel ABI / platform tags),
     /// sorted. Empty when the resolve did not constrain them. Bound so an approval
     /// for one platform's wheels does not authorise another's.
@@ -1075,8 +1289,40 @@ pub struct InstallPlanInputs {
     pub normalized_packages: Vec<String>,
     /// The resolved target interpreter path.
     pub interpreter: PathBuf,
+    /// SHA-256 of the exact retained interpreter bytes.
+    pub interpreter_sha256: String,
+    /// The exact resolver executable path.
+    pub resolver: PathBuf,
+    /// SHA-256 of the exact retained resolver executable bytes.
+    pub resolver_sha256: String,
+    /// Exact resolver version captured from the retained executable.
+    pub resolver_version: String,
+    /// Exact pip distribution version read from bound metadata.
+    pub package_manager_version: String,
+    /// Canonical root-managed pip package directory.
+    pub pip_tree_root: PathBuf,
+    /// Deterministic pip package + dist-info tree digest.
+    pub pip_tree_sha256: String,
+    /// Pip-tree attestation format version.
+    pub pip_tree_binding_version: u32,
+    /// Pip-tree maximum regular-file count.
+    pub pip_tree_max_files: u64,
+    /// Pip-tree maximum aggregate bytes.
+    pub pip_tree_max_bytes: u64,
+    /// Pip-tree maximum bytes for one regular file.
+    pub pip_tree_max_file_bytes: u64,
+    /// Pip-tree maximum relative-path bytes.
+    pub pip_tree_max_path_bytes: u64,
+    /// Pip-tree actual regular-file count.
+    pub pip_tree_files: u64,
+    /// Pip-tree actual aggregate bytes.
+    pub pip_tree_bytes: u64,
     /// The environment tree pip installs into.
     pub target_environment: PathBuf,
+    /// Stable target-parent filesystem identity.
+    pub target_parent_identity: String,
+    /// Exact target final component.
+    pub target_component: String,
     /// The platform tags the resolve targeted (sorted by `new`).
     pub platform_tags: Vec<String>,
     /// The pinned pip argv WITHOUT the trailing approved.txt path.
@@ -1119,7 +1365,23 @@ impl InstallPlanDigest {
             artifact_sha256,
             normalized_packages,
             interpreter: inputs.interpreter.display().to_string(),
+            interpreter_sha256: inputs.interpreter_sha256.to_ascii_lowercase(),
+            resolver: inputs.resolver.display().to_string(),
+            resolver_sha256: inputs.resolver_sha256.to_ascii_lowercase(),
+            resolver_version: inputs.resolver_version,
+            package_manager_version: inputs.package_manager_version,
+            pip_tree_root: inputs.pip_tree_root.display().to_string(),
+            pip_tree_sha256: inputs.pip_tree_sha256.to_ascii_lowercase(),
+            pip_tree_binding_version: inputs.pip_tree_binding_version,
+            pip_tree_max_files: inputs.pip_tree_max_files,
+            pip_tree_max_bytes: inputs.pip_tree_max_bytes,
+            pip_tree_max_file_bytes: inputs.pip_tree_max_file_bytes,
+            pip_tree_max_path_bytes: inputs.pip_tree_max_path_bytes,
+            pip_tree_files: inputs.pip_tree_files,
+            pip_tree_bytes: inputs.pip_tree_bytes,
             target_environment: inputs.target_environment.display().to_string(),
+            target_parent_identity: inputs.target_parent_identity,
+            target_component: inputs.target_component,
             platform_tags,
             install_command_semantics: inputs.install_command_semantics,
             policy_projection_hash: inputs.policy_projection_hash,
@@ -1304,12 +1566,14 @@ mod tests {
     fn pip_install_args_are_the_pinned_flags() {
         let cmd = InstallCommand {
             approved_requirements_path: PathBuf::from("/q/txn/approved.txt"),
+            target_environment: PathBuf::from("/dedicated-target"),
         };
         let args = cmd.pip_install_args();
-        // The exact plan pin, in order: -m pip install + the hardening flags + -r.
-        assert_eq!(args[0], "-m");
-        assert_eq!(args[1], "pip");
-        assert_eq!(args[2], "install");
+        // The exact plan pin, in order: -I -m pip install + hardening flags + -r.
+        assert_eq!(args[0], "-I");
+        assert_eq!(args[1], "-m");
+        assert_eq!(args[2], "pip");
+        assert_eq!(args[3], "install");
         for flag in [
             "--isolated",
             "--no-index",
@@ -1317,6 +1581,7 @@ mod tests {
             "--require-hashes",
             "--no-cache-dir",
             "--force-reinstall",
+            "--upgrade",
         ] {
             assert!(args.iter().any(|a| a == flag), "missing {flag}");
         }
@@ -1324,6 +1589,8 @@ mod tests {
         let r_idx = args.iter().position(|a| a == "-r").unwrap();
         assert_eq!(args[r_idx + 1], "/q/txn/approved.txt");
         assert_eq!(r_idx + 1, args.len() - 1);
+        let target_idx = args.iter().position(|a| a == "--target").unwrap();
+        assert_eq!(args[target_idx + 1], "/dedicated-target");
     }
 
     #[test]
@@ -1332,6 +1599,7 @@ mod tests {
         // package whose version is already installed, defeating a re-verified install.
         let cmd = InstallCommand {
             approved_requirements_path: PathBuf::from("/tmp/approved.txt"),
+            target_environment: PathBuf::from("/dedicated-target"),
         };
         assert!(cmd
             .pip_install_args()
@@ -1385,11 +1653,12 @@ mod tests {
         };
         let materialized = vec![PathBuf::from("/q/txn-1/Flask-3.0.0-py3-none-any.whl")];
         let text = approved_requirements_text(&resolved, &materialized).unwrap();
-        // PEP 503 name (flask, lower-cased), the file:// URL, and the lower-cased hash.
+        // The wheel is relative to the descriptor-bound transaction cwd and the
+        // hash is lower-cased.
         assert_eq!(
             text,
             format!(
-                "flask @ file:///q/txn-1/Flask-3.0.0-py3-none-any.whl --hash=sha256:{}\n",
+                "./Flask-3.0.0-py3-none-any.whl --hash=sha256:{}\n",
                 "a".repeat(64)
             )
         );
@@ -1417,8 +1686,8 @@ mod tests {
         ];
         let text = approved_requirements_text(&resolved, &materialized).unwrap();
         assert_eq!(text.lines().count(), 2);
-        assert!(text.contains("alpha @ file:///q/txn/alpha-1.0-py3-none-any.whl --hash=sha256:"));
-        assert!(text.contains("beta @ file:///q/txn/beta-2.0-py3-none-any.whl --hash=sha256:"));
+        assert!(text.contains("./alpha-1.0-py3-none-any.whl --hash=sha256:"));
+        assert!(text.contains("./beta-2.0-py3-none-any.whl --hash=sha256:"));
     }
 
     #[test]
@@ -1499,7 +1768,13 @@ mod tests {
 
         assert_eq!(plan.materialized.len(), 1);
         assert!(plan.materialized[0].ends_with(filename));
+        assert_eq!(plan.materialized_sha256, vec![digest.clone()]);
         // The approved.txt references the materialised copy and the approved digest.
+        #[cfg(unix)]
+        assert!(plan
+            .approved_requirements
+            .contains(&format!("./{filename} --hash=sha256:")));
+        #[cfg(not(unix))]
         assert!(plan.approved_requirements.contains("demo @ file://"));
         assert!(plan
             .approved_requirements
@@ -1613,6 +1888,58 @@ mod tests {
                     .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
             }
             other => panic!("expected RebindBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_edge_rejects_every_typed_coverage_gap_even_if_upstream_verdict_allows() {
+        for kind in crate::scan::CoverageGapKind::ALL {
+            let gap = crate::scan::CoverageGap {
+                location: SubjectLocation::member(
+                    "/quarantine/demo.whl",
+                    format!("payload/{}.bin", kind.as_str()),
+                ),
+                kind,
+                sha256: None,
+            };
+            let outcome = FirewallOutcome {
+                verdict: Verdict::from_findings(Vec::new(), 3, Timings::default()),
+                integrity_findings: Vec::new(),
+                set_inspection: crate::artifact::inspect::ArtifactSetInspection {
+                    members: Vec::new(),
+                    cross_findings: Vec::new(),
+                    gaps: vec![gap],
+                },
+                materialized: Vec::new(),
+            };
+
+            let error = match require_complete_firewall_outcome(outcome, &Policy::default()) {
+                Ok(_) => panic!("every incomplete artifact outcome must fail before plan creation"),
+                Err(error) => error,
+            };
+            match error {
+                InstallError::RebindBlocked {
+                    verdict,
+                    integrity_mismatch,
+                } => {
+                    assert!(
+                        !integrity_mismatch,
+                        "{} is a coverage failure",
+                        kind.as_str()
+                    );
+                    assert_eq!(
+                        verdict.action,
+                        crate::verdict::Action::Block,
+                        "{} must retain the install Block floor",
+                        kind.as_str()
+                    );
+                    assert!(verdict.findings.iter().any(|finding| {
+                        finding.rule_id == RuleId::AnalysisIncomplete
+                            && finding.description.contains(kind.as_str())
+                    }));
+                }
+                other => panic!("{} returned the wrong error: {other:?}", kind.as_str()),
+            }
         }
     }
 
@@ -2035,6 +2362,75 @@ mod tests {
         assert_eq!(res.distributions_not_found, 0);
     }
 
+    #[test]
+    fn exact_post_install_verifies_pip_target_directory_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"installed directly by pip --target\n";
+        write_installed_dist(
+            tmp.path(),
+            "demo",
+            "1.0",
+            &[("demo.py", body)],
+            &[("demo.py", Some(body))],
+            &[],
+        );
+        let expected = [ExpectedInstalledDistribution {
+            name: "demo".to_string(),
+            version: Some("1.0".to_string()),
+        }];
+        let result = verify_post_install_record_exact(tmp.path(), &expected, &Policy::default());
+        assert_eq!(result.distributions_verified, 1);
+        assert!(result.is_complete());
+    }
+
+    #[test]
+    fn exact_post_install_rejects_stale_version_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_installed_dist(tmp.path(), "demo", "0.9", &[], &[], &[]);
+        let expected = [ExpectedInstalledDistribution {
+            name: "demo".to_string(),
+            version: Some("1.0".to_string()),
+        }];
+        let result = verify_post_install_record_exact(tmp.path(), &expected, &Policy::default());
+        assert_eq!(result.distributions_verified, 0);
+        assert_eq!(result.distributions_not_found, 1);
+        assert!(!result.is_complete());
+    }
+
+    #[test]
+    fn exact_post_install_rejects_duplicate_matching_dist_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_installed_dist(tmp.path(), "demo", "1.0", &[], &[], &[]);
+        let nested = env_with_site(tmp.path());
+        write_installed_dist(&nested, "demo", "1.0", &[], &[], &[]);
+        let expected = [ExpectedInstalledDistribution {
+            name: "demo".to_string(),
+            version: Some("1.0".to_string()),
+        }];
+        let result = verify_post_install_record_exact(tmp.path(), &expected, &Policy::default());
+        assert_eq!(result.distributions_verified, 0);
+        assert_eq!(result.distributions_not_found, 1);
+        assert_eq!(finding_count(&result.verdict), 1);
+    }
+
+    #[test]
+    fn resolved_distribution_identities_bind_wheel_versions() {
+        let resolved = ResolvedSet {
+            locked_requirements: String::new(),
+            artifacts: vec![ResolvedArtifact {
+                wheel_filename: "typing_extensions-4.9.0-py3-none-any.whl".to_string(),
+                sha256: "a".repeat(64),
+            }],
+        };
+        assert_eq!(
+            installed_distribution_identities(&resolved),
+            vec![ExpectedInstalledDistribution {
+                name: "typing-extensions".to_string(),
+                version: Some("4.9.0".to_string()),
+            }]
+        );
+    }
+
     // ---- D7: InstallPlanDigest -----------------------------------------------
 
     /// A full set of binding inputs for a digest, every field populated so a test
@@ -2044,10 +2440,27 @@ mod tests {
             artifact_sha256: vec!["b".repeat(64), "a".repeat(64)], // out of order
             normalized_packages: vec!["flask".to_string(), "click".to_string()],
             interpreter: PathBuf::from("/venv/bin/python"),
+            interpreter_sha256: "c".repeat(64),
+            resolver: PathBuf::from("/usr/bin/uv"),
+            resolver_sha256: "d".repeat(64),
+            resolver_version: "uv 1.2.3".to_string(),
+            package_manager_version: "24.0".to_string(),
+            pip_tree_root: PathBuf::from("/usr/lib/python3/site-packages/pip"),
+            pip_tree_sha256: "e".repeat(64),
+            pip_tree_binding_version: 1,
+            pip_tree_max_files: 20_000,
+            pip_tree_max_bytes: 256 * 1024 * 1024,
+            pip_tree_max_file_bytes: 64 * 1024 * 1024,
+            pip_tree_max_path_bytes: 4096,
+            pip_tree_files: 120,
+            pip_tree_bytes: 32_000,
             target_environment: PathBuf::from("/venv"),
+            target_parent_identity: "linux-devino-v1:1:2".to_string(),
+            target_component: "venv".to_string(),
             platform_tags: vec!["py3-none-any".to_string()],
             install_command_semantics: InstallCommand {
                 approved_requirements_path: PathBuf::from("/q/txn/approved.txt"),
+                target_environment: PathBuf::from("/venv"),
             }
             .pip_install_args_without_requirements_path(),
             policy_projection_hash: "deadbeef".repeat(8),
@@ -2106,10 +2519,52 @@ mod tests {
                 }),
             ),
             (
+                "different interpreter bytes",
+                Box::new(|i: &mut InstallPlanInputs| i.interpreter_sha256 = "0".repeat(64)),
+            ),
+            (
+                "different resolver",
+                Box::new(|i: &mut InstallPlanInputs| i.resolver = PathBuf::from("/other/uv")),
+            ),
+            (
+                "different resolver bytes",
+                Box::new(|i: &mut InstallPlanInputs| i.resolver_sha256 = "0".repeat(64)),
+            ),
+            (
+                "different resolver version",
+                Box::new(|i: &mut InstallPlanInputs| i.resolver_version = "uv 9".to_string()),
+            ),
+            (
+                "different pip version",
+                Box::new(|i: &mut InstallPlanInputs| i.package_manager_version = "99".to_string()),
+            ),
+            (
+                "different pip tree",
+                Box::new(|i: &mut InstallPlanInputs| i.pip_tree_sha256 = "0".repeat(64)),
+            ),
+            (
+                "different pip binding schema",
+                Box::new(|i: &mut InstallPlanInputs| i.pip_tree_binding_version += 1),
+            ),
+            (
+                "different pip binding limits",
+                Box::new(|i: &mut InstallPlanInputs| i.pip_tree_max_file_bytes += 1),
+            ),
+            (
                 "different target env",
                 Box::new(|i: &mut InstallPlanInputs| {
                     i.target_environment = PathBuf::from("/other")
                 }),
+            ),
+            (
+                "different target parent identity",
+                Box::new(|i: &mut InstallPlanInputs| {
+                    i.target_parent_identity = "linux-devino-v1:9:9".to_string()
+                }),
+            ),
+            (
+                "different target component",
+                Box::new(|i: &mut InstallPlanInputs| i.target_component = "other".to_string()),
             ),
             (
                 "different platform tags",
@@ -2167,6 +2622,7 @@ mod tests {
         // temp dirs still bind to the same digest.
         let semantics = InstallCommand {
             approved_requirements_path: PathBuf::from("/q/txn-A/approved.txt"),
+            target_environment: PathBuf::from("/venv"),
         }
         .pip_install_args_without_requirements_path();
         // The flags are present; no concrete approved.txt path is.

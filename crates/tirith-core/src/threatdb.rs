@@ -686,6 +686,50 @@ pub struct ThreatDbStats {
     pub typosquat_count: u32,
     pub popular_count: u32,
     pub string_table_bytes: u32,
+    /// Number of records in the v2 artifact-SHA section. Zero for v1.
+    pub artifact_sha256_count: u64,
+    /// Number of records in the v2 file-content-hash section. Zero for v1.
+    pub file_sha256_count: u64,
+    /// Number of records in the v2 malicious-URL section. Zero for v1.
+    pub malicious_url_count: u64,
+}
+
+/// Per-section record counts attributed to one [`ThreatSource`].
+///
+/// Keeping the section dimensions prevents a stable total for one source from
+/// hiding the complete loss of one indicator kind (for example, artifact hashes
+/// disappearing while package records grow by the same amount).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceRecordCounts {
+    pub package_count: u64,
+    pub hostname_count: u64,
+    pub ip_count: u64,
+    pub typosquat_count: u64,
+    pub artifact_sha256_count: u64,
+    pub file_sha256_count: u64,
+    pub malicious_url_count: u64,
+}
+
+impl SourceRecordCounts {
+    pub fn total(self) -> u64 {
+        self.package_count
+            + self.hostname_count
+            + self.ip_count
+            + self.typosquat_count
+            + self.artifact_sha256_count
+            + self.file_sha256_count
+            + self.malicious_url_count
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.package_count += other.package_count;
+        self.hostname_count += other.hostname_count;
+        self.ip_count += other.ip_count;
+        self.typosquat_count += other.typosquat_count;
+        self.artifact_sha256_count += other.artifact_sha256_count;
+        self.file_sha256_count += other.file_sha256_count;
+        self.malicious_url_count += other.malicious_url_count;
+    }
 }
 
 /// Per-source record counts derived by walking a loaded DB's sections.
@@ -695,6 +739,7 @@ pub struct ThreatDbStats {
 #[derive(Debug, Clone, Default)]
 pub struct SourceBreakdown {
     per_source: Vec<(ThreatSource, u64)>,
+    by_section: Vec<(ThreatSource, SourceRecordCounts)>,
     pub typosquat_count: u64,
     pub popular_count: u64,
 }
@@ -705,6 +750,14 @@ impl SourceBreakdown {
         &self.per_source
     }
 
+    /// Section-specific counts for `source`, or all-zero counts when absent.
+    pub fn section_counts_for(&self, source: ThreatSource) -> SourceRecordCounts {
+        self.by_section
+            .iter()
+            .find_map(|(candidate, counts)| (*candidate == source).then_some(*counts))
+            .unwrap_or_default()
+    }
+
     /// Fold another breakdown's counts into this one (overlay into primary).
     fn merge(&mut self, other: SourceBreakdown) {
         for (src, count) in other.per_source {
@@ -712,6 +765,17 @@ impl SourceBreakdown {
                 *existing += count;
             } else {
                 self.per_source.push((src, count));
+            }
+        }
+        for (src, counts) in other.by_section {
+            if let Some((_, existing)) = self
+                .by_section
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == src)
+            {
+                existing.merge(counts);
+            } else {
+                self.by_section.push((src, counts));
             }
         }
         self.typosquat_count += other.typosquat_count;
@@ -785,6 +849,24 @@ fn fnv1a_hash(data: &[u8]) -> u32 {
         h = h.wrapping_mul(0x0100_0193);
     }
     h
+}
+
+/// Canonical DNS identity shared by threat-indicator ingestion and lookup.
+/// `url::Host::parse` applies the crate's single WHATWG/IDNA policy; removing
+/// the terminal root label first makes `example.test` and `example.test.` the
+/// same DNS name. Invalid and IP-shaped inputs are not hostname indicators.
+pub fn canonical_threat_hostname(host: &str) -> Option<String> {
+    let without_root = host.trim_end_matches('.');
+    if without_root.is_empty() {
+        return None;
+    }
+    match url::Host::parse(without_root).ok()? {
+        url::Host::Domain(domain) => {
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        }
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+    }
 }
 
 fn pkg_key_hash(eco: Ecosystem, name: &[u8]) -> u32 {
@@ -1502,6 +1584,18 @@ impl ThreatDb {
             typosquat_count: self.typosquat_index_count + overlay.typosquat_count,
             popular_count: self.popular_index_count + overlay.popular_count,
             string_table_bytes: self.string_table_size + overlay.string_table_bytes,
+            artifact_sha256_count: self
+                .v2
+                .as_ref()
+                .map_or(0, |sections| sections.artifact_sha_count)
+                + overlay.artifact_sha256_count,
+            file_sha256_count: self
+                .v2
+                .as_ref()
+                .map_or(0, |sections| sections.file_hash_count)
+                + overlay.file_sha256_count,
+            malicious_url_count: self.v2.as_ref().map_or(0, |sections| sections.url_count)
+                + overlay.malicious_url_count,
         }
     }
 
@@ -1518,16 +1612,14 @@ impl ThreatDb {
 
     /// Per-source counts for this DB file only (no overlay recursion).
     fn source_breakdown_self(&self) -> SourceBreakdown {
-        let mut counts: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
-        let mut bump = |src: ThreatSource| {
-            *counts.entry(src as u8).or_insert(0) += 1;
-        };
+        let mut counts: std::collections::BTreeMap<u8, SourceRecordCounts> =
+            std::collections::BTreeMap::new();
 
         // Packages: index entries point to variable-size records.
         for i in 0..self.pkg_index_count {
             if let Some((data_off, _)) = self.pkg_index_entry(i) {
                 if let Some(rec) = self.parse_pkg_record(data_off as usize) {
-                    bump(rec.source);
+                    counts.entry(rec.source as u8).or_default().package_count += 1;
                 }
             }
         }
@@ -1541,7 +1633,7 @@ impl ThreatDb {
                     .get(data_off as usize)
                     .and_then(|&b| ThreatSource::from_u8(b))
                 {
-                    bump(src);
+                    counts.entry(src as u8).or_default().hostname_count += 1;
                 }
             }
         }
@@ -1554,24 +1646,76 @@ impl ThreatDb {
                 .get(base + 4)
                 .and_then(|&b| ThreatSource::from_u8(b))
             {
-                bump(src);
+                counts.entry(src as u8).or_default().ip_count += 1;
             }
         }
 
-        SourceBreakdown {
-            per_source: ThreatSource::ALL
-                .iter()
-                .map(|src| {
-                    // Typosquat records carry no source byte, so the walk never
-                    // bumps `EcosystemsTyposquat`; attribute the whole typosquat
-                    // index to it (adding, not replacing, stays correct).
-                    let mut count = counts.get(&(*src as u8)).copied().unwrap_or(0);
-                    if *src == ThreatSource::EcosystemsTyposquat {
-                        count += self.typosquat_index_count as u64;
+        // V2 fixed-record sections carry their source at a stable byte offset.
+        // Descriptor parsing already proved each extent/count pair is in-bounds;
+        // retain checked arithmetic here so this reporting path remains robust if
+        // those invariants change later.
+        if let Some(v2) = self.v2.as_ref() {
+            let mut walk_sources =
+                |offset: u64, count: u64, record_size: usize, source_offset: usize, section: u8| {
+                    for index in 0..count {
+                        let Some(base) = index
+                            .checked_mul(record_size as u64)
+                            .and_then(|delta| offset.checked_add(delta))
+                            .and_then(|absolute| usize::try_from(absolute).ok())
+                        else {
+                            continue;
+                        };
+                        let Some(src) = self
+                            .data
+                            .get(base + source_offset)
+                            .and_then(|&raw| ThreatSource::from_u8(raw))
+                        else {
+                            continue;
+                        };
+                        let entry = counts.entry(src as u8).or_default();
+                        match section {
+                            0 => entry.artifact_sha256_count += 1,
+                            1 => entry.file_sha256_count += 1,
+                            2 => entry.malicious_url_count += 1,
+                            _ => unreachable!("known v2 section selector"),
+                        }
                     }
-                    (*src, count)
-                })
+                };
+            walk_sources(
+                v2.artifact_sha_offset,
+                v2.artifact_sha_count,
+                ARTIFACT_SHA_RECORD_SIZE,
+                33,
+                0,
+            );
+            walk_sources(
+                v2.file_hash_offset,
+                v2.file_hash_count,
+                FILE_HASH_RECORD_SIZE,
+                33,
+                1,
+            );
+            walk_sources(v2.url_offset, v2.url_count, URL_INDEX_RECORD_SIZE, 36, 2);
+        }
+
+        // Typosquat records carry no source byte, so attribute that whole index
+        // to its defined source while keeping the section dimension explicit.
+        counts
+            .entry(ThreatSource::EcosystemsTyposquat as u8)
+            .or_default()
+            .typosquat_count += self.typosquat_index_count as u64;
+
+        let by_section: Vec<(ThreatSource, SourceRecordCounts)> = ThreatSource::ALL
+            .iter()
+            .map(|src| (*src, counts.get(&(*src as u8)).copied().unwrap_or_default()))
+            .collect();
+
+        SourceBreakdown {
+            per_source: by_section
+                .iter()
+                .map(|(source, counts)| (*source, counts.total()))
                 .collect(),
+            by_section,
             // Typosquat and popular counts are also reported as their own
             // categories (popular has no single source).
             typosquat_count: self.typosquat_index_count as u64,
@@ -2035,20 +2179,20 @@ impl ThreatDb {
 
     /// Check a hostname against the threat DB.
     pub fn check_hostname(&self, host: &str) -> Option<ThreatMatch> {
+        let normalized = canonical_threat_hostname(host)?;
         if self.hostname_index_count == 0 {
             return self
                 .supplemental
                 .as_deref()
-                .and_then(|db| db.check_hostname(host));
+                .and_then(|db| db.check_hostname(&normalized));
         }
-        let normalized = host.to_ascii_lowercase();
         let target_hash = fnv1a_hash(normalized.as_bytes());
 
         let Some(idx) = self.binary_search_hostname_index(&normalized, target_hash) else {
             return self
                 .supplemental
                 .as_deref()
-                .and_then(|db| db.check_hostname(host));
+                .and_then(|db| db.check_hostname(&normalized));
         };
         let base = self.hostname_index_offset as usize + idx as usize * HOSTNAME_INDEX_ENTRY_SIZE;
         let data_off = read_u32_le(&self.data, base)? as usize;
@@ -3253,10 +3397,9 @@ impl ThreatDbWriter {
     }
 
     pub fn add_hostname(&mut self, name: &str, source: ThreatSource) {
-        self.hostnames.push(WriterHostname {
-            name: name.to_ascii_lowercase(),
-            source,
-        });
+        if let Some(name) = canonical_threat_hostname(name) {
+            self.hostnames.push(WriterHostname { name, source });
+        }
     }
 
     pub fn add_ip(&mut self, addr: Ipv4Addr, source: ThreatSource) {
@@ -3412,10 +3555,15 @@ impl ThreatDbWriter {
                 .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name);
         }
 
-        self.hostnames.sort_by(|a, b| a.name.cmp(&b.name));
+        // One physical network record cannot retain multiple provenance claims.
+        // Resolve overlaps by the stable source discriminant before deduplication
+        // so feed insertion order never changes the signed attribution.
+        self.hostnames.sort_by(|a, b| {
+            (a.name.as_str(), a.source as u8).cmp(&(b.name.as_str(), b.source as u8))
+        });
         self.hostnames.dedup_by(|a, b| a.name == b.name);
 
-        self.ips.sort_by_key(|ip| ip.addr);
+        self.ips.sort_by_key(|ip| (ip.addr, ip.source as u8));
         self.ips.dedup_by_key(|ip| ip.addr);
 
         self.typosquats.sort_by(|a, b| {
@@ -4743,6 +4891,61 @@ mod tests {
     }
 
     #[test]
+    fn hostname_ioc_matches_dns_case_root_dot_and_idna_aliases() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        writer.add_hostname("BÜCHER.Example.", ThreatSource::Urlhaus);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        for alias in [
+            "bücher.example",
+            "BÜCHER.EXAMPLE.",
+            "xn--bcher-kva.example",
+            "XN--BCHER-KVA.EXAMPLE.",
+        ] {
+            let matched = db
+                .check_hostname(alias)
+                .unwrap_or_else(|| panic!("canonical hostname alias did not match: {alias}"));
+            assert_eq!(matched.name, "xn--bcher-kva.example");
+        }
+        assert!(db.check_hostname(".").is_none());
+        assert!(db.check_hostname("127.0.0.1").is_none());
+    }
+
+    #[test]
+    fn overlapping_network_ioc_source_is_independent_of_insertion_order() {
+        let key = SigningKey::generate(&mut OsRng);
+        let build = |reverse: bool| {
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+            if reverse {
+                writer.add_hostname("overlap.example", ThreatSource::PhishTank);
+                writer.add_hostname("overlap.example", ThreatSource::Urlhaus);
+                writer.add_ip(Ipv4Addr::new(203, 0, 113, 8), ThreatSource::TorExit);
+                writer.add_ip(Ipv4Addr::new(203, 0, 113, 8), ThreatSource::FeodoTracker);
+            } else {
+                writer.add_hostname("overlap.example", ThreatSource::Urlhaus);
+                writer.add_hostname("overlap.example", ThreatSource::PhishTank);
+                writer.add_ip(Ipv4Addr::new(203, 0, 113, 8), ThreatSource::FeodoTracker);
+                writer.add_ip(Ipv4Addr::new(203, 0, 113, 8), ThreatSource::TorExit);
+            }
+            ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load")
+        };
+
+        for db in [build(false), build(true)] {
+            assert_eq!(
+                db.check_hostname("overlap.example")
+                    .map(|matched| matched.source),
+                Some(ThreatSource::Urlhaus)
+            );
+            assert_eq!(
+                db.check_ip(Ipv4Addr::new(203, 0, 113, 8))
+                    .map(|matched| matched.source),
+                Some(ThreatSource::FeodoTracker)
+            );
+        }
+    }
+
+    #[test]
     fn test_signature_valid() {
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1700000000, 1);
@@ -5378,6 +5581,64 @@ mod tests {
         // 3 packages + 2 hostnames + 2 IPs + 1 typosquat = 8; popular is separate.
         let total: u64 = bd.per_source().iter().map(|(_, c)| c).sum();
         assert_eq!(total, 8);
+    }
+
+    #[test]
+    fn v2_stats_and_source_breakdown_include_every_indicator_section() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_artifact_sha256(
+            [0x11; 32],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_file_sha256(
+            [0x22; 32],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            &[],
+            None,
+        );
+        writer.add_malicious_url("https://bad.example/payload", ThreatSource::Urlhaus);
+        let bytes = writer
+            .build_format(ThreatDbFormat::V2, &key)
+            .expect("v2 build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("v2 load");
+
+        let stats = db.stats();
+        assert_eq!(stats.artifact_sha256_count, 1);
+        assert_eq!(stats.file_sha256_count, 1);
+        assert_eq!(stats.malicious_url_count, 1);
+
+        let breakdown = db.source_breakdown();
+        assert_eq!(
+            breakdown
+                .section_counts_for(ThreatSource::OssfMalicious)
+                .artifact_sha256_count,
+            1
+        );
+        assert_eq!(
+            breakdown
+                .section_counts_for(ThreatSource::DatadogMalicious)
+                .file_sha256_count,
+            1
+        );
+        assert_eq!(
+            breakdown
+                .section_counts_for(ThreatSource::Urlhaus)
+                .malicious_url_count,
+            1
+        );
+        assert_eq!(
+            breakdown
+                .per_source()
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            3
+        );
     }
 
     #[test]

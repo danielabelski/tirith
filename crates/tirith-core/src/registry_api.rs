@@ -26,6 +26,10 @@ use crate::package_risk::{
 use crate::policy;
 use crate::threatdb::Ecosystem;
 
+#[cfg(test)]
+type RegistryUrlValidator =
+    std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync + 'static>;
+
 /// HTTP timeout for one registry request (short — a degraded score beats a hang).
 const REQUEST_TIMEOUT_SECS: u64 = 12;
 /// Hard cap on a registry JSON response (npm "full" docs can be large).
@@ -462,20 +466,29 @@ impl HttpRegistryClient {
             crate::url_validate::validate_server_url(url).map_err(FetchError::Network)?;
         }
 
-        let mut builder = reqwest::blocking::Client::builder()
-            .no_proxy()
+        let builder = if self.enforce_destination_guard {
+            crate::ssrf_guard::server_client_builder()
+        } else {
+            // Debug/test-only local registry fixtures deliberately bypass the
+            // destination guard, but still never inherit ambient proxies.
+            reqwest::blocking::Client::builder().no_proxy()
+        };
+        let client = builder
             .timeout(self.timeout)
             .redirect(registry_redirect_policy(
                 &parsed,
                 !self.enforce_destination_guard,
-            ));
-        if self.enforce_destination_guard {
-            builder = builder.dns_resolver(crate::ssrf_guard::ssrf_guard_resolver());
-        }
-        let client = builder
+            ))
             .build()
             .map_err(|e| FetchError::Network(e.to_string()))?;
 
+        Self::get_json_bytes_with_client(url, &client)
+    }
+
+    fn get_json_bytes_with_client(
+        url: &str,
+        client: &reqwest::blocking::Client,
+    ) -> Result<Vec<u8>, FetchError> {
         let resp = client
             .get(url)
             .header(
@@ -512,6 +525,17 @@ impl HttpRegistryClient {
         }
         Ok(buf)
     }
+
+    #[cfg(test)]
+    fn get_json_bytes_with_test_client(
+        &self,
+        url: &str,
+        client: &reqwest::blocking::Client,
+        validate_initial: &(dyn Fn(&str) -> Result<(), String> + Send + Sync),
+    ) -> Result<Vec<u8>, FetchError> {
+        validate_initial(url).map_err(FetchError::Network)?;
+        Self::get_json_bytes_with_client(url, client)
+    }
 }
 
 /// Registry metadata redirects are stricter than general server redirects:
@@ -522,32 +546,68 @@ fn registry_redirect_policy(
     initial: &url::Url,
     allow_private_test_base: bool,
 ) -> reqwest::redirect::Policy {
+    registry_redirect_policy_with_validator(
+        initial,
+        allow_private_test_base,
+        crate::url_validate::validate_server_url,
+    )
+}
+
+fn registry_redirect_policy_with_validator<Validate>(
+    initial: &url::Url,
+    allow_private_test_base: bool,
+    validate_target: Validate,
+) -> reqwest::redirect::Policy
+where
+    Validate: Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+{
     let initial = initial.clone();
-    reqwest::redirect::Policy::custom(move |attempt| {
-        match registry_redirect_decision(
+    reqwest::redirect::Policy::custom(
+        move |attempt| match registry_redirect_decision_with_validator(
             &initial,
             attempt.url(),
             attempt.previous().len(),
             allow_private_test_base,
+            &validate_target,
         ) {
             Ok(()) => attempt.follow(),
             Err(reason) => attempt.error(reason),
-        }
-    })
+        },
+    )
 }
 
+#[cfg(test)]
 fn registry_redirect_decision(
     initial: &url::Url,
     target: &url::Url,
     prior_hops: usize,
     allow_private_test_base: bool,
 ) -> Result<(), String> {
+    registry_redirect_decision_with_validator(
+        initial,
+        target,
+        prior_hops,
+        allow_private_test_base,
+        &crate::url_validate::validate_server_url,
+    )
+}
+
+fn registry_redirect_decision_with_validator<Validate>(
+    initial: &url::Url,
+    target: &url::Url,
+    prior_hops: usize,
+    allow_private_test_base: bool,
+    validate_target: &Validate,
+) -> Result<(), String>
+where
+    Validate: Fn(&str) -> Result<(), String> + ?Sized,
+{
     const MAX_REDIRECTS: usize = 5;
     if prior_hops >= MAX_REDIRECTS {
         return Err("too many registry redirects".to_string());
     }
     if !allow_private_test_base {
-        crate::ssrf_guard::server_redirect_decision(target.as_str(), prior_hops)?;
+        validate_target(target.as_str())?;
     }
     let same_origin = initial.scheme() == target.scheme()
         && initial.host_str().map(str::to_ascii_lowercase)
@@ -557,6 +617,24 @@ fn registry_redirect_decision(
         return Err("registry redirect changed the validated origin".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn registry_client_with_resolver_for_test(
+    initial: &url::Url,
+    resolver: std::sync::Arc<crate::ssrf_guard::SsrfGuardResolver>,
+    validate_target: RegistryUrlValidator,
+) -> Result<reqwest::blocking::Client, FetchError> {
+    let redirect_validator = std::sync::Arc::clone(&validate_target);
+    crate::ssrf_guard::server_client_builder_with_resolver_for_test(resolver)
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .redirect(registry_redirect_policy_with_validator(
+            initial,
+            false,
+            move |target| redirect_validator(target),
+        ))
+        .build()
+        .map_err(|error| FetchError::Network(error.to_string()))
 }
 
 impl RegistryClient for HttpRegistryClient {
@@ -1299,6 +1377,32 @@ mod tests {
     use super::*;
     use crate::package_risk::LOW_DOWNLOAD_THRESHOLD;
 
+    fn public_server_validator(expected_host: &'static str) -> RegistryUrlValidator {
+        std::sync::Arc::new(move |candidate| {
+            crate::url_validate::validate_server_url_with_resolver_for_test(
+                candidate,
+                &|host, _| {
+                    if host != expected_host {
+                        return Err(format!("unexpected validation host: {host}"));
+                    }
+                    Ok(vec!["93.184.216.34".parse().unwrap()])
+                },
+            )
+        })
+    }
+
+    fn request_error_messages(error: &reqwest::Error) -> Vec<String> {
+        use std::error::Error as _;
+
+        let mut messages = vec![error.to_string()];
+        let mut source = error.source();
+        while let Some(cause) = source {
+            messages.push(cause.to_string());
+            source = cause.source();
+        }
+        messages
+    }
+
     /// A fixture-fed [`RegistryClient`] — no network.
     struct FakeClient {
         result: Result<RegistryMetadata, FetchError>,
@@ -1401,6 +1505,138 @@ mod tests {
         let initial = url::Url::parse("https://registry.npmjs.org/demo").unwrap();
         let loopback = url::Url::parse("http://127.0.0.1/metadata").unwrap();
         assert!(registry_redirect_decision(&initial, &loopback, 0, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_client_rejects_connect_time_private_dns_rebind() {
+        use crate::ssrf_guard::test_support::EnvironmentRestore;
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut restore = EnvironmentRestore::new();
+        restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+        let url = "http://registry-public.example.test:8080/package";
+        let initial = url::Url::parse(url).unwrap();
+        let validator = public_server_validator("registry-public.example.test");
+        validator(url).expect("public preflight answer passes");
+        let resolver = crate::ssrf_guard::ssrf_guard_resolver_with_lookup_for_test(|host| {
+            assert_eq!(host, "registry-public.example.test");
+            Ok(vec!["127.0.0.1:9".parse().unwrap()])
+        });
+        let client = registry_client_with_resolver_for_test(&initial, resolver, validator)
+            .expect("build guarded registry client");
+        let error = client
+            .get(url)
+            .send()
+            .expect_err("connect-time private answer must be refused");
+        let messages = request_error_messages(&error);
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("ssrf_guard") && message.contains("non-public address")
+            }),
+            "registry failure must come from guarded DNS: {messages:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_client_rejects_private_redirect_before_second_request() {
+        use crate::ssrf_guard::test_support::{
+            http_response, EnvironmentRestore, ScriptedHttpServer,
+        };
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut restore = EnvironmentRestore::new();
+        restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+        let fixture = ScriptedHttpServer::start(vec![http_response(
+            "302 Found",
+            &[("Location", "http://127.0.0.1:9/internal")],
+            b"",
+        )]);
+        let address = fixture.address();
+        let url = format!(
+            "http://registry-public.example.test:{}/package",
+            address.port()
+        );
+        let initial = url::Url::parse(&url).unwrap();
+        let validator = public_server_validator("registry-public.example.test");
+        validator(&url).expect("public preflight answer passes");
+        let resolver = crate::ssrf_guard::fixture_resolver_with_lookup_for_test(move |host| {
+            assert_eq!(host, "registry-public.example.test");
+            Ok(vec![address])
+        });
+        let client = registry_client_with_resolver_for_test(&initial, resolver, validator)
+            .expect("build registry fixture client");
+        let error = client
+            .get(&url)
+            .send()
+            .expect_err("private redirect must be refused");
+        let messages = request_error_messages(&error);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("non-public")),
+            "private redirect must fail in destination validation: {messages:?}"
+        );
+        assert_eq!(
+            fixture.finish().len(),
+            1,
+            "redirect target must be refused before a second request"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_client_ignores_ambient_proxy_and_allows_same_origin_redirect() {
+        use crate::ssrf_guard::test_support::{
+            http_response, EnvironmentRestore, ProxyTrap, ScriptedHttpServer,
+        };
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = ScriptedHttpServer::start(vec![
+            http_response("302 Found", &[("Location", "/final")], b""),
+            http_response("200 OK", &[("Content-Type", "application/json")], b"{}"),
+        ]);
+        let proxy = ProxyTrap::start();
+        let mut restore = EnvironmentRestore::new();
+        restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+        restore.install_ambient_proxy(&proxy.url());
+        let address = fixture.address();
+        let url = format!(
+            "http://registry-public.example.test:{}/package",
+            address.port()
+        );
+        let initial = url::Url::parse(&url).unwrap();
+        let validator = public_server_validator("registry-public.example.test");
+        let resolver = crate::ssrf_guard::fixture_resolver_with_lookup_for_test(move |host| {
+            assert_eq!(host, "registry-public.example.test");
+            Ok(vec![address])
+        });
+        let client = registry_client_with_resolver_for_test(
+            &initial,
+            resolver,
+            std::sync::Arc::clone(&validator),
+        )
+        .expect("build registry fixture client");
+        let body = HttpRegistryClient::without_cache()
+            .get_json_bytes_with_test_client(&url, &client, validator.as_ref())
+            .expect("same-origin registry redirect remains available");
+
+        assert_eq!(body, b"{}");
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with(b"GET /package HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with(b"GET /final HTTP/1.1\r\n"));
+        assert!(
+            !proxy.finish(),
+            "registry client must take its independently resolved direct route"
+        );
     }
 
     #[test]

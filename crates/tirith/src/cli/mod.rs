@@ -316,6 +316,30 @@ mod write_json_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
+    #[test]
+    fn contained_atomic_write_preserves_no_clobber_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("commands.yaml");
+
+        super::write_file_atomic_contained(root.path(), &path, b"original\n", false)
+            .expect("no-clobber create must succeed when absent");
+        let error = super::write_file_atomic_contained(root.path(), &path, b"replacement\n", false)
+            .expect_err("no-clobber publish must refuse an existing destination");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original\n");
+
+        super::write_file_atomic_contained(root.path(), &path, b"replacement\n", true)
+            .expect("overwrite still atomically replaces the destination");
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement\n");
+        assert_eq!(
+            std::fs::read_dir(&config).unwrap().count(),
+            1,
+            "successful and refused publications must leave no temp entries"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn contained_atomic_write_rejects_final_symlink() {
@@ -353,6 +377,51 @@ mod write_json_tests {
             .expect_err("a repo-contained writer must refuse an escaping parent link");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!outside.path().join("policy.yaml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_atomic_write_parent_swap_cannot_redirect_publication() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        let held_config = root.path().join(".tirith-held");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("policy.yaml");
+
+        super::write_file_atomic_contained_with_hook(
+            root.path(),
+            &path,
+            b"safe: true\n",
+            true,
+            || {
+                // Swap the checked pathname only after its parent descriptor is
+                // retained, deterministically exercising the old check/use gap.
+                std::fs::rename(&config, &held_config)?;
+                symlink(outside.path(), &config)?;
+                Ok(())
+            },
+        )
+        .expect("publication through the retained parent must remain safe");
+
+        assert!(
+            !outside.path().join("policy.yaml").exists(),
+            "the replacement symlink target must remain untouched"
+        );
+        assert_eq!(
+            std::fs::read(held_config.join("policy.yaml")).unwrap(),
+            b"safe: true\n",
+            "publication must stay bound to the directory opened beneath root"
+        );
+        assert!(
+            std::fs::symlink_metadata(&config)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the replacement parent symlink must not be followed or clobbered"
+        );
     }
 }
 
@@ -392,46 +461,22 @@ pub(crate) fn write_file_atomic_contained(
     contents: &[u8],
     overwrite: bool,
 ) -> std::io::Result<()> {
-    let canonical_root = std::fs::canonicalize(root)?;
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "contained atomic destination has no parent",
-        )
-    })?;
-    let canonical_parent = std::fs::canonicalize(parent)?;
-    if !canonical_parent.starts_with(&canonical_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "atomic destination parent {} escapes contained root {}",
-                canonical_parent.display(),
-                canonical_root.display()
-            ),
-        ));
-    }
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "contained atomic destination has no file name",
-        )
-    })?;
-    let dest = canonical_parent.join(file_name);
-    match std::fs::symlink_metadata(&dest) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "refusing to replace symlinked contained destination {}",
-                    path.display()
-                ),
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    write_file_atomic_to_dest(&dest, contents, overwrite)
+    write_file_atomic_contained_with_hook(root, path, contents, overwrite, || Ok(()))
+}
+
+fn write_file_atomic_contained_with_hook(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    contents: &[u8],
+    overwrite: bool,
+    after_parent_bound: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // Parent creation remains the caller's responsibility, preserving the
+    // previous NotFound behavior. The retained capability now spans validation,
+    // tempfile creation, and atomic publication.
+    let destination = tirith_core::util::ContainedAtomicFile::prepare(root, path, false)?;
+    after_parent_bound()?;
+    destination.write_atomic(contents, overwrite)
 }
 
 fn write_file_atomic_to_dest(

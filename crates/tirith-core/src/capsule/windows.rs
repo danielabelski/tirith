@@ -27,10 +27,11 @@
 //!   per-container package SID and, by default, can read/write only objects whose
 //!   DACL grants that SID (plus world-readable system objects). The backend grants
 //!   the spec's read/write roots to the container SID via explicit ACEs
-//!   ([`acl_grants`]) and grants nothing else, so the sensitive subtrees in
-//!   [`crate::capsule::deny_default_paths`] stay unreachable (the container SID is
-//!   not on their DACLs). The grants are *tracked* and **revoked** after the child
-//!   exits (the CLI executor removes each ACE it added).
+//!   ([`acl_grants`]) and grants nothing else. Before producing any ACE, the shared
+//!   canonical policy gate proves every sensitive deny root is disjoint from those
+//!   positive grants; an overlap is refused because E4 has no proven deny-ACE
+//!   precedence model. The grants are *tracked* and **revoked** after the child exits
+//!   (the CLI executor removes each ACE it added).
 //! - **Network** ([`NetworkPolicy`]): an AppContainer reaches the network ONLY if
 //!   it is granted a networking capability (`internetClient`,
 //!   `internetClientServer`, `privateNetworkClientServer`). For a
@@ -73,8 +74,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use super::{
-    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, FilesystemPolicy, ResourceLimitSupport,
-    ResourceLimits,
+    canonicalize_and_validate_filesystem_policy, CapabilityLevel, Capsule, CapsuleCoverage,
+    CapsuleSpec, FilesystemPolicy, ResourceLimitSupport, ResourceLimits,
 };
 
 /// The stable backend identifier reported in receipts and `tirith doctor`.
@@ -154,8 +155,9 @@ pub fn probe_appcontainer() -> WindowsProbe {
 }
 
 /// Derive the coverage the backend can honestly claim for `spec`, given the
-/// AppContainer probe. **Pure** (no Win32 / spawns), so every branch of the
-/// honesty contract is unit-testable on any platform.
+/// AppContainer probe. It performs only read-only filesystem canonicalization and
+/// path-representation checks (no Win32 mutation / spawns), so every branch of the
+/// honesty contract remains unit-testable on any platform.
 ///
 /// Rules:
 /// - If AppContainer is **not** supported, every flag is `false` (degraded; the
@@ -188,9 +190,12 @@ pub fn derive_coverage(spec: &CapsuleSpec, probe: &WindowsProbe) -> CapsuleCover
         // Degraded, never NoOp-success: nothing is enforced.
         return CapsuleCoverage::NONE;
     }
+    let filesystem_policy_valid = validated_windows_filesystem(&spec.filesystem).is_ok();
     CapsuleCoverage {
-        fs_read_enforced: true,
-        fs_write_enforced: true,
+        // Positive ACL grants cannot be assumed to override a denied descendant.
+        // Never claim FS coverage for an ambiguous/unrepresentable policy.
+        fs_read_enforced: filesystem_policy_valid,
+        fs_write_enforced: filesystem_policy_valid,
         exec_limited: true,
         // No networking capability is ever granted -> no raw outbound socket.
         network_raw_denied: true,
@@ -205,14 +210,16 @@ pub fn derive_coverage(spec: &CapsuleSpec, probe: &WindowsProbe) -> CapsuleCover
 }
 
 /// An error from building (or, in the CLI executor, applying) a Windows capsule
-/// launch. The pure builders here only produce the `Unsupported` /
-/// `UnrepresentablePath` / `NulInArgument` variants; the executor adds Win32 error
-/// detail through its own error type.
+/// launch. The builders here produce policy/representation errors before any Win32
+/// mutation; the executor adds Win32 error detail through its own error type.
 #[derive(Debug)]
 pub enum WindowsCapsuleError {
     /// The requested containment level cannot be honored by E4's backend (an
     /// allow-listed-domains spec, which needs the loopback broker wired in E5).
     Unsupported(String),
+    /// The canonical filesystem policy is ambiguous or cannot be represented by
+    /// this positive-ACL-grant backend.
+    InvalidFilesystemPolicy(String),
     /// A path could not be represented for an ACL grant or a wide-string argument
     /// (e.g. it is not valid UTF-8, or it contains an interior NUL that a
     /// NUL-terminated wide string cannot carry).
@@ -226,6 +233,9 @@ impl std::fmt::Display for WindowsCapsuleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WindowsCapsuleError::Unsupported(m) => write!(f, "unsupported containment: {m}"),
+            WindowsCapsuleError::InvalidFilesystemPolicy(m) => {
+                write!(f, "invalid filesystem policy: {m}")
+            }
             WindowsCapsuleError::UnrepresentablePath(m) => write!(f, "unrepresentable path: {m}"),
             WindowsCapsuleError::NulInArgument(m) => write!(f, "argument contains NUL: {m}"),
         }
@@ -342,32 +352,63 @@ pub struct AclGrant {
 }
 
 /// Compute the ACL grants for `spec`: one [`AclAccess::ReadExecute`] grant per read
-/// root and one [`AclAccess::Modify`] grant per write root, in that order.
-/// **Pure.** The deny roots are NOT emitted as grants — denial is the AppContainer
-/// default (the container SID is simply never added to those DACLs), matching the
-/// default-deny model of the Linux/macOS backends.
+/// root and one [`AclAccess::Modify`] grant per write root, in that order. This does
+/// read-only root canonicalization and overlap validation but makes no ACL changes.
+/// Deny roots are not emitted as grants; the shared gate first proves they are
+/// disjoint from every positive grant because this backend has no proven deny-ACE
+/// precedence model.
 ///
 /// A path that cannot be represented as a NUL-free UTF-16 string (the form
 /// `SetNamedSecurityInfoW` needs) is rejected, so the executor never silently skips
 /// a grant — fail closed on an unrepresentable path rather than run with a quietly
 /// narrower (or, worse for a write root, missing) grant.
 pub fn acl_grants(fs: &FilesystemPolicy) -> Result<Vec<AclGrant>, WindowsCapsuleError> {
+    let canonical = validated_windows_filesystem(fs)?;
+    Ok(acl_grants_from_validated(&canonical))
+}
+
+fn acl_grants_from_validated(fs: &FilesystemPolicy) -> Vec<AclGrant> {
     let mut grants = Vec::with_capacity(fs.read_roots.len() + fs.write_roots.len());
     for root in &fs.read_roots {
-        validate_path_representable(root)?;
         grants.push(AclGrant {
             path: root.clone(),
             access: AclAccess::ReadExecute,
         });
     }
     for root in &fs.write_roots {
-        validate_path_representable(root)?;
         grants.push(AclGrant {
             path: root.clone(),
             access: AclAccess::Modify,
         });
     }
-    Ok(grants)
+    grants
+}
+
+fn validated_windows_filesystem(
+    filesystem: &FilesystemPolicy,
+) -> Result<FilesystemPolicy, WindowsCapsuleError> {
+    // Check raw spelling first so an interior NUL cannot be hidden by a failed
+    // filesystem lookup or normalization error. Validate denies too: a requested
+    // deny that this backend cannot name must prevent any filesystem coverage claim.
+    for root in filesystem
+        .read_roots
+        .iter()
+        .chain(&filesystem.write_roots)
+        .chain(&filesystem.deny_roots)
+    {
+        validate_path_representable(root)?;
+    }
+    let canonical = canonicalize_and_validate_filesystem_policy(filesystem)
+        .map_err(|error| WindowsCapsuleError::InvalidFilesystemPolicy(error.to_string()))?;
+    for root in canonical
+        .read_roots
+        .iter()
+        .chain(&canonical.write_roots)
+        .chain(&canonical.deny_roots)
+    {
+        validate_path_representable(root)?;
+    }
+    Ok(canonical)
 }
 
 /// Ensure `path` can be expressed as a NUL-terminated wide string (valid UTF-8 with
@@ -424,8 +465,9 @@ pub fn job_object_limits(limits: &ResourceLimits) -> JobObjectLimits {
 
 /// A fully-assembled, validated Windows launch plan: everything the CLI executor
 /// needs to create the AppContainer, apply ACLs + the Job Object, and spawn the
-/// child via `CreateProcessW`. **Pure** — building it performs no Win32 and spawns
-/// nothing, so the whole plan is unit-testable on any platform.
+/// child via `CreateProcessW`. Building performs read-only root canonicalization but
+/// no Win32 mutation and spawns nothing, so the whole plan is unit-testable on any
+/// platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsLaunchPlan {
     /// The AppContainer identity to create / derive the package SID from.
@@ -483,6 +525,10 @@ pub fn windows_launch_plan_os(
                 .to_string(),
         ));
     }
+    // Canonicalize/reject filesystem policy before assembling the plan. Apply
+    // exactly the normalized roots that passed this check so a path alias cannot
+    // restore a denied descendant in the ACL grants.
+    let filesystem = validated_windows_filesystem(&spec.filesystem)?;
     if os_contains_nul(program) {
         return Err(WindowsCapsuleError::NulInArgument(format!(
             "program path: {}",
@@ -497,9 +543,11 @@ pub fn windows_launch_plan_os(
         }
     }
 
-    let grants = acl_grants(&spec.filesystem)?;
+    let mut normalized_spec = spec.clone();
+    normalized_spec.filesystem = filesystem;
+    let grants = acl_grants_from_validated(&normalized_spec.filesystem);
     Ok(WindowsLaunchPlan {
-        profile: app_container_profile(spec)?,
+        profile: app_container_profile(&normalized_spec)?,
         acl_grants: grants,
         job_limits: job_object_limits(&spec.resources),
         program: program.to_os_string(),
@@ -719,6 +767,38 @@ mod tests {
     }
 
     #[test]
+    fn derive_coverage_does_not_claim_fs_for_overlapping_deny_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let denied = temp.path().join(".ssh");
+        std::fs::create_dir(&denied).expect("create denied root");
+        let mut spec = CapsuleSpec::locked_down();
+        spec.filesystem.read_roots = vec![temp.path().to_path_buf()];
+        spec.filesystem.deny_roots = vec![denied];
+        let probe = WindowsProbe {
+            appcontainer_supported: true,
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(!coverage.fs_read_enforced);
+        assert!(!coverage.fs_write_enforced);
+        assert!(coverage.is_degraded_against(&spec.required_coverage()));
+    }
+
+    #[test]
+    fn derive_coverage_does_not_claim_fs_for_unrepresentable_deny_root() {
+        let mut spec = CapsuleSpec::locked_down();
+        spec.filesystem.deny_roots = vec![PathBuf::from("C:/credential\0store")];
+        let probe = WindowsProbe {
+            appcontainer_supported: true,
+        };
+
+        let coverage = derive_coverage(&spec, &probe);
+        assert!(!coverage.fs_read_enforced);
+        assert!(!coverage.fs_write_enforced);
+        assert!(windows_launch_plan(&spec, "C:/cmd.exe", &[]).is_err());
+    }
+
+    #[test]
     fn derive_coverage_allowlist_never_claims_egress() {
         // Even for an allow-list spec, E4 reports network_raw_denied (no capability
         // is granted) but NEVER domain_proxy_enforced -> the allow-list level stays
@@ -875,16 +955,27 @@ mod tests {
 
     #[test]
     fn acl_grants_map_read_and_write_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let read = temp.path().join("in");
+        let write = temp.path().join("out");
+        std::fs::create_dir(&read).expect("create read root");
+        std::fs::create_dir(&write).expect("create write root");
         let mut fs = FilesystemPolicy::deny_by_default();
-        fs.read_roots.push(PathBuf::from("C:/data/in"));
-        fs.write_roots.push(PathBuf::from("C:/build/out"));
+        fs.read_roots.push(read.clone());
+        fs.write_roots.push(write.clone());
         let grants = acl_grants(&fs).expect("grants");
         assert_eq!(grants.len(), 2);
         // Read root first, ReadExecute.
-        assert_eq!(grants[0].path, PathBuf::from("C:/data/in"));
+        assert_eq!(
+            grants[0].path,
+            std::fs::canonicalize(read).expect("canonical read root")
+        );
         assert_eq!(grants[0].access, AclAccess::ReadExecute);
         // Write root second, Modify (implies read).
-        assert_eq!(grants[1].path, PathBuf::from("C:/build/out"));
+        assert_eq!(
+            grants[1].path,
+            std::fs::canonicalize(write).expect("canonical write root")
+        );
         assert_eq!(grants[1].access, AclAccess::Modify);
     }
 
@@ -941,8 +1032,11 @@ mod tests {
 
     #[test]
     fn windows_launch_plan_denyall_builds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let write = temp.path().join("work");
+        std::fs::create_dir(&write).expect("create write root");
         let mut spec = CapsuleSpec::locked_down();
-        spec.filesystem.write_roots.push(PathBuf::from("C:/work"));
+        spec.filesystem.write_roots.push(write.clone());
         let plan = windows_launch_plan(&spec, "C:/python/python.exe", &["-m".into(), "pip".into()])
             .expect("plan");
         assert_eq!(plan.program, "C:/python/python.exe");
@@ -955,12 +1049,29 @@ mod tests {
         // No network capability.
         assert!(plan.profile.networking_capabilities.is_empty());
         // The write root became a Modify grant.
-        assert!(plan
-            .acl_grants
-            .iter()
-            .any(|g| g.access == AclAccess::Modify && g.path == Path::new("C:/work")));
+        assert!(plan.acl_grants.iter().any(|g| {
+            g.access == AclAccess::Modify
+                && g.path == std::fs::canonicalize(&write).expect("canonical write root")
+        }));
         // Job kills on close.
         assert!(plan.job_limits.kill_on_close);
+    }
+
+    #[test]
+    fn windows_launch_plan_refuses_covering_allow_before_acl_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let denied = temp.path().join("credentials");
+        std::fs::create_dir(&denied).expect("create denied root");
+        let mut spec = CapsuleSpec::locked_down();
+        spec.filesystem.write_roots = vec![temp.path().to_path_buf()];
+        spec.filesystem.deny_roots = vec![denied];
+
+        let error = windows_launch_plan(&spec, "C:/cmd.exe", &[])
+            .expect_err("overlap must fail closed before executor ACL work");
+        assert!(matches!(
+            error,
+            WindowsCapsuleError::InvalidFilesystemPolicy(_)
+        ));
     }
 
     #[test]

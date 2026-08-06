@@ -9,8 +9,8 @@
 //! loose `mcp.lock` elsewhere is not misclassified.
 //!
 //! **Privacy.** Findings carry only aggregate counts and server *names* — never an env
-//! value, URL userinfo, or hash (the lockfile already strips those; this observes that a
-//! hash changed, not the secret).
+//! value, URL userinfo, or secret-dependent commitment. The v8 lockfile records only
+//! env-name and URL-userinfo presence, so secret rotation is intentionally unobservable.
 //!
 //! **A malformed lockfile is itself a finding** (same `McpServerDrift` rule/severity,
 //! naming the parse failure without echoing bytes): an unparseable baseline can't be
@@ -169,7 +169,7 @@ pub fn check(
 
     if !drifts_after_trust.is_empty() {
         // A SchemaUpgradeRequired entry is a schema-wide signal (lockfile `format_version`
-        // predates this build): emit a distinct Medium finding prompting `mcp lock --force`.
+        // predates this build): emit a distinct Medium finding prompting `mcp lock`.
         // It does NOT short-circuit per-server drift — `compute_drift` still reports real
         // v4 drift, so a config change made during the v4→v5 window can't slip in silently.
         let migration_entry = drifts_after_trust.iter().find_map(|d| match d {
@@ -607,7 +607,8 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
             "The MCP servers declared in this repository's configuration files no longer \
              match `.tirith/mcp.lock` ({summary}). The change may be intentional — but it \
              is a security-relevant surface change (a server added, removed, or its \
-             transport / env / declared tools / URL credentials altered) and should be \
+             transport / env-name presence / declared tools / URL-userinfo presence altered) \
+             and should be \
              reviewed before commit. Run `tirith mcp diff` (informational) or \
              `tirith mcp verify` (gating) to see the exact drift, then re-run \
              `tirith mcp lock` to refresh the lockfile."
@@ -620,31 +621,27 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
     }
 }
 
-/// Finding fired when the lockfile `format_version` predates this build (e.g. v4 or v5 in a
-/// v6 build). Same `McpServerDrift`/Medium as generic drift (paperwork unchanged); the title
-/// names the migration so the operator runs `tirith mcp lock --force` once — avoiding the
-/// phantom-drift storm an older hashing/shape would otherwise produce.
+/// Finding fired when the lockfile `format_version` predates this build. Same
+/// `McpServerDrift`/Medium as generic drift (paperwork unchanged); the title
+/// names the migration so the operator runs `tirith mcp lock` once.
 fn finding_for_schema_upgrade_required(from_version: u32, to_version: u32) -> Finding {
     let detail = format!(
-        "MCP lockfile is at schema v{from_version}; re-lock with `tirith mcp lock --force` \
+        "MCP lockfile is at schema v{from_version}; re-lock with `tirith mcp lock` \
          to migrate to v{to_version} and enable the latest drift detection. Real \
          drift (if any) is reported separately."
     );
     Finding {
         rule_id: RuleId::McpServerDrift,
         severity: Severity::Medium,
-        title: "MCP lockfile schema upgrade required — re-run `tirith mcp lock --force`"
-            .to_string(),
+        title: "MCP lockfile schema upgrade required — re-run `tirith mcp lock`".to_string(),
         description: format!(
             "The committed `.tirith/mcp.lock` was written with schema version {from_version}, \
-             but this build of tirith writes version {to_version}. The on-disk shape is \
-             compatible, and per-server drift is computed under v{from_version}-compatible \
-             semantics during the migration window — so any real drift (URL changed, command \
-             changed, env added/removed, tools added/removed, server added/removed) is still \
-             reported as its own finding. Re-run `tirith mcp lock --force` once to regenerate \
-             the lockfile under v{to_version}'s hashing rules and to capture the newer surface \
-             (the live `tools/list` descriptor lock added in v6, and the `tools_declared` flip \
-             v4 silently ignored)."
+             but this build of tirith writes version {to_version}. Tirith accepts the legacy \
+             shape only as a migration input, normalizes retired fields before comparison, \
+             and still reports observable drift (URL changed, command changed, env or URL \
+             credential presence changed, tools changed, or a server added/removed) as its \
+             own finding. Re-run `tirith mcp lock` once to regenerate the lockfile \
+             under v{to_version}'s current privacy, hashing, and descriptor semantics."
         ),
         evidence: vec![Evidence::Text { detail }],
         human_view: None,
@@ -674,6 +671,9 @@ fn finding_for_unparseable_lockfile(err: &mcp_lock::McpLockLoadError) -> Finding
         mcp_lock::McpLockLoadError::Io { .. } => {
             // Suppress io detail entirely (category-only) to forestall diagnostic-leak regressions.
             ("unreadable file".to_string(), None)
+        }
+        mcp_lock::McpLockLoadError::Parse { line: 0, column: 0 } => {
+            ("privacy-invalid secret-presence marker".to_string(), None)
         }
         mcp_lock::McpLockLoadError::Parse { line, column } => (
             "unparseable JSON or schema mismatch".to_string(),
@@ -770,7 +770,11 @@ mod tests {
             server.descriptor_hash = mcp_lock::compute_descriptor_hash(&server.descriptors);
             server.descriptors_approved = true;
         }
-        fs::write(lockdir.join("mcp.lock"), lock.render()).unwrap();
+        fs::write(
+            lockdir.join("mcp.lock"),
+            lock.render().expect("render MCP lockfile"),
+        )
+        .unwrap();
     }
 
     fn server_identity(inv: &McpInventory, name: &str) -> String {
@@ -867,8 +871,9 @@ mod tests {
     }
 
     #[test]
-    fn check_fires_when_env_value_rotated() {
-        // A rotated credential surfaces as drift via the env-value-hash signal.
+    fn check_ignores_env_value_rotation() {
+        // V8 records only env-name presence, so rotating the credential does
+        // not create drift or expose a reusable verifier in the lockfile.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -890,8 +895,10 @@ mod tests {
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
         let findings = check(&content, Some(&lock_path), &[], &HashMap::new());
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].description.contains("1 changed"));
+        assert!(
+            findings.is_empty(),
+            "same env-name presence must not drift after value rotation: {findings:?}",
+        );
 
         // No raw credential bytes appear in the finding.
         let serialized = serde_json::to_string(&findings).unwrap();
@@ -1051,19 +1058,16 @@ mod tests {
     }
 
     #[test]
-    fn check_handles_lockfile_that_describes_url_userinfo_change() {
-        // Lockfile records a URL userinfo; the config changes it. Drift fires, and the
-        // credential never appears in the finding text.
+    fn check_ignores_url_userinfo_rotation() {
+        // V8 records only that URL userinfo exists. Rotating those credentials
+        // therefore stays clean, and no secret bytes reach a finding.
         let repo = tempdir().unwrap();
         let inv = McpInventory {
             servers: vec![McpServerEntry {
                 name: "s".into(),
                 transport: McpTransport::Url {
                     url: "https://host.example/sse".into(),
-                    userinfo_hash: Some(
-                        // Placeholder; the config-derived hash differs and won't compare equal.
-                        "0000000000000000000000000000000000000000000000000000000000000000".into(),
-                    ),
+                    userinfo_hash: Some("present".into()),
                 },
                 tools: vec![],
                 tools_declared: true,
@@ -1084,7 +1088,10 @@ mod tests {
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
         let findings = check(&content, Some(&lock_path), &[], &HashMap::new());
-        assert_eq!(findings.len(), 1);
+        assert!(
+            findings.is_empty(),
+            "same URL-userinfo presence must not drift after rotation: {findings:?}",
+        );
         let serialized = serde_json::to_string(&findings).unwrap();
         assert!(
             !serialized.contains("rotated:newcredential"),
@@ -1284,7 +1291,9 @@ mod tests {
         fs::create_dir_all(&lockdir).unwrap();
         fs::write(
             lockdir.join("mcp.lock"),
-            McpLockfile::from_inventory(&inv).render(),
+            McpLockfile::from_inventory(&inv)
+                .render()
+                .expect("render MCP lockfile"),
         )
         .unwrap();
 
@@ -1318,7 +1327,7 @@ mod tests {
         let lockdir = repo.path().join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
         let lock_path = lockdir.join("mcp.lock");
-        fs::write(&lock_path, lock.render()).unwrap();
+        fs::write(&lock_path, lock.render().expect("render MCP lockfile")).unwrap();
 
         let mut allowed = HashMap::new();
         allowed.insert(identity, Vec::new());
@@ -1751,7 +1760,9 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let body = McpLockfile::from_inventory(&inv).render();
+        let body = McpLockfile::from_inventory(&inv)
+            .render()
+            .expect("render MCP lockfile");
         let lock_path = lockdir.join("mcp.lock");
         fs::write(&lock_path, &body).unwrap();
 
@@ -1788,7 +1799,9 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let body = McpLockfile::from_inventory(&inv).render();
+        let body = McpLockfile::from_inventory(&inv)
+            .render()
+            .expect("render MCP lockfile");
         let findings = check(&body, Some(&non_existent), &[], &HashMap::new());
         assert!(
             findings.is_empty(),
@@ -1822,7 +1835,9 @@ mod tests {
             malformed_configs: vec![],
             rejected_configs: vec![],
         };
-        let body = McpLockfile::from_inventory(&inv).render();
+        let body = McpLockfile::from_inventory(&inv)
+            .render()
+            .expect("render MCP lockfile");
         let lock_path = lockdir.join("mcp.lock");
         fs::write(&lock_path, &body).unwrap();
 
@@ -2066,13 +2081,13 @@ mod tests {
         write_lockfile_for(repo.path(), &old_inv);
 
         // Doctor the lockfile to ALSO record disallowed tool "evil" (snuck past `mcp lock`).
-        // Use the CURRENT format version (v7) so no schema-migration finding fires — this
+        // Use the CURRENT format version (v8) so no schema-migration finding fires — this
         // test pins the dual-firing of the lockfile-side + per-server drift findings, not the
         // migration prompt (which has its own tests). `hash` is recomputed from data at parse,
         // so the placeholder is discarded but the doctored `tools` still surface.
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let lockfile_doctored = r#"{
-            "format_version": 7,
+            "format_version": 8,
             "inventory_hash": "x",
             "configs": [".mcp.json"],
             "servers": [

@@ -1,5 +1,7 @@
+use std::fmt;
 use std::path::Path;
 
+use serde::de::{Deserialize, IgnoredAny, MapAccess, Visitor};
 use serde_json::{json, Value};
 
 /// Merge a server entry into an MCP JSON config file under `"mcpServers"`.
@@ -509,6 +511,21 @@ pub fn merge_gemini_settings(
 /// Merge a tirith hook into VS Code's settings.json using a JSONC managed block.
 /// Preserves all content outside the block byte-for-byte; errors (with manual
 /// instructions) if a `"hooks"` key already exists outside the block.
+fn vscode_managed_block(begin_marker: &str, end_marker: &str, hook_command: &str) -> String {
+    format!(
+        "\x20\x20{begin_marker}\n\
+         \x20\x20\"hooks\": {{\n\
+         \x20\x20\x20\x20\"PreToolUse\": [\n\
+         \x20\x20\x20\x20\x20\x20{{\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\"type\": \"command\",\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\"command\": \"{hook_command}\"\n\
+         \x20\x20\x20\x20\x20\x20}}\n\
+         \x20\x20\x20\x20]\n\
+         \x20\x20}},\n\
+         \x20\x20{end_marker}"
+    )
+}
+
 pub fn merge_vscode_settings(
     path: &Path,
     scope_root: &Path,
@@ -522,124 +539,82 @@ pub fn merge_vscode_settings(
 
         let begin_marker = "// BEGIN tirith-hooks";
         let end_marker = "// END tirith-hooks";
+        let managed_block = vscode_managed_block(begin_marker, end_marker, hook_command);
 
-        let has_begin = raw.contains(begin_marker);
-
-        if has_begin && !force {
-            eprintln!("tirith: VS Code hooks in {}, up to date", path.display());
-            return Ok(super::fs_helpers::FileUpdate::unchanged());
+        let existing_blocks = collect_managed_blocks(&raw, begin_marker, end_marker)?;
+        if !force {
+            match existing_blocks.as_slice() {
+                [] => {}
+                [existing] if existing.content == managed_block => {}
+                [_] => {
+                    return Err(format!(
+                        "tirith: managed VS Code hooks in {} differ from the expected PreToolUse configuration — use --force to repair",
+                        path.display()
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "tirith: multiple managed VS Code hook blocks found in {} — use --force to repair",
+                        path.display()
+                    ));
+                }
+            }
         }
 
-        let working_text = if has_begin && force {
+        let working_text = if !existing_blocks.is_empty() {
             remove_managed_block(&raw, begin_marker, end_marker)?
         } else {
             raw.clone()
         };
 
-        let managed_block = format!(
-            "\x20\x20{begin_marker}\n\
-         \x20\x20\"hooks\": {{\n\
-         \x20\x20\x20\x20\"PreToolUse\": [\n\
-         \x20\x20\x20\x20\x20\x20{{\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\"type\": \"command\",\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\"command\": \"{hook_command}\"\n\
-         \x20\x20\x20\x20\x20\x20}}\n\
-         \x20\x20\x20\x20]\n\
-         \x20\x20}},\n\
-         \x20\x20{end_marker}"
-        );
-
-        // Scan for an existing "hooks" key outside the managed block.
-        let hooks_key_re =
-            regex::Regex::new(r#"^\s*"hooks"\s*:"#).map_err(|e| format!("regex compile: {e}"))?;
-
-        let mut in_managed_block = false;
-        for line in working_text.lines() {
-            if line.contains(begin_marker) {
-                in_managed_block = true;
-                continue;
-            }
-            if line.contains(end_marker) {
-                in_managed_block = false;
-                continue;
-            }
-            if !in_managed_block && hooks_key_re.is_match(line) {
-                println!(
-                    "Add the following to your hooks.PreToolUse array in {}:\n\
-                 {{\n\
-                 \x20\x20\"type\": \"command\",\n\
-                 \x20\x20\"command\": \"{hook_command}\"\n\
-                 }}",
-                    path.display()
-                );
-                return Err(format!(
-                    "tirith: {} already has a \"hooks\" key — cannot safely merge. \
-                 Add the hook entry shown above manually.",
-                    path.display()
-                ));
-            }
-        }
-
-        // Insert the managed block before the file's closing brace.
-        let insert_pos = working_text.rfind('}').ok_or_else(|| {
+        // Parse the complete JSONC document outside our root-level managed
+        // block. This both rejects malformed settings and detects escaped or
+        // duplicate effective keys without mistaking comments/values for
+        // configuration.
+        let outside_root = parse_jsonc_root(&working_text)?;
+        if outside_root.key_count("hooks") != 0 {
             println!(
-                "Add the following to {}:\n{}",
-                path.display(),
-                managed_block
-            );
-            format!(
-                "tirith: could not locate insertion point in {} — add hook manually",
+                "Add the following to your hooks.PreToolUse array in {}:\n\
+             {{\n\
+             \x20\x20\"type\": \"command\",\n\
+             \x20\x20\"command\": \"{hook_command}\"\n\
+             }}",
                 path.display()
-            )
-        })?;
-
-        let before_brace = &working_text[..insert_pos];
-        let mut result = String::new();
-
-        // The last non-empty, non-comment line needs a trailing comma before the
-        // managed block follows it in the same object.
-        let needs_comma = before_brace
-            .lines()
-            .rev()
-            .find(|line| {
-                let trimmed = line.trim();
-                !trimmed.is_empty() && !trimmed.starts_with("//")
-            })
-            .map(|line| {
-                let trimmed = line.trim();
-                !trimmed.ends_with(',') && !trimmed.ends_with('{')
-            })
-            .unwrap_or(false);
-
-        if needs_comma {
-            let lines: Vec<&str> = before_brace.lines().collect();
-            for i in (0..lines.len()).rev() {
-                let trimmed = lines[i].trim();
-                if !trimmed.is_empty() && !trimmed.starts_with("//") {
-                    result = lines[..i].join("\n");
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str(lines[i]);
-                    result.push(',');
-                    result.push('\n');
-                    if i + 1 < lines.len() {
-                        result.push_str(&lines[i + 1..].join("\n"));
-                        result.push('\n');
-                    }
-                    break;
-                }
-            }
-            if result.is_empty() {
-                result = before_brace.to_string();
-            }
-        } else {
-            result = before_brace.to_string();
-            if !result.ends_with('\n') {
-                result.push('\n');
-            }
+            );
+            return Err(format!(
+                "tirith: {} already has a \"hooks\" key — cannot safely merge. \
+             Add the hook entry shown above manually.",
+                path.display()
+            ));
         }
 
+        // Only report success after the full generated block and absence of a
+        // competing effective `hooks` key have both been checked. The semantic
+        // check prevents an exact-looking block in a comment or nested object
+        // from being accepted as an installed root hook.
+        if !force && existing_blocks.len() == 1 {
+            verify_vscode_managed_document(
+                &raw,
+                begin_marker,
+                end_marker,
+                &managed_block,
+                hook_command,
+            )?;
+            eprintln!("tirith: VS Code hooks in {}, up to date", path.display());
+            return Ok(super::fs_helpers::FileUpdate::unchanged());
+        }
+
+        // The parser records the actual root closing token and the root's
+        // trailing-comma state, so braces and commas inside comments/strings
+        // cannot redirect or corrupt insertion.
+        let insert_pos = outside_root.close;
+        let mut result = working_text[..insert_pos].to_string();
+        if !outside_root.keys.is_empty() && !outside_root.trailing_comma {
+            result.push(',');
+        }
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
         result.push_str(&managed_block);
         result.push('\n');
         result.push_str(&working_text[insert_pos..]);
@@ -647,6 +622,14 @@ pub fn merge_vscode_settings(
         if !result.ends_with('\n') {
             result.push('\n');
         }
+
+        verify_vscode_managed_document(
+            &result,
+            begin_marker,
+            end_marker,
+            &managed_block,
+            hook_command,
+        )?;
 
         if dry_run {
             eprintln!(
@@ -666,43 +649,350 @@ pub fn merge_vscode_settings(
     Ok(())
 }
 
-/// Remove all lines between `begin_marker` and `end_marker` (inclusive).
+#[derive(Debug)]
+struct ManagedBlock {
+    start: usize,
+    end: usize,
+    content: String,
+}
+
+#[derive(Debug)]
+struct JsoncLineComment {
+    line_start: usize,
+    line_end: usize,
+    remove_end: usize,
+    at_root_object: bool,
+}
+
+#[derive(Debug)]
+struct JsoncLex {
+    without_comments: Vec<u8>,
+    line_comments: Vec<JsoncLineComment>,
+}
+
+#[derive(Debug)]
+struct JsoncRoot {
+    value: Value,
+    keys: Vec<String>,
+    close: usize,
+    trailing_comma: bool,
+}
+
+impl JsoncRoot {
+    fn key_count(&self, wanted: &str) -> usize {
+        self.keys
+            .iter()
+            .filter(|key| key.as_str() == wanted)
+            .count()
+    }
+}
+
+struct RootKeys(Vec<String>);
+
+impl<'de> Deserialize<'de> for RootKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(RootKeysVisitor)
+    }
+}
+
+struct RootKeysVisitor;
+
+impl<'de> Visitor<'de> for RootKeysVisitor {
+    type Value = RootKeys;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            keys.push(key);
+            map.next_value::<IgnoredAny>()?;
+        }
+        Ok(RootKeys(keys))
+    }
+}
+
+/// Remove all effective root-object blocks between the paired marker comments.
 fn remove_managed_block(
     text: &str,
     begin_marker: &str,
     end_marker: &str,
 ) -> Result<String, String> {
-    let mut result = Vec::new();
-    let mut suppressing = false;
-
-    for line in text.lines() {
-        if line.contains(begin_marker) {
-            suppressing = true;
-            continue;
-        }
-        if line.contains(end_marker) {
-            if !suppressing {
-                return Err("tirith: found END marker without BEGIN in managed block".to_string());
-            }
-            suppressing = false;
-            continue;
-        }
-        if !suppressing {
-            result.push(line);
-        }
+    let blocks = collect_managed_blocks(text, begin_marker, end_marker)?;
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for block in blocks {
+        out.push_str(&text[cursor..block.start]);
+        cursor = block.end;
     }
-
-    if suppressing {
-        return Err(
-            "tirith: corrupted tirith-hooks block — missing END marker, fix manually".to_string(),
-        );
-    }
-
-    let mut out = result.join("\n");
+    out.push_str(&text[cursor..]);
     if !out.ends_with('\n') {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Return each exactly delimited root-object managed block after validating
+/// pairing. Marker-looking text in a string, block comment, nested object, or
+/// after the root is not an effective delimiter.
+fn collect_managed_blocks(
+    text: &str,
+    begin_marker: &str,
+    end_marker: &str,
+) -> Result<Vec<ManagedBlock>, String> {
+    let lex = lex_jsonc(text)?;
+    let mut blocks = Vec::new();
+    let mut current: Option<&JsoncLineComment> = None;
+
+    for comment in lex
+        .line_comments
+        .iter()
+        .filter(|comment| comment.at_root_object)
+    {
+        let line = &text[comment.line_start..comment.line_end];
+        if line.trim() == begin_marker {
+            if current.is_some() {
+                return Err(
+                    "tirith: corrupted tirith-hooks block — nested BEGIN marker, fix manually"
+                        .to_string(),
+                );
+            }
+            current = Some(comment);
+            continue;
+        }
+        if line.trim() == end_marker {
+            let Some(begin) = current.take() else {
+                return Err("tirith: found END marker without BEGIN in managed block".to_string());
+            };
+            blocks.push(ManagedBlock {
+                start: begin.line_start,
+                end: comment.remove_end,
+                content: text[begin.line_start..comment.line_end].replace("\r\n", "\n"),
+            });
+            continue;
+        }
+    }
+
+    if current.is_some() {
+        return Err(
+            "tirith: corrupted tirith-hooks block — missing END marker, fix manually".to_string(),
+        );
+    }
+    Ok(blocks)
+}
+
+/// Tokenize comments and structural context while preserving byte offsets.
+fn lex_jsonc(text: &str) -> Result<JsoncLex, String> {
+    let bytes = text.as_bytes();
+    let mut without_comments = bytes.to_vec();
+    if without_comments.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        without_comments[..3].fill(b' ');
+    }
+    let mut line_comments = Vec::new();
+    let mut containers = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                let mut escaped = false;
+                let mut closed = false;
+                while let Some(current) = bytes.get(index).copied() {
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if current == b'\\' {
+                        escaped = true;
+                    } else if current == b'"' {
+                        closed = true;
+                        break;
+                    }
+                }
+                if !closed {
+                    return Err("tirith: unterminated string in VS Code settings".into());
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                let comment_start = index;
+                let at_root_object = containers.as_slice() == b"{";
+                index += 2;
+                while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+                    index += 1;
+                }
+                let mut line_end = index;
+                if bytes.get(line_end.wrapping_sub(1)) == Some(&b'\r') {
+                    line_end -= 1;
+                }
+                let line_start = text[..comment_start]
+                    .rfind('\n')
+                    .map(|position| position + 1)
+                    .unwrap_or(0);
+                line_comments.push(JsoncLineComment {
+                    line_start,
+                    line_end,
+                    remove_end: if bytes.get(index) == Some(&b'\n') {
+                        index + 1
+                    } else {
+                        index
+                    },
+                    at_root_object,
+                });
+                without_comments[comment_start..index].fill(b' ');
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let comment_start = index;
+                index += 2;
+                while bytes.get(index..index + 2) != Some(b"*/") {
+                    if index >= bytes.len() {
+                        return Err("tirith: unterminated block comment in VS Code settings".into());
+                    }
+                    index += 1;
+                }
+                index += 2;
+                for byte in &mut without_comments[comment_start..index] {
+                    if *byte != b'\n' && *byte != b'\r' {
+                        *byte = b' ';
+                    }
+                }
+            }
+            b'{' => {
+                containers.push(b'{');
+                index += 1;
+            }
+            b'}' => {
+                if containers.pop() != Some(b'{') {
+                    return Err("tirith: unmatched closing brace in VS Code settings".into());
+                }
+                index += 1;
+            }
+            b'[' => {
+                containers.push(b'[');
+                index += 1;
+            }
+            b']' => {
+                if containers.pop() != Some(b'[') {
+                    return Err("tirith: unmatched closing bracket in VS Code settings".into());
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    if !containers.is_empty() {
+        return Err("tirith: unbalanced JSONC structure in VS Code settings".into());
+    }
+    Ok(JsoncLex {
+        without_comments,
+        line_comments,
+    })
+}
+
+fn parse_jsonc_root(text: &str) -> Result<JsoncRoot, String> {
+    let mut lex = lex_jsonc(text)?;
+    let close = lex
+        .without_comments
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .ok_or_else(|| "tirith: VS Code settings are empty".to_string())?;
+    if lex.without_comments[close] != b'}' {
+        return Err("tirith: VS Code settings root must be a JSON object".into());
+    }
+    let trailing_comma = lex.without_comments[..close]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|position| lex.without_comments[position] == b',');
+
+    // JSONC permits a comma immediately before an object/array close. Replace
+    // only those commas with whitespace so serde_json can validate the full
+    // effective document while all original byte offsets remain stable.
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < lex.without_comments.len() {
+        let byte = lex.without_comments[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b',' {
+            let mut after = index + 1;
+            while lex
+                .without_comments
+                .get(after)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                after += 1;
+            }
+            if lex
+                .without_comments
+                .get(after)
+                .is_some_and(|byte| matches!(*byte, b'}' | b']'))
+            {
+                lex.without_comments[index] = b' ';
+            }
+        }
+        index += 1;
+    }
+
+    let strict = String::from_utf8(lex.without_comments)
+        .map_err(|_| "tirith: VS Code settings are not valid UTF-8".to_string())?;
+    let value: Value = serde_json::from_str(&strict)
+        .map_err(|error| format!("tirith: invalid VS Code settings JSONC: {error}"))?;
+    if !value.is_object() {
+        return Err("tirith: VS Code settings root must be a JSON object".into());
+    }
+    let RootKeys(keys): RootKeys = serde_json::from_str(&strict)
+        .map_err(|error| format!("tirith: invalid VS Code settings JSONC: {error}"))?;
+    Ok(JsoncRoot {
+        value,
+        keys,
+        close,
+        trailing_comma,
+    })
+}
+
+fn verify_vscode_managed_document(
+    text: &str,
+    begin_marker: &str,
+    end_marker: &str,
+    expected_block: &str,
+    hook_command: &str,
+) -> Result<(), String> {
+    let blocks = collect_managed_blocks(text, begin_marker, end_marker)?;
+    if blocks.len() != 1 || blocks[0].content != expected_block {
+        return Err(
+            "tirith: generated VS Code settings do not contain exactly one effective managed hook block"
+                .into(),
+        );
+    }
+    let root = parse_jsonc_root(text)?;
+    let expected_hooks = json!({
+        "PreToolUse": [{
+            "type": "command",
+            "command": hook_command
+        }]
+    });
+    if root.key_count("hooks") != 1 || root.value.get("hooks") != Some(&expected_hooks) {
+        return Err(
+            "tirith: VS Code settings do not expose the exact expected effective PreToolUse hook"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1193,6 +1483,134 @@ mod tests {
     }
 
     #[test]
+    fn vscode_settings_does_not_trust_marker_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            "{\n  // attacker mentions // BEGIN tirith-hooks but installs nothing\n}\n",
+        )
+        .unwrap();
+
+        merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content
+                .lines()
+                .filter(|line| line.trim() == "// BEGIN tirith-hooks")
+                .count(),
+            1
+        );
+        assert!(content.contains("\"PreToolUse\""));
+        assert!(content.contains("\"command\": \"hooks/tirith-hook.sh\""));
+    }
+
+    #[test]
+    fn vscode_settings_does_not_trust_exact_block_in_ineffective_context() {
+        let managed = vscode_managed_block(
+            "// BEGIN tirith-hooks",
+            "// END tirith-hooks",
+            "hooks/tirith-hook.sh",
+        );
+        for poisoned in [
+            format!("{{\n  /*\n{managed}\n  */\n}}\n"),
+            format!("{{\n  \"decoy\": {{\n{managed}\n  }}\n}}\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            fs::write(&path, poisoned).unwrap();
+
+            merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false).unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let root = parse_jsonc_root(&content).unwrap();
+            assert_eq!(root.key_count("hooks"), 1);
+            assert_eq!(
+                root.value["hooks"]["PreToolUse"][0]["command"],
+                "hooks/tirith-hook.sh"
+            );
+            assert_eq!(
+                collect_managed_blocks(&content, "// BEGIN tirith-hooks", "// END tirith-hooks")
+                    .unwrap()
+                    .len(),
+                1,
+                "only the effective root block counts as managed"
+            );
+        }
+    }
+
+    #[test]
+    fn vscode_settings_rejects_unpaired_or_drifted_managed_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{\n  // BEGIN tirith-hooks\n}\n").unwrap();
+        assert!(
+            merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false)
+                .unwrap_err()
+                .contains("missing END marker")
+        );
+
+        fs::write(
+            &path,
+            "{\n  // BEGIN tirith-hooks\n  \"hooks\": {},\n  // END tirith-hooks\n}\n",
+        )
+        .unwrap();
+        assert!(
+            merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false)
+                .unwrap_err()
+                .contains("differ from the expected")
+        );
+    }
+
+    #[test]
+    fn vscode_settings_rejects_competing_hooks_key_beside_exact_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let poisoned = content.replacen("{\n", "{\n  \"hooks\": {},\n", 1);
+        fs::write(&path, poisoned).unwrap();
+
+        assert!(
+            merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false)
+                .unwrap_err()
+                .contains("already has a \"hooks\" key")
+        );
+    }
+
+    #[test]
+    fn vscode_settings_detects_inline_and_escaped_effective_hooks_keys() {
+        for original in [
+            "{ \"hooks\": {} }\n",
+            "{ \"ho\\u006fks\": {} }\n",
+            "{/* comment */ \"hooks\" /* gap */ : {}}\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            fs::write(&path, original).unwrap();
+            assert!(
+                merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false)
+                    .unwrap_err()
+                    .contains("already has a \"hooks\" key"),
+                "effective hooks key was missed in {original:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vscode_settings_ignores_hooks_text_inside_comments_and_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            "{\n  // \"hooks\": {}\n  \"note\": \"\\\"hooks\\\": is documentation\"\n}\n",
+        )
+        .unwrap();
+        merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false).unwrap();
+        assert!(fs::read_to_string(path).unwrap().contains("\"PreToolUse\""));
+    }
+
+    #[test]
     fn vscode_settings_hard_error_on_existing_hooks_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -1263,6 +1681,44 @@ mod tests {
     }
 
     #[test]
+    fn vscode_settings_inserts_after_trailing_block_comment_without_double_comma() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = "{\n  \"editor.fontSize\": 14,\n  /* keep this trailing comment */\n}\n";
+        fs::write(&path, original).unwrap();
+
+        merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let root = parse_jsonc_root(&content).unwrap();
+        assert_eq!(root.value["editor.fontSize"], 14);
+        assert_eq!(
+            root.value["hooks"]["PreToolUse"][0]["command"],
+            "hooks/tirith-hook.sh"
+        );
+        assert!(content.contains("/* keep this trailing comment */"));
+    }
+
+    #[test]
+    fn vscode_settings_uses_root_close_not_brace_in_trailing_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = "{\n  \"editor.fontSize\": 14\n}\n// trailing documentation: }\n";
+        fs::write(&path, original).unwrap();
+
+        merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let root = parse_jsonc_root(&content).unwrap();
+        assert_eq!(root.value["editor.fontSize"], 14);
+        assert_eq!(
+            root.value["hooks"]["PreToolUse"][0]["command"],
+            "hooks/tirith-hook.sh"
+        );
+        assert!(content.ends_with("}\n// trailing documentation: }\n"));
+    }
+
+    #[test]
     fn vscode_settings_force_preserves_jsonc_outside_block() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -1296,14 +1752,14 @@ mod tests {
 
     #[test]
     fn remove_managed_block_removes_block() {
-        let text = "before\n// BEGIN x\nstuff\n// END x\nafter\n";
+        let text = "{\n  // BEGIN x\n  \"managed\": true,\n  // END x\n}\n";
         let result = remove_managed_block(text, "// BEGIN x", "// END x").unwrap();
-        assert_eq!(result, "before\nafter\n");
+        assert_eq!(result, "{\n}\n");
     }
 
     #[test]
     fn remove_managed_block_errors_on_missing_end() {
-        let text = "before\n// BEGIN x\nstuff\n";
+        let text = "{\n  // BEGIN x\n}\n";
         let result = remove_managed_block(text, "// BEGIN x", "// END x");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing END"));
@@ -1311,7 +1767,7 @@ mod tests {
 
     #[test]
     fn remove_managed_block_errors_on_orphan_end() {
-        let text = "before\n// END x\nstuff\n";
+        let text = "{\n  // END x\n}\n";
         let result = remove_managed_block(text, "// BEGIN x", "// END x");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("END marker without BEGIN"));

@@ -2,10 +2,10 @@
 //! a repository declares. Local file ops only (no network, off the detection
 //! hot path); discovery is repo-local (user-level configs never inventoried).
 //!
-//! Privacy invariant: env values and URL userinfos are never persisted in
-//! `mcp.lock` (replaced with a salted hash; see `mcp_lock.rs`) and never
-//! printed by `verify`/`diff` — outputs only name the variable/credential that
-//! changed, never its value or hash.
+//! Privacy invariant: env values and URL userinfos are never persisted or
+//! committed in `mcp.lock` (only their structural presence is recorded; see
+//! `mcp_lock.rs`) and never printed by `verify`/`diff`. Adding or removing a
+//! secret-bearing field drifts; rotating its value intentionally does not.
 
 use std::path::{Path, PathBuf};
 
@@ -84,7 +84,13 @@ pub(crate) fn lock_for_root(repo_root: &Path, json: bool, allow_incomplete_confi
         );
         return 1;
     }
-    let expected = lockfile.render();
+    let expected = match lockfile.render() {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            report_error(json, &format!("failed to render MCP lockfile: {error}"));
+            return 1;
+        }
+    };
     let read_back = tirith_core::util::read_text_no_follow_capped(
         &lock_path,
         expected.len().saturating_add(1) as u64,
@@ -208,7 +214,10 @@ fn write_lockfile(lock_path: &Path, lockfile: &McpLockfile) -> std::io::Result<(
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| std::io::Error::other("MCP lock path has no repository root"))?;
-    super::write_file_atomic_contained(repo_root, lock_path, lockfile.render().as_bytes(), true)
+    let rendered = lockfile
+        .render()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    super::write_file_atomic_contained(repo_root, lock_path, rendered.as_bytes(), true)
 }
 
 /// Emit the machine-readable result.
@@ -463,10 +472,10 @@ fn describe_rejection_reason(reason: &mcp_lock::RejectedReason) -> String {
 ///
 /// Every attacker-controllable field (URL, command, args, env names — all from
 /// a repo `.mcp.json`) is debug-escaped so control bytes (ANSI/CR/BEL) can't
-/// rewrite the operator's terminal. Env values are never stored or printed (the
-/// lockfile carries only a salted hash); a URL's userinfo is already stripped at
-/// parse time — a `(credentials in source URL)` annotation shows the redaction
-/// fired without revealing the credential.
+/// rewrite the operator's terminal. Env values are never stored, committed, or
+/// printed (the lockfile carries only a fixed presence marker); a URL's userinfo
+/// is already stripped at parse time — a `(credentials in source URL)` annotation
+/// shows the redaction fired without revealing the credential.
 fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
     match transport {
         mcp_lock::McpTransport::Url { url, userinfo_hash } => {
@@ -820,9 +829,9 @@ fn print_drift_body(drifts: &[McpDrift]) {
             } => {
                 eprintln!(
                     "  ! schema upgrade required: lockfile is at schema v{from_version}; re-lock \
-                     with `tirith mcp lock --force` to migrate to v{to_version} (this enables \
-                     `tools_declared` drift detection). Real drift, if any, is reported \
-                     separately below."
+                     with `tirith mcp lock` to migrate to v{to_version} and adopt the \
+                     current lockfile privacy and drift semantics. Real drift, if any, is \
+                     reported separately below."
                 );
             }
         }
@@ -850,7 +859,9 @@ fn describe_changed_entry(entry: &McpServerDriftEntry) {
                 eprintln!("      - URL userinfo removed");
             }
             McpTransportChange::UserinfoSwapped => {
-                eprintln!("      - URL userinfo changed (credential rotated)");
+                eprintln!(
+                    "      - legacy URL-userinfo value-change signal (v8 no longer emits this)"
+                );
             }
             McpTransportChange::CommandChanged => {
                 eprintln!("      - stdio command changed");
@@ -874,7 +885,7 @@ fn describe_changed_entry(entry: &McpServerDriftEntry) {
             }
             McpEnvChange::ValueHashChanged { name } => {
                 eprintln!(
-                    "      - env value changed: {} (raw value never stored or printed)",
+                    "      - legacy env-value change signal: {} (v8 no longer emits this)",
                     escape_name(name)
                 );
             }
@@ -1499,7 +1510,7 @@ fn print_explain_human(lock_path: &Path, entry: &McpLockServer) {
             eprintln!("    url:  {}", escape_name(url));
             if userinfo_hash.is_some() {
                 eprintln!(
-                    "    (credentials in source URL — stored as a salted hash, never echoed)"
+                    "    (credentials in source URL — presence recorded, value never committed)"
                 );
             }
         }
@@ -1513,7 +1524,7 @@ fn print_explain_human(lock_path: &Path, entry: &McpLockServer) {
             if env.is_empty() {
                 eprintln!("    env:     (none declared)");
             } else {
-                eprintln!("    env:     (names only — values are stored as salted hashes)");
+                eprintln!("    env:     (names only — values are never committed)");
                 for e in env {
                     eprintln!("      - {}", escape_name(&e.name));
                 }
@@ -2048,6 +2059,37 @@ mod tests {
     }
 
     #[test]
+    fn write_lockfile_refuses_direct_secret_without_clobbering_existing_baseline() {
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "s": { "command": "node", "args": ["server.js"] } } }"#,
+        )
+        .unwrap();
+        let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
+        let inventory = mcp_lock::build_inventory(repo.path());
+        let mut lockfile = McpLockfile::from_inventory(&inventory);
+        write_lockfile(&lock_path, &lockfile).expect("write initial safe baseline");
+        let before = fs::read(&lock_path).expect("read initial baseline");
+
+        let probe = "ghp_DIRECT_WRITE_SECRET_NEVER_PERSIST_123456";
+        lockfile.servers[0].transport = McpTransport::Stdio {
+            command: "node".into(),
+            args: vec![format!("--token={probe}")],
+            env: vec![],
+        };
+        let error = write_lockfile(&lock_path, &lockfile)
+            .expect_err("unsafe direct transport must fail before publication");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains(probe));
+        assert_eq!(
+            fs::read(&lock_path).expect("read preserved baseline"),
+            before,
+            "serialization refusal must preserve the previous trusted lock byte-for-byte"
+        );
+    }
+
+    #[test]
     fn lock_for_root_preserves_unchanged_descriptor_approval() {
         let repo = tempdir().unwrap();
         fs::write(
@@ -2135,8 +2177,62 @@ mod tests {
     }
 
     #[test]
-    fn verify_exits_one_when_env_value_rotated() {
-        // Rotate an env value: the value-hash flips, drift fires, exit 1.
+    fn rejected_config_refuses_lock_and_keeps_verify_nonzero_even_with_override() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+
+        assert_eq!(lock_for_root(repo.path(), false, false), 0);
+        let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
+        let clean_baseline = fs::read(&lock_path).expect("read clean MCP baseline");
+        assert_eq!(verify_for_root(repo.path(), false), 0);
+
+        let vscode = repo.path().join(".vscode");
+        fs::create_dir_all(&vscode).unwrap();
+        fs::write(
+            vscode.join("mcp.json"),
+            r#"{"servers":{"poisoned":{"command":"node","args":["--token=plaintext"]}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_for_root(repo.path(), false),
+            1,
+            "a rejected supported config must make verification fail"
+        );
+        assert_eq!(
+            lock_for_root(repo.path(), false, false),
+            1,
+            "ordinary lock must refuse to publish a partial trusted baseline"
+        );
+        assert_eq!(
+            fs::read(&lock_path).unwrap(),
+            clean_baseline,
+            "refusal must leave the previously trusted baseline byte-identical"
+        );
+
+        assert_eq!(
+            lock_for_root(repo.path(), false, true),
+            0,
+            "only the explicit audit override may record the coverage gap"
+        );
+        let incomplete = mcp_lock::load_lockfile(&lock_path).unwrap();
+        assert_eq!(incomplete.rejected_configs.len(), 1);
+        assert_eq!(incomplete.rejected_configs[0].path, ".vscode/mcp.json");
+        assert_eq!(
+            incomplete.rejected_configs[0].reason,
+            mcp_lock::RejectedReason::SecretBearingArgument
+        );
+        assert_eq!(
+            verify_for_root(repo.path(), false),
+            1,
+            "an exactly matching incomplete override is auditable, never trusted"
+        );
+    }
+
+    #[test]
+    fn verify_exits_zero_when_env_value_rotated() {
+        // V8 records only env-name presence, so value rotation is intentionally
+        // unobservable and does not produce drift.
         let repo = tempdir().unwrap();
         fs::write(
             repo.path().join(".mcp.json"),
@@ -2158,7 +2254,7 @@ mod tests {
         )
         .unwrap();
         let code = verify_for_root(repo.path(), false);
-        assert_eq!(code, 1, "rotated env → drift → exit 1");
+        assert_eq!(code, 0, "rotated env value with same name → no drift");
     }
 
     #[test]

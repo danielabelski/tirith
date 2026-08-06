@@ -13,13 +13,13 @@
 //!
 //! ```text
 //! uv pip compile --generate-hashes --no-build    -> a hash-pinned lock (locked.txt)
-//! python -m pip download --only-binary=:all:                                       \
+//! python -I -m pip download --only-binary=:all:                                    \
 //!        --require-hashes -r locked.txt          -> wheels in a staging dir
 //! ingest each wheel into the D1 quarantine        -> content-addressed blobs
 //! ```
 //!
 //! `uv pip download` does not exist, so the two tools split the work: `uv`
-//! resolves and emits the hash-pinned lock; `python -m pip download` fetches it
+//! resolves and emits the hash-pinned lock; `python -I -m pip download` fetches it
 //! under `--require-hashes`, which makes pip refuse any artifact whose hash is
 //! not in the lock. We then re-hash every downloaded file ourselves on the way
 //! into the quarantine (D1's [`QuarantineStore::ingest_file`]), so the bytes that
@@ -61,9 +61,11 @@
 //! 8. **`uv` / `python` resolved by executable provenance, not blind PATH.**
 //!    [`resolve_tool`] uses [`crate::trusted_child`] to canonicalize, reject
 //!    project/temp and writable/foreign-owned paths, bind file identity, and
-//!    require a root-owned Unix system hierarchy or an explicit owner-only
-//!    canonical path + SHA-256 enrollment. Windows is enrollment-only because
-//!    ambient system-root variables are not proof of installation provenance.
+//!    require a root-managed, non-writable system hierarchy for the enforcing
+//!    package path. On Linux, explicit enrollment may additionally authorize an
+//!    exact static native `uv` image: it is digest-pinned and launched from a
+//!    sealed descriptor. Python enrollment cannot authorize enforcement because
+//!    its mutable runtime/pip dependency tree cannot be sealed with the image.
 //!    Identity is revalidated before each spawn.
 //!
 //! npm / cargo resolution is intentionally absent here: the engine is wheel-only,
@@ -96,6 +98,11 @@ const MAX_INDEX_URLS: usize = 64;
 /// Per-stream diagnostic cap for resolver children. The trusted-child
 /// supervisor kills the process tree if either stream exceeds this bound.
 const RESOLVER_CHILD_OUTPUT_MAX: usize = 4 * 1024 * 1024;
+
+/// Maximum terminal-safe diagnostic text retained from a failed resolver
+/// child. Raw child streams stay in [`ChildOutput`] for in-process decisions;
+/// only this bounded display projection may enter a [`ResolverError`].
+const RESOLVER_DIAGNOSTIC_MAX_BYTES: usize = 4000;
 
 /// What the resolver is permitted to accept beyond the secure default. Every
 /// field defaults to the *refusing* stance, so [`ResolverAllowances::default`] is
@@ -889,6 +896,128 @@ fn resolver_tool_digest(path: &Path) -> Result<String, String> {
     }
 }
 
+/// Enrollment is deliberately narrower than ordinary executable trust. A
+/// user-writable `uv` can participate in enforcement only when Linux can seal
+/// the exact enrolled bytes and the image has no interpreter or dynamic-loader
+/// dependency that could remain mutable outside that seal.
+#[cfg(target_os = "linux")]
+fn validate_static_linux_uv(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileExt as _;
+
+    const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+    const ELFCLASS32: u8 = 1;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const ELFDATA2MSB: u8 = 2;
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const PT_INTERP: u32 = 3;
+    const MAX_PROGRAM_HEADERS: u64 = 4096;
+
+    let file = crate::util::open_read_no_follow_capped(path, RESOLVER_TOOL_MAX_BYTES)
+        .map_err(|error| format!("cannot inspect enrolled uv image: {error:?}"))?;
+    let mut ident = [0_u8; 16];
+    file.read_exact_at(&mut ident, 0)
+        .map_err(|error| format!("cannot read enrolled uv ELF identity: {error}"))?;
+    if &ident[..4] != ELF_MAGIC {
+        return Err(
+            "user-writable uv enrollment requires a static native Linux ELF image; scripts and wrapper launchers are refused"
+                .to_string(),
+        );
+    }
+    let (header_len, phoff_offset, phentsize_offset, phnum_offset) = match ident[4] {
+        ELFCLASS32 => (52_usize, 28_usize, 42_usize, 44_usize),
+        ELFCLASS64 => (64_usize, 32_usize, 54_usize, 56_usize),
+        other => return Err(format!("enrolled uv uses unsupported ELF class {other}")),
+    };
+    let little_endian = match ident[5] {
+        ELFDATA2LSB => true,
+        ELFDATA2MSB => false,
+        other => {
+            return Err(format!(
+                "enrolled uv uses unsupported ELF byte order {other}"
+            ))
+        }
+    };
+    let mut header = vec![0_u8; header_len];
+    file.read_exact_at(&mut header, 0)
+        .map_err(|error| format!("cannot read enrolled uv ELF header: {error}"))?;
+    let read_u16 = |offset: usize| {
+        let bytes: [u8; 2] = header[offset..offset + 2]
+            .try_into()
+            .expect("fixed ELF header offsets are in bounds");
+        if little_endian {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    };
+    let read_u32 = |offset: usize| {
+        let bytes: [u8; 4] = header[offset..offset + 4]
+            .try_into()
+            .expect("fixed ELF header offsets are in bounds");
+        if little_endian {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+    let read_u64 = |offset: usize| {
+        let bytes: [u8; 8] = header[offset..offset + 8]
+            .try_into()
+            .expect("fixed ELF header offsets are in bounds");
+        if little_endian {
+            u64::from_le_bytes(bytes)
+        } else {
+            u64::from_be_bytes(bytes)
+        }
+    };
+    let phoff = if ident[4] == ELFCLASS32 {
+        u64::from(read_u32(phoff_offset))
+    } else {
+        read_u64(phoff_offset)
+    };
+    let phentsize = u64::from(read_u16(phentsize_offset));
+    let phnum = u64::from(read_u16(phnum_offset));
+    if phnum == 0 || phnum > MAX_PROGRAM_HEADERS || phentsize < 4 || phentsize > 256 {
+        return Err("enrolled uv has an invalid or unbounded ELF program-header table".to_string());
+    }
+    let table_bytes = phentsize
+        .checked_mul(phnum)
+        .and_then(|bytes| phoff.checked_add(bytes))
+        .ok_or_else(|| "enrolled uv ELF program-header table overflows".to_string())?;
+    if table_bytes > file.metadata().map_err(|error| error.to_string())?.len() {
+        return Err("enrolled uv ELF program-header table is truncated".to_string());
+    }
+
+    let mut saw_load = false;
+    for index in 0..phnum {
+        let offset = phoff + index * phentsize;
+        let mut kind = [0_u8; 4];
+        file.read_exact_at(&mut kind, offset)
+            .map_err(|error| format!("cannot read enrolled uv program header: {error}"))?;
+        let kind = if little_endian {
+            u32::from_le_bytes(kind)
+        } else {
+            u32::from_be_bytes(kind)
+        };
+        match kind {
+            PT_LOAD => saw_load = true,
+            PT_DYNAMIC | PT_INTERP => {
+                return Err(
+                    "user-writable uv enrollment requires a fully static ELF with no interpreter or dynamic-loader dependency"
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+    }
+    if !saw_load {
+        return Err("enrolled uv ELF has no loadable segment".to_string());
+    }
+    Ok(())
+}
+
 fn remember_discovered_tool(executable: &TrustedExecutable) -> Result<(), String> {
     let digest = resolver_tool_digest(executable.path())?;
     executable
@@ -902,6 +1031,7 @@ fn remember_discovered_tool(executable: &TrustedExecutable) -> Result<(), String
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn revalidate_discovered_tool(executable: &TrustedExecutable) -> Result<(), String> {
     let expected = DISCOVERED_RESOLVER_TOOLS
         .get_or_init(Default::default)
@@ -912,7 +1042,7 @@ fn revalidate_discovered_tool(executable: &TrustedExecutable) -> Result<(), Stri
     let Some(expected) = expected else {
         // Public callers may construct ResolverTools directly, so there may be
         // no process-local discovery digest. Persisted installation provenance
-        // is enforced separately by ValidatedResolverTools::from_public; still
+        // is enforced separately by BoundResolverTools::bind; still
         // revalidate the freshly captured identity here instead of treating a
         // missing discovery entry as an operator-trust bypass.
         return executable
@@ -997,9 +1127,11 @@ fn constant_time_hex_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-/// Explicitly enroll a user-writable resolver executable by canonical absolute
-/// path and SHA-256 in Tirith's owner-only operator trust store. PATH discovery
-/// never creates this pin implicitly.
+/// Explicitly enroll a fully static, native Linux `uv` executable by canonical
+/// absolute path and SHA-256 in Tirith's owner-only operator trust store. A
+/// user-writable Python runtime cannot be made trustworthy by pinning only its
+/// launcher, so it is rejected before any trust-store side effect. PATH
+/// discovery never creates a pin implicitly.
 pub fn enroll_resolver_tool(path: &Path) -> Result<PathBuf, ResolverError> {
     let executable =
         TrustedExecutable::from_absolute(path, &crate::trusted_child::ambient_denied_roots())
@@ -1010,6 +1142,31 @@ pub fn enroll_resolver_tool(path: &Path) -> Result<PathBuf, ResolverError> {
     let canonical = executable.path().to_path_buf();
     #[cfg(windows)]
     windows_trust_acl::validate_executable_hierarchy(&canonical).map_err(resolver_io_error)?;
+    if !executable.has_system_helper_provenance() {
+        #[cfg(target_os = "linux")]
+        {
+            validate_resolver_tool_name("uv", &canonical).map_err(|reason| {
+                ResolverError::ToolUntrusted {
+                    tool: canonical.display().to_string(),
+                    reason: format!(
+                        "user-writable enrollment can authorize only uv; Python and its runtime tree must be root-managed: {reason}"
+                    ),
+                }
+            })?;
+            validate_static_linux_uv(&canonical).map_err(|reason| {
+                ResolverError::ToolUntrusted {
+                    tool: canonical.display().to_string(),
+                    reason,
+                }
+            })?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(ResolverError::ToolUntrusted {
+            tool: canonical.display().to_string(),
+            reason: "user-writable resolver enrollment is enforceable only for a static native uv image on Linux; this platform cannot seal the enrolled executable bytes"
+                .to_string(),
+        });
+    }
     let store_key =
         resolver_tool_store_key(&canonical).map_err(|reason| ResolverError::ToolUntrusted {
             tool: canonical.display().to_string(),
@@ -1695,6 +1852,7 @@ fn pip_download_args(
     proxy_url: &str,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
+        "-I".to_string(),
         "-m".to_string(),
         "pip".to_string(),
         "download".to_string(),
@@ -1858,6 +2016,16 @@ fn run_child_capped(
     for (key, value) in isolated_env_with_proxy(config_home, python.path(), proxy_url) {
         spec = spec.env(key, value);
     }
+    #[cfg(target_os = "linux")]
+    {
+        let python_fd = python
+            .bound_launch_fd()
+            .ok_or_else(|| resolver_io_error("resolver Python has no sealed launch capability"))?;
+        // uv receives `/proc/self/fd/N`, never `/proc/<parent>/fd/N`: opening a
+        // parent's procfs fd is ptrace-policy gated and commonly denied by Yama or
+        // hidepid. Explicit inheritance makes N name this exact sealed file in uv.
+        spec = spec.inherit_fd(python_fd);
+    }
     // `uv` consumes this interpreter path through `--python` before Python is
     // itself the pip-stage program. Bind its identity at the uv boundary too;
     // validating only `program` would leave an auxiliary-executable swap gap.
@@ -1887,9 +2055,12 @@ fn run_child_capped(
             program.path().display(),
             stream
         ))),
-        ChildOutcome::SpawnError(reason) | ChildOutcome::WaitError(reason) => Err(
-            resolver_io_error(format!("{}: {reason}", program.path().display())),
-        ),
+        ChildOutcome::SpawnError(reason)
+        | ChildOutcome::WaitError(reason)
+        | ChildOutcome::CleanupError(reason) => Err(resolver_io_error(format!(
+            "{}: {reason}",
+            program.path().display()
+        ))),
     }
 }
 
@@ -1902,16 +2073,29 @@ struct ChildOutput {
 }
 
 impl ChildOutput {
-    /// Merged stdout+stderr as a lossy string, truncated for an error message so
-    /// a verbose tool cannot blow up a log line.
+    /// Merge stdout+stderr into one bounded, terminal-safe physical line.
+    ///
+    /// Resolver tools process registry-controlled text, so their diagnostics are
+    /// hostile even though the executable itself is trusted. Strip terminal and
+    /// deceptive-Unicode controls before the value enters `ResolverError`, then
+    /// collapse line boundaries so the CLI's eventual `eprintln!` cannot be made
+    /// to forge a second Tirith row. The raw buffers remain available on this
+    /// private value and are never interpolated into human output directly.
     fn diagnostics(&self) -> String {
-        let mut s = String::new();
-        s.push_str(&String::from_utf8_lossy(&self.stdout));
+        let mut raw = String::new();
+        raw.push_str(&String::from_utf8_lossy(&self.stdout));
         if !self.stderr.is_empty() {
-            s.push('\n');
-            s.push_str(&String::from_utf8_lossy(&self.stderr));
+            raw.push('\n');
+            raw.push_str(&String::from_utf8_lossy(&self.stderr));
         }
-        crate::util::truncate_bytes(s.trim(), 4000)
+        let cleaned = crate::mcp::output_filter::sanitize_for_display(raw.trim());
+        let single_line = cleaned
+            .split(['\n', '\r'])
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        crate::util::truncate_bytes(&single_line, RESOLVER_DIAGNOSTIC_MAX_BYTES)
     }
 }
 
@@ -1994,53 +2178,879 @@ pub fn validate_resolver_request_with_artifact_origins(
     validate_resolver_inputs(request, artifact_origins).map(|_| ())
 }
 
-#[derive(Debug)]
-struct ValidatedResolverTools {
+/// Resolver executables after installation-provenance validation and digest
+/// binding. Linux additionally binds each executable to immutable sealed bytes;
+/// other Unix hosts admit only root-managed, non-writable executable/runtime
+/// trees and re-attest their path identities and digests before every child.
+/// The same value must outlive resolve and installation.
+#[derive(Debug, Clone)]
+pub struct BoundResolverTools {
     uv: TrustedExecutable,
     python: TrustedExecutable,
+    uv_sha256: String,
+    python_sha256: String,
+    uv_version: String,
+    pip_version: String,
+    pip_tree: PipTreeBinding,
 }
 
-impl ValidatedResolverTools {
-    fn from_public(tools: &ResolverTools) -> Result<Self, ResolverError> {
-        // Public fields are compatibility surface, not an alternate trust
-        // channel. Reconstruct trusted handles, apply the same installation
-        // provenance policy as PATH discovery, then carry a discovery digest
-        // forward when one exists.
-        let denied_roots = crate::trusted_child::ambient_denied_roots();
-        let uv = TrustedExecutable::from_absolute(&tools.uv, &denied_roots).map_err(|error| {
-            ResolverError::ToolUntrusted {
-                tool: tools.uv.display().to_string(),
-                reason: error.to_string(),
-            }
-        })?;
-        validate_resolver_tool_provenance("uv", &uv).map_err(|reason| {
-            ResolverError::ToolUntrusted {
-                tool: tools.uv.display().to_string(),
-                reason,
-            }
-        })?;
-        revalidate_discovered_tool(&uv).map_err(|reason| ResolverError::ToolUntrusted {
-            tool: tools.uv.display().to_string(),
-            reason,
-        })?;
-        let python =
-            TrustedExecutable::from_absolute(&tools.python, &denied_roots).map_err(|error| {
+/// Versioned, bounded attestation over the exact root-managed pip package and
+/// matching dist-info trees that `python -I -m pip` will import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipTreeBinding {
+    root: PathBuf,
+    metadata_root: PathBuf,
+    sha256: String,
+    files: u64,
+    bytes: u64,
+}
+
+pub const PIP_TREE_BINDING_VERSION: u32 = 1;
+pub const PIP_TREE_MAX_FILES: u64 = 20_000;
+pub const PIP_TREE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn authorize_uv_for_enforcing_resolution(
+    uv: TrustedExecutable,
+) -> Result<TrustedExecutable, ResolverError> {
+    if uv.has_system_helper_provenance() {
+        return Ok(uv);
+    }
+    if !resolver_tool_pin_matches(uv.path()).map_err(resolver_io_error)? {
+        return Err(ResolverError::ToolUntrusted {
+            tool: uv.path().display().to_string(),
+            reason: "uv is neither root-managed nor covered by an explicit enrollment pin"
+                .to_string(),
+        });
+    }
+    validate_static_linux_uv(uv.path()).map_err(|reason| ResolverError::ToolUntrusted {
+        tool: uv.path().display().to_string(),
+        reason,
+    })?;
+    Ok(uv)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn authorize_uv_for_enforcing_resolution(
+    uv: TrustedExecutable,
+) -> Result<TrustedExecutable, ResolverError> {
+    let tool = uv.path().display().to_string();
+    uv.require_system_helper_provenance()
+        .map_err(|error| ResolverError::ToolUntrusted {
+            tool,
+            reason: format!(
+                "enforcing resolution requires root-managed uv on this Unix platform: {error}"
+            ),
+        })
+}
+
+impl BoundResolverTools {
+    pub fn bind(tools: &ResolverTools) -> Result<Self, ResolverError> {
+        #[cfg(not(unix))]
+        {
+            let _ = tools;
+            return Err(ResolverError::ToolUntrusted {
+                tool: "package resolver toolchain".to_string(),
+                reason: "enforcing package resolution requires a platform with a verified immutable-or-root-managed executable and Python/pip dependency-tree binding"
+                    .to_string(),
+            });
+        }
+
+        #[cfg(unix)]
+        {
+            // Public fields are compatibility surface, not an alternate trust
+            // channel. Reconstruct trusted handles, apply the same installation
+            // provenance policy as PATH discovery, then carry a discovery digest
+            // forward when one exists.
+            let denied_roots = crate::trusted_child::ambient_denied_roots();
+            let uv =
+                TrustedExecutable::from_absolute(&tools.uv, &denied_roots).map_err(|error| {
+                    ResolverError::ToolUntrusted {
+                        tool: tools.uv.display().to_string(),
+                        reason: error.to_string(),
+                    }
+                })?;
+            validate_resolver_tool_provenance("uv", &uv).map_err(|reason| {
                 ResolverError::ToolUntrusted {
-                    tool: tools.python.display().to_string(),
-                    reason: error.to_string(),
+                    tool: tools.uv.display().to_string(),
+                    reason,
                 }
             })?;
-        validate_resolver_tool_provenance("python", &python).map_err(|reason| {
-            ResolverError::ToolUntrusted {
+            revalidate_discovered_tool(&uv).map_err(|reason| ResolverError::ToolUntrusted {
+                tool: tools.uv.display().to_string(),
+                reason,
+            })?;
+            let uv = authorize_uv_for_enforcing_resolution(uv)?;
+            let python = TrustedExecutable::from_absolute(&tools.python, &denied_roots).map_err(
+                |error| ResolverError::ToolUntrusted {
+                    tool: tools.python.display().to_string(),
+                    reason: error.to_string(),
+                },
+            )?;
+            validate_resolver_tool_provenance("python", &python).map_err(|reason| {
+                ResolverError::ToolUntrusted {
+                    tool: tools.python.display().to_string(),
+                    reason,
+                }
+            })?;
+            revalidate_discovered_tool(&python).map_err(|reason| ResolverError::ToolUntrusted {
                 tool: tools.python.display().to_string(),
                 reason,
+            })?;
+            let python = python
+            .require_system_helper_provenance()
+            .map_err(|error| ResolverError::ToolUntrusted {
+                tool: tools.python.display().to_string(),
+                reason: format!(
+                    "enforcing resolution refuses user-writable/enrollment-only Python dependency origins: {error}"
+                ),
+            })?;
+
+            // Check the conventional install prefix before executing even a constant
+            // no-site Python probe. A sealed ELF is not sufficient when a same-user
+            // process can replace its loader, stdlib, or adjacent sitecustomize.
+            let python_prefix = python
+                .path()
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .ok_or_else(|| ResolverError::ToolUntrusted {
+                    tool: tools.python.display().to_string(),
+                    reason: "Python executable has no stable installation prefix".to_string(),
+                })?;
+            if !resolver_root_managed_path_chain_is_secure(&python_prefix) {
+                return Err(ResolverError::ToolUntrusted {
+                    tool: tools.python.display().to_string(),
+                    reason: format!(
+                        "Python installation prefix {} is not root-managed and non-writable",
+                        python_prefix.display()
+                    ),
+                });
             }
-        })?;
-        revalidate_discovered_tool(&python).map_err(|reason| ResolverError::ToolUntrusted {
-            tool: tools.python.display().to_string(),
-            reason,
-        })?;
-        Ok(Self { uv, python })
+            let python_version = python_version_from_executable(python.path()).ok_or(
+                ResolverError::ToolUntrusted {
+                    tool: tools.python.display().to_string(),
+                    reason: "canonical Python executable name does not bind an exact major.minor runtime (expected pythonX.Y)"
+                        .to_string(),
+                },
+            )?;
+            let expected_stdlib = python_prefix
+                .join("lib")
+                .join(format!("python{python_version}"))
+                .canonicalize()
+                .map_err(|error| ResolverError::ToolUntrusted {
+                    tool: tools.python.display().to_string(),
+                    reason: format!(
+                        "cannot resolve conventional Python stdlib before execution: {error}"
+                    ),
+                })?;
+            // This type-state token can only be constructed after validating the
+            // complete conventional runtime tree. CPython loads encodings/codecs
+            // before evaluating `-c`, even under `-I -S`, so every Python probe
+            // below requires the token rather than a bare path.
+            let validated_runtime =
+                ValidatedPythonRuntime::validate(python_prefix, python_version, expected_stdlib)?;
+
+            // Linux can close the final validation-to-exec pathname race with a
+            // sealed anonymous descriptor. Other Unix hosts retain the already
+            // validated canonical path, but only after the complete executable,
+            // runtime, and pip hierarchies have proven root-managed and therefore
+            // immutable to the invoking (unprivileged) user.
+            #[cfg(target_os = "linux")]
+            let uv = uv
+                .bind_content()
+                .map_err(|error| ResolverError::ToolUntrusted {
+                    tool: tools.uv.display().to_string(),
+                    reason: format!(
+                        "could not content-bind resolver before network access: {error}"
+                    ),
+                })?;
+            #[cfg(target_os = "linux")]
+            let python = python
+                .bind_content()
+                .map_err(|error| ResolverError::ToolUntrusted {
+                    tool: tools.python.display().to_string(),
+                    reason: format!(
+                        "could not content-bind interpreter before network access: {error}"
+                    ),
+                })?;
+
+            let uv_sha256 = resolver_tool_digest(uv.launch_path()).map_err(|reason| {
+                ResolverError::ToolUntrusted {
+                    tool: uv.path().display().to_string(),
+                    reason,
+                }
+            })?;
+            let python_sha256 = resolver_tool_digest(python.launch_path()).map_err(|reason| {
+                ResolverError::ToolUntrusted {
+                    tool: python.path().display().to_string(),
+                    reason,
+                }
+            })?;
+
+            let uv_version = capture_bound_tool_version(&uv, ["--version"], "uv")?;
+            let runtime = attest_python_runtime_and_pip(&python, &validated_runtime)?;
+
+            Ok(Self {
+                uv,
+                python,
+                uv_sha256,
+                python_sha256,
+                uv_version,
+                pip_version: runtime.0,
+                pip_tree: runtime.1,
+            })
+        }
+    }
+
+    pub fn uv(&self) -> &TrustedExecutable {
+        &self.uv
+    }
+
+    pub fn python(&self) -> &TrustedExecutable {
+        &self.python
+    }
+
+    pub fn uv_sha256(&self) -> &str {
+        &self.uv_sha256
+    }
+
+    pub fn python_sha256(&self) -> &str {
+        &self.python_sha256
+    }
+
+    pub fn uv_version(&self) -> &str {
+        &self.uv_version
+    }
+
+    pub fn pip_version(&self) -> &str {
+        &self.pip_version
+    }
+
+    pub fn pip_tree(&self) -> &PipTreeBinding {
+        &self.pip_tree
+    }
+
+    /// Revalidate every retained executable digest and the bounded root-managed
+    /// pip tree immediately before uv or pip execution.
+    pub fn revalidate_install_authority(&self) -> Result<(), ResolverError> {
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            return Err(ResolverError::ToolUntrusted {
+                tool: "package resolver toolchain".to_string(),
+                reason: "enforcing package execution authority is unavailable on this platform"
+                    .to_string(),
+            });
+        }
+
+        #[cfg(unix)]
+        {
+            self.uv
+                .revalidate()
+                .map_err(|error| resolver_io_error(format!("bound uv changed: {error}")))?;
+            self.python
+                .revalidate()
+                .map_err(|error| resolver_io_error(format!("bound Python changed: {error}")))?;
+            revalidate_bound_tool_digest(&self.uv, &self.uv_sha256, "uv")?;
+            revalidate_bound_tool_digest(&self.python, &self.python_sha256, "Python")?;
+            let current = attest_pip_trees(&self.pip_tree.root, &self.pip_tree.metadata_root)?;
+            if current != self.pip_tree {
+                return Err(resolver_io_error(
+                    "root-managed pip package or metadata tree changed after approval binding",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// A procfs capability path that names the exact sealed interpreter fd inherited
+    /// by uv. [`run_child_capped`] clears CLOEXEC for the same fd in the uv child;
+    /// no cross-process procfs dereference or mutable source path is involved.
+    #[cfg(target_os = "linux")]
+    fn python_capability_path(&self) -> Result<PathBuf, ResolverError> {
+        let fd = self
+            .python
+            .bound_launch_fd()
+            .ok_or_else(|| resolver_io_error("bound Python has no sealed launch descriptor"))?;
+        Ok(self_fd_capability_path(fd))
+    }
+}
+
+#[cfg(unix)]
+fn revalidate_bound_tool_digest(
+    executable: &TrustedExecutable,
+    expected: &str,
+    label: &str,
+) -> Result<(), ResolverError> {
+    let current = resolver_tool_digest(executable.launch_path()).map_err(resolver_io_error)?;
+    if !constant_time_hex_eq(expected.as_bytes(), current.as_bytes()) {
+        return Err(resolver_io_error(format!(
+            "bound {label} content changed after approval binding"
+        )));
+    }
+    executable.revalidate().map_err(|error| {
+        resolver_io_error(format!(
+            "bound {label} identity changed while revalidating content: {error}"
+        ))
+    })
+}
+
+/// Resolver dependency trees need the same root-managed guarantee as the
+/// executable itself. Keep this local rather than weakening the general
+/// trusted-child API: every component must be root-owned, non-group/world
+/// writable, and free of mutating extended ACLs.
+#[cfg(unix)]
+fn resolver_root_managed_path_chain_is_secure(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    path.ancestors().all(|component| {
+        let Ok(metadata) = std::fs::metadata(component) else {
+            return false;
+        };
+        metadata.uid() == 0
+            && metadata.mode() & 0o022 == 0
+            && crate::trusted_child::reject_unix_extended_acl(component, metadata.is_dir()).is_ok()
+    })
+}
+
+impl PipTreeBinding {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn files(&self) -> u64 {
+        self.files
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+#[cfg(unix)]
+const PYTHON_RUNTIME_MAX_FILES: u64 = 100_000;
+#[cfg(unix)]
+const PYTHON_RUNTIME_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const PIP_TREE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const PIP_TREE_MAX_PATH_BYTES: u64 = 4096;
+
+/// Proof that the conventional CPython prefix/version/stdlib tuple has passed a
+/// complete bounded root-managed-tree validation before any Python process runs.
+/// The private fields prevent callers outside this module from fabricating the
+/// proof, and Python attestation accepts this token instead of unchecked paths.
+#[cfg(unix)]
+struct ValidatedPythonRuntime {
+    prefix: PathBuf,
+    version: String,
+    stdlib: PathBuf,
+}
+
+#[cfg(unix)]
+impl ValidatedPythonRuntime {
+    fn validate(prefix: PathBuf, version: String, stdlib: PathBuf) -> Result<Self, ResolverError> {
+        validate_root_managed_runtime_tree(&stdlib)?;
+        Ok(Self {
+            prefix,
+            version,
+            stdlib,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn self_fd_capability_path(fd: std::os::fd::RawFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{fd}"))
+}
+
+#[cfg(unix)]
+fn python_version_from_executable(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let suffix = name.strip_prefix("python")?;
+    let (major, minor) = suffix.split_once('.')?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("{major}.{minor}"))
+}
+
+/// Locate and attest pip without importing or executing pip. Only the built-in
+/// `sys` module is used for the first `-I -S` probe. The returned stdlib is then
+/// checked as a bounded root-managed tree before a second no-site probe imports
+/// the now-proven system `site` module to enumerate system site roots.
+#[cfg(unix)]
+fn attest_python_runtime_and_pip(
+    python: &TrustedExecutable,
+    runtime: &ValidatedPythonRuntime,
+) -> Result<(String, PipTreeBinding), ResolverError> {
+    const RUNTIME_PROBE: &str =
+        "import sys; print(sys.base_prefix); print(f'{sys.version_info[0]}.{sys.version_info[1]}')";
+    let output =
+        capture_bound_tool_version(python, ["-I", "-S", "-c", RUNTIME_PROBE], "Python runtime")?;
+    let lines = output.lines().collect::<Vec<_>>();
+    if lines.len() != 2 || lines.iter().any(|line| line.trim().is_empty()) {
+        return Err(resolver_io_error(
+            "Python no-site runtime probe returned an invalid base-prefix/version tuple",
+        ));
+    }
+    let base_prefix = PathBuf::from(lines[0]);
+    let base_prefix = base_prefix.canonicalize().map_err(|error| {
+        resolver_io_error(format!(
+            "cannot canonicalize Python base prefix {}: {error}",
+            base_prefix.display()
+        ))
+    })?;
+    if base_prefix != runtime.prefix
+        || !python.path().starts_with(&base_prefix)
+        || !resolver_root_managed_path_chain_is_secure(&base_prefix)
+    {
+        return Err(ResolverError::ToolUntrusted {
+            tool: python.path().display().to_string(),
+            reason: format!(
+                "Python reported base prefix {} outside its root-managed executable origin",
+                base_prefix.display()
+            ),
+        });
+    }
+    if lines[1] != runtime.version {
+        return Err(resolver_io_error(format!(
+            "Python runtime reported version {} but executable/stdlib binding selected {}",
+            lines[1], runtime.version
+        )));
+    }
+    let reported_stdlib = base_prefix
+        .join("lib")
+        .join(format!("python{}", lines[1]))
+        .canonicalize()
+        .map_err(ResolverError::Io)?;
+    if reported_stdlib != runtime.stdlib {
+        return Err(resolver_io_error(format!(
+            "Python runtime selected stdlib {} instead of prevalidated {}",
+            reported_stdlib.display(),
+            runtime.stdlib.display()
+        )));
+    }
+
+    const SITE_PROBE: &str = "import site; [print(path) for path in site.getsitepackages()]";
+    let site_output =
+        capture_bound_tool_version(python, ["-I", "-S", "-c", SITE_PROBE], "Python system-site")?;
+    let mut site_roots = Vec::new();
+    for raw in site_output.lines() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(raw);
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(resolver_io_error(format!(
+                    "cannot canonicalize Python system-site root {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        if !resolver_root_managed_path_chain_is_secure(&path) {
+            return Err(ResolverError::ToolUntrusted {
+                tool: python.path().display().to_string(),
+                reason: format!(
+                    "Python system-site root {} is not root-managed and non-writable",
+                    path.display()
+                ),
+            });
+        }
+        validate_site_startup_controls(&path)?;
+        if !site_roots.contains(&path) {
+            site_roots.push(path);
+        }
+    }
+    if site_roots.is_empty() {
+        return Err(resolver_io_error(
+            "Python reported no existing root-managed system-site directory containing pip",
+        ));
+    }
+
+    let mut pip_roots = Vec::new();
+    for site in &site_roots {
+        let candidate = site.join("pip");
+        match candidate.canonicalize() {
+            Ok(candidate) if candidate.is_dir() => {
+                if !resolver_root_managed_path_chain_is_secure(&candidate) {
+                    return Err(ResolverError::ToolUntrusted {
+                        tool: candidate.display().to_string(),
+                        reason: "pip package tree is not root-managed and non-writable".to_string(),
+                    });
+                }
+                if !pip_roots.contains(&candidate) {
+                    pip_roots.push(candidate);
+                }
+            }
+            Ok(_) => {
+                return Err(resolver_io_error(format!(
+                    "pip import root {} is not a directory",
+                    candidate.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ResolverError::Io(error)),
+        }
+    }
+    if pip_roots.len() != 1 {
+        return Err(resolver_io_error(format!(
+            "expected exactly one root-managed pip package tree, found {}",
+            pip_roots.len()
+        )));
+    }
+    let pip_root = pip_roots.pop().expect("length checked");
+    let site_root = pip_root
+        .parent()
+        .ok_or_else(|| resolver_io_error("pip package tree has no site parent"))?;
+    let metadata_root = locate_exact_pip_dist_info(site_root)?;
+    let version = read_pip_metadata_version(&metadata_root)?;
+    let binding = attest_pip_trees(&pip_root, &metadata_root)?;
+    Ok((version, binding))
+}
+
+#[cfg(unix)]
+fn validate_root_managed_runtime_tree(root: &Path) -> Result<(), ResolverError> {
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+    let mut walk = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = walk.next() {
+        let entry = entry.map_err(|error| resolver_io_error(error.to_string()))?;
+        if entry.file_type().is_symlink() {
+            return Err(resolver_io_error(format!(
+                "Python runtime tree contains symlinked dependency {}",
+                entry.path().display()
+            )));
+        }
+        if entry.depth() == 1
+            && matches!(
+                entry.file_name().to_str(),
+                Some("site-packages" | "dist-packages")
+            )
+            && entry.file_type().is_dir()
+        {
+            // Site trees are enumerated and constrained separately below; skipping
+            // them here keeps an unrelated global package set from becoming the
+            // runtime-binding cost.
+            walk.skip_current_dir();
+            continue;
+        }
+        if !resolver_root_managed_path_chain_is_secure(entry.path()) {
+            return Err(ResolverError::ToolUntrusted {
+                tool: entry.path().display().to_string(),
+                reason: "Python runtime dependency is not root-managed and non-writable"
+                    .to_string(),
+            });
+        }
+        let metadata = std::fs::metadata(entry.path()).map_err(ResolverError::Io)?;
+        if metadata.is_file() {
+            files = files.saturating_add(1);
+            bytes = bytes.saturating_add(metadata.len());
+            if files > PYTHON_RUNTIME_MAX_FILES || bytes > PYTHON_RUNTIME_MAX_BYTES {
+                return Err(resolver_io_error(format!(
+                    "Python runtime tree exceeds binding limits ({files} files, {bytes} bytes)"
+                )));
+            }
+        } else if !metadata.is_dir() {
+            return Err(resolver_io_error(format!(
+                "Python runtime tree contains unsupported entry {}",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_site_startup_controls(site_root: &Path) -> Result<(), ResolverError> {
+    for entry in std::fs::read_dir(site_root).map_err(ResolverError::Io)? {
+        let entry = entry.map_err(ResolverError::Io)?;
+        let name = entry.file_name();
+        let is_control = name.to_str().is_some_and(|name| {
+            name.ends_with(".pth") || name == "sitecustomize.py" || name == "usercustomize.py"
+        });
+        if is_control && !resolver_root_managed_path_chain_is_secure(&entry.path()) {
+            return Err(ResolverError::ToolUntrusted {
+                tool: entry.path().display().to_string(),
+                reason: "Python startup control file is user-writable".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn locate_exact_pip_dist_info(site_root: &Path) -> Result<PathBuf, ResolverError> {
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(site_root).map_err(ResolverError::Io)? {
+        let entry = entry.map_err(ResolverError::Io)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("pip-") && lower.ends_with(".dist-info") {
+            let path = entry.path().canonicalize().map_err(ResolverError::Io)?;
+            if !path.is_dir() || !resolver_root_managed_path_chain_is_secure(&path) {
+                return Err(ResolverError::ToolUntrusted {
+                    tool: path.display().to_string(),
+                    reason: "pip dist-info tree is not a root-managed directory".to_string(),
+                });
+            }
+            matches.push(path);
+        }
+    }
+    if matches.len() != 1 {
+        return Err(resolver_io_error(format!(
+            "expected exactly one pip dist-info tree beside the selected package, found {}",
+            matches.len()
+        )));
+    }
+    Ok(matches.pop().expect("length checked"))
+}
+
+#[cfg(unix)]
+fn read_pip_metadata_version(metadata_root: &Path) -> Result<String, ResolverError> {
+    const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+    let metadata_path = metadata_root.join("METADATA");
+    if !resolver_root_managed_path_chain_is_secure(&metadata_path) {
+        return Err(ResolverError::ToolUntrusted {
+            tool: metadata_path.display().to_string(),
+            reason: "pip METADATA is not root-managed and non-writable".to_string(),
+        });
+    }
+    let bytes = crate::util::read_text_no_follow_capped(&metadata_path, MAX_METADATA_BYTES)
+        .map_err(|error| resolver_io_error(format!("cannot read pip METADATA: {error:?}")))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| resolver_io_error("pip METADATA is not valid UTF-8"))?;
+    let mut name = None;
+    let mut version = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("Name:") {
+            name = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("Version:") {
+            version = Some(value.trim());
+        }
+        if name.is_some() && version.is_some() {
+            break;
+        }
+    }
+    if !name.is_some_and(|name| name.eq_ignore_ascii_case("pip")) {
+        return Err(resolver_io_error(
+            "selected pip METADATA has a non-pip Name",
+        ));
+    }
+    let version = version.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_control())
+    });
+    version
+        .map(str::to_string)
+        .ok_or_else(|| resolver_io_error("selected pip METADATA has no bounded version"))
+}
+
+#[cfg(unix)]
+fn attest_pip_trees(
+    pip_root: &Path,
+    metadata_root: &Path,
+) -> Result<PipTreeBinding, ResolverError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    struct Entry {
+        label: &'static str,
+        relative: String,
+        path: PathBuf,
+        directory: bool,
+    }
+
+    let mut entries = Vec::new();
+    for (label, root) in [("package", pip_root), ("metadata", metadata_root)] {
+        if !resolver_root_managed_path_chain_is_secure(root) {
+            return Err(ResolverError::ToolUntrusted {
+                tool: root.display().to_string(),
+                reason: "pip attestation root is not root-managed and non-writable".to_string(),
+            });
+        }
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            let entry = entry.map_err(|error| resolver_io_error(error.to_string()))?;
+            if entry.file_type().is_symlink() {
+                return Err(resolver_io_error(format!(
+                    "pip attestation rejects symlink {}",
+                    entry.path().display()
+                )));
+            }
+            if !entry.file_type().is_dir() && !entry.file_type().is_file() {
+                return Err(resolver_io_error(format!(
+                    "pip attestation rejects non-regular entry {}",
+                    entry.path().display()
+                )));
+            }
+            if !resolver_root_managed_path_chain_is_secure(entry.path()) {
+                return Err(ResolverError::ToolUntrusted {
+                    tool: entry.path().display().to_string(),
+                    reason: "pip tree entry is not root-managed and non-writable".to_string(),
+                });
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(|error| resolver_io_error(error.to_string()))?
+                .to_str()
+                .ok_or_else(|| resolver_io_error("pip tree contains a non-UTF-8 path"))?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if relative.len() as u64 > PIP_TREE_MAX_PATH_BYTES {
+                return Err(resolver_io_error(format!(
+                    "pip tree path exceeds {PIP_TREE_MAX_PATH_BYTES} bytes"
+                )));
+            }
+            entries.push(Entry {
+                label,
+                relative,
+                path: entry.path().to_path_buf(),
+                directory: entry.file_type().is_dir(),
+            });
+        }
+    }
+    entries.sort_by(|left, right| {
+        (left.label, left.relative.as_bytes()).cmp(&(right.label, right.relative.as_bytes()))
+    });
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"tirith-pip-tree-v1\0");
+    hasher.update(PIP_TREE_MAX_FILES.to_be_bytes());
+    hasher.update(PIP_TREE_MAX_BYTES.to_be_bytes());
+    hasher.update(PIP_TREE_MAX_FILE_BYTES.to_be_bytes());
+    hasher.update(PIP_TREE_MAX_PATH_BYTES.to_be_bytes());
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in entries {
+        let metadata = std::fs::metadata(&entry.path).map_err(ResolverError::Io)?;
+        hasher.update(if entry.directory { b"D" } else { b"F" });
+        hasher.update((entry.label.len() as u64).to_be_bytes());
+        hasher.update(entry.label.as_bytes());
+        hasher.update((entry.relative.len() as u64).to_be_bytes());
+        hasher.update(entry.relative.as_bytes());
+        hasher.update((metadata.permissions().mode() & 0o7777).to_be_bytes());
+        if entry.directory {
+            continue;
+        }
+        if !metadata.is_file() || metadata.len() > PIP_TREE_MAX_FILE_BYTES {
+            return Err(resolver_io_error(format!(
+                "pip tree file {} exceeds the per-file binding limit or is not regular",
+                entry.path.display()
+            )));
+        }
+        files = files.saturating_add(1);
+        bytes = bytes.saturating_add(metadata.len());
+        if files > PIP_TREE_MAX_FILES || bytes > PIP_TREE_MAX_BYTES {
+            return Err(resolver_io_error(format!(
+                "pip tree exceeds binding limits ({files} files, {bytes} bytes)"
+            )));
+        }
+        hasher.update(metadata.len().to_be_bytes());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&entry.path)
+            .map_err(ResolverError::Io)?;
+        let opened = file.metadata().map_err(ResolverError::Io)?;
+        if !opened.is_file()
+            || opened.len() != metadata.len()
+            || (opened.permissions().mode() & 0o7777) != (metadata.permissions().mode() & 0o7777)
+        {
+            return Err(resolver_io_error(format!(
+                "pip tree file {} changed while being attested",
+                entry.path.display()
+            )));
+        }
+        let mut remaining = opened.len();
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            let count = file.read(&mut buffer).map_err(ResolverError::Io)?;
+            if count == 0 {
+                return Err(resolver_io_error(format!(
+                    "pip tree file {} was truncated during attestation",
+                    entry.path.display()
+                )));
+            }
+            let take = count.min(remaining as usize);
+            hasher.update(&buffer[..take]);
+            remaining -= take as u64;
+            if take != count {
+                return Err(resolver_io_error(format!(
+                    "pip tree file {} grew during attestation",
+                    entry.path.display()
+                )));
+            }
+        }
+        let mut extra = [0_u8; 1];
+        if file.read(&mut extra).map_err(ResolverError::Io)? != 0 {
+            return Err(resolver_io_error(format!(
+                "pip tree file {} grew during attestation",
+                entry.path.display()
+            )));
+        }
+    }
+    Ok(PipTreeBinding {
+        root: pip_root.to_path_buf(),
+        metadata_root: metadata_root.to_path_buf(),
+        sha256: hex::encode(hasher.finalize()),
+        files,
+        bytes,
+    })
+}
+
+#[cfg(unix)]
+fn capture_bound_tool_version<const N: usize>(
+    executable: &TrustedExecutable,
+    args: [&str; N],
+    label: &str,
+) -> Result<String, ResolverError> {
+    let spec = ChildSpec::new(
+        args,
+        ChildLimits::new(Duration::from_secs(10), 16 * 1024, 16 * 1024),
+    );
+    match crate::trusted_child::run(executable, &spec) {
+        ChildOutcome::Completed { status, stdout, .. } if status.success() => {
+            let text = String::from_utf8_lossy(&stdout).trim().to_string();
+            if text.is_empty() || text.len() > 4096 {
+                return Err(resolver_io_error(format!(
+                    "{label} version probe returned no bounded version text"
+                )));
+            }
+            Ok(text)
+        }
+        ChildOutcome::Completed { status, stderr, .. } => Err(resolver_io_error(format!(
+            "{label} version probe failed with {:?}: {}",
+            status.code(),
+            crate::util::truncate_bytes(&String::from_utf8_lossy(&stderr), 1024)
+        ))),
+        ChildOutcome::Timeout { .. } => Err(ResolverError::Timeout(format!(
+            "{label} version probe exceeded 10s"
+        ))),
+        ChildOutcome::OutputLimitExceeded { .. } => Err(resolver_io_error(format!(
+            "{label} version probe exceeded its output limit"
+        ))),
+        ChildOutcome::SpawnError(reason)
+        | ChildOutcome::WaitError(reason)
+        | ChildOutcome::CleanupError(reason) => Err(resolver_io_error(format!(
+            "{label} version probe failed: {reason}"
+        ))),
     }
 }
 
@@ -2123,7 +3133,28 @@ pub fn resolve_into_quarantine_with_artifact_origins(
     // 1. Effect-free validation of every attacker-controlled input. Only after
     // this succeeds do we stat tools, bind the broker, or write temp files.
     let validated = validate_resolver_inputs(request, artifact_origins)?;
-    let tools = ValidatedResolverTools::from_public(tools)?;
+    let tools = BoundResolverTools::bind(tools)?;
+    resolve_validated_with_bound_tools(request, &tools, txn, validated)
+}
+
+/// Resolve with caller-retained, content-bound tools. Package install uses this
+/// seam so the exact Python image remains alive through the later offline install.
+pub fn resolve_into_quarantine_with_bound_tools(
+    request: &ResolverRequest,
+    tools: &BoundResolverTools,
+    txn: &QuarantineTransaction,
+    artifact_origins: &[String],
+) -> Result<ResolvedSet, ResolverError> {
+    let validated = validate_resolver_inputs(request, artifact_origins)?;
+    resolve_validated_with_bound_tools(request, tools, txn, validated)
+}
+
+fn resolve_validated_with_bound_tools(
+    request: &ResolverRequest,
+    tools: &BoundResolverTools,
+    txn: &QuarantineTransaction,
+    validated: ValidatedResolverInputs,
+) -> Result<ResolvedSet, ResolverError> {
     let permitted =
         PermittedOrigins::from_urls(&validated.permitted_urls).map_err(resolver_io_error)?;
     let broker = ResolverBroker::start(permitted).map_err(resolver_io_error)?;
@@ -2150,10 +3181,15 @@ pub fn resolve_into_quarantine_with_artifact_origins(
         .map_err(ResolverError::Io)?;
 
     // 3. Compile a hash-pinned lock.
+    tools.revalidate_install_authority()?;
+    #[cfg(target_os = "linux")]
+    let python_for_uv = tools.python_capability_path()?;
+    #[cfg(not(target_os = "linux"))]
+    let python_for_uv = tools.python.path().to_path_buf();
     let compile_args = uv_compile_args(
         &requirements_in,
         &lock_path,
-        tools.python.path(),
+        &python_for_uv,
         &validated.canonical_index_urls,
         &request.allowances,
     );
@@ -2178,6 +3214,7 @@ pub fn resolve_into_quarantine_with_artifact_origins(
     verify_lock_hash_pinned(&locked_requirements)?;
 
     // 4. Download the pinned wheels under --require-hashes.
+    tools.revalidate_install_authority()?;
     let download_args = pip_download_args(
         &lock_path,
         &staging,
@@ -2384,6 +3421,64 @@ mod tests {
             allow_direct_url: true,
             allow_untrusted_tool: true,
         }
+    }
+
+    #[test]
+    fn failed_uv_and_pip_diagnostics_are_terminal_safe_and_bounded() {
+        let mut uv_stderr =
+            "\x1b]52;c;Zm9yZ2Vk\x07\rFORGED UV ROW\nname\u{202e}txt\u{200b}: conflict"
+                .as_bytes()
+                .to_vec();
+        uv_stderr.extend(std::iter::repeat_n(
+            b'x',
+            RESOLVER_DIAGNOSTIC_MAX_BYTES + 100,
+        ));
+        let uv_diagnostic = ChildOutput {
+            success: false,
+            stdout: b"uv: no solution".to_vec(),
+            stderr: uv_stderr,
+        }
+        .diagnostics();
+        let uv_error = ResolverError::CompileFailed(uv_diagnostic.clone()).to_string();
+
+        let pip_diagnostic = ChildOutput {
+            success: false,
+            stdout: Vec::new(),
+            stderr: b"\x1b[2Jpip failure\nFORGED PIP ROW\x1b[31m".to_vec(),
+        }
+        .diagnostics();
+        let pip_error = ResolverError::DownloadFailed(pip_diagnostic.clone()).to_string();
+
+        for diagnostic in [&uv_diagnostic, &pip_diagnostic] {
+            assert!(diagnostic.len() <= RESOLVER_DIAGNOSTIC_MAX_BYTES);
+            assert!(!diagnostic
+                .chars()
+                .any(|ch| matches!(ch, '\n' | '\r' | '\x1b' | '\x07')));
+            assert_eq!(
+                crate::mcp::output_filter::sanitize_for_display(diagnostic),
+                diagnostic.as_str(),
+                "diagnostic must already be a terminal-safe display projection"
+            );
+        }
+        assert!(uv_error.contains("uv pip compile failed: uv: no solution | FORGED UV ROW"));
+        assert!(pip_error.contains("pip download failed: pip failure | FORGED PIP ROW"));
+    }
+
+    #[test]
+    fn legitimate_multiline_resolver_diagnostic_remains_readable() {
+        let diagnostic = ChildOutput {
+            success: false,
+            stdout: b"resolved 12 packages".to_vec(),
+            stderr: "ERROR: no matching distribution for café\nretry with another version"
+                .as_bytes()
+                .to_vec(),
+        }
+        .diagnostics();
+
+        assert_eq!(
+            diagnostic,
+            "resolved 12 packages | ERROR: no matching distribution for café | retry with another version"
+        );
     }
 
     // ---- requirement validation -------------------------------------------
@@ -2828,7 +3923,7 @@ mod tests {
         let proxy = "http://tirith:token@127.0.0.1:43123";
         let args = pip_download_args(lock, dest, &[], proxy);
         let joined = args.join(" ");
-        assert!(joined.starts_with("-m pip download"), "{joined}");
+        assert!(joined.starts_with("-I -m pip download"), "{joined}");
         assert!(joined.contains("--only-binary :all:"), "{joined}");
         assert!(joined.contains("--require-hashes"), "{joined}");
         assert!(joined.contains("--no-deps"), "{joined}");
@@ -2837,6 +3932,86 @@ mod tests {
         assert!(joined.contains(&format!("--proxy {proxy}")), "{joined}");
         assert!(joined.contains("--no-index"), "{joined}");
         assert!(joined.contains("--dest /w/staging"), "{joined}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_python_capability_is_child_local_not_parent_procfs() {
+        assert_eq!(
+            self_fd_capability_path(37),
+            PathBuf::from("/proc/self/fd/37")
+        );
+        assert!(
+            !self_fd_capability_path(37)
+                .to_string_lossy()
+                .contains(&std::process::id().to_string()),
+            "uv must not depend on permission to dereference its parent's procfs fd table"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_encodings_tree_refuses_before_python_probe_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let stdlib = directory.path().join("lib/python9.9");
+        let encodings = stdlib.join("encodings");
+        std::fs::create_dir_all(&encodings).unwrap();
+        let marker = directory.path().join("python-probe-ran");
+        std::fs::write(
+            encodings.join("__init__.py"),
+            format!(
+                "from pathlib import Path; Path({:?}).write_text('ran')\n",
+                marker
+            ),
+        )
+        .unwrap();
+
+        // Compile-time API guard: the process-running attestation function cannot
+        // be called with unchecked paths; it requires the validation token.
+        let _attest_requires_validated_runtime: fn(
+            &TrustedExecutable,
+            &ValidatedPythonRuntime,
+        ) -> Result<
+            (String, PipTreeBinding),
+            ResolverError,
+        > = attest_python_runtime_and_pip;
+
+        let result: Result<(), ResolverError> = (|| {
+            let _validated = ValidatedPythonRuntime::validate(
+                directory.path().to_path_buf(),
+                "9.9".to_string(),
+                stdlib,
+            )?;
+            // This marker stands in for the first Python spawn. It is unreachable
+            // when even `encodings` lives in a user-writable runtime tree.
+            std::fs::write(&marker, b"ran").map_err(ResolverError::Io)?;
+            Ok(())
+        })();
+        assert!(matches!(result, Err(ResolverError::ToolUntrusted { .. })));
+        assert!(
+            !marker.exists(),
+            "Python probe must not run before validation"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_executable_name_binds_exact_major_minor() {
+        assert_eq!(
+            python_version_from_executable(Path::new("/usr/bin/python3.12")).as_deref(),
+            Some("3.12")
+        );
+        for path in [
+            "/usr/bin/python3",
+            "/usr/bin/python",
+            "/usr/bin/python3.12.1",
+            "/usr/bin/python3.x",
+        ] {
+            assert!(
+                python_version_from_executable(Path::new(path)).is_none(),
+                "{path}"
+            );
+        }
     }
 
     // ---- lock hash-pin verification ----------------------------------------
@@ -2990,6 +4165,49 @@ certifi==2024.2.2 \\
     }
 
     // ---- tool resolution ---------------------------------------------------
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_unix_binding_reaches_tool_provenance_validation() {
+        let missing_uv = PathBuf::from("/definitely-not-a-tirith-resolver/uv");
+        let missing_python = PathBuf::from("/definitely-not-a-tirith-resolver/python3.12");
+        let error = BoundResolverTools::bind(&ResolverTools {
+            uv: missing_uv.clone(),
+            python: missing_python,
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ResolverError::ToolUntrusted { .. }),
+            "invalid tool selection must fail closed: {error:?}"
+        );
+        assert!(
+            error.to_string().contains(&missing_uv.display().to_string()),
+            "Unix binding must validate the selected tool instead of rejecting the platform: {error}"
+        );
+        assert!(
+            !error.to_string().contains("requires Linux"),
+            "non-Linux Unix hosts must use the root-managed binding contract: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_tool_digest_revalidation_detects_post_binding_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("uv");
+        write_fake_bin(&path, "#!/bin/sh\nexit 0\n");
+        let executable = TrustedExecutable::from_absolute(&path, &[]).unwrap();
+        let expected = resolver_tool_digest(executable.launch_path()).unwrap();
+        revalidate_bound_tool_digest(&executable, &expected, "uv").unwrap();
+
+        write_fake_bin(&path, "#!/bin/sh\nexit 7\n");
+        let error = revalidate_bound_tool_digest(&executable, &expected, "uv").unwrap_err();
+        assert!(
+            error.to_string().contains("bound uv"),
+            "digest drift must be attributed to the bound tool: {error}"
+        );
+    }
 
     #[test]
     fn resolve_tool_missing_is_not_found() {
@@ -3164,10 +4382,11 @@ certifi==2024.2.2 \\
     fn enrollment_rejects_insecure_existing_store_without_laundering_pins() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-        let environment = ResolverEnrollmentTestEnv::new();
-        let tool_directory = environment.tool_directory();
-        let tool = tool_directory.join("uv");
-        write_fake_bin(&tool, "#!/bin/sh\nexit 0\n");
+        let _environment = ResolverEnrollmentTestEnv::new();
+        // A root-managed helper reaches the trust-store validation seam on every
+        // Unix platform. User-owned script uv fixtures are intentionally rejected
+        // earlier by the executable-eligibility gate.
+        let tool = PathBuf::from("/bin/sh");
 
         let trust_file = resolver_tool_trust_file().unwrap();
         std::fs::create_dir_all(trust_file.parent().unwrap()).unwrap();
@@ -3238,7 +4457,20 @@ certifi==2024.2.2 \\
     #[cfg(unix)]
     fn write_fake_bin(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::write(path, body).unwrap();
+        let version_probe = match path.file_name().and_then(|name| name.to_str()) {
+            Some("uv") => "if [ \"$1\" = \"--version\" ]; then echo 'uv 0.test'; exit 0; fi\n",
+            Some(name) if name.starts_with("python") => {
+                "if [ \"$1\" = \"-I\" ] && [ \"$2\" = \"-m\" ] && [ \"$3\" = \"pip\" ] && [ \"$4\" = \"--version\" ]; then echo 'pip 0.test'; exit 0; fi\n"
+            }
+            _ => "",
+        };
+        let rendered = match body.split_once('\n') {
+            Some((shebang, rest)) if shebang.starts_with("#!") => {
+                format!("{shebang}\n{version_probe}{rest}")
+            }
+            _ => format!("{version_probe}{body}"),
+        };
+        std::fs::write(path, rendered).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -3276,7 +4508,29 @@ certifi==2024.2.2 \\
         }
 
         fn enroll(&self, path: &Path) {
-            enroll_resolver_tool(path).expect("fake resolver tool enrollment must succeed");
+            // Install a legacy/raw pin directly. The enforcing tests below need
+            // to prove that even a persisted pin cannot authorize script uv or
+            // user-owned Python; the public enrollment API now rejects those
+            // shapes before writing them.
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let canonical = path.canonicalize().unwrap();
+            let trust_file = resolver_tool_trust_file().unwrap();
+            let trust_dir = trust_file.parent().unwrap();
+            std::fs::create_dir_all(trust_dir).unwrap();
+            std::fs::set_permissions(trust_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut store = read_resolver_tool_trust_store(&trust_file)
+                .unwrap()
+                .unwrap_or_default();
+            store.pins.insert(
+                resolver_tool_store_key(&canonical).unwrap(),
+                resolver_tool_digest(&canonical).unwrap(),
+            );
+            crate::util::write_file_atomic_0600(
+                &trust_file,
+                &serde_json::to_vec_pretty(&store).unwrap(),
+            )
+            .unwrap();
         }
     }
 
@@ -3304,7 +4558,7 @@ certifi==2024.2.2 \\
         write_fake_bin(&uv, "#!/bin/sh\nexit 0\n");
         write_fake_bin(&python, "#!/bin/sh\nexit 0\n");
 
-        let error = ValidatedResolverTools::from_public(&ResolverTools { uv, python }).unwrap_err();
+        let error = BoundResolverTools::bind(&ResolverTools { uv, python }).unwrap_err();
         assert!(matches!(error, ResolverError::ToolUntrusted { .. }));
         assert!(
             error
@@ -3374,13 +4628,12 @@ certifi==2024.2.2 \\
         );
     }
 
-    /// End to end: a fake `uv` emits a hash-pinned lock for one wheel, a fake
-    /// `python -m pip download` drops that exact wheel into `--dest`, and the
-    /// resolver ingests it into the quarantine. Proves the compile -> verify ->
-    /// download -> ingest pipeline and that the locked hash governs the ingest.
+    /// Even explicitly enrolled same-user fake tools cannot reach the compile or
+    /// download stages of the enforcing resolver. Enrollment is analysis authority,
+    /// not authority to supply uv/Python runtime dependencies to an install.
     #[cfg(unix)]
     #[test]
-    fn resolve_into_quarantine_full_pipeline_with_fakes() {
+    fn enrolled_fake_pipeline_is_refused_before_execution() {
         let wheel_body = b"PK\x03\x04 fake but content-addressed wheel body for D2";
         let wheel_name = "examplepkg-1.0.0-py3-none-any.whl";
         let digest = sha256_hex(wheel_body);
@@ -3432,24 +4685,22 @@ certifi==2024.2.2 \\
         let tools = ResolverTools { uv, python };
         let request = ResolverRequest::single("examplepkg==1.0.0");
 
-        let resolved = resolve_into_quarantine(&request, &tools, &txn)
-            .expect("the fake pipeline should resolve and quarantine one wheel");
-        assert_eq!(resolved.artifacts.len(), 1);
-        assert_eq!(resolved.artifacts[0].sha256, digest);
-        assert_eq!(resolved.artifacts[0].wheel_filename, wheel_name);
+        let error = resolve_into_quarantine(&request, &tools, &txn).unwrap_err();
         assert!(
-            resolved.locked_requirements.contains(&digest),
-            "the returned lock must carry the pinned hash"
+            matches!(error, ResolverError::ToolUntrusted { .. }),
+            "{error:?}"
         );
-        // The wheel is a content-addressed blob in the quarantine now.
-        assert!(store.has_blob(&digest));
+        assert!(
+            !store.has_blob(&digest),
+            "untrusted resolver scripts must not create a quarantined artifact"
+        );
     }
 
-    /// If the fake `python` drops a wheel whose content the lock did NOT pin, the
-    /// resolver refuses it (the lock's hash set is the allow-list for the ingest).
+    /// An enrolled user-writable toolchain is refused before an attacker can use
+    /// even a nominally hash-pinned lock to reach the ingest stage.
     #[cfg(unix)]
     #[test]
-    fn resolve_into_quarantine_refuses_unpinned_download() {
+    fn enrolled_fake_unpinned_pipeline_is_refused_before_execution() {
         let environment = ResolverEnrollmentTestEnv::new();
         let bindir = environment.tool_directory();
         let uv = bindir.join("uv");
@@ -3493,16 +4744,16 @@ certifi==2024.2.2 \\
 
         let err = resolve_into_quarantine(&request, &tools, &txn).unwrap_err();
         assert!(
-            matches!(err, ResolverError::UnexpectedDownload(_)),
-            "an unpinned download must be refused: {err:?}"
+            matches!(err, ResolverError::ToolUntrusted { .. }),
+            "{err:?}"
         );
     }
 
-    /// A failing `uv` (non-zero exit) surfaces as `CompileFailed`, never a silent
-    /// proceed.
+    /// The strict system-helper gate precedes execution, so an enrolled failing
+    /// fake uv cannot run far enough to manufacture a compile diagnostic.
     #[cfg(unix)]
     #[test]
-    fn resolve_into_quarantine_compile_failure_is_fail_closed() {
+    fn enrolled_failing_uv_is_refused_before_execution() {
         let environment = ResolverEnrollmentTestEnv::new();
         let bindir = environment.tool_directory();
         let uv = bindir.join("uv");
@@ -3520,8 +4771,8 @@ certifi==2024.2.2 \\
 
         let err = resolve_into_quarantine(&request, &tools, &txn).unwrap_err();
         assert!(
-            matches!(err, ResolverError::CompileFailed(_)),
-            "a failing uv must fail closed: {err:?}"
+            matches!(err, ResolverError::ToolUntrusted { .. }),
+            "{err:?}"
         );
     }
 

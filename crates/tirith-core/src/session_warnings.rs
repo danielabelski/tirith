@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::verdict::{Evidence, Finding};
 
 /// Maximum warning events retained per session.
-const MAX_EVENTS: usize = 100;
+pub(crate) const MAX_EVENTS: usize = 100;
 /// Maximum escalation events retained per session.
-const MAX_ESCALATION_EVENTS: usize = 20;
+pub(crate) const MAX_ESCALATION_EVENTS: usize = 20;
 /// Maximum hidden events retained per session.
 const MAX_HIDDEN_EVENTS: usize = 50;
 /// W7: maximum typed events retained per session for cross-event correlation.
@@ -64,6 +64,10 @@ pub struct SessionWarnings {
     /// Off the hot path; capped to [`MAX_TYPED_EVENTS`].
     #[serde(default)]
     pub typed_events: VecDeque<crate::event_buffer::TypedEvent>,
+    /// Next stable sequence for a confirmed typed event. Zero is accepted only
+    /// while loading legacy state and is repaired before use.
+    #[serde(default)]
+    pub next_typed_event_sequence: u64,
     /// W7: signatures of correlation hits already added to session warning
     /// presentation/accounting, so a hit whose A-then-B pair (or delete burst) is
     /// still inside its window is counted there exactly once. Enforcement ignores
@@ -78,7 +82,7 @@ pub struct SessionWarnings {
 }
 
 /// A single warning event within a session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WarningEvent {
     pub timestamp: String,
     pub rule_id: String,
@@ -91,7 +95,7 @@ pub struct WarningEvent {
 /// Records when an escalation rule fired, for cooldown scoping. `rule_id` is the
 /// crossing rule or `"*"` for aggregate; `domain` is set only for
 /// `domain_scoped` rules (one domain's escalation doesn't cool down others).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscalationEvent {
     pub timestamp: String,
     pub rule_id: String,
@@ -111,7 +115,7 @@ pub struct HiddenEvent {
 
 impl SessionWarnings {
     /// Create a new empty accumulator.
-    fn new(session_id: &str) -> Self {
+    pub(crate) fn new(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
             session_start: chrono::Utc::now().to_rfc3339(),
@@ -124,6 +128,7 @@ impl SessionWarnings {
             hidden_events: VecDeque::new(),
             cooldowns: std::collections::BTreeMap::new(),
             typed_events: VecDeque::new(),
+            next_typed_event_sequence: 1,
             surfaced_correlations: VecDeque::new(),
         }
     }
@@ -211,7 +216,7 @@ pub fn session_state_path(session_id: &str) -> Option<PathBuf> {
 /// new inode and clobber the first. Locking a separate file that is never renamed
 /// keeps writers serialized across the whole read/modify/write while the rename
 /// stays crash-atomic. Mirrors the pending store's `pending.json.lock`.
-fn session_lock_path(session_id: &str) -> Option<PathBuf> {
+pub(crate) fn session_lock_path(session_id: &str) -> Option<PathBuf> {
     session_state_path(session_id).map(|p| {
         let mut name = p.file_name().unwrap_or_default().to_os_string();
         name.push(".lock");
@@ -223,7 +228,32 @@ fn session_lock_path(session_id: &str) -> Option<PathBuf> {
 /// events, cooldowns, and a 200-entry typed-event ring) is far smaller; the cap
 /// bounds the read so a malicious or runaway file is not slurped, and pairs with the
 /// regular-file + no-follow refusal in [`crate::util::read_text_no_follow_capped`].
-const SESSION_FILE_READ_CAP: u64 = 8 * 1024 * 1024;
+pub(crate) const SESSION_FILE_READ_CAP: u64 = 8 * 1024 * 1024;
+
+fn ensure_private_session_directory(directory: &Path) -> std::io::Result<()> {
+    crate::util::create_dir_durable(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::other(
+                "session state path is not a real directory",
+            ));
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session state directory has the wrong owner",
+            ));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            crate::util::fsync_parent_dir(directory)?;
+        }
+    }
+    Ok(())
+}
 
 /// Load session warnings from disk; a fresh (empty) accumulator on any error.
 ///
@@ -257,12 +287,125 @@ pub fn load(session_id: &str) -> SessionWarnings {
     if bytes.is_empty() {
         return SessionWarnings::new(session_id);
     }
-    serde_json::from_slice::<SessionWarnings>(&bytes).unwrap_or_else(|e| {
+    let mut session = serde_json::from_slice::<SessionWarnings>(&bytes).unwrap_or_else(|e| {
         crate::audit::audit_diagnostic(format!(
             "tirith: session: corrupt state for '{session_id}': {e}; resetting"
         ));
         SessionWarnings::new(session_id)
-    })
+    });
+    migrate_typed_event_identities(&mut session);
+    session
+}
+
+/// Assign stable identities to legacy typed events without colliding with
+/// already-migrated/new sequences. Runs only while the caller owns a private
+/// value or the stable session lock.
+pub(crate) fn migrate_typed_event_identities(session: &mut SessionWarnings) {
+    let mut used_sequences = std::collections::HashSet::new();
+    let mut max_sequence = 0u64;
+    for event in &mut session.typed_events {
+        if event.sequence == 0 || !used_sequences.insert(event.sequence) {
+            event.sequence = 0;
+        } else {
+            max_sequence = max_sequence.max(event.sequence);
+        }
+    }
+
+    let mut used_ids = std::collections::HashSet::new();
+
+    let mut next = max_sequence.checked_add(1).unwrap_or(0);
+    for event in &mut session.typed_events {
+        if event.sequence == 0 {
+            if next == 0 {
+                // Leave the legacy sentinel in place. Strict authorization will
+                // reject exhausted state; best-effort presentation must never
+                // wrap a supposedly monotonic security sequence back to one.
+                continue;
+            }
+            event.migrate_legacy_identity(&session.session_id, next);
+            used_sequences.insert(event.sequence);
+            next = next.checked_add(1).unwrap_or(0);
+        } else if event.event_id.is_empty() {
+            event.migrate_legacy_identity(&session.session_id, event.sequence);
+        }
+        if !event.event_id.is_empty() && used_ids.contains(&event.event_id) {
+            let base = event.event_id.clone();
+            let mut replacement = None;
+            for collision in 1..=used_ids.len().saturating_add(1) {
+                let seed = format!(
+                    "tirith-legacy-collision-v1\0{}\0{}\0{}\0{}",
+                    session.session_id, event.sequence, base, collision
+                );
+                let candidate = format!(
+                    "legacy-{}",
+                    crate::execution_state::sha256_hex(seed.as_bytes())
+                );
+                if !used_ids.contains(&candidate) {
+                    replacement = Some(candidate);
+                    break;
+                }
+            }
+            match replacement {
+                Some(candidate) => {
+                    event.event_id = candidate;
+                }
+                None => {
+                    event.event_id.clear();
+                }
+            }
+        }
+        if !event.event_id.is_empty() {
+            used_ids.insert(event.event_id.clone());
+        }
+    }
+    if next != 0 {
+        session.next_typed_event_sequence = session.next_typed_event_sequence.max(next).max(1);
+    }
+}
+
+/// Find a non-zero sequence in at most `used.len() + 1` probes. Wrapping after
+/// `u64::MAX` is safe because a finite in-memory ring cannot occupy the entire
+/// sequence space; the bound prevents hostile state from causing an infinite
+/// loop.
+fn next_free_typed_sequence(used: &std::collections::HashSet<u64>, start: u64) -> Option<u64> {
+    let mut candidate = start.max(1);
+    for _ in 0..=used.len() {
+        if !used.contains(&candidate) {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(1)?;
+    }
+    None
+}
+
+fn assign_typed_event_identity(
+    session: &mut SessionWarnings,
+    event: &mut crate::event_buffer::TypedEvent,
+) -> bool {
+    migrate_typed_event_identities(session);
+    let used: std::collections::HashSet<u64> = session
+        .typed_events
+        .iter()
+        .map(|existing| existing.sequence)
+        .collect();
+    let Some(sequence) = next_free_typed_sequence(&used, session.next_typed_event_sequence) else {
+        return false;
+    };
+    event.sequence = sequence;
+    if event.event_id.is_empty()
+        || session
+            .typed_events
+            .iter()
+            .any(|existing| existing.event_id == event.event_id)
+    {
+        event.event_id.clear();
+        event.migrate_legacy_identity(&session.session_id, sequence);
+    }
+    let Some(next) = sequence.checked_add(1) else {
+        return false;
+    };
+    session.next_typed_event_sequence = next;
+    true
 }
 
 /// W6 — per-rule suppression cooldown, session-backed so one-shot CLI / hook
@@ -452,8 +595,11 @@ pub fn record_escalation_event(session_id: &str, hits: &[crate::escalation::Esca
 /// execution is confirmed. This single-event helper remains for focused recorders
 /// and compatibility. Best-effort and off the hot path; the ring is capped to
 /// [`MAX_TYPED_EVENTS`] (oldest dropped first).
-pub fn record_typed_event(session_id: &str, event: crate::event_buffer::TypedEvent) {
+pub fn record_typed_event(session_id: &str, mut event: crate::event_buffer::TypedEvent) {
     with_session_locked(session_id, move |session| {
+        if !assign_typed_event_identity(session, &mut event) {
+            return;
+        }
         session.typed_events.push_back(event);
         while session.typed_events.len() > MAX_TYPED_EVENTS {
             session.typed_events.pop_front();
@@ -495,9 +641,10 @@ pub fn correlate_session_with_provisional(
 /// Enforcement does not depend on the fresh-hit result here: it already ran via
 /// [`correlate_session_with_provisional`]. This mutation only records confirmed
 /// history and de-duplicates later presentation/accounting of the same sequence.
-pub fn record_executed_typed_events(
+#[cfg(test)]
+pub(crate) fn record_executed_typed_events(
     session_id: &str,
-    events: Vec<crate::event_buffer::TypedEvent>,
+    mut events: Vec<crate::event_buffer::TypedEvent>,
     cmd: &str,
     policy: &crate::policy::Policy,
     dlp_patterns: &[String],
@@ -510,7 +657,12 @@ pub fn record_executed_typed_events(
     let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
     let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
     with_session_locked(session_id, move |session| {
-        session.typed_events.extend(events);
+        for mut event in events.drain(..) {
+            if !assign_typed_event_identity(session, &mut event) {
+                return;
+            }
+            session.typed_events.push_back(event);
+        }
         while session.typed_events.len() > MAX_TYPED_EVENTS {
             session.typed_events.pop_front();
         }
@@ -605,15 +757,11 @@ fn record_fresh_correlation_warnings(
     }
 
     // Expire presentation markers in lockstep with the persisted event window.
-    let live_stamps: std::collections::HashSet<&str> = session
-        .typed_events
-        .iter()
-        .map(|e| e.timestamp.as_str())
-        .collect();
-    session.surfaced_correlations.retain(|sig| {
-        crate::event_buffer::signature_event_timestamps(sig).any(|ts| live_stamps.contains(ts))
-    });
-    drop(live_stamps);
+    let live_events: Vec<crate::event_buffer::TypedEvent> =
+        session.typed_events.iter().cloned().collect();
+    session
+        .surfaced_correlations
+        .retain(|sig| crate::event_buffer::signature_references_live_event(sig, &live_events));
     while session.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS {
         session.surfaced_correlations.pop_front();
     }
@@ -638,8 +786,11 @@ fn record_fresh_correlation_warnings(
 /// like the pending store; locking the data file and renaming over it would orphan
 /// the lock on the old inode and let a concurrent writer clobber it.
 ///
-/// All I/O is best-effort; failures are logged and never panic. The read path is
-/// unchanged: a missing/empty/corrupt session resets to a fresh accumulator.
+/// All I/O is best-effort; failures are logged and never panic. A missing session
+/// starts fresh. Existing empty/corrupt state is left byte-for-byte untouched: it
+/// may be the legacy security-history source for strict execution-state
+/// initialization, so silently repairing it here could erase unknown history and
+/// turn a later fail-closed preparation into an authorization.
 fn with_session_locked<F>(session_id: &str, mutate: F)
 where
     F: FnOnce(&mut SessionWarnings),
@@ -662,7 +813,7 @@ where
         // Create sessions/ and, only if THIS call created it, fsync the grandparent
         // so a first-time-created dir entry survives a crash. The helper keys off
         // create_dir's own result, so there is no exists()-then-create TOCTOU.
-        if let Err(e) = crate::util::create_dir_durable(parent) {
+        if let Err(e) = ensure_private_session_directory(parent) {
             crate::audit::audit_diagnostic(format!(
                 "tirith: session: cannot create state dir {}: {e}",
                 parent.display()
@@ -746,9 +897,12 @@ where
     // file is the normal "fresh session" case; any other refusal skips the mutation
     // (fail closed; the lock is released when this function returns) rather than read or
     // overwrite a foreign / non-regular file.
-    let bytes = match crate::util::read_text_no_follow_capped(&path, SESSION_FILE_READ_CAP) {
-        Ok(b) => b,
-        Err(crate::util::OpenRegularError::NotFound) => Vec::new(),
+    let (bytes, existed) = match crate::util::read_text_no_follow_capped(
+        &path,
+        SESSION_FILE_READ_CAP,
+    ) {
+        Ok(b) => (b, true),
+        Err(crate::util::OpenRegularError::NotFound) => (Vec::new(), false),
         Err(_) => {
             crate::audit::audit_diagnostic(format!(
                 "tirith: session: refusing non-regular, oversized, or unreadable {}; recording skipped",
@@ -758,19 +912,39 @@ where
         }
     };
     // Parse the bytes DIRECTLY (serde_json::from_slice), exactly as `load()` does, so
-    // the reader and writer treat invalid UTF-8 inside the JSON identically (corrupt
-    // resets to a fresh accumulator) rather than the writer silently lossy-decoding it
-    // to U+FFFD and persisting the mangled state.
-    let mut session: SessionWarnings = if bytes.is_empty() {
+    // invalid UTF-8 is never lossy-decoded to U+FFFD. Unlike the presentation reader,
+    // the writer must not reset existing corrupt bytes: strict execution-state
+    // initialization treats this JSON as legacy security history and must continue to
+    // fail closed until an operator deliberately resets the session.
+    let mut session: SessionWarnings = if bytes.is_empty() && !existed {
         SessionWarnings::new(session_id)
+    } else if bytes.is_empty() {
+        crate::audit::audit_diagnostic(format!(
+            "tirith: session: refusing to overwrite empty/corrupt state for '{session_id}'"
+        ));
+        return None;
     } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            crate::audit::audit_diagnostic(format!(
-                "tirith: session: corrupt state for '{session_id}': {e}; resetting"
-            ));
-            SessionWarnings::new(session_id)
-        })
+        match serde_json::from_slice(&bytes) {
+            Ok(session) => session,
+            Err(error) => {
+                crate::audit::audit_diagnostic(format!(
+                    "tirith: session: refusing to overwrite corrupt state for '{session_id}': {error}"
+                ));
+                return None;
+            }
+        }
     };
+    // Before any best-effort writer can publish a normalized copy, require the
+    // same legacy snapshot validation used by one-time strict-state import. In
+    // particular, duplicate non-zero event sequences/IDs must remain a durable
+    // fail-closed signal; migrating them here first would launder semantically
+    // corrupt security history into an apparently clean future import.
+    if let Err(error) = crate::execution_state::validate_session_state(&mut session, session_id) {
+        crate::audit::audit_diagnostic(format!(
+            "tirith: session: refusing to normalize invalid legacy security state for '{session_id}': {error}"
+        ));
+        return None;
+    }
 
     let result = access(&mut session);
 
@@ -908,27 +1082,109 @@ pub fn gc_stale_sessions(max_age_hours: u64) {
         Err(_) => return,
     };
 
-    let max_age = std::time::Duration::from_secs(max_age_hours * 3600);
+    let max_age = std::time::Duration::from_secs(max_age_hours.saturating_mul(3600));
     let now = std::time::SystemTime::now();
 
+    let mut session_ids = std::collections::BTreeSet::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let id = name
+            .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".execution"));
+        if let Some(id) = id.filter(|id| session_state_path(id).is_some()) {
+            session_ids.insert(id.to_string());
+        }
+    }
+
+    for session_id in session_ids {
+        let Some(json_path) = session_state_path(&session_id) else {
+            continue;
+        };
+        let execution_path = sessions_dir.join(format!("{session_id}.execution"));
+        let paths = [&json_path, &execution_path];
+        let newest = paths
+            .iter()
+            .filter_map(|path| fs::symlink_metadata(path).ok())
+            .filter(|metadata| metadata.is_file())
+            .filter_map(|metadata| metadata.modified().ok())
+            .max();
+        let Some(modified) = newest else { continue };
+        if now
+            .duration_since(modified)
+            .map_or(true, |age| age <= max_age)
+        {
             continue;
         }
-        let meta = match fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Some(lock_path) = session_lock_path(&session_id) else {
+            continue;
         };
-        let modified = match meta.modified() {
-            Ok(t) => t,
-            Err(_) => continue,
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let Ok(lock_file) = options.open(&lock_path) else {
+            continue;
         };
-        if let Ok(age) = now.duration_since(modified) {
-            if age > max_age {
-                let _ = fs::remove_file(&path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let Ok(metadata) = lock_file.metadata() else {
+                continue;
+            };
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+            {
+                continue;
             }
         }
+        if lock_file.try_lock_exclusive().is_err() {
+            continue;
+        }
+        // Recheck freshness while serialized with all strict/best-effort writers.
+        let still_stale = paths
+            .iter()
+            .filter_map(|path| fs::symlink_metadata(path).ok())
+            .filter(|metadata| metadata.is_file())
+            .filter_map(|metadata| metadata.modified().ok())
+            .max()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > max_age);
+        if still_stale {
+            #[cfg(unix)]
+            {
+                // Strict state is the authorization source of truth. GC may
+                // delete the pair only after the ledger, stable anchor, path
+                // identities, and policy-derived history retention have all
+                // been validated under this exact lock.
+                let _ = crate::execution_state::gc_strict_session_locked(
+                    &lock_file,
+                    &lock_path,
+                    &sessions_dir,
+                    &session_id,
+                    &json_path,
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                for path in paths {
+                    let Ok(metadata) = fs::symlink_metadata(path) else {
+                        continue;
+                    };
+                    if metadata.is_file() {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        }
+        let _ = fs2::FileExt::unlock(&lock_file);
     }
 }
 
@@ -943,6 +1199,32 @@ pub fn clear_session(session_id: &str) {
 mod tests {
     use super::*;
     use crate::verdict::{Evidence, Finding, RuleId, Severity};
+
+    #[cfg(unix)]
+    struct TestStateHome(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl TestStateHome {
+        fn install(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("XDG_STATE_HOME");
+            // SAFETY: every caller holds the crate-wide environment lock.
+            unsafe { std::env::set_var("XDG_STATE_HOME", path) };
+            Self(previous)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestStateHome {
+        fn drop(&mut self) {
+            // SAFETY: the owning test still holds the crate-wide environment lock.
+            unsafe {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
+                    None => std::env::remove_var("XDG_STATE_HOME"),
+                }
+            }
+        }
+    }
 
     fn make_finding(rule_id: RuleId, severity: Severity) -> Finding {
         Finding {
@@ -985,6 +1267,195 @@ mod tests {
         // Accept max length
         let max_id = "a".repeat(128);
         assert!(session_state_path(&max_id).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_gc_honors_live_retention_and_preserves_invalid_anchor_pairs() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::{Duration, SystemTime};
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir().expect("isolated GC state");
+        let _state = TestStateHome::install(temporary.path());
+
+        let prepare = |session_id: &str,
+                       verdict: &crate::verdict::Verdict,
+                       policy: &crate::policy::Policy| {
+            crate::execution_state::prepare_execution(
+                verdict,
+                policy,
+                "echo reviewed > ~/.bashrc",
+                session_id,
+                crate::escalation::CallerContext::Cli,
+                crate::tokenize::ShellType::Posix,
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+            )
+            .expect("prepare strict GC fixture")
+        };
+        let strict_path = |session_id: &str| {
+            let json = session_state_path(session_id).expect("session path");
+            json.parent()
+                .expect("sessions directory")
+                .join(format!("{session_id}.execution"))
+        };
+        let set_stale = |path: &std::path::Path| {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open stale GC fixture");
+            let modified = SystemTime::now()
+                .checked_sub(Duration::from_secs(2 * 3600))
+                .expect("representable stale time");
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .expect("backdate GC fixture");
+        };
+
+        let mut warning = crate::verdict::Verdict::from_findings(
+            vec![make_finding(RuleId::DotfileOverwrite, Severity::Medium)],
+            3,
+            crate::verdict::Timings::default(),
+        );
+        warning.action = crate::verdict::Action::Warn;
+        let retained_policy = crate::policy::Policy {
+            escalation: vec![crate::escalation::EscalationRule::RepeatCount {
+                rule_ids: vec![RuleId::DotfileOverwrite.to_string()],
+                threshold: 99,
+                window_minutes: 7 * 24 * 60,
+                action: crate::escalation::EscalationAction::Block,
+                domain_scoped: false,
+                cooldown_minutes: 0,
+            }],
+            ..crate::policy::Policy::default()
+        };
+        let retained_id = "gc_live_retention";
+        let retained = prepare(retained_id, &warning, &retained_policy);
+        let retained_gate = crate::execution_state::ExecutionGate::acquire(
+            retained.into_authorizable_draft().expect("warning draft"),
+            Duration::from_secs(1),
+        )
+        .expect("retained warning gate");
+        retained_gate
+            .promote_kernel_exec_stop("gc-live-retention-proof")
+            .expect("promote retained warning");
+        let retained_strict = strict_path(retained_id);
+        set_stale(&retained_strict);
+
+        let empty_id = "gc_empty_expired";
+        drop(prepare(
+            empty_id,
+            &crate::verdict::Verdict::allow_fast(3, crate::verdict::Timings::default()),
+            &crate::policy::Policy::default(),
+        ));
+        let empty_strict = strict_path(empty_id);
+        set_stale(&empty_strict);
+
+        let missing_id = "gc_missing_strict";
+        drop(prepare(
+            missing_id,
+            &crate::verdict::Verdict::allow_fast(3, crate::verdict::Timings::default()),
+            &crate::policy::Policy::default(),
+        ));
+        let missing_strict = strict_path(missing_id);
+        fs::remove_file(&missing_strict).expect("remove strict fixture");
+        let missing_json = session_state_path(missing_id).expect("missing-pair JSON path");
+        fs::write(
+            &missing_json,
+            serde_json::to_vec(&SessionWarnings::new(missing_id)).expect("legacy JSON"),
+        )
+        .expect("write missing-pair JSON");
+        fs::set_permissions(&missing_json, fs::Permissions::from_mode(0o600))
+            .expect("secure missing-pair JSON");
+        set_stale(&missing_json);
+
+        let corrupt_id = "gc_corrupt_strict";
+        drop(prepare(
+            corrupt_id,
+            &crate::verdict::Verdict::allow_fast(3, crate::verdict::Timings::default()),
+            &crate::policy::Policy::default(),
+        ));
+        let corrupt_strict = strict_path(corrupt_id);
+        let mut corrupt = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&corrupt_strict)
+            .expect("open corrupt fixture");
+        let second_slot = corrupt.metadata().expect("strict metadata").len() / 2;
+        corrupt.write_all(&[0u8; 8]).expect("corrupt first slot");
+        corrupt
+            .seek(SeekFrom::Start(second_slot))
+            .expect("seek second slot");
+        corrupt.write_all(&[0u8; 8]).expect("corrupt second slot");
+        corrupt.sync_all().expect("sync corrupt fixture");
+        drop(corrupt);
+        set_stale(&corrupt_strict);
+
+        let partial_id = "gc_partial_strict";
+        drop(prepare(
+            partial_id,
+            &crate::verdict::Verdict::allow_fast(3, crate::verdict::Timings::default()),
+            &crate::policy::Policy::default(),
+        ));
+        let partial_strict = strict_path(partial_id);
+        OpenOptions::new()
+            .write(true)
+            .open(&partial_strict)
+            .expect("open partial fixture")
+            .set_len(1)
+            .expect("truncate partial fixture");
+        set_stale(&partial_strict);
+
+        let mismatch_id = "gc_anchor_mismatch";
+        drop(prepare(
+            mismatch_id,
+            &crate::verdict::Verdict::allow_fast(3, crate::verdict::Timings::default()),
+            &crate::policy::Policy::default(),
+        ));
+        let mismatch_strict = strict_path(mismatch_id);
+        let mismatch_lock = session_lock_path(mismatch_id).expect("mismatch lock path");
+        let mut mismatch_anchor = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&mismatch_lock)
+            .expect("open mismatch anchor");
+        mismatch_anchor
+            .write_all(b"TIRITH-EXECUTION-ANCHOR-V1 ledger-mismatch\n")
+            .expect("write mismatched anchor");
+        mismatch_anchor.sync_all().expect("sync mismatched anchor");
+        drop(mismatch_anchor);
+        set_stale(&mismatch_strict);
+
+        gc_stale_sessions(1);
+
+        assert!(
+            retained_strict.exists(),
+            "stale mtime must not erase policy-retained warning history"
+        );
+        assert!(
+            !empty_strict.exists(),
+            "a valid stale ledger with no live security history is collectible"
+        );
+        assert!(
+            missing_json.exists(),
+            "missing strict state must be preserved"
+        );
+        assert!(
+            corrupt_strict.exists(),
+            "corrupt strict state must be preserved"
+        );
+        assert!(
+            partial_strict.exists(),
+            "partial strict state must be preserved"
+        );
+        assert!(
+            mismatch_strict.exists(),
+            "anchor/ledger instance mismatch must be preserved"
+        );
     }
 
     #[test]
@@ -1766,15 +2237,14 @@ mod tests {
         }
     }
 
-    /// Consistency: a session JSON carrying RAW invalid UTF-8 inside a string must be
-    /// treated as corrupt by BOTH the reader (`load`) and the writer
-    /// (`with_session_locked`). Previously the writer lossy-decoded the bytes to
-    /// U+FFFD via `from_utf8_lossy` and persisted the mangled state, while `load`
-    /// (from_slice) rejected it. Both now use `from_slice` and reset to a fresh
-    /// accumulator.
+    /// A session JSON carrying raw invalid UTF-8 inside a string is corrupt to both
+    /// reader and writer. The presentation reader may return a fresh in-memory view,
+    /// but the writer must preserve the bytes: this file is imported once as legacy
+    /// security history by strict execution-state initialization, and silently
+    /// replacing it would convert an unknown-history failure into an authorization.
     #[cfg(unix)]
     #[test]
-    fn reader_and_writer_treat_invalid_utf8_session_identically() {
+    fn reader_degrades_but_writer_preserves_invalid_utf8_session() {
         use crate::event_buffer::{EventKind, TypedEvent};
         let _guard = crate::TEST_ENV_LOCK
             .lock()
@@ -1809,9 +2279,9 @@ mod tests {
                 "reader must treat an invalid-UTF-8 session as corrupt, not surface total=7"
             );
 
-            // WRITER: a mutation reads it the SAME way (corrupt -> fresh), records the
-            // new event, and rewrites a CLEAN session. The persisted bytes must no
-            // longer contain 0xFF, and a re-load must not carry the corrupt total=7.
+            // WRITER: a best-effort mutation refuses to overwrite the corrupt legacy
+            // source. This preserves the fail-closed signal for strict initialization
+            // instead of erasing unknown security history.
             record_typed_event(
                 sid,
                 TypedEvent::new(
@@ -1820,15 +2290,15 @@ mod tests {
                     "network_egress",
                 ),
             );
-            let after = std::fs::read(&path).expect("read rewritten session");
-            assert!(
-                !after.contains(&0xFF),
-                "writer must not persist lossy-decoded corrupt bytes"
+            let after = std::fs::read(&path).expect("read preserved session");
+            assert_eq!(
+                after, corrupt,
+                "writer must leave corrupt legacy security history byte-for-byte untouched"
             );
             assert_eq!(
                 load(sid).total_warnings,
                 0,
-                "writer must have reset the corrupt session, not preserved total=7"
+                "presentation reads must continue to degrade safely instead of surfacing total=7"
             );
         });
 

@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::verdict::{RuleId, Severity};
 
@@ -43,11 +44,57 @@ pub enum EventKind {
     PackageInstall,
 }
 
+impl EventKind {
+    /// Stable serialized spelling used in durable identities. Keep this explicit:
+    /// Rust's `Debug` output is not a persistence format.
+    fn stable_tag(self) -> &'static str {
+        match self {
+            Self::ProcessExec => "process_exec",
+            Self::FileWrite => "file_write",
+            Self::FileDelete => "file_delete",
+            Self::GitForcePush => "git_force_push",
+            Self::Network => "network",
+            Self::SecretWrite => "secret_write",
+            Self::ShellPipe => "shell_pipe",
+            Self::PackageInstall => "package_install",
+        }
+    }
+}
+
+/// Assurance attached to a typed event's execution boundary.
+///
+/// Legacy events default to `Unresolved` because the old JSON recorder carried
+/// no execution proof. Strict execution records explicitly mark kernel/gateway
+/// completions as `Confirmed`, while the current command
+/// is `Provisional` until a trusted boundary durably promotes it. Correlation
+/// enforcement may use all three conservatively, but its text must not turn an
+/// unresolved observation into an assertion that code ran.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EventProvenance {
+    Confirmed,
+    #[default]
+    Unresolved,
+    Provisional,
+}
+
 /// One recorded, time-stamped event. `path` / `host` / `domain` and any other
 /// detail live in [`Self::metadata`] so the struct stays stable as new
 /// correlations want new context.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct TypedEvent {
+    /// Stable opaque identity. Empty only while deserializing a legacy event;
+    /// session migration fills it deterministically before the event is used.
+    #[serde(default)]
+    pub event_id: String,
+    /// Monotonic sequence within the owning session. Zero is the legacy sentinel
+    /// and is replaced under the session lock during migration.
+    #[serde(default)]
+    pub sequence: u64,
+    /// Execution assurance. Missing on legacy records means unresolved because
+    /// those records predate the proof-carrying split.
+    #[serde(default)]
+    pub provenance: EventProvenance,
     /// RFC 3339 UTC timestamp (`chrono::Utc::now().to_rfc3339()`), lexically
     /// comparable against other events recorded the same way.
     pub timestamp: String,
@@ -63,6 +110,9 @@ impl TypedEvent {
     /// Convenience constructor used by recorders and tests.
     pub fn new(timestamp: &str, kind: EventKind, rule_id: &str) -> Self {
         Self {
+            event_id: String::new(),
+            sequence: 0,
+            provenance: EventProvenance::Confirmed,
             timestamp: timestamp.to_string(),
             kind,
             rule_id: rule_id.to_string(),
@@ -74,6 +124,36 @@ impl TypedEvent {
     pub fn with_meta(mut self, key: &str, value: &str) -> Self {
         self.metadata.insert(key.to_string(), value.to_string());
         self
+    }
+
+    /// Upgrade a deserialized legacy event to a stable identity. The caller
+    /// supplies a unique sequence allocated under the session lock, making
+    /// migration deterministic even when two legacy events otherwise have equal
+    /// content. The allocator must start above every non-zero legacy/new sequence.
+    pub(crate) fn migrate_legacy_identity(&mut self, session_id: &str, assigned_sequence: u64) {
+        if self.sequence == 0 {
+            self.sequence = assigned_sequence.max(1);
+        }
+        if self.event_id.is_empty() {
+            let mut digest = Sha256::new();
+            digest.update(b"tirith-legacy-event-v1\0");
+            digest.update(session_id.as_bytes());
+            digest.update(b"\0");
+            digest.update(self.sequence.to_le_bytes());
+            digest.update(b"\0");
+            digest.update(self.timestamp.as_bytes());
+            digest.update(b"\0");
+            digest.update(self.kind.stable_tag().as_bytes());
+            digest.update(b"\0");
+            digest.update(self.rule_id.as_bytes());
+            for (key, value) in &self.metadata {
+                digest.update(b"\0");
+                digest.update(key.as_bytes());
+                digest.update(b"=");
+                digest.update(value.as_bytes());
+            }
+            self.event_id = format!("legacy-{:x}", digest.finalize());
+        }
     }
 
     /// Borrow the `path` metadatum, if present.
@@ -121,6 +201,49 @@ impl TypedEvent {
     }
 }
 
+/// Timestamp-free event derived during preparation. It cannot be mistaken for
+/// executed history; the execution gate supplies time, stable id, and sequence
+/// only while atomically promoting confirmed evidence.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct EventPrototype {
+    pub kind: EventKind,
+    pub rule_id: String,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl EventPrototype {
+    pub fn new(kind: EventKind, rule_id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            rule_id: rule_id.into(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_meta(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    pub(crate) fn materialize(
+        self,
+        event_id: String,
+        sequence: u64,
+        timestamp: String,
+        provenance: EventProvenance,
+    ) -> TypedEvent {
+        TypedEvent {
+            event_id,
+            sequence,
+            provenance,
+            timestamp,
+            kind: self.kind,
+            rule_id: self.rule_id,
+            metadata: self.metadata,
+        }
+    }
+}
+
 /// A correlation that fired. Mirrors the shape of a [`crate::verdict::Finding`]
 /// closely enough that a consumer can surface it as one, but stays decoupled so
 /// this module never depends on the full finding/evidence machinery.
@@ -134,10 +257,13 @@ pub struct CorrelationHit {
     pub title: String,
     /// Human-readable description of the matched sequence.
     pub description: String,
-    /// Stable signature identifying THIS specific match (rule id + the
-    /// timestamps of the events that triggered it). A session-level consumer
-    /// uses it to de-duplicate: the same A-then-B pair, still inside its window
-    /// on the next command, produces the same signature and is surfaced once.
+    /// Strongest uncertainty among the source events. Consumers can enforce a
+    /// hit while preserving an honest audit/presentation claim.
+    pub provenance: EventProvenance,
+    /// Stable signature identifying THIS specific match. New events contribute
+    /// their opaque id plus session sequence; legacy events fall back to their
+    /// timestamp. A session-level consumer uses it to de-duplicate the same
+    /// A-then-B pair while its source events remain live.
     pub signature: String,
 }
 
@@ -221,7 +347,47 @@ fn cutoff(now_rfc3339: &str, window_secs: i64) -> Option<String> {
 /// window. Both `ts` and `cutoff` are RFC 3339 UTC strings produced the same
 /// way, so a lexical compare is an instant compare.
 fn within_window(ts: &str, cutoff: &str, now_rfc3339: &str) -> bool {
-    ts >= cutoff && ts <= now_rfc3339
+    let (Ok(ts), Ok(cutoff), Ok(_now)) = (
+        chrono::DateTime::parse_from_rfc3339(ts),
+        chrono::DateTime::parse_from_rfc3339(cutoff),
+        chrono::DateTime::parse_from_rfc3339(now_rfc3339),
+    ) else {
+        return false;
+    };
+    // Do not let a local-clock rollback erase a durable event whose monotonic
+    // sequence still precedes the current command. A valid future wall-clock
+    // timestamp therefore remains conservatively live until the clock catches
+    // up; only events older than the lower window bound expire.
+    ts >= cutoff
+}
+
+fn correlation_provenance(events: &[&TypedEvent]) -> EventProvenance {
+    if events
+        .iter()
+        .any(|event| event.provenance == EventProvenance::Provisional)
+    {
+        EventProvenance::Provisional
+    } else if events
+        .iter()
+        .any(|event| event.provenance == EventProvenance::Unresolved)
+    {
+        EventProvenance::Unresolved
+    } else {
+        EventProvenance::Confirmed
+    }
+}
+
+fn provenance_safe_description(
+    provenance: EventProvenance,
+    confirmed: String,
+    conservative: String,
+) -> String {
+    match provenance {
+        EventProvenance::Confirmed => confirmed,
+        EventProvenance::Unresolved | EventProvenance::Provisional => format!(
+            "{conservative} At least one source is pending or has unresolved execution evidence; Tirith enforces this conservatively but does not assert that source executed."
+        ),
+    }
 }
 
 /// Run every correlation rule over `events` as of `now_rfc3339` (an RFC 3339 UTC
@@ -256,22 +422,32 @@ fn earliest_in_window<'a>(
     events
         .iter()
         .filter(|e| e.kind == kind && within_window(&e.timestamp, cutoff, now_rfc3339))
-        .min_by(|a, b| a.timestamp.cmp(&b.timestamp))
+        .min_by(|a, b| event_order(a, b))
 }
 
-/// `B` of kind `b_kind` happened STRICTLY after `after_ts`, within the window.
-///
-/// The boundary is strict (`>`, not `>=`) on purpose: every event a single
-/// command emits is stamped with one shared `now` (see
-/// `escalation::derive_typed_events`), so a same-instant `B` can only be the
-/// SAME command as `A` (e.g. `curl https://x -o id_rsa` is both the secret
-/// write and the network call). Requiring a later instant means a real
-/// "A then B" sequence must span two distinct commands, which are recorded at
-/// distinct wall-clock instants.
+fn event_order(left: &TypedEvent, right: &TypedEvent) -> std::cmp::Ordering {
+    if left.sequence > 0 && right.sequence > 0 {
+        left.sequence
+            .cmp(&right.sequence)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    } else {
+        // Mixed/legacy state has no durable order identity, so retain the old
+        // wall-clock ordering as a compatibility fallback.
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.sequence.cmp(&right.sequence))
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    }
+}
+
+/// `B` of kind `b_kind` happened strictly after `after`, within the wall-clock
+/// window. Stable non-zero session sequences are authoritative, including when
+/// two separate transitions share a timestamp; legacy/mixed events retain the
+/// timestamp fallback.
 fn any_after<'a>(
     events: &'a [TypedEvent],
     b_kind: EventKind,
-    after_ts: &str,
+    after: &TypedEvent,
     cutoff: &str,
     now_rfc3339: &str,
 ) -> Option<&'a TypedEvent> {
@@ -282,18 +458,28 @@ fn any_after<'a>(
         .filter(|e| {
             e.kind == b_kind
                 && within_window(&e.timestamp, cutoff, now_rfc3339)
-                && e.timestamp.as_str() > after_ts
+                && event_order(e, after).is_gt()
         })
-        .min_by(|a, b| a.timestamp.cmp(&b.timestamp))
+        .min_by(|a, b| event_order(a, b))
 }
 
-/// Build a stable de-dup signature for a correlation from its rule and the
-/// timestamps of the events that triggered it.
-fn signature(rule_id: RuleId, parts: &[&str]) -> String {
+/// Stable signature part for one source event. Prefer identity + sequence;
+/// timestamp-only events exist solely for mixed-version compatibility.
+fn event_signature_part(event: &TypedEvent) -> String {
+    if !event.event_id.is_empty() && event.sequence > 0 {
+        format!("e:{}:{}", event.event_id, event.sequence)
+    } else {
+        format!("t:{}", event.timestamp)
+    }
+}
+
+/// Build a stable de-dup signature for a correlation from its rule and source
+/// events.
+fn signature(rule_id: RuleId, events: &[&TypedEvent]) -> String {
     let mut sig = format!("{rule_id:?}");
-    for p in parts {
+    for event in events {
         sig.push('|');
-        sig.push_str(p);
+        sig.push_str(&event_signature_part(event));
     }
     sig
 }
@@ -307,37 +493,67 @@ fn signature(rule_id: RuleId, parts: &[&str]) -> String {
 /// re-derive, so its dedup marker is safe to drop. Returns an empty iterator for a
 /// signature with no `|` (defensive; never produced by [`signature`]).
 pub fn signature_event_timestamps(sig: &str) -> impl Iterator<Item = &str> {
-    sig.split('|').skip(1)
+    sig.split('|').skip(1).filter_map(|part| {
+        if let Some(timestamp) = part.strip_prefix("t:") {
+            Some(timestamp)
+        } else if part.starts_with("e:") {
+            None
+        } else {
+            // Pre-stable-id signature: the part itself was a timestamp.
+            Some(part)
+        }
+    })
+}
+
+/// Whether at least one source named by a correlation signature is still in the
+/// live event window. Understands current stable-id signatures and legacy
+/// timestamp signatures so mixed-version state expires markers correctly.
+pub fn signature_references_live_event(sig: &str, events: &[TypedEvent]) -> bool {
+    sig.split('|').skip(1).any(|part| {
+        if let Some(rest) = part.strip_prefix("e:") {
+            let Some((event_id, sequence)) = rest.rsplit_once(':') else {
+                return false;
+            };
+            let Ok(sequence) = sequence.parse::<u64>() else {
+                return false;
+            };
+            events
+                .iter()
+                .any(|event| event.event_id == event_id && event.sequence == sequence)
+        } else {
+            let timestamp = part.strip_prefix("t:").unwrap_or(part);
+            events.iter().any(|event| event.timestamp == timestamp)
+        }
+    })
 }
 
 /// SecretWrite THEN Network within 30s -> CRITICAL.
 fn secret_then_network(events: &[TypedEvent], now_rfc3339: &str) -> Option<CorrelationHit> {
     let cut = cutoff(now_rfc3339, SECRET_THEN_NETWORK_WINDOW_SECS)?;
     let secret = earliest_in_window(events, EventKind::SecretWrite, &cut, now_rfc3339)?;
-    let net = any_after(
-        events,
-        EventKind::Network,
-        &secret.timestamp,
-        &cut,
-        now_rfc3339,
-    )?;
+    let net = any_after(events, EventKind::Network, secret, &cut, now_rfc3339)?;
     let host = net
         .metadata
         .get("host")
         .or_else(|| net.metadata.get("domain"))
         .map(|h| h.as_str())
         .unwrap_or("a network destination");
+    let provenance = correlation_provenance(&[secret, net]);
     Some(CorrelationHit {
         rule_id: RuleId::SecretWriteThenNetwork,
         severity: Severity::Critical,
         title: "Secret write followed by network egress".to_string(),
-        description: format!(
-            "A secret-bearing file was written, then a network call to {host} ran within {SECRET_THEN_NETWORK_WINDOW_SECS}s. This is the shape of a credential-exfiltration chain."
+        description: provenance_safe_description(
+            provenance,
+            format!(
+                "A secret-bearing file was written, then a network call to {host} ran within {SECRET_THEN_NETWORK_WINDOW_SECS}s. This is the shape of a credential-exfiltration chain."
+            ),
+            format!(
+                "A secret-write-shaped event was followed by a network-egress observation for {host} within {SECRET_THEN_NETWORK_WINDOW_SECS}s. This is the shape of a credential-exfiltration chain."
+            ),
         ),
-        signature: signature(
-            RuleId::SecretWriteThenNetwork,
-            &[&secret.timestamp, &net.timestamp],
-        ),
+        provenance,
+        signature: signature(RuleId::SecretWriteThenNetwork, &[secret, net]),
     })
 }
 
@@ -361,11 +577,11 @@ fn dependency_change_then_network(
                     .map(is_dependency_manifest)
                     .unwrap_or(false)
         })
-        .min_by(|a, b| a.timestamp.cmp(&b.timestamp))?;
+        .min_by(|a, b| event_order(a, b))?;
     let net = any_after(
         events,
         EventKind::Network,
-        &manifest_write.timestamp,
+        manifest_write,
         &cut,
         now_rfc3339,
     )?;
@@ -380,17 +596,22 @@ fn dependency_change_then_network(
         .or_else(|| net.metadata.get("domain"))
         .map(|h| h.as_str())
         .unwrap_or("a network destination");
+    let provenance = correlation_provenance(&[manifest_write, net]);
     Some(CorrelationHit {
         rule_id: RuleId::DependencyChangeThenNetwork,
         severity: Severity::Medium,
         title: "Dependency manifest change followed by network egress".to_string(),
-        description: format!(
-            "{what} was modified, then a network call to {host} ran within {DEP_CHANGE_THEN_NETWORK_WINDOW_SECS}s. A dependency edit that immediately phones out can indicate a poisoned install step."
+        description: provenance_safe_description(
+            provenance,
+            format!(
+                "{what} was modified, then a network call to {host} ran within {DEP_CHANGE_THEN_NETWORK_WINDOW_SECS}s. A dependency edit that immediately phones out can indicate a poisoned install step."
+            ),
+            format!(
+                "A {what} modification-shaped event was followed by a network-egress observation for {host} within {DEP_CHANGE_THEN_NETWORK_WINDOW_SECS}s. This can indicate a poisoned install step."
+            ),
         ),
-        signature: signature(
-            RuleId::DependencyChangeThenNetwork,
-            &[&manifest_write.timestamp, &net.timestamp],
-        ),
+        provenance,
+        signature: signature(RuleId::DependencyChangeThenNetwork, &[manifest_write, net]),
     })
 }
 
@@ -398,24 +619,23 @@ fn dependency_change_then_network(
 fn delete_then_force_push(events: &[TypedEvent], now_rfc3339: &str) -> Option<CorrelationHit> {
     let cut = cutoff(now_rfc3339, DELETE_THEN_FORCE_PUSH_WINDOW_SECS)?;
     let del = earliest_in_window(events, EventKind::FileDelete, &cut, now_rfc3339)?;
-    let push = any_after(
-        events,
-        EventKind::GitForcePush,
-        &del.timestamp,
-        &cut,
-        now_rfc3339,
-    )?;
+    let push = any_after(events, EventKind::GitForcePush, del, &cut, now_rfc3339)?;
+    let provenance = correlation_provenance(&[del, push]);
     Some(CorrelationHit {
         rule_id: RuleId::DeleteThenForcePush,
         severity: Severity::Critical,
         title: "File deletion followed by git force-push".to_string(),
-        description: format!(
-            "A file was deleted, then a `git push --force` ran within {DELETE_THEN_FORCE_PUSH_WINDOW_SECS}s. Deleting then force-pushing can erase history and overwrite a remote branch."
+        description: provenance_safe_description(
+            provenance,
+            format!(
+                "A file was deleted, then a `git push --force` ran within {DELETE_THEN_FORCE_PUSH_WINDOW_SECS}s. Deleting then force-pushing can erase history and overwrite a remote branch."
+            ),
+            format!(
+                "A file-deletion-shaped event was followed by a force-push observation within {DELETE_THEN_FORCE_PUSH_WINDOW_SECS}s. This sequence can erase history and overwrite a remote branch."
+            ),
         ),
-        signature: signature(
-            RuleId::DeleteThenForcePush,
-            &[&del.timestamp, &push.timestamp],
-        ),
+        provenance,
+        signature: signature(RuleId::DeleteThenForcePush, &[del, push]),
     })
 }
 
@@ -449,22 +669,30 @@ fn mass_file_deletion(events: &[TypedEvent], now_rfc3339: &str) -> Option<Correl
         // zero-contribution artifact-only delete (`rm dist/x`) landing later in the
         // window must NOT change the signature, or it would let the SAME already
         // surfaced non-build burst be re-emitted on a pure artifact-cleanup command.
-        let mut stamps: Vec<&str> = matched
+        let mut contributing: Vec<&TypedEvent> = matched
             .iter()
             .filter(|e| e.non_build_delete_count() > 0)
-            .map(|e| e.timestamp.as_str())
+            .copied()
             .collect();
-        stamps.sort_unstable();
+        contributing.sort_unstable_by(|left, right| event_order(left, right));
+        let provenance = correlation_provenance(&contributing);
         Some(CorrelationHit {
             rule_id: RuleId::MassFileDeletion,
             severity: Severity::Critical,
             title: "Mass file deletion in a short window".to_string(),
-            description: format!(
-                "{count} non-build files were deleted within {MASS_DELETE_WINDOW_SECS}s. A burst of deletions can be destructive (ransomware-like or an accidental recursive wipe)."
+            description: provenance_safe_description(
+                provenance,
+                format!(
+                    "{count} non-build files were deleted within {MASS_DELETE_WINDOW_SECS}s. A burst of deletions can be destructive (ransomware-like or an accidental recursive wipe)."
+                ),
+                format!(
+                    "{count} non-build file-deletion observations fell within {MASS_DELETE_WINDOW_SECS}s. This burst has a destructive shape (ransomware-like or an accidental recursive wipe)."
+                ),
             ),
+            provenance,
             signature: signature(
                 RuleId::MassFileDeletion,
-                &[stamps.last().copied().unwrap_or_default()],
+                &[contributing.last().copied()?],
             ),
         })
     } else {
@@ -492,6 +720,9 @@ mod tests {
 
     fn ev(timestamp: String, kind: EventKind) -> TypedEvent {
         TypedEvent {
+            event_id: String::new(),
+            sequence: 0,
+            provenance: EventProvenance::Confirmed,
             timestamp,
             kind,
             rule_id: "test".to_string(),
@@ -955,6 +1186,66 @@ mod tests {
             "the later B must not be the chosen match: {}",
             hit.signature
         );
+    }
+
+    #[test]
+    fn legacy_missing_provenance_is_unresolved() {
+        let event: TypedEvent = serde_json::from_value(serde_json::json!({
+            "event_id": "legacy-event",
+            "sequence": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "kind": "network",
+            "rule_id": "network_egress",
+            "metadata": {}
+        }))
+        .expect("legacy typed event");
+        assert_eq!(event.provenance, EventProvenance::Unresolved);
+    }
+
+    #[test]
+    fn same_timestamp_events_follow_strict_sequence_order() {
+        let base = now();
+        let timestamp = base.to_rfc3339();
+        let mut secret = ev(timestamp.clone(), EventKind::SecretWrite);
+        secret.event_id = "event-secret".to_string();
+        secret.sequence = 41;
+        let mut network = ev(timestamp, EventKind::Network);
+        network.event_id = "event-network".to_string();
+        network.sequence = 42;
+        let hits = correlate(&[secret, network], &base.to_rfc3339());
+        assert!(fired(&hits, RuleId::SecretWriteThenNetwork));
+    }
+
+    #[test]
+    fn clock_rollback_keeps_durable_prior_event_conservatively_live() {
+        let base = now();
+        let mut secret = ev(ts(base, 10), EventKind::SecretWrite);
+        secret.event_id = "future-secret".to_string();
+        secret.sequence = 71;
+        let mut network = ev(ts(base, 0), EventKind::Network);
+        network.event_id = "current-network".to_string();
+        network.sequence = 72;
+        let hits = correlate(&[secret, network], &base.to_rfc3339());
+        assert!(fired(&hits, RuleId::SecretWriteThenNetwork));
+    }
+
+    #[test]
+    fn unresolved_correlation_enforces_without_claiming_execution() {
+        let base = now();
+        let mut secret = ev(ts(base, -10), EventKind::SecretWrite);
+        secret.event_id = "unresolved-secret".to_string();
+        secret.sequence = 81;
+        secret.provenance = EventProvenance::Unresolved;
+        let mut network = ev(ts(base, -1), EventKind::Network);
+        network.event_id = "confirmed-network".to_string();
+        network.sequence = 82;
+        let hit = correlate(&[secret, network], &base.to_rfc3339())
+            .into_iter()
+            .find(|hit| hit.rule_id == RuleId::SecretWriteThenNetwork)
+            .expect("conservative correlation");
+        assert_eq!(hit.provenance, EventProvenance::Unresolved);
+        assert!(hit.description.contains("does not assert"));
+        assert!(!hit.description.contains(" ran "));
     }
 
     // --- helpers + isolation -------------------------------------------------

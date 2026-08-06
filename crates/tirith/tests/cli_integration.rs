@@ -76,6 +76,59 @@ fn tirith() -> Command {
     cmd
 }
 
+#[test]
+fn ordinary_cli_tests_cannot_bypass_the_hermetic_command_builder() {
+    let source = include_str!("cli_integration.rs");
+    let raw_invocation = concat!("Command::new(env!(\"", "CARGO_BIN_EXE_tirith", "\"))");
+    assert_eq!(
+        source.matches(raw_invocation).count(),
+        2,
+        "only tirith() and the documented raw __capsule-child handle-inheritance probe may invoke the binary directly"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn output_wrap_actions_never_execute_a_path_shadowed_ps() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let attacker = tempfile::Builder::new()
+        .prefix("tirith-output-wrap-shadow-")
+        .tempdir_in(home::home_dir().expect("test account home"))
+        .expect("create same-UID non-transient attacker directory");
+    let bin = attacker.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let marker = attacker.path().join("path-ps-executed");
+    let counterfeit = bin.join("ps");
+    fs::write(
+        &counterfeit,
+        format!(
+            "#!/bin/sh\n: > '{}'\nexit 97\n",
+            marker.display().to_string().replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&counterfeit, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for action in ["on", "off", "status"] {
+        let output = tirith()
+            .env("PATH", &bin)
+            .env("SHELL", "/bin/bash")
+            .args(["output", "wrap", action])
+            .output()
+            .unwrap_or_else(|error| panic!("run output wrap {action}: {error}"));
+        assert!(
+            output.status.success(),
+            "output wrap {action} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        !marker.exists(),
+        "on, off, and status must all use trusted process inspection rather than PATH ps"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn setup_cursor_force_rejects_hardlinked_hook_without_mutating_external_inode() {
@@ -155,10 +208,10 @@ fn macos_capsule_execs_and_does_not_inherit_unrelated_fd() {
     spec.environment.temporary_home = false;
     spec.environment.allow = vec!["PATH".to_string()];
     // This regression is about exec-status and handle inheritance, not filesystem
-    // policy. Permit reads so the native target remains stable across macOS dyld,
-    // locale, and runtime-path changes; writes and network remain deny-by-default,
-    // and the unrelated-handle boundary under test remains fully enforced.
-    spec.filesystem.read_roots.push(PathBuf::from("/"));
+    // policy. The baseline profile already permits dyld and system-runtime reads;
+    // grant only the directory containing the target shell so every default
+    // credential deny root remains effective.
+    spec.filesystem.read_roots.push(PathBuf::from("/bin"));
     let spec_json = serde_json::to_string(&spec).expect("serialize capsule spec");
 
     let source = fs::File::open("/dev/null").expect("open fd source");
@@ -1761,6 +1814,9 @@ fn run_json_execution_refuses_before_network_and_emits_one_trusted_object() {
 #[test]
 fn run_accepts_generated_bash_s_typed_argv_before_url_validation() {
     let out = tirith()
+        // Do not let a user-managed Homebrew bash become the first PATH hit:
+        // this test exercises typed argv parsing, not interpreter provenance.
+        .env("PATH", "/bin:/usr/bin")
         .args([
             "run",
             "--capsule",
@@ -2790,6 +2846,296 @@ fn init_does_not_execute_path_shadowed_diagnostics_or_prompt_binary() {
     assert!(!stdout.contains(" tirith prompt-status --short"));
 }
 
+#[cfg(unix)]
+#[test]
+fn sourced_bash_hook_keeps_using_pinned_or_builtin_helpers_after_path_changes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().expect("hook test home");
+    let fake_bin = home.path().join("repo-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin");
+    let marker = home.path().join("path-shadow-executed");
+    for name in ["tirith", "date", "mkdir", "wc", "tr", "sed", "stty"] {
+        let fake = fake_bin.join(name);
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n/usr/bin/touch '{}'\nexit 99\n",
+                marker.display()
+            ),
+        )
+        .expect("write fake helper");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700))
+            .expect("make fake helper executable");
+    }
+
+    let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical tirith binary");
+    let real_dir = real.parent().expect("tirith binary parent");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/bash-hook.bash");
+    let hook_source = fs::read_to_string(&hook).expect("read embedded Bash hook");
+    for pattern in [
+        "$(date +%s)",
+        "! mkdir -p",
+        "$(wc -c",
+        "| tr -s",
+        "| sed ",
+        "$(stty -g",
+        "trap 'stty ",
+    ] {
+        assert!(
+            !hook_source.contains(pattern),
+            "Bash hook retains PATH-resolved preflight helper {pattern:?}"
+        );
+    }
+    let script = format!(
+        r#"source '{}'
+export PATH='{}:/usr/bin:/bin'
+_TIRITH_RECEIPT_PROTOCOL=1
+_TIRITH_RECEIPT_INSTANCE={}
+_tirith_receipt_discard bash-enter {} >/dev/null 2>&1 || :
+_TIRITH_ENTER_CAP_FILE="$HOME/helper-capability"
+builtin printf 'x' >"$_TIRITH_ENTER_CAP_FILE"
+_tirith_enter_capability_proven >/dev/null 2>&1 || :
+_tirith_persist_safe_mode
+normalized="$(_tirith_normalize_spacing $'  a\t  b  ')"
+_tirith_restore_terminal_state sane
+builtin printf '%s\n%s\n' "$normalized" "$_TIRITH_BIN"
+"#,
+        hook.display(),
+        fake_bin.display(),
+        "b".repeat(64),
+        "a".repeat(64),
+    );
+    let out = Command::new("/bin/bash")
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/bin:/bin",
+                real_dir.display(),
+                fake_bin.display()
+            ),
+        )
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env_remove("TIRITH_SESSION_ID")
+        .env_remove("_TIRITH_BASH_LOADED")
+        .output()
+        .expect("source and invoke bash hook");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("hook helper output is UTF-8");
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("a b"));
+    assert_eq!(lines.next().map(PathBuf::from).as_ref(), Some(&real));
+    assert_eq!(lines.next(), None);
+    assert!(
+        !marker.exists(),
+        "PATH mutation redirected a sourced hook into the repository shim"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn root_zsh_and_fish_hook_helpers_ignore_path_shadow_after_source() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().expect("hook helper test home");
+    let fake_bin = home.path().join("repo-bin");
+    fs::create_dir(&fake_bin).expect("create fake helper bin");
+    let marker = home.path().join("path-shadowed-helper-executed");
+    for name in [
+        "tirith", "date", "grep", "mktemp", "rm", "wc", "env", "sh", "bash",
+    ] {
+        let fake = fake_bin.join(name);
+        fs::write(
+            &fake,
+            format!("#!/bin/sh\n: > '{}'\nexit 99\n", marker.display()),
+        )
+        .expect("write fake helper");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700))
+            .expect("make fake helper executable");
+    }
+
+    let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical tirith binary");
+    let real_dir = real.parent().expect("tirith binary parent");
+    let initial_path = format!(
+        "{}:{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        real_dir.display(),
+        fake_bin.display()
+    );
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let zsh_hook = root.join("shell/lib/zsh-hook.zsh");
+    let fish_hook = root.join("shell/lib/fish-hook.fish");
+
+    let zsh_script = format!(
+        r#"source '{}'
+PATH='{}'
+export PATH
+capture="$(_tirith_v3_new_capture_file)" || exit 61
+command "$_TIRITH_WC_BIN" -c <"$capture" >/dev/null || exit 62
+command "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" -c ':' || exit 63
+_tirith_v3_remove_capture_files "$capture" || exit 64
+command "$_TIRITH_BIN" __execution-receipt capability >/dev/null || exit 65
+print -r -- "$_TIRITH_MKTEMP_BIN|$_TIRITH_RM_BIN|$_TIRITH_WC_BIN|$_TIRITH_ENV_BIN|$_TIRITH_SH_BIN"
+"#,
+        zsh_hook.display(),
+        fake_bin.display(),
+    );
+    match Command::new("zsh")
+        .args(["-dfc", &zsh_script])
+        .env("PATH", &initial_path)
+        .env("HOME", home.path())
+        .env_remove("TIRITH_SESSION_ID")
+        .env_remove("_TIRITH_ZSH_LOADED")
+        .output()
+    {
+        Ok(out) => {
+            assert!(
+                out.status.success(),
+                "zsh pinned-helper probe failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.trim().split('|').all(|path| path.starts_with('/')),
+                "zsh helper paths must remain absolute: {stdout:?}"
+            );
+        }
+        Err(_) => eprintln!("skipping zsh pinned-helper probe: zsh not available"),
+    }
+
+    let fish_script = format!(
+        r#"source '{}'
+set -gx PATH '{}'
+set capture (_tirith_v3_new_capture_file); or exit 71
+command "$_TIRITH_WC_BIN" -c <"$capture" >/dev/null; or exit 72
+command "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" -c ':'; or exit 73
+_tirith_v3_remove_capture_files "$capture"; or exit 74
+command "$_TIRITH_BIN" __execution-receipt capability >/dev/null; or exit 75
+command "$_TIRITH_BASH_TIMEOUT_BIN" -c ':'; or exit 76
+builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" "$_TIRITH_BASH_TIMEOUT_BIN"
+"#,
+        fish_hook.display(),
+        fake_bin.display(),
+    );
+    match Command::new("fish")
+        .args(["--no-config", "-c", &fish_script])
+        .env("PATH", &initial_path)
+        .env("HOME", home.path())
+        .env_remove("TIRITH_SESSION_ID")
+        .env_remove("_TIRITH_FISH_LOADED")
+        .output()
+    {
+        Ok(out) => {
+            assert!(
+                out.status.success(),
+                "fish pinned-helper probe failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.trim().split('|').all(|path| path.starts_with('/')),
+                "fish helper paths must remain absolute: {stdout:?}"
+            );
+        }
+        Err(_) => eprintln!("skipping fish pinned-helper probe: fish not available"),
+    }
+
+    assert!(
+        !marker.exists(),
+        "a PATH-shadowed v3 helper or Tirith binary was executed"
+    );
+
+    for hook in [zsh_hook, fish_hook] {
+        let source = fs::read_to_string(&hook).expect("read root receipt hook");
+        let forbidden: &[&str] = if hook.ends_with("zsh-hook.zsh") {
+            &[
+                "$(date +%s)",
+                "| grep ",
+                "$(mktemp)",
+                "command rm ",
+                "local tmpfile=$(mktemp)",
+                "echo -n \"$pasted\"",
+            ]
+        } else {
+            &[
+                "(date +%s)",
+                "(mktemp)",
+                "| env _TIRITH_HOOK",
+                "command rm ",
+                "(bash -c",
+                "command -q bash",
+                "echo -n \"$content\"",
+            ]
+        };
+        for pattern in forbidden {
+            assert!(
+                !source.contains(pattern),
+                "hook retains PATH-resolved preflight helper {pattern:?}: {}",
+                hook.display()
+            );
+        }
+        assert!(
+            source.contains("command \"$_TIRITH_ENV_BIN\"")
+                && source.contains("\"$_TIRITH_SH_BIN\" -c")
+                && source.contains("_tirith_v3_new_capture_file")
+                && source.contains("_tirith_v3_remove_capture_files"),
+            "v3 transport must route through pinned helpers: {}",
+            hook.display()
+        );
+        assert!(
+            !source.contains("_TIRITH_PENDING_RECEIPT")
+                && !source.contains("_tirith_receipt_preexec")
+                && !source.contains("fish_preexec")
+                && !source.contains("fish_postexec"),
+            "v3 delivery must commit synchronously before line acceptance: {}",
+            hook.display()
+        );
+        let v3_start = if hook.ends_with("zsh-hook.zsh") {
+            source
+                .find("# Protocol v3 returns only")
+                .expect("zsh v3 transport start")
+        } else {
+            source
+                .find("    set -l outfile \"\"")
+                .expect("fish v3 transport start")
+        };
+        let v3_end = source[v3_start..]
+            .find("# Legacy protocol-off behavior")
+            .map(|offset| v3_start + offset)
+            .expect("v3 transport end");
+        let v3 = &source[v3_start..v3_end];
+        let drift = v3
+            .find("command changed before receipt commit")
+            .expect("pre-commit drift guard");
+        let consume = v3
+            .find("_tirith_receipt_consume_at")
+            .expect("synchronous receipt consume");
+        let native_handoff = if hook.ends_with("zsh-hook.zsh") {
+            v3.rfind("zle .accept-line").expect("zsh native handoff")
+        } else {
+            v3.rfind("commandline -f execute")
+                .expect("fish native handoff")
+        };
+        assert!(
+            drift < consume && consume < native_handoff,
+            "drift must be checked before consume, and consume before native handoff: {}",
+            hook.display()
+        );
+        assert!(
+            v3.contains(
+                "receipt recovery completed but cannot authorize replay; command not executed"
+            ) && v3.contains("press Enter for a fresh check"),
+            "reconciliation must never authorize replay after consume failure: {}",
+            hook.display()
+        );
+    }
+}
+
 #[test]
 fn init_unsupported_shell() {
     let out = tirith()
@@ -3121,7 +3467,8 @@ fn receipt_list_empty() {
 #[cfg(unix)]
 #[test]
 fn paste_trailing_cr_allows() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tirith"))
+    let mut cmd = tirith();
+    let mut child = cmd
         .args(["paste", "--shell", "posix"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3145,7 +3492,8 @@ fn paste_trailing_cr_allows() {
 #[cfg(unix)]
 #[test]
 fn paste_embedded_cr_blocks() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tirith"))
+    let mut cmd = tirith();
+    let mut child = cmd
         .args(["paste", "--shell", "posix"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3169,7 +3517,8 @@ fn paste_embedded_cr_blocks() {
 #[cfg(unix)]
 #[test]
 fn paste_windows_crlf_allows() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tirith"))
+    let mut cmd = tirith();
+    let mut child = cmd
         .args(["paste", "--shell", "posix"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3870,7 +4219,8 @@ fn paste_audit_failures_are_visible_with_debug_env() {
 fn paste_oversized_input_rejected() {
     use std::io::Write;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tirith"))
+    let mut cmd = tirith();
+    let mut child = cmd
         .args(["paste", "--shell", "posix"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -4028,20 +4378,20 @@ set fake_dir "{fake_dir}"
 spawn -noecho bash --norc --noprofile -i
 expect -re {{[$#] $}}
 send -- "export PS1='PROMPT> '\r"
-expect "PROMPT> "
-send -- "export PATH=$fake_dir:$PATH\r"
-expect "PROMPT> "
+expect -re {{PROMPT> $}}
+send -- "export PATH=$fake_dir:\$PATH\r"
+expect -re {{PROMPT> $}}
 send -- "export TIRITH_BASH_MODE=enter\r"
-expect "PROMPT> "
+expect -re {{PROMPT> $}}
 send -- "export _TIRITH_TEST_SKIP_HEALTH=1\r"
-expect "PROMPT> "
+expect -re {{PROMPT> $}}
 send -- "source '$hook'\r"
-expect "PROMPT> "
+expect -re {{PROMPT> $}}
 send -- "touch $marker\r"
 sleep 1
 send -- "\x15"
 sleep 0.5
-send -- "echo MODE=$_TIRITH_BASH_MODE\r"
+send -- "echo MODE=\$_TIRITH_BASH_MODE\r"
 expect {{
   -re {{MODE=preexec}} {{}}
   timeout {{ exit 2 }}
@@ -4063,6 +4413,13 @@ expect eof
         .expect("failed to run expect");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success() && stderr.trim().is_empty(),
+        "expect PTY driver failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status
+    );
 
     assert!(
         !marker.exists(),
@@ -4071,7 +4428,7 @@ expect eof
 
     assert!(
         stdout.contains("unexpected exit code") || stdout.contains("protection downgraded"),
-        "output should mention degrade reason, got:\n{stdout}"
+        "output should mention degrade reason, got stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     assert!(
@@ -4111,6 +4468,678 @@ fn tirith_isolated(
         .env("TIRITH_LOG", "0")
         .current_dir(cwd);
     cmd
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_capability_reports_protocol_v3() {
+    let out = tirith()
+        .args(["__execution-receipt", "capability"])
+        .output()
+        .expect("run shell execution receipt capability probe");
+
+    assert!(
+        out.status.success(),
+        "protocol-v3 capability probe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"TIRITH_EXECUTION_RECEIPT_PROTOCOL=3\n");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_legacy_new_instance_fails_without_bearer() {
+    let out = tirith()
+        .args(["__execution-receipt", "new-instance"])
+        .output()
+        .expect("run disabled protocol-v1 registration");
+
+    assert!(!out.status.success(), "protocol-v1 registration must fail");
+    assert!(
+        out.stdout.is_empty(),
+        "a disabled registration must not disclose bearer bytes: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("protocol-v3 registration"),
+        "failure must direct hooks to protocol v3: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_external_arm_is_a_non_authorizing_v3_tombstone() {
+    let out = tirith()
+        .args([
+            "__execution-receipt",
+            "arm",
+            "--channel",
+            "zsh",
+            "--approval",
+            "granted",
+            "--warn-acknowledged",
+        ])
+        .output()
+        .expect("run disabled external shell receipt arm command");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "the arm tombstone must never return bearer data: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("disabled in protocol v3"),
+        "unexpected tombstone diagnostic: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_empty_command_fails_without_legacy_temp_path() {
+    let out = tirith()
+        .args([
+            "check",
+            "--interactive",
+            "--approval-check",
+            "--execution-receipt",
+            "zsh",
+            "--offline",
+            "--no-daemon",
+        ])
+        .output()
+        .expect("run empty shell execution receipt check");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "receipt mode must not expose a legacy approval temp path: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("receipt command is empty"),
+        "unexpected empty-command diagnostic: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn legacy_approval_check_stdout_remains_one_temp_path() {
+    let isolated = tempfile::tempdir().expect("isolated legacy approval-check cwd");
+    let out = tirith()
+        .current_dir(isolated.path())
+        .args([
+            "check",
+            "--approval-check",
+            "--offline",
+            "--no-daemon",
+            "--",
+            "true",
+        ])
+        .output()
+        .expect("run legacy approval-check");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "legacy approval-check failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("approval path is UTF-8");
+    assert!(stdout.ends_with('\n'));
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "stdout contract changed: {stdout:?}"
+    );
+    let approval_path = PathBuf::from(stdout.trim_end_matches('\n'));
+    assert_eq!(
+        fs::read_to_string(&approval_path).expect("read legacy approval metadata"),
+        "TIRITH_REQUIRES_APPROVAL=no\n"
+    );
+    fs::remove_file(approval_path).expect("remove legacy approval metadata");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_registration_is_parent_bound_and_one_time() {
+    let isolated = tempfile::tempdir().expect("isolated receipt registration state");
+    let state_dir = isolated.path().join("state");
+    let session_id = "cli-receipt-parent-bound";
+    let shell_pid = std::process::id().to_string();
+    let register = || {
+        tirith_isolated(session_id, &state_dir, isolated.path())
+            .args([
+                "__execution-receipt",
+                "register",
+                "--family",
+                "bash",
+                "--shell-pid",
+                shell_pid.as_str(),
+            ])
+            .output()
+            .expect("register shell execution receipt capability")
+    };
+
+    let first = register();
+    assert!(
+        first.status.success(),
+        "direct child registration failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let bearer = String::from_utf8(first.stdout)
+        .expect("registration bearer must be UTF-8")
+        .trim()
+        .to_string();
+    assert_eq!(bearer.len(), 64, "bearer must encode 256 random bits");
+    assert!(
+        bearer
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "bearer must be lowercase hexadecimal"
+    );
+
+    let second = register();
+    assert!(
+        !second.status.success(),
+        "the same euid/session slot must not register twice"
+    );
+    assert!(
+        second.stdout.is_empty(),
+        "duplicate registration must not return the original or a new bearer: {:?}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("already has a protocol-v3 registration"),
+        "unexpected duplicate-registration error: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_registration_rejects_unrelated_live_pid() {
+    let isolated = tempfile::tempdir().expect("isolated receipt registration state");
+    let state_dir = isolated.path().join("state");
+    let mut unrelated = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn unrelated live process");
+    assert!(
+        unrelated
+            .try_wait()
+            .expect("inspect unrelated process")
+            .is_none(),
+        "unrelated registration target must still be live"
+    );
+    let unrelated_pid = unrelated.id().to_string();
+
+    let out = tirith_isolated("cli-receipt-unrelated-pid", &state_dir, isolated.path())
+        .args([
+            "__execution-receipt",
+            "register",
+            "--family",
+            "zsh",
+            "--shell-pid",
+            unrelated_pid.as_str(),
+        ])
+        .output()
+        .expect("attempt registration against unrelated live process");
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+
+    assert!(
+        !out.status.success(),
+        "a sibling process must not be accepted as Tirith's shell parent"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "rejected registration must not return a bearer: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not the Tirith process's actual parent"),
+        "unexpected unrelated-PID error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn root_bash_hook_protocol_v3_response_parser_is_fail_closed() {
+    let isolated = tempfile::tempdir().expect("isolated Bash receipt parser state");
+    let token = "a".repeat(64);
+    let valid = isolated.path().join("valid");
+    let empty = isolated.path().join("empty");
+    let extra = isolated.path().join("extra");
+    let untagged = isolated.path().join("untagged");
+    let unterminated = isolated.path().join("unterminated");
+    let trailing_unterminated = isolated.path().join("trailing-unterminated");
+    let trailing_nul = isolated.path().join("trailing-nul");
+    fs::write(&valid, format!("TIRITH_EXECUTION_RECEIPT={token}\n")).expect("write valid response");
+    fs::write(&empty, b"").expect("write empty response");
+    fs::write(
+        &extra,
+        format!("TIRITH_EXECUTION_RECEIPT={token}\nunexpected\n"),
+    )
+    .expect("write extra-line response");
+    fs::write(&untagged, format!("{token}\n")).expect("write untagged response");
+    fs::write(&unterminated, format!("TIRITH_EXECUTION_RECEIPT={token}"))
+        .expect("write unterminated response");
+    fs::write(
+        &trailing_unterminated,
+        format!("TIRITH_EXECUTION_RECEIPT={token}\ntrailing"),
+    )
+    .expect("write valid line plus trailing unterminated response");
+    let mut trailing_nul_bytes = format!("TIRITH_EXECUTION_RECEIPT={token}\n").into_bytes();
+    trailing_nul_bytes.push(0);
+    fs::write(&trailing_nul, trailing_nul_bytes)
+        .expect("write valid line plus trailing NUL byte response");
+
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
+    let hook_source = fs::read_to_string(&hook).expect("read root Bash hook");
+    assert!(
+        !hook_source.contains("__execution-receipt arm")
+            && !hook_source.contains("_tirith_receipt_arm"),
+        "protocol v3 hooks must never arm a receipt from the shell"
+    );
+    assert!(
+        !hook_source.contains("_TIRITH_PENDING_SOURCE")
+            && !hook_source.contains("source \"/dev/fd/")
+            && hook_source.contains("builtin eval -- \"$pending_eval\""),
+        "deferred commands must remain in memory and use builtin eval, never source-from-pipe"
+    );
+    assert!(
+        !hook_source.contains("<<< \"$READLINE_LINE\"")
+            && hook_source.contains("exit \"${PIPESTATUS[1]}\""),
+        "syntax validation must use the parser side of an anonymous pipeline, not a here-string"
+    );
+    assert!(
+        hook_source
+            .lines()
+            .filter(|line| line.contains("command \"$_TIRITH_BIN\""))
+            .all(|line| line.contains("builtin command")),
+        "a user function named command must not interpose on the pinned Tirith binary"
+    );
+    let script = format!(
+        r#"_TIRITH_BASH_INTERNAL=1
+source '{}'
+probe() {{
+  local label="$1" file="$2" check_rc="$3" parse_rc
+  _tirith_parse_v3_receipt_response "$file" "$check_rc"
+  parse_rc=$?
+  printf '%s=%s:%s\n' "$label" "$parse_rc" "$_TIRITH_PARSED_RECEIPT"
+}}
+probe allow '{}' 0
+probe warn '{}' 2
+probe block '{}' 1
+probe block_with_token '{}' 1
+probe empty_allow '{}' 0
+probe extra '{}' 0
+probe untagged '{}' 0
+probe unterminated '{}' 0
+probe trailing_unterminated '{}' 0
+probe trailing_nul '{}' 0
+probe unsupported_rc '{}' 3
+"#,
+        hook.display(),
+        valid.display(),
+        valid.display(),
+        empty.display(),
+        valid.display(),
+        empty.display(),
+        extra.display(),
+        untagged.display(),
+        unterminated.display(),
+        trailing_unterminated.display(),
+        trailing_nul.display(),
+        valid.display(),
+    );
+    let out = Command::new("/bin/bash")
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env("HOME", isolated.path())
+        .env("TMPDIR", isolated.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("TIRITH_SESSION_ID", "cli-root-bash-receipt-v3-parser")
+        .env_remove("_TIRITH_BASH_LOADED")
+        .output()
+        .expect("exercise root Bash protocol-v3 parser");
+
+    assert!(
+        out.status.success(),
+        "Bash receipt parser exercise failed (code {:?})\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("parser probe stdout is UTF-8"),
+        format!(
+            "allow=0:{token}\n\
+             warn=0:{token}\n\
+             block=1:\n\
+             block_with_token=2:{token}\n\
+             empty_allow=2:\n\
+             extra=2:\n\
+             untagged=2:\n\
+             unterminated=2:\n\
+             trailing_unterminated=2:\n\
+             trailing_nul=2:\n\
+             unsupported_rc=2:{token}\n"
+        )
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn root_bash_hook_repeated_complex_delivery_and_exact_pipe_are_bash32_safe() {
+    let isolated = tempfile::tempdir().expect("isolated Bash delivery state");
+    let capture_dir = isolated.path().join("capture");
+    fs::create_dir(&capture_dir).expect("create private capture directory");
+    let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical Tirith binary");
+    let real_dir = real.parent().expect("Tirith binary parent");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
+    let script = format!(
+        r#"_TIRITH_BASH_INTERNAL=1
+_TIRITH_TEST_SKIP_HEALTH=1
+source '{}'
+_TIRITH_BIN=/usr/bin/true
+_TIRITH_RECEIPT_PROTOCOL=0
+TIRITH_COMPLEX_RUNS=0
+iteration=0
+complex_command=$'if true; then\n  TIRITH_COMPLEX_RUNS=$((TIRITH_COMPLEX_RUNS + 1))\nfi'
+while [[ $iteration -lt 128 ]]; do
+  _tirith_unsafe_to_eval "$complex_command" || exit 70
+  _TIRITH_PENDING_EVAL="$complex_command"
+  _tirith_prompt_hook || exit 71
+  iteration=$((iteration + 1))
+done
+
+_TIRITH_RECEIPT_PROTOCOL=3
+set -T
+if _tirith_receipt_parent_context_is_valid; then
+  main_context=accepted
+else
+  main_context=rejected
+fi
+subshell_context=$(
+  if _tirith_receipt_parent_context_is_valid; then
+    builtin printf '%s' accepted
+  else
+    builtin printf '%s' rejected
+  fi
+)
+
+TIRITH_COMMAND_INTERPOSED=0
+TIRITH_EVAL_INTERPOSED=0
+command() {{ TIRITH_COMMAND_INTERPOSED=1; return 99; }}
+eval() {{ TIRITH_EVAL_INTERPOSED=1; return 99; }}
+set -o pipefail
+_tirith_check_command_syntax $'if true; then\n  :\nfi'
+complete_syntax_rc="$_TIRITH_SYNTAX_RC"
+_tirith_check_command_syntax 'if true; then'
+incomplete_syntax_rc="$_TIRITH_SYNTAX_RC"
+case "$_TIRITH_SYNTAX_ERROR" in
+  *'unexpected EOF'*|*'unexpected end of file'*) incomplete_syntax_error=recognized ;;
+  *) incomplete_syntax_error=unrecognized ;;
+esac
+set +o pipefail
+
+frame=$'token-line\ncommand-without-final-newline'
+_tirith_open_exact_input_pipe "$frame" || exit 72
+frame_fd="$_TIRITH_OPENED_FD"
+unset _TIRITH_OPENED_FD
+first="" second="" third="" first_rc=0 second_rc=0 third_rc=0
+IFS= builtin read -r first <&"$frame_fd" || first_rc=$?
+IFS= builtin read -r second <&"$frame_fd" || second_rc=$?
+IFS= builtin read -r third <&"$frame_fd" || third_rc=$?
+_tirith_close_pending_fd "$frame_fd" || exit 73
+
+_tirith_receipt_consume() {{ TIRITH_CONSUMED_TOKEN="$2"; return 0; }}
+_tirith_receipt_discard() {{ TIRITH_DISCARDED_TOKEN="$2"; return 0; }}
+_tirith_degrade_to_preexec() {{ TIRITH_DEGRADE_REASON="$1"; return 0; }}
+
+TIRITH_PARTIAL_EXECUTED=0
+_TIRITH_PENDING_EVAL='TIRITH_PARTIAL_EXECUTED=1'
+_TIRITH_PENDING_COMMAND='TIRITH_PARTIAL_EXECUTED=1'
+unset _TIRITH_PENDING_RECEIPT
+partial_rc=0
+_tirith_prompt_hook || partial_rc=$?
+partial_degrade="$TIRITH_DEGRADE_REASON"
+
+TIRITH_MISMATCH_EXECUTED=0
+TIRITH_DEGRADE_REASON=""
+TIRITH_DISCARDED_TOKEN=""
+_TIRITH_PENDING_EVAL='TIRITH_MISMATCH_EXECUTED=1'
+_TIRITH_PENDING_COMMAND='TIRITH_MISMATCH_EXECUTED=2'
+_TIRITH_PENDING_RECEIPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+mismatch_rc=0
+_tirith_prompt_hook || mismatch_rc=$?
+mismatch_degrade="$TIRITH_DEGRADE_REASON"
+
+TIRITH_VALID_EXECUTED=0
+TIRITH_CONSUMED_TOKEN=""
+_TIRITH_PENDING_EVAL='TIRITH_VALID_EXECUTED=1'
+_TIRITH_PENDING_COMMAND='TIRITH_VALID_EXECUTED=1'
+_TIRITH_PENDING_RECEIPT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+valid_rc=0
+_tirith_prompt_hook || valid_rc=$?
+command_interposed="$TIRITH_COMMAND_INTERPOSED"
+eval_interposed="$TIRITH_EVAL_INTERPOSED"
+unset -f command eval
+_TIRITH_BIN=/usr/bin/true
+builtin printf 'runs=%s\nmain_context=%s\nsubshell_context=%s\ncomplete_syntax_rc=%s\nincomplete_syntax_rc=%s\nincomplete_syntax_error=%s\nframe=%s:%s:%s:%s:%s:%s\npartial=%s:%s:%s\nmismatch=%s:%s:%s:%s\nvalid=%s:%s:%s\ninterposed=%s:%s\n' \
+  "$TIRITH_COMPLEX_RUNS" "$main_context" "$subshell_context" \
+  "$complete_syntax_rc" "$incomplete_syntax_rc" "$incomplete_syntax_error" \
+  "$first_rc" "$first" "$second_rc" "$second" "$third_rc" "$third" \
+  "$partial_rc" "$TIRITH_PARTIAL_EXECUTED" "$partial_degrade" \
+  "$mismatch_rc" "$TIRITH_MISMATCH_EXECUTED" "$TIRITH_DISCARDED_TOKEN" "$mismatch_degrade" \
+  "$valid_rc" "$TIRITH_VALID_EXECUTED" "$TIRITH_CONSUMED_TOKEN" \
+  "$command_interposed" "$eval_interposed"
+"#,
+        hook.display(),
+    );
+    let out = Command::new("/bin/bash")
+        .args(["--norc", "--noprofile", "-i", "-c", &script])
+        .current_dir(isolated.path())
+        .env("HOME", isolated.path())
+        .env("XDG_STATE_HOME", isolated.path().join("state"))
+        .env("TMPDIR", &capture_dir)
+        .env("PATH", format!("{}:/usr/bin:/bin", real_dir.display()))
+        .env("TIRITH_SESSION_ID", "cli-root-bash-complex-memory-delivery")
+        .env("TIRITH_BASH_MODE", "enter")
+        .env("TIRITH_LOG", "0")
+        .env_remove("_TIRITH_BASH_LOADED")
+        .output()
+        .expect("exercise repeated Bash 3.2 in-memory command delivery");
+
+    assert!(
+        out.status.success(),
+        "Bash delivery exercise failed (code {:?})\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("delivery probe stdout is UTF-8");
+    let fields: std::collections::HashMap<&str, &str> = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    assert_eq!(fields.get("runs"), Some(&"128"));
+    assert_eq!(fields.get("main_context"), Some(&"accepted"));
+    assert_eq!(fields.get("subshell_context"), Some(&"rejected"));
+    assert_eq!(fields.get("complete_syntax_rc"), Some(&"0"));
+    assert_ne!(fields.get("incomplete_syntax_rc"), Some(&"0"));
+    assert_eq!(fields.get("incomplete_syntax_error"), Some(&"recognized"));
+    assert_eq!(
+        fields.get("frame"),
+        Some(&"0:token-line:1:command-without-final-newline:1:"),
+        "anonymous receipt input changed its exact newline framing"
+    );
+    assert_eq!(
+        fields.get("partial"),
+        Some(&"1:0:deferred command state lacks its receipt commit marker")
+    );
+    assert_eq!(
+        fields.get("mismatch"),
+        Some(
+            &"1:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:deferred command state did not match its receipt"
+        )
+    );
+    assert_eq!(
+        fields.get("valid"),
+        Some(&"0:1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
+    assert_eq!(fields.get("interposed"), Some(&"0:0"));
+    assert_eq!(
+        fs::read_dir(&capture_dir)
+            .expect("inspect capture directory")
+            .count(),
+        0,
+        "in-memory delivery must leave no capture files"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn root_bash_hook_protocol_v3_runs_receipt_commands_as_direct_children() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let isolated = tempfile::tempdir().expect("isolated Bash receipt hook state");
+    let capture_dir = isolated.path().join("capture");
+    fs::create_dir(&capture_dir).expect("create private capture directory");
+    let shadow_dir = isolated.path().join("shadow-bin");
+    fs::create_dir(&shadow_dir).expect("create PATH-shadow directory");
+    let shadow_marker = isolated.path().join("path-shadow-executed");
+    let shadow_tirith = shadow_dir.join("tirith");
+    fs::write(
+        &shadow_tirith,
+        format!(
+            "#!/bin/sh\n/usr/bin/touch '{}'\nexit 0\n",
+            shadow_marker.display()
+        ),
+    )
+    .expect("write PATH-shadow Tirith");
+    fs::set_permissions(&shadow_tirith, fs::Permissions::from_mode(0o700))
+        .expect("make PATH-shadow Tirith executable");
+    let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical Tirith binary");
+    let real_dir = real.parent().expect("Tirith binary parent");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
+    let script = format!(
+        "_TIRITH_BASH_INTERNAL=1; \
+         source '{}'; \
+         export PATH='{}:/usr/bin:/bin'; \
+         _TIRITH_COMMAND_SHADOW_CALLED=0; \
+         command() {{ _TIRITH_COMMAND_SHADOW_CALLED=1; return 0; }}; \
+         _tirith_preexec_receipt_check 'printf receipt-direct-child-ok' no; receipt_rc=$?; \
+         printf 'protocol=%s\\nbearer=%s\\nreceipt_rc=%s\\ncwd=%s\\ncommand_shadow=%s\\n' \
+           \"$_TIRITH_RECEIPT_PROTOCOL\" \"$_TIRITH_RECEIPT_INSTANCE\" \"$receipt_rc\" \"$PWD\" \
+           \"$_TIRITH_COMMAND_SHADOW_CALLED\"",
+        hook.display(),
+        shadow_dir.display(),
+    );
+    let out = Command::new("/bin/bash")
+        .args(["--norc", "--noprofile", "-i", "-c", &script])
+        .current_dir(isolated.path())
+        .env("HOME", isolated.path())
+        .env("XDG_STATE_HOME", isolated.path().join("state"))
+        .env("TMPDIR", &capture_dir)
+        .env("PATH", format!("{}:/usr/bin:/bin", real_dir.display()))
+        .env("TIRITH_SESSION_ID", "cli-root-bash-receipt-v3")
+        .env("TIRITH_BASH_MODE", "preexec")
+        .env("TIRITH_LOG", "0")
+        .env_remove("_TIRITH_BASH_LOADED")
+        .env_remove("_TIRITH_RECEIPT_INSTANCE")
+        .env_remove("_TIRITH_RECEIPT_SHELL_PID")
+        .env_remove("_TIRITH_RECEIPT_FAMILY")
+        .output()
+        .expect("source root Bash hook and exercise protocol-v3 receipt path");
+
+    assert!(
+        out.status.success(),
+        "Bash hook receipt exercise failed (code {:?})\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("hook probe stdout is UTF-8");
+    let fields: std::collections::HashMap<&str, &str> = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    assert_eq!(fields.get("protocol"), Some(&"3"));
+    let bearer = fields.get("bearer").copied().unwrap_or_default();
+    assert_eq!(bearer.len(), 64, "hook registration must return a bearer");
+    assert!(
+        bearer
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "hook bearer must be lowercase hexadecimal"
+    );
+    assert_eq!(
+        fields.get("receipt_rc"),
+        Some(&"0"),
+        "receipt creation/consume must retain the shell parent binding; stdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fields.get("command_shadow"), Some(&"0"));
+    assert!(
+        !shadow_marker.exists(),
+        "PATH mutation redirected a pinned root-hook invocation"
+    );
+    let reported_cwd = fields.get("cwd").copied().unwrap_or_default();
+    assert_eq!(
+        fs::canonicalize(reported_cwd).expect("canonical reported hook cwd"),
+        fs::canonicalize(isolated.path()).expect("canonical expected hook cwd"),
+        "capture must not move receipt operations out of the shell's cwd"
+    );
+    assert_eq!(
+        fs::read_dir(&capture_dir)
+            .expect("inspect capture directory")
+            .count(),
+        0,
+        "all private capture files must be removed"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn powershell_execution_receipt_path_fails_closed() {
+    let isolated = tempfile::tempdir().expect("isolated PowerShell receipt state");
+    let state_dir = isolated.path().join("state");
+    let out = tirith_isolated(
+        "cli-receipt-powershell-unsupported",
+        &state_dir,
+        isolated.path(),
+    )
+    .args([
+        "check",
+        "--shell",
+        "powershell",
+        "--interactive",
+        "--approval-check",
+        "--execution-receipt",
+        "powershell",
+        "--no-daemon",
+        "--",
+        "Write-Output ok",
+    ])
+    .output()
+    .expect("attempt strict PowerShell execution receipt");
+
+    assert!(
+        !out.status.success(),
+        "mutable PowerShell history must not create a strict execution receipt"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("strict PowerShell execution receipts are unsupported"),
+        "unexpected PowerShell receipt error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -6206,6 +7235,53 @@ fn install_npm_clean_package_no_exec_exits_zero() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn install_rejects_transient_path_manager_even_when_policy_bypass_is_requested() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let attacker = tempfile::Builder::new()
+        .prefix("tirith-install-path-shadow-")
+        .tempdir_in("/tmp")
+        .expect("create transient attacker directory");
+    let bin = attacker.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let marker = attacker.path().join("counterfeit-manager-executed");
+    let counterfeit = bin.join("npm");
+    fs::write(
+        &counterfeit,
+        format!(
+            "#!/bin/sh\n: > '{}'\nexit 0\n",
+            marker.display().to_string().replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&counterfeit, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = tirith_install()
+        .env("PATH", &bin)
+        .env("TIRITH", "0")
+        .args(["install", "--yes", "npm", "my-unique-internal-pkg-xyzzy"])
+        .output()
+        .expect("run install with a counterfeit PATH manager");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "untrusted executable selection is a non-bypassable transaction error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("refusing to analyze-and-run an untrusted"),
+        "the refusal must identify the executable-provenance boundary: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "the counterfeit manager must never execute, including under TIRITH=0"
+    );
+}
+
 #[test]
 fn install_no_exec_after_source_is_a_hard_error() {
     // `--no-exec` is a tirith flag; placed AFTER <source> it lands in the package-manager args
@@ -6387,19 +7463,21 @@ fn install_human_output_never_claims_sandboxing() {
 }
 
 #[test]
-fn install_help_states_it_is_not_a_sandbox() {
+fn install_help_scopes_package_manager_and_url_containment() {
     let out = tirith()
         .args(["install", "--help"])
         .output()
         .expect("failed to run tirith install --help");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("does NOT sandbox") || stdout.contains("not sandbox"),
-        "install --help must state it does not sandbox, got:\n{stdout}"
+        stdout.contains("package-manager installs") && stdout.contains("not sandboxed"),
+        "install --help must state package-manager installs are not sandboxed, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("non-goal"),
-        "install --help must reference sandboxing as a non-goal, got:\n{stdout}"
+        stdout.contains("`url` form")
+            && stdout.contains("contained by default")
+            && stdout.contains("fail closed"),
+        "install --help must state that the URL form is contained and fail-closed, got:\n{stdout}"
     );
 }
 
@@ -7348,9 +8426,9 @@ fn mcp_lock_writes_lockfile_for_planted_config() {
     // The lockfile records both servers, deterministically sorted by name.
     let contents = fs::read_to_string(&lock_path).unwrap();
     let lock: serde_json::Value = serde_json::from_str(&contents).expect("lockfile must be JSON");
-    // format_version 6 — adds the live `tools/list` descriptor lock (captured at
-    // runtime; empty for a config-only `mcp lock`) atop v5's `tools_declared` hash.
-    assert_eq!(lock["format_version"], 6);
+    // Format v8 retains the descriptor lock and stores secret-bearing transport
+    // fields with presence-only privacy semantics.
+    assert_eq!(lock["format_version"], 8);
     let servers = lock["servers"].as_array().expect("servers array");
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0]["name"], "filesystem");
@@ -7447,16 +8525,38 @@ fn mcp_lock_is_deterministic_across_runs() {
 }
 
 #[test]
-fn mcp_lock_malformed_config_is_recorded_not_fatal() {
-    // A malformed MCP config contributes no servers and is reported as
-    // unparseable — it is never an error.
+fn mcp_lock_malformed_config_requires_explicit_incomplete_override() {
+    // A malformed MCP config must not silently become a trusted partial
+    // baseline. The explicit audit override may record the gap, but verify will
+    // continue to treat that baseline as incomplete.
     let repo = tempfile::tempdir().unwrap();
     let iso = tempfile::tempdir().unwrap();
     fs::create_dir_all(repo.path().join(".git")).unwrap();
     fs::write(repo.path().join("mcp.json"), "{ not valid json at all").unwrap();
 
-    let (stdout, _err, code) = run_mcp_lock(repo.path(), iso.path(), &["--format", "json"]);
-    assert_eq!(code, 0, "a malformed config is not fatal");
+    let lock_path = repo.path().join(".tirith").join("mcp.lock");
+    let (stdout, stderr, code) = run_mcp_lock(repo.path(), iso.path(), &["--format", "json"]);
+    assert_eq!(code, 1, "a malformed config must refuse an ordinary lock");
+    let refusal = format!("{stdout}{stderr}");
+    assert!(
+        refusal.contains("incomplete MCP baseline")
+            && refusal.contains("--allow-incomplete-configs"),
+        "the refusal must explain the explicit audit override: {refusal}"
+    );
+    assert!(
+        !lock_path.exists(),
+        "default refusal must not publish a partial MCP baseline"
+    );
+
+    let (stdout, _err, code) = run_mcp_lock(
+        repo.path(),
+        iso.path(),
+        &["--allow-incomplete-configs", "--format", "json"],
+    );
+    assert_eq!(
+        code, 0,
+        "the explicit incomplete-baseline override may record the gap"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("mcp lock JSON");
     // The file is discovered (counts as a config) but yields no servers.
     assert_eq!(v["configs_found"], 1);
@@ -7464,6 +8564,7 @@ fn mcp_lock_malformed_config_is_recorded_not_fatal() {
     let malformed = v["malformed_configs"].as_array().unwrap();
     assert_eq!(malformed.len(), 1);
     assert_eq!(malformed[0], "mcp.json");
+    assert_eq!(v["incomplete_override_used"], true);
 }
 
 #[test]
@@ -7507,20 +8608,20 @@ fn mcp_lock_does_not_leak_url_userinfo_into_committed_file() {
         !lock_text.contains("@mcp.example.com"),
         "the userinfo `@` boundary leaked into the committed mcp.lock:\n{lock_text}"
     );
-    // The schema is at format_version 6 (which adds the live `tools/list` descriptor lock);
-    // v4's URL userinfo redaction is preserved through the bumps.
+    // V8 preserves URL redaction but replaces the old deterministic commitment
+    // with a fixed presence marker.
     let lock: serde_json::Value = serde_json::from_str(lock_text).expect("lockfile must be JSON");
-    assert_eq!(lock["format_version"], 6);
+    assert_eq!(lock["format_version"], 8);
 
     // The URL transport stores the redacted URL and carries the `userinfo_hash` field; it does
     // NOT carry a plaintext userinfo / credential / token field.
     let transport = &lock["servers"][0]["transport"];
     assert_eq!(transport["kind"], "url");
     assert_eq!(transport["url"], "https://mcp.example.com:8443/sse");
-    assert!(
-        transport.get("userinfo_hash").is_some(),
-        "the URL transport must carry a userinfo_hash field when the source URL had \
-         credentials: {transport}"
+    assert_eq!(
+        transport.get("userinfo_hash"),
+        Some(&serde_json::Value::String("present".into())),
+        "the URL transport must carry only the fixed presence marker: {transport}"
     );
     for forbidden in ["userinfo", "credential", "credentials", "token", "password"] {
         assert!(
@@ -7596,16 +8697,17 @@ fn mcp_lock_does_not_leak_env_secret_into_committed_file() {
         !lock_text.contains(secret),
         "the raw env value {secret:?} leaked into the committed mcp.lock:\n{lock_text}"
     );
-    // The env shape is the expected `{ name, value_hash }`, not `{ name, value }`.
+    // The historical `value_hash` field now carries only a fixed presence marker.
     let lock: serde_json::Value = serde_json::from_str(lock_text).expect("lockfile must be JSON");
     let env = lock["servers"][0]["transport"]["env"]
         .as_array()
         .expect("env array");
     assert_eq!(env.len(), 2, "both env vars must be captured");
     for entry in env {
-        assert!(
-            entry.get("value_hash").is_some(),
-            "every env entry must carry a value_hash field"
+        assert_eq!(
+            entry.get("value_hash"),
+            Some(&serde_json::Value::String("present".into())),
+            "every env entry must carry only the fixed presence marker"
         );
         assert!(
             entry.get("value").is_none(),
@@ -7739,7 +8841,7 @@ fn mcp_verify_json_emits_envelope() {
     assert_eq!(v["in_sync"], true);
     assert_eq!(v["drift_count"], 0);
     assert_eq!(v["command"], "tirith mcp verify");
-    assert_eq!(v["lockfile_format_version"], 6);
+    assert_eq!(v["lockfile_format_version"], 8);
 }
 
 #[test]
@@ -7821,8 +8923,8 @@ fn mcp_diff_exits_two_when_no_lockfile() {
 }
 
 #[test]
-fn mcp_verify_does_not_leak_env_value_on_drift() {
-    // Headline privacy check: a value-hash rotation surfaces as drift; the
+fn mcp_verify_env_value_rotation_is_private_and_non_drifting() {
+    // V8 stores no value-dependent commitment: rotation stays in sync and the
     // raw env value never appears in stdout or stderr.
     let repo = tempfile::tempdir().unwrap();
     let iso = tempfile::tempdir().unwrap();
@@ -7851,7 +8953,7 @@ fn mcp_verify_does_not_leak_env_value_on_drift() {
 
     let (stdout, err, code) =
         run_mcp_subcommand("verify", repo.path(), iso.path(), &["--format", "json"]);
-    assert_eq!(code, 1, "value-hash flip must surface as drift");
+    assert_eq!(code, 0, "env value rotation must not surface as drift");
     assert!(
         !stdout.contains(secret_old) && !stdout.contains(secret_new),
         "raw env values must NEVER appear in stdout: stdout={stdout}"
@@ -7863,13 +8965,13 @@ fn mcp_verify_does_not_leak_env_value_on_drift() {
 
     // Human surface: the same property.
     let (stdout_h, err_h, code_h) = run_mcp_subcommand("verify", repo.path(), iso.path(), &[]);
-    assert_eq!(code_h, 1);
+    assert_eq!(code_h, 0);
     assert!(!stdout_h.contains(secret_old) && !stdout_h.contains(secret_new));
     assert!(!err_h.contains(secret_old) && !err_h.contains(secret_new));
 }
 
 #[test]
-fn mcp_verify_does_not_leak_url_userinfo_on_drift() {
+fn mcp_verify_url_userinfo_rotation_is_private_and_non_drifting() {
     let repo = tempfile::tempdir().unwrap();
     let iso = tempfile::tempdir().unwrap();
     fs::create_dir_all(repo.path().join(".git")).unwrap();
@@ -7894,7 +8996,7 @@ fn mcp_verify_does_not_leak_url_userinfo_on_drift() {
     .unwrap();
 
     let (stdout, err, code) = run_mcp_subcommand("verify", repo.path(), iso.path(), &[]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 0, "URL-userinfo rotation must not surface as drift");
     assert!(
         !stdout.contains(userinfo_old) && !stdout.contains(userinfo_new),
         "raw URL userinfo must never appear in stdout: stdout={stdout}"
@@ -10356,7 +11458,54 @@ fn clipboard_daemon_requires_foreground_flag() {
 fn gateway_filter_output_blocks_osc52_payload() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Stdio;
+    use std::process::{Child, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn terminate_and_reap(child: &mut Child) {
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+
+    fn read_response(
+        responses: &mpsc::Receiver<std::io::Result<String>>,
+        child: &mut Child,
+        description: &str,
+    ) -> String {
+        match responses.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                terminate_and_reap(child);
+                panic!("failed to read {description}: {error}");
+            }
+            Err(error) => {
+                terminate_and_reap(child);
+                panic!("timed out waiting for {description}: {error}");
+            }
+        }
+    }
+
+    fn wait_for_exit(child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    terminate_and_reap(child);
+                    panic!("gateway did not exit within 10 seconds after stdin closed");
+                }
+                Err(error) => {
+                    terminate_and_reap(child);
+                    panic!("failed to wait for gateway shutdown: {error}");
+                }
+            }
+        }
+    }
 
     let dir = tempfile::tempdir().expect("tempdir");
 
@@ -10370,9 +11519,19 @@ fn gateway_filter_output_blocks_osc52_payload() {
 # Stub MCP server: respond to initialize, then to tools/call with OSC52.
 set -u
 IFS= read -r line1
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"stub","version":"0.0.1"}}}'
+initialize_id=$(printf '%s\n' "$line1" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\("[^"]*"\).*/\1/p')
+if [ -z "$initialize_id" ]; then
+    printf '%s\n' 'stub could not extract initialize request id' >&2
+    exit 1
+fi
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${initialize_id},\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"stub\",\"version\":\"0.0.1\"}}}"
 IFS= read -r line2
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"prefix\u001B]52;c;aGVsbG8=\u0007suffix"}],"isError":false}}'
+request_id=$(printf '%s\n' "$line2" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\("[^"]*"\).*/\1/p')
+if [ -z "$request_id" ]; then
+    printf '%s\n' 'stub could not extract request id' >&2
+    exit 1
+fi
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${request_id},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"prefix\\u001B]52;c;aGVsbG8=\\u0007suffix\"}],\"isError\":false}}"
 # Block until stdin closes so the gateway shuts us down cleanly.
 cat > /dev/null
 "#;
@@ -10417,7 +11576,14 @@ policy:
 
     let mut child_stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut reader = BufReader::new(stdout);
+    let (response_tx, response_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if response_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
 
     // Step 1: initialize. Gateway forwards, stub responds.
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
@@ -10428,23 +11594,18 @@ policy:
     writeln!(child_stdin, "{call}").expect("write tools/call");
 
     // Read responses. The gateway emits one response per request line.
-    let mut init_resp = String::new();
-    reader
-        .read_line(&mut init_resp)
-        .expect("read init response");
+    let init_resp = read_response(&response_rx, &mut child, "initialize response");
+    let call_resp = read_response(&response_rx, &mut child, "tools/call response");
+
+    // Close stdin so the gateway shuts down the stub.
+    drop(child_stdin);
+    wait_for_exit(&mut child);
+    reader.join().expect("join gateway stdout reader");
+
     assert!(
         init_resp.contains("\"id\":1"),
         "first response should echo id=1: {init_resp}"
     );
-
-    let mut call_resp = String::new();
-    reader
-        .read_line(&mut call_resp)
-        .expect("read tools/call response");
-
-    // Close stdin so the gateway shuts down the stub.
-    drop(child_stdin);
-    let _ = child.wait();
 
     // Pin the contract.
     let v: serde_json::Value =
@@ -12417,20 +13578,82 @@ fn isolate_test_process_group(command: &mut Command) {
 }
 
 #[cfg(unix)]
-fn terminate_test_process_group(child: &mut std::process::Child) {
-    let pid = child.id() as libc::pid_t;
-    // Only signal a negative process-group id after proving the child became the
-    // leader we requested. This avoids ever targeting the test runner's group if
-    // process-group setup failed unexpectedly.
-    if unsafe { libc::getpgid(pid) } == pid {
-        // SAFETY: `pid` is a live child-owned process-group id. ESRCH is benign:
-        // the group may have exited between the poll and this cleanup.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+fn observe_test_child_without_reaping(pid: libc::pid_t) -> std::io::Result<bool> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
+}
+
+#[cfg(unix)]
+fn reap_test_child_bounded(
+    child: &mut std::process::Child,
+    deadline: std::time::Instant,
+) -> Result<std::process::ExitStatus, String> {
+    let pid = child.id() as libc::pid_t;
+    loop {
+        match observe_test_child_without_reaping(pid) {
+            Ok(true) => return child.wait().map_err(|error| error.to_string()),
+            Ok(false) => {}
+            Err(error) => return Err(format!("could not observe child exit: {error}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("direct child did not exit before the cleanup deadline".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn finish_test_process_group(
+    child: &mut std::process::Child,
+    process_group: libc::pid_t,
+    direct_exit_observed: bool,
+    deadline: std::time::Instant,
+) -> Result<std::process::ExitStatus, String> {
+    // The leader remains unreaped until after this signal, anchoring the
+    // numeric process-group id so the negative-PID signal cannot hit a reused
+    // unrelated group.
+    let signal_error = if unsafe { libc::kill(-process_group, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // Darwin reports EPERM (rather than ESRCH) when the anchored group has
+        // no signalable members beyond its already-exited zombie leader. A live
+        // same-UID descendant would make the group signal succeed, so this is
+        // benign only after waitid proved the direct leader exited. Other Unix
+        // platforms retain the stricter ESRCH-only allowance.
+        let empty_anchored_group = direct_exit_observed
+            && (error.raw_os_error() == Some(libc::ESRCH)
+                || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM)));
+        if !empty_anchored_group {
+            Some(error)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let _ = child.kill();
-    let _ = child.wait();
+    let reaped = reap_test_child_bounded(child, deadline);
+    if let Some(error) = signal_error {
+        return Err(format!(
+            "could not terminate child process group: {error}; direct-child reap: {reaped:?}"
+        ));
+    }
+    reaped
 }
 
 #[cfg(unix)]
@@ -12449,55 +13672,73 @@ fn wait_for_output_bounded(
         })
     }
 
+    let child_pid = child.id() as libc::pid_t;
+    let process_group = unsafe { libc::getpgid(child_pid) };
+    if process_group != child_pid {
+        let reason = if process_group < 0 {
+            std::io::Error::last_os_error().to_string()
+        } else {
+            format!("unexpected process group {process_group}")
+        };
+        let _ = child.kill();
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let cleanup = reap_test_child_bounded(&mut child, cleanup_deadline);
+        panic!(
+            "{context} child {child_pid} was not the confirmed leader of its requested process group: {reason}; cleanup: {cleanup:?}"
+        );
+    }
     let stdout = child.stdout.take().map(drain);
     let stderr = child.stderr.take().map(drain);
     let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // A descendant may still hold a captured pipe after the direct
-                // child exits. Tear down the remaining group before joining the
-                // drainers so the join itself cannot hang forever.
-                let pid = child.id() as libc::pid_t;
-                if unsafe { libc::getpgid(pid) } == pid {
-                    unsafe {
-                        libc::kill(-pid, libc::SIGKILL);
-                    }
-                }
-                break status;
-            }
-            Ok(None) if std::time::Instant::now() < deadline => {
+    let observation = loop {
+        match observe_test_child_without_reaping(child.id() as libc::pid_t) {
+            Ok(true) => break Ok(true),
+            Ok(false) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Ok(None) => {
-                terminate_test_process_group(&mut child);
-                if let Some(handle) = stdout {
-                    let _ = handle.join();
-                }
-                if let Some(handle) = stderr {
-                    let _ = handle.join();
-                }
-                panic!("{context} did not exit within {timeout:?}");
-            }
-            Err(error) => {
-                terminate_test_process_group(&mut child);
-                if let Some(handle) = stdout {
-                    let _ = handle.join();
-                }
-                if let Some(handle) = stderr {
-                    let _ = handle.join();
-                }
-                panic!("could not poll {context}: {error}");
-            }
+            Ok(false) => break Ok(false),
+            Err(error) => break Err(error),
         }
     };
+    let direct_exit_observed_for_cleanup = observation.as_ref().copied().unwrap_or(false);
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = finish_test_process_group(
+        &mut child,
+        process_group,
+        direct_exit_observed_for_cleanup,
+        cleanup_deadline,
+    );
 
-    let stdout = stdout
-        .map(|handle| handle.join().expect("stdout drain thread panicked"))
-        .unwrap_or_default();
-    let stderr = stderr
-        .map(|handle| handle.join().expect("stderr drain thread panicked"))
-        .unwrap_or_default();
+    fn join_drain_bounded(
+        handle: Option<std::thread::JoinHandle<Vec<u8>>>,
+        stream: &str,
+        deadline: std::time::Instant,
+    ) -> Vec<u8> {
+        let Some(handle) = handle else {
+            return Vec::new();
+        };
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{stream} drain did not finish before the cleanup deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("{stream} drain thread panicked"))
+    }
+
+    let stdout = join_drain_bounded(stdout, "stdout", cleanup_deadline);
+    let stderr = join_drain_bounded(stderr, "stderr", cleanup_deadline);
+    let direct_exit_observed = observation
+        .unwrap_or_else(|error| panic!("could not poll {context}: {error}; cleanup: {status:?}"));
+    let status =
+        status.unwrap_or_else(|error| panic!("{context} process-tree cleanup failed: {error}"));
+    assert!(
+        direct_exit_observed,
+        "{context} did not exit within {timeout:?}"
+    );
     std::process::Output {
         status,
         stdout,
@@ -12512,7 +13753,11 @@ fn bounded_wait_kills_and_reaps_the_child_process_group() {
     let descendant_pid_path = temp.path().join("descendant.pid");
     let mut command = Command::new("/bin/sh");
     command
-        .args(["-c", "sleep 30 & echo $! > \"$1\"; wait", "tirith-test"])
+        .args([
+            "-c",
+            "/bin/sleep 30 & echo $! > \"$1\"; wait",
+            "tirith-test",
+        ])
         .arg(&descendant_pid_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -12543,18 +13788,50 @@ fn bounded_wait_kills_and_reaps_the_child_process_group() {
         "the fixture should exercise timeout cleanup"
     );
 
-    fn process_exists(pid: libc::pid_t) -> bool {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn process_is_running(pid: libc::pid_t) -> bool {
         let rc = unsafe { libc::kill(pid, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
-    assert!(!process_exists(direct_pid), "direct child must be reaped");
+    #[cfg(target_os = "macos")]
+    fn process_is_running(pid: libc::pid_t) -> bool {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                expected as libc::c_int,
+            )
+        };
+        read == expected as libc::c_int && unsafe { info.assume_init() }.pbi_status != libc::SZOMB
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: libc::pid_t) -> bool {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(") ")
+            .is_none_or(|(_, fields)| !fields.starts_with("Z "))
+    }
+
+    assert!(
+        !process_is_running(direct_pid),
+        "direct child must be reaped"
+    );
     let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while process_exists(descendant_pid) && std::time::Instant::now() < reap_deadline {
+    while process_is_running(descendant_pid) && std::time::Instant::now() < reap_deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(
-        !process_exists(descendant_pid),
+        !process_is_running(descendant_pid),
         "descendant must not survive timeout cleanup"
     );
 }
@@ -13325,8 +14602,7 @@ fn secret_revoke_leads_with_revocation_url() {
 /// the incident flag file (`state_dir()`), and `XDG_DATA_HOME` + `APPDATA`/`LOCALAPPDATA` carry
 /// the audit log (`data_dir()`) (M9; M10).
 fn incident_tirith(state: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
-    cmd.env_remove("TIRITH");
+    let mut cmd = tirith();
     cmd.env("XDG_STATE_HOME", state);
     cmd.env("XDG_DATA_HOME", state);
     // Windows: etcetera resolves state_dir()/data_dir() from APPDATA / LOCALAPPDATA, not the
@@ -13394,8 +14670,7 @@ fn incident_start_json_fatal_emits_parseable_json() {
     let blocker = tmp.path().join("not-a-dir");
     fs::write(&blocker, b"x").unwrap();
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
-    cmd.env_remove("TIRITH");
+    let mut cmd = tirith();
     cmd.env("XDG_STATE_HOME", &blocker);
     cmd.env("XDG_DATA_HOME", tmp.path());
     let out = cmd
@@ -13841,8 +15116,7 @@ fn incident_report_to_stdout_without_out_flag() {
 /// the canary store lives in `state_dir()` (XDG_STATE_HOME on Unix, APPDATA /
 /// LOCALAPPDATA on Windows), so pin all of them. Mirrors `incident_tirith`.
 fn canary_tirith(state: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
-    cmd.env_remove("TIRITH");
+    let mut cmd = tirith();
     cmd.env("XDG_STATE_HOME", state);
     cmd.env("XDG_DATA_HOME", state);
     cmd.env("APPDATA", state);
@@ -13972,8 +15246,7 @@ fn canary_create_json_store_error_is_machine_readable() {
     let blocker = tmp.path().join("not-a-dir");
     fs::write(&blocker, b"x").unwrap();
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
-    cmd.env_remove("TIRITH");
+    let mut cmd = tirith();
     cmd.env("XDG_STATE_HOME", &blocker);
     cmd.env("XDG_DATA_HOME", tmp.path());
     let out = cmd
@@ -14182,10 +15455,9 @@ fn taint_list_warns_on_incomplete_store_read() {
 /// A `tirith` command with manifest discovery pinned to `root` (a tempdir that
 /// holds `.tirith/commands.yaml`) and runtime state isolated under `root`.
 fn commands_tirith(root: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
-    cmd.env_remove("TIRITH");
+    let mut cmd = tirith();
     cmd.env("TIRITH_POLICY_ROOT", root);
-    cmd.env("TIRITH_INTERACTIVE", "0");
+    cmd.env_remove("TIRITH_INTERACTIVE");
     cmd.env("TIRITH_OFFLINE", "1");
     // Isolate state_dir()/data_dir() on every platform (Unix XDG + Windows
     // APPDATA/LOCALAPPDATA) so the audit log never touches the real home.
@@ -14193,7 +15465,30 @@ fn commands_tirith(root: &std::path::Path) -> Command {
     cmd.env("XDG_DATA_HOME", root);
     cmd.env("APPDATA", root);
     cmd.env("LOCALAPPDATA", root);
+    // `tirith()` disables persistence by default. These command-catalogue tests
+    // explicitly own every audit destination under `root`, and the run-audit
+    // regressions need to exercise the real durable writer.
+    cmd.env("TIRITH_LOG", "1");
     cmd
+}
+
+/// Detach a CLI test from any terminal owned by the test runner. This makes
+/// `/dev/tty` deterministically unavailable even when `cargo test` itself was
+/// launched from an interactive shell.
+#[cfg(unix)]
+fn commands_without_controlling_terminal(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: `setsid` is async-signal-safe and this closure does not allocate.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() >= 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
 }
 
 /// Write `<root>/.tirith/commands.yaml`.
@@ -14245,16 +15540,113 @@ fn commands_list_reports_real_action_for_warn_entry() {
 }
 
 #[test]
-fn commands_run_surfaces_warn_findings_instead_of_swallowing() {
-    // Finding A: a `commands run` of an ALLOWED command that the engine flags at Warn must RENDER
-    // the findings (like `tirith check`), not silently run it.
+fn commands_list_human_output_sanitizes_manifest_fields() {
     let root = tempfile::tempdir().expect("tempdir");
-    write_root_manifest(
-        root.path(),
-        "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x\"\n",
+    let hostile_name = "safe\x1b[2J\nFORGED-NAME";
+    let hostile_command = "echo \x1b[31mRED\x1b[0m\nFORGED-COMMAND";
+    let hostile_pattern = "*bad\x1b[2J\nFORGED-PATTERN*";
+    // JSON is valid YAML, and serde_json escapes the control bytes on disk so
+    // the manifest parser materializes the exact hostile scalar values.
+    let manifest = serde_json::json!({
+        "allowed": [{ "name": hostile_name, "command": hostile_command }],
+        "dangerous": [{ "pattern": hostile_pattern, "action": "warn" }],
+    });
+    write_root_manifest(root.path(), &manifest.to_string());
+
+    let human = commands_tirith(root.path())
+        .args(["commands", "list"])
+        .output()
+        .expect("commands list human");
+    assert_eq!(
+        human.status.code(),
+        Some(0),
+        "list should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        !human.stdout.contains(&0x1b),
+        "manifest ANSI controls must not reach the terminal: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("\nFORGED-"),
+        "manifest newlines must not forge catalogue rows: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("safeFORGED-NAME")
+            && stdout.contains("echo REDFORGED-COMMAND")
+            && stdout.contains("*badFORGED-PATTERN*"),
+        "sanitization must preserve the readable manifest text: {stdout:?}"
     );
 
+    // The structured boundary remains lossless: sanitization is a human-output
+    // projection, not a mutation of the manifest values.
+    let structured = commands_tirith(root.path())
+        .args(["commands", "list", "--json"])
+        .output()
+        .expect("commands list json");
+    assert_eq!(structured.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
+    assert_eq!(json["allowed"][0]["name"], hostile_name);
+    assert_eq!(json["allowed"][0]["command"], hostile_command);
+    assert_eq!(json["dangerous"][0]["pattern"], hostile_pattern);
+}
+
+#[cfg(unix)]
+#[test]
+fn commands_run_human_banner_sanitizes_manifest_fields() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let hostile_name = "safe\x1b[2J\nFORGED-NAME";
+    // A quoted argument to the no-op `:` builtin lets the raw command contain
+    // ANSI and a newline without producing child output or a second command.
+    let hostile_command = ": 'command\x1b[31mRED\x1b[0m\nFORGED-COMMAND'";
+    let manifest = serde_json::json!({
+        "allowed": [{ "name": hostile_name, "command": hostile_command }],
+    });
+    write_root_manifest(root.path(), &manifest.to_string());
+
     let out = commands_tirith(root.path())
+        .args(["commands", "run", hostile_name, "--yes"])
+        .output()
+        .expect("commands run hostile display fields");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the inert command should execute successfully; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.stderr.contains(&0x1b),
+        "manifest ANSI controls must not reach the run banner: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("\nFORGED-"),
+        "manifest newlines must not forge run-output rows: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Running allowed command 'safeFORGED-NAME': : 'commandREDFORGED-COMMAND'"),
+        "the safe banner must retain readable manifest text: {stderr:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn commands_run_non_tty_warn_refuses_after_rendering_findings() {
+    // A warning is visible but is not authorization. Without --yes or a trusted
+    // controlling terminal the command must be refused with the verdict's Warn
+    // exit code, even when the CLI's stdin/stdout/stderr are otherwise usable.
+    let root = tempfile::tempdir().expect("tempdir");
+    let marker = root.path().join("warn-command-ran");
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x > warn-command-ran\"\n",
+    );
+
+    let mut cmd = commands_tirith(root.path());
+    cmd.current_dir(root.path());
+    commands_without_controlling_terminal(&mut cmd);
+    let out = cmd
         .args(["commands", "run", "greet"])
         .output()
         .expect("commands run greet");
@@ -14272,11 +15664,15 @@ fn commands_run_surfaces_warn_findings_instead_of_swallowing() {
         combined.contains("WARNING"),
         "commands run must show a WARNING for a Warn verdict, got:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
-    // Non-interactive (TIRITH_INTERACTIVE=0): it proceeds and runs the command,
-    // so the echoed text reaches stdout (proof it executed AFTER surfacing).
+    assert_eq!(out.status.code(), Some(2), "Warn refusal keeps exit code 2");
     assert!(
-        stdout.contains("https://bit.ly/x"),
-        "non-interactive run should proceed and execute the command, got:\n{stdout}"
+        stderr.contains("controlling-terminal confirmation is unavailable")
+            && stderr.contains("--yes"),
+        "the refusal must explain the trusted-terminal/--yes requirement, got:\n{stderr}"
+    );
+    assert!(
+        !marker.exists(),
+        "a non-TTY warning must not execute the allow-listed command"
     );
 }
 
@@ -14292,14 +15688,14 @@ fn commands_run_still_refuses_and_renders_on_block() {
     );
 
     let out = commands_tirith(root.path())
-        .args(["commands", "run", "danger"])
+        .args(["commands", "run", "danger", "--yes"])
         .output()
         .expect("commands run danger");
 
     assert_eq!(
         out.status.code(),
         Some(1),
-        "a blocked command must refuse (exit 1)"
+        "--yes must never override a blocked command (exit 1)"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -14320,44 +15716,47 @@ fn commands_run_still_refuses_and_renders_on_block() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn commands_run_interactive_warn_decline_refuses() {
-    // The security-critical half of the interactive Warn-ack branch: when the prompt fires and
-    // the operator DECLINES ("n"), the command must NOT run (exit 1, "aborted by user", no echo
-    // on stdout).
+fn commands_run_piped_yes_never_acknowledges_warn() {
+    // Piped stdin is attacker-controlled automation input, not proof of a human
+    // at the controlling terminal. Even "yes" must be ignored and fail closed.
     use std::io::Write as _;
     use std::process::Stdio;
 
     let root = tempfile::tempdir().expect("tempdir");
+    let marker = root.path().join("piped-yes-ran");
     write_root_manifest(
         root.path(),
-        "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x\"\n",
+        "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x > piped-yes-ran\"\n",
     );
 
-    // Decline: "n" → abort, exit 1, command does NOT execute (no echo on stdout).
     let mut cmd = commands_tirith(root.path());
+    cmd.current_dir(root.path());
+    commands_without_controlling_terminal(&mut cmd);
     cmd.env("TIRITH_INTERACTIVE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .args(["commands", "run", "greet"]);
-    let mut child = cmd.spawn().expect("spawn (decline)");
-    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
-    let declined = child.wait_with_output().expect("wait (decline)");
-    let dstdout = String::from_utf8_lossy(&declined.stdout);
-    let dstderr = String::from_utf8_lossy(&declined.stderr);
+    let mut child = cmd.spawn().expect("spawn piped-yes attempt");
+    child.stdin.take().unwrap().write_all(b"yes\n").unwrap();
+    let refused = child.wait_with_output().expect("wait piped-yes attempt");
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
     assert_eq!(
-        declined.status.code(),
-        Some(1),
-        "declining the Warn ack must exit 1, got stdout:\n{dstdout}\nstderr:\n{dstderr}"
+        refused.status.code(),
+        Some(2),
+        "unacknowledged Warn must preserve exit 2, got stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        dstderr.contains("aborted by user"),
-        "decline must report 'aborted by user', got stderr:\n{dstderr}"
+        stderr.contains("controlling-terminal confirmation is unavailable")
+            && stderr.contains("--yes"),
+        "piped input refusal must explain the trusted approval paths, got:\n{stderr}"
     );
     assert!(
-        !dstdout.contains("https://bit.ly/x"),
-        "a DECLINED command must NOT execute (no echo on stdout), got stdout:\n{dstdout}"
+        !marker.exists(),
+        "piped yes must never execute the warning-producing command"
     );
 }
 
@@ -14371,11 +15770,11 @@ fn read_audit_log_for(root: &std::path::Path) -> String {
 }
 
 // UNIX-ONLY (CodeRabbit R19 #0): both this and
-// `commands_run_noninteractive_proceed_writes_run_audit` assert on an audit log WRITTEN BY A
+// `commands_run_yes_writes_run_audit` assert on an audit log WRITTEN BY A
 // `tirith` SUBPROCESS, then read back.
 #[cfg(unix)]
 #[test]
-fn commands_run_interactive_warn_decline_writes_no_run_audit() {
+fn commands_run_piped_yes_warn_refusal_writes_no_run_audit() {
     use std::io::Write as _;
     use std::process::Stdio;
 
@@ -14385,40 +15784,41 @@ fn commands_run_interactive_warn_decline_writes_no_run_audit() {
         "allowed:\n  - name: greet\n    command: \"echo https://bit.ly/x\"\n",
     );
 
-    // Decline the interactive Warn ack ("n"): the command must NOT run...
+    // Even a piped "yes" is not an acknowledgement: detach the child from any
+    // test-runner terminal so the refusal is deterministic.
     let mut cmd = commands_tirith(root.path());
+    commands_without_controlling_terminal(&mut cmd);
     cmd.env("TIRITH_INTERACTIVE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .args(["commands", "run", "greet"]);
-    let mut child = cmd.spawn().expect("spawn (decline)");
-    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
-    let declined = child.wait_with_output().expect("wait (decline)");
+    let mut child = cmd.spawn().expect("spawn piped yes");
+    child.stdin.take().unwrap().write_all(b"yes\n").unwrap();
+    let refused = child.wait_with_output().expect("wait piped yes");
     assert_eq!(
-        declined.status.code(),
-        Some(1),
-        "declining the Warn ack must exit 1"
+        refused.status.code(),
+        Some(2),
+        "a no-TTY Warn refusal must preserve the warning exit code"
     );
 
-    // ...so NO audit record for the run command may exist.
+    // The command never spawned, so no run audit may exist.
     let log = read_audit_log_for(root.path());
     assert!(
         !log.contains("bit.ly"),
-        "a DECLINED warn must NOT write a run audit entry, but the log contains it:\n{log}"
+        "a no-TTY warn refusal must NOT write a run audit entry, but the log contains it:\n{log}"
     );
 }
 
 // UNIX-ONLY (CodeRabbit R19 #0): asserts on a subprocess-WRITTEN audit log; the Windows
 // audit-write path is broken (0-byte log via `fs2` lock/write on an append-only handle) — see the
-// gate note on `commands_run_interactive_warn_decline_writes_no_run_audit` above and the
+// gate note on `commands_run_piped_yes_warn_refusal_writes_no_run_audit` above and the
 // pre-existing `commands_run_audit_applies_operator_dlp_patterns`.
 #[cfg(unix)]
 #[test]
-fn commands_run_noninteractive_proceed_writes_run_audit() {
-    // The inverse of the decline case: a non-interactive proceed
-    // (`TIRITH_INTERACTIVE=0`, set by `commands_tirith`) DOES execute the command,
-    // so the deferred audit DOES fire and the run is recorded.
+fn commands_run_yes_writes_run_audit() {
+    // Explicit --yes is the intentional automation acknowledgement. It executes
+    // a Warn command without a TTY, so the deferred run audit must be recorded.
     let root = tempfile::tempdir().expect("tempdir");
     write_root_manifest(
         root.path(),
@@ -14426,13 +15826,13 @@ fn commands_run_noninteractive_proceed_writes_run_audit() {
     );
 
     let out = commands_tirith(root.path())
-        .args(["commands", "run", "greet"])
+        .args(["commands", "run", "greet", "--yes"])
         .output()
         .expect("commands run greet");
     assert_eq!(
         out.status.code(),
         Some(0),
-        "a non-interactive proceed must exit 0, stderr:\n{}",
+        "an explicit --yes Warn run must exit with the child code, stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     // Proof it executed (echoed marker reached stdout)...
@@ -14507,17 +15907,17 @@ fn commands_run_json_emits_single_object_when_warn() {
     );
 
     let out = commands_tirith(root.path())
-        .args(["commands", "run", "warn", "--json"])
+        .args(["commands", "run", "warn", "--yes", "--json"])
         .output()
         .expect("commands run warn --json");
 
     // Pin the exit code (CodeRabbit R12 #J, sibling of the allowed-clean test): a
-    // non-interactively-proceeded warn returns the CHILD's exit code, and the
+    // explicitly acknowledged warn returns the CHILD's exit code, and the
     // child here (`echo … > /dev/null`) succeeds → 0.
     assert_eq!(
         out.status.code(),
         Some(0),
-        "warn-proceed run returns the child exit code (0 here); stderr:\n{}",
+        "warn --yes run returns the child exit code (0 here); stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -14528,15 +15928,12 @@ fn commands_run_json_emits_single_object_when_warn() {
         )
     });
     assert_eq!(v["name"], "warn");
-    // Warn/WarnAck — proceeded non-interactively, so it ran.
+    // Warn/WarnAck — explicitly acknowledged with --yes, so it ran.
     assert!(
         v["action"] == "warn" || v["action"] == "warn_ack",
         "expected a warn action, got: {v}"
     );
-    assert_eq!(
-        v["running"], true,
-        "non-interactive warn proceeds, got: {v}"
-    );
+    assert_eq!(v["running"], true, "warn --yes proceeds, got: {v}");
     assert_eq!(v["refused"], false);
     // The warn finding is folded into the SAME object, not a separate document.
     let ids: Vec<String> = v["findings"]
@@ -14548,6 +15945,61 @@ fn commands_run_json_emits_single_object_when_warn() {
     assert!(
         ids.iter().any(|id| id == "shortened_url"),
         "the warn finding must be embedded in the single object, got ids: {ids:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn commands_run_json_no_tty_warn_refusal_is_one_object() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let marker = root.path().join("json-warn-command-ran");
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: warn\n    command: \"echo https://bit.ly/x > json-warn-command-ran\"\n",
+    );
+
+    let mut cmd = commands_tirith(root.path());
+    cmd.current_dir(root.path());
+    commands_without_controlling_terminal(&mut cmd);
+    let out = cmd
+        .args(["commands", "run", "warn", "--json"])
+        .output()
+        .expect("commands run warn --json without tty");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a refused Warn preserves its verdict exit code"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "refused Warn stdout must be exactly one JSON object ({error}); stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["name"], "warn");
+    assert_eq!(v["action"], "warn");
+    assert_eq!(v["running"], false);
+    assert_eq!(v["refused"], true);
+    let error = v["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("controlling-terminal confirmation is unavailable")
+            && error.contains("--yes"),
+        "JSON refusal must explain how to acknowledge intentionally, got: {v}"
+    );
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .filter_map(|finding| finding["rule_id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"shortened_url"),
+        "the refusal object must retain the warning findings, got: {v}"
+    );
+    assert!(
+        !marker.exists(),
+        "a no-TTY JSON warning refusal must not execute the command"
     );
 }
 
@@ -14827,7 +16279,7 @@ fn commands_run_audit_applies_operator_dlp_patterns() {
     // `<root>/.tirith/policy.yaml` via the cwd walk-up — not solely via TIRITH_POLICY_ROOT.
     let out = commands_tirith(root.path())
         .current_dir(root.path())
-        .args(["commands", "run", "emit"])
+        .args(["commands", "run", "emit", "--yes"])
         .output()
         .expect("commands run emit");
     assert_eq!(out.status.code(), Some(0), "clean allowed command runs");
@@ -18471,6 +19923,103 @@ fn fix_on_non_tty_guidance_exits_one_without_rerun_hint() {
 
 // ---- A2: scan coverage gaps, require_complete, and gap-action scoping ----
 
+#[test]
+fn scan_missing_positional_target_is_an_unconditional_cli_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let missing = tmp.path().join("deleted-scan-root");
+    let missing_arg = missing.display().to_string();
+
+    let out = tirith()
+        .args(["scan", "--format", "json", &missing_arg])
+        .output()
+        .expect("run scan with a missing positional target");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a missing explicitly requested target must fail even without --ci; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("path not found"),
+        "the operational error must identify the missing target: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn scan_missing_file_target_errors_before_exclusion_filters() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let missing = tmp.path().join("missing.txt");
+    let missing_arg = missing.display().to_string();
+
+    let out = tirith()
+        .args(["scan", "--file", &missing_arg, "--exclude", "*", "--ci"])
+        .output()
+        .expect("run scan --file with a missing excluded target");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "filters must not turn a missing explicit file into a successful no-op; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("file not found"),
+        "the operational error must identify the missing file: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_ci_fails_on_unreadable_ordinary_subtree_but_scans_readable_sibling() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("project");
+    let readable = project.join("readable");
+    let unreadable = project.join("ordinary-directory");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::create_dir_all(&readable).unwrap();
+    fs::create_dir_all(&unreadable).unwrap();
+    fs::write(readable.join("keep.md"), "safe control").unwrap();
+    fs::write(unreadable.join("hidden.md"), "hidden content").unwrap();
+
+    let original_mode = fs::metadata(&unreadable).unwrap().permissions().mode();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = tirith_in_proj(&project)
+        .args(["scan", "--ci", "--format", "json", "."])
+        .output()
+        .expect("run CI scan with an unreadable subtree");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(original_mode)).unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an enumeration failure must fail --ci regardless of directory name; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+    assert_eq!(json["analysis_incomplete"], true);
+    assert!(
+        json["coverage_gaps"].as_array().is_some_and(|gaps| {
+            gaps.iter().any(|gap| {
+                gap["kind"] == "enumeration_failed"
+                    && gap["location"]
+                        .as_str()
+                        .is_some_and(|location| location.contains("ordinary-directory"))
+            })
+        }),
+        "the failed subtree enumeration must remain visible: {json}"
+    );
+    assert_eq!(
+        json["scanned_count"], 1,
+        "the readable sibling must still be scanned: {json}"
+    );
+}
+
 /// A2 — `tirith scan --ci` with a repo-scoped `require_complete: true` over a
 /// tree containing an OVERSIZED PRIORITY file fails closed (exit 1) and the JSON
 /// reports `analysis_incomplete` with the oversized gap.
@@ -18925,7 +20474,7 @@ fn package_inspect_cross_distribution_attaches_to_loader_names_payload() {
 }
 
 #[test]
-fn package_inspect_sdist_is_unsupported_gap_exit_0() {
+fn package_inspect_sdist_unsupported_gap_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path();
     // A gzip-magic file named `.whl` would still sniff as gzip → Unsupported; here
@@ -18937,19 +20486,27 @@ fn package_inspect_sdist_is_unsupported_gap_exit_0() {
         .arg(&sdist)
         .output()
         .expect("run package inspect sdist");
-    // An sdist is Unsupported (a coverage gap), not a finding: clean exit 0.
+    // An sdist is Unsupported. On the enforcing artifact surface that coverage
+    // gap is material and therefore fails closed.
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "an unsupported sdist is a coverage gap, not a block; stderr:\n{}",
+        Some(1),
+        "an unsupported sdist must fail closed; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(json["action"], "block");
     assert!(
         json["coverage_gaps"]
             .as_array()
-            .is_some_and(|g| !g.is_empty()),
+            .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "unsupported")),
         "the sdist must be recorded as a coverage gap: {json}"
+    );
+    assert!(
+        json["findings"].as_array().is_some_and(|findings| findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "analysis_incomplete")),
+        "the unresolved artifact coverage must produce analysis_incomplete: {json}"
     );
 }
 
@@ -19116,6 +20673,63 @@ fn empty_path_dir(home: &std::path::Path) -> std::path::PathBuf {
     empty_bin
 }
 
+#[cfg(unix)]
+#[test]
+fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let attacker = tempfile::Builder::new()
+        .prefix("tirith-pkg-resolver-shadow-")
+        .tempdir_in(home::home_dir().expect("test account home"))
+        .expect("create same-UID non-transient resolver directory");
+    let bin = attacker.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let marker = attacker.path().join("counterfeit-resolver-executed");
+    let counterfeit_uv = bin.join("uv");
+    fs::write(
+        &counterfeit_uv,
+        format!(
+            "#!/bin/sh\n: > '{}'\nexit 97\n",
+            marker.display().to_string().replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&counterfeit_uv, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for action in ["approve", "install"] {
+        let state = tempfile::tempdir().unwrap();
+        let mut command = tirith();
+        command
+            .env("PATH", &bin)
+            .env("XDG_CONFIG_HOME", state.path().join("config"))
+            .env("XDG_DATA_HOME", state.path().join("data"))
+            .env("APPDATA", state.path().join("data"));
+        if action == "install" {
+            command.args(["pkg", action, "pip", "--yes", "examplepkg==1.0.0"]);
+        } else {
+            command.args(["pkg", action, "pip", "examplepkg==1.0.0"]);
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("run pkg {action}: {error}"));
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "pkg {action} must fail closed on resolver provenance: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("resolve failed") && stderr.contains("explicit `tirith pkg trust-tool"),
+            "pkg {action} must report the resolver trust boundary: {stderr}"
+        );
+    }
+    assert!(
+        !marker.exists(),
+        "neither pkg approve nor pkg install may execute an unenrolled PATH resolver"
+    );
+}
+
 /// `tirith pkg install pip <req>` on a host whose resolver toolchain is ABSENT must
 /// fail closed: a non-zero exit and a refusal message, never a clean success or a
 /// silent uncontained install. This is the real enforcing-surface negative path —
@@ -19205,13 +20819,24 @@ fn pkg_install_rejects_direct_url_before_tool_or_quarantine_effects() {
 #[test]
 fn pkg_install_pip_json_still_fails_closed_when_toolchain_absent() {
     let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("dedicated-target");
     let out = tirith()
         .env("PATH", empty_path_dir(home.path()))
         .env("XDG_DATA_HOME", home.path())
         .env("APPDATA", home.path())
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
-        .args(["pkg", "install", "pip", "requests==2.31.0", "--json"])
+        // Keep every Tirith-owned option after the requirement. This is the real
+        // parser boundary that trailing_var_arg previously swallowed.
+        .args([
+            "pkg",
+            "install",
+            "pip",
+            "requests==2.31.0",
+            "--target",
+            target.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .expect("failed to run tirith pkg install --json");
     assert_eq!(
@@ -19219,6 +20844,20 @@ fn pkg_install_pip_json_still_fails_closed_when_toolchain_absent() {
         Some(1),
         "pkg install --json must fail closed when the toolchain is absent; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "pkg install --json must emit exactly one parseable JSON document: {error}; stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error_phase"], "plan_preparation");
+    assert_eq!(json["target_executed"], false);
+    assert_eq!(json["target_published"], false);
+    assert!(
+        !target.exists(),
+        "an early structured refusal must not create the dedicated target"
     );
 }
 

@@ -28,6 +28,7 @@ pub mod env_guard;
 pub mod escalation;
 pub mod event_buffer;
 pub mod exec_provenance;
+pub mod execution_state;
 pub mod extract;
 pub mod homoglyph;
 pub mod hygiene;

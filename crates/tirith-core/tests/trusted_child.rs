@@ -4,16 +4,15 @@ use std::ffi::OsStr;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-#[cfg(target_os = "linux")]
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
-#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 #[cfg(not(target_os = "linux"))]
 use tirith_core::trusted_child::TrustedExecutableError;
 use tirith_core::trusted_child::{
-    run, sanitized_path, CaptureStream, ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable,
+    resolve_system_helper_on_path, run, sanitized_path, CaptureStream, ChildLimits, ChildOutcome,
+    ChildSpec, TrustedExecutable,
 };
 
 fn make_executable(path: &Path, body: &str) {
@@ -41,6 +40,28 @@ fn shell() -> TrustedExecutable {
         .expect("a system shell must be available")
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_is_running(pid: libc::pid_t) -> bool {
+    (unsafe { libc::kill(pid, 0) }) == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_running(pid: libc::pid_t) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected as libc::c_int,
+        )
+    };
+    read == expected as libc::c_int && unsafe { info.assume_init() }.pbi_status != libc::SZOMB
+}
+
 #[cfg(target_os = "linux")]
 fn process_is_running(pid: libc::pid_t) -> bool {
     if unsafe { libc::kill(pid, 0) } != 0 {
@@ -57,6 +78,22 @@ fn process_is_running(pid: libc::pid_t) -> bool {
         return true;
     };
     !after_name.starts_with("Z ")
+}
+
+fn assert_descendant_stopped(pid_file: &Path, context: &str) {
+    let pid: libc::pid_t = std::fs::read_to_string(pid_file)
+        .unwrap_or_else(|error| panic!("{context} did not publish a descendant PID: {error}"))
+        .trim()
+        .parse()
+        .expect("descendant PID must be numeric");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_running(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !process_is_running(pid),
+        "{context} descendant {pid} survived process-group cleanup"
+    );
 }
 
 #[test]
@@ -345,6 +382,99 @@ fn generic_trusted_lookup_preserves_versioned_absolute_paths() {
 
     let selected = TrustedExecutable::resolve_on_path("bash", &path, &[]).unwrap();
     assert_eq!(selected.path(), bash.canonicalize().unwrap());
+}
+
+#[test]
+fn system_helper_rejects_an_arbitrary_same_uid_path_shadow_without_execution() {
+    let home = home::home_dir().expect("test account home");
+    let temporary = tempfile::Builder::new()
+        .prefix("tirith-system-helper-shadow-")
+        .tempdir_in(home)
+        .unwrap();
+    let shadow_bin = temporary.path().join("shadow-bin");
+    std::fs::create_dir(&shadow_bin).unwrap();
+    let marker = temporary.path().join("shadow-executed");
+    let quoted_marker = marker.display().to_string().replace('\'', "'\"'\"'");
+    let shadow = shadow_bin.join("sh");
+    make_executable(
+        &shadow,
+        &format!("#!/bin/sh\nprintf executed > '{quoted_marker}'\n"),
+    );
+    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths([shadow_bin.as_path(), Path::new("/bin")]).unwrap();
+
+    let error = resolve_system_helper_on_path("sh", &path).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("untrusted executable provenance"),
+        "same-UID 0755 helper outside cwd/temp must fail provenance: {error}"
+    );
+    assert!(
+        !marker.exists(),
+        "rejecting a PATH shadow must not execute it"
+    );
+}
+
+#[test]
+fn system_helper_rejects_a_user_symlink_origin_to_a_system_binary() {
+    let home = home::home_dir().expect("test account home");
+    let temporary = tempfile::Builder::new()
+        .prefix("tirith-system-helper-link-")
+        .tempdir_in(home)
+        .unwrap();
+    let shadow_bin = temporary.path().join("shadow-bin");
+    std::fs::create_dir(&shadow_bin).unwrap();
+    symlink("/bin/sh", shadow_bin.join("sh")).unwrap();
+    let path = std::env::join_paths([shadow_bin.as_path(), Path::new("/bin")]).unwrap();
+
+    let error = resolve_system_helper_on_path("sh", &path).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("untrusted executable provenance"),
+        "canonical system target must not launder a same-UID selection origin: {error}"
+    );
+}
+
+#[test]
+fn system_helper_rejects_a_same_uid_per_user_nix_profile_without_execution() {
+    let home = home::home_dir().expect("test account home");
+    let temporary = tempfile::Builder::new()
+        .prefix("tirith-system-helper-nix-profile-")
+        .tempdir_in(home)
+        .unwrap();
+    let profile_bin = temporary.path().join(".nix-profile").join("bin");
+    std::fs::create_dir_all(&profile_bin).unwrap();
+    let marker = temporary.path().join("per-user-nix-helper-executed");
+    let quoted_marker = marker.display().to_string().replace('\'', "'\"'\"'");
+    let shadow = profile_bin.join("sh");
+    make_executable(
+        &shadow,
+        &format!("#!/bin/sh\nprintf executed > '{quoted_marker}'\n"),
+    );
+    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths([profile_bin.as_path(), Path::new("/bin")]).unwrap();
+
+    let error = resolve_system_helper_on_path("sh", &path).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("untrusted executable provenance"),
+        "same-UID per-user Nix profiles must fail provenance: {error}"
+    );
+    assert!(
+        !marker.exists(),
+        "rejecting a per-user Nix helper must not execute it"
+    );
+}
+
+#[test]
+fn system_helper_preserves_a_root_managed_system_binary() {
+    let path = std::env::join_paths([Path::new("/bin"), Path::new("/usr/bin")]).unwrap();
+    let shell = resolve_system_helper_on_path("sh", &path)
+        .expect("the canonical root-managed system shell must remain available");
+    assert!(shell.path().is_absolute());
 }
 
 #[test]
@@ -685,48 +815,83 @@ fn supervisor_enforces_the_capture_cap_before_retaining_excess() {
     ));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn supervisor_deadline_is_not_defeated_by_a_descendant_holding_stdout() {
+fn supervisor_success_is_not_defeated_by_a_descendant_holding_output_pipes() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("grandchild.pid");
-    let body = format!("sleep 30 & printf '%s' $! > '{}'", pid_file.display());
+    let body = format!(
+        "/bin/sleep 30 & printf '%s' $! > '{}'; exit 0",
+        pid_file.display()
+    );
     let args = [OsStr::new("-c"), OsStr::new(&body)];
-    // Leave enough startup budget for heavily loaded CI to execute the shell
-    // and publish the descendant PID before the deadline. The long-lived
-    // `sleep` still guarantees the timeout path rather than normal completion.
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(3), 64, 64));
+
+    let started = Instant::now();
+    let outcome = run(&shell(), &spec);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "successful direct exit waited for descendant-held pipe EOF"
+    );
+    match outcome {
+        ChildOutcome::Completed { status, .. } => assert!(status.success()),
+        other => panic!("immediate direct success was not preserved: {other:?}"),
+    }
+    assert_descendant_stopped(&pid_file, "successful direct exit");
+}
+
+#[test]
+fn supervisor_timeout_kills_a_descendant_holding_output_pipes() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("grandchild.pid");
+    let body = format!(
+        "/bin/sleep 30 & printf '%s' $! > '{}'; wait",
+        pid_file.display()
+    );
+    let args = [OsStr::new("-c"), OsStr::new(&body)];
     let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 64, 64));
 
     let started = Instant::now();
     let outcome = run(&shell(), &spec);
     assert!(
         started.elapsed() < Duration::from_secs(6),
-        "the wall deadline plus bounded process-group cleanup must remain finite"
+        "timeout plus process-tree and reader cleanup exceeded its hard bound"
     );
-    assert!(matches!(outcome, ChildOutcome::Timeout { .. }));
-
-    let pid: libc::pid_t = std::fs::read_to_string(pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    let mut alive = true;
-    for _ in 0..100 {
-        alive = process_is_running(pid);
-        if !alive {
-            break;
+    assert!(matches!(
+        outcome,
+        ChildOutcome::Timeout {
+            cleanup_succeeded: true
         }
-        // A killed grandchild can remain visible briefly as an orphaned zombie
-        // until the platform reaper collects it.
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        !alive,
-        "the descendant process must be terminated with its group"
-    );
+    ));
+    assert_descendant_stopped(&pid_file, "timeout");
 }
 
-#[cfg(target_os = "linux")]
+#[test]
+fn supervisor_output_cap_kills_a_descendant_holding_output_pipes() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("grandchild.pid");
+    let body = format!(
+        "/bin/sleep 30 & printf '%s' $! > '{}'; printf 12345; exit 0",
+        pid_file.display()
+    );
+    let args = [OsStr::new("-c"), OsStr::new(&body)];
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(3), 4, 64));
+
+    let started = Instant::now();
+    let outcome = run(&shell(), &spec);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "output-cap cleanup waited for descendant-held pipe EOF"
+    );
+    assert!(matches!(
+        outcome,
+        ChildOutcome::OutputLimitExceeded {
+            stream: CaptureStream::Stdout,
+            cleanup_succeeded: true
+        }
+    ));
+    assert_descendant_stopped(&pid_file, "output cap");
+}
+
 #[test]
 fn supervisor_cleans_up_a_descendant_after_the_parent_completed() {
     let temp = tempfile::tempdir().unwrap();
@@ -763,7 +928,6 @@ fn supervisor_cleans_up_a_descendant_after_the_parent_completed() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn parallel_supervisors_do_not_signal_unrelated_process_groups() {
     const WORKERS: usize = 12;

@@ -8,7 +8,16 @@ use std::path::PathBuf;
 
 const BEGIN_MARKER: &str = "# BEGIN tirith-hook v1";
 const END_MARKER: &str = "# END tirith-hook";
-const BEGIN_PREFIX: &str = "# BEGIN tirith-hook";
+const BEGIN_MARKER_STEM: &str = "# BEGIN tirith-hook v";
+
+/// Match only the managed marker grammar, while still recognizing a future
+/// numeric block version. Prefix-like user comments must remain user content.
+fn is_managed_begin_marker(line: &str) -> bool {
+    let Some(version) = line.strip_prefix(BEGIN_MARKER_STEM) else {
+        return false;
+    };
+    !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 /// Check whether a binary path needs quoting for shell interpolation.
 fn needs_quoting(s: &str) -> bool {
@@ -45,6 +54,9 @@ fn needs_quoting(s: &str) -> bool {
 /// Single-quote a path for safe shell interpolation (per-shell escaping for an
 /// embedded `'`). Returned unchanged when no special characters.
 pub(crate) fn shell_quote(path: &str, shell: &str) -> String {
+    if shell == "nushell" {
+        return crate::cli::init::nushell_string_literal(path);
+    }
     if !needs_quoting(path) {
         return path.to_string();
     }
@@ -147,7 +159,7 @@ fn has_executable_tirith_init(content: &str) -> bool {
 fn validate_marker_pairing(content: &str) -> Result<(), String> {
     let mut in_block = false;
     for line in content.lines() {
-        if line.starts_with(BEGIN_PREFIX) {
+        if is_managed_begin_marker(line) {
             if in_block {
                 return Err(
                     "corrupted tirith-hook block — nested BEGIN markers, fix manually".to_string(),
@@ -176,7 +188,7 @@ fn extract_managed_block(content: &str) -> Option<String> {
     let mut block_lines = Vec::new();
 
     for line in content.lines() {
-        if line.starts_with(BEGIN_PREFIX) {
+        if is_managed_begin_marker(line) {
             in_block = true;
             block_lines.push(line);
             continue;
@@ -231,22 +243,10 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
     let hook_line = match shell {
         "fish" => format!("{quoted_bin} init --shell fish | source"),
         "nushell" => {
-            // Nushell can't eval dynamically — resolve the source path at setup time.
-            match std::process::Command::new(tirith_bin)
-                .args(["init", "--shell", "nushell"])
-                .output()
-            {
-                Ok(out) if out.status.success() => {
-                    String::from_utf8_lossy(&out.stdout).trim().to_string()
-                }
-                _ => {
-                    return Err(
-                        "could not resolve nushell hook path — run `tirith init --shell nushell` \
-                         and add the output to your config.nu manually"
-                            .to_string(),
-                    );
-                }
-            }
+            // Nushell cannot eval dynamically. Resolve the same hook asset that
+            // `tirith init --shell nushell` would print without spawning a
+            // second Tirith process with inherited environment or unbounded I/O.
+            resolve_nushell_hook_line()?
         }
         "powershell" => {
             format!("Invoke-Expression (& {quoted_bin} init --shell powershell)")
@@ -264,7 +264,7 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
             let existing = snapshot.text(&profile_path)?.unwrap_or_default();
             let begin_count = existing
                 .lines()
-                .filter(|line| line.starts_with(BEGIN_PREFIX))
+                .filter(|line| is_managed_begin_marker(line))
                 .count();
 
             // A manually-added hook is an intentional opt-out from managed
@@ -353,6 +353,29 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
     Ok(())
 }
 
+fn resolve_nushell_hook_line() -> Result<String, String> {
+    let hook_dir = crate::cli::init::find_hook_dir().ok_or_else(|| {
+        "could not resolve nushell hook path — run `tirith init --shell nushell` and add the output to your config.nu manually"
+            .to_string()
+    })?;
+    nushell_hook_line_for_dir(&hook_dir)
+}
+
+fn nushell_hook_line_for_dir(hook_dir: &std::path::Path) -> Result<String, String> {
+    let hook_path = hook_dir.join("lib").join("nushell-hook.nu");
+    let hook_path_text = super::run_impl::path_to_utf8(&hook_path, "Nushell hook")?;
+    if !hook_path.is_file() {
+        return Err(format!(
+            "resolved nushell hook is missing or not a file: {}",
+            hook_path.display()
+        ));
+    }
+    Ok(format!(
+        "source {}",
+        shell_quote(&hook_path_text, "nushell")
+    ))
+}
+
 /// Remove all lines between BEGIN/END markers (inclusive). Caller MUST call
 /// `validate_marker_pairing` first — this does not re-validate, and unbalanced
 /// markers would drop trailing content.
@@ -361,7 +384,7 @@ fn remove_hook_blocks(content: &str) -> String {
     let mut suppressing = false;
 
     for line in content.lines() {
-        if line.starts_with(BEGIN_PREFIX) {
+        if is_managed_begin_marker(line) {
             suppressing = true;
             continue;
         }
@@ -384,6 +407,35 @@ fn remove_hook_blocks(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nushell_hook_line_uses_existing_hook_without_a_child_process() {
+        let root = tempfile::tempdir().unwrap();
+        let hook_dir = root.path().join("shell assets");
+        let lib = hook_dir.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let hook = lib.join("nushell-hook.nu");
+        std::fs::write(&hook, "# inert test hook\n").unwrap();
+
+        let line = nushell_hook_line_for_dir(&hook_dir).unwrap();
+        assert_eq!(
+            line,
+            format!("source {}", shell_quote(hook.to_str().unwrap(), "nushell"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nushell_hook_line_rejects_non_utf8_persisted_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"shell-\xff".to_vec());
+        let hook_dir = root.path().join(name);
+
+        let error = nushell_hook_line_for_dir(&hook_dir).unwrap_err();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -429,6 +481,20 @@ mod tests {
         assert_eq!(shell_quote("tirith", "zsh"), "tirith");
         assert_eq!(shell_quote("tirith", "fish"), "tirith");
         assert_eq!(shell_quote("tirith", "powershell"), "tirith");
+        assert_eq!(shell_quote("tirith", "nushell"), "\"tirith\"");
+    }
+
+    #[test]
+    fn quote_nushell_path_uses_double_quoted_nushell_escapes() {
+        assert_eq!(
+            shell_quote("/tmp/it's \\quoted\" #hook\n\t", "nushell"),
+            "\"/tmp/it's \\\\quoted\\\" #hook\\n\\t\""
+        );
+    }
+
+    #[test]
+    fn quote_nushell_path_encodes_other_control_characters() {
+        assert_eq!(shell_quote("a\u{001f}b", "nushell"), "\"a\\u{1f}b\"");
     }
 
     #[test]
@@ -524,6 +590,30 @@ mod tests {
     #[test]
     fn valid_no_blocks() {
         assert!(validate_marker_pairing("just content\n").is_ok());
+    }
+
+    #[test]
+    fn begin_marker_requires_an_exact_numeric_version_grammar() {
+        for line in [
+            "# BEGIN tirith-hook",
+            "# BEGIN tirith-hook migration notes",
+            "# BEGIN tirith-hook v",
+            "# BEGIN tirith-hook v1 notes",
+            "# BEGIN tirith-hook v1 ",
+            " # BEGIN tirith-hook v1",
+        ] {
+            assert!(!is_managed_begin_marker(line), "line={line:?}");
+        }
+        assert!(is_managed_begin_marker("# BEGIN tirith-hook v1"));
+        assert!(is_managed_begin_marker("# BEGIN tirith-hook v27"));
+    }
+
+    #[test]
+    fn prefix_like_comments_are_not_extracted_or_removed() {
+        let content = "# BEGIN tirith-hook v1 migration notes\nkeep this\n# END tirith-hook migration notes\n";
+        assert!(validate_marker_pairing(content).is_ok());
+        assert!(extract_managed_block(content).is_none());
+        assert_eq!(remove_hook_blocks(content), content);
     }
 
     #[test]

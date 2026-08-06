@@ -253,16 +253,18 @@ pub struct Policy {
 
     /// **M8 ch1** — `provider:context` → criticality map, populated by
     /// [`Policy::load_context_labels`] from user- and repo-scope label files
-    /// (repo wins). NOT serialized — labels live in their own file. Values:
+    /// (trusted user labels win; repo may only add or raise criticality). NOT
+    /// serialized — labels live in their own file. Values:
     /// `critical`/`production`/`prod`/`live`/`p0`/`p1` (case-insensitive).
     #[serde(skip)]
     pub context_labels: BTreeMap<String, String>,
 
     /// **M8 ch2** — `host` (or `user@host`) → criticality map for SSH, populated
-    /// by [`Policy::load_ssh_host_labels`] (repo wins). Matcher tries exact
-    /// `user@host` then bare host; `~/.ssh/config` aliases are resolved at label
-    /// time so the file stores the FINAL hostname. Only critical/prod-tier values
-    /// fire the rule; others document the inventory without enforcing.
+    /// by [`Policy::load_ssh_host_labels`] with the same trusted precedence.
+    /// Matcher evaluates exact `user@host` and bare host labels together, with
+    /// any critical value taking precedence; `~/.ssh/config` aliases are
+    /// resolved at label time so the file stores the FINAL hostname. Only
+    /// critical/prod-tier values fire the rule; others document the inventory.
     #[serde(skip)]
     pub ssh_host_labels: BTreeMap<String, String>,
 
@@ -839,7 +841,10 @@ impl ScanPolicyConfig {
     }
 
     /// Effective action for an arbitrary coverage-gap kind, mapping each kind to
-    /// its configured action. A `Panicked`, `Truncated`, `HashBudgetExceeded`, or
+    /// its configured action. An `EnumerationFailed` gap uses the unreadable-file
+    /// bucket because the filesystem could not be read, although scan result
+    /// assembly independently floors enumeration failures at Warn. A `Panicked`,
+    /// `Truncated`, `HashBudgetExceeded`, or
     /// any archive coverage-limit gap (`EntryCountCapped`, `TotalBytesCapped`,
     /// `CompressionRatioExceeded`, `MemberTooLarge`, `NativeTruncated`) has no
     /// dedicated key; it is treated as an oversized-class gap (the most
@@ -859,7 +864,7 @@ impl ScanPolicyConfig {
             | K::CompressionRatioExceeded
             | K::MemberTooLarge
             | K::NativeTruncated => self.oversized_action(),
-            K::Unreadable => self.unreadable_action(),
+            K::Unreadable | K::EnumerationFailed => self.unreadable_action(),
             K::Unsupported | K::UnsupportedCompression => self.unsupported_action(),
         }
     }
@@ -1130,6 +1135,13 @@ pub struct PackagePolicy {
 }
 
 impl PackagePolicy {
+    /// Package-age warning window. `None` preserves the shipped 30-day risk
+    /// baseline rather than disabling the warning path.
+    pub fn warn_newer_than_days_effective(&self) -> u32 {
+        self.warn_newer_than_days
+            .unwrap_or(crate::package_risk::VERY_NEW_PACKAGE_DAYS as u32)
+    }
+
     /// Aggregate-score Block threshold (override or baseline 76).
     pub fn block_aggregate_score_effective(&self) -> u32 {
         self.block_aggregate_score
@@ -1188,6 +1200,60 @@ pub(crate) struct ParsedPolicyDocument {
     pub(crate) policy: Policy,
 }
 
+/// The migrated repository document retained alongside its default-filled
+/// [`Policy`]. Serde defaults deliberately make ordinary policy loading easy,
+/// but a tightening overlay must distinguish an omitted field (no opinion)
+/// from an explicitly supplied default-valued field (for example an explicit
+/// `warn_install_script_network_call: true`).
+struct RepoPolicyDocument {
+    migrated: Option<serde_yaml::Value>,
+    parse_failed: bool,
+}
+
+impl RepoPolicyDocument {
+    fn parsed(migrated: serde_yaml::Value) -> Self {
+        Self {
+            migrated: Some(migrated),
+            parse_failed: false,
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            migrated: None,
+            parse_failed: true,
+        }
+    }
+
+    fn top_value(&self, key: &str) -> Option<&serde_yaml::Value> {
+        self.migrated
+            .as_ref()?
+            .as_mapping()?
+            .get(serde_yaml::Value::String(key.to_string()))
+    }
+
+    fn top_present(&self, key: &str) -> bool {
+        self.top_value(key).is_some()
+    }
+
+    fn top_bool(&self, key: &str) -> Option<bool> {
+        self.top_value(key)?.as_bool()
+    }
+
+    fn package_present(&self, key: &str) -> bool {
+        self.top_value("package_policy")
+            .and_then(serde_yaml::Value::as_mapping)
+            .is_some_and(|mapping| mapping.contains_key(serde_yaml::Value::String(key.to_string())))
+    }
+
+    fn package_bool(&self, key: &str) -> Option<bool> {
+        self.top_value("package_policy")?
+            .as_mapping()?
+            .get(serde_yaml::Value::String(key.to_string()))?
+            .as_bool()
+    }
+}
+
 /// Failure stage for the shared policy document pipeline.
 #[derive(Debug)]
 pub(crate) enum PolicyDocumentError {
@@ -1223,10 +1289,10 @@ impl Policy {
         Ok(ParsedPolicyDocument { migrated, policy })
     }
 
-    /// Discover and load partial policy (bypass + fail_mode), for the tier-2
-    /// fast bypass path. Same resolution order as full discovery, and M11 ch5
-    /// incident overrides are applied here too so a `TIRITH=0` bypass honors an
-    /// active incident.
+    /// Discover local policy plus runtime incident overrides without contacting
+    /// the configured remote policy service or loading read-only list overlays.
+    /// This is suitable only for local diagnostics and compatibility tests. An
+    /// enforcement or bypass decision must use [`Self::discover`] instead.
     pub fn discover_partial(cwd: Option<&str>) -> Self {
         let mut p = Self::discover_local(cwd);
         p.apply_runtime_overrides();
@@ -1264,58 +1330,77 @@ impl Policy {
     fn discover_resolved(cwd: Option<&str>) -> Self {
         let local = Self::discover_local(cwd);
 
-        // F8 — track the ORIGIN of each connection field so an ambient
-        // (env-sourced) key is never paired with a server URL that came from a
-        // REPO-scoped policy. After F9 a repo's `policy_server_url` is already
-        // `None`, so the fallback below cannot select a repo URL; this is the
-        // explicit belt-and-suspenders guard. `true` = ambient env origin.
+        // Treat the endpoint and credential as one provenance-aware pair. In
+        // particular, an environment-selected origin must never inherit a
+        // stored user/org credential: changing only TIRITH_SERVER_URL would
+        // otherwise send that credential to an attacker-selected public host.
         let url_from_env = std::env::var("TIRITH_SERVER_URL")
             .ok()
             .filter(|s| !s.is_empty());
-        let server_url_is_env = url_from_env.is_some();
-        let server_url = url_from_env.or_else(|| local.policy_server_url.clone());
-
         let key_from_env = std::env::var("TIRITH_API_KEY")
             .ok()
             .filter(|s| !s.is_empty());
-        let api_key_is_env = key_from_env.is_some();
-        let api_key = key_from_env.or_else(|| local.policy_server_api_key.clone());
-
-        let (server_url, api_key) = match (server_url, api_key) {
-            (Some(u), Some(k)) => (u, k),
-            _ => return local,
+        let (server_url, api_key) = match (url_from_env, key_from_env) {
+            // A complete ambient pair is operator-controlled as one unit.
+            (Some(url), Some(key)) => (url, key),
+            // Never reuse a file credential after an ambient origin change.
+            (Some(_), None) => {
+                eprintln!(
+                    "tirith: warning: TIRITH_SERVER_URL requires a paired TIRITH_API_KEY; refusing to reuse a stored policy credential"
+                );
+                return local;
+            }
+            // An ambient secret may authenticate to a trusted user/org URL, but
+            // never to a repository-sourced URL. Repo URL fields are already
+            // sanitized; retain this explicit belt-and-suspenders check.
+            (None, Some(key)) => {
+                if local.scope == PolicyScope::Repo {
+                    eprintln!(
+                        "tirith: warning: refusing to send ambient TIRITH_API_KEY to a repo-scoped policy_server_url; using local policy"
+                    );
+                    return local;
+                }
+                let Some(url) = local.policy_server_url.clone() else {
+                    return local;
+                };
+                (url, key)
+            }
+            // A stored key remains bound to the stored endpoint selected from
+            // the same trusted policy document.
+            (None, None) => match (
+                local.policy_server_url.clone(),
+                local.policy_server_api_key.clone(),
+            ) {
+                (Some(url), Some(key)) => (url, key),
+                _ => return local,
+            },
         };
-
-        // F8 guard: an AMBIENT env key must only authenticate to a server URL
-        // that is itself operator-controlled — env-sourced, OR a non-repo local
-        // scope. A URL drawn from a repo-scoped policy paired with an ambient
-        // key would leak that key to repo-controlled infrastructure; refuse and
-        // fall back to the local policy (no fetch).
-        if api_key_is_env && !server_url_is_env && local.scope == PolicyScope::Repo {
-            eprintln!(
-                "tirith: warning: refusing to send ambient TIRITH_API_KEY to a repo-scoped policy_server_url; using local policy"
-            );
-            return local;
-        }
 
         let fail_mode = local.policy_fetch_fail_mode.as_deref().unwrap_or("open");
 
         match crate::policy_client::fetch_remote_policy(&server_url, &api_key) {
             Ok(yaml) => {
-                let _ = cache_remote_policy(&yaml);
                 // Migrations run on remote YAML the same as local (M5.5 F3).
                 match Self::try_parse_yaml(&yaml) {
                     Ok(mut p) => {
+                        // Never replace a known-good cache with malformed remote
+                        // bytes. The envelope is also bound to this exact
+                        // endpoint/credential identity.
+                        if let Err(error) = cache_remote_policy(&server_url, &api_key, &yaml) {
+                            eprintln!(
+                                "tirith: warning: could not cache validated remote policy: {error}"
+                            );
+                        }
                         p.path = Some(format!("remote:{server_url}"));
                         // F8/F9 — a remote-server policy is operator-controlled
                         // (trusted); stamp Remote so it is never sanitized as a repo.
                         p.scope = PolicyScope::Remote;
                         // Retain connection details so audit upload can reuse them.
                         if p.policy_server_url.is_none() {
-                            p.policy_server_url = Some(server_url);
+                            p.policy_server_url = Some(server_url.clone());
                         }
                         if p.policy_server_api_key.is_none() {
-                            p.policy_server_api_key = Some(api_key);
+                            p.policy_server_api_key = Some(api_key.clone());
                         }
                         p
                     }
@@ -1330,7 +1415,7 @@ impl Policy {
                             eprintln!(
                                 "tirith: warning: remote policy parse error ({e}), trying cache"
                             );
-                            match load_cached_remote_policy() {
+                            match load_cached_remote_policy(&server_url, &api_key) {
                                 Some(p) => p,
                                 None => {
                                     eprintln!(
@@ -1359,7 +1444,7 @@ impl Policy {
                 }
                 "cached" => {
                     eprintln!("tirith: warning: remote policy fetch failed ({e}), trying cache");
-                    match load_cached_remote_policy() {
+                    match load_cached_remote_policy(&server_url, &api_key) {
                         Some(p) => p,
                         None => {
                             eprintln!("tirith: warning: no cached remote policy, using local");
@@ -1377,31 +1462,199 @@ impl Policy {
         }
     }
 
-    /// Discover local policy only (no remote fetch). Stamps [`Self::scope`] from
-    /// the discovery BRANCH (F8/F9) and, when that branch is
-    /// [`PolicyScope::Repo`], neutralizes the loaded policy down to
-    /// tightening-only via [`Self::sanitize_repo_scoped`] — a repo checkout is
-    /// attacker-controllable, so it may add restrictions but never relax,
-    /// suppress, or exfil.
+    /// Discover local policy only (no remote fetch). An operator-controlled org
+    /// policy, user policy, or the built-in defaults is always loaded first as
+    /// the trusted baseline. A distinct repository policy is then sanitized and
+    /// merged only through [`Self::merge_repo_tightening`]. This prevents the
+    /// mere presence of `.tirith/policy.yaml` from shadowing trusted settings or
+    /// suppressing the baseline's remote-policy configuration.
     fn discover_local(cwd: Option<&str>) -> Self {
-        match discover_local_policy_path_scoped(cwd) {
+        let trusted = discover_trusted_local_policy_path_scoped();
+        let trusted_path = trusted.as_ref().map(|(path, _)| path.clone());
+        let mut baseline = match trusted {
             Some((path, scope)) => {
-                let mut p = Self::load_from_path(&path);
-                p.scope = scope;
-                // F9 — default-deny on the untrusted (repo) branch ONLY. Org/User
-                // are operator-controlled and honored in full. Runs right after
-                // load so the policy.yaml suppression/bypass/exfil fields are
-                // neutralized before any caller sees the policy. (The parallel
-                // repo flat-file suppression channel is closed in
-                // [`Self::load_org_lists`]; the repo `.tirith/trust.json` overlay
-                // is no longer auto-honored by [`Self::load_trust_entries`] — only
-                // the user-scope trust store is merged.)
-                if scope == PolicyScope::Repo {
-                    p.sanitize_repo_scoped();
-                }
-                p
+                let mut policy = Self::load_from_path(&path);
+                policy.scope = scope;
+                policy
             }
             None => Policy::default(),
+        };
+
+        if let Some(repo_path) = discover_policy_path(cwd) {
+            // TIRITH_POLICY_ROOT may intentionally point at this checkout. Do
+            // not parse and append the same document a second time under a
+            // different scope.
+            if trusted_path.as_ref() != Some(&repo_path) {
+                let (mut repo, document) = Self::load_from_path_with_document(&repo_path);
+                repo.scope = PolicyScope::Repo;
+                // A named but unreadable or malformed repository policy has
+                // already been converted to the explicit catch-all fail-closed
+                // policy. Do not turn that parse failure into a partial overlay
+                // whose fields depend on serde defaults.
+                if document.parse_failed {
+                    return repo;
+                }
+                // F9 — neutralize weakening, suppression, exfiltration, and
+                // remote-redirection fields before the total monotonic merge.
+                repo.sanitize_repo_scoped();
+                baseline.merge_repo_tightening(repo, &document);
+            }
+        }
+        baseline
+    }
+
+    /// Merge a sanitized repository policy into a trusted baseline without
+    /// replacing any trusted field. This destructures [`Policy`] without `..` as
+    /// a production compile-time tripwire: adding a field makes this function
+    /// fail to compile until its trust-boundary semantics are classified.
+    fn merge_repo_tightening(&mut self, repo: Policy, document: &RepoPolicyDocument) {
+        let Policy {
+            path,
+            scope: _,
+            schema_version: _,
+            fail_mode,
+            allow_bypass_env,
+            allow_bypass_env_noninteractive,
+            paranoia,
+            severity_overrides: _,
+            additional_known_domains: _,
+            allowlist: _,
+            blocklist,
+            approval_rules,
+            network_deny,
+            network_allow: _,
+            webhooks: _,
+            checkpoints: _,
+            scan,
+            allowlist_rules: _,
+            custom_rules,
+            dlp_custom_patterns: _,
+            injection_seeds_custom,
+            mcp_redact_injection: _,
+            strict_warn: _,
+            action_overrides,
+            escalation,
+            policy_server_url: _,
+            policy_server_api_key: _,
+            policy_fetch_fail_mode: _,
+            enforce_fail_mode: _,
+            threat_intel: _,
+            package_policy,
+            agent_rules,
+            share,
+            context_guard_enabled: _,
+            context_destructive_verbs,
+            context_labels: _,
+            ssh_host_labels: _,
+            iac_require_plan_before_apply: _,
+            sudo_require_reason: _,
+            sudo_session_ttl: _,
+            env_guard_enabled: _,
+            env_guard_sensitive_vars,
+            exec_guard_enabled: _,
+            hooks_guard_enabled: _,
+            baseline_enabled: _,
+            allowed_install_domains: _,
+            gateway_profile,
+            neutralized_fields,
+        } = repo;
+
+        let baseline_was_default = self.scope == PolicyScope::Default;
+
+        // Scalars are combined only in the restrictive direction. Sanitization
+        // forces the repo bypass/redaction flags off and the default-on context
+        // guard on, so these boolean operations cannot weaken the baseline.
+        if document.top_present("fail_mode") && fail_mode == FailMode::Closed {
+            self.fail_mode = FailMode::Closed;
+        }
+        // Any repo declaration of a bypass field is merged only after repo-scope
+        // sanitization has forced it off. Omission remains a true no-op.
+        if document.top_present("allow_bypass_env") {
+            self.allow_bypass_env &= allow_bypass_env;
+        }
+        if document.top_present("allow_bypass_env_noninteractive") {
+            self.allow_bypass_env_noninteractive &= allow_bypass_env_noninteractive;
+        }
+        if document.top_present("paranoia") {
+            self.paranoia = self.paranoia.max(paranoia);
+        }
+        // These default-valued scalars must only participate when the repo
+        // actually declared them. Otherwise an empty repo policy would silently
+        // rewrite a trusted operator's choices.
+        if document.top_bool("mcp_redact_injection") == Some(false) {
+            self.mcp_redact_injection = false;
+        }
+        if document.top_bool("strict_warn") == Some(true) {
+            self.strict_warn = true;
+        }
+        if document.top_bool("context_guard_enabled") == Some(true) {
+            self.context_guard_enabled = true;
+        }
+        if document.top_bool("iac_require_plan_before_apply") == Some(true) {
+            self.iac_require_plan_before_apply = true;
+        }
+        if document.top_bool("env_guard_enabled") == Some(true) {
+            self.env_guard_enabled = true;
+        }
+        if document.top_bool("exec_guard_enabled") == Some(true) {
+            self.exec_guard_enabled = true;
+        }
+        if document.top_bool("hooks_guard_enabled") == Some(true) {
+            self.hooks_guard_enabled = true;
+        }
+        if document.top_present("gateway_profile") && gateway_profile.is_some() {
+            self.gateway_profile = gateway_profile;
+        }
+
+        extend_unique(&mut self.blocklist, blocklist);
+        extend_unique(&mut self.network_deny, network_deny);
+        extend_unique(&mut self.injection_seeds_custom, injection_seeds_custom);
+        extend_unique(&mut self.env_guard_sensitive_vars, env_guard_sensitive_vars);
+        merge_string_vec_map(
+            &mut self.context_destructive_verbs,
+            context_destructive_verbs,
+        );
+        extend_unique(
+            &mut self.share.customer_id_patterns,
+            share.customer_id_patterns,
+        );
+
+        // These rule forms only add an enforcement decision. They are appended
+        // rather than keyed replacement so a repo can never erase a trusted
+        // rule with a colliding identifier.
+        // Repository approval rules may match before a trusted rule. Clamp
+        // their timeout fallback to the most restrictive outcome so ordering
+        // can never turn a trusted block fallback into allow/warn execution.
+        self.approval_rules
+            .extend(approval_rules.into_iter().map(|mut rule| {
+                rule.fallback = "block".to_string();
+                rule
+            }));
+        self.custom_rules.extend(custom_rules);
+        self.escalation.extend(escalation);
+        self.agent_rules.allow.extend(agent_rules.allow);
+        self.agent_rules.deny.extend(agent_rules.deny);
+        for (rule_id, action) in action_overrides {
+            if action == "block" {
+                self.action_overrides.insert(rule_id, action);
+            }
+        }
+
+        merge_repo_scan_tightening(&mut self.scan, scan);
+        merge_repo_package_tightening(&mut self.package_policy, package_policy, document);
+
+        for field in neutralized_fields {
+            if !self.neutralized_fields.contains(&field) {
+                self.neutralized_fields.push(field);
+            }
+        }
+
+        // With no org/user document, retain repo provenance for diagnostics.
+        // Otherwise the trusted baseline's path/scope remain authoritative,
+        // especially for remote URL/key provenance.
+        if baseline_was_default {
+            self.path = path;
+            self.scope = PolicyScope::Repo;
         }
     }
 
@@ -1425,11 +1678,11 @@ impl Policy {
     /// * `context_guard_enabled` — `false` disables the M8 operational-context
     ///   destructive-command guard (`rules::context`/`container`/`iac`
     ///   early-return). Pure suppression.
-    /// * `package_policy` — demote/silence supply-chain findings
-    ///   (`install_txn`): `block_dependency_confusion`/
-    ///   `warn_install_script_network_call` flips, raised
-    ///   `block_aggregate_score`/`warn_aggregate_score`/`block_osv_min_cvss`.
-    ///   Several fire OFFLINE (typosquat distance, aggregate score).
+    /// * weakening `package_policy` values are clamped field-by-field:
+    ///   `block_dependency_confusion`/`warn_install_script_network_call` cannot
+    ///   be disabled, and aggregate/CVSS thresholds cannot be raised above the
+    ///   shipping baseline. Tightening package values remain eligible for the
+    ///   later monotonic merge.
     /// * `threat_intel` — `osv_enabled`/`deps_dev_enabled: false` disable
     ///   advisory lookups (`threatdb_api`); also a home for planted API keys.
     /// * `allowed_install_domains` — listing the attacker's host DOWNGRADES
@@ -1448,11 +1701,14 @@ impl Policy {
     /// * `custom_rules` — only ADD detections.
     /// * `paranoia` — `retain_by_paranoia` keeps Medium+ at any tier; raising it
     ///   keeps MORE Info/Low. A lower value is never weaker than the default 1.
-    /// * `strict_warn`, the M8/M9 guard toggles (`iac_require_plan_before_apply`,
-    ///   `sudo_require_reason`, `env_guard_enabled`, `exec_guard_enabled`,
-    ///   `hooks_guard_enabled`, `baseline_enabled`) — default `false`/off; a repo
-    ///   can only turn them ON, which adds rules. `context_destructive_verbs`,
-    ///   `env_guard_sensitive_vars` only WIDEN the destructive/sensitive sets.
+    /// * `strict_warn` and the monotonic M8/M9 guard toggles
+    ///   (`iac_require_plan_before_apply`, `env_guard_enabled`,
+    ///   `exec_guard_enabled`, `hooks_guard_enabled`) — default `false`/off; a
+    ///   repo can only turn them ON, which adds rules.
+    ///   `context_destructive_verbs`, `env_guard_sensitive_vars` only WIDEN the
+    ///   destructive/sensitive sets. `sudo_require_reason` and
+    ///   `baseline_enabled` are reset because they respectively downgrade sudo
+    ///   findings and enable persistent observation writes.
     /// * `agent_rules` — `deny` tightens; `allow` is NOT a bypass (escalation.rs).
     /// * `checkpoints`, `sudo_session_ttl`, `scan.additional_config_files`/
     ///   `mcp_allowed_tools` — retention/coverage/tightening, never a guard relax.
@@ -1564,13 +1820,22 @@ impl Policy {
         // that defaults ON, demote/silence supply-chain findings, disable threat
         // lookups, or downgrade a paste-source mismatch by self-listing its host.
         record!("context_guard_enabled", context_guard_enabled);
-        record!("package_policy", package_policy);
         record!("threat_intel", threat_intel);
         record!("allowed_install_domains", allowed_install_domains);
         self.context_guard_enabled = defaults.context_guard_enabled;
-        self.package_policy = defaults.package_policy.clone();
+        if sanitize_repo_package_tightening(&mut self.package_policy) {
+            neutralized.push("package_policy");
+        }
         self.threat_intel = defaults.threat_intel.clone();
         self.allowed_install_domains = defaults.allowed_install_domains.clone();
+
+        // These opt-ins are not monotonic repo restrictions. A reasoned sudo
+        // session downgrades findings, while baseline learning writes persistent
+        // observations. Preserve the trusted operator's scalar choices.
+        record!("sudo_require_reason", sudo_require_reason);
+        record!("baseline_enabled", baseline_enabled);
+        self.sudo_require_reason = defaults.sudo_require_reason;
+        self.baseline_enabled = defaults.baseline_enabled;
 
         // MCP / scan suppression — a `trusted_mcp_servers` identity silences the four
         // MCP config rules + drift; `ignore_patterns`/`fail_on`/`profiles` suppress
@@ -1746,18 +2011,84 @@ impl Policy {
         format!("{:x}", h.finalize())
     }
 
+    /// Exact, in-memory identity for an execution decision.
+    ///
+    /// Unlike [`Self::security_projection_hash`], this deliberately binds the
+    /// VALUES of every serialized policy field, plus the decision-relevant
+    /// fields that serde omits. Only the resulting digest is persisted. That
+    /// lets the execution gate distinguish policies whose redacted receipt
+    /// projection is intentionally identical (for example, two custom-rule
+    /// lists of the same length) without writing rule text, tenant labels, or
+    /// credentials into execution state.
+    pub(crate) fn execution_identity_hash(&self) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+
+        let secret_hash = |value: Option<&str>| {
+            value.map(|value| {
+                let mut digest = Sha256::new();
+                digest.update(value.as_bytes());
+                format!("{:x}", digest.finalize())
+            })
+        };
+        let serialized = serde_json::to_value(self)
+            .map_err(|error| format!("serialize exact execution policy identity: {error}"))?;
+        let identity = serde_json::json!({
+            "schema": 1,
+            "policy": serialized,
+            "scope": self.scope.as_str(),
+            "context_labels": self.context_labels,
+            "ssh_host_labels": self.ssh_host_labels,
+            // These credentials are skipped by Policy serialization. Their
+            // presence/value can still change live threat-intel behaviour, so
+            // bind a one-way digest without placing the credential in the
+            // canonical JSON even transiently.
+            "google_safe_browsing_key_sha256":
+                secret_hash(self.threat_intel.google_safe_browsing_key.as_deref()),
+            "abusech_auth_key_sha256":
+                secret_hash(self.threat_intel.abusech_auth_key.as_deref()),
+        });
+        let canonical = crate::audit::canonical_json_for_hash(&identity);
+        let mut digest = Sha256::new();
+        digest.update(canonical.as_bytes());
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
     /// Return a fail-closed policy that blocks everything.
     fn fail_closed_policy() -> Self {
         Policy {
             fail_mode: FailMode::Closed,
             allow_bypass_env: false,
             allow_bypass_env_noninteractive: false,
+            // `fail_mode` is consumed by several subsystem-specific callers but
+            // is not, by itself, an engine verdict. Carry an unsuppressible
+            // all-input rule so ordinary Exec/Paste/FileScan enforcement cannot
+            // turn an unavailable or invalid effective policy into a clean
+            // Allow. The finding has no URL evidence, so URL allowlists cannot
+            // remove it; the returned policy also has no severity overrides.
+            custom_rules: vec![CustomRule {
+                id: "tirith-effective-policy-unavailable".to_string(),
+                pattern: Some("(?s).*".to_string()),
+                when: None,
+                context: vec!["exec".to_string(), "paste".to_string(), "file".to_string()],
+                severity: Severity::High,
+                title: "Effective policy is unavailable".to_string(),
+                description: "Tirith cannot validate the configured effective policy; fail-closed enforcement refuses the operation.".to_string(),
+                action: Some(crate::verdict::Action::Block),
+            }],
             path: Some("fail-closed".into()),
             ..Default::default()
         }
     }
 
     fn load_from_path(path: &Path) -> Self {
+        Self::load_from_path_with_document(path).0
+    }
+
+    /// Load once and retain the migrated document for repository-overlay
+    /// presence checks. Returning the document from the same bounded,
+    /// no-follow read avoids a second-read TOCTOU between policy values and the
+    /// field-presence decisions that govern their merge.
+    fn load_from_path_with_document(path: &Path) -> (Self, RepoPolicyDocument) {
         // Read via the no-follow, size-capped reader (mirrors `merge_context_labels`
         // / repo_hooks / scan). The matched file may be an attacker-controlled repo
         // `.tirith/policy.yaml`, consumed HERE — BEFORE `scope == Repo` sanitization
@@ -1775,7 +2106,7 @@ impl Policy {
                     "tirith: warning: cannot read policy at {}: {e:?}",
                     path.display()
                 );
-                return Self::fail_closed_policy();
+                return (Self::fail_closed_policy(), RepoPolicyDocument::failed());
             }
         };
         let content = match String::from_utf8(bytes) {
@@ -1785,20 +2116,28 @@ impl Policy {
                     "tirith: warning: policy at {} is not valid UTF-8: {e}",
                     path.display()
                 );
-                return Self::fail_closed_policy();
+                return (Self::fail_closed_policy(), RepoPolicyDocument::failed());
             }
         };
         let source = path.display().to_string();
-        match Self::try_parse_yaml(&content) {
-            Ok(mut p) => {
-                p.path = Some(source);
-                p
+        match Self::parse_document(&content)
+            .map_err(|error| error.to_string())
+            .and_then(|document| {
+                Self::validate_loaded_policy(&document.policy)?;
+                Ok(document)
+            }) {
+            Ok(ParsedPolicyDocument {
+                migrated,
+                mut policy,
+            }) => {
+                policy.path = Some(source);
+                (policy, RepoPolicyDocument::parsed(migrated))
             }
             Err(e) => {
                 eprintln!("tirith: warning: policy load failed at {source}: {e}");
                 // Same logic: a parse failure on a named policy file hides the
                 // operator's config — fail closed, don't silently revert to open.
-                Self::fail_closed_policy()
+                (Self::fail_closed_policy(), RepoPolicyDocument::failed())
             }
         }
     }
@@ -1810,6 +2149,11 @@ impl Policy {
         let ParsedPolicyDocument { policy, .. } =
             Self::parse_document(content).map_err(|error| error.to_string())?;
 
+        Self::validate_loaded_policy(&policy)?;
+        Ok(policy)
+    }
+
+    fn validate_loaded_policy(policy: &Policy) -> Result<(), String> {
         // Enforce the pattern-XOR-when invariant at LOAD time (CodeRabbit M13
         // R3): a both/neither rule is a silent no-op, so reject the whole policy
         // here — the single chokepoint every load path routes through.
@@ -1825,7 +2169,7 @@ impl Policy {
                 .map_err(|e| format!("custom_rules[{idx}] (id '{}'): {e}", rule.id))?;
         }
 
-        Ok(policy)
+        Ok(())
     }
 
     /// Load a policy from YAML text, running migrations first. Public so tests
@@ -1936,29 +2280,47 @@ impl Policy {
         })
     }
 
-    /// **M8 ch1** — merge user- then repo-scope context-label files (repo wins)
-    /// into `context_labels`. Flat YAML map `provider:context: criticality`;
-    /// missing/empty files are fine, parse errors are diagnosed and skipped.
+    /// **M8 ch1** — merge user- then repo-scope context-label files into
+    /// `context_labels`. User labels win conflicts; a repository may only add an
+    /// unknown key or raise an existing noncritical label to a critical class.
+    /// Flat YAML map `provider:context: criticality`; missing/empty files are
+    /// fine, parse errors are diagnosed and skipped.
     pub fn load_context_labels(&mut self, cwd: Option<&str>) {
         if let Some(user_path) = user_context_labels_path() {
-            merge_context_labels(&user_path, &mut self.context_labels);
+            merge_context_labels(
+                &user_path,
+                &mut self.context_labels,
+                LabelMergeMode::Trusted,
+            );
         }
         if let Some(repo_root) = find_repo_root(cwd) {
             let repo_path = repo_root.join(".tirith").join("context-labels.yaml");
-            merge_context_labels(&repo_path, &mut self.context_labels);
+            merge_context_labels(
+                &repo_path,
+                &mut self.context_labels,
+                LabelMergeMode::RepoTightening,
+            );
         }
     }
 
-    /// **M8 ch2** — merge user- then repo-scope SSH host-label files (repo wins)
-    /// into `ssh_host_labels`. Flat YAML map `host: criticality` (host may carry
-    /// a `user@` prefix; lookup is exact with bare-host fallback).
+    /// **M8 ch2** — merge user- then repo-scope SSH host-label files with the
+    /// same trusted-precedence rule. Flat YAML map `host: criticality` (host may
+    /// carry a `user@` prefix; lookup is exact with bare-host fallback).
     pub fn load_ssh_host_labels(&mut self, cwd: Option<&str>) {
         if let Some(user_path) = user_ssh_host_labels_path() {
-            merge_context_labels(&user_path, &mut self.ssh_host_labels);
+            merge_context_labels(
+                &user_path,
+                &mut self.ssh_host_labels,
+                LabelMergeMode::TrustedSsh,
+            );
         }
         if let Some(repo_root) = find_repo_root(cwd) {
             let repo_path = repo_root.join(".tirith").join("ssh-host-labels.yaml");
-            merge_context_labels(&repo_path, &mut self.ssh_host_labels);
+            merge_context_labels(
+                &repo_path,
+                &mut self.ssh_host_labels,
+                LabelMergeMode::RepoSshTightening,
+            );
         }
     }
 
@@ -2260,6 +2622,239 @@ fn normalize_exact_url(value: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
+fn extend_unique<T: PartialEq>(baseline: &mut Vec<T>, overlay: Vec<T>) {
+    for value in overlay {
+        if !baseline.contains(&value) {
+            baseline.push(value);
+        }
+    }
+}
+
+fn merge_string_vec_map(
+    baseline: &mut HashMap<String, Vec<String>>,
+    overlay: HashMap<String, Vec<String>>,
+) {
+    for (key, values) in overlay {
+        extend_unique(baseline.entry(key).or_default(), values);
+    }
+}
+
+fn merge_gap_action(baseline: &mut Option<GapAction>, overlay: Option<GapAction>) {
+    let Some(overlay) = overlay else { return };
+    if overlay > baseline.unwrap_or_default() {
+        *baseline = Some(overlay);
+    }
+}
+
+/// Nested scan-policy half of the total repo-overlay tripwire. Weakening fields
+/// have already been emptied by `sanitize_repo_scoped`; they are still bound
+/// explicitly here so a future nested field requires a deliberate decision.
+fn merge_repo_scan_tightening(baseline: &mut ScanPolicyConfig, repo: ScanPolicyConfig) {
+    let ScanPolicyConfig {
+        additional_config_files,
+        trusted_mcp_servers: _,
+        mcp_allowed_tools,
+        ignore_patterns: _,
+        fail_on: _,
+        profiles: _,
+        require_complete,
+        oversized_file_action,
+        unreadable_file_action,
+        unsupported_artifact_action,
+    } = repo;
+
+    extend_unique(
+        &mut baseline.additional_config_files,
+        additional_config_files,
+    );
+    for (server, repo_tools) in mcp_allowed_tools {
+        match baseline.mcp_allowed_tools.get_mut(&server) {
+            Some(trusted_tools) => {
+                trusted_tools.retain(|tool| repo_tools.contains(tool));
+                trusted_tools.sort();
+                trusted_tools.dedup();
+            }
+            None => {
+                let mut repo_tools = repo_tools;
+                repo_tools.sort();
+                repo_tools.dedup();
+                baseline.mcp_allowed_tools.insert(server, repo_tools);
+            }
+        }
+    }
+    baseline.require_complete |= require_complete;
+    merge_gap_action(&mut baseline.oversized_file_action, oversized_file_action);
+    merge_gap_action(&mut baseline.unreadable_file_action, unreadable_file_action);
+    merge_gap_action(
+        &mut baseline.unsupported_artifact_action,
+        unsupported_artifact_action,
+    );
+}
+
+/// Clamp repo package controls against the shipping baseline. Returns whether
+/// any weakening value was neutralized. Fields whose defaults are already
+/// restrictive treat that default as "no overlay opinion", so an empty repo
+/// document cannot rewrite a trusted package policy.
+fn sanitize_repo_package_tightening(repo: &mut PackagePolicy) -> bool {
+    let mut neutralized = false;
+    if repo
+        .warn_newer_than_days
+        .is_some_and(|value| value < crate::package_risk::VERY_NEW_PACKAGE_DAYS as u32)
+    {
+        repo.warn_newer_than_days = None;
+        neutralized = true;
+    }
+    if repo.block_typosquat_distance == Some(0) {
+        repo.block_typosquat_distance = None;
+        neutralized = true;
+    }
+    if repo
+        .block_aggregate_score
+        .is_some_and(|value| value > DEFAULT_BLOCK_AGGREGATE_SCORE)
+    {
+        repo.block_aggregate_score = None;
+        neutralized = true;
+    }
+    if repo
+        .warn_aggregate_score
+        .is_some_and(|value| value > DEFAULT_WARN_AGGREGATE_SCORE)
+    {
+        repo.warn_aggregate_score = None;
+        neutralized = true;
+    }
+    if repo
+        .block_osv_min_cvss
+        .is_some_and(|value| !value.is_finite() || value > DEFAULT_BLOCK_OSV_MIN_CVSS)
+    {
+        repo.block_osv_min_cvss = None;
+        neutralized = true;
+    }
+    if !repo.warn_install_script_network_call {
+        repo.warn_install_script_network_call = true;
+        neutralized = true;
+    }
+    if !repo.block_dependency_confusion {
+        repo.block_dependency_confusion = true;
+        neutralized = true;
+    }
+    if repo
+        .repo_mismatch_check_max_packages
+        .is_some_and(|value| value < DEFAULT_REPO_MISMATCH_CHECK_MAX_PACKAGES)
+    {
+        repo.repo_mismatch_check_max_packages = None;
+        neutralized = true;
+    }
+    neutralized
+}
+
+fn tighten_max_option<T: Ord + Copy>(baseline: &mut Option<T>, overlay: Option<T>) {
+    if let Some(overlay) = overlay {
+        if baseline.is_none_or(|current| overlay > current) {
+            *baseline = Some(overlay);
+        }
+    }
+}
+
+fn tighten_max_option_with_default<T: Ord + Copy>(
+    baseline: &mut Option<T>,
+    overlay: Option<T>,
+    default: T,
+) {
+    if let Some(overlay) = overlay {
+        if overlay > baseline.unwrap_or(default) {
+            *baseline = Some(overlay);
+        }
+    }
+}
+
+fn tighten_lower_u32(baseline: &mut Option<u32>, overlay: Option<u32>, default: u32) {
+    let Some(overlay) = overlay else { return };
+    if overlay < baseline.unwrap_or(default) {
+        *baseline = Some(overlay);
+    }
+}
+
+/// Package fields are merged one by one; no repo package object ever replaces
+/// the trusted object. The no-rest destructure is a nested compile tripwire.
+fn merge_repo_package_tightening(
+    baseline: &mut PackagePolicy,
+    repo: PackagePolicy,
+    document: &RepoPolicyDocument,
+) {
+    let PackagePolicy {
+        block_not_found,
+        block_newer_than_days,
+        warn_newer_than_days,
+        warn_low_downloads_below,
+        block_install_scripts_for_unknown_packages,
+        block_typosquat_distance,
+        block_aggregate_score,
+        warn_aggregate_score,
+        block_osv_min_cvss,
+        block_repo_mismatch,
+        warn_install_script_network_call: _,
+        block_dependency_confusion: _,
+        internal_package_names,
+        repo_mismatch_check_max_packages,
+    } = repo;
+
+    if document.package_present("block_not_found") {
+        baseline.block_not_found |= block_not_found;
+    }
+    tighten_max_option(&mut baseline.block_newer_than_days, block_newer_than_days);
+    tighten_max_option_with_default(
+        &mut baseline.warn_newer_than_days,
+        warn_newer_than_days,
+        crate::package_risk::VERY_NEW_PACKAGE_DAYS as u32,
+    );
+    tighten_max_option(
+        &mut baseline.warn_low_downloads_below,
+        warn_low_downloads_below,
+    );
+    if document.package_present("block_install_scripts_for_unknown_packages") {
+        baseline.block_install_scripts_for_unknown_packages |=
+            block_install_scripts_for_unknown_packages;
+    }
+    tighten_max_option(
+        &mut baseline.block_typosquat_distance,
+        block_typosquat_distance,
+    );
+    tighten_lower_u32(
+        &mut baseline.block_aggregate_score,
+        block_aggregate_score,
+        DEFAULT_BLOCK_AGGREGATE_SCORE,
+    );
+    tighten_lower_u32(
+        &mut baseline.warn_aggregate_score,
+        warn_aggregate_score,
+        DEFAULT_WARN_AGGREGATE_SCORE,
+    );
+    if let Some(repo_cvss) = block_osv_min_cvss {
+        if repo_cvss.is_finite() && repo_cvss < baseline.block_osv_min_cvss_effective() {
+            baseline.block_osv_min_cvss = Some(repo_cvss);
+        }
+    }
+    if document.package_present("block_repo_mismatch") {
+        baseline.block_repo_mismatch |= block_repo_mismatch;
+    }
+    // These two booleans ship true, so their value alone cannot distinguish an
+    // omitted field from an explicit tightening request. Use the retained YAML
+    // presence/value: explicit true raises a trusted false, explicit false was
+    // a weakening attempt and is ignored after sanitization.
+    if document.package_bool("warn_install_script_network_call") == Some(true) {
+        baseline.warn_install_script_network_call = true;
+    }
+    if document.package_bool("block_dependency_confusion") == Some(true) {
+        baseline.block_dependency_confusion = true;
+    }
+    extend_unique(&mut baseline.internal_package_names, internal_package_names);
+    if let Some(repo_max) = repo_mismatch_check_max_packages {
+        if repo_max > baseline.repo_mismatch_check_max_packages_effective() {
+            baseline.repo_mismatch_check_max_packages = Some(repo_max);
+        }
+    }
+}
+
 pub fn allowlist_pattern_matches(pattern: &str, url: &str) -> bool {
     let p = pattern.trim();
     if validate_trust_pattern(p).is_err() {
@@ -2307,9 +2902,24 @@ fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
     None
 }
 
-/// Resolve the path `discover_local` would load, without reading it. Same order
-/// (`TIRITH_POLICY_ROOT/.tirith` → walk-up to `.git` → user config). Existence-
-/// based: a present-but-unparseable file still yields its path here.
+/// Select only an operator-controlled local baseline. Repository discovery is
+/// intentionally separate so it can never short-circuit this lookup.
+fn discover_trusted_local_policy_path_scoped() -> Option<(PathBuf, PolicyScope)> {
+    if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
+        let root = root.trim();
+        if !root.is_empty() {
+            if let Some(path) = find_policy_in_dir(&PathBuf::from(root).join(".tirith")) {
+                return Some((path, PolicyScope::Org));
+            }
+        }
+    }
+    user_policy_path().map(|path| (path, PolicyScope::User))
+}
+
+/// Resolve the primary path selected by legacy single-path callers, without
+/// reading it. Effective policy discovery may additionally compose a trusted
+/// org/user baseline with a repo tightening overlay. This helper deliberately
+/// retains its existing path precedence for configuration-editing callers.
 pub fn discover_local_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
     discover_local_policy_path_scoped(cwd).map(|(path, _scope)| path)
 }
@@ -2449,7 +3059,15 @@ const LABELS_FILE_READ_CAP: u64 = 1024 * 1024;
 /// F17 — reads via [`util::read_text_no_follow_capped`] so a symlinked label
 /// file cannot redirect the read onto an arbitrary file (the repo-scope label
 /// paths live under an attacker-influenced `<repo>/.tirith/`).
-fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>) {
+#[derive(Clone, Copy)]
+enum LabelMergeMode {
+    Trusted,
+    TrustedSsh,
+    RepoTightening,
+    RepoSshTightening,
+}
+
+fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>, mode: LabelMergeMode) {
     let bytes = match crate::util::read_text_no_follow_capped(path, LABELS_FILE_READ_CAP) {
         Ok(b) => b,
         Err(crate::util::OpenRegularError::NotFound) => return,
@@ -2464,6 +3082,15 @@ fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>) {
             return;
         }
     };
+    merge_context_label_bytes(path, bytes, into, mode);
+}
+
+fn merge_context_label_bytes(
+    path: &Path,
+    bytes: Vec<u8>,
+    into: &mut BTreeMap<String, String>,
+    mode: LabelMergeMode,
+) {
     let content = match String::from_utf8(bytes) {
         Ok(c) => c,
         Err(e) => {
@@ -2503,7 +3130,54 @@ fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>) {
             let key = key.trim();
             let val = val.trim();
             if !key.is_empty() && !val.is_empty() {
-                into.insert(key.to_string(), val.to_string());
+                let canonical_key;
+                let key = if matches!(
+                    mode,
+                    LabelMergeMode::TrustedSsh | LabelMergeMode::RepoSshTightening
+                ) {
+                    canonical_key = match crate::rules::shared::canonicalize_ssh_label_key(key) {
+                        Some(key) => key,
+                        None => continue,
+                    };
+                    canonical_key.as_str()
+                } else {
+                    key
+                };
+                match (mode, into.get(key)) {
+                    (LabelMergeMode::Trusted | LabelMergeMode::TrustedSsh, _)
+                    | (LabelMergeMode::RepoTightening, None) => {
+                        into.insert(key.to_string(), val.to_string());
+                    }
+                    (LabelMergeMode::RepoSshTightening, None) => {
+                        // SSH lookup gives an exact `user@host` entry precedence
+                        // over its bare-host fallback. A repo must not create a
+                        // noncritical exact entry that shadows a trusted
+                        // production bare-host label.
+                        let trusted_bare =
+                            key.rsplit_once('@').and_then(|(_, host)| into.get(host));
+                        if !trusted_bare.is_some_and(|existing| {
+                            crate::rules::shared::is_critical_label(existing)
+                                && !crate::rules::shared::is_critical_label(val)
+                        }) {
+                            into.insert(key.to_string(), val.to_string());
+                        }
+                    }
+                    (
+                        LabelMergeMode::RepoTightening | LabelMergeMode::RepoSshTightening,
+                        Some(existing),
+                    ) if !crate::rules::shared::is_critical_label(existing)
+                        && crate::rules::shared::is_critical_label(val) =>
+                    {
+                        // A repository may raise an existing label to a guarded
+                        // production class, but never downgrade or relabel a
+                        // trusted user/org entry to suppress the guard.
+                        into.insert(key.to_string(), val.to_string());
+                    }
+                    (
+                        LabelMergeMode::RepoTightening | LabelMergeMode::RepoSshTightening,
+                        Some(_),
+                    ) => {}
+                }
             }
         }
     }
@@ -2514,21 +3188,21 @@ fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>) {
 /// and `tirith ssh label`.
 ///
 /// F17 — both label paths are `<root>/<dir>/<file>.yaml` where the repo-scope
-/// `<dir>` (`<repo>/.tirith`) is attacker-influenceable. The write is hardened
-/// two ways:
-///   * [`util::canonical_within`] against the GRANDPARENT (`<root>`)
-///     canonicalizes through `<dir>`, so a SYMLINKED `.tirith` (or `tirith`)
-///     directory that escapes `<root>` is rejected before any write; and
-///   * [`util::open_write_no_follow`] refuses a symlinked FINAL component, so a
-///     pre-planted `<file>.yaml` symlink cannot redirect the write either.
-///
-/// The read-back of existing entries already goes through the symlink-refusing
-/// [`merge_context_labels`].
+/// `<dir>` (`<repo>/.tirith`) is attacker-influenceable. A retained
+/// [`util::ContainedAtomicFile`] traverses every descendant without following
+/// links, reads the prior file through that held parent, and keeps the same
+/// capability through tempfile creation and atomic publication. A parent-path
+/// replacement therefore cannot redirect either the read or the write.
 pub fn write_context_label(path: &Path, label_key: &str, criticality: &str) -> std::io::Result<()> {
-    let mut existing: BTreeMap<String, String> = BTreeMap::new();
-    merge_context_labels(path, &mut existing);
-    existing.insert(label_key.to_string(), criticality.to_string());
+    write_context_label_with_hook(path, label_key, criticality, || Ok(()))
+}
 
+fn write_context_label_with_hook(
+    path: &Path,
+    label_key: &str,
+    criticality: &str,
+    after_parent_bound: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/<file> → <repo>,
     // <config>/tirith/<file> → <config>. A label path is always at least three
     // components deep; refuse a malformed shallower path rather than guess.
@@ -2539,59 +3213,88 @@ pub fn write_context_label(path: &Path, label_key: &str, criticality: &str) -> s
         )
     })?;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let destination = crate::util::ContainedAtomicFile::prepare(containment_root, path, true)?;
+    let mut existing: BTreeMap<String, String> = BTreeMap::new();
+    match destination.read_capped(LABELS_FILE_READ_CAP) {
+        Ok(bytes) => merge_context_label_bytes(path, bytes, &mut existing, LabelMergeMode::Trusted),
+        Err(crate::util::OpenRegularError::NotFound) => {}
+        Err(error) => {
+            // Match the load path's visible failure semantics: a malformed or
+            // unreadable prior label file does not silently disappear.
+            eprintln!(
+                "tirith: warning: context-labels file at {} read error: {error:?}",
+                path.display(),
+            );
+        }
     }
-
-    // F17 — reject a symlinked containing directory (e.g. a planted `.tirith`
-    // symlink) that would redirect the write outside its trusted root. Done
-    // after create_dir_all so a legit first-run `.tirith` exists to canonicalize.
-    if !crate::util::canonical_within(path, containment_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing to write label outside its trusted root ({})",
-                containment_root.display()
-            ),
-        ));
-    }
+    existing.insert(label_key.to_string(), criticality.to_string());
 
     let yaml = serde_yaml::to_string(&existing).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("serialize: {e}"))
     })?;
-    // F17 — O_NOFOLLOW + 0600 (refuses a symlinked final component).
-    let mut f = crate::util::open_write_no_follow(path, true)?;
-    use std::io::Write as _;
-    f.write_all(yaml.as_bytes())?;
-    Ok(())
+    after_parent_bound()?;
+    destination.write_atomic(yaml.as_bytes(), true)
 }
 
-/// Cache path for remote policy: `~/.cache/tirith/remote-policy.yaml`.
+/// Cache path for the origin-bound remote policy envelope.
 fn remote_policy_cache_path() -> Option<PathBuf> {
     let cache_dir = std::env::var("XDG_CACHE_HOME")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| home::home_dir().map(|h| h.join(".cache")))?;
-    Some(cache_dir.join("tirith").join("remote-policy.yaml"))
+    Some(cache_dir.join("tirith").join("remote-policy.json"))
 }
 
-/// Cache the raw YAML from a remote policy fetch.
-fn cache_remote_policy(yaml: &str) -> std::io::Result<()> {
+const REMOTE_POLICY_CACHE_SCHEMA: u8 = 1;
+const REMOTE_POLICY_CACHE_READ_CAP: u64 = POLICY_FILE_READ_CAP * 2 + 4096;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemotePolicyCacheEnvelope {
+    schema: u8,
+    /// SHA-256 over a normalized endpoint and the selected credential. This
+    /// binds both tenant and origin without persisting the credential itself.
+    origin_credential_fingerprint: String,
+    policy_yaml: String,
+}
+
+fn remote_policy_cache_fingerprint(server_url: &str, api_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let normalized_origin = url::Url::parse(server_url)
+        .map(|mut parsed| {
+            parsed.set_fragment(None);
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| server_url.trim().to_string());
+    let mut digest = Sha256::new();
+    digest.update(b"tirith-remote-policy-cache-v1\0");
+    digest.update((normalized_origin.len() as u64).to_be_bytes());
+    digest.update(normalized_origin.as_bytes());
+    digest.update((api_key.len() as u64).to_be_bytes());
+    digest.update(api_key.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// Cache validated remote YAML in an origin/credential-bound envelope.
+fn cache_remote_policy(server_url: &str, api_key: &str, yaml: &str) -> std::io::Result<()> {
     if let Some(path) = remote_policy_cache_path() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&path)?;
-        use std::io::Write;
-        f.write_all(yaml.as_bytes())?;
+        let envelope = RemotePolicyCacheEnvelope {
+            schema: REMOTE_POLICY_CACHE_SCHEMA,
+            origin_credential_fingerprint: remote_policy_cache_fingerprint(server_url, api_key),
+            policy_yaml: yaml.to_string(),
+        };
+        let bytes = serde_json::to_vec(&envelope).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("serialize remote policy cache: {error}"),
+            )
+        })?;
+        crate::util::write_file_atomic_0600(&path, &bytes)?;
     }
     Ok(())
 }
@@ -2600,15 +3303,46 @@ fn cache_remote_policy(yaml: &str) -> std::io::Result<()> {
 /// remote-success path (via [`Policy::try_parse_yaml`]) so an older cached
 /// policy is upgraded before deserialization (else `cached` mode would drop
 /// relocated fields).
-fn load_cached_remote_policy() -> Option<Policy> {
+fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> {
     let path = remote_policy_cache_path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    match Policy::try_parse_yaml(&content) {
+    let bytes = match crate::util::read_text_no_follow_capped(&path, REMOTE_POLICY_CACHE_READ_CAP) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "tirith: warning: cached remote policy read error at {}: {error:?}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let envelope: RemotePolicyCacheEnvelope = match serde_json::from_slice(&bytes) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            eprintln!("tirith: warning: cached remote policy envelope parse error: {error}");
+            return None;
+        }
+    };
+    if envelope.schema != REMOTE_POLICY_CACHE_SCHEMA
+        || envelope.origin_credential_fingerprint
+            != remote_policy_cache_fingerprint(server_url, api_key)
+    {
+        eprintln!(
+            "tirith: warning: cached remote policy belongs to a different endpoint or credential; ignoring it"
+        );
+        return None;
+    }
+    match Policy::try_parse_yaml(&envelope.policy_yaml) {
         Ok(mut p) => {
             p.path = Some(format!("cached:{}", path.display()));
             // A cached remote policy is operator-controlled (it was fetched from
             // the configured server); stamp Remote so it is never repo-sanitized.
             p.scope = PolicyScope::Remote;
+            if p.policy_server_url.is_none() {
+                p.policy_server_url = Some(server_url.to_string());
+            }
+            if p.policy_server_api_key.is_none() {
+                p.policy_server_api_key = Some(api_key.to_string());
+            }
             Some(p)
         }
         Err(e) => {
@@ -2621,6 +3355,238 @@ fn load_cached_remote_policy() -> Option<Policy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn context_label_parent_swap_cannot_redirect_write() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let labels_dir = root.path().join(".tirith");
+        let held_labels_dir = root.path().join(".tirith-held");
+        std::fs::create_dir(&labels_dir).unwrap();
+        let label_path = labels_dir.join("context-labels.yaml");
+        std::fs::write(&label_path, "existing: staging\n").unwrap();
+
+        write_context_label_with_hook(&label_path, "aws:prod", "critical", || {
+            // Exercise the former containment-check/open interval at a
+            // deterministic boundary after the parent capability and prior
+            // contents are already bound.
+            std::fs::rename(&labels_dir, &held_labels_dir)?;
+            symlink(outside.path(), &labels_dir)?;
+            Ok(())
+        })
+        .expect("label publication must remain bound to the held directory");
+
+        assert!(
+            !outside.path().join("context-labels.yaml").exists(),
+            "the replacement symlink target must not receive label data"
+        );
+        let written = std::fs::read_to_string(held_labels_dir.join("context-labels.yaml")).unwrap();
+        assert!(written.contains("existing") && written.contains("aws:prod"));
+        assert!(
+            std::fs::symlink_metadata(&labels_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the replacement parent link must remain untouched"
+        );
+    }
+
+    #[test]
+    fn repo_labels_cannot_downgrade_trusted_context_or_ssh_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user-labels.yaml");
+        let repo = dir.path().join("repo-labels.yaml");
+        std::fs::write(
+            &user,
+            "shared: production\nraise-me: staging\nuser-only: critical\n",
+        )
+        .unwrap();
+        std::fs::write(&repo, "shared: dev\nraise-me: p0\nrepo-only: staging\n").unwrap();
+
+        let mut labels = BTreeMap::new();
+        merge_context_labels(&user, &mut labels, LabelMergeMode::Trusted);
+        merge_context_labels(&repo, &mut labels, LabelMergeMode::RepoTightening);
+
+        assert_eq!(labels.get("shared").map(String::as_str), Some("production"));
+        assert_eq!(labels.get("raise-me").map(String::as_str), Some("p0"));
+        assert_eq!(
+            labels.get("user-only").map(String::as_str),
+            Some("critical")
+        );
+        assert_eq!(labels.get("repo-only").map(String::as_str), Some("staging"));
+    }
+
+    #[test]
+    fn repo_ssh_exact_label_cannot_shadow_trusted_critical_bare_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user-ssh-labels.yaml");
+        let repo = dir.path().join("repo-ssh-labels.yaml");
+        std::fs::write(&user, "prod.example: production\n").unwrap();
+        std::fs::write(
+            &repo,
+            "alice@PROD.EXAMPLE.: dev\nbob@prod.example: critical\n",
+        )
+        .unwrap();
+
+        let mut labels = BTreeMap::new();
+        merge_context_labels(&user, &mut labels, LabelMergeMode::TrustedSsh);
+        merge_context_labels(&repo, &mut labels, LabelMergeMode::RepoSshTightening);
+
+        assert!(!labels.contains_key("alice@prod.example"));
+        assert_eq!(
+            labels.get("bob@prod.example").map(String::as_str),
+            Some("critical")
+        );
+        assert_eq!(
+            labels.get("prod.example").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    fn merge_repo_yaml_for_test(trusted: &mut Policy, yaml: &str) {
+        let ParsedPolicyDocument {
+            migrated,
+            mut policy,
+        } = Policy::parse_document(yaml).expect("repo test policy parses");
+        let document = RepoPolicyDocument::parsed(migrated);
+        policy.scope = PolicyScope::Repo;
+        policy.sanitize_repo_scoped();
+        trusted.merge_repo_tightening(policy, &document);
+    }
+
+    #[test]
+    fn empty_repo_policy_is_a_true_no_op_for_default_filled_scalars() {
+        let mut trusted = Policy {
+            allow_bypass_env: true,
+            mcp_redact_injection: true,
+            context_guard_enabled: false,
+            package_policy: PackagePolicy {
+                warn_install_script_network_call: false,
+                block_dependency_confusion: false,
+                ..PackagePolicy::default()
+            },
+            ..Policy::default()
+        };
+
+        merge_repo_yaml_for_test(&mut trusted, "{}\n");
+
+        assert!(trusted.allow_bypass_env);
+        assert!(trusted.mcp_redact_injection);
+        assert!(!trusted.context_guard_enabled);
+        assert!(!trusted.package_policy.warn_install_script_network_call);
+        assert!(!trusted.package_policy.block_dependency_confusion);
+    }
+
+    #[test]
+    fn repo_package_day_zero_block_is_preserved_without_weakening_trusted_policy() {
+        let mut baseline = Policy::default();
+        merge_repo_yaml_for_test(
+            &mut baseline,
+            "package_policy:\n  block_newer_than_days: 0\n",
+        );
+        assert_eq!(baseline.package_policy.block_newer_than_days, Some(0));
+
+        let mut trusted = Policy::default();
+        trusted.package_policy.block_newer_than_days = Some(7);
+        merge_repo_yaml_for_test(
+            &mut trusted,
+            "package_policy:\n  block_newer_than_days: 0\n",
+        );
+        assert_eq!(
+            trusted.package_policy.block_newer_than_days,
+            Some(7),
+            "repo day-zero policy must not narrow a trusted seven-day block window"
+        );
+    }
+
+    #[test]
+    fn explicit_repo_defaults_can_tighten_but_not_weaken_trusted_policy() {
+        let mut trusted = Policy {
+            allow_bypass_env: true,
+            context_guard_enabled: false,
+            package_policy: PackagePolicy {
+                warn_install_script_network_call: false,
+                block_dependency_confusion: false,
+                ..PackagePolicy::default()
+            },
+            ..Policy::default()
+        };
+        merge_repo_yaml_for_test(
+            &mut trusted,
+            "allow_bypass_env: false\ncontext_guard_enabled: true\npackage_policy:\n  warn_install_script_network_call: true\n  block_dependency_confusion: true\n",
+        );
+
+        assert!(!trusted.allow_bypass_env);
+        assert!(trusted.context_guard_enabled);
+        assert!(trusted.package_policy.warn_install_script_network_call);
+        assert!(trusted.package_policy.block_dependency_confusion);
+    }
+
+    #[test]
+    fn explicit_repo_bypass_enablement_is_neutralized_after_presence_merge() {
+        let mut trusted = Policy {
+            allow_bypass_env: true,
+            allow_bypass_env_noninteractive: true,
+            ..Policy::default()
+        };
+
+        merge_repo_yaml_for_test(
+            &mut trusted,
+            "allow_bypass_env: true\nallow_bypass_env_noninteractive: true\n",
+        );
+
+        assert!(!trusted.allow_bypass_env);
+        assert!(!trusted.allow_bypass_env_noninteractive);
+    }
+
+    #[test]
+    fn repo_package_age_warning_uses_effective_thirty_day_baseline() {
+        for (repo_days, expected) in [(1, None), (30, None), (31, Some(31))] {
+            let mut trusted = Policy::default();
+            merge_repo_yaml_for_test(
+                &mut trusted,
+                &format!("package_policy:\n  warn_newer_than_days: {repo_days}\n"),
+            );
+            assert_eq!(trusted.package_policy.warn_newer_than_days, expected);
+            assert_eq!(
+                trusted.package_policy.warn_newer_than_days_effective(),
+                expected.unwrap_or(30)
+            );
+        }
+    }
+
+    #[test]
+    fn repo_approval_rule_fallback_is_clamped_to_block() {
+        let mut trusted = Policy::default();
+        merge_repo_yaml_for_test(
+            &mut trusted,
+            "approval_rules:\n  - rule_ids: [credential_in_command]\n    timeout_secs: 1\n    fallback: allow\n",
+        );
+        assert_eq!(trusted.approval_rules.len(), 1);
+        assert_eq!(trusted.approval_rules[0].fallback, "block");
+    }
+
+    #[test]
+    fn remote_policy_cache_is_bound_to_endpoint_and_credential() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = tempfile::tempdir().unwrap();
+        let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
+        let yaml = "paranoia: 4\n";
+
+        cache_remote_policy("https://a.example/policy", "tenant-a-key", yaml).unwrap();
+        assert_eq!(
+            load_cached_remote_policy("https://a.example/policy", "tenant-a-key")
+                .map(|policy| policy.paranoia),
+            Some(4)
+        );
+        assert!(load_cached_remote_policy("https://b.example/policy", "tenant-a-key").is_none());
+        assert!(load_cached_remote_policy("https://a.example/policy", "tenant-b-key").is_none());
+    }
 
     // ----------------------------- M5.5 F3 schema_version round-trips -----
 
@@ -2881,6 +3847,40 @@ custom_rules:
     }
 
     #[test]
+    fn environment_url_never_reuses_stored_policy_key() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(
+            policy_dir.join("policy.yaml"),
+            "paranoia: 3\n\
+             policy_fetch_fail_mode: closed\n\
+             policy_server_url: https://trusted.example/policy\n\
+             policy_server_api_key: stored-secret\n",
+        )
+        .unwrap();
+
+        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", dir.path());
+        let _url = EnvVarGuard::set("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+        let _key = EnvVarGuard::unset("TIRITH_API_KEY");
+
+        let policy = Policy::discover(Some(dir.path().to_str().unwrap()));
+        assert_eq!(
+            policy.paranoia, 3,
+            "must return the local policy without fetch"
+        );
+        assert_ne!(policy.path.as_deref(), Some("fail-closed"));
+        assert_eq!(
+            policy.policy_server_api_key.as_deref(),
+            Some("stored-secret"),
+            "refusal must not mutate the trusted local document"
+        );
+    }
+
+    #[test]
     fn discover_local_only_ignores_policy_server_and_never_fetches() {
         // CodeRabbit M13 PR #132 R9-2: the offline discovery path must NEVER
         // make a remote fetch, even when a policy server is configured via BOTH
@@ -2904,6 +3904,7 @@ custom_rules:
         let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
         let state = tempfile::tempdir().unwrap();
         let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", state.path().join("config"));
         // Drop any incident-flag cache loaded by an earlier test so the lookup
         // re-reads against our isolated (empty) state dir.
         crate::incident::invalidate_cache();
@@ -2980,6 +3981,7 @@ custom_rules:
         let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
         let state = tempfile::tempdir().unwrap();
         let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", state.path().join("config"));
         crate::incident::invalidate_cache();
 
         let dir = tempfile::tempdir().unwrap();
@@ -3024,6 +4026,7 @@ custom_rules:
         let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
         let state = tempfile::tempdir().unwrap();
         let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", state.path().join("config"));
         crate::incident::invalidate_cache();
 
         let dir = tempfile::tempdir().unwrap();
@@ -3071,6 +4074,208 @@ custom_rules:
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    fn discovery_test_rule(id: &str, pattern: &str) -> CustomRule {
+        CustomRule {
+            id: id.to_string(),
+            pattern: Some(pattern.to_string()),
+            when: None,
+            context: vec!["exec".to_string()],
+            severity: Severity::High,
+            title: id.to_string(),
+            description: String::new(),
+            action: Some(crate::verdict::Action::Block),
+        }
+    }
+
+    #[test]
+    fn empty_repo_policy_cannot_shadow_trusted_user_baseline() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let isolated = tempfile::tempdir().unwrap();
+        let config_home = isolated.path().join("config");
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        let _url = EnvVarGuard::unset("TIRITH_SERVER_URL");
+        let _key = EnvVarGuard::unset("TIRITH_API_KEY");
+
+        let user_dir = config_home.join("tirith");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let trusted_package = PackagePolicy {
+            block_not_found: true,
+            block_aggregate_score: Some(40),
+            internal_package_names: vec![InternalPackageSpec::from_pattern("trusted-*")],
+            ..PackagePolicy::default()
+        };
+        let trusted = Policy {
+            strict_warn: true,
+            blocklist: vec!["trusted-block.example".into()],
+            network_deny: vec!["10.0.0.0/8".into()],
+            custom_rules: vec![discovery_test_rule("trusted-block", "trusted-command")],
+            policy_server_url: Some("https://policy.trusted.example/v1".into()),
+            policy_server_api_key: Some("trusted-key".into()),
+            policy_fetch_fail_mode: Some("closed".into()),
+            enforce_fail_mode: Some(true),
+            package_policy: trusted_package.clone(),
+            ..Policy::default()
+        };
+        std::fs::write(
+            user_dir.join("policy.yaml"),
+            serde_yaml::to_string(&trusted).unwrap(),
+        )
+        .unwrap();
+
+        let repo = isolated.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".tirith")).unwrap();
+        std::fs::write(repo.join(".tirith/policy.yaml"), "{}\n").unwrap();
+
+        let effective = Policy::discover_local(Some(repo.to_str().unwrap()));
+        assert_eq!(effective.scope, PolicyScope::User);
+        assert!(effective.strict_warn, "trusted strict mode must survive");
+        assert_eq!(effective.blocklist, trusted.blocklist);
+        assert_eq!(effective.network_deny, trusted.network_deny);
+        assert_eq!(effective.custom_rules.len(), 1);
+        assert_eq!(
+            effective.policy_server_url, trusted.policy_server_url,
+            "repo presence must not suppress remote discovery"
+        );
+        assert_eq!(
+            effective.policy_server_api_key,
+            trusted.policy_server_api_key
+        );
+        assert_eq!(
+            effective.policy_fetch_fail_mode,
+            trusted.policy_fetch_fail_mode
+        );
+        assert_eq!(effective.enforce_fail_mode, trusted.enforce_fail_mode);
+        assert_eq!(effective.package_policy, trusted_package);
+    }
+
+    #[test]
+    fn hostile_repo_policy_only_adds_restrictions_to_trusted_org_baseline() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let isolated = tempfile::tempdir().unwrap();
+        let config_home = isolated.path().join("config");
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let _url = EnvVarGuard::unset("TIRITH_SERVER_URL");
+        let _key = EnvVarGuard::unset("TIRITH_API_KEY");
+
+        let org = isolated.path().join("org");
+        std::fs::create_dir_all(org.join(".tirith")).unwrap();
+        let trusted_package = PackagePolicy {
+            block_not_found: true,
+            block_aggregate_score: Some(35),
+            warn_install_script_network_call: true,
+            block_dependency_confusion: true,
+            internal_package_names: vec![InternalPackageSpec::from_pattern("org-*")],
+            ..PackagePolicy::default()
+        };
+        let trusted = Policy {
+            fail_mode: FailMode::Closed,
+            strict_warn: true,
+            blocklist: vec!["org-block.example".into()],
+            network_deny: vec!["192.0.2.0/24".into()],
+            custom_rules: vec![discovery_test_rule("org-rule", "org-command")],
+            policy_server_url: Some("https://policy.org.example/v1".into()),
+            policy_server_api_key: Some("org-key".into()),
+            policy_fetch_fail_mode: Some("closed".into()),
+            enforce_fail_mode: Some(true),
+            package_policy: trusted_package.clone(),
+            ..Policy::default()
+        };
+        std::fs::write(
+            org.join(".tirith/policy.yaml"),
+            serde_yaml::to_string(&trusted).unwrap(),
+        )
+        .unwrap();
+        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", &org);
+
+        let repo = isolated.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".tirith")).unwrap();
+        let hostile = Policy {
+            fail_mode: FailMode::Open,
+            strict_warn: false,
+            allowlist: vec!["attacker.example".into()],
+            network_allow: vec!["0.0.0.0/0".into()],
+            blocklist: vec!["repo-block.example".into()],
+            network_deny: vec!["198.51.100.0/24".into()],
+            custom_rules: vec![discovery_test_rule("repo-rule", "repo-command")],
+            policy_server_url: Some("https://attacker.example/policy".into()),
+            policy_server_api_key: Some("steal-me".into()),
+            policy_fetch_fail_mode: Some("open".into()),
+            enforce_fail_mode: Some(false),
+            package_policy: PackagePolicy {
+                block_not_found: false,
+                block_aggregate_score: Some(100),
+                block_repo_mismatch: true,
+                warn_install_script_network_call: false,
+                block_dependency_confusion: false,
+                internal_package_names: vec![InternalPackageSpec::from_pattern("repo-*")],
+                ..PackagePolicy::default()
+            },
+            ..Policy::default()
+        };
+        std::fs::write(
+            repo.join(".tirith/policy.yaml"),
+            serde_yaml::to_string(&hostile).unwrap(),
+        )
+        .unwrap();
+
+        let effective = Policy::discover_local(Some(repo.to_str().unwrap()));
+        assert_eq!(effective.scope, PolicyScope::Org);
+        assert_eq!(effective.fail_mode, FailMode::Closed);
+        assert!(effective.strict_warn);
+        assert!(effective.blocklist.iter().any(|v| v == "org-block.example"));
+        assert!(effective
+            .blocklist
+            .iter()
+            .any(|v| v == "repo-block.example"));
+        assert!(effective.network_deny.iter().any(|v| v == "192.0.2.0/24"));
+        assert!(effective
+            .network_deny
+            .iter()
+            .any(|v| v == "198.51.100.0/24"));
+        assert!(effective
+            .custom_rules
+            .iter()
+            .any(|rule| rule.id == "org-rule"));
+        assert!(effective
+            .custom_rules
+            .iter()
+            .any(|rule| rule.id == "repo-rule"));
+        assert_eq!(effective.allowlist, trusted.allowlist);
+        assert_eq!(effective.network_allow, trusted.network_allow);
+        assert_eq!(effective.policy_server_url, trusted.policy_server_url);
+        assert_eq!(
+            effective.policy_server_api_key,
+            trusted.policy_server_api_key
+        );
+        assert_eq!(
+            effective.policy_fetch_fail_mode,
+            trusted.policy_fetch_fail_mode
+        );
+        assert_eq!(effective.enforce_fail_mode, trusted.enforce_fail_mode);
+        assert!(effective.package_policy.block_not_found);
+        assert_eq!(effective.package_policy.block_aggregate_score, Some(35));
+        assert!(effective.package_policy.block_repo_mismatch);
+        assert!(effective.package_policy.warn_install_script_network_call);
+        assert!(effective.package_policy.block_dependency_confusion);
+        assert!(effective
+            .package_policy
+            .internal_package_names
+            .contains(&InternalPackageSpec::from_pattern("org-*")));
+        assert!(effective
+            .package_policy
+            .internal_package_names
+            .contains(&InternalPackageSpec::from_pattern("repo-*")));
+        assert!(effective.neutralized_fields.contains(&"policy_server_url"));
+        assert!(effective.neutralized_fields.contains(&"package_policy"));
     }
 
     #[test]
@@ -3898,6 +5103,11 @@ custom_rules:
             mcp_redact_injection: true,
             context_guard_enabled: false,
             package_policy: PackagePolicy {
+                // Tightening values must survive the package clamp.
+                block_not_found: true,
+                block_newer_than_days: Some(7),
+                internal_package_names: vec![InternalPackageSpec::from_pattern("repo-*")],
+                // Weakening values must be clamped back to their defaults.
                 block_dependency_confusion: false,
                 warn_install_script_network_call: false,
                 block_aggregate_score: Some(100),
@@ -4111,9 +5321,35 @@ custom_rules:
             context_guard_enabled, d.context_guard_enabled,
             "RESET: context_guard_enabled (false would disable the context guard)"
         );
+        assert!(
+            package_policy.block_not_found,
+            "CLAMP: tightening package block survives"
+        );
         assert_eq!(
-            package_policy, d.package_policy,
-            "RESET: package_policy (demotes/silences supply-chain findings)"
+            package_policy.block_newer_than_days,
+            Some(7),
+            "CLAMP: tightening package threshold survives"
+        );
+        assert_eq!(
+            package_policy.internal_package_names.len(),
+            1,
+            "CLAMP: dependency-confusion names survive"
+        );
+        assert_eq!(
+            package_policy.block_aggregate_score, d.package_policy.block_aggregate_score,
+            "CLAMP: weaker aggregate block threshold is neutralized"
+        );
+        assert_eq!(
+            package_policy.block_osv_min_cvss, d.package_policy.block_osv_min_cvss,
+            "CLAMP: weaker OSV threshold is neutralized"
+        );
+        assert!(
+            package_policy.warn_install_script_network_call,
+            "CLAMP: repo cannot disable install-script network warnings"
+        );
+        assert!(
+            package_policy.block_dependency_confusion,
+            "CLAMP: repo cannot disable dependency-confusion blocking"
         );
         assert_eq!(
             threat_intel.osv_enabled, d.threat_intel.osv_enabled,
@@ -4201,7 +5437,10 @@ custom_rules:
             iac_require_plan_before_apply,
             "KEPT: iac_require_plan_before_apply"
         );
-        assert!(sudo_require_reason, "KEPT: sudo_require_reason");
+        assert_eq!(
+            sudo_require_reason, d.sudo_require_reason,
+            "RESET: repo cannot enable the sudo-session severity downgrade"
+        );
         assert_eq!(sudo_session_ttl, Some(60), "KEPT: sudo_session_ttl");
         assert!(env_guard_enabled, "KEPT: env_guard_enabled");
         assert_eq!(
@@ -4211,7 +5450,10 @@ custom_rules:
         );
         assert!(exec_guard_enabled, "KEPT: exec_guard_enabled");
         assert!(hooks_guard_enabled, "KEPT: hooks_guard_enabled");
-        assert!(baseline_enabled, "KEPT: baseline_enabled");
+        assert_eq!(
+            baseline_enabled, d.baseline_enabled,
+            "RESET: repo cannot enable persistent baseline observation writes"
+        );
         assert_eq!(
             gateway_profile,
             Some(GatewayProfile::Secure),

@@ -136,6 +136,45 @@ pub fn env_snapshot() -> HashMap<String, String> {
     std::env::vars().collect()
 }
 
+const MAX_NESTED_COMMAND_DEPTH: usize = 8;
+
+fn collect_executable_segments(
+    input: &str,
+    shell: ShellType,
+    depth: usize,
+    out: &mut Vec<(tokenize::Segment, ShellType)>,
+) -> bool {
+    let execution_view = crate::extract::shell_execution_view(input, shell);
+    out.extend(
+        tokenize::tokenize(execution_view.as_ref(), shell)
+            .into_iter()
+            .map(|segment| (segment, shell)),
+    );
+    let nested = crate::extract::executable_substitution_scan(input, shell).bodies;
+    if nested.is_empty() {
+        return false;
+    }
+    if depth >= MAX_NESTED_COMMAND_DEPTH {
+        return true;
+    }
+    let mut incomplete = false;
+    for body in nested {
+        // Do not use `Iterator::any`: traversing every sibling is required to
+        // collect all executable segments even after an earlier depth gap.
+        incomplete |= collect_executable_segments(&body.input, body.shell, depth + 1, out);
+    }
+    incomplete
+}
+
+fn executable_segments(
+    input: &str,
+    shell: ShellType,
+) -> (Vec<(tokenize::Segment, ShellType)>, bool) {
+    let mut segments = Vec::new();
+    let incomplete = collect_executable_segments(input, shell, 0, &mut segments);
+    (segments, incomplete)
+}
+
 /// Cheap, filesystem-free blast-radius check for the hot path. Fires the
 /// string-shape-only rules ([`RuleId::BlastWritesSystemPath`],
 /// [`RuleId::BlastEmptyVarGlob`], [`RuleId::BlastFindDelete`],
@@ -147,13 +186,44 @@ pub fn cheap_check(
     env_map: &HashMap<String, String>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let segments = tokenize::tokenize(input, shell);
+    let (segments, nested_incomplete) = executable_segments(input, shell);
 
-    for seg in &segments {
-        let Some(parsed) = parse_fs_op(seg) else {
-            continue;
+    if nested_incomplete {
+        findings.push(finding(
+            RuleId::AnalysisIncomplete,
+            Severity::High,
+            "nested command analysis exceeded its depth limit",
+            "A destructive command may be hidden in nested shell execution syntax deeper than \
+             Tirith's bounded parser can safely resolve.",
+            Evidence::CommandPattern {
+                pattern: "over-deep nested shell execution".to_string(),
+                matched: input.to_string(),
+            },
+        ));
+    }
+
+    for (seg, segment_shell) in &segments {
+        let parsed = match parse_fs_op(seg, *segment_shell) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => continue,
+            Err(_) => {
+                if segment_has_destructive_marker(seg, *segment_shell) {
+                    findings.push(finding(
+                        RuleId::AnalysisIncomplete,
+                        Severity::High,
+                        "could not resolve destructive command wrapper",
+                        "The command contains a destructive filesystem operation behind an \
+                         ambiguous or over-deep wrapper chain. Tirith refuses to treat the \
+                         outer wrapper as benign.",
+                        Evidence::CommandPattern {
+                            pattern: "unresolved destructive wrapper".to_string(),
+                            matched: seg.raw.clone(),
+                        },
+                    ));
+                }
+                continue;
+            }
         };
-
         // `find … -delete` / `rsync --delete` are advisory in their own right:
         // surface them even for non-system targets — the recursive sweep is the hazard.
         match parsed.op {
@@ -237,7 +307,24 @@ pub fn cheap_check(
                 continue;
             }
 
-            if is_system_path(target) {
+            let resolved_target = match expand_known_path(target, env_map) {
+                Ok(target) => target,
+                Err(()) => {
+                    findings.push(finding(
+                        RuleId::AnalysisIncomplete,
+                        Severity::High,
+                        "destructive target expansion could not be resolved",
+                        "A destructive filesystem target contains a shell expansion Tirith \
+                         cannot resolve from the injected environment. It is blocked instead \
+                         of being classified from the benign-looking raw operand.",
+                        Evidence::Text {
+                            detail: format!("unresolved destructive target '{target}'"),
+                        },
+                    ));
+                    continue;
+                }
+            };
+            if is_system_path(&resolved_target, env_map.get("HOME").map(String::as_str)) {
                 findings.push(finding(
                     RuleId::BlastWritesSystemPath,
                     Severity::High,
@@ -247,7 +334,9 @@ pub fn cheap_check(
                      breaks the OS or removes other users' data. Run `tirith preview` to \
                      see the exact impact first.",
                     Evidence::Text {
-                        detail: format!("target '{target}' is a system path"),
+                        detail: format!(
+                            "target '{target}' resolves to system path '{resolved_target}'"
+                        ),
                     },
                 ));
             }
@@ -287,13 +376,24 @@ fn simulate_with_work_limit(
         ..BlastReport::default()
     };
     let mut budget = WorkBudget::new(work_limit);
-    let segments = tokenize::tokenize(input, shell);
+    let (segments, nested_incomplete) = executable_segments(input, shell);
+    if nested_incomplete {
+        report.walk_errors += 1;
+        report.walk_truncated = true;
+    }
 
-    for seg in &segments {
-        let Some(parsed) = parse_fs_op(seg) else {
-            continue;
+    for (seg, segment_shell) in &segments {
+        let parsed = match parse_fs_op(seg, *segment_shell) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => continue,
+            Err(_) => {
+                if segment_has_destructive_marker(seg, *segment_shell) {
+                    report.walk_errors += 1;
+                    report.walk_truncated = true;
+                }
+                continue;
+            }
         };
-
         for target in &parsed.targets {
             // Empty-var glob collapses to root — record and skip the walk (no `/`).
             if empty_var_glob_var(target, env_map).is_some() {
@@ -303,12 +403,26 @@ fn simulate_with_work_limit(
                 continue;
             }
 
-            if is_system_path(target) {
+            let resolved_target = match expand_known_path(target, env_map) {
+                Ok(target) => target,
+                Err(()) => {
+                    report.walk_errors += 1;
+                    report.walk_truncated = true;
+                    continue;
+                }
+            };
+
+            if is_system_path_for_preview(
+                &resolved_target,
+                cwd,
+                env_map.get("HOME").map(String::as_str),
+            ) {
                 report.writes_system_path = true;
             }
 
             // Expand the target (glob against cwd, else literal) to concrete paths.
-            let Some(expanded) = expand_target(target, cwd, &mut report, &mut budget) else {
+            let Some(expanded) = expand_target(&resolved_target, cwd, &mut report, &mut budget)
+            else {
                 return report;
             };
 
@@ -387,19 +501,29 @@ pub fn report_findings(report: &BlastReport) -> Vec<Finding> {
 
 /// Parse a tokenized segment into a destructive-op descriptor, or `None` when
 /// the leader is not a recognized destructive command.
-fn parse_fs_op(seg: &tokenize::Segment) -> Option<ParsedFsOp> {
-    let leader = seg.command.as_deref()?;
-    let leader = leader_name(leader);
+fn parse_fs_op(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> Result<Option<ParsedFsOp>, crate::rules::command::EffectiveCommandError> {
+    let effective = crate::rules::command::resolve_effective_segment(seg, shell)?;
+    let Some(leader) = effective.command.as_deref() else {
+        return Ok(None);
+    };
+    let leader = crate::rules::command::normalize_cmd_base(leader, shell);
+    Ok(parse_op_for_leader(&leader, &effective.args))
+}
 
-    // Unwrap a leading `sudo`/`doas` so `sudo rm -rf /home` is recognized as the
-    // `rm` it is — privilege escalation must NOT drop out of the check. Mirrors
-    // `engine::baseline_shared_components`, which also de-sudo's the leader.
-    if matches!(leader, "sudo" | "doas") {
-        let (wrapped_leader, wrapped_args) = unwrap_sudo(&seg.args)?;
-        return parse_op_for_leader(leader_name(&wrapped_leader), &wrapped_args);
-    }
-
-    parse_op_for_leader(leader, &seg.args)
+fn segment_has_destructive_marker(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    tokenize::split_words(&crate::rules::command::normalize_shell_token(
+        &seg.raw, shell,
+    ))
+    .iter()
+    .any(|word| {
+        matches!(
+            crate::rules::command::normalize_cmd_base(word, shell).as_str(),
+            "rm" | "mv" | "chmod" | "find" | "rsync"
+        )
+    })
 }
 
 /// Match a (de-sudo'd) leader + args onto a destructive-op descriptor.
@@ -414,71 +538,6 @@ fn parse_op_for_leader(leader: &str, args: &[String]) -> Option<ParsedFsOp> {
     }
 }
 
-/// Skip a `sudo`/`doas` invocation's own flags (and their values), leading
-/// `VAR=value` assignments, and an optional `--`, then return the WRAPPED command.
-/// `None` when no wrapped command follows (e.g. `sudo -v`).
-fn unwrap_sudo(args: &[String]) -> Option<(String, Vec<String>)> {
-    // sudo short flags that consume the NEXT token as their value.
-    const VALUE_SHORT: [&str; 6] = ["-u", "-g", "-C", "-D", "-R", "-T"];
-    // sudo long flags that consume the next token (`--flag=value` is handled by
-    // the `contains('=')` branch below).
-    const VALUE_LONG: [&str; 9] = [
-        "--user",
-        "--group",
-        "--close-from",
-        "--chdir",
-        "--role",
-        "--type",
-        "--other-user",
-        "--host",
-        "--prompt",
-    ];
-
-    let mut idx = 0;
-    while idx < args.len() {
-        let a = strip_outer_quotes(&args[idx]);
-        if a == "--" {
-            idx += 1;
-            break;
-        }
-        if a.starts_with("--") {
-            let name = a.split('=').next().unwrap_or(a);
-            // `--flag=value` is self-contained; a bare VALUE_LONG `--flag` eats
-            // the next token.
-            if !a.contains('=') && VALUE_LONG.contains(&name) {
-                idx += 2;
-            } else {
-                idx += 1;
-            }
-            continue;
-        }
-        if a.starts_with('-') && a.len() > 1 {
-            if VALUE_SHORT.contains(&a) {
-                idx += 2;
-            } else {
-                idx += 1;
-            }
-            continue;
-        }
-        // A leading `VAR=value` is an env assignment, not the command.
-        if a.contains('=') && !a.starts_with('/') {
-            idx += 1;
-            continue;
-        }
-        // First non-flag, non-assignment token is the wrapped leader.
-        break;
-    }
-
-    let leader = args.get(idx).map(|s| strip_outer_quotes(s).to_string())?;
-    let wrapped_args: Vec<String> = args[idx + 1..].to_vec();
-    Some((leader, wrapped_args))
-}
-
-/// Strip a leading path component from a leader so `/bin/rm` matches `rm`.
-fn leader_name(leader: &str) -> &str {
-    leader.rsplit(['/', '\\']).next().unwrap_or(leader)
-}
-
 /// Parse `rm` / `mv` / `chmod`: collect non-flag operands, note recursion. For
 /// `chmod` the first non-flag operand is the mode and is dropped from targets.
 fn parse_simple(op: FsOp, args: &[String]) -> ParsedFsOp {
@@ -487,28 +546,73 @@ fn parse_simple(op: FsOp, args: &[String]) -> ParsedFsOp {
     let mut after_double_dash = false;
     let mut seen_mode = false;
 
-    for arg in args {
-        let a = strip_outer_quotes(arg);
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = strip_outer_quotes(&args[idx]);
         if after_double_dash {
             targets.push(a.to_string());
+            idx += 1;
             continue;
         }
         if a == "--" {
             after_double_dash = true;
+            idx += 1;
             continue;
         }
         if a.starts_with('-') && a.len() > 1 {
             if is_recursive_flag(a) {
                 recursive = true;
             }
+            if op == FsOp::Chmod && a == "--reference" {
+                // The consumed reference replaces MODE; the following positional
+                // is therefore already a target.
+                seen_mode = true;
+                idx += 2;
+                continue;
+            }
+            if op == FsOp::Chmod && a.starts_with("--reference=") {
+                seen_mode = true;
+                idx += 1;
+                continue;
+            }
+            if op == FsOp::Mv && matches!(a, "-t" | "--target-directory") {
+                if let Some(directory) = args.get(idx + 1) {
+                    targets.push(strip_outer_quotes(directory).to_string());
+                }
+                idx += 2;
+                continue;
+            }
+            if op == FsOp::Mv {
+                if let Some(directory) = a.strip_prefix("--target-directory=") {
+                    targets.push(directory.to_string());
+                    idx += 1;
+                    continue;
+                }
+                if let Some(directory) = a.strip_prefix("-t").filter(|value| !value.is_empty()) {
+                    // GNU short options may carry their required value in the
+                    // same argv token (`mv -t/etc payload`). The destination is
+                    // still a destructive target and must not disappear merely
+                    // because the spelling is attached.
+                    targets.push(directory.to_string());
+                    idx += 1;
+                    continue;
+                }
+                if matches!(a, "-S" | "--suffix") {
+                    idx += 2;
+                    continue;
+                }
+            }
+            idx += 1;
             continue;
         }
         if op == FsOp::Chmod && !seen_mode {
             // First positional chmod arg is the mode, not a target.
             seen_mode = true;
+            idx += 1;
             continue;
         }
         targets.push(a.to_string());
+        idx += 1;
     }
 
     ParsedFsOp {
@@ -527,11 +631,23 @@ fn parse_find(args: &[String]) -> Option<ParsedFsOp> {
     }
 
     let mut targets = Vec::new();
-    for a in &stripped {
-        if a.starts_with('-') {
+    let mut idx = 0;
+    // GNU/POSIX find traversal options precede the path operands.
+    while idx < stripped.len() {
+        match stripped[idx] {
+            "-H" | "-L" | "-P" => idx += 1,
+            "-D" => idx += 2,
+            option if option.starts_with("-O") => idx += 1,
+            _ => break,
+        }
+    }
+    while idx < stripped.len() {
+        let arg = stripped[idx];
+        if arg.starts_with('-') || matches!(arg, "!" | "(" | ")") {
             break;
         }
-        targets.push((*a).to_string());
+        targets.push(arg.to_string());
+        idx += 1;
     }
     if targets.is_empty() {
         targets.push(".".to_string());
@@ -641,17 +757,72 @@ fn empty_var_glob_var(
     }
 }
 
-/// Well-known broad system paths by string shape. Mirrors `rules::sudo`'s
-/// `is_broad_path` plus the bare `~` home shape.
-fn is_system_path(p: &str) -> bool {
-    let p = p.trim();
-    if p == "~" || p == "~/" {
-        return true;
+/// Expand only deterministic shell path forms: `~`/`~/...` and bare `$NAME` /
+/// `${NAME}` references supplied by the injected environment. Shell operators,
+/// command substitutions, and unknown variables are unresolved rather than
+/// compared as harmless literal text.
+fn expand_known_path(target: &str, env_map: &HashMap<String, String>) -> Result<String, ()> {
+    let target = target.trim();
+    let mut source = target.to_string();
+    if source == "~" || source.starts_with("~/") {
+        let home = env_map.get("HOME").ok_or(())?;
+        source = if source == "~" {
+            home.clone()
+        } else {
+            format!("{}/{}", home.trim_end_matches('/'), &source[2..])
+        };
+    } else if source.starts_with('~') {
+        // `~user` requires passwd-database lookup and is intentionally unresolved.
+        return Err(());
     }
-    // Exact roots and trailing-slash variants.
+
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut idx = 0;
+    while idx < chars.len() {
+        if chars[idx] != '$' {
+            out.push(chars[idx]);
+            idx += 1;
+            continue;
+        }
+        idx += 1;
+        let name = if idx < chars.len() && chars[idx] == '{' {
+            idx += 1;
+            let start = idx;
+            while idx < chars.len() && (chars[idx].is_ascii_alphanumeric() || chars[idx] == '_') {
+                idx += 1;
+            }
+            if idx == start || idx >= chars.len() || chars[idx] != '}' {
+                return Err(());
+            }
+            let name: String = chars[start..idx].iter().collect();
+            idx += 1;
+            name
+        } else {
+            let start = idx;
+            while idx < chars.len() && (chars[idx].is_ascii_alphanumeric() || chars[idx] == '_') {
+                idx += 1;
+            }
+            if idx == start {
+                return Err(());
+            }
+            chars[start..idx].iter().collect()
+        };
+        out.push_str(env_map.get(&name).ok_or(())?);
+    }
+    Ok(out)
+}
+
+fn lexical_path_string(path: &str) -> String {
+    canonicalize_lexical(Path::new(path), Path::new("/"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn is_protected_root(path: &str) -> bool {
     matches!(
-        p,
-        "/" | "/home"
+        path.trim_end_matches('/'),
+        "" | "/home"
             | "/usr"
             | "/etc"
             | "/var"
@@ -665,23 +836,53 @@ fn is_system_path(p: &str) -> bool {
             | "/sys"
             | "/proc"
             | "/dev"
-    ) || matches!(
-        p,
-        "/home/"
-            | "/usr/"
-            | "/etc/"
-            | "/var/"
-            | "/opt/"
-            | "/srv/"
-            | "/lib/"
-            | "/bin/"
-            | "/sbin/"
-            | "/boot/"
-            | "/root/"
-            | "/sys/"
-            | "/proc/"
-            | "/dev/"
     )
+}
+
+/// Classify exact broad roots, the injected HOME, lexical aliases of either,
+/// and wildcard patterns rooted in those protected trees.
+fn is_system_path(path: &str, home: Option<&str>) -> bool {
+    // The cheap path has no cwd, so it cannot safely classify a relative
+    // operand as a system path. Joining relative paths onto `/` made ordinary
+    // cleanup targets such as `.`, `*.log`, and `foo*` look like the filesystem
+    // root. Deterministic `~`/environment expansion happens before this helper,
+    // so protected paths reached through those forms are absolute here and
+    // remain covered; cwd-relative operands are left to `tirith preview`.
+    if !Path::new(path).is_absolute() {
+        return false;
+    }
+
+    let first_glob = path.find(['*', '?', '[']);
+    let candidate = if let Some(index) = first_glob {
+        let prefix = &path[..index];
+        let directory = if prefix.ends_with('/') {
+            Path::new(prefix.trim_end_matches('/'))
+        } else {
+            Path::new(prefix)
+                .parent()
+                .unwrap_or_else(|| Path::new(prefix))
+        };
+        lexical_path_string(directory.to_string_lossy().as_ref())
+    } else {
+        lexical_path_string(path)
+    };
+    if is_protected_root(&candidate) {
+        return true;
+    }
+    home.is_some_and(|home| {
+        let home = lexical_path_string(home);
+        candidate == home
+            || (first_glob.is_some()
+                && Path::new(&candidate).strip_prefix(Path::new(&home)).is_ok())
+    })
+}
+
+/// Preview has an explicit cwd, so it can safely classify relative operands and
+/// wildcard patterns after resolving them against that cwd. The hot-path helper
+/// above deliberately cannot do this because it has no trustworthy cwd input.
+fn is_system_path_for_preview(path: &str, cwd: &Path, home: Option<&str>) -> bool {
+    let resolved = resolve_relative(path, cwd);
+    is_system_path(resolved.to_string_lossy().as_ref(), home)
 }
 
 fn target_is_glob(target: &str) -> bool {
@@ -732,98 +933,177 @@ fn resolve_relative(target: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-/// Single-level glob: split into `<dir>/<basename-pattern>`, read `<dir>`, keep
-/// name-matching entries. Only the basename may have a wildcard — enough for the
-/// common `./dist/*` / `*.log` preview shapes.
+/// Bounded component-by-component shell glob expansion. Every directory open,
+/// entry result, and candidate classification is charged to the shared work
+/// budget, so wildcard directory components cannot grow work outside the preview
+/// cap. `**` is intentionally treated as a single-level `*` (no recursive glob).
 fn glob_in_cwd(
     pattern: &str,
     cwd: &Path,
     report: &mut BlastReport,
     budget: &mut WorkBudget,
 ) -> Option<Vec<PathBuf>> {
-    let (dir_part, name_part) = match pattern.rsplit_once('/') {
-        Some((d, n)) => (d.to_string(), n.to_string()),
-        None => (String::new(), pattern.to_string()),
-    };
-    let dir = if dir_part.is_empty() {
-        cwd.to_path_buf()
+    let mut candidates = vec![if pattern.starts_with('/') {
+        PathBuf::from("/")
     } else {
-        resolve_relative(&dir_part, cwd)
-    };
+        cwd.to_path_buf()
+    }];
+    let components: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
 
-    // Charge the directory operation before opening it. The returned match list
-    // can never grow beyond the shared budget because every candidate is charged.
-    if !budget.consume(report) {
-        return None;
-    }
-    let mut out = Vec::new();
-    match std::fs::read_dir(&dir) {
-        Ok(entries) => {
-            for entry in entries {
-                if !budget.consume(report) {
-                    return None;
-                }
-                match entry {
-                    Ok(entry) => {
-                        if !budget.consume(report) {
-                            return None;
-                        }
-                        let name = entry.file_name();
-                        let name = name.to_string_lossy();
-                        if glob_match(&name_part, &name) {
-                            report.glob_expansion_count += 1;
-                            out.push(entry.path());
-                        }
-                    }
-                    Err(_) => {
-                        if !budget.consume(report) {
-                            return None;
-                        }
-                        report.walk_errors += 1;
-                    }
-                }
+    for (component_index, component) in components.iter().enumerate() {
+        let component = *component;
+        if !target_is_glob(component) {
+            for candidate in &mut candidates {
+                candidate.push(component);
             }
+            continue;
         }
-        // A glob over an unreadable dir expands to nothing; record it so the
-        // report flags the walk as incomplete (F3).
-        Err(_) => {
+
+        let mut next = Vec::new();
+        for directory in &candidates {
             if !budget.consume(report) {
                 return None;
             }
-            report.walk_errors += 1;
+            match std::fs::read_dir(directory) {
+                Ok(entries) => {
+                    for entry in entries {
+                        if !budget.consume(report) {
+                            return None;
+                        }
+                        match entry {
+                            Ok(entry) => {
+                                if !budget.consume(report) {
+                                    return None;
+                                }
+                                let name = entry.file_name();
+                                let name = name.to_string_lossy();
+                                if name.starts_with('.') && !component.starts_with('.') {
+                                    continue;
+                                }
+                                if glob_match(component, &name) {
+                                    // A match used as an intermediate path
+                                    // component must be traversable as a
+                                    // directory. Shell globbing silently drops
+                                    // ordinary files here; treating their later
+                                    // `read_dir(NotADirectory)` as an analysis
+                                    // error made normal mixed directories look
+                                    // incomplete. The existing candidate-
+                                    // classification budget charge above also
+                                    // bounds this metadata lookup.
+                                    if component_index + 1 < components.len() {
+                                        match std::fs::metadata(entry.path()) {
+                                            Ok(metadata) if metadata.is_dir() => {}
+                                            Ok(_) => continue,
+                                            Err(error)
+                                                if error.kind() == std::io::ErrorKind::NotFound =>
+                                            {
+                                                continue;
+                                            }
+                                            Err(_) => {
+                                                if !budget.consume(report) {
+                                                    return None;
+                                                }
+                                                report.walk_errors += 1;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    next.push(entry.path());
+                                }
+                            }
+                            Err(_) => {
+                                if !budget.consume(report) {
+                                    return None;
+                                }
+                                report.walk_errors += 1;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !budget.consume(report) {
+                        return None;
+                    }
+                    report.walk_errors += 1;
+                }
+            }
+        }
+        candidates = next;
+        if candidates.is_empty() {
+            break;
         }
     }
-    Some(out)
+
+    report.glob_expansion_count = report
+        .glob_expansion_count
+        .saturating_add(candidates.len() as u64);
+    Some(candidates)
 }
 
-/// Minimal glob matcher: `*` (any run), `?` (one char), `[` literal. Enough for
-/// preview-grade counting.
+/// Component glob matcher supporting `*`, `?`, bracket sets/ranges, and bracket
+/// negation (`[!x]`/`[^x]`). Memoization bounds adversarial backtracking.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    // Iterative match with backtracking on `*`.
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let (mut star, mut mark) = (None::<usize>, 0usize);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = ti;
-            pi += 1;
-        } else if let Some(s) = star {
-            pi = s + 1;
-            mark += 1;
-            ti = mark;
-        } else {
-            return false;
+    let mut memo = vec![vec![None; t.len() + 1]; p.len() + 1];
+
+    fn matches_from(
+        p: &[char],
+        t: &[char],
+        pi: usize,
+        ti: usize,
+        memo: &mut [Vec<Option<bool>>],
+    ) -> bool {
+        if let Some(result) = memo[pi][ti] {
+            return result;
         }
+        let result = if pi == p.len() {
+            ti == t.len()
+        } else {
+            match p[pi] {
+                '*' => {
+                    matches_from(p, t, pi + 1, ti, memo)
+                        || (ti < t.len() && matches_from(p, t, pi, ti + 1, memo))
+                }
+                '?' => ti < t.len() && matches_from(p, t, pi + 1, ti + 1, memo),
+                '[' => {
+                    let mut end = pi + 1;
+                    while end < p.len() && p[end] != ']' {
+                        end += 1;
+                    }
+                    if end == p.len() {
+                        ti < t.len() && p[pi] == t[ti] && matches_from(p, t, pi + 1, ti + 1, memo)
+                    } else if ti >= t.len() {
+                        false
+                    } else {
+                        let mut cursor = pi + 1;
+                        let negated = cursor < end && matches!(p[cursor], '!' | '^');
+                        if negated {
+                            cursor += 1;
+                        }
+                        let mut class_match = false;
+                        while cursor < end {
+                            if cursor + 2 < end && p[cursor + 1] == '-' {
+                                class_match |= p[cursor] <= t[ti] && t[ti] <= p[cursor + 2];
+                                cursor += 3;
+                            } else {
+                                class_match |= p[cursor] == t[ti];
+                                cursor += 1;
+                            }
+                        }
+                        (class_match != negated) && matches_from(p, t, end + 1, ti + 1, memo)
+                    }
+                }
+                literal => {
+                    ti < t.len() && literal == t[ti] && matches_from(p, t, pi + 1, ti + 1, memo)
+                }
+            }
+        };
+        memo[pi][ti] = Some(result);
+        result
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
+
+    matches_from(&p, &t, 0, 0, &mut memo)
 }
 
 /// Decide whether `path` escapes the repo: with a `repo_root`, not under the
@@ -1013,13 +1293,28 @@ fn finding(
     }
 }
 
-/// Drop duplicate `rule_id` findings (keep first): multiple system-path targets
-/// surface one finding, not N.
+/// Keep one ordinary blast finding per rule, while dropping only exact
+/// `AnalysisIncomplete` duplicates. Distinct unresolved destructive targets
+/// can share that rule ID but carry different evidence; collapsing them would
+/// hide an independent failure boundary.
 fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen_rules = std::collections::HashSet::new();
+    let mut seen_incomplete = std::collections::HashSet::new();
     findings
         .into_iter()
-        .filter(|f| seen.insert(f.rule_id))
+        .filter(|finding| {
+            if finding.rule_id != RuleId::AnalysisIncomplete {
+                return seen_rules.insert(finding.rule_id);
+            }
+            let evidence = serde_json::to_string(&finding.evidence)
+                .unwrap_or_else(|_| format!("{:?}", finding.evidence));
+            seen_incomplete.insert((
+                finding.severity,
+                finding.title.clone(),
+                finding.description.clone(),
+                evidence,
+            ))
+        })
         .collect()
 }
 
@@ -1030,6 +1325,30 @@ mod tests {
 
     fn empty_env() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    #[test]
+    fn dedup_preserves_distinct_incomplete_boundaries() {
+        let first = finding(
+            RuleId::AnalysisIncomplete,
+            Severity::High,
+            "first unresolved boundary",
+            "first description",
+            Evidence::Text {
+                detail: "first evidence".to_string(),
+            },
+        );
+        let second = finding(
+            RuleId::AnalysisIncomplete,
+            Severity::High,
+            "second unresolved boundary",
+            "second description",
+            Evidence::Text {
+                detail: "second evidence".to_string(),
+            },
+        );
+        let deduped = dedup_findings(vec![first.clone(), first, second]);
+        assert_eq!(deduped.len(), 2);
     }
 
     fn simulate_with_tiny_budget(input: &str, cwd: &Path, work_limit: usize) -> BlastReport {
@@ -1274,9 +1593,68 @@ mod tests {
     }
 
     #[test]
+    fn cheap_check_relative_roots_and_globs_are_left_to_preview() {
+        for input in ["rm -rf .", "rm -f *.log", "rm -rf foo*"] {
+            let findings = cheap_check(input, ShellType::Posix, &empty_env());
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::BlastWritesSystemPath),
+                "relative target must not be resolved against filesystem root: {input} -> {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cheap_check_absolute_glob_and_expanded_home_remain_protected() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/Users/alice".to_string());
+
+        for input in [r#"rm -rf /etc/*"#, r#"rm -rf "$HOME""#] {
+            let findings = cheap_check(input, ShellType::Posix, &env);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+                "protected absolute target escaped classification: {input} -> {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_classifies_relative_targets_against_its_supplied_cwd() {
+        // Exercise only lexical classification: do not invoke `simulate` and do
+        // not read or walk the synthetic system paths.
+        assert!(is_system_path_for_preview(".", Path::new("/etc"), None));
+        assert!(is_system_path_for_preview(
+            "*.conf",
+            Path::new("/etc"),
+            None
+        ));
+        assert!(!is_system_path_for_preview(
+            ".",
+            Path::new("/tmp/project"),
+            None
+        ));
+    }
+
+    #[test]
     fn cheap_check_mv_to_root() {
         let f = cheap_check("mv important /", ShellType::Posix, &empty_env());
         assert!(f.iter().any(|f| f.rule_id == RuleId::BlastWritesSystemPath));
+    }
+
+    #[test]
+    fn cheap_check_mv_attached_target_directory_preserves_destination() {
+        let protected = cheap_check("mv -t/etc payload", ShellType::Posix, &empty_env());
+        assert!(protected
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath));
+
+        let relative = cheap_check("mv -t./dist payload", ShellType::Posix, &empty_env());
+        assert!(relative
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::BlastWritesSystemPath));
     }
 
     #[test]
@@ -1309,6 +1687,116 @@ mod tests {
             f.iter().any(|f| f.rule_id == RuleId::BlastWritesSystemPath),
             "wrapped rm under sudo flags must still fire"
         );
+    }
+
+    #[test]
+    fn cheap_check_resolves_execution_wrappers_and_value_taking_options() {
+        for input in [
+            "env rm -rf /home",
+            "command rm -rf /etc",
+            "exec rm -rf /var",
+            "nohup rm -rf /opt",
+            "time -f %e rm -rf /srv",
+            "sudo -p prompt rm -rf /root",
+            "doas -u root rm -rf /boot",
+        ] {
+            let findings = cheap_check(input, ShellType::Posix, &empty_env());
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+                "wrapper bypassed blast-radius check: {input} -> {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cheap_check_find_traversal_options_preserve_the_real_root_target() {
+        let findings = cheap_check("find -H / -delete", ShellType::Posix, &empty_env());
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::BlastFindDelete));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath));
+    }
+
+    #[test]
+    fn cheap_check_resolves_environment_tilde_glob_and_lexical_path_equivalence() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/Users/alice".to_string());
+        env.insert("ROOT".to_string(), "/etc".to_string());
+        for input in [
+            r#"rm -rf "$HOME""#,
+            r#"rm -rf "$ROOT/*""#,
+            "rm -rf /tmp/../etc",
+            "rm -rf ~/",
+            "rm -rf /var/log/../*",
+        ] {
+            let findings = cheap_check(input, ShellType::Posix, &env);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+                "equivalent protected path escaped: {input} -> {findings:?}"
+            );
+        }
+
+        // A prefix assignment does not affect parameter expansion in the same
+        // shell command: `HOME=/tmp rm -rf "$HOME"` still expands the shell's
+        // inherited HOME and must remain blocked.
+        let prefixed_home =
+            cheap_check(r#"HOME=/tmp/build rm -rf "$HOME""#, ShellType::Posix, &env);
+        assert!(prefixed_home
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath));
+
+        let mut safe_env = env.clone();
+        safe_env.insert("ROOT".to_string(), "/tmp/build".to_string());
+        let control = cheap_check(r#"rm -rf "$ROOT""#, ShellType::Posix, &safe_env);
+        assert!(control
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::BlastWritesSystemPath));
+    }
+
+    #[test]
+    fn cheap_check_analyzes_background_groups_and_command_substitutions() {
+        for input in [
+            "echo ready & rm -rf /",
+            "echo $(rm -rf /)",
+            "(rm -rf /)",
+            "{ rm -rf /; }",
+        ] {
+            let findings = cheap_check(input, ShellType::Posix, &empty_env());
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+                "nested/secondary command escaped: {input} -> {findings:?}"
+            );
+        }
+
+        for (input, shell) in [
+            ("echo ready; echo (rm -rf /)", ShellType::Fish),
+            ("echo ok; and rm -rf /", ShellType::Fish),
+            ("false; or rm -rf /", ShellType::Fish),
+            ("not rm -rf /", ShellType::Fish),
+            ("if true; then rm -rf /; fi", ShellType::Posix),
+            ("while true; do rm -rf /; done", ShellType::Posix),
+            ("case x in x) rm -rf /;; esac", ShellType::Posix),
+            ("(echo ready & rm -rf /)", ShellType::Cmd),
+            (r#"cmd /C "(echo ready & rm -rf /)""#, ShellType::Cmd),
+            (r#"cmd /C "if exist marker rm -rf /""#, ShellType::Cmd),
+            (r#"cmd /C "for %i in (x) do rm -rf /""#, ShellType::Cmd),
+        ] {
+            let findings = cheap_check(input, shell, &empty_env());
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+                "shell-specific group/substitution escaped: {input} -> {findings:?}"
+            );
+        }
     }
 
     #[test]
@@ -1487,6 +1975,46 @@ mod tests {
     }
 
     #[test]
+    fn simulate_supports_bracket_and_wildcard_directory_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("service-a/logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("a.txt"), b"a").unwrap();
+        fs::write(logs.join("b.txt"), b"b").unwrap();
+        fs::write(logs.join("c.txt"), b"c").unwrap();
+
+        let report = simulate(
+            "rm -f service-*/logs/[ab].txt",
+            ShellType::Posix,
+            dir.path(),
+            Some(dir.path()),
+            &empty_env(),
+        );
+        assert_eq!(report.glob_expansion_count, 2);
+        assert_eq!(report.file_count, 2);
+        assert_eq!(report.walk_errors, 0);
+    }
+
+    #[test]
+    fn glob_intermediate_component_ignores_ordinary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plain.txt"), b"not a directory").unwrap();
+        fs::create_dir_all(dir.path().join("service-a")).unwrap();
+        fs::write(dir.path().join("service-a/a.txt"), b"match").unwrap();
+
+        let report = simulate(
+            "rm -f */*.txt",
+            ShellType::Posix,
+            dir.path(),
+            Some(dir.path()),
+            &empty_env(),
+        );
+        assert_eq!(report.glob_expansion_count, 1);
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.walk_errors, 0);
+    }
+
+    #[test]
     fn simulate_empty_var_glob_is_system_and_outside() {
         let dir = tempfile::tempdir().unwrap();
         let report = simulate(
@@ -1543,6 +2071,10 @@ mod tests {
         assert!(glob_match("f?.txt", "f1.txt"));
         assert!(!glob_match("f?.txt", "f12.txt"));
         assert!(glob_match("*", "anything"));
+        assert!(glob_match("[ab].txt", "a.txt"));
+        assert!(glob_match("[a-c].txt", "b.txt"));
+        assert!(glob_match("[!a].txt", "b.txt"));
+        assert!(!glob_match("[!a].txt", "a.txt"));
     }
 
     #[test]

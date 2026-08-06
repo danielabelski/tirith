@@ -332,9 +332,14 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     },
     PatternEntry {
         id: "docker_command",
-        tier1_exec_fragments: &[r"(?:docker|podman)\s+(pull|run|build|create|compose|image)"],
+        // Admit the standalone runtime token, then let `rules::container` parse
+        // global options and the eventual subcommand. Matching only an
+        // immediately adjacent subcommand made commands such as
+        // `docker --context prod run --privileged ...` invisible to the full
+        // rule pass.
+        tier1_exec_fragments: &[r"\b(?:docker|podman)\b"],
         tier1_paste_only_fragments: &[],
-        notes: "Docker/Podman commands that reference images",
+        notes: "Docker/Podman commands, including global-option forms",
     },
     PatternEntry {
         id: "pipe_to_interpreter",
@@ -492,8 +497,8 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         tier1_exec_fragments: &[
             r"/dev/tcp/",
             r"/dev/udp/",
-            r"\b(?:nc|ncat|netcat)\b",
-            r"\bsocat\b",
+            r"(?i:\b(?:nc|ncat|netcat)(?:\.exe)?\b)",
+            r"(?i:\bsocat(?:\.exe)?\b)",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Reverse/bind shell shapes (/dev/tcp, nc -e, socat EXEC:) — PR3",
@@ -531,6 +536,10 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             r"\bIO::Socket\b",
             r"\bNet::",
             r"\bLWP::",
+            // PHP function names are case-insensitive. Keep this scoped to the
+            // PHP-capable primitives rather than changing other languages'
+            // case semantics in the precise rule.
+            r"(?i:\b(?:system|popen|shell_exec|passthru|proc_open)\s*\()",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Inline-interpreter suspicious payload markers (python -c/node -e/... \
@@ -576,7 +585,10 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             r"\[trusted=yes\]",
             r"--allow-unauthenticated\b",
             r"--allow-insecure-repositories\b",
+            r"--allow-downgrades-to-insecure-repositories\b",
             r"--nogpgcheck\b",
+            r"(?i:--no-gpg-checks\b)",
+            r"(?i:(?:APT::Get::AllowUnauthenticated|Acquire::Allow(?:InsecureRepositories|DowngradeToInsecureRepositories|WeakRepositories))\b)",
             r"(?i)gpgcheck\s*=\s*0",
             r"(?i)SigLevel\s*=\s*Never",
         ],
@@ -680,7 +692,7 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         // listed because `aws-vault exec … -- aws s3 rm …` is the same shape with a
         // credential wrapper. `\b` keeps `aws-` / `azimuth` out of the hit list.
         tier1_exec_fragments: &[
-            r"\b(?:kubectl|kustomize|helm|argocd|aws|aws-vault|gcloud|az)\b",
+            r"\b(?:kubectl|oc|kustomize|helm|argocd|aws|aws-vault|gcloud|az)\b",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Cloud / k8s CLIs for production-context destructive-command detection (M8 ch1)",
@@ -705,9 +717,8 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     },
     PatternEntry {
         id: "docker_exec",
-        // M8 ch5 — the `docker_command` entry does not match `exec`, so the
-        // prod-container exec rule needs its own tier-1 admission ticket. (The
-        // privileged-run / bind-mount rules ride on `docker_command`.)
+        // Kept as an explicit coverage declaration even though the broader
+        // `docker_command` admission above also reaches this sink.
         tier1_exec_fragments: &[r"(?:docker|podman)\s+exec"],
         tier1_paste_only_fragments: &[],
         notes: "Docker / Podman exec subcommand for prod-container detection (M8 ch5)",

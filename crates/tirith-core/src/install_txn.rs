@@ -2663,7 +2663,7 @@ fn policy_findings_for(
     // PackagePolicyNewerThanDays — package_age_days against thresholds
     if let Some(prov) = provenance {
         if let Some(age_days) = prov.package_age_days {
-            let warn_d = pp.warn_newer_than_days;
+            let warn_d = Some(pp.warn_newer_than_days_effective());
             let block_d = pp.block_newer_than_days;
             let (fired, sev) = match (block_d, warn_d) {
                 (Some(b), _) if (age_days as u32) <= b => (true, Severity::High),
@@ -4902,6 +4902,43 @@ mod tests {
             f.severity,
             Severity::High,
             "block_newer_than_days crossed -> Block severity"
+        );
+    }
+
+    #[test]
+    fn package_policy_day_zero_blocks_only_packages_published_today() {
+        let pkg = PackageRef {
+            ecosystem: Ecosystem::Npm,
+            name: "fresh-pkg".to_string(),
+            alias: None,
+            version: VersionIntent::Unspecified,
+        };
+        let severity_for_age = |age_days| {
+            let provenance = ApiProvenance {
+                source: "npm".to_string(),
+                package_age_days: Some(age_days),
+                package_existence: PackageExistence::Exists,
+                ..Default::default()
+            };
+            let breakdown = breakdown_with_provenance(
+                "fresh-pkg",
+                Ecosystem::Npm,
+                NameVsPopular::Unknown,
+                provenance,
+            );
+            let mut policy = empty_policy();
+            policy.package_policy.block_newer_than_days = Some(0);
+            risk_findings_for(&pkg, &breakdown, &[], &policy)
+                .into_iter()
+                .find(|finding| finding.rule_id == RuleId::PackagePolicyNewerThanDays)
+                .map(|finding| finding.severity)
+                .expect("age warning/block finding")
+        };
+        assert_eq!(severity_for_age(0), Severity::High);
+        assert_eq!(
+            severity_for_age(1),
+            Severity::Medium,
+            "a one-day-old package may warn but must not hit the day-zero block"
         );
     }
 

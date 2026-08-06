@@ -39,6 +39,11 @@ type LookupFn = dyn Fn(&str) -> Result<Vec<SocketAddr>, String> + Send + Sync;
 enum ResolverMode {
     PublicOnly,
     Fetch(Result<crate::url_validate::PrivateFetchPolicy, String>),
+    /// Unit-test-only transport mapping for loopback HTTP fixtures. Adversarial
+    /// resolver tests use `PublicOnly` so the real connect-time policy is still
+    /// exercised; this variant is absent from every non-test library build.
+    #[cfg(test)]
+    FixtureUnchecked,
 }
 
 impl Resolve for SsrfGuardResolver {
@@ -79,6 +84,8 @@ fn validate_answer_set(
             crate::url_validate::validate_resolved_destination(host, addresses, Some(policy))
         }
         ResolverMode::Fetch(Err(reason)) => Err(reason.clone()),
+        #[cfg(test)]
+        ResolverMode::FixtureUnchecked => Ok(()),
     }
 }
 
@@ -125,6 +132,71 @@ where
     })
 }
 
+/// Strict server-resolver seam for hermetic DNS-rebinding tests. Unlike the
+/// fixture resolver below, this applies the production public-only policy to
+/// the injected connect-time answer.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn ssrf_guard_resolver_with_lookup_for_test<F>(lookup: F) -> Arc<SsrfGuardResolver>
+where
+    F: Fn(&str) -> Result<Vec<SocketAddr>, String> + Send + Sync + 'static,
+{
+    Arc::new(SsrfGuardResolver {
+        mode: ResolverMode::PublicOnly,
+        lookup: Arc::new(lookup),
+    })
+}
+
+/// Test-only DNS mapping used to connect a public-looking hostname to a local
+/// scripted HTTP fixture. It proves request shape, redirect behavior, and proxy
+/// bypass without granting production code a private-destination escape hatch.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn fixture_resolver_with_lookup_for_test<F>(lookup: F) -> Arc<SsrfGuardResolver>
+where
+    F: Fn(&str) -> Result<Vec<SocketAddr>, String> + Send + Sync + 'static,
+{
+    Arc::new(SsrfGuardResolver {
+        mode: ResolverMode::FixtureUnchecked,
+        lookup: Arc::new(lookup),
+    })
+}
+
+fn blocking_client_builder_with_resolver(
+    resolver: Arc<SsrfGuardResolver>,
+) -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .dns_resolver(resolver)
+}
+
+/// Shared production builder for server clients. Keeping proxy disablement and
+/// connect-time DNS enforcement in one constructor prevents individual sinks
+/// from silently regressing to reqwest's ambient proxy behavior.
+pub(crate) fn server_client_builder() -> reqwest::blocking::ClientBuilder {
+    blocking_client_builder_with_resolver(ssrf_guard_resolver()).redirect(server_redirect_policy())
+}
+
+/// Shared production builder for user-fetch clients. Callers retain their own
+/// purpose-specific redirect policy while inheriting no-proxy + guarded DNS.
+pub(crate) fn fetch_client_builder() -> reqwest::blocking::ClientBuilder {
+    blocking_client_builder_with_resolver(fetch_resolver())
+}
+
+#[cfg(test)]
+pub(crate) fn server_client_builder_with_resolver_for_test(
+    resolver: Arc<SsrfGuardResolver>,
+) -> reqwest::blocking::ClientBuilder {
+    blocking_client_builder_with_resolver(resolver).redirect(server_redirect_policy())
+}
+
+#[cfg(test)]
+pub(crate) fn fetch_client_builder_with_resolver_for_test(
+    resolver: Arc<SsrfGuardResolver>,
+) -> reqwest::blocking::ClientBuilder {
+    blocking_client_builder_with_resolver(resolver)
+}
+
 /// Maximum redirect hops the server clients will follow before giving up.
 /// reqwest's implicit default would silently follow up to 10 hops into
 /// anywhere; the server paths cap at 5 and re-validate every hop.
@@ -164,6 +236,285 @@ pub fn server_redirect_policy() -> reqwest::redirect::Policy {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::ffi::OsString;
+    use std::io::{Read as _, Write as _};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const FIXTURE_DEADLINE: Duration = Duration::from_secs(3);
+
+    pub(crate) struct EnvironmentRestore(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvironmentRestore {
+        pub(crate) fn new() -> Self {
+            Self(Vec::new())
+        }
+
+        pub(crate) fn set(&mut self, name: &'static str, value: Option<&str>) {
+            self.0.push((name, std::env::var_os(name)));
+            // SAFETY: callers hold crate::TEST_ENV_LOCK for this guard's full
+            // lifetime, serializing process-environment mutation.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        pub(crate) fn install_ambient_proxy(&mut self, proxy_url: &str) {
+            for name in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                self.set(name, Some(proxy_url));
+            }
+            self.set("NO_PROXY", Some(""));
+            self.set("no_proxy", Some(""));
+        }
+    }
+
+    impl Drop for EnvironmentRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..).rev() {
+                // SAFETY: the environment lock remains held until this guard
+                // has restored every value.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn http_response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        )
+        .into_bytes();
+        for (name, value) in headers {
+            response.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        response.extend_from_slice(b"\r\n");
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn request_is_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let header_end = header_end + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + content_length
+    }
+
+    pub(crate) struct ScriptedHttpServer {
+        address: SocketAddr,
+        requests: Arc<Mutex<Vec<Vec<u8>>>>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<Result<(), String>>>,
+    }
+
+    impl ScriptedHttpServer {
+        pub(crate) fn start(responses: Vec<Vec<u8>>) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind HTTP fixture");
+            listener
+                .set_nonblocking(true)
+                .expect("make HTTP fixture nonblocking");
+            let address = listener.local_addr().expect("read HTTP fixture address");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let worker_requests = Arc::clone(&requests);
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                let deadline = Instant::now() + FIXTURE_DEADLINE;
+                let expected = responses.len();
+                for response in responses {
+                    let mut accepted = None;
+                    while !worker_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                accepted = Some(stream);
+                                break;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => return Err(format!("accept HTTP fixture: {error}")),
+                        }
+                    }
+                    let Some(mut stream) = accepted else {
+                        if worker_stop.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        return Err(format!(
+                            "HTTP fixture received fewer than {expected} requests before deadline"
+                        ));
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(500)))
+                        .map_err(|error| format!("set fixture read timeout: {error}"))?;
+                    let mut request = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 4096];
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                request.extend_from_slice(&chunk[..read]);
+                                if request_is_complete(&request) {
+                                    break;
+                                }
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                break;
+                            }
+                            Err(error) => return Err(format!("read HTTP fixture: {error}")),
+                        }
+                    }
+                    worker_requests
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(request);
+                    stream
+                        .write_all(&response)
+                        .map_err(|error| format!("write HTTP fixture: {error}"))?;
+                    stream
+                        .flush()
+                        .map_err(|error| format!("flush HTTP fixture: {error}"))?;
+                }
+                Ok(())
+            });
+            Self {
+                address,
+                requests,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        pub(crate) fn address(&self) -> SocketAddr {
+            self.address
+        }
+
+        pub(crate) fn finish(mut self) -> Vec<Vec<u8>> {
+            let result = self
+                .worker
+                .take()
+                .expect("HTTP fixture worker")
+                .join()
+                .expect("join HTTP fixture");
+            result.expect("HTTP fixture completed");
+            let requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            requests
+        }
+    }
+
+    impl Drop for ScriptedHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    pub(crate) struct ProxyTrap {
+        address: SocketAddr,
+        hit: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ProxyTrap {
+        pub(crate) fn start() -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind proxy trap");
+            listener
+                .set_nonblocking(true)
+                .expect("make proxy trap nonblocking");
+            let address = listener.local_addr().expect("read proxy trap address");
+            let hit = Arc::new(AtomicBool::new(false));
+            let worker_hit = Arc::clone(&hit);
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                let deadline = Instant::now() + FIXTURE_DEADLINE;
+                while !worker_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            worker_hit.store(true, Ordering::Release);
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                address,
+                hit,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        pub(crate) fn url(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        pub(crate) fn finish(mut self) -> bool {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                worker.join().expect("join proxy trap");
+            }
+            self.hit.load(Ordering::Acquire)
+        }
+    }
+
+    impl Drop for ProxyTrap {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::url_validate::{is_cloud_metadata_addr, is_public_addr, PrivateFetchPolicy};
     use std::net::{IpAddr, SocketAddr};
@@ -174,6 +525,67 @@ mod tests {
 
     fn ips(values: &[&str]) -> Vec<IpAddr> {
         values.iter().map(|value| value.parse().unwrap()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_client_builders_ignore_ambient_proxies_and_keep_direct_routes_working() {
+        use super::test_support::{
+            http_response, EnvironmentRestore, ProxyTrap, ScriptedHttpServer,
+        };
+        use std::time::Duration;
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = ScriptedHttpServer::start(vec![
+            http_response("200 OK", &[], b"server-direct"),
+            http_response("200 OK", &[], b"fetch-direct"),
+        ]);
+        let proxy = ProxyTrap::start();
+        let mut restore = EnvironmentRestore::new();
+        restore.install_ambient_proxy(&proxy.url());
+
+        let address = fixture.address();
+        let resolver = super::fixture_resolver_with_lookup_for_test(move |host| {
+            if host != "guarded-direct.example.test" {
+                return Err(format!("unexpected fixture host: {host}"));
+            }
+            Ok(vec![address])
+        });
+        let server_client = super::server_client_builder_with_resolver_for_test(resolver.clone())
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("build guarded server client");
+        let fetch_client = super::fetch_client_builder_with_resolver_for_test(resolver)
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("build guarded fetch client");
+        let base = format!(
+            "http://guarded-direct.example.test:{}",
+            fixture.address().port()
+        );
+
+        let server_body = server_client
+            .get(format!("{base}/server"))
+            .send()
+            .expect("server client takes the direct route")
+            .text()
+            .expect("read server response");
+        let fetch_body = fetch_client
+            .get(format!("{base}/fetch"))
+            .send()
+            .expect("fetch client takes the direct route")
+            .text()
+            .expect("read fetch response");
+
+        assert_eq!(server_body, "server-direct");
+        assert_eq!(fetch_body, "fetch-direct");
+        assert_eq!(fixture.finish().len(), 2);
+        assert!(
+            !proxy.finish(),
+            "guarded clients must not delegate destination resolution to ambient proxies"
+        );
     }
 
     #[test]

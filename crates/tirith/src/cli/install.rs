@@ -12,10 +12,10 @@
 //!
 //! ## What this is NOT
 //!
-//! This is analysis + a recorded transaction. It does NOT sandbox, isolate, or
-//! contain the install — runtime sandboxing is an explicit tirith non-goal (see
-//! `docs/threat-model.md`); the real install runs with the user's full
-//! privileges.
+//! Package-manager forms are analysis + a recorded transaction and do not
+//! sandbox the real package manager. The URL form is stricter: the reviewed
+//! script uses the shared verified capsule executor and fails closed instead of
+//! running live bytes uncontained.
 
 #[cfg(unix)]
 use tirith_core::runner::{self, RunOptions};
@@ -138,18 +138,51 @@ impl InstallRunner for ProcessInstallRunner<'_> {
         args: &[String],
         capture: bool,
     ) -> std::io::Result<InstallRunOutput> {
-        // Revalidate the selected invocation path, its canonical target, and
-        // the target's content digest immediately before spawn. `program` must
-        // be the absolute path stored in the approved plan; PATH is never
-        // consulted for the primary executable. Executing the selected path
-        // preserves multicall argv[0] semantics such as `cargo -> rustup`.
-        let mut command = Command::new(self.executable.path());
+        // Launch the exact retained executable identity. Linux native binaries
+        // use a fully sealed descriptor. Shebang entrypoints must retain a real
+        // pathname because interpreters commonly resolve sibling resources from
+        // that path; those launches instead receive an immediate identity and
+        // digest revalidation below. The selected spelling is also retained as
+        // argv[0], preserving multicall semantics such as `cargo -> rustup`.
+        #[cfg(target_os = "linux")]
+        let bound_fd = self.executable.trusted.bound_launch_fd();
+        #[cfg(target_os = "linux")]
+        let launch_program = bound_fd.map_or_else(
+            || self.executable.path().as_os_str().to_os_string(),
+            |fd| OsString::from(format!("/proc/self/fd/{fd}")),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let launch_program = self.executable.path().as_os_str().to_os_string();
+        let mut command = Command::new(launch_program);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.arg0(self.executable.path());
+        }
         command.args(args);
         self.source_binding.configure_command(&mut command);
         // Keep both identity checks as close to the actual spawn as the
         // process API permits, after all command configuration is complete.
-        self.executable.verify_program(program)?;
+        // Verify the primary executable last so pathname scripts get the
+        // narrowest available revalidation-to-exec window.
         self.source_binding.verify()?;
+        self.executable.verify_program(program)?;
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = bound_fd {
+            use std::os::unix::process::CommandExt as _;
+
+            // SAFETY: fcntl is async-signal-safe. The descriptor is a sealed
+            // native image and must survive exec so `/proc/self/fd/N` remains
+            // available to the kernel. Scripts never take this branch.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         if capture {
             // PR #121 fix-list item 3 — capture mode for `--format json` buffers
             // child stdout/stderr so they don't interleave between JSON objects
@@ -182,25 +215,69 @@ struct InstallExecutableBinding {
     invocation_path: PathBuf,
     canonical_path: PathBuf,
     sha256: [u8; 32],
+    /// Retains the selected provenance and, on Linux, the immutable executable
+    /// descriptor from analysis through the final spawn.
+    trusted: tirith_core::trusted_child::TrustedExecutable,
 }
 
 impl InstallExecutableBinding {
     fn resolve(program: &str) -> std::io::Result<Self> {
-        let trusted =
-            tirith_core::trusted_child::resolve_ambient(program).map_err(std::io::Error::other)?;
+        let path_value = std::env::var_os("PATH").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("cannot resolve {program}: PATH is unset"),
+            )
+        })?;
+        Self::resolve_on_path(program, &path_value)
+    }
+
+    fn resolve_on_path(program: &str, path_value: &OsStr) -> std::io::Result<Self> {
+        let trusted = tirith_core::trusted_child::TrustedExecutable::resolve_on_path(
+            program,
+            path_value,
+            &tirith_core::trusted_child::ambient_denied_roots(),
+        )
+        .map_err(std::io::Error::other)?;
+        // Reject a writable first hit that actually shadows the same command in
+        // a later system directory. A user-managed installation with no such
+        // collision remains valid because its exact bytes/path identity are
+        // bound below; repository and transient roots were already rejected by
+        // TrustedExecutable.
+        Self::reject_unsafe_path_selection(trusted.invocation_path(), path_value)?;
         Self::from_trusted(trusted)
     }
 
     fn from_trusted(
         trusted: tirith_core::trusted_child::TrustedExecutable,
     ) -> std::io::Result<Self> {
+        Self::from_trusted_inner(trusted)
+    }
+
+    #[cfg(test)]
+    fn from_trusted_for_test(
+        trusted: tirith_core::trusted_child::TrustedExecutable,
+    ) -> std::io::Result<Self> {
+        Self::from_trusted_inner(trusted)
+    }
+
+    fn from_trusted_inner(
+        trusted: tirith_core::trusted_child::TrustedExecutable,
+    ) -> std::io::Result<Self> {
         let invocation_path = trusted.invocation_path().to_path_buf();
         let canonical_path = trusted.path().to_path_buf();
-        let sha256 = hash_install_executable(&canonical_path)?;
+        #[cfg(target_os = "linux")]
+        let trusted = match classify_linux_install_executable(&canonical_path)? {
+            LinuxInstallExecutableKind::Native => {
+                trusted.bind_content().map_err(std::io::Error::other)?
+            }
+            LinuxInstallExecutableKind::Script => trusted,
+        };
+        let sha256 = hash_install_executable(trusted.launch_path())?;
         Ok(Self {
             invocation_path,
             canonical_path,
             sha256,
+            trusted,
         })
     }
 
@@ -213,6 +290,83 @@ impl InstallExecutableBinding {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    /// Package-manager identity is a non-bypassable transaction precondition.
+    /// The planner assumes npm/pip/cargo/etc. semantics, so a same-UID PATH
+    /// shadow must be rejected before analysis rather than represented as a
+    /// policy finding that `TIRITH=0` could override.
+    fn reject_unsafe_path_selection(
+        invocation_path: &Path,
+        path_value: &OsStr,
+    ) -> std::io::Result<()> {
+        let path_dirs: Vec<PathBuf> = std::env::split_paths(path_value).collect();
+        let Some(parent) = invocation_path.parent() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "selected package-manager executable has no parent directory",
+            ));
+        };
+        let selected_name = invocation_path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "selected package-manager executable has no file name",
+            )
+        })?;
+        let current_dir = std::env::current_dir()?;
+        let mut selected_index = None;
+        for (index, directory) in path_dirs.iter().enumerate() {
+            let absolute = if directory.is_absolute() {
+                directory.clone()
+            } else {
+                current_dir.join(directory)
+            };
+            if absolute != parent {
+                continue;
+            }
+            if !directory.is_absolute() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing package-manager executable {} selected through a relative PATH entry",
+                        invocation_path.display()
+                    ),
+                ));
+            }
+            selected_index = Some(index);
+            break;
+        }
+        let Some(selected_index) = selected_index else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "selected package-manager executable is not attributable to the approved PATH snapshot",
+            ));
+        };
+        if !tirith_core::path_audit::writable_dir_precedes_system(parent, &path_dirs) {
+            return Ok(());
+        }
+
+        let shadowed_system_executable = path_dirs
+            .iter()
+            .skip(selected_index + 1)
+            .filter(|directory| {
+                tirith_core::path_audit::SYSTEM_PATH_DIRS
+                    .iter()
+                    .any(|system| directory.as_path() == Path::new(system))
+            })
+            .map(|directory| directory.join(selected_name))
+            .find(|candidate| tirith_core::path_audit::is_executable_file(candidate));
+        let Some(shadowed_system_executable) = shadowed_system_executable else {
+            return Ok(());
+        };
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing package-manager executable {} because it shadows later trusted system executable {}",
+                invocation_path.display(),
+                shadowed_system_executable.display()
+            ),
+        ))
     }
 
     fn verify_program(&self, program: &str) -> std::io::Result<()> {
@@ -233,23 +387,66 @@ impl InstallExecutableBinding {
                 "approved install executable path does not match the spawn path",
             ));
         }
-        let trusted =
+        self.trusted.revalidate().map_err(std::io::Error::other)?;
+
+        // A sealed Linux native executable is intentionally independent of any
+        // later pathname or symlink change. Every pathname launch (including a
+        // Linux shebang script) must still resolve to the approved canonical
+        // identity and digest at the final spawn boundary.
+        #[cfg(target_os = "linux")]
+        if self.trusted.bound_launch_fd().is_some() {
+            return Ok(());
+        }
+        let current =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(requested, denied_roots)
                 .map_err(std::io::Error::other)?;
-        if trusted.invocation_path() != self.invocation_path
-            || trusted.path() != self.canonical_path
+        if current.invocation_path() != self.invocation_path
+            || current.path() != self.canonical_path
         {
             return Err(std::io::Error::other(
                 "approved install executable now resolves to a different path",
             ));
         }
-        if hash_install_executable(trusted.path())? != self.sha256 {
+        if hash_install_executable(current.path())? != self.sha256 {
             return Err(std::io::Error::other(
                 "approved install executable changed after analysis",
             ));
         }
+        self.trusted.revalidate().map_err(std::io::Error::other)?;
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxInstallExecutableKind {
+    Native,
+    Script,
+}
+
+/// Linux can safely execute an ELF image through a sealed descriptor, but a
+/// shebang interpreter needs the validated pathname so sibling-relative module
+/// and resource lookup retains ordinary package-manager semantics.
+#[cfg(target_os = "linux")]
+fn classify_linux_install_executable(path: &Path) -> std::io::Result<LinuxInstallExecutableKind> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut prefix = [0_u8; 4];
+    let count = file.read(&mut prefix)?;
+    if count >= 2 && &prefix[..2] == b"#!" {
+        return Ok(LinuxInstallExecutableKind::Script);
+    }
+    if count == prefix.len() && prefix == *b"\x7fELF" {
+        return Ok(LinuxInstallExecutableKind::Native);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "install executable {} is neither an ELF native binary nor a shebang script",
+            path.display()
+        ),
+    ))
 }
 
 fn hash_install_executable(path: &Path) -> std::io::Result<[u8; 32]> {
@@ -523,12 +720,12 @@ impl TrustedInstallEnvironment {
 
         #[cfg(unix)]
         {
-            return Ok(Self {
+            Ok(Self {
                 account_home,
                 private_temp,
                 presentation,
                 sanitized_path,
-            });
+            })
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -2560,6 +2757,18 @@ fn run_url(
         }
     };
 
+    // Executed child bytes can never share structured stdout with a trusted JSON
+    // envelope. Refuse before preflight, DNS, download, or confirmation so this
+    // mode emits exactly one Tirith-owned document.
+    if json && !no_exec {
+        let _ = write_json_stdout(&serde_json::json!({
+            "schema_version": 2,
+            "kind": "install_url",
+            "error": "install URL JSON output is inspection-only; pass --no-exec or omit --format json before executing"
+        }));
+        return 1;
+    }
+
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
@@ -2590,13 +2799,7 @@ fn run_url(
         tirith_core::escalation::apply_agent_rules(&mut preflight, &policy);
     }
 
-    if json {
-        // A JSON-write failure means the consumer never got the verdict — do not
-        // then download. Exit non-zero.
-        if !print_url_preflight_json(url, &preflight) {
-            return 1;
-        }
-    } else {
+    if !json {
         print_url_preflight_human(url, &preflight);
     }
 
@@ -2636,7 +2839,9 @@ fn run_url(
 
     // A blocking preflight that was not bypassed refuses before any download.
     if blocked_and_refused {
-        if !json {
+        if json {
+            let _ = print_url_transaction_json(url, &preflight, None, None);
+        } else {
             eprintln!(
                 "tirith install: refusing to download — the URL preflight \
                  BLOCKED this transaction (see findings above)."
@@ -2669,14 +2874,14 @@ fn run_url(
         no_exec,
         interactive,
         expected_sha256: sha256,
-        // `tirith install` keeps its historical uncontained execution; the
-        // contained path is opt-in on `tirith run --capsule` (E5).
+        // Live URL installation uses the same verified, content-bound capsule
+        // executor as `tirith run`; there is no uncontained fallback.
         exec_fn: None,
     };
-    match runner::run(opts) {
+    match runner::run_with_verified_executor(opts, Box::new(crate::cli::run::capsuled_exec)) {
         Ok(result) => {
             let json_ok = if json {
-                print_url_outcome_json(&result)
+                print_url_transaction_json(url, &preflight, Some(&result), None)
             } else {
                 if result.executed {
                     eprintln!(
@@ -2712,9 +2917,7 @@ fn run_url(
         }
         Err(e) => {
             if json {
-                // Via `write_json_stdout` so the trailing newline is a fallible
-                // write (no broken-pipe panic).
-                let _ = write_json_stdout(&serde_json::json!({ "error": e }));
+                let _ = print_url_transaction_json(url, &preflight, None, Some(e.as_str()));
             } else {
                 eprintln!("tirith install: {}", install_value_for_human(&e));
             }
@@ -2951,31 +3154,34 @@ fn print_url_preflight_human(url: &str, verdict: &Verdict) {
     }
 }
 
-/// Render the URL-form preflight verdict (JSON). `false` on a write failure.
-fn print_url_preflight_json(url: &str, verdict: &Verdict) -> bool {
-    let out = serde_json::json!({
-        "schema_version": 1,
-        "kind": "install_url_preflight",
-        "url": url,
-        "sandboxed": false,
-        "verdict": verdict,
-    });
-    write_json_stdout(&out)
-}
-
-/// JSON record of the completed URL transaction. `false` on a write failure.
+/// The URL form emits one trusted JSON document. Live JSON execution is refused
+/// before network access, while inspection mode combines URL preflight and body
+/// outcome instead of streaming two unrelated JSON objects.
 #[cfg(unix)]
-fn print_url_outcome_json(result: &runner::RunResult) -> bool {
+fn print_url_transaction_json(
+    url: &str,
+    preflight: &Verdict,
+    result: Option<&runner::RunResult>,
+    error: Option<&str>,
+) -> bool {
+    let outcome = result.map(|result| {
+        serde_json::json!({
+            "receipt": &result.receipt,
+            "verdict": &result.verdict,
+            "analysis_complete": result.analysis_complete,
+            "refused": result.refused,
+            "executed": result.executed,
+            "exit_code": result.exit_code,
+        })
+    });
     let out = serde_json::json!({
-        "schema_version": 1,
-        "kind": "install_url_outcome",
-        "sandboxed": false,
-        "receipt": &result.receipt,
-        "verdict": &result.verdict,
-        "analysis_complete": result.analysis_complete,
-        "refused": result.refused,
-        "executed": result.executed,
-        "exit_code": result.exit_code,
+        "schema_version": 2,
+        "kind": "install_url",
+        "url": url,
+        "execution_policy": "contained_by_default",
+        "preflight": preflight,
+        "outcome": outcome,
+        "error": error,
     });
     write_json_stdout(&out)
 }
@@ -3500,7 +3706,7 @@ mod tests {
         .unwrap();
 
         let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
-        let executable = InstallExecutableBinding::from_trusted(
+        let executable = InstallExecutableBinding::from_trusted_for_test(
             tirith_core::trusted_child::TrustedExecutable::from_absolute(&shell, &[]).unwrap(),
         )
         .unwrap();
@@ -3896,7 +4102,15 @@ mod tests {
             let attacker_temp = PathBuf::from(std::env::var_os(ATTACKER_TEMP_ROOT).unwrap());
             let primary_error = InstallExecutableBinding::resolve("cargo")
                 .expect_err("a split-root temporary PATH executable must be rejected");
-            assert!(primary_error.to_string().contains("untrusted executable"));
+            let selected = attacker_path.join("bin/cargo");
+            let message = primary_error.to_string();
+            let denied_as_transient = primary_error.kind() == std::io::ErrorKind::Other
+                && message.contains(&format!("untrusted executable {}", selected.display()))
+                && message.contains("inside denied root");
+            assert!(
+                denied_as_transient,
+                "unexpected hostile executable rejection: {message}"
+            );
             let binding = InstallSourceBinding::capture(
                 PackageManager::Cargo,
                 Some(&attacker_path),
@@ -3945,8 +4159,20 @@ mod tests {
         // isolation than a process-global ENV_LOCK and cannot race other tests.
         use std::os::unix::fs::PermissionsExt as _;
 
-        let attacker_path = tempfile::tempdir().unwrap();
-        let attacker_temp = tempfile::tempdir().unwrap();
+        // Put both attacker-controlled roots under the conventional OS temp
+        // boundary. The child deliberately redirects every temp selector to
+        // `attacker_temp`, so a default `tempfile::tempdir()` rooted in the
+        // parent test harness's custom TMPDIR would be unknowable to the child.
+        // `/tmp` remains independently denied even under that split-root
+        // environment, which exercises the production fail-closed policy.
+        let attacker_path = tempfile::Builder::new()
+            .prefix("tirith-install-attacker-path-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let attacker_temp = tempfile::Builder::new()
+            .prefix("tirith-install-attacker-temp-")
+            .tempdir_in("/tmp")
+            .unwrap();
         std::fs::create_dir(attacker_path.path().join("bin")).unwrap();
         let fake_cargo = attacker_path.path().join("bin/cargo");
         std::fs::write(&fake_cargo, "#!/bin/sh\nexit 0\n").unwrap();
@@ -3954,6 +4180,7 @@ mod tests {
         let test_name = std::thread::current().name().unwrap().to_string();
         let mut child = Command::new(std::env::current_exe().unwrap());
         child
+            .env_clear()
             .arg("--exact")
             .arg(test_name)
             .arg("--nocapture")
@@ -4051,7 +4278,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn executable_identity_recheck_rejects_replacement() {
+    fn pathname_script_replacement_is_rejected_before_launch() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().unwrap();
@@ -4061,7 +4288,7 @@ mod tests {
         let trusted =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(&path, &[]).unwrap();
         let canonical = trusted.path().to_path_buf();
-        let binding = InstallExecutableBinding::from_trusted(trusted).unwrap();
+        let binding = InstallExecutableBinding::from_trusted_for_test(trusted).unwrap();
         let program = path.to_str().unwrap();
         binding
             .verify_program_with_denied(program, &[])
@@ -4071,47 +4298,200 @@ mod tests {
         std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o755)).unwrap();
         let error = binding
             .verify_program_with_denied(program, &[])
-            .expect_err("replacement at the approved path must fail");
-        assert!(error.to_string().contains("changed after analysis"));
+            .expect_err("replacement at the approved script path must fail");
+        assert!(error.to_string().contains("changed"), "{error}");
     }
 
     #[test]
     #[cfg(unix)]
-    fn executable_binding_preserves_multicall_invocation_and_rejects_retargeting() {
+    fn normal_user_managed_manager_is_safely_bound() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-user-install-manager-")
+            .tempdir_in(home::home_dir().expect("test account home"))
+            .unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let manager = bin.join("cargo");
+        std::fs::write(&manager, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let user_path = std::env::join_paths([bin.as_path()]).expect("test PATH is representable");
+        let binding = InstallExecutableBinding::resolve_on_path("cargo", &user_path)
+            .expect("a validated user-managed package manager must be supported");
+        assert_eq!(binding.path(), manager);
+        binding
+            .verify_program_with_denied(manager.to_str().unwrap(), &[])
+            .expect("the safely bound user manager must revalidate");
+        #[cfg(target_os = "linux")]
+        assert!(
+            binding.trusted.bound_launch_fd().is_none(),
+            "a user-managed shebang entrypoint must retain pathname semantics"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writable_path_shadow_of_system_executable_is_rejected() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-install-manager-shadow-")
+            .tempdir_in(home::home_dir().expect("test account home"))
+            .unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let manager = bin.join("sh");
+        std::fs::write(&manager, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let before_system = std::env::join_paths([bin.as_path(), Path::new("/bin")])
+            .expect("test PATH is representable");
+        let error = InstallExecutableBinding::resolve_on_path("sh", &before_system)
+            .expect_err("a writable first hit that shadows /bin/sh must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("shadows later trusted system executable /bin/sh"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shebang_manager_can_load_sibling_relative_resources() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-shebang-manager-")
+            .tempdir_in(home::home_dir().expect("test account home"))
+            .unwrap();
+        let bin = directory.path().join("bin");
+        let lib = directory.path().join("lib");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(&lib).unwrap();
+        std::fs::write(lib.join("value.txt"), b"sibling-resource\n").unwrap();
+        let manager = bin.join("manager");
+        std::fs::write(
+            &manager,
+            b"#!/bin/sh\nscript_dir=${0%/*}\nIFS= read -r value < \"$script_dir/../lib/value.txt\"\nprintf '%s' \"$value\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let trusted =
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(&manager, &[]).unwrap();
+        let binding = InstallExecutableBinding::from_trusted(trusted).unwrap();
+        assert!(binding.trusted.bound_launch_fd().is_none());
+        let source_binding = InstallSourceBinding::capture(
+            PackageManager::Cargo,
+            Some(directory.path()),
+            &["demo".to_string()],
+        )
+        .unwrap();
+        let output = ProcessInstallRunner {
+            executable: &binding,
+            source_binding: &source_binding,
+        }
+        .run(manager.to_str().unwrap(), &[], true)
+        .unwrap();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout.as_deref(), Some("sibling-resource"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn executable_binding_preserves_multicall_invocation_without_following_retargeting() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        let directory = tempfile::tempdir().unwrap();
-        let rustup = directory.path().join("rustup");
-        std::fs::write(&rustup, b"#!/bin/sh\nprintf '%s' \"${0##*/}\"\n").unwrap();
-        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-install-multicall-")
+            .tempdir_in(trusted_account_home().expect("OS account home"))
+            .unwrap();
+        let rustup = PathBuf::from("/bin/sh").canonicalize().unwrap();
         let cargo = directory.path().join("cargo");
         symlink(&rustup, &cargo).unwrap();
 
         let trusted =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(&cargo, &[]).unwrap();
         let canonical = rustup.canonicalize().unwrap();
-        let binding = InstallExecutableBinding::from_trusted(trusted).unwrap();
+        let binding = InstallExecutableBinding::from_trusted_for_test(trusted).unwrap();
         assert_eq!(binding.path(), cargo);
         assert_eq!(binding.canonical_path, canonical);
         binding
             .verify_program_with_denied(cargo.to_str().unwrap(), &[])
             .expect("the unchanged selected proxy and target must verify");
 
-        let proxy_output = Command::new(binding.path()).output().unwrap();
-        assert!(proxy_output.status.success());
-        assert_eq!(proxy_output.stdout, b"cargo");
-        let canonical_output = Command::new(&binding.canonical_path).output().unwrap();
-        assert_eq!(canonical_output.stdout, b"rustup");
+        let source_binding = InstallSourceBinding::capture(
+            PackageManager::Cargo,
+            Some(directory.path()),
+            &["demo".to_string()],
+        )
+        .unwrap();
+        let runner = ProcessInstallRunner {
+            executable: &binding,
+            source_binding: &source_binding,
+        };
+        let output = runner
+            .run(
+                cargo.to_str().unwrap(),
+                &["-c".to_string(), "printf '%s' \"${0##*/}\"".to_string()],
+                true,
+            )
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout.as_deref(), Some("cargo"));
 
         let replacement = directory.path().join("replacement");
         std::fs::write(&replacement, b"#!/bin/sh\nprintf replacement\n").unwrap();
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_file(&cargo).unwrap();
         symlink(&replacement, &cargo).unwrap();
+        binding
+            .verify_program_with_denied(cargo.to_str().unwrap(), &[])
+            .expect("retargeting argv[0] metadata cannot change the retained launch identity");
+        let output = runner
+            .run(
+                cargo.to_str().unwrap(),
+                &["-c".to_string(), "printf '%s' \"${0##*/}\"".to_string()],
+                true,
+            )
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout.as_deref(), Some("cargo"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_binding_rejects_unsealed_script_proxy_retargeting() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-install-script-proxy-")
+            .tempdir_in(trusted_account_home().expect("OS account home"))
+            .unwrap();
+        let original = directory.path().join("original");
+        let replacement = directory.path().join("replacement");
+        for path in [&original, &replacement] {
+            std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cargo = directory.path().join("cargo");
+        symlink(&original, &cargo).unwrap();
+
+        let trusted =
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(&cargo, &[]).unwrap();
+        let binding = InstallExecutableBinding::from_trusted_for_test(trusted).unwrap();
+        binding
+            .verify_program_with_denied(cargo.to_str().unwrap(), &[])
+            .expect("the unchanged script proxy and target must verify");
+
+        std::fs::remove_file(&cargo).unwrap();
+        symlink(&replacement, &cargo).unwrap();
         let error = binding
             .verify_program_with_denied(cargo.to_str().unwrap(), &[])
-            .expect_err("retargeting the selected Cargo proxy must fail closed");
-        assert!(error.to_string().contains("resolves to a different path"));
+            .expect_err("an unsealed script proxy retarget must fail closed");
+        assert!(error.to_string().contains("different path"), "{error}");
     }
 
     #[test]

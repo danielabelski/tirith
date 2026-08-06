@@ -104,6 +104,7 @@ rust-mcp-schema = { version = "0.10", default-features = false, features = ["202
 # (verified in the PR-0 spike); the consuming code (C2) bounds size/depth/branch/
 # $ref/regex/cache/error. License MIT.
 jsonschema = { version = "0.46", default-features = false }
+walkdir = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -114,6 +115,8 @@ libc = { workspace = true }
 # resolved dependency graph; the explicit feature set is limited to those calls.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", default-features = false, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Security",
@@ -121,6 +124,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Security_Cryptography",
     "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_SystemServices",

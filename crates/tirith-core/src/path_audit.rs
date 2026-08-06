@@ -479,6 +479,28 @@ fn dir_precedes_system(dir: &Path, path_dirs: &[PathBuf]) -> bool {
     }
 }
 
+/// Whether `dir` is writable by the current user and can win selection ahead of
+/// a trusted system directory in an already ordered PATH snapshot.
+///
+/// The generic hot-path command rule intentionally narrows this signal to
+/// repository and temporary directories to avoid noisy advisory findings. A
+/// transaction that is about to execute a package manager has a stronger
+/// provenance requirement and uses this broader predicate to reject any
+/// writable manager selected before the first system directory. A PATH with no
+/// system directory is also unsafe: in that case every selected writable
+/// directory is authoritative, so there is no trusted fallback boundary.
+pub fn writable_dir_precedes_system(dir: &Path, path_dirs: &[PathBuf]) -> bool {
+    let Some(dir_idx) = path_dirs.iter().position(|candidate| candidate == dir) else {
+        return false;
+    };
+    let system_idx = path_dirs.iter().position(|candidate| {
+        SYSTEM_PATH_DIRS
+            .iter()
+            .any(|system| candidate == Path::new(system))
+    });
+    system_idx.is_none_or(|index| dir_idx < index) && dir_is_user_writable(dir)
+}
+
 /// `true` when the current user can write to `dir` (via `access(2)` `W_OK`).
 /// Non-Unix returns `false` (the rule is a Unix-PATH concern).
 #[cfg(unix)]
@@ -682,6 +704,23 @@ mod tests {
             locs.is_empty(),
             "a generic writable ~/.local/bin shape must not fire the HOT rule: {locs:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_path_predicate_treats_missing_system_boundary_as_unsafe() {
+        let directory = tempfile::tempdir().unwrap();
+        let only_writable = vec![directory.path().to_path_buf()];
+        assert!(writable_dir_precedes_system(
+            directory.path(),
+            &only_writable
+        ));
+
+        let after_system = vec![pb("/usr/bin"), directory.path().to_path_buf()];
+        assert!(!writable_dir_precedes_system(
+            directory.path(),
+            &after_system
+        ));
     }
 
     #[test]

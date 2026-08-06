@@ -430,12 +430,13 @@ struct ShellOutOutput {
 }
 
 /// Run a binary with a hard wall-clock timeout, mapping the shared helper's
-/// outcome onto [`ContextDetectFailure`]. A missing binary (`spawn` `NotFound`)
-/// becomes `NotConfigured` ("no signal"), distinct from a real I/O error.
+/// outcome onto [`ContextDetectFailure`]. A missing binary at trusted resolution
+/// becomes `NotConfigured` ("no signal"); an untrusted first PATH hit is a real
+/// provenance I/O error and is never executed.
 fn run_with_timeout(program: &str, args: &[&str]) -> Result<ShellOutOutput, ContextDetectFailure> {
     use crate::trusted_child::TrustedExecutableError;
     use crate::util::{run_trusted_with_timeout, ShellTimeoutOutcome};
-    let executable = match crate::trusted_child::resolve_ambient(program) {
+    let executable = match crate::trusted_child::resolve_system_helper(program) {
         Ok(executable) => executable,
         Err(TrustedExecutableError::NotFound(_)) => {
             return Err(ContextDetectFailure::NotConfigured)
@@ -471,6 +472,7 @@ fn run_with_timeout(program: &str, args: &[&str]) -> Result<ShellOutOutput, Cont
         ShellTimeoutOutcome::NotFound => Err(ContextDetectFailure::NotConfigured),
         ShellTimeoutOutcome::SpawnError(reason) => Err(ContextDetectFailure::Io(reason)),
         ShellTimeoutOutcome::WaitError(reason) => Err(ContextDetectFailure::Io(reason)),
+        ShellTimeoutOutcome::CleanupError(reason) => Err(ContextDetectFailure::Io(reason)),
         ShellTimeoutOutcome::Timeout {
             cleanup_succeeded: true,
         } => Err(ContextDetectFailure::Timeout),
@@ -496,6 +498,45 @@ fn run_with_timeout(program: &str, args: &[&str]) -> Result<ShellOutOutput, Cont
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: every caller holds TEST_ENV_LOCK until Drop restores the
+            // previous value.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the owning test still holds TEST_ENV_LOCK.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_marker_executable(path: &std::path::Path, marker: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let marker = marker.display().to_string().replace('\'', "'\"'\"'");
+        std::fs::write(path, format!("#!/bin/sh\n: > '{marker}'\nexit 97\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn provider_parse_round_trips() {
         for p in [
@@ -506,6 +547,45 @@ mod tests {
         ] {
             assert_eq!(Provider::parse(p.as_str()), Some(p));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloud_context_callers_reject_path_shadowed_helpers() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temporary = tempfile::Builder::new()
+            .prefix("tirith-context-shadow-")
+            .tempdir_in(home::home_dir().expect("test account home"))
+            .unwrap();
+        let shadow_bin = temporary.path().join("shadow-bin");
+        std::fs::create_dir(&shadow_bin).unwrap();
+        let marker = temporary.path().join("cloud-helper-executed");
+        for helper in ["gcloud", "az"] {
+            write_marker_executable(&shadow_bin.join(helper), &marker);
+        }
+
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![shadow_bin.clone()];
+        path_entries.extend(std::env::split_paths(&inherited));
+        let _path = EnvVarGuard::set("PATH", std::env::join_paths(path_entries).unwrap());
+
+        for (helper, args) in [
+            ("gcloud", &["config", "list", "--format=json"][..]),
+            ("az", &["account", "show", "-o", "json"][..]),
+        ] {
+            let error = run_with_timeout(helper, args)
+                .expect_err("a first-hit helper under a same-UID home directory must be refused");
+            assert!(
+                matches!(error, ContextDetectFailure::Io(_)),
+                "untrusted {helper} should surface as a provenance I/O failure: {error:?}"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "context detection must not execute PATH-shadowed gcloud or az"
+        );
     }
 
     #[test]
@@ -588,12 +668,18 @@ mod tests {
         let _ = detect_aws();
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_triggers_on_slow_binary() {
-        // `sleep` is POSIX-only; skip on Windows (same watchdog path anyway).
-        if cfg!(windows) {
-            return;
-        }
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = std::env::join_paths([
+            std::path::Path::new("/usr/bin"),
+            std::path::Path::new("/bin"),
+        ])
+        .unwrap();
+        let _path = EnvVarGuard::set("PATH", path);
         let result = run_with_timeout("sleep", &["10"]);
         assert!(
             matches!(result, Err(ContextDetectFailure::Timeout)),

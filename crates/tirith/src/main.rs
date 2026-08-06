@@ -129,8 +129,106 @@ Examples:
   tirith temp-run -- /bin/sh -c 'printf done > result.txt'
   tirith temp-run --json -- npm install left-pad";
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ShellReceiptChannelArg {
+    Zsh,
+    Fish,
+    BashEnter,
+    BashPreexec,
+    #[value(name = "powershell")]
+    PowerShell,
+}
+
+impl From<ShellReceiptChannelArg> for tirith_core::execution_state::ShellReceiptChannel {
+    fn from(value: ShellReceiptChannelArg) -> Self {
+        match value {
+            ShellReceiptChannelArg::Zsh => Self::Zsh,
+            ShellReceiptChannelArg::Fish => Self::Fish,
+            ShellReceiptChannelArg::BashEnter => Self::BashEnter,
+            ShellReceiptChannelArg::BashPreexec => Self::BashPreexec,
+            ShellReceiptChannelArg::PowerShell => Self::PowerShell,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ShellHookFamilyArg {
+    Zsh,
+    Fish,
+    Bash,
+}
+
+impl From<ShellHookFamilyArg> for tirith_core::execution_state::ShellHookFamily {
+    fn from(value: ShellHookFamilyArg) -> Self {
+        match value {
+            ShellHookFamilyArg::Zsh => Self::Zsh,
+            ShellHookFamilyArg::Fish => Self::Fish,
+            ShellHookFamilyArg::Bash => Self::Bash,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ShellApprovalOutcomeArg {
+    Granted,
+    Rejected,
+    TimedOut,
+}
+
+impl From<ShellApprovalOutcomeArg> for tirith_core::execution_state::ShellApprovalOutcome {
+    fn from(value: ShellApprovalOutcomeArg) -> Self {
+        match value {
+            ShellApprovalOutcomeArg::Granted => Self::Granted,
+            ShellApprovalOutcomeArg::Rejected => Self::Rejected,
+            ShellApprovalOutcomeArg::TimedOut => Self::TimedOut,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum ExecutionReceiptAction {
+    Capability,
+    Register {
+        #[arg(long, value_enum)]
+        family: ShellHookFamilyArg,
+        #[arg(long)]
+        shell_pid: u32,
+    },
+    /// Protocol-v1 compatibility tombstone; never returns a bearer.
+    NewInstance,
+    /// Protocol-v2 compatibility tombstone. Protocol v3 arms inside `check` and
+    /// never accepts caller-supplied approval or warning-acknowledgement facts.
+    Arm {
+        #[arg(long, value_enum)]
+        channel: ShellReceiptChannelArg,
+        #[arg(long, value_enum)]
+        approval: Option<ShellApprovalOutcomeArg>,
+        #[arg(long)]
+        warn_acknowledged: bool,
+    },
+    Consume {
+        #[arg(long, value_enum)]
+        channel: ShellReceiptChannelArg,
+    },
+    Reconcile {
+        #[arg(long, value_enum)]
+        channel: ShellReceiptChannelArg,
+    },
+    Discard {
+        #[arg(long, value_enum)]
+        channel: ShellReceiptChannelArg,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal one-shot shell execution receipt protocol.
+    #[command(name = "__execution-receipt", hide = true)]
+    ExecutionReceiptInternal {
+        #[command(subcommand)]
+        action: ExecutionReceiptAction,
+    },
+
     /// Manage the tirith background daemon
     #[command(after_help = "\
 Examples:
@@ -176,6 +274,17 @@ Examples:
         /// Used by shell hooks for the approval workflow.
         #[arg(long)]
         approval_check: bool,
+
+        /// Internal hook channel for a one-shot execution receipt. Existing
+        /// approval-check callers omit this and retain the exact legacy stdout
+        /// contract.
+        #[arg(
+            long,
+            hide = true,
+            value_enum,
+            requires_all = ["approval_check", "interactive"]
+        )]
+        execution_receipt: Option<ShellReceiptChannelArg>,
 
         /// Require acknowledgement for warnings (overrides policy)
         #[arg(long)]
@@ -287,22 +396,20 @@ Examples:
         #[arg(long)]
         no_exec: bool,
 
-        /// Execute the reviewed script inside the OS containment capsule.
-        /// Enforcing: a host whose backend cannot provide the required coverage
-        /// refuses rather than running uncontained. Download/DNS happens first
-        /// under the fetch validator, outside interpreter containment.
+        /// Legacy compatibility spelling. Live execution is already contained by
+        /// default and fails closed when required coverage is unavailable.
         #[arg(long)]
         capsule: bool,
 
         /// Preserve a pipe-to-shell interpreter selected by a verified safe
-        /// suggestion. Requires --capsule and --script-stdin.
-        #[arg(long, requires = "capsule", requires = "script_stdin")]
+        /// suggestion. Requires --script-stdin; execution remains contained.
+        #[arg(long, requires = "script_stdin")]
         interpreter: Option<tirith_core::runner::PipeInterpreter>,
 
         /// Feed reviewed bytes to the selected interpreter over stdin (Linux
         /// only). macOS refuses because it cannot guarantee complete descendant
         /// cleanup after setsid(); no fallback runs uncontained.
-        #[arg(long, requires = "capsule", requires = "interpreter")]
+        #[arg(long, requires = "interpreter")]
         script_stdin: bool,
 
         /// Exact literal argument for the selected stdin interpreter. This
@@ -329,10 +436,12 @@ BEFORE running it, presents the verdict, records the transaction (a working-
 directory checkpoint plus an audit entry), then runs the real install only
 after the analysis and your go-ahead.
 
-This is pre-execution install-RISK ANALYSIS plus a recorded transaction. It
-does NOT sandbox or isolate the install — the real `npm install` / `pip
-install` / `cargo install` (or the downloaded script) runs with your full
-privileges. Runtime sandboxing is an explicit tirith non-goal.
+This is pre-execution install-RISK ANALYSIS plus a recorded transaction. Real
+package-manager installs (`npm`, `pip`, `cargo`, and others) are not sandboxed;
+on x86_64 Linux, use `tirith pkg install` for the enforcing package firewall.
+Other platforms and architectures refuse that enforcing execution. The `url`
+form is different: reviewed scripts execute contained by default and fail closed
+when the Linux capsule cannot provide the required coverage.
 
 The package(s) are scored with the deterministic `tirith package risk`
 engine, the install command with the install-command rules, and any URL with
@@ -415,18 +524,22 @@ Examples:
         sha256: Option<String>,
     },
 
-    /// Package firewall: resolve, inspect, and install ONLY the verified bytes,
-    /// inside a containment capsule, with a tamper-evident receipt (Python only).
+    /// Package firewall: resolve and inspect Python packages; on x86_64 Linux,
+    /// install ONLY the verified bytes inside a containment capsule, with a
+    /// tamper-evident receipt.
     #[command(after_help = "\
 Examples:
-  tirith pkg approve pip requests==2.31.0       # resolve+inspect, print the plan digest
-  tirith pkg install pip requests==2.31.0       # install only the approved, inspected bytes
+  tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
+  tirith pkg install pip requests==2.31.0 --target .tirith-pkg
   tirith pkg install pip flask --target .venv --yes
   tirith pkg verify-env --target .venv requests flask
   tirith pkg receipt list
 
-`tirith pkg install` is the ENFORCING path (contained, hash-pinned, fails closed
-on degraded coverage); `tirith install` is the analysis path. They are distinct.")]
+`tirith pkg install` is the ENFORCING path (contained, hash-pinned, and supported
+only on x86_64 Linux). Every other platform or architecture refuses before pip
+executes. This platform limit applies only to enforcing execution: `pkg approve`
+does not install, `pkg verify-env` only verifies an existing tree, and
+`tirith install` remains the analysis path.")]
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
@@ -1025,7 +1138,11 @@ Examples:
     #[command(after_help = "\
 Examples:
   tirith gateway run --upstream-bin npx --upstream-arg @modelcontextprotocol/server-filesystem --config gateway.yaml
-  tirith gateway validate-config --config gateway.yaml")]
+  tirith gateway validate-config --config gateway.yaml
+
+`gateway run` requires the Unix strict execution-state backend. On Windows it
+refuses before reading the run config or starting the upstream process;
+`gateway validate-config` remains available cross-platform.")]
     Gateway {
         #[command(subcommand)]
         action: GatewayAction,
@@ -3551,14 +3668,20 @@ Looks up the named entry under `allowed[]` and executes its command through the
 shell. Being on the allowlist suppresses only the `repo_command_unknown`
 annotation — it does NOT make a command safe to run blindly, so the resolved
 command is re-checked through the engine first and REFUSED if tirith blocks it
-(a `dangerous[]` match or any real High/Critical finding). The run is audited.
+(a `dangerous[]` match or any real High/Critical finding). Warn/WarnAck findings
+require acknowledgement from the controlling terminal; non-interactive automation
+must pass --yes explicitly. Piped stdin is never accepted as acknowledgement.
+The run is audited only after the command successfully spawns.
 
 Examples:
   tirith commands run test
-  tirith commands run build")]
+  tirith commands run build --yes")]
     Run {
         /// The `allowed[].name` of the command to run.
         name: String,
+        /// Explicitly acknowledge Warn/WarnAck findings for intentional automation.
+        #[arg(long)]
+        yes: bool,
         /// Output format (default: human).
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5200,17 +5323,15 @@ enum PkgAction {
     /// the plan digest the approval binds to. Does NOT install.
     #[command(after_help = "\
 Examples:
-  tirith pkg approve pip requests==2.31.0
+  tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
   tirith pkg approve pip flask --target .venv")]
     Approve {
         /// The ecosystem (only `pip` is enforced).
         #[arg(value_enum)]
         ecosystem: PkgEcosystem,
         /// Requirement specs (e.g. `requests==2.31.0`).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         requirements: Vec<String>,
-        /// Install target directory (pip `--target`); defaults to the interpreter
-        /// prefix.
+        /// Required new dedicated install directory (pip `--target`).
         #[arg(long)]
         target: Option<std::path::PathBuf>,
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
@@ -5228,21 +5349,24 @@ Examples:
         json: bool,
     },
     /// Resolve + inspect + install ONLY the verified, hash-pinned bytes, inside the
-    /// containment capsule, recording a tamper-evident receipt. Fails closed on
-    /// degraded containment.
+    /// containment capsule, recording a tamper-evident receipt. Enforcing execution
+    /// is x86_64 Linux-only; every other platform or architecture fails closed
+    /// before pip starts.
     #[command(after_help = "\
 Examples:
-  tirith pkg install pip requests==2.31.0
-  tirith pkg install pip flask --target .venv --yes")]
+  tirith pkg install pip requests==2.31.0 --target .tirith-pkg
+  tirith pkg install pip flask --target .venv --yes
+
+Execution is supported only on x86_64 Linux. Unsupported platforms and
+architectures refuse before pip starts; they never fall back to an uncontained
+install.")]
     Install {
         /// The ecosystem (only `pip` is enforced).
         #[arg(value_enum)]
         ecosystem: PkgEcosystem,
         /// Requirement specs (e.g. `requests==2.31.0`).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         requirements: Vec<String>,
-        /// Install target directory (pip `--target`); defaults to the interpreter
-        /// prefix.
+        /// Required new dedicated install directory (pip `--target`).
         #[arg(long)]
         target: Option<std::path::PathBuf>,
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
@@ -5277,7 +5401,6 @@ Examples:
         #[arg(long)]
         target: std::path::PathBuf,
         /// The distribution names to verify (PEP 503 normalized internally).
-        #[arg(trailing_var_arg = true)]
         packages: Vec<String>,
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -5286,10 +5409,10 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Enroll a user-writable uv/python executable by canonical path and SHA-256
-    /// in Tirith's owner-only resolver-tool trust store.
+    /// Enroll a fully static, native Linux uv executable by canonical path and
+    /// SHA-256. Python runtimes must remain root-managed.
     TrustTool {
-        /// Absolute path to the executable to enroll.
+        /// Absolute path to the static Linux uv executable to enroll.
         path: std::path::PathBuf,
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -5830,6 +5953,74 @@ Examples:
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TrustMutationScope {
+    User,
+    Repo,
+    Invalid(String),
+}
+
+impl TrustMutationScope {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::User => "user",
+            Self::Repo => "repo",
+            Self::Invalid(value) => value,
+        }
+    }
+}
+
+impl std::str::FromStr for TrustMutationScope {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "user" => Self::User,
+            "repo" => Self::Repo,
+            // Keep parsing infallible so Clap never reflects the raw,
+            // attacker-controlled invalid value in its own error renderer. The
+            // trust command's library-level scope check remains fail closed and
+            // prints this sanitized value at its final human-output sink.
+            other => Self::Invalid(cli::sanitize_for_human_output(other, false)),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TrustQueryScope {
+    User,
+    Repo,
+    All,
+    Invalid(String),
+}
+
+impl TrustQueryScope {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::User => "user",
+            Self::Repo => "repo",
+            Self::All => "all",
+            Self::Invalid(value) => value,
+        }
+    }
+}
+
+impl std::str::FromStr for TrustQueryScope {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "user" => Self::User,
+            "repo" => Self::Repo,
+            "all" => Self::All,
+            // See `TrustMutationScope::from_str`: unknown values must reach
+            // Tirith's sanitized, fail-closed sink rather than Clap's raw
+            // invalid-value output.
+            other => Self::Invalid(cli::sanitize_for_human_output(other, false)),
+        })
+    }
+}
+
 #[derive(Subcommand)]
 enum TrustAction {
     /// Add a trusted pattern (narrow scope and a 30d TTL by default)
@@ -5862,8 +6053,13 @@ Examples:
         #[arg(long)]
         reason: Option<String>,
         /// Scope: user (default) or repo
-        #[arg(long, default_value = "user")]
-        scope: String,
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(TrustMutationScope),
+            value_name = "user|repo",
+            default_value = "user"
+        )]
+        scope: TrustMutationScope,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5893,8 +6089,13 @@ Examples:
         #[arg(long)]
         expired: bool,
         /// Scope: user, repo, or all (default)
-        #[arg(long, default_value = "all")]
-        scope: String,
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(TrustQueryScope),
+            value_name = "user|repo|all",
+            default_value = "all"
+        )]
+        scope: TrustQueryScope,
     },
     /// Explain a trust entry: scope, coverage, expiry, and why it was added
     #[command(after_help = "\
@@ -5905,8 +6106,13 @@ Examples:
         /// Pattern of the entry to explain
         pattern: String,
         /// Scope: user, repo, or all (default)
-        #[arg(long, default_value = "all")]
-        scope: String,
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(TrustQueryScope),
+            value_name = "user|repo|all",
+            default_value = "all"
+        )]
+        scope: TrustQueryScope,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5938,8 +6144,13 @@ Examples:
         #[arg(long)]
         rule: Option<String>,
         /// Scope: user (default) or repo
-        #[arg(long, default_value = "user")]
-        scope: String,
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(TrustMutationScope),
+            value_name = "user|repo",
+            default_value = "user"
+        )]
+        scope: TrustMutationScope,
     },
     /// Show last trigger and interactively trust domains
     #[command(after_help = "\
@@ -5968,8 +6179,13 @@ Examples:
         #[arg(long)]
         expired: bool,
         /// Scope: user, repo, or all (default)
-        #[arg(long, default_value = "all")]
-        scope: String,
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(TrustQueryScope),
+            value_name = "user|repo|all",
+            default_value = "all"
+        )]
+        scope: TrustQueryScope,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5991,8 +6207,13 @@ Examples:
         #[arg(long)]
         expired: bool,
         /// Scope: user, repo, or all (default)
-        #[arg(long, default_value = "all")]
-        scope: String,
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(TrustQueryScope),
+            value_name = "user|repo|all",
+            default_value = "all"
+        )]
+        scope: TrustQueryScope,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -6326,13 +6547,13 @@ Examples:
     #[command(after_help = "\
 Loads the committed .tirith/mcp.lock baseline, rebuilds the current MCP-server
 inventory from the repo's configuration files, and reports any drift — an MCP
-server added, removed, or altered (transport, env, declared tools, or URL
-credentials) since the lockfile was taken.
+server added, removed, or structurally altered (transport, env-name presence,
+declared tools, or URL-userinfo presence) since the lockfile was taken.
 
 This is the gating companion to `tirith mcp lock`: use it in CI to fail a
-build when an MCP surface change lands without a lockfile refresh. The human
-output never prints env values or URL userinfos — only the redacted / hashed
-form the lockfile already carries.
+build when an MCP surface change lands without a lockfile refresh. Env values
+and URL userinfos are neither printed nor committed; only their structural
+presence is recorded, so secret rotation intentionally does not drift.
 
 Exit codes:
   0  inventory matches the lockfile (no drift).
@@ -6361,7 +6582,8 @@ lockfile.
 
 The human output groups drifts as added / removed / changed, naming each
 server by its declared name. Env values and URL userinfos are never printed
-— only that the variable / credential changed, and only on a per-name basis.
+or committed; adding/removing their structural presence drifts, while rotating
+a present secret value intentionally does not.
 
 Exit codes:
   0  normal — `diff` is informational, so this exit code is returned whether
@@ -6421,8 +6643,9 @@ named server: declared tools (or the wildcard \"all tools\" state when
 the source config omitted the `tools` key), the redacted transport,
 injected environment variable **names** (never values), and the
 capabilities the lockfile implies. Env values and URL userinfos are
-never printed — the lockfile stores only their salted hashes and this
-explainer respects the same boundary `verify` and `diff` enforce.
+never printed or committed — the lockfile records only their structural
+presence, and this explainer respects the same boundary `verify` and
+`diff` enforce.
 
 Server lookup is **case-sensitive exact**. When the named server is
 missing, the explainer suggests the closest match by prefix and then
@@ -6870,8 +7093,9 @@ Examples:
 /// Process entry point. tirith's real logic runs in [`run`], on a thread with
 /// an explicit 16 MiB stack: `clap` builds and parses tirith's large command
 /// tree at startup, which is stack-heavy, and Windows' ~1 MiB default
-/// main-thread stack overflows it once the CLI grows. A generous stack keeps
-/// startup safe on every platform regardless of how the command set expands.
+/// main-thread stack is insufficient for the current tree. The explicit size
+/// avoids the currently observed overflow on platforms with small defaults;
+/// future CLI growth may require retuning.
 fn main() {
     // Internal capsule launcher (`tirith __capsule-child ...`, Stack E unit E2)
     // must run while the process is single-threaded: seccomp filters only the
@@ -6908,6 +7132,31 @@ fn run() {
     cli::init_quiet(cli.quiet);
 
     let exit_code = match cli.command {
+        Commands::ExecutionReceiptInternal { action } => match action {
+            ExecutionReceiptAction::Capability => cli::check::receipt_capability(),
+            ExecutionReceiptAction::Register { family, shell_pid } => {
+                cli::check::register_receipt_instance(shell_pid, family.into())
+            }
+            ExecutionReceiptAction::NewInstance => cli::check::new_receipt_instance(),
+            ExecutionReceiptAction::Arm {
+                channel,
+                approval,
+                warn_acknowledged,
+            } => cli::check::arm_receipt(
+                channel.into(),
+                approval.map(tirith_core::execution_state::ShellApprovalOutcome::from),
+                warn_acknowledged,
+            ),
+            ExecutionReceiptAction::Consume { channel } => {
+                cli::check::consume_receipt(channel.into())
+            }
+            ExecutionReceiptAction::Reconcile { channel } => {
+                cli::check::reconcile_receipt(channel.into())
+            }
+            ExecutionReceiptAction::Discard { channel } => {
+                cli::check::discard_receipt(channel.into())
+            }
+        },
         Commands::Daemon { action } => match action {
             DaemonAction::Start { detach } => cli::daemon::start(detach),
             DaemonAction::Stop => cli::daemon::stop(),
@@ -6921,6 +7170,7 @@ fn run() {
             non_interactive,
             interactive,
             approval_check,
+            execution_receipt,
             strict_warn,
             no_daemon,
             warn_only,
@@ -6957,6 +7207,7 @@ fn run() {
                     non_interactive,
                     interactive,
                     approval_check,
+                    execution_receipt.map(tirith_core::execution_state::ShellReceiptChannel::from),
                     strict_warn,
                     no_daemon,
                     warn_only,
@@ -7659,7 +7910,7 @@ fn run() {
                     permanent,
                     broad,
                     reason.as_deref(),
-                    &scope,
+                    scope.as_str(),
                     json,
                 )
             }
@@ -7672,7 +7923,7 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::trust::snapshot_current_trust();
-                cli::trust::list(rule.as_deref(), json, expired, &scope)
+                cli::trust::list(rule.as_deref(), json, expired, scope.as_str())
             }
             TrustAction::Explain {
                 pattern,
@@ -7681,7 +7932,7 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::trust::explain(&pattern, &scope, json)
+                cli::trust::explain(&pattern, scope.as_str(), json)
             }
             TrustAction::Diff { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -7691,7 +7942,7 @@ fn run() {
                 pattern,
                 rule,
                 scope,
-            } => cli::trust::remove(&pattern, rule.as_deref(), &scope),
+            } => cli::trust::remove(&pattern, rule.as_deref(), scope.as_str()),
             TrustAction::Last => cli::trust::last(),
             TrustAction::FromLastTrigger { apply } => cli::trust::from_last_trigger(apply),
             TrustAction::Gc {
@@ -7701,7 +7952,7 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::trust::gc(expired, &scope, json)
+                cli::trust::gc(expired, scope.as_str(), json)
             }
             TrustAction::Prune {
                 expired,
@@ -7710,7 +7961,7 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::trust::prune(expired, &scope, json)
+                cli::trust::prune(expired, scope.as_str(), json)
             }
             TrustAction::Audit {
                 since,
@@ -8522,9 +8773,14 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::commands::list(json)
             }
-            RepoCommandsAction::Run { name, format, json } => {
+            RepoCommandsAction::Run {
+                name,
+                yes,
+                format,
+                json,
+            } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::commands::run(&name, json)
+                cli::commands::run(&name, yes, json)
             }
             RepoCommandsAction::Check {
                 shell,
@@ -8701,41 +8957,183 @@ fn run() {
 
 #[cfg(test)]
 mod help_category_tests {
-    use super::{Cli, COMMANDS_BY_CATEGORY};
-    use clap::CommandFactory;
+    use super::{
+        Cli, Commands, PkgAction, TrustAction, TrustMutationScope, TrustQueryScope,
+        COMMANDS_BY_CATEGORY,
+    };
+    use clap::{CommandFactory, Parser};
+
+    fn with_large_cli_stack(test: impl FnOnce() + Send + 'static) {
+        // Building or parsing the full debug clap tree exceeds the default
+        // test-thread stack. Keep every parser regression on one explicit,
+        // bounded stack instead of relying on a process-wide RUST_MIN_STACK.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn CLI parser test on enlarged stack")
+            .join()
+            .expect("CLI parser test panicked");
+    }
 
     /// Every non-hidden top-level command must appear in the categorized help
     /// block, so `tirith --help`'s overview never silently drifts from the real
     /// command set when a new subcommand is added.
     #[test]
     fn every_command_is_categorized() {
-        // `Cli::command()` builds a very large command tree; the default ~2 MiB
-        // test-thread stack overflows in debug, so build it on a roomier stack.
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let cmd = Cli::command();
-                for sub in cmd.get_subcommands() {
-                    if sub.is_hide_set() {
-                        continue;
-                    }
-                    let name = sub.get_name();
-                    if name == "help" {
-                        continue; // clap's auto-generated built-in
-                    }
-                    // Token-level match (not substring): a command name must appear
-                    // as a whole whitespace-delimited token, so e.g. `run` can't
-                    // false-pass by being a substring of `temp-run`.
-                    assert!(
-                        COMMANDS_BY_CATEGORY
-                            .split_whitespace()
-                            .any(|tok| tok == name),
-                        "command `{name}` is missing from COMMANDS_BY_CATEGORY — add it to a category"
-                    );
+        with_large_cli_stack(|| {
+            let cmd = Cli::command();
+            for sub in cmd.get_subcommands() {
+                if sub.is_hide_set() {
+                    continue;
                 }
-            })
-            .unwrap()
-            .join()
+                let name = sub.get_name();
+                if name == "help" {
+                    continue; // clap's auto-generated built-in
+                }
+                // Token-level match (not substring): a command name must appear
+                // as a whole whitespace-delimited token, so e.g. `run` can't
+                // false-pass by being a substring of `temp-run`.
+                assert!(
+                    COMMANDS_BY_CATEGORY
+                        .split_whitespace()
+                        .any(|tok| tok == name),
+                    "command `{name}` is missing from COMMANDS_BY_CATEGORY — add it to a category"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn pkg_positionals_do_not_capture_known_options_after_values() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "tirith",
+                "pkg",
+                "install",
+                "pip",
+                "requests==2.31.0",
+                "--target",
+                "/tmp/tirith-pkg-target",
+                "--yes",
+                "--allow-degraded",
+                "--json",
+            ])
+            .expect("known package options remain parseable after requirement specs");
+            assert!(matches!(
+                cli.command,
+                Commands::Pkg {
+                    action: PkgAction::Install {
+                        requirements,
+                        target: Some(target),
+                        yes: true,
+                        allow_degraded: true,
+                        json: true,
+                        ..
+                    }
+                } if requirements.len() == 1 && requirements[0] == "requests==2.31.0"
+                    && target == std::path::Path::new("/tmp/tirith-pkg-target")
+            ));
+
+            let verify = Cli::try_parse_from([
+                "tirith",
+                "pkg",
+                "verify-env",
+                "--target",
+                "/tmp/tirith-pkg-target",
+                "requests",
+                "--json",
+            ])
+            .expect("verify-env JSON remains parseable after package names");
+            assert!(matches!(
+                verify.command,
+                Commands::Pkg {
+                    action: PkgAction::VerifyEnv {
+                        packages,
+                        json: true,
+                        ..
+                    }
+                } if packages.len() == 1 && packages[0] == "requests"
+            ));
+        });
+    }
+
+    #[test]
+    fn trust_mutation_scope_is_typed_and_routes_unknown_values_to_safe_failure() {
+        with_large_cli_stack(|| {
+            let cli =
+                Cli::try_parse_from(["tirith", "trust", "add", "example.com", "--scope", "repo"])
+                    .unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Trust {
+                    action: TrustAction::Add {
+                        scope: TrustMutationScope::Repo,
+                        ..
+                    }
+                }
+            ));
+
+            let cli =
+                Cli::try_parse_from(["tirith", "trust", "remove", "example.com", "--scope", "all"])
+                    .unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Trust {
+                    action: TrustAction::Remove {
+                        scope: TrustMutationScope::Invalid(ref value),
+                        ..
+                    }
+                } if value == "all"
+            ));
+
+            let cli = Cli::try_parse_from([
+                "tirith",
+                "trust",
+                "add",
+                "example.com",
+                "--scope",
+                "repo\u{1b}]52;c;Y2xpcA\u{7}\nFORGED\u{202e}\u{200b}",
+            ])
             .unwrap();
+            let Commands::Trust {
+                action:
+                    TrustAction::Add {
+                        scope: TrustMutationScope::Invalid(value),
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("hostile scope must route to the typed invalid variant");
+            };
+            for forbidden in ['\u{1b}', '\u{7}', '\u{202e}', '\u{200b}', '\n', '\r'] {
+                assert!(!value.contains(forbidden));
+            }
+        });
+    }
+
+    #[test]
+    fn trust_query_scope_routes_unknown_values_to_safe_failure() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from(["tirith", "trust", "list", "--scope", "all"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Trust {
+                    action: TrustAction::List {
+                        scope: TrustQueryScope::All,
+                        ..
+                    }
+                }
+            ));
+            let cli = Cli::try_parse_from(["tirith", "trust", "gc", "--scope", "staging"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Trust {
+                    action: TrustAction::Gc {
+                        scope: TrustQueryScope::Invalid(ref value),
+                        ..
+                    }
+                } if value == "staging"
+            ));
+        });
     }
 }

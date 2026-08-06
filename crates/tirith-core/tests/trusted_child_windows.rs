@@ -42,7 +42,8 @@ fn windows_helper_grandchild_holds_inherited_pipes() {
 
 #[test]
 fn windows_helper_parent_exits_with_a_live_grandchild() {
-    if std::env::var(HELPER_MODE).ok().as_deref() != Some("parent") {
+    let mode = std::env::var(HELPER_MODE).ok();
+    if !matches!(mode.as_deref(), Some("parent" | "timeout-parent")) {
         return;
     }
     let executable = std::env::current_exe().unwrap();
@@ -66,6 +67,12 @@ fn windows_helper_parent_exits_with_a_live_grandchild() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(pid_file.exists(), "grandchild did not publish its pid");
+    if mode.as_deref() == Some("timeout-parent") {
+        // Keep both the direct child and its descendant alive with inherited
+        // output handles. The supervisor must hit its wall deadline, terminate
+        // the complete Job, and return without waiting for either pipe holder.
+        std::thread::sleep(Duration::from_secs(30));
+    }
     // Dropping Child closes only this helper's process handle. The grandchild
     // deliberately remains live with inherited stdout/stderr handles.
 }
@@ -202,7 +209,7 @@ fn windows_supervisor_rejects_an_explicit_working_directory() {
 }
 
 #[test]
-fn windows_supervisor_kills_descendants_holding_pipes_at_deadline() {
+fn windows_supervisor_preserves_success_while_killing_descendants_holding_pipes() {
     let executable = TrustedExecutable::current().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let pid_file = directory.path().join("grandchild.pid");
@@ -220,12 +227,10 @@ fn windows_supervisor_kills_descendants_holding_pipes_at_deadline() {
     let started = Instant::now();
     let outcome = run(&executable, &spec);
     assert!(started.elapsed() < Duration::from_secs(4));
-    assert!(matches!(
-        outcome,
-        ChildOutcome::Timeout {
-            cleanup_succeeded: true
-        }
-    ));
+    match outcome {
+        ChildOutcome::Completed { status, .. } => assert!(status.success()),
+        other => panic!("direct-child success was not preserved: {other:?}"),
+    }
 
     let pid = std::fs::read_to_string(pid_file)
         .unwrap()
@@ -241,5 +246,50 @@ fn windows_supervisor_kills_descendants_holding_pipes_at_deadline() {
             let _ = CloseHandle(process);
         }
         assert_eq!(wait, WAIT_OBJECT_0, "descendant survived Job termination");
+    }
+}
+
+#[test]
+fn windows_supervisor_timeout_kills_descendants_holding_pipes() {
+    let executable = TrustedExecutable::current().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("timeout-grandchild.pid");
+    let spec = helper_spec(
+        &[
+            "--exact",
+            "windows_helper_parent_exits_with_a_live_grandchild",
+            "--nocapture",
+        ],
+        ChildLimits::new(Duration::from_millis(750), 4096, 4096),
+    )
+    .env(HELPER_MODE, "timeout-parent")
+    .env(HELPER_PID_FILE, pid_file.as_os_str());
+
+    let started = Instant::now();
+    let outcome = run(&executable, &spec);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "timeout cleanup waited for inherited pipes"
+    );
+    assert!(matches!(
+        outcome,
+        ChildOutcome::Timeout {
+            cleanup_succeeded: true
+        }
+    ));
+
+    let pid = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    // SAFETY: OpenProcess only obtains a synchronization handle for the PID.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if !process.is_null() {
+        let wait = unsafe { WaitForSingleObject(process, 2000) };
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        assert_eq!(wait, WAIT_OBJECT_0, "descendant survived timeout cleanup");
     }
 }

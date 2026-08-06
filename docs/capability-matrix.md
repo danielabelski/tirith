@@ -128,7 +128,7 @@ Inspected:
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith pkg install` | Full | Resolves with hashes, quarantines the exact wheel bytes, inspects them, then installs only the verified bytes inside a containment capsule with a tamper-evident receipt. Python-only enforcement. | Yes |
+| `tirith pkg install` | Full | Resolves with hashes, quarantines the exact wheel bytes, and inspects them. Enforcing Python installation is x86_64 Linux-only and uses only the verified bytes inside a containment capsule with a tamper-evident receipt; every other platform or architecture fails closed before pip starts. | Yes |
 | `tirith pkg verify-env` | Full | Verifies an installed environment's files against their RECORD and the threat DB. Python-only. | Yes |
 | `tirith pkg approve` | Full | Binds an approval to an InstallPlanDigest over the inspected artifact hashes, packages, target env, policy projection, and DB sequence. | Yes |
 | `tirith pkg graph` | Full | Renders the execution/ownership provenance graph from inspected artifact execution edges and the ownership map. | Yes |

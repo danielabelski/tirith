@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::event_buffer::{EventKind, TypedEvent};
+use crate::event_buffer::{EventKind, EventPrototype, TypedEvent};
 use crate::session_warnings::SessionWarnings;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
@@ -59,7 +59,7 @@ impl EscalationAction {
 }
 
 /// Which rule/domain triggered an escalation, for per-key cooldown scoping.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EscalationHit {
     /// The rule that crossed the threshold, or `"*"` for the wildcard aggregate.
     pub rule_id: String,
@@ -454,7 +454,7 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
 /// this shared between enforcement and safe-command verification prevents a
 /// raw `Allow` from bypassing action overrides, `agent_rules`, approvals, or
 /// paranoia on an executable suggestion.
-fn apply_stateless_policy_effects(
+pub(crate) fn apply_stateless_policy_effects(
     raw_verdict: &Verdict,
     policy: &crate::policy::Policy,
     caller: CallerContext,
@@ -546,7 +546,7 @@ fn apply_stateless_policy_effects(
     effective
 }
 
-fn apply_correlation_findings(
+pub(crate) fn apply_correlation_findings(
     effective: &mut Verdict,
     policy: &crate::policy::Policy,
     correlation_hits: &[crate::event_buffer::CorrelationHit],
@@ -730,7 +730,8 @@ pub fn post_process_verdict(
 /// response confirms the forwarded request completed. Diagnostic/preflight callers
 /// (CLI and MCP check tools) have no execution confirmation and must not call it.
 /// A Block verdict is rejected defensively even if a caller misuses the API.
-pub fn record_executed_verdict_events(
+#[cfg(test)]
+pub(crate) fn record_executed_verdict_events(
     verdict: &Verdict,
     policy: &crate::policy::Policy,
     cmd: &str,
@@ -780,13 +781,20 @@ pub fn record_executed_verdict_events(
 /// non-manifest) files (intentionally not recorded from the command string to
 /// avoid flooding the ring; only the dependency-manifest case above emits a
 /// `FileWrite`).
-fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut events: Vec<TypedEvent> = Vec::new();
+pub(crate) fn derive_event_prototypes(cmd: &str, verdict: &Verdict) -> Vec<EventPrototype> {
+    derive_event_prototypes_for_shell(cmd, verdict, ShellType::Posix)
+}
+
+pub(crate) fn derive_event_prototypes_for_shell(
+    cmd: &str,
+    verdict: &Verdict,
+    shell: ShellType,
+) -> Vec<EventPrototype> {
+    let mut events: Vec<EventPrototype> = Vec::new();
     // EventKind is Copy + Eq (not Hash, by design), so a small Vec is the seen-set.
     let mut seen_kinds: Vec<EventKind> = Vec::new();
 
-    let push = |events: &mut Vec<TypedEvent>,
+    let push = |events: &mut Vec<EventPrototype>,
                 seen: &mut Vec<EventKind>,
                 kind: EventKind,
                 rule_id: &str,
@@ -794,8 +802,7 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
         // One event per kind per command keeps the ring focused.
         if !seen.contains(&kind) {
             seen.push(kind);
-            events.push(TypedEvent {
-                timestamp: now.clone(),
+            events.push(EventPrototype {
                 kind,
                 rule_id: rule_id.to_string(),
                 metadata: meta,
@@ -839,7 +846,7 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
     }
 
     // --- Command-shape signals ---------------------------------------------
-    let segments = tokenize::tokenize(cmd, ShellType::Posix);
+    let segments = tokenize::tokenize(cmd, shell);
     let mut leader_is_network = false;
     let mut delete_path: Option<String> = None;
     // Path-operand counts accumulated across ALL rm/unlink/shred segments in this
@@ -1011,6 +1018,25 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
     }
 
     events
+}
+
+/// Compatibility materializer for diagnostic/best-effort callers. Strict
+/// execution authorization keeps the timestamp-free prototypes above and lets
+/// [`crate::execution_state::ExecutionGate`] assign durable identities only
+/// after evidence reaches a trusted boundary.
+fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    derive_event_prototypes(cmd, verdict)
+        .into_iter()
+        .map(|prototype| {
+            prototype.materialize(
+                String::new(),
+                0,
+                timestamp.clone(),
+                crate::event_buffer::EventProvenance::Confirmed,
+            )
+        })
+        .collect()
 }
 
 /// Flatten all evidence across a verdict's findings (so host extraction can run).
@@ -1929,6 +1955,7 @@ mod tests {
             hidden_events: std::collections::VecDeque::new(),
             cooldowns: std::collections::BTreeMap::new(),
             typed_events: std::collections::VecDeque::new(),
+            next_typed_event_sequence: 1,
             surfaced_correlations: std::collections::VecDeque::new(),
         }
     }

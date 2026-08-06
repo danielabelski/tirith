@@ -209,6 +209,31 @@ pub fn is_critical_label(label: &str) -> bool {
     )
 }
 
+/// Canonical key used by SSH host-label policy and runtime lookup. DNS names
+/// and OpenSSH host aliases are case-insensitive, and a final DNS root dot is
+/// semantically insignificant. The optional username remains byte-for-byte
+/// significant so `Alice@host` cannot silently become `alice@host`.
+pub fn canonicalize_ssh_label_key(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (user, host) = match raw.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() => (Some(user), host),
+        Some(_) => return None,
+        None => (None, raw),
+    };
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    Some(match user {
+        Some(user) => format!("{user}@{host}"),
+        None => host,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +271,20 @@ mod tests {
         assert!(is_url_shortener("tinyurl.com"));
         assert!(!is_url_shortener("github.com"));
         assert!(!is_url_shortener("bit.ly.evil.com"));
+    }
+
+    #[test]
+    fn ssh_label_keys_fold_only_the_host_identity() {
+        assert_eq!(
+            canonicalize_ssh_label_key(" Alice@PROD.Example. ").as_deref(),
+            Some("Alice@prod.example")
+        );
+        assert_eq!(
+            canonicalize_ssh_label_key("alice@prod.example").as_deref(),
+            Some("alice@prod.example")
+        );
+        assert!(canonicalize_ssh_label_key("@prod.example").is_none());
+        assert!(canonicalize_ssh_label_key(".").is_none());
     }
 
     #[test]
