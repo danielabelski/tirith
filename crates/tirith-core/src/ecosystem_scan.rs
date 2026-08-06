@@ -41,6 +41,135 @@ pub const MAX_DEPENDENCIES: usize = 5_000;
 /// directory). Configurable via `--max-installed-entries`; `0` means unbounded.
 pub const DEFAULT_MAX_INSTALLED_ENTRIES: usize = 5_000;
 
+/// Per-file byte cap for any manifest / lockfile / installed metadata read
+/// (repo-0277). Reads go through a `limit + 1` bounded reader from a single
+/// open handle, so an oversized hostile manifest is rejected BEFORE its bytes
+/// are fully allocated, without a metadata-check-then-read race.
+pub const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Aggregate byte budget across every manifest read in one scan (repo-0277).
+/// Per-file caps alone still allow thousands of at-cap files; the aggregate
+/// budget turns a padded repository into a coverage gap instead of an OOM.
+pub const MAX_SCAN_READ_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Depth cap for recursive `requirements*.txt` include resolution
+/// (repo-0275). Cycles and include bombs are rejected past it.
+pub const MAX_REQUIREMENTS_INCLUDE_DEPTH: usize = 8;
+
+/// Total cap on requirements includes resolved in one scan (repo-0275).
+pub const MAX_REQUIREMENTS_INCLUDES: usize = 64;
+
+/// Depth cap for the nested `node_modules` walk (repo-0274).
+pub const MAX_NESTED_NODE_MODULES_DEPTH: usize = 16;
+
+/// Why a manifest-sized read failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedReadError {
+    /// The file exceeded the per-file cap (only `limit + 1` bytes were read).
+    Oversized,
+    /// Open or read failed.
+    Io,
+}
+
+/// Read a manifest through a single opened handle with a strict `limit + 1`
+/// reader: the cap is enforced DURING the read, never by a
+/// metadata-check-then-read race, and an oversized file is never fully
+/// materialized (repo-0277).
+fn read_manifest_bounded(path: &Path) -> Result<String, BoundedReadError> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|_| BoundedReadError::Io)?;
+    let mut buf = Vec::new();
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| BoundedReadError::Io)?;
+    if buf.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(BoundedReadError::Oversized);
+    }
+    String::from_utf8(buf).map_err(|_| BoundedReadError::Io)
+}
+
+/// The shared aggregate read budget for one scan (repo-0277). Every
+/// manifest-sized read charges its byte length here; when the budget is
+/// exhausted, later manifests are not read at all and the scan reports a
+/// coverage gap instead of allocating without bound.
+struct ScanReadBudget {
+    remaining: u64,
+    exhausted_reported: bool,
+}
+
+impl ScanReadBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_SCAN_READ_BYTES,
+            exhausted_reported: false,
+        }
+    }
+
+    /// Charge `bytes`; `false` when the aggregate budget is now exhausted.
+    fn charge(&mut self, bytes: u64) -> bool {
+        if bytes > self.remaining {
+            self.remaining = 0;
+            return false;
+        }
+        self.remaining -= bytes;
+        true
+    }
+
+    /// Whether the budget is already exhausted (skip the read entirely).
+    fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+/// Build the policy-aware [`RuleId::AnalysisIncomplete`] findings for
+/// ecosystem-scan coverage gaps (repo-0273/repo-0381): each gap is a finding
+/// whose severity follows the policy's per-gap-kind action and
+/// `scan.require_complete`, mirroring the artifact coverage contract so a
+/// truncated or partly-unreadable scan can never report Allow by default and
+/// blocks outright under fail-closed profiles.
+fn ecosystem_coverage_gap_findings(
+    gaps: &[crate::scan::CoverageGap],
+    policy: Option<&crate::policy::Policy>,
+) -> Vec<Finding> {
+    use crate::policy::GapAction;
+    gaps.iter()
+        .map(|gap| {
+            let configured = policy
+                .map(|p| p.scan.action_for_gap_kind(gap.kind))
+                .unwrap_or(GapAction::Warn);
+            let must_fail =
+                policy.is_some_and(|p| p.scan.require_complete) || configured == GapAction::Fail;
+            let severity = if must_fail {
+                Severity::High
+            } else {
+                // A coverage gap must never be invisible: floored to Warn even
+                // when the policy's gap action is Ignore.
+                Severity::Medium
+            };
+            let location = gap.location.to_string();
+            Finding {
+                rule_id: RuleId::AnalysisIncomplete,
+                severity,
+                title: "Ecosystem scan incomplete".to_string(),
+                description: format!(
+                    "Part of the dependency scan was not analyzed ({}): {}. Potentially relevant \
+                     packages or manifests were omitted, so a clean result is not provably \
+                     complete.",
+                    gap.kind.as_str(),
+                    location
+                ),
+                evidence: vec![Evidence::Text {
+                    detail: format!("{} ({})", location, gap.kind.as_str()),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }
+        })
+        .collect()
+}
+
 /// Directory names never descended into — build output and vendored trees hold
 /// installed content, not declared manifests, and would dominate the walk.
 const SKIP_DIRS: &[&str] = &[
@@ -70,6 +199,8 @@ pub enum ManifestKind {
     PyRequirementsTxt,
     /// Python `pyproject.toml` — PEP 621 + Poetry dependency tables.
     PyPyprojectToml,
+    /// Python `poetry.lock` — Poetry's resolved lockfile (exact versions).
+    PyPoetryLock,
     /// Rust `Cargo.toml` — `[dependencies]` and friends.
     CargoToml,
     /// Go `go.mod` — `require` directives.
@@ -83,7 +214,9 @@ impl ManifestKind {
     pub fn ecosystem(self) -> Ecosystem {
         match self {
             ManifestKind::NpmPackageJson | ManifestKind::NpmPackageLock => Ecosystem::Npm,
-            ManifestKind::PyRequirementsTxt | ManifestKind::PyPyprojectToml => Ecosystem::PyPI,
+            ManifestKind::PyRequirementsTxt
+            | ManifestKind::PyPyprojectToml
+            | ManifestKind::PyPoetryLock => Ecosystem::PyPI,
             ManifestKind::CargoToml => Ecosystem::Crates,
             ManifestKind::GoMod => Ecosystem::Go,
             ManifestKind::RubyGemfile => Ecosystem::RubyGems,
@@ -97,6 +230,7 @@ impl ManifestKind {
             ManifestKind::NpmPackageLock => "package-lock.json",
             ManifestKind::PyRequirementsTxt => "requirements.txt",
             ManifestKind::PyPyprojectToml => "pyproject.toml",
+            ManifestKind::PyPoetryLock => "poetry.lock",
             ManifestKind::CargoToml => "Cargo.toml",
             ManifestKind::GoMod => "go.mod",
             ManifestKind::RubyGemfile => "Gemfile",
@@ -110,6 +244,7 @@ impl ManifestKind {
             "package.json" => Some(ManifestKind::NpmPackageJson),
             "package-lock.json" => Some(ManifestKind::NpmPackageLock),
             "pyproject.toml" => Some(ManifestKind::PyPyprojectToml),
+            "poetry.lock" => Some(ManifestKind::PyPoetryLock),
             "Cargo.toml" => Some(ManifestKind::CargoToml),
             "go.mod" => Some(ManifestKind::GoMod),
             "Gemfile" => Some(ManifestKind::RubyGemfile),
@@ -138,7 +273,19 @@ pub struct DiscoveredManifest {
 /// descended; reads only directory entries, never file content. A file `root`
 /// returns that single manifest. Result is sorted by path for determinism.
 pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
+    discover_manifests_with_gaps(root).0
+}
+
+/// [`discover_manifests`] plus the coverage gaps the walk hit (repo-0273):
+/// reaching the entry cap or the depth cap is reported, never silent, so a
+/// manifest hidden beyond a limit cannot produce a clean-looking scan.
+pub fn discover_manifests_with_gaps(
+    root: &Path,
+) -> (Vec<DiscoveredManifest>, Vec<crate::scan::CoverageGap>) {
+    use crate::scan::{CoverageGap, CoverageGapKind};
+
     let mut found: Vec<DiscoveredManifest> = Vec::new();
+    let mut gaps: Vec<CoverageGap> = Vec::new();
 
     // A file root: classify it directly.
     if root.is_file() {
@@ -152,13 +299,14 @@ pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
                 kind,
             });
         }
-        return found;
+        return (found, gaps);
     }
 
     // Iterative walk with an explicit work stack (no recursion, so depth is a
     // hard bound and a deep tree cannot blow the stack). Sorted before return.
     let mut examined = 0usize;
     let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    let mut depth_capped = false;
     while let Some((dir, depth)) = queue.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -167,8 +315,20 @@ pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
         for entry in entries.flatten() {
             examined += 1;
             if examined > MAX_WALK_ENTRIES {
+                gaps.push(CoverageGap {
+                    location: crate::location::SubjectLocation::installed(root),
+                    kind: CoverageGapKind::EntryCountCapped,
+                    sha256: None,
+                });
                 found.sort_by(|a, b| a.path.cmp(&b.path));
-                return found;
+                if depth_capped {
+                    gaps.push(CoverageGap {
+                        location: crate::location::SubjectLocation::installed(root),
+                        kind: CoverageGapKind::Truncated,
+                        sha256: None,
+                    });
+                }
+                return (found, gaps);
             }
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else {
@@ -182,6 +342,8 @@ pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
                 }
                 if depth < MAX_WALK_DEPTH {
                     queue.push((path, depth + 1));
+                } else {
+                    depth_capped = true;
                 }
             } else if file_type.is_file() {
                 if let Some(kind) = entry
@@ -196,7 +358,14 @@ pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
     }
 
     found.sort_by(|a, b| a.path.cmp(&b.path));
-    found
+    if depth_capped {
+        gaps.push(CoverageGap {
+            location: crate::location::SubjectLocation::installed(root),
+            kind: CoverageGapKind::Truncated,
+            sha256: None,
+        });
+    }
+    (found, gaps)
 }
 
 /// One dependency a manifest declares.
@@ -259,12 +428,50 @@ pub fn parse_manifest(kind: ManifestKind, text: &str) -> Option<Vec<DeclaredDepe
     match kind {
         ManifestKind::NpmPackageJson => parse_package_json(text),
         ManifestKind::NpmPackageLock => parse_package_lock(text),
-        ManifestKind::PyRequirementsTxt => Some(parse_requirements_txt(text)),
+        ManifestKind::PyRequirementsTxt => Some(parse_requirements_txt_ex(text).deps),
         ManifestKind::PyPyprojectToml => parse_pyproject_toml(text),
+        ManifestKind::PyPoetryLock => parse_poetry_lock(text),
         ManifestKind::CargoToml => parse_cargo_toml(text),
         ManifestKind::GoMod => Some(parse_go_mod(text)),
         ManifestKind::RubyGemfile => Some(parse_gemfile(text)),
     }
+}
+
+/// The detailed outcome of parsing one manifest (repo-0275): besides the
+/// assessed dependencies, the sources that need follow-up — requirements
+/// includes to resolve from the verified project root, and direct URL/VCS
+/// references whose non-registry source must surface as a coverage gap even
+/// when the package NAME could still be assessed.
+#[derive(Debug, Default)]
+pub(crate) struct ManifestParseDetails {
+    pub deps: Vec<DeclaredDependency>,
+    /// `-r` / `--requirement` include targets (as written, to be resolved
+    /// against the including manifest's directory).
+    pub includes: Vec<String>,
+    /// Direct URL/VCS dependency sources (as written). Every one is a
+    /// coverage gap; when a package name was extractable it was ALSO assessed.
+    pub unsupported_sources: Vec<String>,
+}
+
+/// [`parse_manifest`] plus the follow-up source channel. Pure: no I/O —
+/// include resolution happens in the collector, which owns the verified root.
+pub(crate) fn parse_manifest_detailed(
+    kind: ManifestKind,
+    text: &str,
+) -> Option<ManifestParseDetails> {
+    if kind == ManifestKind::PyRequirementsTxt {
+        let parsed = parse_requirements_txt_ex(text);
+        return Some(ManifestParseDetails {
+            deps: parsed.deps,
+            includes: parsed.includes,
+            unsupported_sources: parsed.unsupported_sources,
+        });
+    }
+    parse_manifest(kind, text).map(|deps| ManifestParseDetails {
+        deps,
+        includes: Vec::new(),
+        unsupported_sources: Vec::new(),
+    })
 }
 
 /// npm `package.json`: `dependencies`, `devDependencies`, `optionalDependencies`,
@@ -750,8 +957,28 @@ fn npm_lock_identity(
 /// Python `requirements.txt`: one PEP 508 specifier per line. Comments, blank
 /// lines, and pip option lines (`-r`, `--index-url`, `-e`, …) are skipped; the
 /// bare distribution name is extracted.
+#[cfg(test)]
 fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
+    parse_requirements_txt_ex(text).deps
+}
+
+/// The full outcome of parsing one requirements file (repo-0275): besides the
+/// assessed dependencies, the `-r`/`--requirement` includes that must be
+/// resolved from the verified project root, and the direct URL/VCS references
+/// whose non-registry source must surface as a coverage gap even when the
+/// package name was extractable.
+#[derive(Debug, Default)]
+pub(crate) struct RequirementsParseEx {
+    pub deps: Vec<DeclaredDependency>,
+    pub includes: Vec<String>,
+    pub unsupported_sources: Vec<String>,
+}
+
+/// Extended requirements parser: dependencies plus follow-up sources.
+fn parse_requirements_txt_ex(text: &str) -> RequirementsParseEx {
     let mut out = Vec::new();
+    let mut includes = Vec::new();
+    let mut unsupported_sources = Vec::new();
     for raw_line in text.lines() {
         // Strip an inline comment, then trim.
         let line = match raw_line.split_once(" #") {
@@ -762,12 +989,43 @@ fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // pip directive lines (`-r other.txt`, `--index-url ...`, `-e .`).
+        // Include directives pull another requirements file into the SAME
+        // dependency set; silently skipping them under-reports the project.
+        // The target is recorded for bounded, contained resolution by the
+        // collector.
+        for flag in ["-r", "--requirement", "-c", "--constraint"] {
+            if let Some(rest) = line
+                .strip_prefix(flag)
+                .filter(|_| line.len() > flag.len())
+                .filter(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('='))
+            {
+                let target = rest.trim_start_matches(['=', ' ', '\t']).trim();
+                if !target.is_empty() {
+                    includes.push(target.to_string());
+                }
+            }
+        }
+        // pip directive lines (`--index-url ...`, `-e .`) carry no registry
+        // dependency.
         if line.starts_with('-') {
             continue;
         }
-        // A bare URL / VCS install (`git+https://…`) has no PyPI name to score.
-        if line.contains("://") {
+        // A direct URL / VCS install (`git+https://…` or a PEP 508 direct
+        // reference `name @ https://…`) is not registry-verifiable; it must
+        // surface as a coverage gap even when a name was extractable.
+        if line.contains("://") || line.contains(" @ ") {
+            unsupported_sources.push(line.to_string());
+            if let Some((name, _)) = line.split_once(" @ ") {
+                if let Some(name) = python_requirement_name(name.trim()) {
+                    out.push(DeclaredDependency {
+                        name,
+                        alias: None,
+                        ecosystem: Ecosystem::PyPI,
+                        version: VersionIntent::Unspecified,
+                        dev: false,
+                    });
+                }
+            }
             continue;
         }
         if let Some(name) = python_requirement_name(line) {
@@ -783,7 +1041,11 @@ fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
             });
         }
     }
-    out
+    RequirementsParseEx {
+        deps: out,
+        includes,
+        unsupported_sources,
+    }
 }
 
 /// Extract the bare distribution name from a PEP 508 requirement line,
@@ -944,6 +1206,44 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         }
     }
 
+    Some(out)
+}
+
+/// Poetry `poetry.lock`: the `[[package]]` array carries exact resolved
+/// versions, so locked dependencies are assessed as Exact pins instead of
+/// degrading to the pyproject's unconstrained names. `None` on malformed TOML
+/// so a broken lockfile is a parse failure, not an empty scan.
+fn parse_poetry_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
+    let doc = toml::from_str::<toml::Value>(text).ok()?;
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    if let Some(packages) = doc.get("package").and_then(|p| p.as_array()) {
+        for package in packages {
+            let Some(name) = package.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() || !is_plausible_package_name(name) {
+                continue;
+            }
+            let version = package.get("version").and_then(|v| v.as_str());
+            let dev = package
+                .get("category")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c == "dev");
+            if seen.insert(name.to_ascii_lowercase()) {
+                out.push(DeclaredDependency {
+                    name: name.to_string(),
+                    alias: None,
+                    ecosystem: Ecosystem::PyPI,
+                    version: version
+                        .map(|v| VersionIntent::Exact(v.to_string()))
+                        .unwrap_or(VersionIntent::Unspecified),
+                    dev,
+                });
+            }
+        }
+    }
     Some(out)
 }
 
@@ -2144,9 +2444,12 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
 
     // Dispatch on mode → (manifest_labels, declared_deps). Downstream scoring +
     // verdict assembly is mode-independent (the byte-identical-JSON invariant).
-    let (mut manifest_labels, mut declared) = match &request.mode {
+    let (mut manifest_labels, mut declared, scan_gaps) = match &request.mode {
         ScanMode::Manifests => collect_from_manifests(request, &mut notes),
-        ScanMode::Installed => collect_from_installed_tree(request, &mut notes),
+        ScanMode::Installed => {
+            let (labels, deps) = collect_from_installed_tree(request, &mut notes);
+            (labels, deps, Vec::new())
+        }
         ScanMode::SpecificLockfile(path) => collect_from_specific_lockfile(path, &mut notes),
     };
 
@@ -2224,13 +2527,28 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     let default_policy = crate::policy::Policy::default();
     let effective_policy = request.policy.unwrap_or(&default_policy);
     let mut findings: Vec<Finding> = Vec::new();
+    // Coverage gaps (repo-0273/repo-0277): unreadable, oversized, truncated, or
+    // budget-capped inputs become policy-aware `AnalysisIncomplete` findings so
+    // an incompletely-read project can never look clean by default.
+    findings.extend(ecosystem_coverage_gap_findings(&scan_gaps, request.policy));
     for assessment in &assessments {
-        findings.extend(findings_for(assessment, effective_policy));
+        let mut dep_findings = findings_for(assessment, effective_policy);
         // Policy-driven per-dependency rules; allowlisted assessments suppress
         // these too, matching `findings_for`.
         if !assessment.allowlisted {
-            findings.extend(policy_findings_for_assessment(assessment, effective_policy));
+            dep_findings.extend(policy_findings_for_assessment(assessment, effective_policy));
         }
+        // repo-0380: rule-scoped allowlist entries suppress ONLY their own
+        // rule for this dependency — never the whole dependency.
+        dep_findings.retain(|f| {
+            !rule_scoped_allowlisted(
+                effective_policy,
+                assessment.dependency.ecosystem,
+                &assessment.dependency.name,
+                &f.rule_id.to_string(),
+            )
+        });
+        findings.extend(dep_findings);
     }
 
     // B5 installed-distribution integrity: only in `--installed` mode (the
@@ -2278,6 +2596,27 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     }
 }
 
+/// repo-0380: `true` when a rule-scoped allowlist entry names exactly this
+/// rule and this dependency (bare `name` or qualified `eco:name`,
+/// case-insensitive). Global allowlisting is handled separately via the
+/// assessment-level `allowlisted` flag.
+fn rule_scoped_allowlisted(
+    policy: &crate::policy::Policy,
+    eco: Ecosystem,
+    name: &str,
+    rule_id: &str,
+) -> bool {
+    let bare = name.to_lowercase();
+    let qualified = format!("{}:{}", eco, bare);
+    policy.allowlist_rules.iter().any(|rule| {
+        rule.rule_id.eq_ignore_ascii_case(rule_id)
+            && rule.patterns.iter().any(|p| {
+                let entry = p.trim().to_lowercase();
+                entry == bare || entry == qualified
+            })
+    })
+}
+
 // Per-mode collectors all return (manifest_labels, declared_deps) in the same
 // shape so the downstream scoring loop is mode-independent.
 
@@ -2286,8 +2625,12 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
 fn collect_from_manifests(
     request: &ScanRequest,
     notes: &mut Vec<ScanNote>,
-) -> (Vec<String>, Vec<(DeclaredDependency, String)>) {
-    let manifests = discover_manifests(request.root);
+) -> (
+    Vec<String>,
+    Vec<(DeclaredDependency, String)>,
+    Vec<crate::scan::CoverageGap>,
+) {
+    let (manifests, mut gaps) = discover_manifests_with_gaps(request.root);
     if manifests.is_empty() {
         notes.push(ScanNote {
             manifest: None,
@@ -2300,12 +2643,25 @@ fn collect_from_manifests(
 
     let mut declared: Vec<(DeclaredDependency, String)> = Vec::new();
     let mut manifest_labels: Vec<String> = Vec::new();
+    let mut budget = ScanReadBudget::new();
+    let mut includes_resolved = 0usize;
+    let canonical_root = std::fs::canonicalize(request.root).ok();
     for manifest in &manifests {
         let rel = relative_label(request.root, &manifest.path);
         manifest_labels.push(rel.clone());
-        parse_one_manifest(manifest, &rel, &mut declared, notes);
+        parse_one_manifest(
+            manifest,
+            &rel,
+            &mut declared,
+            notes,
+            &mut budget,
+            &mut gaps,
+            &mut includes_resolved,
+            canonical_root.as_deref(),
+            0,
+        );
     }
-    (manifest_labels, declared)
+    (manifest_labels, declared, gaps)
 }
 
 /// Read a single lockfile by path (the `--lockfile <path>` form). An
@@ -2313,20 +2669,24 @@ fn collect_from_manifests(
 fn collect_from_specific_lockfile(
     path: &Path,
     notes: &mut Vec<ScanNote>,
-) -> (Vec<String>, Vec<(DeclaredDependency, String)>) {
+) -> (
+    Vec<String>,
+    Vec<(DeclaredDependency, String)>,
+    Vec<crate::scan::CoverageGap>,
+) {
     if !path.exists() {
         notes.push(ScanNote {
             manifest: None,
             note: format!("lockfile not found: {}", path.display()),
         });
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         notes.push(ScanNote {
             manifest: None,
             note: format!("lockfile has no readable file name: {}", path.display()),
         });
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
     let Some(kind) = ManifestKind::from_file_name(name) else {
         notes.push(ScanNote {
@@ -2338,7 +2698,7 @@ fn collect_from_specific_lockfile(
                 path.display()
             ),
         });
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
     let discovered = DiscoveredManifest {
         path: path.to_path_buf(),
@@ -2346,8 +2706,22 @@ fn collect_from_specific_lockfile(
     };
     let label = path.display().to_string();
     let mut declared: Vec<(DeclaredDependency, String)> = Vec::new();
-    parse_one_manifest(&discovered, &label, &mut declared, notes);
-    (vec![label], declared)
+    let mut budget = ScanReadBudget::new();
+    let mut gaps = Vec::new();
+    let mut includes_resolved = 0usize;
+    let canonical_root = path.parent().and_then(|p| std::fs::canonicalize(p).ok());
+    parse_one_manifest(
+        &discovered,
+        &label,
+        &mut declared,
+        notes,
+        &mut budget,
+        &mut gaps,
+        &mut includes_resolved,
+        canonical_root.as_deref(),
+        0,
+    );
+    (vec![label], declared, gaps)
 }
 
 /// Walk installed-tree directories under `request.root` and synthesize
@@ -2460,18 +2834,69 @@ fn parse_one_manifest(
     rel: &str,
     out: &mut Vec<(DeclaredDependency, String)>,
     notes: &mut Vec<ScanNote>,
+    budget: &mut ScanReadBudget,
+    gaps: &mut Vec<crate::scan::CoverageGap>,
+    includes_resolved: &mut usize,
+    canonical_root: Option<&Path>,
+    include_depth: usize,
 ) {
-    let text = match std::fs::read_to_string(&manifest.path) {
-        Ok(t) => t,
-        Err(e) => {
+    use crate::scan::{CoverageGap, CoverageGapKind};
+    // The aggregate byte budget (repo-0277) is charged before every read so a
+    // padded repository becomes a coverage gap instead of an OOM.
+    if budget.exhausted() {
+        if !budget.exhausted_reported {
+            budget.exhausted_reported = true;
             notes.push(ScanNote {
                 manifest: Some(rel.to_string()),
-                note: format!("could not read manifest: {e}"),
+                note: format!(
+                    "the aggregate manifest read budget ({MAX_SCAN_READ_BYTES} bytes) is \
+                     exhausted — this and later manifests were not read.",
+                ),
+            });
+        }
+        gaps.push(CoverageGap {
+            location: crate::location::SubjectLocation::installed(&manifest.path),
+            kind: CoverageGapKind::Truncated,
+            sha256: None,
+        });
+        return;
+    }
+    // Bounded read through a single open handle (repo-0277): the per-file cap
+    // is enforced DURING the read, never by a metadata-then-read race.
+    let text = match read_manifest_bounded(&manifest.path) {
+        Ok(t) => {
+            budget.charge(t.len() as u64);
+            t
+        }
+        Err(BoundedReadError::Oversized) => {
+            notes.push(ScanNote {
+                manifest: Some(rel.to_string()),
+                note: format!(
+                    "manifest exceeds the per-file cap of {MAX_MANIFEST_BYTES} bytes; \
+                     its dependencies were not assessed.",
+                ),
+            });
+            gaps.push(CoverageGap {
+                location: crate::location::SubjectLocation::installed(&manifest.path),
+                kind: CoverageGapKind::Oversized,
+                sha256: None,
+            });
+            return;
+        }
+        Err(BoundedReadError::Io) => {
+            notes.push(ScanNote {
+                manifest: Some(rel.to_string()),
+                note: "could not read manifest.".to_string(),
+            });
+            gaps.push(CoverageGap {
+                location: crate::location::SubjectLocation::installed(&manifest.path),
+                kind: CoverageGapKind::Unreadable,
+                sha256: None,
             });
             return;
         }
     };
-    match parse_manifest(manifest.kind, &text) {
+    let details = match parse_manifest_detailed(manifest.kind, &text) {
         None => {
             notes.push(ScanNote {
                 manifest: Some(rel.to_string()),
@@ -2481,18 +2906,98 @@ fn parse_one_manifest(
                     manifest.kind.label()
                 ),
             });
+            return;
         }
-        Some(deps) => {
-            if deps.is_empty() {
-                notes.push(ScanNote {
-                    manifest: Some(rel.to_string()),
-                    note: "the manifest parsed but declares no dependencies.".to_string(),
-                });
-            }
-            for dep in deps {
-                out.push((dep, rel.to_string()));
-            }
+        Some(details) => details,
+    };
+    if details.deps.is_empty() && details.includes.is_empty() {
+        notes.push(ScanNote {
+            manifest: Some(rel.to_string()),
+            note: "the manifest parsed but declares no dependencies.".to_string(),
+        });
+    }
+    for dep in details.deps {
+        out.push((dep, rel.to_string()));
+    }
+    // Direct URL/VCS sources (repo-0275) are not registry-verifiable: each one
+    // is an explicit coverage note even when its package name was assessed.
+    if !details.unsupported_sources.is_empty() {
+        notes.push(ScanNote {
+            manifest: Some(rel.to_string()),
+            note: format!(
+                "{} direct URL/VCS dependenc{} cannot be registry-verified (e.g. `{}`); \
+                 review their provenance manually.",
+                details.unsupported_sources.len(),
+                if details.unsupported_sources.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                details.unsupported_sources[0],
+            ),
+        });
+    }
+    // Resolve `-r`/`--requirement` includes (repo-0275) relative to the
+    // including manifest's directory, contained under the verified scan root,
+    // with hard depth and count caps so include bombs/cycles are rejected.
+    for include in &details.includes {
+        if include_depth >= MAX_REQUIREMENTS_INCLUDE_DEPTH
+            || *includes_resolved >= MAX_REQUIREMENTS_INCLUDES
+        {
+            notes.push(ScanNote {
+                manifest: Some(rel.to_string()),
+                note: format!(
+                    "requirements include `{include}` was not resolved: the include depth/count \
+                     cap was reached; its dependencies were not assessed.",
+                ),
+            });
+            gaps.push(CoverageGap {
+                location: crate::location::SubjectLocation::installed(&manifest.path),
+                kind: CoverageGapKind::Truncated,
+                sha256: None,
+            });
+            continue;
         }
+        let candidate = manifest
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(include);
+        // Containment: the canonical include target must stay under the
+        // canonical scan root, so a `../../etc/...` or symlink escape is not
+        // followed.
+        let contained = match (std::fs::canonicalize(&candidate), canonical_root) {
+            (Ok(resolved), Some(root)) => resolved.starts_with(root),
+            (Ok(_), None) => true,
+            (Err(_), _) => false,
+        };
+        if !contained {
+            notes.push(ScanNote {
+                manifest: Some(rel.to_string()),
+                note: format!(
+                    "requirements include `{include}` escapes the scan root or does not \
+                     exist; it was not followed.",
+                ),
+            });
+            continue;
+        }
+        *includes_resolved += 1;
+        let include_manifest = DiscoveredManifest {
+            path: candidate,
+            kind: ManifestKind::PyRequirementsTxt,
+        };
+        let include_rel = format!("{rel} -> {include}");
+        parse_one_manifest(
+            &include_manifest,
+            &include_rel,
+            out,
+            notes,
+            budget,
+            gaps,
+            includes_resolved,
+            canonical_root,
+            include_depth + 1,
+        );
     }
 }
 
@@ -3832,6 +4337,41 @@ impl EcosystemScanReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // repo-0380: rule-scoped allowlist entries suppress only their own rule.
+    #[test]
+    fn rule_scoped_allowlist_suppresses_only_the_named_rule() {
+        let mut policy = crate::policy::Policy::default();
+        policy.allowlist_rules.push(crate::policy::AllowlistRule {
+            rule_id: "threat_package_typosquat".to_string(),
+            patterns: vec!["left-pad".to_string()],
+        });
+        assert!(rule_scoped_allowlisted(
+            &policy,
+            Ecosystem::Npm,
+            "left-pad",
+            "threat_package_typosquat"
+        ));
+        assert!(!rule_scoped_allowlisted(
+            &policy,
+            Ecosystem::Npm,
+            "left-pad",
+            "threat_malicious_package"
+        ));
+        assert!(!rule_scoped_allowlisted(
+            &policy,
+            Ecosystem::Npm,
+            "other-pkg",
+            "threat_package_typosquat"
+        ));
+        // Qualified form also matches.
+        assert!(rule_scoped_allowlisted(
+            &policy,
+            Ecosystem::Npm,
+            "left-pad",
+            "threat_package_typosquat"
+        ));
+    }
 
     #[test]
     fn manifest_kind_classifies_known_filenames() {

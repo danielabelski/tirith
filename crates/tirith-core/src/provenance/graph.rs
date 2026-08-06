@@ -320,7 +320,10 @@ impl ProvenanceGraphBuilder {
 
     /// Fold one MCP server entry.
     fn add_mcp_server(&mut self, server: &McpServerEntry) {
-        let server_id = format!("mcp:{}", server.name);
+        // repo-0315: names come from repository-controlled MCP configuration.
+        // Escape the `:`/`/`/`%` delimiters so `server "a" + tool "b"` and
+        // `server "a/b"` can never collapse into the same node id.
+        let server_id = format!("mcp:{}", escape_mcp_id_component(&server.name));
         self.upsert_node(ProvenanceNode {
             id: server_id.clone(),
             kind: NodeKind::McpServer,
@@ -351,7 +354,11 @@ impl ProvenanceGraphBuilder {
         }
 
         for tool in &server.tools {
-            let tool_id = format!("mcp:{}/{}", server.name, tool);
+            let tool_id = format!(
+                "mcp:{}/{}",
+                escape_mcp_id_component(&server.name),
+                escape_mcp_id_component(tool)
+            );
             self.upsert_node(ProvenanceNode {
                 id: tool_id.clone(),
                 kind: NodeKind::McpTool,
@@ -611,6 +618,23 @@ fn is_empty_location(location: &SubjectLocation) -> bool {
 /// the id when the transport names no endpoint ([`McpTransport::Unknown`]), so no
 /// `ServedBy` edge is drawn. The strings come from the already-redacted lock, so no
 /// raw credential is rendered.
+/// Percent-escape the MCP node-id delimiters in one attacker-controlled name
+/// component (repo-0315): `%` first, then `:` and `/`. Unescaped components let
+/// `server "a" / tool "b"` and `server "a/b"` share the id `mcp:a/b`, merging
+/// two distinct security surfaces into one node.
+fn escape_mcp_id_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            ':' => out.push_str("%3A"),
+            '/' => out.push_str("%2F"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn mcp_transport_endpoint(transport: &McpTransport) -> (Option<String>, String, String) {
     match transport {
         McpTransport::Url { url, .. } => (
@@ -866,6 +890,64 @@ mod tests {
             .iter()
             .all(|e| e.kind != EdgeKind::DuplicateOwner));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn mcp_node_ids_do_not_collide_across_delimiter_names() {
+        // repo-0315: server "a" exposing tool "b" and a server literally named
+        // "a/b" must remain two distinct nodes.
+        let inventory = McpInventory {
+            servers: vec![
+                McpServerEntry {
+                    name: "a".to_string(),
+                    transport: McpTransport::Stdio {
+                        command: "mcp-a".to_string(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                    },
+                    tools: vec!["b".to_string()],
+                    tools_declared: true,
+                    source_config: ".mcp.json".to_string(),
+                },
+                McpServerEntry {
+                    name: "a/b".to_string(),
+                    transport: McpTransport::Stdio {
+                        command: "mcp-ab".to_string(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                    },
+                    tools: Vec::new(),
+                    tools_declared: false,
+                    source_config: ".mcp.json".to_string(),
+                },
+            ],
+            configs: vec![".mcp.json".to_string()],
+            malformed_configs: Vec::new(),
+            rejected_configs: Vec::new(),
+        };
+        let mut builder = ProvenanceGraphBuilder::new();
+        builder.add_mcp_inventory(&inventory);
+        let graph = builder.build();
+
+        let server_nodes: Vec<&ProvenanceNode> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::McpServer)
+            .collect();
+        assert_eq!(
+            server_nodes.len(),
+            2,
+            "the delimiter-named server must not merge into the tool node"
+        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::McpTool && n.label == "b"));
+        assert!(server_nodes.iter().any(|n| n.id == "mcp:a%2Fb"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.id == "mcp:a/b" && n.kind == NodeKind::McpTool));
     }
 
     #[test]

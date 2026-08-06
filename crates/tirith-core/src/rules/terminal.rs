@@ -580,6 +580,72 @@ pub fn check_clipboard_html(html: &str, plain_text: &str) -> Vec<Finding> {
         });
     }
 
+    // repo-0334: the deception check was one-directional. A benign-looking
+    // HTML part with a LONGER or simply DIFFERENT malicious text/plain payload
+    // (the string the terminal actually pastes) is the dangerous direction.
+    if plain_len > visible_len + 50 {
+        findings.push(Finding {
+            rule_id: RuleId::ClipboardHidden,
+            severity: Severity::High,
+            title: "Clipboard plain text contains more than rendered HTML".to_string(),
+            description: format!(
+                "Plain-text payload has ~{plain_len} chars vs {visible_len} chars of HTML-visible \
+                 text ({} chars only in the pasted text)",
+                plain_len - visible_len
+            ),
+            evidence: vec![Evidence::Text {
+                detail: format!(
+                    "plain text: {plain_len} chars, HTML visible text: {visible_len} chars"
+                ),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    // repo-0334: equal-LENGTH but different content must not pass either. When
+    // both parts are non-trivial and no directional finding fired, require a
+    // majority of the plain text's words to appear in the HTML-visible text.
+    if plain_len >= 20 && visible_len >= 20 && findings.is_empty() {
+        let visible_words: std::collections::HashSet<String> = visible_text
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect();
+        let plain_words: Vec<String> = plain_text
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect();
+        if !plain_words.is_empty() {
+            let overlap = plain_words
+                .iter()
+                .filter(|w| visible_words.contains(*w))
+                .count();
+            if overlap * 2 < plain_words.len() {
+                findings.push(Finding {
+                    rule_id: RuleId::ClipboardHidden,
+                    severity: Severity::High,
+                    title: "Clipboard plain text differs from rendered HTML".to_string(),
+                    description: "The text/plain payload shares fewer than half its words with \
+                        the HTML-visible content — the pasted command is not what the rendered \
+                        preview showed."
+                        .to_string(),
+                    evidence: vec![Evidence::Text {
+                        detail: format!(
+                            "word overlap {overlap}/{} between plain text and HTML-visible text",
+                            plain_words.len()
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+    }
+
     findings
 }
 

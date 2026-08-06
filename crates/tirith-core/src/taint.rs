@@ -185,6 +185,44 @@ pub fn invalidate_cache() {
 /// A prior entry for the same path is left in place — `is_tainted` returns the
 /// LAST match, so an append is an effective update.
 fn append_entry(store: &Path, entry: &TaintEntry) -> std::io::Result<()> {
+    with_store_lock(store, |store| append_entry_unlocked(store, entry))
+}
+
+/// Dedicated cross-process lock file for a store (`<store>.lock`), mirroring
+/// the session/pending stores (repo-0343/repo-0438). JSONL appends and the
+/// clear rewrite must be serialized or a concurrent mark can be silently lost
+/// and an interleaved partial line reads as a clean miss.
+fn store_lock_path(store: &Path) -> PathBuf {
+    let mut name = store.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn with_store_lock<R>(
+    store: &Path,
+    f: impl FnOnce(&Path) -> std::io::Result<R>,
+) -> std::io::Result<R> {
+    use fs2::FileExt as _;
+    let lock_path = store_lock_path(store);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = opts.open(&lock_path)?;
+    file.lock_exclusive()?;
+    let result = f(store);
+    let _ = file.unlock();
+    result
+}
+
+fn append_entry_unlocked(store: &Path, entry: &TaintEntry) -> std::io::Result<()> {
     if let Some(parent) = store.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -216,12 +254,31 @@ pub fn mark_tainted_at(
         path: key.to_string_lossy().into_owned(),
         origin: origin.into(),
         marked_at: chrono::Utc::now().to_rfc3339(),
-        source_url,
+        // repo-0344: the source URL can carry userinfo credentials, signed
+        // query parameters, or bearer tokens. Strip them before the URL is
+        // persisted and later shown in findings/terminal evidence.
+        source_url: source_url.map(|u| redact_url_for_storage(&u)),
         source_repo,
     };
     append_entry(store, &entry)?;
     invalidate_cache();
     Ok(entry)
+}
+
+/// Remove credential-bearing components (userinfo, query, fragment) from a
+/// URL before it is persisted to the taint store (repo-0344). Unparseable
+/// values fall back to the generic secret redactor.
+fn redact_url_for_storage(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => crate::redact::redact(raw),
+    }
 }
 
 /// Production entry point: mark `path` tainted in the default store.
@@ -384,6 +441,12 @@ pub fn list_taints() -> Vec<TaintEntry> {
 /// valid-but-unparseable line (a future schema field) is PRESERVED VERBATIM — a
 /// line is dropped ONLY when it parses as a `TaintEntry` matching the key.
 pub fn clear_taint_at(store: &Path, path: &Path, cwd: Option<&Path>) -> std::io::Result<usize> {
+    // repo-0438: the read-modify-rename must hold the store lock or a
+    // concurrent `mark` between the read and the rename is silently discarded.
+    with_store_lock(store, |store| clear_taint_locked(store, path, cwd))
+}
+
+fn clear_taint_locked(store: &Path, path: &Path, cwd: Option<&Path>) -> std::io::Result<usize> {
     let key = normalize_key(path, cwd);
     let key_str = key.to_string_lossy().into_owned();
 

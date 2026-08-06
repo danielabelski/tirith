@@ -16,9 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::package_risk::{
-    ApiProvenance, MaintainerChangeHistory, MaintainerRef, OwnershipTransfer,
-};
+use crate::package_risk::{MaintainerChangeHistory, MaintainerRef, OwnershipTransfer};
 use crate::policy;
 use crate::threatdb::Ecosystem;
 
@@ -54,18 +52,6 @@ fn snapshot_path(eco: Ecosystem, name: &str) -> Option<PathBuf> {
         })
         .collect();
     Some(dir.join(format!("{safe_name}.jsonl")))
-}
-
-/// Record a snapshot from an already-fetched [`ApiProvenance`] (no network
-/// call). Best-effort; `true` on success.
-pub fn record_snapshot(eco: Ecosystem, name: &str, prov: &ApiProvenance) -> bool {
-    let row = SnapshotRow {
-        captured_at: unix_now(),
-        maintainers: maintainers_from_provenance(prov),
-        latest_version: prov.latest_version.clone(),
-        repository_url: prov.repository_url_for_check(),
-    };
-    write_row(eco, name, &row)
 }
 
 /// Best-effort write of one row, with rolling-cap pruning.
@@ -218,14 +204,6 @@ fn is_full_takeover_snapshots(older: &SnapshotRow, newer: &SnapshotRow) -> bool 
         .maintainers
         .iter()
         .any(|m| old_ids.contains(m.id.as_str()))
-}
-
-/// `ApiProvenance` carries no maintainer list today, so this returns empty
-/// (honest no-data). Maintainers are written explicitly via
-/// [`record_snapshot_with_maintainers`] from the `RegistryMetadata`-aware paths;
-/// this is a hook for when `ApiProvenance` grows a maintainers field.
-fn maintainers_from_provenance(_prov: &ApiProvenance) -> Vec<MaintainerRef> {
-    Vec::new()
 }
 
 /// Snapshot writer for when the caller already has the maintainer list (e.g.

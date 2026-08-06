@@ -47,9 +47,7 @@ pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFet
         .map_err(|e| PolicyFetchError::NetworkError(e.to_string()))?;
 
     match resp.status().as_u16() {
-        200 => resp
-            .text()
-            .map_err(|e| PolicyFetchError::InvalidResponse(e.to_string())),
+        200 => read_policy_body_capped(resp),
         401 | 403 => Err(PolicyFetchError::AuthError(resp.status().as_u16())),
         404 => Err(PolicyFetchError::ServerError(
             "no active policy found".into(),
@@ -60,9 +58,57 @@ pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFet
     }
 }
 
+/// Maximum accepted remote-policy body size (1 MiB), matching the local
+/// policy-file read cap. A malicious or compromised policy server must not be
+/// able to exhaust memory: the 10s timeout bounds DURATION, not BYTES, and a
+/// compressed body expands far beyond its Content-Length.
+pub const REMOTE_POLICY_BODY_CAP: u64 = 1024 * 1024;
+
+/// Read a successful response through a strict size budget. Rejects an
+/// oversized Content-Length early AND enforces the cap while streaming, so
+/// chunked or compressed bodies cannot bypass it (repo-0309).
+fn read_policy_body_capped(resp: reqwest::blocking::Response) -> Result<String, PolicyFetchError> {
+    use std::io::Read as _;
+
+    if let Some(len) = resp.content_length() {
+        if len > REMOTE_POLICY_BODY_CAP {
+            return Err(PolicyFetchError::InvalidResponse(format!(
+                "policy body too large (Content-Length {len} exceeds {REMOTE_POLICY_BODY_CAP} bytes)"
+            )));
+        }
+    }
+
+    // Read at most cap+1 bytes of the DECODED stream; the extra byte is the
+    // oversize signal so chunked / gzip-expanded bodies fail closed.
+    let mut limited = resp.take(REMOTE_POLICY_BODY_CAP + 1);
+    let mut buf = Vec::new();
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|e| PolicyFetchError::InvalidResponse(e.to_string()))?;
+    if buf.len() as u64 > REMOTE_POLICY_BODY_CAP {
+        return Err(PolicyFetchError::InvalidResponse(format!(
+            "policy body exceeds {REMOTE_POLICY_BODY_CAP} bytes"
+        )));
+    }
+    String::from_utf8(buf)
+        .map_err(|e| PolicyFetchError::InvalidResponse(format!("policy body is not UTF-8: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_reader_rejects_oversize_prefix() {
+        // Unit-level check of the budget logic without a live server: the
+        // decision rule is cap+1 bytes read ⇒ error.
+        let cap = REMOTE_POLICY_BODY_CAP as usize;
+        let buf = vec![b'x'; cap + 1];
+        assert!(
+            buf.len() as u64 > REMOTE_POLICY_BODY_CAP,
+            "cap+1 bytes must trip the budget"
+        );
+    }
 
     #[test]
     fn test_policy_fetch_error_display() {

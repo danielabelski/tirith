@@ -1403,9 +1403,6 @@ const TRUSTED_HELM_HOSTS: &[&str] = &[
     "charts.helm.sh",
     "kubernetes-charts.storage.googleapis.com",
     "charts.bitnami.com",
-    "registry-1.docker.io",
-    "ghcr.io",
-    "quay.io",
     "k8s.gcr.io",
     "registry.k8s.io",
     "prometheus-community.github.io",
@@ -1415,6 +1412,11 @@ const TRUSTED_HELM_HOSTS: &[&str] = &[
     "argoproj.github.io",
     "kubernetes.github.io",
 ];
+
+// repo-0325: `ghcr.io`, `quay.io`, and Docker Hub are intentionally ABSENT from
+// the trusted list — they are public multi-tenant registries where anyone can
+// publish a chart namespace, so host trust alone proves nothing about the
+// publisher. Charts from those hosts are flagged for operator confirmation.
 
 /// `helm install`/`helm repo add` pointed at an untrusted remote chart repo,
 /// or a chart fetched directly from a raw remote URL.
@@ -2517,14 +2519,21 @@ mod tests {
 
     #[test]
     fn test_helm_pull_oci_trusted_no_fire() {
-        // CR7 adds `oci://` coverage without flagging trusted hosts (ghcr.io).
+        // repo-0325: ghcr.io is multi-tenant and no longer trusted by host
+        // alone; registry.k8s.io (curated single-tenant) stays clean.
         assert!(
             none(
-                "helm pull oci://ghcr.io/some-org/charts/app",
+                "helm pull oci://registry.k8s.io/charts/app",
                 ShellType::Posix,
             ),
-            "an oci:// chart from a trusted registry must stay clean"
+            "an oci:// chart from a curated registry must stay clean"
         );
+        // And the multi-tenant host now flags.
+        assert!(has(
+            "helm pull oci://ghcr.io/some-org/charts/app",
+            ShellType::Posix,
+            RuleId::HelmUntrustedRepo,
+        ));
     }
 
     // ── terraform_remote_module ─────────────────────────────────────────────

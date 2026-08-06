@@ -446,7 +446,11 @@ pub fn export_csv(records: &[AuditRecord]) -> String {
         out.push_str(&format!(
             "{},{},{},{},{},{},{},{}\n",
             csv_escape(&r.timestamp),
-            csv_escape(&r.session_id),
+            // repo-0249: TIRITH_SESSION_ID is environment-controlled; a value
+            // starting with `=`/`+`/`-`/`@` becomes an active spreadsheet
+            // formula when the CSV is opened. Neutralize like the other
+            // caller-influenced cells.
+            csv_escape(&csv_neutralize_formula(&r.session_id)),
             csv_escape(&r.action),
             csv_escape(&csv_neutralize_formula(&rules)),
             csv_escape(&csv_neutralize_formula(&r.command_redacted)),
@@ -693,7 +697,16 @@ tr:nth-child(even) { background: #e9ecef; }
 
 /// Escape a markdown table cell (pipes and newlines break table formatting).
 fn escape_md_cell(s: &str) -> String {
-    s.replace('|', "\\|").replace('\n', " ").replace('\r', "")
+    // repo-0360: audit-log fields are attacker-influenced. Beyond the table
+    // delimiters, strip terminal controls/bidi and neutralize raw HTML so the
+    // report is inert in both a terminal and a Markdown renderer.
+    let stripped = crate::mcp::output_filter::sanitize_for_display(s);
+    stripped
+        .replace('|', "\\|")
+        .replace('<', "\\<")
+        .replace('>', "\\>")
+        .replace('\n', " ")
+        .replace('\r', "")
 }
 
 /// Escape HTML special characters.

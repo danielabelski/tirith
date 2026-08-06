@@ -1108,16 +1108,79 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// Decide whether `path` escapes the repo: with a `repo_root`, not under the
 /// canonicalized root; without one, any absolute path or climb above `cwd`.
+///
+/// The lexical answer is only trusted when NO existing component of the path
+/// is a symlink (repo-0409): for `repo/link/file` where `link` is a repository
+/// symlink to an outside directory, the filesystem follows the intermediate
+/// symlink while the lexical check still sees containment. In that case the
+/// canonical target (or, for a not-yet-existing tail, its canonical deepest
+/// existing ancestor with the tail re-appended) is compared against the
+/// canonical containment root; anything unresolvable is conservatively an
+/// escape.
 fn path_escapes_repo(path: &Path, cwd: &Path, repo_root: Option<&Path>) -> bool {
     let resolved = canonicalize_lexical(path, cwd);
-    match repo_root {
-        Some(root) => {
-            let root = canonicalize_lexical(root, cwd);
-            !resolved.starts_with(&root)
+    let lexical_root = repo_root.map(|r| canonicalize_lexical(r, cwd));
+    let lexical_escape = match &lexical_root {
+        Some(root) => !resolved.starts_with(root),
+        None => !resolved.starts_with(canonicalize_lexical(cwd, cwd)),
+    };
+    if lexical_escape {
+        return true;
+    }
+    if !has_symlink_component(&resolved) {
+        return false;
+    }
+    let root_basis = lexical_root.unwrap_or_else(|| canonicalize_lexical(cwd, cwd));
+    let canon_root = canonicalize_or_deepest(&root_basis);
+    let canon_target = canonicalize_or_deepest(&resolved);
+    match (canon_target, canon_root) {
+        (Some(target), Some(root)) => !target.starts_with(root),
+        // Cannot prove containment through a symlinked path: fail safe.
+        _ => true,
+    }
+}
+
+/// True when ANY existing component of `path` (an absolute, lexically
+/// normalized path) is a symlink — including the final component. Stops at the
+/// first missing prefix (nothing deeper can exist).
+fn has_symlink_component(path: &Path) -> bool {
+    let mut prefix = std::path::PathBuf::new();
+    for comp in path.components() {
+        prefix.push(comp.as_os_str());
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return true;
+                }
+            }
+            Err(_) => return false,
         }
-        None => {
-            let base = canonicalize_lexical(cwd, cwd);
-            !resolved.starts_with(&base)
+    }
+    false
+}
+
+/// Canonicalize `path` when it exists; otherwise canonicalize its deepest
+/// existing ancestor and re-append the (nonexistent) tail components, so a
+/// not-yet-created target beneath a symlinked directory still resolves to its
+/// real destination. `None` when no ancestor can be canonicalized.
+fn canonicalize_or_deepest(path: &Path) -> Option<std::path::PathBuf> {
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if cursor.as_os_str().is_empty() {
+            return None;
+        }
+        match std::fs::canonicalize(cursor) {
+            Ok(mut canon) => {
+                for tail in missing.iter().rev() {
+                    canon.push(tail);
+                }
+                return Some(canon);
+            }
+            Err(_) => {
+                missing.push(cursor.file_name()?);
+                cursor = cursor.parent()?;
+            }
         }
     }
 }
@@ -1422,6 +1485,57 @@ mod tests {
         assert_eq!(report.work_units_used, 4);
         assert_eq!(report.glob_expansion_count, 0);
         assert_eq!(report.file_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_symlink_component_counts_as_repo_escape() {
+        // repo-0409: `repo/link/file` where `link` is a repository symlink to
+        // an outside directory must be an escape — the filesystem follows the
+        // intermediate symlink even though the lexical path looks contained.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+
+        // Existing target through the symlink.
+        assert!(path_escapes_repo(
+            &repo.join("link").join("file"),
+            &repo,
+            Some(&repo),
+        ));
+        // Not-yet-existing target beneath the symlinked directory.
+        assert!(path_escapes_repo(
+            &repo.join("link").join("newfile"),
+            &repo,
+            Some(&repo),
+        ));
+        // A genuinely contained path stays contained.
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        assert!(!path_escapes_repo(
+            &repo.join("sub").join("file"),
+            &repo,
+            Some(&repo),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_repo_symlink_pointing_inside_repo_is_not_an_escape() {
+        // A symlink whose target remains inside the repo is not an escape —
+        // canonical resolution proves containment instead of flagging every
+        // symlink indiscriminately.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(repo.join("real")).unwrap();
+        std::os::unix::fs::symlink(repo.join("real"), repo.join("alias")).unwrap();
+        assert!(!path_escapes_repo(
+            &repo.join("alias").join("file"),
+            &repo,
+            Some(&repo),
+        ));
     }
 
     #[test]

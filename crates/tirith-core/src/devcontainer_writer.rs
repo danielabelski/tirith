@@ -12,12 +12,38 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::util::{ContainedAtomicFile, OpenRegularError};
+
 /// Human-readable marker retained for CLI output compatibility.
 pub const TIRITH_HOOK_MARKER: &str = "tirith init";
 /// Reserved lifecycle-command key owned by Tirith.
 pub const TIRITH_HOOK_KEY: &str = "tirith-init";
 
 const TIRITH_HOOK_ARGV: [&str; 4] = ["tirith", "init", "--shell", "auto"];
+
+/// devcontainer.json and .gitignore are small configuration files; cap reads
+/// so a hostile or broken file cannot force an unbounded allocation.
+const CONFIG_READ_CAP: u64 = 1024 * 1024;
+
+/// True only when `path` exists as a REGULAR file reached without following a
+/// final symlink, and every component of its parent directory is likewise not
+/// a symlink (repo-0271). `is_file()` follows links and would accept a
+/// repository-planted redirect outside the project.
+fn regular_file_no_follow(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            matches!(
+                std::fs::symlink_metadata(parent),
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink()
+            )
+        }
+        _ => true,
+    }
+}
 
 /// Outcome of an inject / setup operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,13 +62,17 @@ pub enum InjectOutcome {
 
 /// Find devcontainer.json under `cwd`: nested `.devcontainer/` first, then the
 /// flat `.devcontainer.json` Codespaces also accepts. `None` if neither exists.
+///
+/// Both the file AND its parent must be reached without following a
+/// repository-controlled symlink (repo-0271); a symlinked candidate is skipped
+/// so the writer below never resolves a redirect outside the project.
 pub fn find_devcontainer_json(cwd: &Path) -> Option<PathBuf> {
     let nested = cwd.join(".devcontainer").join("devcontainer.json");
-    if nested.is_file() {
+    if regular_file_no_follow(&nested) {
         return Some(nested);
     }
     let flat = cwd.join(".devcontainer.json");
-    if flat.is_file() {
+    if regular_file_no_follow(&flat) {
         return Some(flat);
     }
     None
@@ -57,13 +87,37 @@ pub fn default_devcontainer_json(cwd: &Path) -> PathBuf {
 /// Add the Tirith lifecycle command plus `TIRITH_DEVCONTAINER=1` to an existing
 /// devcontainer.json, or (with `create_if_missing`) write a minimal one.
 ///
+/// `root` is the selected repository root: every read and write is confined
+/// beneath it through a retained, no-follow parent capability, refuses a
+/// symlinked destination, and publishes atomically via a same-directory
+/// temporary file (repo-0271). A repository-planted symlink at
+/// `.devcontainer/`, `devcontainer.json`, or `.devcontainer.json` is rejected
+/// instead of rewriting an external target.
+///
 /// Existing string and argv lifecycle forms become a multi-command object so
 /// an untrusted setup command cannot prevent Tirith from being launched. A
 /// re-run is a no-op only when the reserved entry contains the exact argv.
-pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome {
-    let content_str = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+pub fn inject_tirith_hook(path: &Path, root: &Path, create_if_missing: bool) -> InjectOutcome {
+    let prepared = match ContainedAtomicFile::prepare(root, path, create_if_missing) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            return InjectOutcome::ParseError(
+                path.to_path_buf(),
+                format!("refusing unsafe devcontainer destination: {e}"),
+            )
+        }
+    };
+    let content_str = match prepared.read_capped(CONFIG_READ_CAP) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                return InjectOutcome::ParseError(
+                    path.to_path_buf(),
+                    "devcontainer.json is not UTF-8".to_string(),
+                )
+            }
+        },
+        Err(OpenRegularError::NotFound) => {
             if !create_if_missing {
                 return InjectOutcome::NotFound(path.to_path_buf());
             }
@@ -75,13 +129,16 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
                 },
                 "containerEnv": { "TIRITH_DEVCONTAINER": "1" },
             });
-            match write_pretty(path, &value) {
+            match write_pretty(&prepared, &value) {
                 Ok(()) => return InjectOutcome::Created(path.to_path_buf()),
                 Err(e) => return InjectOutcome::ParseError(path.to_path_buf(), e),
             }
         }
         Err(e) => {
-            return InjectOutcome::ParseError(path.to_path_buf(), format!("read error: {e}"));
+            return InjectOutcome::ParseError(
+                path.to_path_buf(),
+                format!("refusing unsafe devcontainer source: {e:?}"),
+            );
         }
     };
 
@@ -102,7 +159,7 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
     }
     upsert_container_env_flag(&mut value);
 
-    match write_pretty(path, &value) {
+    match write_pretty(&prepared, &value) {
         Ok(()) => InjectOutcome::Updated(path.to_path_buf()),
         Err(e) => InjectOutcome::ParseError(path.to_path_buf(), e),
     }
@@ -110,9 +167,30 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
 
 /// Idempotently ensure `<cwd>/.gitignore` has a `.tirith/` entry so
 /// per-codespace state never leaks into the repo.
+///
+/// The existing file is read through a no-follow, size-capped contained
+/// reader and republished atomically beneath `cwd` (repo-0271). A symlinked
+/// `.gitignore` is an error, and an UNREADABLE file is no longer silently
+/// treated as empty (which would have truncated a non-UTF-8 symlink target
+/// down to just the Tirith stanza).
 pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
     let path = cwd.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let prepared = ContainedAtomicFile::prepare(cwd, &path, false)?;
+    let existing = match prepared.read_capped(CONFIG_READ_CAP) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                ".gitignore is not UTF-8; refusing to rewrite it",
+            )
+        })?,
+        Err(OpenRegularError::NotFound) => String::new(),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to read unsafe .gitignore: {e:?}"),
+            ))
+        }
+    };
     for line in existing.lines() {
         let t = line.trim();
         if t == ".tirith" || t == ".tirith/" || t == "/.tirith" || t == "/.tirith/" {
@@ -125,7 +203,7 @@ pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
     }
     new_content.push_str("# tirith state directory (devcontainer / codespaces)\n");
     new_content.push_str(".tirith/\n");
-    std::fs::write(&path, new_content)?;
+    prepared.write_atomic(new_content.as_bytes(), true)?;
     Ok(true)
 }
 
@@ -210,17 +288,14 @@ fn upsert_container_env_flag(value: &mut Value) {
     }
 }
 
-fn write_pretty(path: &Path, value: &Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(format!("create dir {}: {e}", parent.display()));
-        }
-    }
+fn write_pretty(prepared: &ContainedAtomicFile, value: &Value) -> Result<(), String> {
     let pretty = serde_json::to_string_pretty(value)
         .map_err(|e| format!("serialize devcontainer.json: {e}"))?;
     let mut content = pretty;
     content.push('\n');
-    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
+    prepared
+        .write_atomic(content.as_bytes(), true)
+        .map_err(|e| format!("atomic write: {e}"))
 }
 
 /// Strip JSONC line/block comments and trailing commas (before `]`/`}`),
@@ -371,7 +446,7 @@ mod tests {
     fn inject_creates_minimal_file_when_missing_and_flagged() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(".devcontainer/devcontainer.json");
-        let outcome = inject_tirith_hook(&path, true);
+        let outcome = inject_tirith_hook(&path, dir.path(), true);
         assert!(matches!(outcome, InjectOutcome::Created(_)));
         let value = read_devcontainer(&path);
         assert_exact_tirith_lifecycle_entry(&value);
@@ -382,9 +457,9 @@ mod tests {
     fn inject_idempotent_second_run_is_no_op() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(".devcontainer/devcontainer.json");
-        let first = inject_tirith_hook(&path, true);
+        let first = inject_tirith_hook(&path, dir.path(), true);
         assert!(matches!(first, InjectOutcome::Created(_)));
-        let second = inject_tirith_hook(&path, true);
+        let second = inject_tirith_hook(&path, dir.path(), true);
         assert!(
             matches!(second, InjectOutcome::AlreadyInjected(_)),
             "expected AlreadyInjected, got {second:?}"
@@ -404,7 +479,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let outcome = inject_tirith_hook(&path, false);
+        let outcome = inject_tirith_hook(&path, dir.path(), false);
         assert!(matches!(outcome, InjectOutcome::Updated(_)));
         let value = read_devcontainer(&path);
         assert_eq!(value["postCreateCommand"]["existing"], "npm ci");
@@ -420,7 +495,7 @@ mod tests {
             r#"{ "name": "demo", "postCreateCommand": ["npm", "ci"] }"#,
         )
         .unwrap();
-        let outcome = inject_tirith_hook(&path, false);
+        let outcome = inject_tirith_hook(&path, dir.path(), false);
         assert!(matches!(outcome, InjectOutcome::Updated(_)));
         let value = read_devcontainer(&path);
         assert_eq!(value["postCreateCommand"]["existing"], json!(["npm", "ci"]));
@@ -457,7 +532,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = inject_tirith_hook(&path, false);
+        let outcome = inject_tirith_hook(&path, dir.path(), false);
         assert!(matches!(outcome, InjectOutcome::Updated(_)));
         let value = read_devcontainer(&path);
         assert_exact_tirith_lifecycle_entry(&value);
@@ -474,7 +549,7 @@ mod tests {
         std::fs::write(&path, r#"{ "postCreateCommand": "exit 1" }"#).unwrap();
 
         assert!(matches!(
-            inject_tirith_hook(&path, false),
+            inject_tirith_hook(&path, dir.path(), false),
             InjectOutcome::Updated(_)
         ));
         let value = read_devcontainer(&path);
@@ -493,7 +568,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            inject_tirith_hook(&path, false),
+            inject_tirith_hook(&path, dir.path(), false),
             InjectOutcome::Updated(_)
         ));
         let value = read_devcontainer(&path);
@@ -520,7 +595,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            inject_tirith_hook(&path, false),
+            inject_tirith_hook(&path, dir.path(), false),
             InjectOutcome::Updated(_)
         ));
         let value = read_devcontainer(&path);
@@ -536,7 +611,7 @@ mod tests {
     fn inject_returns_not_found_when_create_disabled() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("missing.json");
-        let outcome = inject_tirith_hook(&path, false);
+        let outcome = inject_tirith_hook(&path, dir.path(), false);
         assert!(matches!(outcome, InjectOutcome::NotFound(_)));
     }
 
@@ -567,5 +642,72 @@ mod tests {
         ensure_gitignore_entry(dir.path()).unwrap();
         let added_again = ensure_gitignore_entry(dir.path()).unwrap();
         assert!(!added_again, "second call must report nothing was added");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inject_refuses_symlinked_devcontainer_json() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let external = outside.path().join("external.json");
+        std::fs::write(&external, r#"{ "name": "victim" }"#).unwrap();
+        let link = dir.path().join(".devcontainer.json");
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+
+        // Discovery must skip the planted link...
+        assert!(find_devcontainer_json(dir.path()).is_none());
+        // ...and a direct inject must refuse rather than rewrite the target.
+        let outcome = inject_tirith_hook(&link, dir.path(), false);
+        assert!(
+            matches!(outcome, InjectOutcome::ParseError(_, _)),
+            "expected refusal, got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&external).unwrap(),
+            r#"{ "name": "victim" }"#,
+            "the external symlink target must remain byte-identical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inject_refuses_symlinked_devcontainer_parent() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("devcontainer.json"),
+            r#"{ "name": "victim" }"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".devcontainer")).unwrap();
+
+        assert!(find_devcontainer_json(dir.path()).is_none());
+        let nested = dir.path().join(".devcontainer/devcontainer.json");
+        let outcome = inject_tirith_hook(&nested, dir.path(), true);
+        assert!(
+            matches!(outcome, InjectOutcome::ParseError(_, _)),
+            "expected refusal through a symlinked parent, got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("devcontainer.json")).unwrap(),
+            r#"{ "name": "victim" }"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitignore_entry_refuses_symlink_and_unreadable_content() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let external = outside.path().join("notes.txt");
+        std::fs::write(&external, "do not append here\n").unwrap();
+        std::os::unix::fs::symlink(&external, dir.path().join(".gitignore")).unwrap();
+
+        assert!(ensure_gitignore_entry(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&external).unwrap(),
+            "do not append here\n",
+            "the symlink target must not receive the Tirith stanza"
+        );
     }
 }

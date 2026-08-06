@@ -244,6 +244,38 @@ fn contrast_ratio(c1: (f64, f64, f64), c2: (f64, f64, f64)) -> f64 {
     (lighter + 0.05) / (darker + 0.05)
 }
 
+/// repo-0331: the benign-hidden exemption is only valid for the genuine a11y
+/// shapes — an `<svg>` symbol def, or an inline `<span>`/`<i>` whose CLASS
+/// TOKEN (not substring) is `sr-only`/`icon`. A hidden `<div>` with
+/// `class='icon'` carrying agent instructions no longer slips through.
+fn is_benign_hidden_element(tag_lower: &str) -> bool {
+    if tag_lower.starts_with("<svg") {
+        return true;
+    }
+    let is_inline = tag_lower.starts_with("<span")
+        || tag_lower.starts_with("<i ")
+        || tag_lower.starts_with("<i>");
+    if !is_inline {
+        return false;
+    }
+    // Extract the class attribute value and compare whole tokens.
+    let Some(class_start) = tag_lower.find("class") else {
+        return false;
+    };
+    let after = &tag_lower[class_start + 5..];
+    let after = after.trim_start();
+    let after = after.strip_prefix('=').unwrap_or(after).trim_start();
+    let quote = after.chars().next().unwrap_or('"');
+    if quote != '"' && quote != '\'' {
+        return false;
+    }
+    let inner = &after[1..];
+    let value_end = inner.find(quote).unwrap_or(inner.len());
+    inner[..value_end]
+        .split_whitespace()
+        .any(|token| token == "sr-only" || token == "icon")
+}
+
 fn check_html_hidden_attributes(input: &str, findings: &mut Vec<Finding>) {
     use once_cell::sync::Lazy;
     use regex::Regex;
@@ -263,7 +295,10 @@ fn check_html_hidden_attributes(input: &str, findings: &mut Vec<Finding>) {
         .iter()
         .filter(|m| {
             let text = m.as_str().to_lowercase();
-            !(text.starts_with("<svg") || text.contains("sr-only") || text.contains("icon"))
+            // repo-0331: the substring exemptions let `class='icon'` whitewash
+            // an arbitrary hidden <div>. Only inline a11y elements with the
+            // class TOKEN qualify now.
+            !is_benign_hidden_element(&text)
         })
         .collect();
 
@@ -592,8 +627,7 @@ const PDF_NESTING_DEPTH_CAP: usize = 256;
 /// are skipped to the end of the line, and bytes between a lexical `stream` /
 /// `endstream` pair are skipped completely. A hex string `< ... >` (single `<`)
 /// needs no special case: its body is only hex digits and whitespace, so scanning
-/// through it counts nothing. Compressed object streams remain the parser's job;
-/// this preflight only prevents unsafe raw object nesting from reaching lopdf.
+/// through it counts nothing.
 fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
     let mut depth: usize = 0;
     let mut max_depth: usize = 0;
@@ -688,6 +722,75 @@ fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
     }
 
     max_depth
+}
+
+/// repo-0332: maximum decompressed bytes examined per compressed object
+/// stream, and cap on streams inspected. Bounds the preflight's own work.
+const PDF_OBJSTM_MAX_DECOMPRESSED: usize = 4 * 1024 * 1024;
+const PDF_OBJSTM_MAX_STREAMS: usize = 64;
+
+/// Maximum object nesting hidden inside COMPRESSED object streams
+/// (`/ObjStm`). The raw-byte preflight cannot see through flate compression,
+/// so every object stream is decompressed (bounded) and scanned with the same
+/// lexical nesting counter before lopdf ever sees the document. Returns the
+/// maximum hidden depth found, or `None` when a stream cannot be inspected
+/// (truncated, over-cap, or undecodable) — callers must treat `None` as
+/// fail-closed.
+fn pdf_objstm_max_hidden_nesting(raw: &[u8]) -> Option<usize> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read as _;
+
+    let mut max_depth = 0usize;
+    let mut inspected = 0usize;
+    let mut cursor = 0usize;
+    while let Some(rel) = raw.get(cursor..)?.windows(7).position(|w| w == b"/ObjStm") {
+        let marker = cursor + rel;
+        // The stream keyword follows the marker's dictionary.
+        let search_from = marker + 7;
+        let window_end = raw.len().min(search_from + 4096);
+        let Some(stream_rel) = raw[search_from..window_end]
+            .windows(6)
+            .position(|w| w == b"stream")
+        else {
+            return None; // no stream body within reach: cannot prove safe
+        };
+        let stream_kw = search_from + stream_rel;
+        // Skip the EOL after `stream`.
+        let mut data_start = stream_kw + 6;
+        if raw.get(data_start) == Some(&b'\r') {
+            data_start += 1;
+        }
+        if raw.get(data_start) == Some(&b'\n') {
+            data_start += 1;
+        }
+        let Some(end_rel) = raw
+            .get(data_start..)?
+            .windows(9)
+            .position(|w| w == b"endstream")
+        else {
+            return None; // unterminated stream: cannot prove nesting is safe
+        };
+        let data_end = data_start + end_rel;
+        inspected += 1;
+        if inspected > PDF_OBJSTM_MAX_STREAMS {
+            return None; // too many streams to verify: fail closed
+        }
+        let decoder = ZlibDecoder::new(&raw[data_start..data_end]);
+        let mut decompressed = Vec::new();
+        if decoder
+            .take((PDF_OBJSTM_MAX_DECOMPRESSED + 1) as u64)
+            .read_to_end(&mut decompressed)
+            .is_err()
+        {
+            return None; // undecodable: cannot prove nesting is safe
+        }
+        if decompressed.len() > PDF_OBJSTM_MAX_DECOMPRESSED {
+            return None;
+        }
+        max_depth = max_depth.max(pdf_max_nesting_depth(&decompressed));
+        cursor = data_end + 9;
+    }
+    Some(max_depth)
 }
 
 fn pdf_token_boundary(byte: u8) -> bool {
@@ -1676,6 +1779,31 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
             "PDF object nesting exceeds the safe depth limit of {PDF_NESTING_DEPTH_CAP}"
         )]));
         return findings;
+    }
+
+    // repo-0332: compressed object streams hide nesting from the raw scan, so
+    // decompress + rescan them. An uninspectable stream is fail-closed: the
+    // document never reaches the vulnerable parser.
+    match pdf_objstm_max_hidden_nesting(raw_bytes) {
+        Some(hidden) if hidden <= PDF_NESTING_DEPTH_CAP => {}
+        Some(_) => {
+            eprintln!(
+                "tirith: scan: PDF rejected: compressed object stream nesting exceeds safe limit"
+            );
+            findings.push(pdf_analysis_incomplete(&[format!(
+                "PDF compressed object stream nesting exceeds the safe depth limit of {PDF_NESTING_DEPTH_CAP}"
+            )]));
+            return findings;
+        }
+        None => {
+            eprintln!(
+                "tirith: scan: PDF rejected: a compressed object stream could not be safety-inspected"
+            );
+            findings.push(pdf_analysis_incomplete(&[
+                "PDF contains a compressed object stream that could not be inspected for unsafe nesting (undecodable, truncated, or over the inspection cap)".to_string(),
+            ]));
+            return findings;
+        }
     }
 
     let doc = match lopdf::Document::load_mem(raw_bytes) {

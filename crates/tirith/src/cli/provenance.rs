@@ -463,6 +463,7 @@ mod tests {
                 detail: "member\u{1b}[2J\nFORGED\u{202e}".to_string(),
             }],
             coverage_gaps: Vec::new(),
+            new_inspection_findings: Vec::new(),
         };
         let verdict = diff.evaluate(&Policy::default());
         let mut out = Vec::new();
@@ -499,6 +500,7 @@ mod tests {
                 kind: tirith_core::scan::CoverageGapKind::EntryCountCapped,
                 sha256: None,
             }],
+            new_inspection_findings: Vec::new(),
         };
         let verdict = diff.evaluate(&Policy::default());
         assert_eq!(verdict.action, tirith_core::verdict::Action::Block);

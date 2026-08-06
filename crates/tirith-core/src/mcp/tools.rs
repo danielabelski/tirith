@@ -496,14 +496,32 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
 
     let structured = directory_scan_structured(&result);
 
-    let text = format_dir_scan_text(&result);
+    // repo-0298: coverage gaps must honor the operator's completeness policy —
+    // under `require_complete` (or a per-gap Fail action) an incompletely
+    // scanned directory is an ERROR result, never a clean "no issues found".
+    let completeness_violation = !result.coverage_gaps.is_empty()
+        && (policy.scan.require_complete
+            || result.coverage_gaps.iter().any(|gap| {
+                matches!(
+                    policy.scan.action_for_gap_kind(gap.kind),
+                    crate::policy::GapAction::Fail
+                )
+            }));
+    let mut text = format_dir_scan_text(&result);
+    if completeness_violation {
+        text = format!(
+            "ANALYSIS INCOMPLETE (policy `scan.require_complete` / per-gap Fail): {}\n{}",
+            result.coverage_gaps.len(),
+            text
+        );
+    }
 
     ToolCallResult {
         content: vec![ContentItem {
             content_type: "text".into(),
             text,
         }],
-        is_error: false,
+        is_error: completeness_violation,
         structured_content: Some(structured),
     }
 }
@@ -642,7 +660,18 @@ fn build_cloaking_response(
             differing.join(", ")
         )
     } else {
-        format!("No cloaking detected for {}", result.url)
+        // repo-0299: the comparison only ran when every agent returned a
+        // non-empty body at the baseline status. If any agent's response was
+        // empty/blocked, "no cloaking" was never established — say so.
+        let all_comparable = result.agent_responses.iter().all(|r| r.content_length > 0);
+        if all_comparable {
+            format!("No cloaking detected for {}", result.url)
+        } else {
+            format!(
+                "Cloaking check INCONCLUSIVE for {}: at least one agent received an empty/blocked response, so no clean baseline comparison exists",
+                result.url
+            )
+        }
     };
 
     // DLP-redact diff text before serialization.

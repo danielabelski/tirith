@@ -162,7 +162,7 @@ fn scan_ssh_dir(ssh_dir: &Path) -> Vec<HygieneFinding> {
                     expected: "0600".to_string(),
                     actual: format_mode(mode),
                     fix_suggestion: format!("chmod 0600 {}", path.display()),
-                    fix_kind: FixKind::Chmod { mode: 0o600 },
+                    fix_kind: chmod_fix_kind(&path),
                 });
             }
         }
@@ -247,7 +247,7 @@ fn scan_aws_dir(aws_dir: &Path) -> Vec<HygieneFinding> {
                     expected: "0600".to_string(),
                     actual: format_mode(mode),
                     fix_suggestion: format!("chmod 0600 {}", path.display()),
-                    fix_kind: FixKind::Chmod { mode: 0o600 },
+                    fix_kind: chmod_fix_kind(&path),
                 });
             }
         }
@@ -272,7 +272,7 @@ fn scan_kubeconfig(kube_config: &Path) -> Vec<HygieneFinding> {
                 expected: "0600".to_string(),
                 actual: format_mode(mode),
                 fix_suggestion: format!("chmod 0600 {}", kube_config.display()),
-                fix_kind: FixKind::Chmod { mode: 0o600 },
+                fix_kind: chmod_fix_kind(kube_config),
             });
         }
     }
@@ -524,6 +524,9 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
             // descent decision (a symlinked dir is NOT descended — loop/escape
             // prevention) but follow the link via `path.is_file()` for leaf
             // candidates, else a world-readable `.env` behind a symlink hides.
+            // Detection still follows the leaf link, but `chmod_fix_kind`
+            // downgrades a symlinked candidate to a Manual fix so the CLI
+            // never auto-chmods through it (repo-0284).
             let file_type = match entry.file_type() {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -577,7 +580,7 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
                             expected: "0600 (not world-readable)".to_string(),
                             actual: format_mode(mode),
                             fix_suggestion: format!("chmod 0600 {}", path.display()),
-                            fix_kind: FixKind::Chmod { mode: 0o600 },
+                            fix_kind: chmod_fix_kind(&path),
                         });
                     }
                 }
@@ -660,6 +663,20 @@ fn mode_is_group_or_other_accessible(mode: u32) -> bool {
 /// `true` when "other" has the read bit (`mode & 0o004`).
 fn mode_is_world_readable(mode: u32) -> bool {
     mode & 0o004 != 0
+}
+
+/// Fix kind for a permission finding (repo-0284): an automatic chmod is only
+/// offered for a NON-symlinked path. A symlinked file keeps its finding — a
+/// world-readable secret behind a link is still exposed — but drops to
+/// Manual so `hygiene fix` never generates an automatic fix that would chmod
+/// an attacker-selected target outside the scanned tree. The CLI fixer
+/// independently re-verifies with a no-follow open, an fstat regular-file
+/// check, and a descriptor-based fchmod, so a scan-to-fix swap is closed too.
+fn chmod_fix_kind(path: &Path) -> FixKind {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_symlink() => FixKind::Chmod { mode: 0o600 },
+        _ => FixKind::Manual,
+    }
 }
 
 /// Permission bits of `mode` as a 4-digit octal string (e.g. `"0644"`).

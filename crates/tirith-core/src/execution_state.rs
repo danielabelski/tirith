@@ -4917,12 +4917,19 @@ mod tests {
 
     #[test]
     fn exact_policy_identity_distinguishes_same_count_redacted_projections() {
+        // Two policies differing ONLY in a secret (redacted out of the
+        // projection) share one projection hash but must have distinct exact
+        // execution identities.
+        let mut left_intel = crate::policy::ThreatIntelConfig::default();
+        left_intel.abusech_auth_key = Some("key-alpha".to_string());
         let left = Policy {
-            dlp_custom_patterns: vec!["TENANT-ALPHA-[0-9]+".to_string()],
+            threat_intel: left_intel,
             ..Policy::default()
         };
+        let mut right_intel = crate::policy::ThreatIntelConfig::default();
+        right_intel.abusech_auth_key = Some("key-beta".to_string());
         let right = Policy {
-            dlp_custom_patterns: vec!["TENANT-BETA-[A-Z]+".to_string()],
+            threat_intel: right_intel,
             ..Policy::default()
         };
         assert_eq!(

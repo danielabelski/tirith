@@ -197,6 +197,8 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
     }
 
     let baseline_normalized = normalize_html(baseline_body);
+    let baseline_scripts = normalize_active_content(baseline_body);
+    let baseline_status = responses[baseline_idx].1;
 
     let mut diff_pairs = Vec::new();
     let mut cloaking_detected = false;
@@ -210,24 +212,56 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
         })
         .collect();
 
-    for (i, (name, _status, body)) in responses.iter().enumerate() {
+    for (i, (name, status, body)) in responses.iter().enumerate() {
         if i == baseline_idx {
             continue;
         }
+        // repo-0321: an agent-specific STATUS difference is itself a cloaking
+        // signal (identical text at a different status code).
+        if *status != baseline_status {
+            cloaking_detected = true;
+            diff_pairs.push(DiffPair {
+                agent_a: "chrome".to_string(),
+                agent_b: name.clone(),
+                diff_chars: 0,
+                diff_text: Some(format!(
+                    "status differs: baseline {baseline_status} vs agent {status}"
+                )),
+            });
+            continue;
+        }
+        // repo-0321: an EMPTY response to a selected agent (while the baseline
+        // loaded) is cloaking, not a skip.
         if body.is_empty() {
+            cloaking_detected = true;
+            diff_pairs.push(DiffPair {
+                agent_a: "chrome".to_string(),
+                agent_b: name.clone(),
+                diff_chars: baseline_body.len(),
+                diff_text: Some("agent received an empty body; baseline did not".to_string()),
+            });
             continue;
         }
 
         let normalized = normalize_html(body);
         let diff_chars = word_diff_size(&baseline_normalized, &normalized);
+        // repo-0321: visible-text normalization strips <script>/<style>; an
+        // agent-specific payload hiding only in active content must still
+        // count, so compare the active-content channel too.
+        let scripts = normalize_active_content(body);
+        let script_diff = word_diff_size(&baseline_scripts, &scripts);
 
-        if diff_chars > 10 {
+        if diff_chars > 10 || script_diff > 10 {
             cloaking_detected = true;
-            let diff_detail = generate_diff_text(&baseline_normalized, &normalized);
+            let diff_detail = if diff_chars > 10 {
+                generate_diff_text(&baseline_normalized, &normalized)
+            } else {
+                "agent-specific <script>/<style> content".to_string()
+            };
             diff_pairs.push(DiffPair {
                 agent_a: "chrome".to_string(),
                 agent_b: name.clone(),
-                diff_chars,
+                diff_chars: diff_chars.max(script_diff),
                 diff_text: Some(diff_detail),
             });
         }
@@ -341,6 +375,32 @@ fn fetch_with_ua(
 /// Normalize HTML for comparison — strip content that varies between requests
 /// (scripts, styles, CSRF tokens, nonces).
 #[cfg(unix)]
+/// repo-0321: normalize ONLY the active-content channel (`<script>`/`<style>`
+/// bodies) so agent-specific JavaScript/CSS differences are comparable; the
+/// visible-text normalization deliberately strips these.
+fn normalize_active_content(input: &str) -> String {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+
+    static SCRIPT_BODY: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<script[^>]*>(.*?)</script>").unwrap());
+    static STYLE_BODY: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<style[^>]*>(.*?)</style>").unwrap());
+    static NONCE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\bnonce="[^"]*""#).unwrap());
+    static WHITESPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+
+    let mut parts: Vec<String> = Vec::new();
+    for cap in SCRIPT_BODY.captures_iter(input) {
+        parts.push(cap[1].to_string());
+    }
+    for cap in STYLE_BODY.captures_iter(input) {
+        parts.push(cap[1].to_string());
+    }
+    let joined = parts.join(" ");
+    let s = NONCE.replace_all(&joined, "");
+    WHITESPACE.replace_all(&s, " ").trim().to_string()
+}
+
 fn normalize_html(input: &str) -> String {
     use once_cell::sync::Lazy;
     use regex::Regex;

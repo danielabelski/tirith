@@ -135,7 +135,7 @@ pub struct ReleaseAnomaly {
 /// anomaly and every incomplete-analysis gap. A result is clean only when both
 /// collections are empty; no visible anomaly does not make an incomplete
 /// comparison trustworthy.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReleaseDiff {
     /// The flagged deltas, sorted by kind then detail for determinism.
     pub anomalies: Vec<ReleaseAnomaly>,
@@ -144,6 +144,13 @@ pub struct ReleaseDiff {
     /// A diff carrying any gap is never eligible for an Allow verdict.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_gaps: Vec<CoverageGap>,
+    /// The NEW artifact's direct per-member findings (native import-execution
+    /// chains and similar member-decided signals). They are not deltas, so they
+    /// do not fit [`Self::anomalies`], but discarding them would let a wheel
+    /// with a conclusive native chain look clean on this review surface just
+    /// because its overall shape resembles the old release (repo-0245).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_inspection_findings: Vec<Finding>,
 }
 
 impl ReleaseDiff {
@@ -216,6 +223,7 @@ impl ReleaseDiff {
     pub fn evaluate(&self, policy: &Policy) -> Verdict {
         // Tier-3 by construction (no tier-1 command gate); timings unmeasured here.
         let mut findings = self.findings();
+        findings.extend(self.new_inspection_findings.iter().cloned());
         findings.extend(crate::artifact::artifact_analysis_incomplete_findings(
             &self.coverage_gaps,
             Some(policy),
@@ -297,10 +305,9 @@ pub fn diff_artifact_files(old: &Path, new: &Path) -> Result<ReleaseDiff, Releas
             new_inspected.violation_details,
         ));
     }
-    Ok(diff_inspections(
-        &old_inspected.inspection,
-        &new_inspected.inspection,
-    ))
+    let mut diff = diff_inspections(&old_inspected.inspection, &new_inspected.inspection);
+    diff.new_inspection_findings = new_inspected.native_findings;
+    Ok(diff)
 }
 
 /// The pure differential seam: compare two already-computed inspections and flag
@@ -394,6 +401,9 @@ pub fn diff_inspections(old: &ArtifactInspection, new: &ArtifactInspection) -> R
     ReleaseDiff {
         anomalies,
         coverage_gaps,
+        // The pure seam has no direct-inspection findings; `diff_artifact_files`
+        // attaches them when it has the full `InspectedArtifact`.
+        new_inspection_findings: Vec::new(),
     }
 }
 
@@ -1057,7 +1067,14 @@ mod tests {
         let diff = diff_inspections(&old, &new);
         let json = serde_json::to_string(&diff).unwrap();
         let back: ReleaseDiff = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, diff);
+        assert_eq!(back.anomalies, diff.anomalies);
+        assert_eq!(back.coverage_gaps, diff.coverage_gaps);
+        assert_eq!(
+            back.new_inspection_findings.len(),
+            diff.new_inspection_findings.len()
+        );
+        // A re-serialization byte match also proves the round-trip is stable.
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
     /// A strict policy that upgrades `artifact_release_anomaly` to block turns the

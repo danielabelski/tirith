@@ -66,6 +66,10 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 csv = { workspace = true }
 owo-colors = { workspace = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# repo-0332: flate-decode PDF compressed object streams for the nesting
+# preflight (lopdf 0.34 cannot be trusted to parse them safely). Same version
+# already in the lockfile via `zip`.
+flate2 = "1"
 # B7 native binary triage. A vetted, pure-Rust, READ-ONLY object-format parser
 # (gimli-rs/object), used to read ELF / fat (universal) Mach-O / PE+TLS section,
 # symbol, import and init tables from a bounded in-memory buffer. Features are

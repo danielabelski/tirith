@@ -453,6 +453,9 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::OutputTitleManipulation
         | RuleId::OutputClearScreen
         | RuleId::OutputTruncatedEscapeSequence
+        // repo-0279 — analyzer hit/findings overflow means security evidence was
+        // dropped; fail closed (keep the Block), never downgrade to a redacted Warn.
+        | RuleId::OutputAnalysisOverflow
         // C7 — an output-side EXFIL finding must NEVER be downgraded to a redacted
         // Warn; it keeps the whole-message Block (it is not an injection seed).
         | RuleId::OutputDataExfiltration

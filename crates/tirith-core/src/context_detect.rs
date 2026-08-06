@@ -147,13 +147,63 @@ impl DetectionResult {
 /// Process-global cache (`OnceLock`-deferred init, fine-grained inner `Mutex`).
 static CACHE: OnceLock<Mutex<CacheEntry>> = OnceLock::new();
 type ProviderDetection = Result<ProviderContext, ContextDetectFailure>;
-type ProviderCache = BTreeMap<Provider, (Instant, ProviderDetection)>;
+type ProviderCache = BTreeMap<Provider, (Instant, ContextFingerprint, ProviderDetection)>;
 static PROVIDER_CACHE: OnceLock<Mutex<ProviderCache>> = OnceLock::new();
 
 #[derive(Default)]
 struct CacheEntry {
     captured_at: Option<Instant>,
     result: DetectionResult,
+    fingerprint: ContextFingerprint,
+}
+
+/// repo-0266: a 5-second blind TTL let a long-lived process evaluate a
+/// destructive command against a context that had already changed underneath
+/// it (`kubectl config use-context prod` seconds after a dev-context call).
+/// The cache is only honored while the fingerprint of the provider inputs
+/// (relevant env vars + config-file mtimes) is unchanged; any change forces a
+/// fresh detection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ContextFingerprint {
+    kubeconfig_env: Option<String>,
+    kubeconfig_mtime: Option<std::time::SystemTime>,
+    kube_default_mtime: Option<std::time::SystemTime>,
+    aws_profile: Option<String>,
+    aws_default_profile: Option<String>,
+    aws_config_mtime: Option<std::time::SystemTime>,
+    aws_credentials_mtime: Option<std::time::SystemTime>,
+    azure_profile: Option<String>,
+    gcloud_config: Option<String>,
+}
+
+fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn current_fingerprint() -> ContextFingerprint {
+    let home = home::home_dir();
+    let kube_default = home.as_ref().map(|h| h.join(".kube").join("config"));
+    let aws_config = home.as_ref().map(|h| h.join(".aws").join("config"));
+    let aws_credentials = home.as_ref().map(|h| h.join(".aws").join("credentials"));
+    ContextFingerprint {
+        kubeconfig_env: std::env::var("KUBECONFIG").ok(),
+        kubeconfig_mtime: std::env::var("KUBECONFIG")
+            .ok()
+            .and_then(|v| {
+                let separator = if cfg!(windows) { ';' } else { ':' };
+                v.split(separator).next().map(str::trim).map(String::from)
+            })
+            .as_deref()
+            .map(std::path::Path::new)
+            .and_then(|p| file_mtime(p)),
+        kube_default_mtime: kube_default.as_deref().and_then(file_mtime),
+        aws_profile: std::env::var("AWS_PROFILE").ok(),
+        aws_default_profile: std::env::var("AWS_DEFAULT_PROFILE").ok(),
+        aws_config_mtime: aws_config.as_deref().and_then(file_mtime),
+        aws_credentials_mtime: aws_credentials.as_deref().and_then(file_mtime),
+        azure_profile: std::env::var("AZURE_CONFIG_DIR").ok(),
+        gcloud_config: std::env::var("CLOUDSDK_CONFIG").ok(),
+    }
 }
 
 fn cache() -> &'static Mutex<CacheEntry> {
@@ -170,13 +220,19 @@ fn provider_cache() -> &'static Mutex<ProviderCache> {
 ///
 /// Test-only: `TIRITH_CONTEXT_DETECT_DISABLE=1` returns an empty result with no
 /// filesystem / shell-out access, so integration tests don't pick up the
-/// developer's real cloud config.
+/// developer's real cloud config. repo-0265: honored ONLY in debug builds — a
+/// production (release) binary ignores the variable entirely, so an
+/// attacker-controlled environment cannot silence context detection.
+pub(crate) fn context_detect_disabled() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("TIRITH_CONTEXT_DETECT_DISABLE")
+            .ok()
+            .as_deref()
+            == Some("1")
+}
+
 pub fn detect_all() -> DetectionResult {
-    if std::env::var("TIRITH_CONTEXT_DETECT_DISABLE")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
+    if context_detect_disabled() {
         return DetectionResult::default();
     }
 
@@ -188,12 +244,17 @@ pub fn detect_all() -> DetectionResult {
 
     if let Some(captured_at) = guard.captured_at {
         if now.duration_since(captured_at) < Duration::from_secs(CACHE_TTL_SECS) {
-            return guard.result.clone();
+            // repo-0266: the TTL only applies while the provider inputs are
+            // byte-identical; a config rewrite or env change invalidates early.
+            if guard.fingerprint == current_fingerprint() {
+                return guard.result.clone();
+            }
         }
     }
 
     let fresh = refresh_all();
     guard.captured_at = Some(now);
+    guard.fingerprint = current_fingerprint();
     guard.result = fresh.clone();
     fresh
 }
@@ -212,11 +273,7 @@ pub fn detect_single(provider: Provider) -> Result<ProviderContext, ContextDetec
 /// Detect only the command's provider and cache that result. This keeps the
 /// analysis hot path from executing unrelated provider CLIs.
 pub fn detect_provider(provider: Provider) -> Result<ProviderContext, ContextDetectFailure> {
-    if std::env::var("TIRITH_CONTEXT_DETECT_DISABLE")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
+    if context_detect_disabled() {
         return Err(ContextDetectFailure::NotConfigured);
     }
     let now = Instant::now();
@@ -224,13 +281,15 @@ pub fn detect_provider(provider: Provider) -> Result<ProviderContext, ContextDet
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some((captured_at, result)) = guard.get(&provider) {
-        if now.duration_since(*captured_at) < Duration::from_secs(CACHE_TTL_SECS) {
+    if let Some((captured_at, fingerprint, result)) = guard.get(&provider) {
+        if now.duration_since(*captured_at) < Duration::from_secs(CACHE_TTL_SECS)
+            && *fingerprint == current_fingerprint()
+        {
             return result.clone();
         }
     }
     let result = detect_single(provider);
-    guard.insert(provider, (now, result.clone()));
+    guard.insert(provider, (now, current_fingerprint(), result.clone()));
     result
 }
 

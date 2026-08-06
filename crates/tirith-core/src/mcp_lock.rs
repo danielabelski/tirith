@@ -3396,19 +3396,28 @@ fn diff_tools(
 /// caller can present each differently: `NotFound` (no file), `Io` (present but
 /// unreadable), `Parse` (invalid JSON / schema).
 pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    // repo-0291: the lockfile is repository-controlled — read it no-follow,
+    // regular-file-only, and size-capped so a symlink to `/dev/zero` or a
+    // giant file cannot hang or exhaust memory during gateway init.
+    const MAX_LOCKFILE_BYTES: u64 = 4 * 1024 * 1024;
+    let bytes = match crate::util::read_text_no_follow_capped(path, MAX_LOCKFILE_BYTES) {
+        Ok(b) => b,
+        Err(crate::util::OpenRegularError::NotFound) => {
             return Err(McpLockLoadError::NotFound);
         }
-        Err(e) => {
+        Err(_) => {
             // Capture only the category kind, not the io-error Display (privacy —
-            // see [`McpLockLoadError::Io`]).
+            // see [`McpLockLoadError::Io`]). Non-regular/oversized both map to
+            // the generic I/O category: the file exists but is not safely
+            // loadable.
             return Err(McpLockLoadError::Io {
-                kind: McpLockIoKind::from_io_kind(e.kind()),
+                kind: McpLockIoKind::from_io_kind(std::io::ErrorKind::InvalidData),
             });
         }
     };
+    let content = String::from_utf8(bytes).map_err(|_| McpLockLoadError::Io {
+        kind: McpLockIoKind::from_io_kind(std::io::ErrorKind::InvalidData),
+    })?;
     parse_lockfile(&content)
 }
 

@@ -29,9 +29,14 @@ pub fn setup(path: Option<&Path>, json: bool) -> i32 {
             }
         },
     };
+    // Resolve the selected root once so containment is proven against the
+    // canonical repository location, not a lexical alias (repo-0369). The
+    // writer revalidates every component descriptor-relatively regardless;
+    // this keeps the displayed/recorded path honest.
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
 
     let target = find_devcontainer_json(&cwd).unwrap_or_else(|| default_devcontainer_json(&cwd));
-    let outcome = inject_tirith_hook(&target, true);
+    let outcome = inject_tirith_hook(&target, &cwd, true);
     let injected_code = report_outcome("codespaces setup", &outcome, json);
     if injected_code != 0 {
         return injected_code;

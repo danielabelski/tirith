@@ -24,7 +24,9 @@ ignore = [
     # requires Rust 1.85, above tirith's MSRV 1.83, so we cannot bump lopdf. The
     # only untrusted entry point, check_pdf() in rules/rendered.rs, runs a
     # nesting-depth preflight (PDF_NESTING_DEPTH_CAP) that rejects the bomb BEFORE
-    # load_mem is ever called, so the crash path is blocked. Remove this ignore
+    # load_mem is ever called, including a decompress-and-rescan of every
+    # compressed object stream (repo-0332/pr173-0027: the former raw-bytes-only
+    # preflight was bypassable via /ObjStm). Remove this ignore
     # (and the .cargo/audit.toml twin) once MSRV/lopdf can move.
     "RUSTSEC-2026-0187",
     # quick-xml 0.32.0 DoS advisories: quadratic run time when checking a start

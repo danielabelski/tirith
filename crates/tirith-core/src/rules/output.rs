@@ -12,13 +12,35 @@
 //!   with a host differing from the href host.
 //! * Title manipulation / screen clear — Info severity.
 
-use crate::extract::{OutputScanResult, OutputSgrHit};
+use crate::extract::OutputScanResult;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Convert an [`OutputScanResult`] into findings — the entire tier-3 rule layer
 /// for the output pipeline (every finding traces back to a byte-scanner hit).
 pub fn check(scan: &OutputScanResult) -> Vec<Finding> {
     let mut findings = Vec::new();
+
+    // repo-0279 — the byte scanner dropped evidence past its bounded retention
+    // cap. Surface that as an analysis-incomplete finding (fail-closed for
+    // secure profiles) instead of silently continuing with partial evidence.
+    if scan.dropped_hits > 0 {
+        findings.push(Finding {
+            rule_id: RuleId::OutputAnalysisOverflow,
+            severity: Severity::High,
+            title: "Output analysis evidence limit exceeded".to_string(),
+            description: format!(
+                "The output stream contained more escape-sequence evidence than the analyzer's bounded retention ({} hit(s) dropped). The stream was analyzed with partial evidence, so a detection gap is possible; the stream is treated as suspicious rather than allocating without bound.",
+                scan.dropped_hits
+            ),
+            evidence: vec![Evidence::Text {
+                detail: format!("dropped_hits={}", scan.dropped_hits),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
 
     for hit in &scan.osc52 {
         findings.push(Finding {
@@ -168,19 +190,32 @@ fn check_hyperlink_mismatch(scan: &OutputScanResult) -> Vec<Finding> {
     findings
 }
 
-/// SGR-based hidden text: one sequence sets fg == bg (across the 30-37/40-47,
-/// 90-97/100-107 bright, and 38/48 extended-color forms).
+/// SGR-based hidden text. repo-0327: evaluate a ROLLING terminal style state
+/// across hits instead of each sequence in isolation —
+/// * SGR 8 (conceal) / SGR 28 (conceal off) is honored directly;
+/// * a foreground set in one sequence and a matching background set in a LATER
+///   sequence now compares the EFFECTIVE colors;
+/// * basic/bright/indexed/RGB forms are normalized through the xterm 256
+///   palette so equivalent spellings compare equal.
+/// A finding fires on each TRANSITION into a hidden state.
 fn check_hidden_text_via_sgr(scan: &OutputScanResult) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let mut state = SgrStyleState::default();
     for sgr in &scan.sgr {
-        if let Some(reason) = sgr_marks_invisible(sgr) {
+        let was_hidden = state.hidden_reason();
+        state.apply(&sgr.params);
+        let now_hidden = state.hidden_reason();
+        // Fire once per transition into a hidden state (not on every SGR that
+        // keeps it hidden), and note when a hidden region is re-established
+        // after being cleared.
+        if now_hidden.is_some() && now_hidden != was_hidden {
             findings.push(Finding {
                 rule_id: RuleId::OutputHiddenText,
                 severity: Severity::Medium,
-                title: "Hidden text via matching foreground/background SGR".to_string(),
+                title: "Hidden text via terminal style state".to_string(),
                 description: format!(
-                    "Output contains an SGR sequence where the explicit foreground color equals the explicit background color, \
-                     rendering any text after it invisible: {reason}."
+                    "Output establishes an invisible terminal style ({}), rendering any text after it invisible.",
+                    now_hidden.unwrap_or_default()
                 ),
                 evidence: vec![Evidence::ByteSequence {
                     offset: sgr.offset,
@@ -195,6 +230,114 @@ fn check_hidden_text_via_sgr(scan: &OutputScanResult) -> Vec<Finding> {
         }
     }
     findings
+}
+
+/// Effective terminal style, rolled forward across SGR sequences (repo-0327).
+#[derive(Debug, Default)]
+struct SgrStyleState {
+    fg: Option<ColorToken>,
+    bg: Option<ColorToken>,
+    conceal: bool,
+}
+
+impl SgrStyleState {
+    /// Apply one SGR parameter list to the rolling state (xterm semantics:
+    /// 0 resets, 8/28 conceal on/off, 39/49 default fg/bg, empty params = 0).
+    fn apply(&mut self, params: &[u32]) {
+        if params.is_empty() {
+            // `\e[m` is a full reset.
+            *self = Self::default();
+            return;
+        }
+        let mut i = 0;
+        while i < params.len() {
+            match params[i] {
+                0 => *self = Self::default(),
+                8 => self.conceal = true,
+                28 => self.conceal = false,
+                30..=37 => self.fg = Some(ColorToken::Basic(params[i] - 30)),
+                39 => self.fg = None,
+                40..=47 => self.bg = Some(ColorToken::Basic(params[i] - 40)),
+                49 => self.bg = None,
+                90..=97 => self.fg = Some(ColorToken::Bright(params[i] - 90)),
+                100..=107 => self.bg = Some(ColorToken::Bright(params[i] - 100)),
+                38 => {
+                    if let Some((tok, consumed)) = parse_extended_color(&params[i..]) {
+                        self.fg = Some(tok);
+                        i += consumed;
+                        continue;
+                    }
+                }
+                48 => {
+                    if let Some((tok, consumed)) = parse_extended_color(&params[i..]) {
+                        self.bg = Some(tok);
+                        i += consumed;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    /// `Some(reason)` when text written in this style is invisible: explicit
+    /// conceal, or effective fg == bg after palette normalization.
+    fn hidden_reason(&self) -> Option<String> {
+        if self.conceal {
+            return Some("SGR 8 conceal attribute is active".to_string());
+        }
+        match (&self.fg, &self.bg) {
+            (Some(fg), Some(bg)) if color_to_rgb(fg) == color_to_rgb(bg) => Some(format!(
+                "effective foreground equals background (fg={fg:?} bg={bg:?})"
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Normalize any SGR color spelling to its xterm 256-palette RGB triple so
+/// basic, bright, indexed, and truecolor forms compare by EFFECT (repo-0327).
+fn color_to_rgb(tok: &ColorToken) -> (u8, u8, u8) {
+    const BASIC16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    let indexed = |n: u32| -> (u8, u8, u8) {
+        match n {
+            0..=15 => BASIC16[n as usize],
+            16..=231 => {
+                let c = (n - 16) as u8;
+                let level = |v: u8| if v == 0 { 0 } else { 55 + 40 * v };
+                (level(c / 36), level((c % 36) / 6), level(c % 6))
+            }
+            232..=255 => {
+                let g = 8 + 10 * (n - 232) as u8;
+                (g, g, g)
+            }
+            _ => (0, 0, 0),
+        }
+    };
+    match tok {
+        ColorToken::Basic(n) => BASIC16[(*n as usize) % 8],
+        ColorToken::Bright(n) => BASIC16[8 + (*n as usize) % 8],
+        ColorToken::Indexed(n) => indexed(*n),
+        ColorToken::Rgb(r, g, b) => (*r as u8, *g as u8, *b as u8),
+    }
 }
 
 /// Zero-width run > 8 chars — the v1 (ii) clause of OutputHiddenText.
@@ -294,63 +437,6 @@ pub fn check_fake_prompt(text: &str) -> Vec<Finding> {
     findings
 }
 
-/// Resolve `(fg, bg)` comparable color tokens from an SGR param list (base
-/// 30-37/40-47, indexed 38;5;N/48;5;N, truecolor 38;2;R;G;B). Either side is
-/// `None` when the SGR did not specify it explicitly (we never infer defaults).
-fn resolve_sgr_colors(params: &[u32]) -> (Option<ColorToken>, Option<ColorToken>) {
-    let mut fg: Option<ColorToken> = None;
-    let mut bg: Option<ColorToken> = None;
-    let mut i = 0;
-    while i < params.len() {
-        let p = params[i];
-        match p {
-            0 => {
-                // Reset → treat both sides as unset (we never infer defaults).
-                fg = None;
-                bg = None;
-                i += 1;
-            }
-            30..=37 => {
-                fg = Some(ColorToken::Basic(p - 30));
-                i += 1;
-            }
-            40..=47 => {
-                bg = Some(ColorToken::Basic(p - 40));
-                i += 1;
-            }
-            90..=97 => {
-                fg = Some(ColorToken::Bright(p - 90));
-                i += 1;
-            }
-            100..=107 => {
-                bg = Some(ColorToken::Bright(p - 100));
-                i += 1;
-            }
-            38 => {
-                // 38;5;N or 38;2;R;G;B
-                if let Some(next_token) = parse_extended_color(&params[i..]) {
-                    fg = Some(next_token.0);
-                    i += next_token.1;
-                } else {
-                    i += 1;
-                }
-            }
-            48 => {
-                if let Some(next_token) = parse_extended_color(&params[i..]) {
-                    bg = Some(next_token.0);
-                    i += next_token.1;
-                } else {
-                    i += 1;
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    (fg, bg)
-}
-
 fn parse_extended_color(params: &[u32]) -> Option<(ColorToken, usize)> {
     if params.len() < 3 {
         return None;
@@ -368,17 +454,6 @@ enum ColorToken {
     Bright(u32),
     Indexed(u32),
     Rgb(u32, u32, u32),
-}
-
-/// Some(reason) when the SGR sets fg == bg (both explicit) within one sequence.
-fn sgr_marks_invisible(sgr: &OutputSgrHit) -> Option<String> {
-    let (fg, bg) = resolve_sgr_colors(&sgr.params);
-    match (fg, bg) {
-        (Some(fg_tok), Some(bg_tok)) if fg_tok == bg_tok => {
-            Some(format!("fg={fg_tok:?} bg={bg_tok:?}"))
-        }
-        _ => None,
-    }
 }
 
 /// Extract a host from a URL string, or `None`. The bare-host branch requires

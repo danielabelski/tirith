@@ -34,6 +34,43 @@ use crate::verdict::{RuleId, Severity};
 const SHELL_OUT_TIMEOUT: Duration = Duration::from_millis(1500);
 const SHELL_OUT_CAP: usize = 4 * 1024 * 1024;
 
+/// Cap for any single persistence-surface file read (repo-0407): rc files,
+/// SSH configs, `.envrc`, and launch-agent units are all small in practice;
+/// the cap stops a hostile or pathological file from exhausting memory across
+/// scan/diff/watch polls.
+const SURFACE_READ_CAP: u64 = 4 * 1024 * 1024;
+
+/// Bound on inventoried launch-agent / systemd units per directory so a
+/// stuffed directory cannot drive unbounded scan work (repo-0407).
+const MAX_LAUNCH_ENTRIES_PER_DIR: usize = 512;
+
+/// How a persistence-surface read ended (repo-0308/0407). Distinguishing
+/// [`SurfaceRead::Unsafe`] from [`SurfaceRead::Absent`] keeps an
+/// existing-but-unsafe file from silently looking REMOVED in the next diff:
+/// it stays `present` with NO content, which reads as a modification signal
+/// rather than a clean absence.
+enum SurfaceRead {
+    Absent,
+    Contents(Vec<u8>),
+    /// Present but not safely readable as a regular, contained file (symlink,
+    /// special file, over-cap, I/O error). Target bytes are NEVER taken from
+    /// such a path, so unknown secret formats cannot leak through
+    /// `added_lines`.
+    Unsafe,
+}
+
+/// Read a persistence surface through a no-follow, regular-file-only,
+/// size-capped reader (repo-0308/0407). A symlink or special file is refused
+/// by the open itself, so no attacker-selected target bytes ever enter the
+/// scan, the hash, or the diff output.
+fn read_surface(path: &Path) -> SurfaceRead {
+    match crate::util::read_text_no_follow_capped(path, SURFACE_READ_CAP) {
+        Ok(bytes) => SurfaceRead::Contents(bytes),
+        Err(crate::util::OpenRegularError::NotFound) => SurfaceRead::Absent,
+        Err(_) => SurfaceRead::Unsafe,
+    }
+}
+
 /// The class of persistence surface; determines which [`RuleId`] a change fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -281,17 +318,26 @@ const POWERSHELL_PROFILES: &[&str] = &[
 /// Build a [`PersistenceEntry`] for a file path. A missing/unreadable file
 /// yields an absent entry (empty-string hash) so a later appearance is detectable.
 fn file_entry(key: &str, kind: PersistenceKind, path: &Path) -> PersistenceEntry {
-    let (present, content) = match read_text_if_file(path) {
-        Some(c) => (true, c),
-        None => (false, String::new()),
+    let (present, sha256, size, content) = match read_surface(path) {
+        SurfaceRead::Contents(bytes) => {
+            let sha = sha256_hex(&bytes);
+            let size = bytes.len();
+            let content = String::from_utf8_lossy(&bytes).into_owned();
+            (true, sha, size, content)
+        }
+        SurfaceRead::Absent => (false, sha256_hex(b""), 0, String::new()),
+        // Existing but unsafe (symlink/special/over-cap): keep PRESENT so the
+        // next diff reads as a modification, never as a clean removal
+        // (repo-0407). No target bytes are disclosed.
+        SurfaceRead::Unsafe => (true, sha256_hex(b""), 0, String::new()),
     };
     PersistenceEntry {
         key: key.to_string(),
         kind,
         location: path.display().to_string(),
         present,
-        sha256: sha256_hex(content.as_bytes()),
-        size: content.len(),
+        sha256,
+        size,
         content,
     }
 }
@@ -339,10 +385,15 @@ fn launch_agent_dir(dir: &Path, ext: &str) -> Vec<PersistenceEntry> {
         Err(_) => return entries,
     };
     for entry in read.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+        if entries.len() >= MAX_LAUNCH_ENTRIES_PER_DIR {
+            eprintln!(
+                "tirith: persistence: launch-agent inventory of {} truncated at {} entries",
+                dir.display(),
+                MAX_LAUNCH_ENTRIES_PER_DIR
+            );
+            break;
         }
+        let path = entry.path();
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
@@ -350,17 +401,27 @@ fn launch_agent_dir(dir: &Path, ext: &str) -> Vec<PersistenceEntry> {
         if !name.to_ascii_lowercase().ends_with(&format!(".{ext}")) {
             continue;
         }
-        // Read raw bytes (plists may be binary); hash for change-detection.
-        let bytes = std::fs::read(&path).unwrap_or_default();
-        // UTF-8-lossy copy for added-line diffing of XML plists / systemd units.
-        let content = String::from_utf8_lossy(&bytes).into_owned();
+        // repo-0407: no-follow, regular-file-only, size-capped read (plists
+        // may be binary; raw bytes hashed for change-detection). A symlinked
+        // or unreadable unit stays PRESENT with no content — a modification
+        // signal, never a silent absence, and no target bytes disclosed.
+        let (sha256, size, content) = match read_surface(&path) {
+            SurfaceRead::Contents(bytes) => {
+                let sha = sha256_hex(&bytes);
+                let size = bytes.len();
+                let content = String::from_utf8_lossy(&bytes).into_owned();
+                (sha, size, content)
+            }
+            SurfaceRead::Unsafe => (sha256_hex(b""), 0, String::new()),
+            SurfaceRead::Absent => continue,
+        };
         entries.push(PersistenceEntry {
             key: format!("launch_agent:{name}"),
             kind: PersistenceKind::LaunchAgent,
             location: path.display().to_string(),
             present: true,
-            sha256: sha256_hex(&bytes),
-            size: bytes.len(),
+            sha256,
+            size,
             content,
         });
     }
@@ -405,7 +466,10 @@ fn login_items_entry() -> PersistenceEntry {
 /// Inventory the git global hooks path (`core.hooksPath`) from `~/.gitconfig`
 /// (inventory-only); `None` when unset.
 fn git_hooks_path_entry(home: &Path) -> Option<PersistenceEntry> {
-    let gitconfig = read_text_if_file(&home.join(".gitconfig"))?;
+    let gitconfig = match read_surface(&home.join(".gitconfig")) {
+        SurfaceRead::Contents(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        _ => return None,
+    };
     let hooks_path = parse_git_hooks_path(&gitconfig)?;
     Some(PersistenceEntry {
         key: "git_hooks_path".to_string(),
@@ -464,18 +528,35 @@ fn collect_envrc_ancestry(cwd: &Path) -> Vec<PersistenceEntry> {
         }
         budget -= 1;
         let envrc = dir.join(".envrc");
-        if envrc.is_file() {
-            if let Some(content) = read_text_if_file(&envrc) {
+        // repo-0308: a repository-controlled `.envrc` must be read through a
+        // no-follow, regular-file-only, size-capped reader. A symlinked
+        // `.envrc` still REGISTERS as a Direnv surface (direnv would load it)
+        // but the symlink target's bytes are never read, hashed, or emitted
+        // as `added_lines` — pattern redaction is not a confidentiality
+        // boundary for unknown secret formats.
+        match read_surface(&envrc) {
+            SurfaceRead::Contents(bytes) => {
+                let content = String::from_utf8_lossy(&bytes).into_owned();
                 entries.push(PersistenceEntry {
                     key: format!("direnv:{}", envrc.display()),
                     kind: PersistenceKind::Direnv,
                     location: envrc.display().to_string(),
                     present: true,
-                    sha256: sha256_hex(content.as_bytes()),
-                    size: content.len(),
+                    sha256: sha256_hex(&bytes),
+                    size: bytes.len(),
                     content,
                 });
             }
+            SurfaceRead::Unsafe => entries.push(PersistenceEntry {
+                key: format!("direnv:{}", envrc.display()),
+                kind: PersistenceKind::Direnv,
+                location: envrc.display().to_string(),
+                present: true,
+                sha256: sha256_hex(b""),
+                size: 0,
+                content: String::new(),
+            }),
+            SurfaceRead::Absent => {}
         }
         cur = dir.parent();
     }
@@ -698,14 +779,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
-}
-
-/// Read a path as UTF-8 text only when it is a regular file; `None` otherwise.
-fn read_text_if_file(path: &Path) -> Option<String> {
-    if !path.is_file() {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
 }
 
 /// Default on-disk snapshot path: `state_dir()/persistence_snapshot.json`.
@@ -1313,5 +1386,61 @@ mod tests {
             entries.iter().any(|e| e.kind == PersistenceKind::Direnv),
             "ancestry walk should find the parent .envrc, got {entries:?}"
         );
+    }
+
+    /// repo-0308: a symlinked `.envrc` still registers as a Direnv surface
+    /// (direnv would load it) but the symlink target's bytes are never read,
+    /// hashed, or emitted as content.
+    #[cfg(unix)]
+    #[test]
+    fn envrc_symlink_registers_surface_without_disclosing_target() {
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("accounts.txt");
+        let secret_body = "account: alice\npassword: not-a-known-format-12345\n";
+        std::fs::write(&secret, secret_body).unwrap();
+        std::os::unix::fs::symlink(&secret, repo.path().join(".envrc")).unwrap();
+
+        let entries = collect_envrc_ancestry(repo.path());
+        let entry = entries
+            .iter()
+            .find(|e| e.kind == PersistenceKind::Direnv)
+            .expect("a symlinked .envrc must still register as a surface");
+        assert!(entry.present);
+        assert!(
+            entry.content.is_empty(),
+            "no target bytes may be disclosed: {:?}",
+            entry.content
+        );
+        assert_eq!(entry.size, 0);
+        assert!(
+            !entry.content.contains("alice") && !entry.content.contains("not-a-known-format"),
+            "target content leaked into the entry"
+        );
+    }
+
+    /// repo-0407: an unreadable tracked surface stays PRESENT (modification
+    /// signal) instead of silently reading as removed, and its content is
+    /// never taken from an unsafe path.
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_surface_stays_present_with_empty_content() {
+        let home = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("real-zshrc");
+        std::fs::write(&target, b"export SECRET=hunter2\n").unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join(".zshrc")).unwrap();
+
+        let entries = scan_with_root(home.path(), None);
+        let entry = entries
+            .iter()
+            .find(|e| e.key == "shell_rc:.zshrc")
+            .expect("the rc file must remain inventoried");
+        assert!(
+            entry.present,
+            "an unsafe surface must not read as cleanly absent"
+        );
+        assert!(entry.content.is_empty());
+        assert!(!entry.content.contains("hunter2"));
     }
 }

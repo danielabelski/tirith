@@ -379,21 +379,59 @@ fn is_usable_repo_url(url: &str) -> bool {
         return false;
     }
     let lower = u.to_lowercase();
-    // A URL or a git+/scp-style remote.
-    let looks_like_url = lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("git://")
-        || lower.starts_with("git+")
-        || lower.starts_with("ssh://")
-        || lower.contains("github.com")
-        || lower.contains("gitlab.com")
-        || lower.contains("bitbucket.org");
-    if !looks_like_url {
-        return false;
-    }
     // Reject obvious placeholders.
     let placeholders = ["example.com", "your-repo", "todo", "n/a", "none"];
-    !placeholders.iter().any(|p| lower.contains(p))
+    if placeholders.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+    // repo-0318: decide from the PARSED URL, never substring matching —
+    // `javascript:github.com` or `https://github.com.attacker.invalid` must not
+    // count as a usable source repository.
+    // A recognized source-host only counts when it is the real host or one of
+    // its subdomains.
+    fn is_source_host(host: &str) -> bool {
+        ["github.com", "gitlab.com", "bitbucket.org"]
+            .iter()
+            .any(|base| host == *base || host.ends_with(&format!(".{base}")))
+    }
+    // A host that merely CONTAINS a known forge string (without being that
+    // forge or its subdomain) is a suffix-spoof and never a usable source link
+    // (repo-0318: `github.com.attacker.invalid`).
+    fn spoofs_source_host(host: &str) -> bool {
+        ["github.com", "gitlab.com", "bitbucket.org"]
+            .iter()
+            .any(|base| host.contains(base) && !is_source_host(host))
+    }
+    // git+<scheme>://…
+    let normalized = lower.strip_prefix("git+").unwrap_or(&lower);
+    if normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .or_else(|| normalized.strip_prefix("git://"))
+        .or_else(|| normalized.strip_prefix("ssh://"))
+        .is_some()
+    {
+        let Ok(parsed) = url::Url::parse(normalized) else {
+            return false;
+        };
+        return parsed
+            .host_str()
+            .is_some_and(|host| !host.is_empty() && !spoofs_source_host(host));
+    }
+    // scp-style git remote: `[user@]host:path` with a real source host.
+    if let Some((user_host, _path)) = lower.split_once(':') {
+        let host = user_host.rsplit('@').next().unwrap_or(user_host);
+        if !host.is_empty() && is_source_host(host) {
+            return true;
+        }
+    }
+    // Bare `host/path` shorthand with a real source host as the first segment.
+    if let Some(host) = lower.split('/').next() {
+        if is_source_host(host) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Default registry base URLs (the per-registry path is appended in fetchers).
@@ -1695,10 +1733,19 @@ mod tests {
         assert!(is_usable_repo_url("https://github.com/owner/repo"));
         assert!(is_usable_repo_url("git+https://github.com/o/r.git"));
         assert!(is_usable_repo_url("git://gitlab.com/o/r"));
+        assert!(is_usable_repo_url("git@github.com:owner/repo.git"));
+        assert!(is_usable_repo_url("github.com/owner/repo"));
         assert!(!is_usable_repo_url(""));
         assert!(!is_usable_repo_url("   "));
         assert!(!is_usable_repo_url("not a url"));
         assert!(!is_usable_repo_url("https://example.com/your-repo"));
+        // repo-0318: substring lookalikes are not usable source links.
+        assert!(!is_usable_repo_url("javascript:github.com"));
+        assert!(!is_usable_repo_url(
+            "https://github.com.attacker.invalid/o/r"
+        ));
+        assert!(!is_usable_repo_url("https://"));
+        assert!(!is_usable_repo_url("ssh://:22/path"));
     }
 
     #[test]

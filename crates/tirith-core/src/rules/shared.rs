@@ -160,12 +160,17 @@ pub const URL_SHORTENER_HOSTS: &[&str] = &[
     "v.gd",
     "goo.gl",
     "ow.ly",
+    "buff.ly",
+    "rb.gy",
 ];
 
 /// `true` when `host` (any case) is a known URL shortener from
 /// [`URL_SHORTENER_HOSTS`].
 pub fn is_url_shortener(host: &str) -> bool {
+    // repo-0301: DNS names are case-insensitive and a trailing root dot is
+    // semantically identical (`bit.ly.` == `bit.ly`).
     let lower = host.to_ascii_lowercase();
+    let lower = lower.trim_end_matches('.');
     URL_SHORTENER_HOSTS.iter().any(|s| lower == *s)
 }
 

@@ -237,6 +237,11 @@ impl TypedToolResult {
         for block in &self.content {
             collect_block_strings(&block.to_value(), &mut out);
         }
+        // repo-0292: top-level `extra` fields (`_meta`, vendor extensions) are
+        // attacker-controlled too and are re-emitted verbatim by `to_value`.
+        // Scanning only `content` let an upstream smuggle prompt-injection or
+        // terminal-control text past the analyzer in a standard field.
+        collect_block_strings(&Value::Object(self.extra.clone()), &mut out);
         out
     }
 }

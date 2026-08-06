@@ -13,26 +13,16 @@ const MAX_REDIRECTS: usize = 10;
 
 const HOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Known URL shortener domains (lowercase).
-const SHORTENER_DOMAINS: &[&str] = &[
-    "bit.ly",
-    "t.co",
-    "tinyurl.com",
-    "is.gd",
-    "v.gd",
-    "goo.gl",
-    "ow.ly",
-    "buff.ly",
-    "rb.gy",
-];
+/// repo-0303: aggregate wall-clock budget across the whole redirect chain.
+const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Returns `true` if `url` is hosted on a known URL shortener domain.
 pub fn is_shortened_url(url: &str) -> bool {
+    // repo-0301: one canonical shortener list shared with the transport
+    // detector (case- and trailing-dot-insensitive), so a host the rule flags
+    // is always a host this resolver accepts.
     extract_host(url)
-        .map(|h| {
-            let lower = h.to_lowercase();
-            SHORTENER_DOMAINS.iter().any(|&s| lower == s)
-        })
+        .map(crate::rules::shared::is_url_shortener)
         .unwrap_or(false)
 }
 
@@ -132,8 +122,15 @@ where
     V: Fn(&str) -> Result<(), String>,
 {
     let mut current = start_url.to_string();
+    // repo-0303: one AGGREGATE deadline for the whole chain. Ten hops at five
+    // seconds each otherwise lets one short URL hold a blocking worker for
+    // ~50s; the daemon enriches these sequentially.
+    let deadline = std::time::Instant::now() + AGGREGATE_TIMEOUT;
 
     for _ in 0..MAX_REDIRECTS {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         // SSRF guard: refuse a forbidden destination before connecting. Applies
         // to the initial URL and every redirect hop.
         if validate(&current).is_err() {
@@ -158,6 +155,14 @@ where
 fn resolve_location(current: &str, location: &str) -> Option<String> {
     if location.starts_with("http://") || location.starts_with("https://") {
         Some(location.to_string())
+    } else if let Some(rest) = location.strip_prefix("//") {
+        // repo-0302: a `//host/path` Location is a NETWORK-PATH reference that
+        // keeps only the SCHEME — it is not an origin-relative path. Resolving
+        // it against the current origin would inspect a different destination
+        // than the one a browser/curl actually follows.
+        let scheme_end = current.find("://")?;
+        let scheme = &current[..scheme_end];
+        Some(format!("{scheme}://{rest}"))
     } else if location.starts_with('/') {
         extract_origin(current).map(|origin| format!("{origin}{location}"))
     } else {
@@ -187,6 +192,21 @@ fn cache_put(url: &str, resolved: &str) {
     if let Ok(mut cache) = CACHE.lock() {
         if cache.len() > 1024 {
             cache.retain(|_, (_, ts)| ts.elapsed() < CACHE_TTL);
+        }
+        // repo-0303: HARD cap. The retain above only drops expired entries; an
+        // attacker feeding unique cache-busting URLs inside the TTL window
+        // otherwise grows the map without bound. Evict oldest first.
+        while cache.len() >= 1024 {
+            let oldest = cache
+                .iter()
+                .max_by_key(|(_, (_, ts))| ts.elapsed())
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(key) => {
+                    cache.remove(&key);
+                }
+                None => break,
+            }
         }
         cache.insert(url.to_string(), (resolved.to_string(), Instant::now()));
     }

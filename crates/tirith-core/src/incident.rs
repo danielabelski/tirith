@@ -151,9 +151,9 @@ impl std::fmt::Display for StartError {
                 "an incident is already active since {} (reason: {})",
                 s.started_at_display(),
                 if s.reason.is_empty() {
-                    "<none>"
+                    "<none>".to_string()
                 } else {
-                    &s.reason
+                    display_sanitize_single_line(&s.reason)
                 }
             ),
             StartError::NoStateDir => write!(f, "could not resolve tirith state dir"),
@@ -163,6 +163,18 @@ impl std::fmt::Display for StartError {
 }
 
 impl std::error::Error for StartError {}
+
+/// Sanitize an operator/env-controlled flag field for a single-line HUMAN
+/// display sink (repo-0287): strip C0/C1 controls, ESC/OSC sequences, and
+/// deceptive Unicode via the central display sanitizer, then collapse any
+/// surviving line breaks. The raw value stays intact in the structured JSON
+/// flag file; only terminal-bound copies pass through here.
+fn display_sanitize_single_line(value: &str) -> String {
+    crate::mcp::output_filter::sanitize_for_display(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Tri-state read of the incident flag. Distinguishing `Absent` from `Corrupt`
 /// is load-bearing for fail-SAFE: a corrupt flag means an incident WAS started
@@ -1024,5 +1036,51 @@ mod tests {
         let real = dir.path().join("real");
         std::fs::write(&real, b"{}").unwrap();
         assert!(mtime_nanos(&real).0);
+    }
+
+    /// repo-0287: a `--reason` carrying ANSI CSI and OSC 52 (clipboard)
+    /// payloads must never reach a human display sink; the structured value
+    /// itself stays verbatim for JSON.
+    #[test]
+    fn start_error_display_strips_terminal_controls() {
+        let payload_reason = "cleanup \u{1b}[2J\u{1b}]52;c;Ymx1c2g=\u{1b}\\ done\nnext-line";
+        let state = IncidentState {
+            started_at: 1_700_000_000,
+            started_by: "tester".to_string(),
+            reason: payload_reason.to_string(),
+        };
+        let rendered = StartError::AlreadyActive(Box::new(state.clone())).to_string();
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "no ESC byte may survive: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\n'),
+            "single-line sink must collapse newlines: {rendered:?}"
+        );
+        assert!(rendered.contains("cleanup"), "{rendered:?}");
+        assert!(rendered.contains("done next-line"), "{rendered:?}");
+        // The stored value is untouched (structured consumers keep fidelity).
+        assert_eq!(state.reason, payload_reason);
+    }
+
+    /// repo-0287: Unicode C1 controls (8-bit CSI form) and bidi/zero-width
+    /// deception codepoints are stripped too, not just 7-bit ESC.
+    #[test]
+    fn display_sanitize_strips_c1_and_deceptive_unicode() {
+        let rendered = display_sanitize_single_line("a\u{9b}1;31mB\u{202e}C\u{200b}D");
+        assert!(!rendered.contains('\u{9b}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{200b}'), "{rendered:?}");
+        assert!(
+            rendered
+                .chars()
+                .all(|ch| !ch.is_control() || matches!(ch, '\t' | ' ')),
+            "no control codepoint may survive: {rendered:?}"
+        );
+        assert!(
+            rendered.contains('B') && rendered.contains('D'),
+            "{rendered:?}"
+        );
     }
 }

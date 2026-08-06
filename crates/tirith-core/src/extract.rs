@@ -398,15 +398,25 @@ pub struct OutputSgrHit {
 
 /// Rolling state for [`scan_output_chunk`], persisted across chunks so OSC/CSI/
 /// SGR sequences split across chunks are detected end-to-end. Zero-width runs
-/// are chunk-local (the v1 hidden-text threshold is well within a 64 KiB window).
+/// and partial UTF-8 scalars are ALSO carried across chunks (repo-0328): an
+/// upstream tool must not split a >8 zero-width run — or one multi-byte
+/// zero-width scalar — across a chunk boundary to evade `OutputHiddenText`.
 #[derive(Debug, Default, Clone)]
 pub struct OutputScanState {
     /// Absolute byte offset of the *next* byte to be fed in, so emitted offsets
     /// are file-wide. The streaming driver bumps this by each chunk's length.
     pub byte_offset: usize,
-    /// A trailing UTF-8 `0xC2` lead byte held across chunks so a C1 scalar whose
-    /// two bytes straddle the transport boundary is interpreted atomically.
-    pending_c1_utf8_lead: bool,
+    /// Up to three trailing bytes held across chunks because they form a strict
+    /// PREFIX of a UTF-8 scalar whose remainder arrives in the next chunk
+    /// (generalizes the original lone-`0xC2` hold so a split zero-width scalar
+    /// is decoded atomically instead of miscounted — repo-0328).
+    pending_utf8: [u8; 4],
+    pending_utf8_len: u8,
+    /// Zero-width run in progress: absolute start offset and scalar count,
+    /// carried across chunk boundaries. Flushed into the result only on a
+    /// non-zero-width scalar or explicit end-of-stream finalization.
+    zw_run_start: Option<usize>,
+    zw_run_count: usize,
     phase: OutputPhase,
     osc_buf: Vec<u8>,
     /// OSC introducer (`0`, `2`, `52`, `8`): accumulate digits, dispatch on `;`.
@@ -476,6 +486,28 @@ pub struct OutputScanResult {
     /// OSC sequences whose payload or introducer exceeded the analysis cap.
     /// The operation is captured before payload retention starts when possible.
     pub osc_overflow: Vec<OutputOscOverflowHit>,
+    /// Bounded-evidence counter (repo-0279): hits DROPPED after a per-class
+    /// retention cap was reached. Non-zero means the analyzer truncated
+    /// attacker-amplified evidence; the output rule translates this into a
+    /// fail-closed analyzer-overflow finding instead of allocating without
+    /// bound.
+    pub dropped_hits: u64,
+}
+
+/// Per-class retention cap for streamed output evidence (repo-0279). A dense
+/// stream of harmless four-byte SGR resets otherwise turns a bounded-size
+/// response into millions of heap-bearing records. 4096 hits per class is far
+/// beyond any legitimate terminal stream's useful evidence.
+const OUTPUT_HIT_CAP: usize = 4096;
+
+/// Push one evidence hit under the per-class cap; beyond the cap, count the
+/// drop so the analyzer can surface an overflow finding.
+fn push_bounded<T>(vec: &mut Vec<T>, item: T, dropped: &mut u64) {
+    if vec.len() < OUTPUT_HIT_CAP {
+        vec.push(item);
+    } else {
+        *dropped = dropped.saturating_add(1);
+    }
 }
 
 /// One generic OSC hit (file-wide offset + decoded payload).
@@ -516,11 +548,15 @@ fn record_osc_overflow(state: &mut OutputScanState, result: &mut OutputScanResul
     if state.osc_discarding {
         return;
     }
-    result.osc_overflow.push(OutputOscOverflowHit {
-        offset: state.osc_start_offset,
-        operation: state.osc_operation.clone(),
-        retained_cap: OUTPUT_OSC_CAP,
-    });
+    push_bounded(
+        &mut result.osc_overflow,
+        OutputOscOverflowHit {
+            offset: state.osc_start_offset,
+            operation: state.osc_operation.clone(),
+            retained_cap: OUTPUT_OSC_CAP,
+        },
+        &mut result.dropped_hits,
+    );
     state.osc_discarding = true;
     state.osc_buf.clear();
 }
@@ -540,26 +576,24 @@ fn reset_osc_state(state: &mut OutputScanState, phase: OutputPhase) {
 /// Findings are *appended* to `result`; `engine::analyze_output_*` translates
 /// it into `Finding`s after all chunks are fed.
 pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut OutputScanResult) {
-    // Track consecutive zero-width chars within THIS chunk only — runs that
-    // straddle a chunk boundary intentionally do NOT count (the >8 v1 threshold
-    // is well within a 64 KiB window), keeping the state machine compact.
-    let mut zw_run_start: Option<usize> = None;
-    let mut zw_run_count: usize = 0;
+    // Zero-width runs live in `state` and span chunk boundaries (repo-0328):
+    // eight zero-width chars ending one chunk and the remainder opening the
+    // next are ONE rendered run and must still produce OutputHiddenText.
     let original_chunk_start = state.byte_offset;
     let original_chunk_len = chunk.len();
-    let had_c1_lead = state.pending_c1_utf8_lead;
-    state.pending_c1_utf8_lead = false;
+    let pending_len = state.pending_utf8_len as usize;
+    state.pending_utf8_len = 0;
     let mut joined = Vec::new();
-    let chunk = if had_c1_lead {
-        joined.reserve(chunk.len() + 1);
-        joined.push(0xC2);
+    let chunk = if pending_len > 0 {
+        joined.reserve(chunk.len() + pending_len);
+        joined.extend_from_slice(&state.pending_utf8[..pending_len]);
         joined.extend_from_slice(chunk);
         joined.as_slice()
     } else {
         chunk
     };
-    let chunk_start_offset = if had_c1_lead {
-        original_chunk_start.saturating_sub(1)
+    let chunk_start_offset = if pending_len > 0 {
+        original_chunk_start.saturating_sub(pending_len)
     } else {
         original_chunk_start
     };
@@ -567,12 +601,20 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
     let mut byte_idx = 0;
     while byte_idx < chunk.len() {
         let raw_b = chunk[byte_idx];
-        if raw_b == 0xC2 && byte_idx + 1 == chunk.len() {
-            // Do not misclassify a UTF-8 C1 scalar just because its continuation
-            // byte arrives in the next transport chunk. The absolute byte offset
-            // still advances below; the next call temporarily prepends this byte.
-            state.pending_c1_utf8_lead = true;
-            break;
+        {
+            // Do not misclassify a scalar whose continuation bytes arrive in
+            // the next transport chunk: when the unconsumed tail is a strict
+            // PREFIX of a valid UTF-8 scalar (1-3 bytes), hold it and resume
+            // with it prepended next call. Generalizes the original lone-0xC2
+            // hold so a split zero-width scalar (e.g. U+200B = E2 80 8B) is
+            // decoded atomically (repo-0328). The absolute byte offset still
+            // advances below.
+            let tail = &chunk[byte_idx..];
+            if tail.len() <= 3 && utf8_incomplete_prefix(tail) {
+                state.pending_utf8[..tail.len()].copy_from_slice(tail);
+                state.pending_utf8_len = tail.len() as u8;
+                break;
+            }
         }
         // Valid Rust strings encode ECMA-48 C1 controls as UTF-8 C2 80..9F.
         // Normalize that pair to its control byte for the state machine while
@@ -680,20 +722,32 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                     if b == b'm' {
                         // Parse SGR params: ";"-separated decimal ints; empty = 0.
                         let params = parse_sgr_params(&state.sgr_buf);
-                        result.sgr.push(OutputSgrHit {
-                            offset: abs_offset,
-                            params,
-                        });
+                        push_bounded(
+                            &mut result.sgr,
+                            OutputSgrHit {
+                                offset: abs_offset,
+                                params,
+                            },
+                            &mut result.dropped_hits,
+                        );
                     } else if b == b'J' && state.sgr_buf == b"2" {
-                        result.screen_clear.push(OutputOscHit {
-                            offset: abs_offset,
-                            payload: "\\e[2J".to_string(),
-                        });
+                        push_bounded(
+                            &mut result.screen_clear,
+                            OutputOscHit {
+                                offset: abs_offset,
+                                payload: "\\e[2J".to_string(),
+                            },
+                            &mut result.dropped_hits,
+                        );
                     } else if b == b'H' && state.sgr_buf.is_empty() {
-                        result.screen_clear.push(OutputOscHit {
-                            offset: abs_offset,
-                            payload: "\\e[H".to_string(),
-                        });
+                        push_bounded(
+                            &mut result.screen_clear,
+                            OutputOscHit {
+                                offset: abs_offset,
+                                payload: "\\e[H".to_string(),
+                            },
+                            &mut result.dropped_hits,
+                        );
                     }
                     state.phase = OutputPhase::Idle;
                     state.sgr_buf.clear();
@@ -791,10 +845,10 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
             let remaining = &chunk[byte_idx..];
             if let Some(ch) = decode_utf8_scalar_prefix(remaining) {
                 if is_zero_width(ch) || is_unicode_tag(ch) {
-                    if zw_run_start.is_none() {
-                        zw_run_start = Some(chunk_start_offset + byte_idx);
+                    if state.zw_run_start.is_none() {
+                        state.zw_run_start = Some(chunk_start_offset + byte_idx);
                     }
-                    zw_run_count += 1;
+                    state.zw_run_count += 1;
                     byte_idx += ch.len_utf8();
                     continue;
                 }
@@ -802,32 +856,55 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
         }
 
         // Non-ZW byte — flush any in-flight run.
-        if zw_run_count > 8 {
-            if let Some(off) = zw_run_start {
-                result.zero_width_runs.push(OutputZeroWidthRun {
-                    offset: off,
-                    count: zw_run_count,
-                });
-            }
-        }
-        zw_run_start = None;
-        zw_run_count = 0;
+        flush_zero_width_run(state, result);
 
         byte_idx += byte_width;
     }
 
-    // End-of-chunk ZW flush.
-    if zw_run_count > 8 {
-        if let Some(off) = zw_run_start {
-            result.zero_width_runs.push(OutputZeroWidthRun {
-                offset: off,
-                count: zw_run_count,
-            });
-        }
-    }
-
     // Advance global offset for next chunk.
     state.byte_offset = original_chunk_start + original_chunk_len;
+}
+
+/// Emit the in-flight zero-width run when it exceeds the hidden-text threshold
+/// and reset the carried run state. Called on a non-zero-width scalar and at
+/// end-of-stream finalization — NOT at chunk boundaries (repo-0328).
+fn flush_zero_width_run(state: &mut OutputScanState, result: &mut OutputScanResult) {
+    if state.zw_run_count > 8 {
+        if let Some(off) = state.zw_run_start {
+            push_bounded(
+                &mut result.zero_width_runs,
+                OutputZeroWidthRun {
+                    offset: off,
+                    count: state.zw_run_count,
+                },
+                &mut result.dropped_hits,
+            );
+        }
+    }
+    state.zw_run_start = None;
+    state.zw_run_count = 0;
+}
+
+/// True when `tail` (1-3 bytes) is EXACTLY one strict prefix of a valid UTF-8
+/// scalar — decoding could complete once more bytes arrive. Complete or
+/// invalid sequences return false (repo-0328).
+fn utf8_incomplete_prefix(tail: &[u8]) -> bool {
+    let needed = match *tail.first().unwrap_or(&0) {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return false,
+    };
+    if tail.len() >= needed {
+        return false;
+    }
+    match std::str::from_utf8(tail) {
+        Ok(_) => false,
+        // `error_len() == None` signals "incomplete"; `valid_up_to() == 0`
+        // requires the whole tail to be that one incomplete scalar (rejects
+        // overlong/surrogate prefixes, which error with a concrete length).
+        Err(e) => e.valid_up_to() == 0 && e.error_len().is_none(),
+    }
 }
 
 /// Whole-buffer wrapper for the streaming scanner (used by `engine::analyze_output`).
@@ -836,8 +913,9 @@ pub fn scan_output_bytes(input: &[u8]) -> OutputScanResult {
     let mut result = OutputScanResult::default();
     scan_output_chunk(input, &mut state, &mut result);
     // Flush any trailing in-flight sequence so a truncated `\e]52;…` at EOF
-    // is detected instead of silently dropped.
-    finalize_scan_state(&mut state);
+    // is detected instead of silently dropped, and a trailing zero-width run
+    // is emitted (repo-0328).
+    finalize_scan_state(&mut state, Some(&mut result));
     result
 }
 
@@ -862,7 +940,20 @@ pub struct OutputScanFinalize {
 /// Silent-failure fix (Sev-5): pre-fix the scanner ended in an OSC/CSI/string
 /// control state silently on truncation and the output filter accepted it;
 /// callers can now emit an `OutputTruncatedEscapeSequence` finding.
-pub fn finalize_scan_state(state: &mut OutputScanState) -> OutputScanFinalize {
+///
+/// When `result` is supplied, any in-flight zero-width run is flushed into it
+/// first (repo-0328): a stream ENDING on a >8 zero-width run must still
+/// produce `OutputHiddenText` even though no trailing visible scalar arrived.
+pub fn finalize_scan_state(
+    state: &mut OutputScanState,
+    result: Option<&mut OutputScanResult>,
+) -> OutputScanFinalize {
+    if let Some(result) = result {
+        flush_zero_width_run(state, result);
+    } else {
+        state.zw_run_start = None;
+        state.zw_run_count = 0;
+    }
     let mut out = OutputScanFinalize::default();
     let in_flight = !matches!(state.phase, OutputPhase::Idle);
     if in_flight {
@@ -892,7 +983,7 @@ pub fn finalize_scan_state(state: &mut OutputScanState) -> OutputScanFinalize {
         state.osc8_active_uri = None;
         state.osc8_visible_buf.clear();
     }
-    state.pending_c1_utf8_lead = false;
+    state.pending_utf8_len = 0;
     out
 }
 
@@ -952,17 +1043,25 @@ fn finalize_osc(
 
     match head {
         "0" | "2" => {
-            result.title_set.push(OutputOscHit {
-                offset: abs_offset,
-                payload: format!("{rest_str}{payload_str}"),
-            });
+            push_bounded(
+                &mut result.title_set,
+                OutputOscHit {
+                    offset: abs_offset,
+                    payload: format!("{rest_str}{payload_str}"),
+                },
+                &mut result.dropped_hits,
+            );
             reset_osc_state(state, OutputPhase::Idle);
         }
         "52" => {
-            result.osc52.push(OutputOscHit {
-                offset: abs_offset,
-                payload: payload_str,
-            });
+            push_bounded(
+                &mut result.osc52,
+                OutputOscHit {
+                    offset: abs_offset,
+                    payload: payload_str,
+                },
+                &mut result.dropped_hits,
+            );
             reset_osc_state(state, OutputPhase::Idle);
         }
         "8" => {
@@ -986,11 +1085,15 @@ fn finalize_osc(
                     .unwrap_or("")
                     .to_string();
                 let captured_uri = state.osc8_active_uri.take().unwrap_or_default();
-                result.hyperlinks.push(OutputHyperlinkHit {
-                    offset: state.osc8_uri_start_offset,
-                    uri: captured_uri,
-                    visible,
-                });
+                push_bounded(
+                    &mut result.hyperlinks,
+                    OutputHyperlinkHit {
+                        offset: state.osc8_uri_start_offset,
+                        uri: captured_uri,
+                        visible,
+                    },
+                    &mut result.dropped_hits,
+                );
                 state.osc8_visible_buf.clear();
                 state.phase = OutputPhase::Idle;
             } else {
@@ -1001,11 +1104,15 @@ fn finalize_osc(
                     let visible = std::str::from_utf8(&state.osc8_visible_buf)
                         .unwrap_or("")
                         .to_string();
-                    result.hyperlinks.push(OutputHyperlinkHit {
-                        offset: state.osc8_uri_start_offset,
-                        uri: captured_uri,
-                        visible,
-                    });
+                    push_bounded(
+                        &mut result.hyperlinks,
+                        OutputHyperlinkHit {
+                            offset: state.osc8_uri_start_offset,
+                            uri: captured_uri,
+                            visible,
+                        },
+                        &mut result.dropped_hits,
+                    );
                 }
                 state.osc8_active_uri = Some(uri);
                 state.osc8_uri_start_offset = abs_offset;
@@ -1086,7 +1193,7 @@ mod output_scan_tests {
 
         assert_eq!(result.osc52.len(), 1, "split UTF-8 C1 OSC 52 detected");
         assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
-        assert!(!finalize_scan_state(&mut state).truncated_escape);
+        assert!(!finalize_scan_state(&mut state, None).truncated_escape);
     }
 
     #[test]
@@ -1109,7 +1216,7 @@ mod output_scan_tests {
             &mut complete_state,
             &mut complete_result,
         );
-        assert!(!finalize_scan_state(&mut complete_state).truncated_escape);
+        assert!(!finalize_scan_state(&mut complete_state, None).truncated_escape);
 
         let mut truncated_state = OutputScanState::default();
         let mut truncated_result = OutputScanResult::default();
@@ -1118,7 +1225,7 @@ mod output_scan_tests {
             &mut truncated_state,
             &mut truncated_result,
         );
-        assert!(finalize_scan_state(&mut truncated_state).truncated_escape);
+        assert!(finalize_scan_state(&mut truncated_state, None).truncated_escape);
     }
 
     #[test]
@@ -1228,7 +1335,7 @@ mod output_scan_tests {
         let mut state = OutputScanState::default();
         let mut result = OutputScanResult::default();
         scan_output_chunk(&input, &mut state, &mut result);
-        let finalized = finalize_scan_state(&mut state);
+        let finalized = finalize_scan_state(&mut state, None);
 
         assert_eq!(result.osc_overflow.len(), 1);
         assert!(!finalized.truncated_escape);
@@ -1244,7 +1351,7 @@ mod output_scan_tests {
         let mut state = OutputScanState::default();
         let mut result = OutputScanResult::default();
         scan_output_chunk(b"hello\x1b]52;c;aGVsbG8", &mut state, &mut result);
-        let fin = finalize_scan_state(&mut state);
+        let fin = finalize_scan_state(&mut state, None);
         assert!(fin.truncated_escape, "truncated OSC must flag in-flight");
         assert!(
             fin.truncated_osc52,
@@ -1258,7 +1365,7 @@ mod output_scan_tests {
         let mut state = OutputScanState::default();
         let mut result = OutputScanResult::default();
         scan_output_chunk(b"hello world\n", &mut state, &mut result);
-        let fin = finalize_scan_state(&mut state);
+        let fin = finalize_scan_state(&mut state, None);
         assert!(!fin.truncated_escape);
         assert!(!fin.truncated_osc52);
     }
@@ -1269,7 +1376,7 @@ mod output_scan_tests {
         let mut state = OutputScanState::default();
         let mut result = OutputScanResult::default();
         scan_output_chunk(b"prefix\x1b[31", &mut state, &mut result);
-        let fin = finalize_scan_state(&mut state);
+        let fin = finalize_scan_state(&mut state, None);
         assert!(fin.truncated_escape);
         assert!(!fin.truncated_osc52, "CSI != OSC52");
     }

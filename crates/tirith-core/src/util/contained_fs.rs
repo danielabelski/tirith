@@ -39,6 +39,23 @@ impl ContainedAtomicFile {
     pub fn write_atomic(&self, contents: &[u8], overwrite: bool) -> io::Result<()> {
         self.0.write_atomic(contents, overwrite)
     }
+
+    /// Streaming variant of [`ContainedAtomicFile::write_atomic`]: copy from
+    /// `reader` into the prepared temporary file, fsync it, then publish
+    /// relative to the retained parent capability. When `unix_mode` is
+    /// `Some`, the temporary file is `fchmod`'d BEFORE publication so the
+    /// destination entry appears with its final permissions atomically — no
+    /// post-rename chmod window and no more-permissive intermediate mode.
+    /// Ignored off unix.
+    pub fn write_atomic_from_reader<R: std::io::Read + ?Sized>(
+        &self,
+        reader: &mut R,
+        overwrite: bool,
+        unix_mode: Option<u32>,
+    ) -> io::Result<()> {
+        self.0
+            .write_atomic_from_reader(reader, overwrite, unix_mode)
+    }
 }
 
 /// Create `dir` and any missing ancestors through retained directory
@@ -484,6 +501,16 @@ mod platform {
         }
 
         pub(super) fn write_atomic(&self, contents: &[u8], overwrite: bool) -> io::Result<()> {
+            let mut slice = contents;
+            self.write_atomic_from_reader(&mut slice, overwrite, None)
+        }
+
+        pub(super) fn write_atomic_from_reader<R: std::io::Read + ?Sized>(
+            &self,
+            reader: &mut R,
+            overwrite: bool,
+            unix_mode: Option<u32>,
+        ) -> io::Result<()> {
             require_nonsymlink_final(&self.parent, &self.name, &self.display)?;
             if !overwrite && inspect_final(&self.parent, &self.name)?.is_some() {
                 return Err(io::Error::new(
@@ -521,7 +548,18 @@ mod platform {
             };
             // SAFETY: `fd` is a newly owned descriptor.
             let mut file = unsafe { File::from_raw_fd(fd) };
-            file.write_all(contents)?;
+            // Apply the caller's final mode BEFORE any byte is published so the
+            // destination entry never exists with a more permissive
+            // intermediate mode and no post-rename chmod window exists
+            // (repo-0261). The already-open O_WRONLY descriptor keeps writing
+            // even to a read-only mode.
+            if let Some(mode) = unix_mode {
+                // SAFETY: `file` is a live, uniquely owned descriptor.
+                if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            std::io::copy(reader, &mut file)?;
             file.flush()?;
             file.sync_all()?;
 
@@ -1240,6 +1278,16 @@ mod platform {
         }
 
         pub(super) fn write_atomic(&self, contents: &[u8], overwrite: bool) -> io::Result<()> {
+            let mut slice = contents;
+            self.write_atomic_from_reader(&mut slice, overwrite, None)
+        }
+
+        pub(super) fn write_atomic_from_reader<R: std::io::Read + ?Sized>(
+            &self,
+            reader: &mut R,
+            overwrite: bool,
+            _unix_mode: Option<u32>,
+        ) -> io::Result<()> {
             let exists = inspect_destination(&self.parent, &self.name, &self.display)?;
             if exists && !overwrite {
                 return Err(io::Error::new(
@@ -1264,7 +1312,7 @@ mod platform {
                 armed: true,
             };
             inspect_regular(raw_handle(&temp.file), &self.display)?;
-            temp.file.write_all(contents)?;
+            std::io::copy(reader, &mut temp.file)?;
             temp.file.flush()?;
             temp.file.sync_all()?;
 
@@ -1505,6 +1553,15 @@ mod platform {
         }
 
         pub(super) fn write_atomic(&self, _contents: &[u8], _overwrite: bool) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub(super) fn write_atomic_from_reader<R: std::io::Read + ?Sized>(
+            &self,
+            _reader: &mut R,
+            _overwrite: bool,
+            _unix_mode: Option<u32>,
+        ) -> io::Result<()> {
             Err(unsupported())
         }
     }

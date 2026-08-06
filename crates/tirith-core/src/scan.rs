@@ -551,6 +551,13 @@ fn hash_path_within_budget(path: &Path) -> Option<String> {
 
 /// Scan a single file and return its [`ScanFileOutcome`].
 ///
+
+/// repo-0422: path text in diagnostics comes from the scanned tree and can
+/// contain ANSI/OSC control bytes — sanitize before writing to stderr.
+fn sanitized_display(path: &Path) -> String {
+    crate::mcp::output_filter::sanitize_for_display(&path.display().to_string())
+}
+
 /// A2d — ONE handle, bounded hash. We open ONCE (no-follow, refusing a symlinked
 /// final component so a planted symlink can't redirect the read outside the
 /// tree), `fstat` THAT open fd, and read/hash from the SAME handle — closing the
@@ -581,7 +588,7 @@ fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome
         Err(crate::util::OpenRegularError::NotFound) => {
             eprintln!(
                 "tirith: scan: cannot read {} (not found)",
-                logical_path.display()
+                sanitized_display(logical_path)
             );
             return ScanFileOutcome::Skipped(CoverageGap {
                 location,
@@ -592,7 +599,7 @@ fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome
         Err(crate::util::OpenRegularError::NotRegularFile) => {
             eprintln!(
                 "tirith: scan: skipping {} (symlink or non-regular file)",
-                logical_path.display()
+                sanitized_display(logical_path)
             );
             return ScanFileOutcome::Skipped(CoverageGap {
                 location,
@@ -604,7 +611,10 @@ fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome
         // unreadable for totality rather than panicking.
         Err(crate::util::OpenRegularError::TooLarge)
         | Err(crate::util::OpenRegularError::Io(_)) => {
-            eprintln!("tirith: scan: cannot read {}", logical_path.display());
+            eprintln!(
+                "tirith: scan: cannot read {}",
+                sanitized_display(logical_path)
+            );
             return ScanFileOutcome::Skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
@@ -631,7 +641,10 @@ fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome
     let size = match file.metadata() {
         Ok(m) => m.len(),
         Err(e) => {
-            eprintln!("tirith: scan: cannot stat {}: {e}", logical_path.display());
+            eprintln!(
+                "tirith: scan: cannot stat {}: {e}",
+                sanitized_display(logical_path)
+            );
             return ScanFileOutcome::Skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
@@ -654,7 +667,7 @@ fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome
         };
         eprintln!(
             "tirith: scan: skipping {} (exceeds {}B analysis limit: {})",
-            logical_path.display(),
+            sanitized_display(logical_path),
             MAX_FILE_SIZE,
             kind.as_str()
         );
@@ -703,7 +716,7 @@ fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome
                 };
                 eprintln!(
                     "tirith: scan: skipping {} (grew past {}B analysis limit during read)",
-                    logical_path.display(),
+                    sanitized_display(logical_path),
                     MAX_FILE_SIZE
                 );
                 return ScanFileOutcome::Skipped(CoverageGap {
@@ -714,7 +727,10 @@ fn scan_single_file_at(read_path: &Path, logical_path: &Path) -> ScanFileOutcome
             }
             Ok(_) => buf,
             Err(e) => {
-                eprintln!("tirith: scan: cannot read {}: {e}", logical_path.display());
+                eprintln!(
+                    "tirith: scan: cannot read {}: {e}",
+                    sanitized_display(logical_path)
+                );
                 return ScanFileOutcome::Skipped(CoverageGap {
                     location,
                     kind: CoverageGapKind::Unreadable,
@@ -770,7 +786,7 @@ fn catch_panic_scanning<T>(file_path: &Path, f: impl FnOnce() -> T) -> Option<T>
         Err(_) => {
             eprintln!(
                 "tirith: scan: internal error scanning {} (skipped — see panic message above)",
-                file_path.display()
+                sanitized_display(file_path)
             );
             None
         }
@@ -933,12 +949,15 @@ fn collect_files(
         Ok(metadata) => metadata,
         Err(error) => {
             let gap = if error.kind() == std::io::ErrorKind::NotFound {
-                eprintln!("tirith: scan: path does not exist: {}", path.display());
+                eprintln!(
+                    "tirith: scan: path does not exist: {}",
+                    sanitized_display(path)
+                );
                 unreadable_gap(path)
             } else {
                 eprintln!(
                     "tirith: scan: cannot inspect requested path {}: {error}",
-                    path.display()
+                    sanitized_display(path)
                 );
                 enumeration_gap(path)
             };
@@ -981,7 +1000,7 @@ fn collect_files(
     if !metadata.is_dir() {
         eprintln!(
             "tirith: scan: path is not a regular file or directory: {}",
-            path.display()
+            sanitized_display(path)
         );
         return CollectedFiles {
             text_candidates: Vec::new(),
@@ -1045,7 +1064,10 @@ fn collect_files_recursive(
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("tirith: scan: cannot read directory {}: {e}", dir.display());
+            eprintln!(
+                "tirith: scan: cannot read directory {}: {e}",
+                sanitized_display(dir)
+            );
             collected.coverage_gaps.push(enumeration_gap(dir));
             return;
         }
@@ -1057,7 +1079,7 @@ fn collect_files_recursive(
             Err(e) => {
                 eprintln!(
                     "tirith: scan: error reading entry in {}: {e}",
-                    dir.display()
+                    sanitized_display(dir)
                 );
                 collected.coverage_gaps.push(enumeration_gap(dir));
                 continue;
@@ -1076,7 +1098,7 @@ fn collect_files_recursive(
             Err(e) => {
                 eprintln!(
                     "tirith: scan: cannot stat entry {}: {e} (skipped)",
-                    path.display()
+                    sanitized_display(&path)
                 );
                 collected.coverage_gaps.push(enumeration_gap(&path));
                 continue;
@@ -1188,6 +1210,14 @@ fn collect_config_symlink(
 ) {
     let is_config_link = is_priority_file(logical_path)
         || crate::rules::aifile::is_ai_config_file(logical_path)
+        // repo-0421: dependency manifests are security-relevant logical names
+        // too — a symlinked `package.json` must scan its in-root target or
+        // produce a coverage gap, never a silent skip.
+        || logical_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::ecosystem_scan::ManifestKind::from_file_name)
+            .is_some()
         || logical_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1209,7 +1239,7 @@ fn collect_config_symlink(
         Err(e) => {
             eprintln!(
                 "tirith: scan: cannot resolve config symlink {}: {e}",
-                logical_path.display()
+                sanitized_display(logical_path)
             );
             collected.coverage_gaps.push(unreadable_gap(logical_path));
             return;

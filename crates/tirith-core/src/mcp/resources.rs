@@ -56,6 +56,19 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                 crate::redact::redact_findings(&mut fr.findings, &policy.dlp_custom_patterns);
             }
 
+            // repo-0293: honor the operator's completeness policy — under
+            // `scan.require_complete` (or per-gap Fail actions) coverage gaps
+            // must surface as an explicit incomplete marker, not a clean
+            // resource response.
+            let completeness_violation = !result.coverage_gaps.is_empty()
+                && (policy.scan.require_complete
+                    || result.coverage_gaps.iter().any(|gap| {
+                        matches!(
+                            policy.scan.action_for_gap_kind(gap.kind),
+                            crate::policy::GapAction::Fail
+                        )
+                    }));
+
             let report = json!({
                 "scanned_count": result.scanned_count,
                 "skipped_count": result.skipped_count,
@@ -65,6 +78,7 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>(),
                 "analysis_incomplete": !result.coverage_gaps.is_empty(),
+                "completeness_policy_violated": completeness_violation,
                 "coverage_gaps": &result.coverage_gaps,
                 "total_findings": result.total_findings(),
                 "files": result.file_results.iter()

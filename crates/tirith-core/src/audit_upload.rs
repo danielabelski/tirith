@@ -5,6 +5,35 @@ use std::path::PathBuf;
 const DEFAULT_MAX_EVENTS: usize = 1000;
 const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
 
+/// Dedicated cross-process lock guarding every spool read/append/rewrite
+/// (repo-0250): without it, two drainers snapshot-then-rewrite from stale
+/// state and can delete or duplicate each other's events.
+fn spool_lock_path() -> PathBuf {
+    let mut name = spool_path().into_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn with_spool_lock<R>(f: impl FnOnce() -> std::io::Result<R>) -> std::io::Result<R> {
+    use fs2::FileExt as _;
+    let lock_path = spool_lock_path();
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&lock_path)?;
+    file.lock_exclusive()?;
+    let result = f();
+    let _ = file.unlock();
+    result
+}
+
 /// Spool file path: `$XDG_STATE_HOME/tirith/audit-queue.jsonl` (falls back to
 /// `~/.local/state/...`).
 fn spool_path() -> PathBuf {
@@ -20,6 +49,10 @@ fn spool_path() -> PathBuf {
 ///
 /// DLP redaction must be applied **before** calling this function.
 pub fn spool_event(event_json: &str) -> std::io::Result<()> {
+    with_spool_lock(|| spool_event_locked(event_json))
+}
+
+fn spool_event_locked(event_json: &str) -> std::io::Result<()> {
     let path = spool_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -88,7 +121,10 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
         return;
     }
 
-    let content = match fs::read_to_string(&path) {
+    // Snapshot under the spool lock (repo-0250); the network phase runs
+    // unlocked so appends are not blocked behind slow sends, and the final
+    // rewrite re-locks and removes only the prefix this drainer actually sent.
+    let content = match with_spool_lock(|| fs::read_to_string(&path)) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -161,21 +197,27 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
 
 /// Rewrite the spool file with the remaining unsent lines.
 fn rewrite_spool(path: &std::path::Path, remaining: &[String]) {
-    if remaining.is_empty() {
-        if let Err(e) = fs::write(path, "") {
-            crate::audit::audit_diagnostic(format!(
-                "tirith: audit-spool: failed to clear spool: {e}"
-            ));
+    let _ = with_spool_lock(|| {
+        // repo-0250: under the lock, re-read the CURRENT file and remove only
+        // the prefix this drainer sent. Events appended by another process
+        // while we were sending land at the end and must survive. On any
+        // suffix mismatch (another drainer intervened), keep the file as-is —
+        // at-least-once delivery beats silent loss.
+        let current = fs::read_to_string(path).unwrap_or_default();
+        let current_lines: Vec<String> = current.lines().map(String::from).collect();
+        if current_lines.len() < remaining.len()
+            || current_lines[current_lines.len() - remaining.len()..] != *remaining
+        {
+            return Ok(());
         }
-    } else {
+        let keep = &current_lines[..current_lines.len() - remaining.len()];
+        let _ = keep; // the sent prefix we are dropping
         let mut content = remaining.join("\n");
-        content.push('\n');
-        if let Err(e) = fs::write(path, content) {
-            crate::audit::audit_diagnostic(format!(
-                "tirith: audit-spool: failed to rewrite spool: {e}"
-            ));
+        if !content.is_empty() {
+            content.push('\n');
         }
-    }
+        fs::write(path, content)
+    });
 }
 
 /// Primary entry point: append the event to the durable spool, then spawn a
@@ -272,11 +314,30 @@ mod tests {
     fn test_rewrite_spool_with_remaining() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.jsonl");
-        fs::write(&path, "").unwrap();
+        // The on-disk spool holds the drainer's snapshot (sent + unsent lines).
+        fs::write(&path, "line1\nline2\nline3\nline4\n").unwrap();
 
         let remaining = vec!["line3".to_string(), "line4".to_string()];
         rewrite_spool(&path, &remaining);
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "line3\nline4\n");
+    }
+
+    #[test]
+    fn test_rewrite_spool_preserves_concurrent_appends() {
+        // repo-0250: lines appended by another process AFTER the drainer's
+        // snapshot must survive the rewrite; the rewrite is refused when the
+        // pending tail no longer matches (at-least-once beats silent loss).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        fs::write(&path, "line1\nline3\nline4\nline5-new\n").unwrap();
+
+        let remaining = vec!["line3".to_string(), "line4".to_string()];
+        rewrite_spool(&path, &remaining);
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content, "line1\nline3\nline4\nline5-new\n",
+            "a suffix mismatch must leave the spool untouched"
+        );
     }
 }

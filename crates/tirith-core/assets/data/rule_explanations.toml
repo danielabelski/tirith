@@ -1725,6 +1725,17 @@ examples_good = ["A normal log file that ends with a newline or any non-escape b
 false_positive_guidance = "True-positive in practice: well-formed terminal output terminates its OSC/CSI sequences and keeps control payloads bounded. A truncated or oversized sequence usually means the producer was cut off, hostile, or tampered with."
 remediation = "Under fail-closed mode the wrapping response is replaced with a placeholder. Under fail-open the finding is surfaced as a warning; consult the audit log and re-fetch the source if possible."
 
+[[rule]]
+id = "output_analysis_overflow"
+title = "Output evidence exceeded bounded analyzer retention"
+category = "output"
+severity_rationale = "High — the byte scanner dropped escape-sequence evidence past its per-class retention cap, so the stream was analyzed with partial evidence. Treating this as analysis-incomplete prevents an attacker from flooding harmless sequences to push real evidence past the cap."
+description = "The streamed output contained more escape-sequence hits than the analyzer retains per evidence class. Excess hits were counted and dropped instead of allocated, so memory stays bounded; the finding marks the resulting analysis as partial."
+examples_bad = ["A 16 MiB tool response consisting of millions of four-byte SGR resets — designed to amplify analyzer memory or push a later malicious sequence past the evidence cap."]
+examples_good = ["Ordinary terminal output with far fewer than the per-class hit cap of escape sequences."]
+false_positive_guidance = "Effectively never: legitimate terminal streams stay orders of magnitude below the cap. Reaching it indicates an adversarial or pathological producer."
+remediation = "Fail-closed callers should deny the stream. Re-fetch or re-run the producer if the content is legitimately needed; the cap itself is deliberate and not tunable per stream."
+
 # M7 ch5 — prompt-injection seed phrases.
 
 [[rule]]

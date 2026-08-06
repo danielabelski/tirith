@@ -290,6 +290,11 @@ pub enum RuleId {
     /// bounded analysis retention. Truncated/oversized `\e]52;<base64>` must
     /// remain High and fail closed instead of being silently dropped.
     OutputTruncatedEscapeSequence,
+    /// repo-0279 — streamed-output evidence exceeded the analyzer's bounded
+    /// retention, so hits were DROPPED. Attacker-amplified escape density must
+    /// surface as an analysis-incomplete signal rather than silent evidence
+    /// loss or unbounded allocation.
+    OutputAnalysisOverflow,
 
     // Prompt-injection rules (M7 ch5) — fire from `rules::prompt_injection` when
     // a seed phrase appears, reached from `analyze_output` and from `analyze`

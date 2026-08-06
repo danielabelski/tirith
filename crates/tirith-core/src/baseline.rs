@@ -223,9 +223,10 @@ fn salt_state(salt_file: &Path) -> std::sync::Arc<SaltState> {
 /// Read the salt from `salt_file` (must be exactly [`SALT_LEN`] bytes), or
 /// generate a fresh 32-byte salt and persist it atomically at `0600`.
 ///
-/// Fail-open with a floor: if absent/corrupt AND unpersistable, returns
-/// [`SaltState::Disabled`] (with a one-time warning) rather than an unpersisted
-/// salt that would churn every hash forever (F4).
+/// Fail-open with a floor: if absent/corrupt AND unpersistable, or if the OS
+/// CSPRNG fails (no time-derived salt is ever persisted — repo-0251), returns
+/// [`SaltState::Disabled`] (with a one-time warning) rather than an
+/// unpersisted or predictable salt that would churn every hash forever (F4).
 fn load_salt_state(salt_file: &Path) -> SaltState {
     let mut existing_is_corrupt = false;
     // R9 #C + R11 #1/#4: read through the race-free capped helper (O_NONBLOCK +
@@ -241,16 +242,16 @@ fn load_salt_state(salt_file: &Path) -> SaltState {
         Err(_) => existing_is_corrupt = true,
     }
 
-    // Fresh 32-byte salt from the OS RNG; on entropy failure fall back to a
-    // time-derived salt so hashing never aborts (fail-open — a weak salt only
-    // weakens privacy for this process, never crashes).
+    // Fresh 32-byte salt from the OS RNG. On entropy failure NEVER fall back
+    // to time-derived material: a predictable value persisted as the
+    // installation salt would let anyone holding the shareable baseline store
+    // enumerate plausible clock values and reverse the truncated hashes
+    // (repo-0251). Disable baseline for this session instead; a later run
+    // retries secure generation.
     let mut salt = [0u8; SALT_LEN];
-    if getrandom::fill(&mut salt).is_err() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        salt[..16].copy_from_slice(&nanos.to_le_bytes());
+    if let Err(error) = getrandom::fill(&mut salt) {
+        warn_entropy_failure_once(salt_file, &error);
+        return SaltState::Disabled;
     }
     let salt = salt.to_vec();
 
@@ -383,6 +384,20 @@ fn warn_baseline_disabled_once(salt_file: &Path) {
             "tirith: WARNING: baseline salt at {} is unreadable and could not be \
              written; anomaly baseline is disabled for this session (run \
              `tirith doctor` to diagnose the state directory).",
+            salt_file.display()
+        );
+    }
+}
+
+fn warn_entropy_failure_once(salt_file: &Path, error: &getrandom::Error) {
+    use std::sync::atomic::Ordering;
+    if !SALT_WARNED.swap(true, Ordering::Relaxed) {
+        // Write fallibly so a closed/broken stderr cannot panic (R22 #4).
+        let _ = writeln!(
+            std::io::stderr(),
+            "tirith: WARNING: the OS entropy source failed ({error}); no \
+             time-derived salt was generated or persisted at {} and anomaly \
+             baseline is disabled for this session.",
             salt_file.display()
         );
     }

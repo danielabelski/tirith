@@ -81,14 +81,19 @@ use super::{
 /// The stable backend identifier reported in receipts and `tirith doctor`.
 pub const BACKEND_ID: &str = "appcontainer";
 
-/// Resource dimensions mapped into the Job Object by `job_object_limits`.
+/// Resource dimensions enforced by the traced launch path: CPU time, job
+/// memory, and active-process count are mapped into the Job Object by
+/// `job_object_limits`, and the wall-clock deadline is enforced by the CLI
+/// executor's finite `wait_for` (which terminates the Job on expiry). Open
+/// handles have no per-Job mechanism and output bytes are not captured by this
+/// launcher, so those two dimensions remain honestly unsupported.
 const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
     cpu_seconds: true,
     memory_bytes: true,
     max_processes: true,
     max_open_files: false,
     max_output_bytes: false,
-    wall_clock_seconds: false,
+    wall_clock_seconds: true,
 };
 
 /// The display name handed to `CreateAppContainerProfile` for tirith's containers.
@@ -829,7 +834,8 @@ mod tests {
         spec.resources = ResourceLimits::default();
         assert!(!derive_coverage(&spec, &probe).resource_limits_enforced);
 
-        // Only wall-clock / output (NOT Job-Object-able) -> still not claimed.
+        // Only wall-clock (wait-enforced) + output (NOT enforced anywhere) ->
+        // still not claimed, because output remains unenforced.
         spec.resources = ResourceLimits {
             wall_clock_seconds: Some(60),
             max_output_bytes: Some(1024),

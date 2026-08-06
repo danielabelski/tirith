@@ -7,18 +7,33 @@ const DNS_BLOCKLISTS: &[(&str, &str)] = &[
     ("dnsbl.sorbs.net", "SORBS"),
 ];
 
+/// repo-0300: per-call work bounds — unique addresses queried and an overall
+/// wall-clock budget (system DNS has no per-query deadline).
+const MAX_DNSBL_ADDRESSES: usize = 8;
+const MAX_DNSBL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Check if a domain appears in DNS-based blocklists (DNSBLs): resolve the
 /// domain to IPs, then query each DNSBL with the reversed-IP lookup format.
 /// Returns the matching blocklist display names (empty on no resolution/match).
 pub fn check_dns_blocklist(domain: &str) -> Vec<String> {
-    let ips = match resolve_domain_ips(domain) {
+    // repo-0300: attacker-controlled hosts reach this function through daemon
+    // enrichment. Bound the total work: one resolution, a capped number of
+    // unique addresses, and an overall deadline so a hostile domain cannot pin
+    // a blocking worker for an attacker-controlled duration.
+    let deadline = std::time::Instant::now() + MAX_DNSBL_BUDGET;
+    let mut ips = match resolve_domain_ips(domain) {
         Some(ips) => ips,
         None => return Vec::new(),
     };
+    ips.sort();
+    ips.dedup();
 
     let mut matches = Vec::new();
 
-    for ip in &ips {
+    for ip in ips.iter().take(MAX_DNSBL_ADDRESSES) {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         let reversed = reverse_ipv4(ip);
         let reversed = match reversed {
             Some(r) => r,
@@ -26,6 +41,9 @@ pub fn check_dns_blocklist(domain: &str) -> Vec<String> {
         };
 
         for &(zone, display_name) in DNS_BLOCKLISTS {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             let query = format!("{reversed}.{zone}");
             if dnsbl_lookup(&query) {
                 let entry = display_name.to_string();

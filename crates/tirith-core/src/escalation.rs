@@ -611,8 +611,88 @@ pub fn post_process_verdict_for_verification(
         crate::session_warnings::correlate_session_with_provisional(session_id, &provisional_events)
     };
     apply_correlation_findings(&mut effective, policy, &correlation_hits);
+    if !correlation_hits.is_empty() {
+        reapply_monotonic_policy_effects(&mut effective, policy, caller);
+    }
 
     effective
+}
+
+/// Re-run the monotonic policy controls (action overrides, approval, paranoia
+/// filtering) over a verdict that was AUGMENTED with correlation findings
+/// after the first [`apply_stateless_policy_effects`] pass (repo-0281).
+///
+/// Correlation findings are appended AFTER the unified policy pipeline because
+/// they depend on typed events derived from the post-policy verdict. Without
+/// this second pass, a policy `action_overrides` entry blocking a correlation
+/// rule (e.g. `DependencyChangeThenNetwork`) or an approval rule targeting it
+/// was silently ignored, and paranoia never evaluated the appended finding.
+///
+/// Only correlation findings can change the outcome here: every control below
+/// is idempotent over the findings the first pass already processed
+/// (`apply_action_overrides` only upgrades, approval matching is stable for an
+/// unchanged finding set, and paranoia filtering removes nothing twice).
+/// `apply_agent_rules` is deliberately NOT re-run: it keys on the caller
+/// origin, not findings, and re-running would duplicate its denial finding.
+/// Escalation is likewise not re-run: it is session-stateful (repeat-density
+/// recording), not a monotonic pure function of the finding set.
+fn reapply_monotonic_policy_effects(
+    effective: &mut Verdict,
+    policy: &crate::policy::Policy,
+    caller: CallerContext,
+) {
+    // Snapshot for the causal re-add lookups below (paranoia must never leave a
+    // causal action without its explaining finding, mirroring the first pass).
+    let baseline_findings = effective.findings.clone();
+    let mut causal_rule_ids: HashSet<String> = HashSet::new();
+
+    // Action overrides over the AUGMENTED finding set: an operator override
+    // targeting a correlation rule now applies to the appended finding.
+    if !policy.action_overrides.is_empty() {
+        let (new_action, caused_by) = apply_action_overrides(
+            effective.action,
+            &effective.findings,
+            &policy.action_overrides,
+        );
+        effective.action = new_action;
+        causal_rule_ids.extend(caused_by);
+    }
+
+    // Approval rules over the augmented set: an approval rule targeting a
+    // correlation finding can now match (and, for non-CLI callers, blocks).
+    if effective.action != Action::Block {
+        if let Some(meta) = crate::approval::check_approval(effective, policy) {
+            crate::approval::apply_approval(effective, &meta);
+            causal_rule_ids.insert(meta.rule_id.clone());
+            if caller != CallerContext::Cli && effective.requires_approval == Some(true) {
+                effective.action = Action::Block;
+            }
+        }
+    }
+
+    // Paranoia filtering evaluates the correlation findings too, with the same
+    // "never downgrade a causal action" protection as the first pass.
+    let pre_paranoia_action = effective.action;
+    crate::engine::filter_findings_by_paranoia(effective, policy.paranoia);
+    if !causal_rule_ids.is_empty()
+        && action_rank(pre_paranoia_action) > action_rank(effective.action)
+    {
+        effective.action = pre_paranoia_action;
+    }
+    for causal in &baseline_findings {
+        if !causal_rule_ids.contains(&causal.rule_id.to_string()) {
+            continue;
+        }
+        let already_present = effective.findings.iter().any(|ef| {
+            ef.rule_id == causal.rule_id
+                && ef.severity == causal.severity
+                && ef.title == causal.title
+                && ef.description == causal.description
+        });
+        if !already_present {
+            effective.findings.push(causal.clone());
+        }
+    }
 }
 
 /// Post-processing pipeline applied after the engine produces a raw verdict:
@@ -719,6 +799,9 @@ pub fn post_process_verdict(
         crate::session_warnings::correlate_session_with_provisional(session_id, &provisional_events)
     };
     apply_correlation_findings(&mut effective, policy, &correlation_hits);
+    if !correlation_hits.is_empty() {
+        reapply_monotonic_policy_effects(&mut effective, policy, caller);
+    }
 
     effective
 }
@@ -1633,9 +1716,10 @@ fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) ->
     let mut out: Vec<String> = Vec::new();
 
     // 1) Shell redirection target anywhere in the raw segment: `> ~/.npmrc`.
-    if let Some(path) = redirection_target(&seg.raw) {
-        out.push(path);
-    }
+    // EVERY redirection is collected (the shell opens all of them for writing,
+    // even when a later redirect wins the fd), and each target is dequoted so
+    // `printf x > ".env"` still matches the `.env` secret basename.
+    out.extend(redirection_targets(&seg.raw));
 
     // 2) Downloader output flag: `curl -o .env`, `wget -O id_rsa`. The flag set is
     // TOOL-AWARE (see `output_target_value_flags`): curl `-O`/`--remote-name` is
@@ -1713,7 +1797,11 @@ fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) ->
         _ => {}
     }
 
-    out
+    // Dequote every collected target once, here: segment args retain their
+    // shell quoting, so a quoted destination (`curl -o ".env"`, `cp a '.env'`,
+    // `tee ".npmrc"`) would otherwise defeat the exact secret/manifest basename
+    // comparisons downstream.
+    out.into_iter().map(|t| shell_dequote(&t)).collect()
 }
 
 /// Compute the per-source write targets for a `cp -t DIR a b ...` (or mv/install)
@@ -1799,13 +1887,73 @@ fn path_is_manifest(path: &str) -> bool {
     crate::event_buffer::is_dependency_manifest(base)
 }
 
-/// Find a `> path` / `>> path` redirection target in raw segment text and return
-/// the path (unclassified). Tokenizes on whitespace and looks for a `>`/`>>`
-/// token (or a `>`-prefixed token) followed by a path. Also handles a file
-/// descriptor prefix immediately before the operator (`1>.env`, `2>package.json`,
-/// `1> .env`): a single leading digit 0-9 designates the redirected fd and does
-/// not change that the FOLLOWING text is the write target.
-fn redirection_target(raw: &str) -> Option<String> {
+/// POSIX shell dequoting for a single word: single quotes are literal, double
+/// quotes allow backslash escapes only before `$` `` ` `` `"` `\` and newline,
+/// and an unquoted backslash escapes the next character (a backslash-newline
+/// pair is removed). Unterminated quotes degrade to "rest of token is quoted",
+/// matching how far the analysis can safely go. Dynamic content (`$`,
+/// backticks) is preserved verbatim: such targets simply never match the
+/// literal secret/manifest basenames, so an unresolved dynamic destination
+/// stays a documented blind spot rather than a fabricated finding.
+fn shell_dequote(tok: &str) -> String {
+    let mut out = String::with_capacity(tok.len());
+    let mut chars = tok.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                for inner in chars.by_ref() {
+                    if inner == '\'' {
+                        break;
+                    }
+                    out.push(inner);
+                }
+            }
+            '"' => {
+                while let Some(inner) = chars.next() {
+                    match inner {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(&next) = chars.peek() {
+                                if matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                                    if next != '\n' {
+                                        out.push(next);
+                                    }
+                                    chars.next();
+                                } else {
+                                    out.push('\\');
+                                }
+                            } else {
+                                out.push('\\');
+                            }
+                        }
+                        _ => out.push(inner),
+                    }
+                }
+            }
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    if next != '\n' {
+                        out.push(next);
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Find every `> path` / `>> path` redirection target in raw segment text and
+/// return the paths (unclassified, still shell-quoted; callers dequote).
+///
+/// Unlike a first-match scan this returns ALL redirections: the shell opens
+/// every redirection target for writing left-to-right, so
+/// `printf x > /tmp/log > .env` still TRUNCATES `.env` even though the later
+/// redirect wins stdout. Recognises separated (`> path`) and attached
+/// (`>path`) forms, a single-digit fd prefix (`1>.env`, `2>>log`), and the
+/// bash both-streams spellings (`&> path`, `&>>path`). fd-duplication and
+/// close targets (`>&2`, `2>&1`, `>&-`) are NOT file writes and are skipped.
+fn redirection_targets(raw: &str) -> Vec<String> {
     /// Strip a single optional leading fd digit (0-9) from a redirection token, so
     /// `1>` / `2>>` / `1>.env` are normalised to `>` / `>>` / `>.env`. POSIX allows
     /// multi-digit fds, but a single digit covers the practical stdout/stderr
@@ -1823,23 +1971,36 @@ fn redirection_target(raw: &str) -> Option<String> {
         }
         tok
     }
+    let mut out = Vec::new();
     let toks: Vec<&str> = raw.split_whitespace().collect();
     for (i, raw_tok) in toks.iter().enumerate() {
         let tok = strip_fd_prefix(raw_tok);
-        // `> path` or `>> path` (separated), with optional fd prefix (`1> path`).
-        if (tok == ">" || tok == ">>") || (tok.ends_with('>') && tok.chars().all(|c| c == '>')) {
+        // Normalise the operator spellings: bash `&>`/`&>>` (both streams) and
+        // the ordinary `>`/`>>`. Whatever remains after the operator is either
+        // the attached target or empty (separated form: the NEXT token is the
+        // target).
+        let rest = tok
+            .strip_prefix("&>>")
+            .or_else(|| tok.strip_prefix("&>"))
+            .or_else(|| tok.strip_prefix(">>"))
+            .or_else(|| tok.strip_prefix('>'));
+        let Some(rest) = rest else {
+            continue;
+        };
+        if rest.is_empty() {
+            // Separated form: `> path`, `1> path`, `&> path`.
             if let Some(next) = toks.get(i + 1) {
-                return Some((*next).to_string());
+                out.push((*next).to_string());
             }
+            continue;
         }
-        // `>path` / `>>path` (attached), with optional fd prefix (`1>path`).
-        if let Some(rest) = tok.strip_prefix(">>").or_else(|| tok.strip_prefix('>')) {
-            if !rest.is_empty() {
-                return Some(rest.to_string());
-            }
+        // fd duplication (`>&2`, `2>&1`) or close (`>&-`): no file is written.
+        if rest.starts_with('&') {
+            continue;
         }
+        out.push(rest.to_string());
     }
-    None
+    out
 }
 
 #[cfg(test)]
@@ -3470,16 +3631,105 @@ mod tests {
         // POSIX fd-prefixed redirections (`1>.env`, `2>package.json`, `1> .env`)
         // designate a redirected fd but still write the FOLLOWING text. Each must be
         // recognized as the write target, glued and separated.
-        assert_eq!(redirection_target("printf x 1>.env"), Some(".env".into()));
+        assert_eq!(redirection_targets("printf x 1>.env"), vec![".env"]);
         assert_eq!(
-            redirection_target("printf x 2>package.json"),
-            Some("package.json".into())
+            redirection_targets("printf x 2>package.json"),
+            vec!["package.json"]
         );
-        assert_eq!(redirection_target("printf x 1> .env"), Some(".env".into()));
+        assert_eq!(redirection_targets("printf x 1> .env"), vec![".env"]);
         // Plain forms still work, and a non-redirection token is not a target.
-        assert_eq!(redirection_target("printf x > .env"), Some(".env".into()));
-        assert_eq!(redirection_target("printf x >> .env"), Some(".env".into()));
-        assert_eq!(redirection_target("printf x .env"), None);
+        assert_eq!(redirection_targets("printf x > .env"), vec![".env"]);
+        assert_eq!(redirection_targets("printf x >> .env"), vec![".env"]);
+        assert!(redirection_targets("printf x .env").is_empty());
+    }
+
+    #[test]
+    fn redirection_targets_collects_every_redirect_and_skips_fd_dup() {
+        // Every redirection target is a file the shell opens for writing, so the
+        // concealed second redirect must be reported alongside the first.
+        assert_eq!(
+            redirection_targets("printf x > /tmp/log > .env"),
+            vec!["/tmp/log", ".env"]
+        );
+        // bash both-streams spellings.
+        assert_eq!(redirection_targets("make &> build.log"), vec!["build.log"]);
+        assert_eq!(redirection_targets("make &>>build.log"), vec!["build.log"]);
+        // fd duplication / close are not file writes.
+        assert!(redirection_targets("printf x 2>&1").is_empty());
+        assert!(redirection_targets("printf x >&2").is_empty());
+        assert!(redirection_targets("printf x >&-").is_empty());
+    }
+
+    #[test]
+    fn shell_dequote_restores_quoted_literal_paths() {
+        assert_eq!(shell_dequote("\".env\""), ".env");
+        assert_eq!(shell_dequote("'.env'"), ".env");
+        assert_eq!(shell_dequote(".e\\nv"), ".env");
+        assert_eq!(shell_dequote("\"/tmp/my file/.env\""), "/tmp/my file/.env");
+        // Dynamic content survives verbatim (never matches a literal basename).
+        assert_eq!(shell_dequote("\"$HOME/.env\""), "$HOME/.env");
+    }
+
+    #[test]
+    fn quoted_and_secondary_redirection_targets_still_raise_secret_write() {
+        // repo-0282 regression: a quoted destination and a concealed later
+        // redirect must both still produce the SecretWrite event.
+        for cmd in ["printf x > \".env\"", "printf x > /tmp/log > .env"] {
+            let v = raw_verdict_with(Action::Allow, vec![], None);
+            let events = derive_typed_events(cmd, &v);
+            assert!(
+                events.iter().any(|e| e.kind == EventKind::SecretWrite),
+                "{cmd} must emit SecretWrite, got {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn correlation_findings_are_subject_to_action_overrides() {
+        // repo-0281: a correlation finding appended after the first policy pass
+        // must still be evaluated by the operator's action overrides — before
+        // the fix, an override blocking `DependencyChangeThenNetwork` was
+        // silently ignored and the Medium correlation stayed at Warn.
+        let correlation = make_finding(RuleId::DependencyChangeThenNetwork, Severity::Medium);
+        let mut effective = raw_verdict_with(Action::Warn, vec![correlation], None);
+        let mut policy = crate::policy::Policy::default();
+        policy.action_overrides.insert(
+            RuleId::DependencyChangeThenNetwork.to_string(),
+            "block".to_string(),
+        );
+        reapply_monotonic_policy_effects(&mut effective, &policy, CallerContext::Cli);
+        assert_eq!(
+            effective.action,
+            Action::Block,
+            "correlation finding must be blocked by the configured override"
+        );
+        // The causal correlation finding survives paranoia filtering so the
+        // Block is never left without its explaining finding.
+        assert!(effective
+            .findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::DependencyChangeThenNetwork));
+    }
+
+    #[test]
+    fn correlation_findings_are_subject_to_approval_rules() {
+        // repo-0281: an approval rule targeting a correlation finding must
+        // match after augmentation (and, for non-CLI callers, block).
+        let correlation = make_finding(RuleId::SecretWriteThenNetwork, Severity::Medium);
+        let mut effective = raw_verdict_with(Action::Warn, vec![correlation], None);
+        let mut policy = crate::policy::Policy::default();
+        policy.approval_rules = vec![crate::policy::ApprovalRule {
+            rule_ids: vec![RuleId::SecretWriteThenNetwork.to_string()],
+            timeout_secs: 0,
+            fallback: "block".to_string(),
+        }];
+        reapply_monotonic_policy_effects(&mut effective, &policy, CallerContext::Cli);
+        assert_eq!(effective.requires_approval, Some(true));
+        // Non-CLI surfaces cannot prompt: approval becomes Block.
+        let correlation = make_finding(RuleId::SecretWriteThenNetwork, Severity::Medium);
+        let mut effective = raw_verdict_with(Action::Warn, vec![correlation], None);
+        reapply_monotonic_policy_effects(&mut effective, &policy, CallerContext::Gateway);
+        assert_eq!(effective.action, Action::Block);
     }
 
     #[test]

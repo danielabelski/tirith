@@ -646,11 +646,7 @@ fn resolve_labeled_context(
         return Ok(None);
     }
 
-    if std::env::var("TIRITH_CONTEXT_DETECT_DISABLE")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
+    if crate::context_detect::context_detect_disabled() {
         return Err(format!(
             "fresh {} context detection is disabled",
             provider.as_str()

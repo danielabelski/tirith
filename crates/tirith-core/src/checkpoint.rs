@@ -63,6 +63,14 @@ pub struct ManifestEntry {
     pub sha256: String,
     pub size: u64,
     pub is_dir: bool,
+    /// Captured unix permission bits (`mode & 0o7777`) for this path, recorded
+    /// per manifest entry so restore applies each path's ORIGINAL mode instead
+    /// of whichever mode happened to be stored on the shared content-addressed
+    /// blob first (repo-0261). `None` on non-unix captures and in manifests
+    /// written before this field existed (restore then falls back to the blob
+    /// permissions, the pre-fix behavior).
+    #[serde(default)]
+    pub mode: Option<u32>,
 }
 
 /// Result of listing checkpoints.
@@ -245,6 +253,19 @@ fn write_checkpoint_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result
 /// Create a checkpoint of the given paths.
 pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<CheckpointMeta, String> {
     require_pro()?;
+    create_with_config(paths, trigger_command, &CheckpointConfig::default())
+}
+
+/// Create a checkpoint while enforcing `config.max_total_bytes` DURING
+/// traversal and copying, not only at purge time (repo-0262). The budget is
+/// deduplication-aware: only bytes actually copied into the store count
+/// against it. Exceeding the budget (or running out of filesystem space for a
+/// large copy) aborts the checkpoint and removes the incomplete directory.
+pub fn create_with_config(
+    paths: &[&str],
+    trigger_command: Option<&str>,
+    config: &CheckpointConfig,
+) -> Result<CheckpointMeta, String> {
     let base_dir = secure_checkpoints_dir()?;
     let id = uuid::Uuid::new_v4().to_string();
     let cp_dir = base_dir.join(&id);
@@ -252,38 +273,59 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
 
     fs::create_dir_all(&files_dir).map_err(|e| format!("create checkpoint dir: {e}"))?;
 
+    let mut budget = CreationBudget {
+        limit: config.max_total_bytes,
+        remaining_copy_bytes: config.max_total_bytes,
+    };
     let mut manifest: Vec<ManifestEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
 
-    for path_str in paths {
-        let path = Path::new(path_str);
-        if !path.exists() {
-            continue;
-        }
-
-        if path.is_file() {
-            match backup_file(path, &files_dir) {
-                Ok(entry) => {
-                    total_bytes += entry.size;
-                    manifest.push(entry);
-                }
-                Err(e) => {
-                    eprintln!("tirith: checkpoint: skip {path_str}: {e}");
-                }
+    let mut fill = || -> Result<(), BackupError> {
+        for path_str in paths {
+            let path = Path::new(path_str);
+            if !path.exists() {
+                continue;
             }
-        } else if path.is_dir() {
-            match backup_dir(path, &files_dir) {
-                Ok(entries) => {
-                    for entry in entries {
+
+            if path.is_file() {
+                match backup_file(path, &files_dir, &mut budget) {
+                    Ok(entry) => {
                         total_bytes += entry.size;
                         manifest.push(entry);
                     }
+                    Err(BackupError::Skip(e)) => {
+                        eprintln!("tirith: checkpoint: skip {path_str}: {e}");
+                    }
+                    Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
                 }
-                Err(e) => {
-                    eprintln!("tirith: checkpoint: skip dir {path_str}: {e}");
+            } else if path.is_dir() {
+                match backup_dir(path, &files_dir, &mut budget) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            total_bytes += entry.size;
+                            manifest.push(entry);
+                        }
+                    }
+                    Err(BackupError::Skip(e)) => {
+                        eprintln!("tirith: checkpoint: skip dir {path_str}: {e}");
+                    }
+                    Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
                 }
             }
         }
+        Ok(())
+    };
+
+    if let Err(BackupError::Abort(e) | BackupError::Skip(e)) = fill() {
+        // Abort and remove the incomplete checkpoint so a partial manifest can
+        // never be listed or restored (repo-0262).
+        if let Err(cleanup) = fs::remove_dir_all(&cp_dir) {
+            eprintln!(
+                "tirith: checkpoint: failed to remove aborted checkpoint dir {}: {cleanup}",
+                cp_dir.display()
+            );
+        }
+        return Err(e);
     }
 
     if manifest.is_empty() {
@@ -473,7 +515,7 @@ fn remove_bound_checkpoint_dir(base_dir: &Path, checkpoint_id: &str) -> Result<(
 /// the auto-checkpoint path feeds it an absolute cwd, so a checkpoint of an
 /// absolute path is legitimate and must restore. The escape risk that remains
 /// (a destination reached through a symlink) is handled separately by
-/// [`reject_symlinked_restore_dest`], which is the real overwrite guard. We still
+/// [`restore_contained_write`], which is the real overwrite guard. We still
 /// reject `..` here so a crafted manifest cannot climb out of an otherwise
 /// in-tree path.
 fn validate_restore_path(path: &str) -> Result<(), String> {
@@ -499,9 +541,9 @@ fn validate_restore_path(path: &str) -> Result<(), String> {
 ///   missing/corrupt meta.json) cannot be anchored safely and is REJECTED rather
 ///   than silently resolved against the caller's cwd.
 ///
-/// The caller still applies [`reject_symlinked_restore_dest`] +
-/// [`copy_no_follow_from_reader`] to the returned path, so symlink redirection at
-/// the final component is closed independently of this anchoring.
+/// The caller still applies [`restore_contained_write`] to the returned path,
+/// so symlink redirection — final component OR intermediate directory — is
+/// closed independently of this anchoring.
 fn anchor_restore_dst(original_path: &str, capture_root: Option<&Path>) -> Result<PathBuf, String> {
     let p = Path::new(original_path);
     if p.is_absolute() {
@@ -604,34 +646,145 @@ fn verify_checkpoint_dir_identity(
     }
 }
 
-fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
-    // The destination file: a symlink here would have `fs::copy` write through it.
-    if let Ok(meta) = fs::symlink_metadata(dst) {
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "refusing to restore through symlink at destination: {}",
-                dst.display()
-            ));
+/// Create missing restore parent directories RESTRICTIVELY (0700 on unix,
+/// regardless of umask) so a formerly-private directory never reappears as
+/// umask-default 0755 before its recorded mode is applied (repo-0261).
+/// Existing directories keep their current mode; recorded modes are applied
+/// afterwards by [`apply_recorded_dir_modes`].
+fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+/// Containment root used for descriptor-relative restore writes: the
+/// filesystem root itself. Traversal from here refuses every symlinked
+/// component except root-authorized system aliases (e.g. macOS
+/// `/var -> private/var`), which matches the capture-side canonicalization
+/// that already resolves ancestor links when recording paths.
+#[cfg(unix)]
+fn contained_root_for(_dst: &Path) -> std::io::Result<PathBuf> {
+    Ok(PathBuf::from("/"))
+}
+
+#[cfg(windows)]
+fn contained_root_for(dst: &Path) -> std::io::Result<PathBuf> {
+    let mut components = dst.components();
+    let prefix = match components.next() {
+        Some(std::path::Component::Prefix(prefix)) => prefix.as_os_str(),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "restore destination has no drive prefix",
+            ))
+        }
+    };
+    let mut root = PathBuf::from(prefix);
+    root.push("\\");
+    Ok(root)
+}
+
+/// Write verified blob bytes to `dst` through a descriptor-pinned, no-follow
+/// parent traversal and an atomic same-directory rename (repo-0260). Unlike
+/// the retired path-based symlink re-check, an intermediate directory cannot
+/// be swapped for a symlink between validation and publication: the retained
+/// parent descriptor remains the only authority for both the temporary file
+/// and the rename. `unix_mode` is applied to the temporary file before
+/// publication so the entry never exists with a more permissive mode
+/// (repo-0261).
+#[cfg(any(unix, windows))]
+fn restore_contained_write(
+    dst: &Path,
+    src: &mut fs::File,
+    unix_mode: Option<u32>,
+) -> std::io::Result<()> {
+    let root = contained_root_for(dst)?;
+    let writer = crate::util::ContainedAtomicFile::prepare(&root, dst, false)?;
+    writer.write_atomic_from_reader(src, true, unix_mode)?;
+    #[cfg(windows)]
+    {
+        // The descriptor-relative writer does not carry the portable readonly
+        // bit on Windows; apply it after publication (same contract the legacy
+        // writer provided).
+        if let Ok(meta) = src.metadata() {
+            let _ = fs::set_permissions(dst, meta.permissions());
         }
     }
-    // Every existing ancestor: a symlinked directory in the path could escape the
-    // tree even though the leaf itself is not (yet) a link.
-    let mut cur = dst.parent();
-    while let Some(p) = cur {
-        if p.as_os_str().is_empty() {
-            break;
+    Ok(())
+}
+
+/// Apply a recorded directory mode through an `O_NOFOLLOW|O_DIRECTORY` handle
+/// so a post-restore namespace swap cannot chmod a symlink's target
+/// (repo-0261).
+#[cfg(unix)]
+fn set_dir_mode_no_follow(dir: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)?;
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recorded directory path is not a directory",
+        ));
+    }
+    handle.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
+}
+
+/// Recreate recorded directories that are still missing and re-apply their
+/// captured modes, deepest paths first so a restrictive parent mode is never
+/// applied before its children exist (repo-0261). Runs AFTER all file
+/// contents have been restored.
+fn apply_recorded_dir_modes(
+    manifest: &[ManifestEntry],
+    capture_root: Option<&Path>,
+    report: &mut RestoreReport,
+) {
+    let mut dirs: Vec<&ManifestEntry> = manifest.iter().filter(|e| e.is_dir).collect();
+    dirs.sort_by_key(|entry| {
+        std::cmp::Reverse(Path::new(&entry.original_path).components().count())
+    });
+    for entry in dirs {
+        if let Err(e) = validate_restore_path(&entry.original_path) {
+            report.errors.push((entry.original_path.clone(), e));
+            continue;
         }
-        if let Ok(meta) = fs::symlink_metadata(p) {
-            if meta.file_type().is_symlink() {
-                return Err(format!(
-                    "refusing to restore through symlinked parent directory: {}",
-                    p.display()
+        let dst = match anchor_restore_dst(&entry.original_path, capture_root) {
+            Ok(p) => p,
+            Err(e) => {
+                report.errors.push((entry.original_path.clone(), e));
+                continue;
+            }
+        };
+        if !dst.exists() {
+            if let Err(e) = create_dir_all_private(&dst) {
+                report.errors.push((
+                    entry.original_path.clone(),
+                    format!("cannot recreate recorded directory: {e}"),
+                ));
+                continue;
+            }
+        }
+        #[cfg(unix)]
+        if let Some(mode) = entry.mode {
+            if let Err(e) = set_dir_mode_no_follow(&dst, mode) {
+                report.errors.push((
+                    entry.original_path.clone(),
+                    format!("cannot apply recorded directory mode: {e}"),
                 ));
             }
         }
-        cur = p.parent();
     }
-    Ok(())
 }
 
 /// Copy from an ALREADY-OPEN source handle into `dst` WITHOUT following a symlink
@@ -664,6 +817,11 @@ fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
 ///   reparse point at `dst` is never mutated.
 /// * other non-unix platforms fall back to `File::create` (which truncates) and
 ///   rely on the caller's pre-write symlink check.
+///
+/// LEGACY fallback (repo-0260): retained for platforms without
+/// descriptor-relative writes and for the direct unit regressions;
+/// unix/windows restores go through [`restore_contained_write`].
+#[cfg(any(test, not(any(unix, windows))))]
 fn copy_no_follow_from_reader<R: Read>(
     src: &mut R,
     dst: &Path,
@@ -903,17 +1061,12 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
         };
         let dst = dst_buf.as_path();
 
-        // Refuse to write through a symlink. `fs::copy` follows symlinks at the
-        // destination, so a repointed symlink at `dst` (or any existing parent
-        // component) could redirect the write outside the intended tree. Reject
-        // the entry and leave whatever the link points at untouched.
-        if let Err(e) = reject_symlinked_restore_dest(dst) {
-            report.errors.push((entry.original_path.clone(), e));
-            continue;
-        }
-
         if let Some(parent) = dst.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
+            // repo-0261: create missing parents RESTRICTIVELY (0700) so a
+            // formerly-private directory never reappears as umask-default
+            // 0755; recorded directory modes are re-applied after all file
+            // contents are in place.
+            if let Err(e) = create_dir_all_private(parent) {
                 report.errors.push((
                     entry.original_path.clone(),
                     format!("cannot create parent dir: {e}"),
@@ -935,49 +1088,67 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             ));
             continue;
         }
-        // F5 (TOCTOU): the symlink pre-check above ran BEFORE `create_dir_all`, so
-        // an attacker could have repointed `dst` (or swapped in a symlink) in the
-        // window between. Re-validate the parent chain immediately before the write
-        // (this is the LAST statement before the copy, so the window is just the
-        // syscalls inside `copy_no_follow_from_reader`'s open), AND perform the
-        // write through a no-follow open on unix so a symlink planted at the FINAL
-        // component is refused atomically by the open itself (`fs::copy` would
-        // instead follow it and write through). The first pre-check still runs for
-        // an early, cheap rejection and to cover non-unix.
-        //
-        // RESIDUAL: `O_NOFOLLOW` only protects the leaf, and this re-check resolves
-        // PARENT components by path, so a sufficiently fast attacker who swaps an
-        // intermediate parent dir for a symlink in the (now minimal) window between
-        // this check and the open could still redirect the write. Fully closing it
-        // needs an `openat`-with-pinned-dir-fds traversal of the whole path, which
-        // is a larger, platform-specific change deferred here; this bounded
-        // re-validation shrinks the window to the smallest practical size.
-        if let Err(e) = reject_symlinked_restore_dest(dst) {
-            report.errors.push((entry.original_path.clone(), e));
-            continue;
-        }
-        // K2: preserve the backup blob's permissions onto the restored file.
-        // Read them from the OPEN blob handle (`fstat`, no path re-stat) so the
-        // mode applied is the one we just verified the bytes of. If the stat fails
-        // we cannot prove the source mode; bucket it as an error rather than risk
-        // creating the file with the over-permissive process default.
-        let blob_perms = match blob.metadata() {
-            Ok(m) => m.permissions(),
-            Err(e) => {
-                report.errors.push((
-                    entry.original_path.clone(),
-                    format!("cannot read backup permissions: {e}"),
-                ));
-                continue;
-            }
+        // repo-0261: prefer the PER-PATH mode recorded in the manifest; fall
+        // back to the blob's mode only for pre-fix manifests (where dedup may
+        // have picked a different path's mode). The mode is applied to the
+        // temporary file BEFORE publication, so the restored entry never
+        // exists with a more permissive intermediate mode.
+        #[cfg(unix)]
+        let restore_mode: Option<u32> = match entry.mode {
+            Some(mode) => Some(mode),
+            None => match blob.metadata() {
+                Ok(m) => {
+                    use std::os::unix::fs::PermissionsExt;
+                    Some(m.permissions().mode() & 0o7777)
+                }
+                Err(e) => {
+                    report.errors.push((
+                        entry.original_path.clone(),
+                        format!("cannot read backup permissions: {e}"),
+                    ));
+                    continue;
+                }
+            },
         };
-        match copy_no_follow_from_reader(&mut blob, dst, &blob_perms) {
+        // repo-0260: the write itself is descriptor-relative end to end. The
+        // destination's parent chain is traversed beneath the filesystem root
+        // with pinned, no-follow directory descriptors (only root-authorized
+        // system alias links are resolved), the restored bytes land in a
+        // private temporary file opened relative to that retained parent, and
+        // publication is an atomic rename RELATIVE TO THE SAME DESCRIPTOR.
+        // An intermediate-directory symlink swap can therefore no longer
+        // redirect verified bytes outside the capture tree, closing the
+        // residual the old path-based re-check explicitly deferred.
+        #[cfg(any(unix, windows))]
+        let outcome = restore_contained_write(
+            dst,
+            &mut blob,
+            #[cfg(unix)]
+            restore_mode,
+            #[cfg(not(unix))]
+            None,
+        );
+        // K2 (legacy fallback for platforms without descriptor-relative
+        // writes): preserve the backup blob's permissions onto the restored
+        // file, read from the OPEN blob handle (`fstat`, no path re-stat).
+        #[cfg(not(any(unix, windows)))]
+        let outcome = match blob.metadata() {
+            Ok(m) => copy_no_follow_from_reader(&mut blob, dst, &m.permissions()),
+            Err(e) => Err(e),
+        };
+        match outcome {
             Ok(_) => report.restored.push(entry.original_path.clone()),
             Err(e) => report
                 .errors
                 .push((entry.original_path.clone(), e.to_string())),
         }
     }
+
+    // repo-0261: with every file's contents in place, recreate recorded
+    // directories that are still missing (e.g. empty at capture time) and
+    // re-apply each recorded directory mode, deepest paths first so a
+    // restrictive parent mode cannot lock out a child's creation or chmod.
+    apply_recorded_dir_modes(&manifest, capture_root.as_deref(), &mut report);
 
     let detail = format!(
         "checkpoint_id={checkpoint_id} attempted={} restored={} missing={} corrupt={} errors={}",
@@ -1458,46 +1629,152 @@ fn normalize_capture_path(path: &Path) -> String {
     }
 }
 
-fn backup_file(path: &Path, files_dir: &Path) -> Result<ManifestEntry, String> {
-    let sha = sha256_file(path)?;
+/// Why a single path could not be backed up.
+#[derive(Debug)]
+enum BackupError {
+    /// Per-path problem: skip the path and keep checkpointing the rest.
+    Skip(String),
+    /// Global budget or space exhaustion: abort the whole checkpoint and
+    /// remove the incomplete directory so a partial manifest can never be
+    /// listed or restored (repo-0262).
+    Abort(String),
+}
+
+/// Deduplication-aware creation budget (repo-0262). Only bytes actually
+/// COPIED into the store draw it down; a deduplicated blob costs nothing.
+/// Traversal still bounds the entry count and per-file size separately.
+struct CreationBudget {
+    limit: u64,
+    remaining_copy_bytes: u64,
+}
+
+/// Captured unix permission bits for a manifest path (repo-0261): recorded
+/// per path so restore applies each path's ORIGINAL mode rather than whichever
+/// mode the shared content-addressed blob happened to get first.
+fn captured_mode(meta: &fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// Free space available to an unprivileged user on the filesystem containing
+/// `path` (unix `statvfs`); `None` when undeterminable so callers degrade to
+/// budget-only enforcement.
+#[cfg(unix)]
+fn available_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a live NUL-terminated string and `stat` points to
+    // writable storage that a successful call initializes.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: successful statvfs initialized the struct.
+    let stat = unsafe { stat.assume_init() };
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// Backup a single file to the checkpoint files directory.
+fn backup_file(
+    path: &Path,
+    files_dir: &Path,
+    budget: &mut CreationBudget,
+) -> Result<ManifestEntry, BackupError> {
+    let sha = sha256_file(path).map_err(BackupError::Skip)?;
     let dst = files_dir.join(&sha);
 
-    // Content-addressed dedup: two checkpointed files with identical contents
-    // share a single on-disk copy.
-    if !dst.exists() {
-        fs::copy(path, &dst).map_err(|e| format!("copy: {e}"))?;
-    }
-
-    let size = match path.metadata() {
-        Ok(m) => m.len(),
+    let meta = match path.metadata() {
+        Ok(m) => Some(m),
         Err(e) => {
             eprintln!(
                 "tirith: checkpoint: cannot read metadata for {}: {e}",
                 path.display()
             );
-            0
+            None
         }
     };
+    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+    // Content-addressed dedup: two checkpointed files with identical contents
+    // share a single on-disk copy. Only a REAL copy draws down the cumulative
+    // creation budget (repo-0262).
+    if !dst.exists() {
+        if size > budget.remaining_copy_bytes {
+            return Err(BackupError::Abort(format!(
+                "checkpoint exceeds the configured total-byte limit of {} bytes while copying {}; aborting",
+                budget.limit,
+                path.display()
+            )));
+        }
+        // Refuse to START a large copy the filesystem cannot hold (repo-0262):
+        // failing mid-copy would leave a torn blob and a wasted partial write.
+        #[cfg(unix)]
+        if size >= 1024 * 1024 {
+            if let Some(free) = available_bytes(files_dir) {
+                if free < size {
+                    return Err(BackupError::Abort(format!(
+                        "insufficient filesystem space for checkpoint copy of {} ({size} bytes needed, {free} available)",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        fs::copy(path, &dst).map_err(|e| BackupError::Skip(format!("copy: {e}")))?;
+        budget.remaining_copy_bytes = budget.remaining_copy_bytes.saturating_sub(size);
+    }
 
     Ok(ManifestEntry {
         original_path: normalize_capture_path(path),
         sha256: sha,
         size,
         is_dir: false,
+        mode: meta.as_ref().and_then(captured_mode),
     })
 }
 
 /// Backup a directory recursively.
 ///
-/// NOTE: only files are recorded, so `restore()` does not recreate empty
-/// directories that existed at checkpoint time (parents of restored files are
-/// created implicitly).
-fn backup_dir(dir: &Path, files_dir: &Path) -> Result<Vec<ManifestEntry>, String> {
+/// Directory entries are recorded too (repo-0261): restore recreates empty
+/// directories and re-applies each recorded directory mode after the files are
+/// in place, instead of leaving every parent at the umask default.
+fn backup_dir(
+    dir: &Path,
+    files_dir: &Path,
+    budget: &mut CreationBudget,
+) -> Result<Vec<ManifestEntry>, BackupError> {
     let mut entries = Vec::new();
     const MAX_FILES: usize = 10_000;
     const MAX_SINGLE_FILE: u64 = 100 * 1024 * 1024; // 100 MiB per file
 
-    backup_dir_recursive(dir, files_dir, &mut entries, MAX_FILES, MAX_SINGLE_FILE)?;
+    // Record the captured root directory itself so restore can recreate it
+    // (even when empty) and restore its original mode.
+    if let Ok(meta) = dir.symlink_metadata() {
+        if meta.file_type().is_dir() {
+            entries.push(ManifestEntry {
+                original_path: normalize_capture_path(dir),
+                sha256: String::new(),
+                size: 0,
+                is_dir: true,
+                mode: captured_mode(&meta),
+            });
+        }
+    }
+    backup_dir_recursive(
+        dir,
+        files_dir,
+        &mut entries,
+        MAX_FILES,
+        MAX_SINGLE_FILE,
+        budget,
+    )?;
     Ok(entries)
 }
 
@@ -1507,12 +1784,14 @@ fn backup_dir_recursive(
     entries: &mut Vec<ManifestEntry>,
     max_files: usize,
     max_single_file: u64,
-) -> Result<(), String> {
+    budget: &mut CreationBudget,
+) -> Result<(), BackupError> {
     if entries.len() >= max_files {
         return Ok(());
     }
 
-    let read_dir = fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+    let read_dir = fs::read_dir(dir)
+        .map_err(|e| BackupError::Skip(format!("read dir {}: {e}", dir.display())))?;
 
     for entry in read_dir {
         if entries.len() >= max_files {
@@ -1553,13 +1832,14 @@ fn backup_dir_recursive(
                 );
                 continue;
             }
-            match backup_file(&path, files_dir) {
+            match backup_file(&path, files_dir, budget) {
                 Ok(e) => entries.push(e),
-                Err(e) => {
+                Err(BackupError::Skip(e)) => {
                     eprintln!("tirith: checkpoint: skip {}: {e}", path.display());
                 }
+                Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
             }
-        } else if path.is_dir() {
+        } else if meta.file_type().is_dir() {
             // Skip dot-dirs (e.g. .git) — rarely worth it and can dominate the budget.
             if path
                 .file_name()
@@ -1569,7 +1849,23 @@ fn backup_dir_recursive(
             {
                 continue;
             }
-            backup_dir_recursive(&path, files_dir, entries, max_files, max_single_file)?;
+            // Record the directory itself so restore recreates empty
+            // directories and re-applies its original mode (repo-0261).
+            entries.push(ManifestEntry {
+                original_path: normalize_capture_path(&path),
+                sha256: String::new(),
+                size: 0,
+                is_dir: true,
+                mode: captured_mode(&meta),
+            });
+            backup_dir_recursive(
+                &path,
+                files_dir,
+                entries,
+                max_files,
+                max_single_file,
+                budget,
+            )?;
         }
     }
 
@@ -1603,6 +1899,14 @@ fn sha256_reader<R: Read>(reader: &mut R) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unlimited creation budget for backup-helper unit tests.
+    fn test_budget() -> CreationBudget {
+        CreationBudget {
+            limit: u64::MAX,
+            remaining_copy_bytes: u64::MAX,
+        }
+    }
 
     #[test]
     fn test_should_auto_checkpoint() {
@@ -1747,7 +2051,7 @@ mod tests {
         let files_dir = tmp.path().join("files");
         fs::create_dir_all(&files_dir).unwrap();
 
-        let entry = backup_file(&test_file, &files_dir).unwrap();
+        let entry = backup_file(&test_file, &files_dir, &mut test_budget()).unwrap();
         assert!(!entry.sha256.is_empty());
         assert_eq!(entry.size, 11);
         assert!(!entry.is_dir);
@@ -1769,8 +2073,14 @@ mod tests {
         let files_dir = tmp.path().join("files");
         fs::create_dir_all(&files_dir).unwrap();
 
-        let entries = backup_dir(&dir, &files_dir).unwrap();
-        assert_eq!(entries.len(), 2, "should backup 2 files: {entries:?}");
+        let entries = backup_dir(&dir, &files_dir, &mut test_budget()).unwrap();
+        let files = entries.iter().filter(|e| !e.is_dir).count();
+        let dirs = entries.iter().filter(|e| e.is_dir).count();
+        assert_eq!(files, 2, "should backup 2 files: {entries:?}");
+        assert_eq!(
+            dirs, 2,
+            "project and src directories are recorded for mode/empty-dir restore: {entries:?}"
+        );
     }
 
     #[test]
@@ -1779,7 +2089,11 @@ mod tests {
         let files_dir = tmp.path().join("files");
         fs::create_dir_all(&files_dir).unwrap();
 
-        let result = backup_file(Path::new("/nonexistent/file.txt"), &files_dir);
+        let result = backup_file(
+            Path::new("/nonexistent/file.txt"),
+            &files_dir,
+            &mut test_budget(),
+        );
         assert!(result.is_err());
     }
 
@@ -2159,6 +2473,7 @@ mod tests {
                 sha256: empty_sha256(),
                 size: 0,
                 is_dir: false,
+                mode: None,
             }])
             .unwrap();
             fs::write(evil.join("manifest.json"), evil_manifest).expect("write evil manifest");
@@ -3360,6 +3675,219 @@ mod tests {
         assert!(
             stray.is_empty(),
             "no temp file must remain after atomic meta/manifest writes, found: {stray:?}"
+        );
+    }
+
+    /// repo-0262: creation enforces the configured total-byte limit DURING the
+    /// copy, aborts, and removes the incomplete checkpoint directory so a
+    /// partial manifest can never be listed or restored.
+    #[cfg(unix)]
+    #[test]
+    fn create_aborts_and_cleans_up_when_total_byte_budget_exceeded() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let state_dir = tmpdir.path().join("state");
+        let workdir = tmpdir.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        // Two DISTINCT 3 KiB files (no dedup rescue) against a 4 KiB budget:
+        // the first copy fits, the second must abort the whole checkpoint.
+        let file_a = workdir.join("a.bin");
+        let file_b = workdir.join("b.bin");
+        fs::write(&file_a, vec![0xAAu8; 3072]).unwrap();
+        fs::write(&file_b, vec![0xBBu8; 3072]).unwrap();
+
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+
+        let a = file_a.to_string_lossy().into_owned();
+        let b = file_b.to_string_lossy().into_owned();
+        let config = CheckpointConfig {
+            max_count: 50,
+            max_age_days: 30,
+            max_total_bytes: 4096,
+        };
+        let result = create_with_config(&[a.as_str(), b.as_str()], Some("test budget"), &config);
+
+        let leftover = try_checkpoints_dir().map(|store| {
+            fs::read_dir(&store)
+                .map(|rd| rd.filter_map(|e| e.ok()).count())
+                .unwrap_or(0)
+        });
+
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        let error = result.expect_err("the 4 KiB budget must abort the second 3 KiB copy");
+        assert!(
+            error.contains("total-byte limit"),
+            "error must name the configured limit: {error}"
+        );
+        assert_eq!(
+            leftover,
+            Some(0),
+            "the aborted checkpoint directory must be removed"
+        );
+    }
+
+    /// repo-0261: per-path modes survive content-addressed dedup, missing
+    /// parents are recreated privately (0700), recorded directories reappear
+    /// (even empty ones), and recorded directory modes are re-applied after
+    /// the file contents land.
+    #[cfg(unix)]
+    #[test]
+    fn restore_applies_per_path_modes_and_recreates_empty_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let state_dir = tmpdir.path().join("state");
+        let workdir = tmpdir.path().join("project");
+        let private_dir = workdir.join("private");
+        let empty_dir = workdir.join("empty");
+        fs::create_dir_all(&private_dir).unwrap();
+        fs::create_dir_all(&empty_dir).unwrap();
+        fs::set_permissions(&private_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&empty_dir, fs::Permissions::from_mode(0o710)).unwrap();
+
+        // Identical contents, DIFFERENT original modes: the dedup blob can only
+        // carry one mode, so this pair is exactly the per-path-mode leak.
+        let creds = private_dir.join("creds");
+        let creds_copy = workdir.join("creds-copy");
+        fs::write(&creds, "shared-secret-contents").unwrap();
+        fs::write(&creds_copy, "shared-secret-contents").unwrap();
+        fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&creds_copy, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+
+        let root = workdir.to_string_lossy().into_owned();
+        let outcome = (|| -> Result<(RestoreReport, PathBuf), String> {
+            let meta = create(&[root.as_str()], Some("test modes"))?;
+            // Destroy state: remove the private and empty dirs, rewrite the
+            // copy with looser contents AND mode.
+            fs::remove_dir_all(&private_dir).map_err(|e| format!("rm private: {e}"))?;
+            fs::remove_dir_all(&empty_dir).map_err(|e| format!("rm empty: {e}"))?;
+            fs::write(&creds_copy, "tampered").map_err(|e| format!("rewrite: {e}"))?;
+            fs::set_permissions(&creds_copy, fs::Permissions::from_mode(0o666))
+                .map_err(|e| format!("chmod: {e}"))?;
+            let report = restore_reported(&meta.id)?;
+            Ok((report, tmpdir.path().join("store").join(&meta.id)))
+        })();
+
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        let (report, _) = outcome.expect("create + restore should succeed");
+        assert!(
+            report.errors.is_empty(),
+            "no restore errors expected: {report:?}"
+        );
+
+        let mode_of = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            fs::read_to_string(&creds).unwrap(),
+            "shared-secret-contents"
+        );
+        assert_eq!(mode_of(&creds), 0o600, "per-path file mode, not blob mode");
+        assert_eq!(
+            fs::read_to_string(&creds_copy).unwrap(),
+            "shared-secret-contents"
+        );
+        assert_eq!(
+            mode_of(&creds_copy),
+            0o644,
+            "dedup must not leak the sibling path's stricter or looser mode"
+        );
+        assert_eq!(
+            mode_of(&private_dir),
+            0o700,
+            "recorded private dir mode re-applied"
+        );
+        assert!(empty_dir.is_dir(), "recorded empty dir recreated");
+        assert_eq!(
+            mode_of(&empty_dir),
+            0o710,
+            "recorded empty dir mode applied"
+        );
+    }
+
+    /// repo-0260: a symlink swapped in at an INTERMEDIATE destination directory
+    /// after checkpointing must fail the restore closed instead of redirecting
+    /// verified bytes through the link.
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_symlinked_intermediate_parent() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let state_dir = tmpdir.path().join("state");
+        let workdir = tmpdir.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let keep = workdir.join("keep.txt");
+        fs::write(&keep, "verified bytes").unwrap();
+
+        let victim_dir = tmpdir.path().join("victim");
+        fs::create_dir_all(&victim_dir).unwrap();
+        let victim_file = victim_dir.join("keep.txt");
+        fs::write(&victim_file, "ORIGINAL").unwrap();
+
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+
+        let root = workdir.to_string_lossy().into_owned();
+        let outcome = (|| -> Result<RestoreReport, String> {
+            let meta = create(&[root.as_str()], Some("test symlink parent"))?;
+            // Swap the intermediate destination directory for a symlink to the
+            // victim tree AFTER capture.
+            fs::remove_dir_all(&workdir).map_err(|e| format!("rm workdir: {e}"))?;
+            std::os::unix::fs::symlink(&victim_dir, &workdir)
+                .map_err(|e| format!("symlink: {e}"))?;
+            restore_reported(&meta.id)
+        })();
+
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        let report = outcome.expect("restore_reported should bucket, not abort");
+        assert!(
+            report.restored.is_empty(),
+            "nothing may restore through a symlinked parent: {report:?}"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|(path, _)| path.contains("keep.txt")),
+            "the redirected entry must be bucketed as an error: {report:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&victim_file).unwrap(),
+            "ORIGINAL",
+            "verified bytes must never land in the symlink's target tree"
         );
     }
 }

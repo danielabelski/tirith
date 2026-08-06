@@ -141,6 +141,11 @@ const MANIFEST_FILENAME: &str = "commands.yaml";
 /// parse error (CodeRabbit R17 #1, read-guard class).
 const MANIFEST_READ_CAP: u64 = 256 * 1024;
 
+/// repo-0263: work-budget caps validated at load time (fail-closed).
+const MAX_DANGEROUS_ENTRIES: usize = 512;
+const MAX_ALLOWED_ENTRIES: usize = 4096;
+const MAX_PATTERN_CHARS: usize = 1024;
+
 impl CommandsManifest {
     /// Parse a manifest from YAML text.
     ///
@@ -152,7 +157,37 @@ impl CommandsManifest {
         let manifest: Self =
             serde_yaml::from_str(text).map_err(|e| ManifestError::Parse(e.to_string()))?;
         manifest.validate_no_duplicates()?;
+        manifest.validate_work_budget()?;
         Ok(manifest)
+    }
+
+    /// repo-0263: cap the worst-case matching work a repo-controlled manifest
+    /// can force. `match_dangerous` is `O(dangerous.len() x command_length x
+    /// pattern_length)` on the shell-check hot path, so entry/pattern counts
+    /// are bounded at LOAD time — an over-budget manifest is rejected outright
+    /// (fail-closed) rather than silently truncated, which would hide the real
+    /// dangerous entry past the cap.
+    fn validate_work_budget(&self) -> Result<(), ManifestError> {
+        if self.dangerous.len() > MAX_DANGEROUS_ENTRIES {
+            return Err(ManifestError::Parse(format!(
+                "dangerous[] has {} entries; the maximum is {MAX_DANGEROUS_ENTRIES}",
+                self.dangerous.len()
+            )));
+        }
+        if self.allowed.len() > MAX_ALLOWED_ENTRIES {
+            return Err(ManifestError::Parse(format!(
+                "allowed[] has {} entries; the maximum is {MAX_ALLOWED_ENTRIES}",
+                self.allowed.len()
+            )));
+        }
+        for entry in &self.dangerous {
+            if entry.pattern.chars().count() > MAX_PATTERN_CHARS {
+                return Err(ManifestError::Parse(format!(
+                    "dangerous[].pattern exceeds {MAX_PATTERN_CHARS} characters"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Error on duplicate `allowed[].name` or `dangerous[].pattern`. Dedup uses
@@ -265,9 +300,12 @@ impl CommandsManifest {
     /// shell-significant whitespace on both sides — see [`Self::match_allowed`].
     pub fn match_dangerous(&self, command: &str) -> Vec<&DangerousEntry> {
         let needle = trim_shell_ws(command);
+        // repo-0263: decode the command ONCE per evaluation instead of once
+        // per pattern.
+        let needle_chars: Vec<char> = needle.chars().collect();
         self.dangerous
             .iter()
-            .filter(|e| glob_match(trim_shell_ws(&e.pattern), needle))
+            .filter(|e| glob_match_predecoded(trim_shell_ws(&e.pattern), &needle_chars))
             .collect()
     }
 
@@ -576,9 +614,17 @@ fn trim_shell_ws(s: &str) -> &str {
 /// Minimal glob matcher supporting only `*` (any run, incl. empty), anchored at
 /// both ends. A two-pointer backtracking matcher over chars (non-ASCII safe, no
 /// external dependency).
+#[cfg(test)]
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
+    glob_match_predecoded(pattern, &t)
+}
+
+/// [`glob_match`] with the text already decoded (repo-0263: the hot path
+/// decodes a long command once per evaluation, not once per pattern).
+fn glob_match_predecoded(pattern: &str, text: &[char]) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: &[char] = text;
 
     let mut pi = 0usize;
     let mut ti = 0usize;

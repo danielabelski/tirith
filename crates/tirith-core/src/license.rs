@@ -516,9 +516,28 @@ pub fn refresh_from_server(server_url: &str, api_key: &str) -> Result<String, St
         // sequences. Status-specific text below is entirely local.
         return Err(refresh_status_error(status));
     }
-    let token = resp
-        .text()
+    // repo-0289: bound the body BEFORE materializing it. The timeout limits
+    // duration, not bytes; a malicious server could otherwise stream an
+    // unbounded body into memory. A license token is a few KiB, so 64 KiB is
+    // generous headroom.
+    const MAX_REFRESH_BODY: u64 = 64 * 1024;
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_REFRESH_BODY)
+    {
+        return Err("Server response too large".to_string());
+    }
+    let mut body = Vec::new();
+    use std::io::Read as _;
+    let mut limited = std::io::Read::take(resp, MAX_REFRESH_BODY + 1);
+    limited
+        .read_to_end(&mut body)
         .map_err(|e| format!("Failed to read response: {e}"))?;
+    if body.len() as u64 > MAX_REFRESH_BODY {
+        return Err("Server response too large".to_string());
+    }
+    let token =
+        String::from_utf8(body).map_err(|_| "Server response was not valid UTF-8".to_string())?;
     let trimmed = token.trim().to_string();
     if trimmed.is_empty() {
         return Err("Server returned empty token".to_string());

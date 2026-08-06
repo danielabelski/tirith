@@ -80,9 +80,27 @@ impl CompiledSeeds {
 pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<(String, regex::Error)>) {
     let mut good = Vec::new();
     let mut bad = Vec::new();
+    // repo-0330: each seed has an independent 1 MiB program/DFA allowance, so
+    // COUNT and AGGREGATE source size need their own budget — otherwise a
+    // hostile policy ships thousands of individually-valid near-limit patterns
+    // and exhausts memory at paste/view/MCP init. Over-budget patterns are
+    // rejected into the bad-list (visible, fail-closed), never silently dropped.
+    let mut accepted = 0usize;
+    let mut accepted_source_bytes = 0usize;
     for pattern in patterns {
         let trimmed = pattern.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if accepted >= MAX_CUSTOM_SEEDS
+            || accepted_source_bytes + trimmed.len() > MAX_CUSTOM_SEED_SOURCE_BYTES
+        {
+            bad.push((
+                pattern.clone(),
+                regex::Error::Syntax(
+                    "custom seed budget exceeded (too many/too large patterns)".to_string(),
+                ),
+            ));
             continue;
         }
         match compile_seed_regex(trimmed) {
@@ -93,6 +111,8 @@ pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<(String, regex:
                     rule_id,
                     raw: trimmed.to_string(),
                 });
+                accepted += 1;
+                accepted_source_bytes += trimmed.len();
             }
             Err(e) => bad.push((pattern.clone(), e)),
         }
@@ -137,6 +157,11 @@ fn substitute_placeholders(seed: &str) -> String {
 /// under it, and a pathological pattern is rejected (asserted by
 /// `pathological_seed_is_rejected_by_size_limit`).
 const MAX_SEED_REGEX_SIZE: usize = 1 << 20;
+
+/// repo-0330: aggregate custom-seed budgets (count + total source bytes),
+/// enforced in [`compile_seeds`] regardless of whether policy validation ran.
+const MAX_CUSTOM_SEEDS: usize = 256;
+const MAX_CUSTOM_SEED_SOURCE_BYTES: usize = 256 * 1024;
 
 /// The ONE compile path every seed consumer shares: rewrite `<placeholder>`
 /// tokens, then build a case-insensitive [`Regex`] under a bounded compiled size

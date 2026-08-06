@@ -448,7 +448,7 @@ fn with_private_plan_snapshot<T>(
 /// Hot-path warning: MUST NOT be called from `engine::analyze` — the only
 /// caller is the interactive `tirith iac check-plan`.
 fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, String> {
-    use crate::util::{run_trusted_with_timeout, ShellTimeoutOutcome};
+    use crate::util::run_trusted_with_timeout;
 
     let program = match tool {
         PlanTool::Terraform => "terraform",
@@ -487,6 +487,20 @@ fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, 
             "LOCALAPPDATA",
         ],
     );
+    show_json_outcome(program, outcome)
+}
+
+/// Map a supervised `terraform/tofu show -json` outcome onto the rendered plan
+/// bytes or an error. The byte cap is enforced TWICE: the supervisor stops
+/// reading, kills, and reaps the process group as soon as drained stdout exceeds
+/// [`MAX_PLAN_SIZE_BYTES`] ([`ShellTimeoutOutcome::OutputLimitExceeded`]), and the
+/// post-hoc length check below catches anything that still slipped through, so
+/// the cap is a real memory bound, not a label (repo-0286).
+fn show_json_outcome(
+    program: &str,
+    outcome: crate::util::ShellTimeoutOutcome,
+) -> Result<Vec<u8>, String> {
+    use crate::util::ShellTimeoutOutcome;
     match outcome {
         ShellTimeoutOutcome::Completed { status, stdout } => {
             if status.success() {
@@ -832,5 +846,78 @@ mod tests {
             pulumi_type_from_urn("urn:pulumi::proj::aws:iam/role:Role::svc"),
             "aws:iam/role:Role",
         );
+    }
+
+    #[test]
+    fn show_json_outcome_maps_output_limit_exceeded_to_error() {
+        // repo-0286: when the supervisor's capped drain trips, the renderer must
+        // fail — never accept a partially drained plan as complete JSON.
+        use crate::util::ShellTimeoutOutcome;
+        let err = show_json_outcome(
+            "terraform",
+            ShellTimeoutOutcome::OutputLimitExceeded {
+                cleanup_succeeded: true,
+            },
+        )
+        .expect_err("over-cap output must be rejected");
+        assert!(err.contains("output cap"), "unexpected error: {err}");
+        let err = show_json_outcome(
+            "tofu",
+            ShellTimeoutOutcome::OutputLimitExceeded {
+                cleanup_succeeded: false,
+            },
+        )
+        .expect_err("over-cap output must be rejected even when cleanup fails");
+        assert!(err.contains("cleanup failed"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_json_outcome_rejects_oversize_completed_stdout() {
+        // repo-0286: the post-hoc length check is the second line of defense —
+        // even a "completed" child whose captured stdout exceeds the cap is
+        // rejected.
+        use crate::util::ShellTimeoutOutcome;
+        use std::os::unix::process::ExitStatusExt as _;
+        let outcome = ShellTimeoutOutcome::Completed {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: vec![b'{'; (MAX_PLAN_SIZE_BYTES + 1) as usize],
+        };
+        let err = show_json_outcome("terraform", outcome)
+            .expect_err("completed-but-oversize stdout must be rejected");
+        assert!(err.contains("cap is"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_drain_kills_child_past_output_cap() {
+        // repo-0286 regression: the shared drain enforces the byte cap DURING
+        // the read (stop reading, kill, reap the process group); it does not
+        // buffer the child's complete stdout and check afterwards. 8 MiB far
+        // exceeds any pipe buffer, so the child is still blocked mid-write when
+        // the 1 KiB cap trips.
+        let executable = crate::trusted_child::resolve_system_helper("cat")
+            .expect("/bin/cat must resolve as a trusted system helper");
+        let fixture = tempfile::Builder::new()
+            .prefix("tirith-iac-cap-")
+            .tempfile()
+            .unwrap();
+        std::fs::write(fixture.path(), vec![b'x'; 8 * 1024 * 1024]).unwrap();
+        let outcome = crate::util::run_trusted_with_timeout(
+            &executable,
+            &[fixture.path().to_str().unwrap()],
+            std::time::Duration::from_secs(15),
+            1024,
+            &[],
+        );
+        match outcome {
+            crate::util::ShellTimeoutOutcome::OutputLimitExceeded { cleanup_succeeded } => {
+                assert!(
+                    cleanup_succeeded,
+                    "the over-cap child must be killed and reaped"
+                );
+            }
+            other => panic!("expected OutputLimitExceeded, got {other:?}"),
+        }
     }
 }

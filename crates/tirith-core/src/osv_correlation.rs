@@ -61,6 +61,19 @@ const CACHE_TTL_SECS: u64 = 3600;
 /// Per-call timeout — the CLI path is interactive; a degraded score beats a hang.
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 
+/// repo-0305: hard caps on the OSV response and its cached form. The timeout
+/// bounds time, not memory — a fast hostile upstream could otherwise allocate
+/// unbounded vectors/strings before the deadline fires.
+const MAX_OSV_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_OSV_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_OSV_VULNS: usize = 256;
+const MAX_OSV_ALIASES: usize = 64;
+const MAX_OSV_SEVERITIES: usize = 16;
+const MAX_OSV_REFERENCES: usize = 64;
+const MAX_OSV_ID_LEN: usize = 256;
+const MAX_OSV_SUMMARY_LEN: usize = 4096;
+const MAX_OSV_URL_LEN: usize = 2048;
+
 /// Resolve OSV advisories for `(eco, name, version)` with the lookup state — the
 /// canonical entry point. Distinguishes Verified-empty from Unavailable-empty,
 /// which the legacy [`for_package`] cannot.
@@ -118,7 +131,17 @@ fn cache_path(key: &str) -> Option<std::path::PathBuf> {
 
 fn load_cache<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
     let path = cache_path(key)?;
-    let content = std::fs::read_to_string(path).ok()?;
+    // repo-0305: the cached model is deserialized into memory, so the read
+    // itself must be bounded — a corrupted or attacker-influenced cache file
+    // must not allocate without limit on later runs.
+    let file = std::fs::File::open(path).ok()?;
+    let mut limited = std::io::Read::take(file, MAX_OSV_CACHE_BYTES + 1);
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut limited, &mut buf).ok()?;
+    if buf.len() as u64 > MAX_OSV_CACHE_BYTES {
+        return None;
+    }
+    let content = String::from_utf8(buf).ok()?;
     let env: CacheEnvelope<T> = serde_json::from_str(&content).ok()?;
     if unix_now().saturating_sub(env.fetched_at) > CACHE_TTL_SECS {
         return None;
@@ -208,24 +231,67 @@ fn query_osv_sync(
         )
         .json(&body)
         .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<OsvQueryResponse>()
         .ok()?;
+    let mut resp = resp.error_for_status().ok()?;
+    // repo-0305: bound the body BEFORE deserialization. A declared length over
+    // the cap fails fast; otherwise read at most cap+1 bytes so an unbounded
+    // chunked body can never be fully materialized.
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_OSV_RESPONSE_BYTES)
+    {
+        return None;
+    }
+    let mut body_buf = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut resp, MAX_OSV_RESPONSE_BYTES + 1),
+        &mut body_buf,
+    )
+    .ok()?;
+    if body_buf.len() as u64 > MAX_OSV_RESPONSE_BYTES {
+        return None;
+    }
+    let resp: OsvQueryResponse = serde_json::from_slice(&body_buf).ok()?;
 
     let summaries: Vec<OsvAdvisorySummary> = resp
         .vulns
         .into_iter()
-        .map(|v| OsvAdvisorySummary {
-            cvss: parse_cvss3_base(&v.severity),
-            id: v.id,
-            aliases: v.aliases,
-            summary: v.summary,
-            reference: v.references.into_iter().map(|r| r.url).next(),
+        .take(MAX_OSV_VULNS)
+        .map(|v| {
+            let severity: Vec<OsvSeverity> =
+                v.severity.into_iter().take(MAX_OSV_SEVERITIES).collect();
+            OsvAdvisorySummary {
+                cvss: parse_cvss3_base(&severity),
+                id: truncate_str(v.id, MAX_OSV_ID_LEN),
+                aliases: v
+                    .aliases
+                    .into_iter()
+                    .take(MAX_OSV_ALIASES)
+                    .map(|a| truncate_str(a, MAX_OSV_ID_LEN))
+                    .collect(),
+                summary: v.summary.map(|s| truncate_str(s, MAX_OSV_SUMMARY_LEN)),
+                reference: v
+                    .references
+                    .into_iter()
+                    .take(MAX_OSV_REFERENCES)
+                    .map(|r| truncate_str(r.url, MAX_OSV_URL_LEN))
+                    .next(),
+            }
         })
         .collect();
     Some(summaries)
+}
+
+/// Truncate on a char boundary (repo-0305 string-length caps).
+fn truncate_str(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 /// Parse the CVSS v3 base score from an OSV `severity` array.

@@ -6,12 +6,29 @@ use std::time::Instant;
 /// Global session ID for the current tirith process lifetime.
 static SESSION_ID: OnceLock<String> = OnceLock::new();
 
+/// The session-ID alphabet shared by the resolver and the state-store path
+/// validation (repo-0339): an env-supplied ID outside this alphabet silently
+/// disabled warning recording (every state path resolved to `None`), so the
+/// resolver rejects it instead of preserving it.
+pub(crate) fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Get or generate the session ID: `TIRITH_SESSION_ID` env var, else an
 /// auto-generated per-process UUID. New code that needs the file-based fallback
 /// for agent hooks should prefer [`resolve_session_id`].
 pub fn session_id() -> &'static str {
     SESSION_ID.get_or_init(|| {
-        std::env::var("TIRITH_SESSION_ID").unwrap_or_else(|_| generate_session_id())
+        // repo-0339: an invalid env ID must not propagate (it would silently
+        // disable every session-state write); fall back to a fresh valid ID.
+        std::env::var("TIRITH_SESSION_ID")
+            .ok()
+            .filter(|s| is_valid_session_id(s))
+            .unwrap_or_else(generate_session_id)
     })
 }
 
@@ -33,7 +50,7 @@ pub fn env_session_id() -> Option<&'static str> {
         .get_or_init(|| {
             std::env::var("TIRITH_SESSION_ID")
                 .ok()
-                .filter(|s| !s.is_empty())
+                .filter(|s| is_valid_session_id(s))
         })
         .as_deref()
 }
@@ -170,7 +187,7 @@ fn load_or_create_fallback_file(scope: &str) -> String {
                     {
                         if let Ok(content) = String::from_utf8(buf) {
                             let id = content.trim().to_string();
-                            if !id.is_empty() && id.len() <= 128 {
+                            if is_valid_session_id(&id) {
                                 return id;
                             }
                         }
@@ -184,6 +201,26 @@ fn load_or_create_fallback_file(scope: &str) -> String {
 
     let new_id = generate_session_id();
     write_fallback_file(&path, &new_id);
+    // repo-0342: a concurrent process may have won the create race. Re-read the
+    // on-disk winner and return THAT id so every concurrent first invocation
+    // converges on one session, instead of analyzing under divergent UUIDs.
+    if let Ok(file) = crate::util::open_read_no_follow_capped(&path, FALLBACK_FILE_READ_CAP) {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        if (&file)
+            .take(FALLBACK_FILE_READ_CAP.saturating_add(1))
+            .read_to_end(&mut buf)
+            .is_ok()
+            && buf.len() as u64 <= FALLBACK_FILE_READ_CAP
+        {
+            if let Ok(content) = String::from_utf8(buf) {
+                let id = content.trim().to_string();
+                if is_valid_session_id(&id) {
+                    return id;
+                }
+            }
+        }
+    }
     new_id
 }
 

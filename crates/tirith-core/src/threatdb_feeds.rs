@@ -26,7 +26,7 @@ pub fn extract_hostname_from_url(raw: &str) -> Option<String> {
 pub fn parse_urlhaus_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
     let mut csv = csv::ReaderBuilder::new()
         .has_headers(true)
-        .flexible(true)
+        .flexible(false)
         .from_reader(reader);
     let headers = csv
         .headers()
@@ -36,14 +36,11 @@ pub fn parse_urlhaus_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
     let url_idx = headers
         .iter()
         .position(|header| matches!(header, "url" | "urlhaus_link"))
-        .unwrap_or(2);
+        .ok_or_else(|| format!("URLhaus schema error: no 'url' column in headers {headers:?}"))?;
 
     let mut entries = FeedEntries::default();
     for record in csv.records() {
-        let record = match record {
-            Ok(record) => record,
-            Err(_) => continue,
-        };
+        let record = record.map_err(|e| format!("URLhaus record error: {e}"))?;
         let raw = record.get(url_idx).or_else(|| {
             record
                 .iter()
@@ -60,7 +57,7 @@ pub fn parse_urlhaus_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
 pub fn parse_threatfox_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
     let mut csv = csv::ReaderBuilder::new()
         .has_headers(true)
-        .flexible(true)
+        .flexible(false)
         .from_reader(reader);
     let headers = csv
         .headers()
@@ -69,15 +66,14 @@ pub fn parse_threatfox_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
 
     let ioc_idx = headers.iter().position(|header| header == "ioc");
     let ioc_type_idx = headers.iter().position(|header| header == "ioc_type");
+    let ioc_idx = ioc_idx
+        .ok_or_else(|| format!("ThreatFox schema error: no 'ioc' column in headers {headers:?}"))?;
 
     let mut entries = FeedEntries::default();
     for record in csv.records() {
-        let record = match record {
-            Ok(record) => record,
-            Err(_) => continue,
-        };
+        let record = record.map_err(|e| format!("ThreatFox record error: {e}"))?;
 
-        let raw_ioc = ioc_idx.and_then(|idx| record.get(idx)).or_else(|| {
+        let raw_ioc = record.get(ioc_idx).or_else(|| {
             record.iter().find(|value| {
                 value.contains('.') || value.starts_with("http://") || value.starts_with("https://")
             })
@@ -155,7 +151,7 @@ pub fn parse_threatfox_zip<R: Read + Seek>(reader: R) -> Result<FeedEntries, Str
 pub fn parse_phishtank_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
     let mut csv = csv::ReaderBuilder::new()
         .has_headers(true)
-        .flexible(true)
+        .flexible(false)
         .from_reader(reader);
     let headers = csv
         .headers()
@@ -164,14 +160,11 @@ pub fn parse_phishtank_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
     let url_idx = headers
         .iter()
         .position(|header| header == "url")
-        .unwrap_or(1);
+        .ok_or_else(|| format!("PhishTank schema error: no 'url' column in headers {headers:?}"))?;
 
     let mut entries = FeedEntries::default();
     for record in csv.records() {
-        let record = match record {
-            Ok(record) => record,
-            Err(_) => continue,
-        };
+        let record = record.map_err(|e| format!("PhishTank record error: {e}"))?;
         if let Some(host) = record.get(url_idx).and_then(extract_hostname_from_url) {
             entries.hostnames.push(host);
         }
@@ -211,7 +204,7 @@ pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> 
     // that indicator.
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
-        .flexible(true)
+        .flexible(false)
         .from_reader(reader);
     let mut records = rdr.records();
 
@@ -243,10 +236,7 @@ pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> 
 
     let mut entries = FeedEntries::default();
     for record in leading.into_iter().chain(records) {
-        let record = match record {
-            Ok(record) => record,
-            Err(_) => continue,
-        };
+        let record = record.map_err(|e| format!("DigitalSide record error: {e}"))?;
 
         // MISP `to_ids` gate: ingest only analyst-flagged detectable indicators.
         if record.get(to_ids_idx).map(str::trim) != Some("1") {
@@ -748,5 +738,38 @@ mod tests {
             Some(BehaviorTag::NetworkExfil)
         );
         assert_eq!(BehaviorTag::from_name("nope"), None);
+    }
+
+    #[test]
+    fn urlhaus_csv_fails_without_url_header() {
+        let csv = "id,dateadded,link\n1,2024-01-01,https://evil.example/path\n";
+        let err = parse_urlhaus_csv(csv.as_bytes()).unwrap_err();
+        assert!(err.contains("schema error"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn threatfox_csv_fails_without_ioc_header() {
+        let csv = "value,type\nbad.example,domain\n";
+        let err = parse_threatfox_csv(csv.as_bytes()).unwrap_err();
+        assert!(err.contains("schema error"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn phishtank_csv_fails_without_url_header() {
+        let csv = "phish_id,link\n1,https://phish.example/login\n";
+        let err = parse_phishtank_csv(csv.as_bytes()).unwrap_err();
+        assert!(err.contains("schema error"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn csv_record_errors_are_fatal() {
+        // A ragged record (fewer fields than the header) is a hard parse error
+        // under the strict (non-flexible) reader; the feed must fail rather
+        // than silently return the records read so far.
+        let csv = "id,dateadded,url\n1,2024-01-01,https://ok.example/\n2,2024-01-02\n";
+        assert!(parse_urlhaus_csv(csv.as_bytes()).is_err());
+
+        let csv = "ioc,ioc_type\nbad.example,domain\n\"unclosed,domain\n";
+        assert!(parse_threatfox_csv(csv.as_bytes()).is_err());
     }
 }

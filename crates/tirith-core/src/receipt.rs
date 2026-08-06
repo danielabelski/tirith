@@ -76,7 +76,19 @@ impl Receipt {
         let dir = receipts_dir().ok_or("cannot determine receipts directory")?;
         let path = dir.join(format!("{sha256}.json"));
         let content = fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
-        serde_json::from_str(&content).map_err(|e| format!("parse: {e}"))
+        let receipt: Self = serde_json::from_str(&content).map_err(|e| format!("parse: {e}"))?;
+        // Bind the loaded receipt to the requested identity (repo-0416): the
+        // store is content-addressed, so a document whose embedded hash differs
+        // from the requested filename is a substituted receipt — verifying it
+        // would check a DIFFERENT cached script while reporting the requested
+        // one as verified.
+        if receipt.sha256 != sha256 {
+            return Err(format!(
+                "receipt identity mismatch: {sha256}.json contains a receipt for {}",
+                receipt.sha256
+            ));
+        }
+        Ok(receipt)
     }
 
     /// List all receipts.
@@ -121,6 +133,82 @@ impl Receipt {
         let hash = sha2_hex(&content);
         Ok(hash == self.sha256)
     }
+
+    /// The public, JSON-serializable view of this receipt for default CLI
+    /// output (repo-0415 / repo-0420): credential-bearing URL userinfo is
+    /// redacted and local-machine metadata (`cwd`) is omitted. The stored
+    /// receipt keeps full fidelity; only the default output is minimized.
+    pub fn public_view(&self) -> PublicReceipt {
+        PublicReceipt {
+            url: redact_url_userinfo(&self.url),
+            final_url: self.final_url.as_deref().map(redact_url_userinfo),
+            redirects: self
+                .redirects
+                .iter()
+                .map(|u| redact_url_userinfo(u))
+                .collect(),
+            sha256: self.sha256.clone(),
+            size: self.size,
+            domains_referenced: self.domains_referenced.clone(),
+            paths_referenced: self.paths_referenced.clone(),
+            analysis_method: self.analysis_method.clone(),
+            privilege: self.privilege.clone(),
+            timestamp: self.timestamp.clone(),
+            git_repo: self.git_repo.as_deref().map(redact_url_userinfo),
+            git_branch: self.git_branch.clone(),
+        }
+    }
+}
+
+/// Redact the userinfo component (`user:password@`) of an absolute URL while
+/// keeping scheme, host, and path for diagnostics (repo-0415). Applied to
+/// every URL a receipt serializes so a credential-bearing Git remote or
+/// download URL (`https://user:pat@host/...`) cannot reach JSON output, logs,
+/// or CI artifacts. Strings without a `scheme://authority` form or without
+/// userinfo pass through unchanged.
+pub fn redact_url_userinfo(url: &str) -> String {
+    // Userinfo exists only in an authority-based absolute URL.
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let after_scheme = &url[authority_start..];
+    // The authority ends at the first path/query/fragment delimiter.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .map(|i| authority_start + i)
+        .unwrap_or(url.len());
+    let authority = &url[authority_start..authority_end];
+    // RFC 3986 splits userinfo at the LAST `@` (a conformant producer
+    // percent-encodes any `@` inside the password).
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}://***@{}{}",
+        &url[..scheme_end],
+        &authority[at + 1..],
+        &url[authority_end..]
+    )
+}
+
+/// The redacted output DTO serialized by `tirith run --json` and
+/// `tirith receipt last|list --json` (repo-0415 / repo-0420). Same diagnostic
+/// shape as [`Receipt`] minus `cwd`, with every URL field userinfo-redacted.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PublicReceipt {
+    pub url: String,
+    pub final_url: Option<String>,
+    pub redirects: Vec<String>,
+    pub sha256: String,
+    pub size: u64,
+    pub domains_referenced: Vec<String>,
+    pub paths_referenced: Vec<String>,
+    pub analysis_method: String,
+    pub privilege: String,
+    pub timestamp: String,
+    pub git_repo: Option<String>,
+    pub git_branch: Option<String>,
 }
 
 // ===========================================================================
@@ -965,6 +1053,97 @@ mod tests {
     fn test_short_hash_normal() {
         let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         assert_eq!(short_hash(hash), "abcdef012345");
+    }
+
+    fn script_receipt(sha256: String) -> Receipt {
+        Receipt {
+            url: "https://example.com/install.sh".to_string(),
+            final_url: None,
+            redirects: vec![],
+            sha256,
+            size: 42,
+            domains_referenced: vec!["example.com".to_string()],
+            paths_referenced: vec![],
+            analysis_method: "test".to_string(),
+            privilege: "user".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            cwd: Some("/Users/operator/secret-project".to_string()),
+            git_repo: Some("https://deploy:pat-token-123@github.com/org/repo.git".to_string()),
+            git_branch: Some("main".to_string()),
+        }
+    }
+
+    #[test]
+    fn redact_url_userinfo_strips_credentials_keeps_host() {
+        assert_eq!(
+            redact_url_userinfo("https://deploy:pat-token-123@github.com/org/repo.git"),
+            "https://***@github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_url_userinfo("https://user@host:8443/path?q=1#f"),
+            "https://***@host:8443/path?q=1#f"
+        );
+        // No userinfo / not an absolute authority URL: unchanged.
+        assert_eq!(
+            redact_url_userinfo("https://github.com/org/repo"),
+            "https://github.com/org/repo"
+        );
+        assert_eq!(
+            redact_url_userinfo("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+        assert_eq!(redact_url_userinfo("not a url @ all"), "not a url @ all");
+    }
+
+    #[test]
+    fn public_view_redacts_userinfo_and_omits_cwd() {
+        let r = script_receipt("a".repeat(64));
+        let v = serde_json::to_value(r.public_view()).unwrap();
+        assert_eq!(
+            v["git_repo"],
+            serde_json::json!("https://***@github.com/org/repo.git"),
+            "credential userinfo must be redacted, host kept"
+        );
+        assert!(
+            v.get("cwd").is_none(),
+            "local-machine cwd must not reach default JSON output"
+        );
+        let blob = v.to_string();
+        assert!(!blob.contains("pat-token-123"), "{blob}");
+        assert!(!blob.contains("secret-project"), "{blob}");
+    }
+
+    #[test]
+    fn load_rejects_substituted_receipt_identity() {
+        // repo-0416: a receipt file whose embedded hash differs from the
+        // requested filename is a substituted receipt — verifying it would
+        // check a DIFFERENT cached script while reporting success for the
+        // requested one.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _guards = isolate_dirs(root.path());
+        let dir = root.path().join("tirith").join("receipts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let requested = "a".repeat(64);
+        let embedded = "b".repeat(64);
+        let receipt = script_receipt(embedded);
+        std::fs::write(
+            dir.join(format!("{requested}.json")),
+            serde_json::to_string(&receipt).unwrap(),
+        )
+        .unwrap();
+        let err = Receipt::load(&requested).expect_err("a substituted receipt must be rejected");
+        assert!(err.contains("mismatch"), "{err}");
+        // A matching receipt still loads.
+        let receipt = script_receipt(requested.clone());
+        std::fs::write(
+            dir.join(format!("{requested}.json")),
+            serde_json::to_string(&receipt).unwrap(),
+        )
+        .unwrap();
+        assert!(Receipt::load(&requested).is_ok());
     }
 
     #[test]

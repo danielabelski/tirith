@@ -312,35 +312,101 @@ pub fn which_all_os(command: &str, path_value: &std::ffi::OsStr) -> Vec<PathBuf>
             out.push(candidate);
         }
         #[cfg(windows)]
-        if Path::new(command).extension().is_none() {
-            for extension in windows_path_extensions() {
-                let candidate = dir.join(format!("{command}{extension}"));
-                if is_executable_file(&candidate) {
-                    out.push(candidate);
-                }
-            }
+        {
+            // repo-0307: reproduce Windows shell resolution for a bare command
+            // — PATHEXT candidates in the shell's order, matched
+            // case-insensitively — so a repository-controlled `git.exe` /
+            // `git.cmd` / `GIT.BAT` resolves exactly the way the shell would
+            // resolve it instead of being invisible to the audit.
+            out.extend(resolve_windows_candidates(&dir, command));
         }
     }
     out
 }
 
+/// The validated PATHEXT list: only `.EXT` tokens, shell order preserved,
+/// case-insensitively de-duplicated, lowercased for comparison. A missing or
+/// entirely invalid PATHEXT falls back to the shell's default executable
+/// extensions so resolution never silently resolves NOTHING (repo-0307).
+#[cfg(any(windows, test))]
+fn parse_pathext(value: Option<&str>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if let Some(value) = value {
+        for token in value.split(';') {
+            let token = token.trim();
+            if token.len() < 2 || !token.starts_with('.') {
+                continue;
+            }
+            let lower = token.to_ascii_lowercase();
+            if seen.insert(lower.clone()) {
+                out.push(lower);
+            }
+        }
+    }
+    if out.is_empty() {
+        out = [".com", ".exe", ".bat", ".cmd"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+    out
+}
+
+/// Candidate executable file NAMES for `command` in one directory, in Windows
+/// shell resolution order and matched case-insensitively (repo-0307). A bare
+/// command tries the extensionless name first, then each validated PATHEXT
+/// extension in order; a command typed WITH an extension resolves only that
+/// exact name. `dir_listing` holds the directory's entry names; the matched
+/// entry's OWN spelling is returned (NTFS preserves case). Pure, so the
+/// semantics are unit-testable off Windows.
+#[cfg(any(windows, test))]
+fn windows_command_candidates(
+    command: &str,
+    pathext: &[String],
+    dir_listing: &[String],
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if Path::new(command).extension().is_some() {
+        names.push(command.to_string());
+    } else {
+        names.push(command.to_string());
+        for extension in pathext {
+            names.push(format!("{command}{extension}"));
+        }
+    }
+    let mut out = Vec::new();
+    for wanted in names {
+        if let Some(actual) = dir_listing
+            .iter()
+            .find(|entry| entry.eq_ignore_ascii_case(&wanted))
+        {
+            out.push(actual.clone());
+        }
+    }
+    out
+}
+
+/// Resolve `command` in `dir` the way a Windows shell would, returning the
+/// resolved executable paths in candidate order (repo-0307).
 #[cfg(windows)]
-fn windows_path_extensions() -> Vec<String> {
-    std::env::var("PATHEXT")
-        .ok()
-        .map(|value| {
-            value
-                .split(';')
-                .filter(|extension| !extension.is_empty())
-                .map(str::to_ascii_lowercase)
-                .collect()
+fn resolve_windows_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    let pathext = parse_pathext(std::env::var("PATHEXT").ok().as_deref());
+    let listing: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    windows_command_candidates(command, &pathext, &listing)
+        .into_iter()
+        .map(|name| {
+            let candidate = dir.join(name);
+            candidate
         })
-        .unwrap_or_else(|| {
-            [".com", ".exe", ".bat", ".cmd"]
-                .into_iter()
-                .map(str::to_string)
-                .collect()
-        })
+        .filter(|candidate| is_executable_file(candidate))
+        .collect()
 }
 
 /// `true` when `path` is under one of [`SYSTEM_PATH_DIRS`]. Used by
@@ -918,5 +984,62 @@ mod tests {
     #[test]
     fn resolve_leader_bare_name_no_hit_is_none() {
         assert!(resolve_leader("definitely-not-on-path-xyz", None, None, "/usr/bin").is_none());
+    }
+
+    /// repo-0307: PATHEXT parsing validates tokens, preserves shell order, and
+    /// de-duplicates case-insensitively; missing/invalid input falls back to
+    /// the default executable extensions.
+    #[test]
+    fn parse_pathext_validates_and_orders() {
+        assert_eq!(
+            parse_pathext(Some(".COM;.EXE;.BAT;junk;;.exe;.CMD")),
+            vec![".com", ".exe", ".bat", ".cmd"]
+        );
+        assert_eq!(
+            parse_pathext(Some(".PS1;.EXE")),
+            vec![".ps1", ".exe"],
+            "shell order is preserved, not sorted"
+        );
+        assert_eq!(
+            parse_pathext(None),
+            vec![".com", ".exe", ".bat", ".cmd"],
+            "missing PATHEXT uses the default list"
+        );
+        assert_eq!(
+            parse_pathext(Some(";;;")),
+            vec![".com", ".exe", ".bat", ".cmd"],
+            "an entirely invalid PATHEXT still resolves the defaults"
+        );
+    }
+
+    /// repo-0307: bare names resolve to .exe/.cmd/.bat candidates in PATHEXT
+    /// order with case-insensitive matching, and the directory entry's own
+    /// spelling is returned.
+    #[test]
+    fn windows_candidates_match_case_insensitively_in_shell_order() {
+        let listing = vec![
+            "GIT.EXE".to_string(),
+            "git.CMD".to_string(),
+            "other.txt".to_string(),
+        ];
+        let pathext = vec![".exe".to_string(), ".cmd".to_string(), ".bat".to_string()];
+        assert_eq!(
+            windows_command_candidates("git", &pathext, &listing),
+            vec!["GIT.EXE".to_string(), "git.CMD".to_string()],
+            "uppercase/mixed-case extensions resolve like the shell"
+        );
+        assert!(
+            windows_command_candidates("missing", &pathext, &listing).is_empty(),
+            "no candidate means no resolution"
+        );
+        // A command typed WITH an extension resolves only that exact name.
+        assert_eq!(
+            windows_command_candidates("git.cmd", &pathext, &listing),
+            vec!["git.CMD".to_string()]
+        );
+        assert!(
+            windows_command_candidates("git.bat", &pathext, &listing).is_empty(),
+            "an explicitly typed extension does not widen to other candidates"
+        );
     }
 }

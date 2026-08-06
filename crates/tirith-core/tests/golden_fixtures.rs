@@ -698,6 +698,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "prompt_injection_obfuscated",
     // Output-side data-exfiltration rule (C7)
     "output_data_exfiltration",
+    // Output-side bounded-analysis gap (R2)
+    "output_analysis_overflow",
     // Operational-context rules (M8 ch1)
     "context_prod_destructive_command",
     "context_prod_write_operation",
@@ -852,10 +854,13 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "agent_denied_by_policy",
     "command_network_deny",
     "license_required",
-    "custom_rule_match",  // requires custom_rules in policy (Team-only)
-    "server_cloaking",    // requires network fetch (Unix-only)
-    "clipboard_hidden",   // requires --html clipboard input
-    "pdf_hidden_text",    // requires .pdf file input
+    "custom_rule_match", // requires custom_rules in policy (Team-only)
+    "server_cloaking",   // requires network fetch (Unix-only)
+    "clipboard_hidden",  // requires --html clipboard input
+    "pdf_hidden_text",   // requires .pdf file input
+    // requires >4096 scanner hits in one output stream (unit-tested in
+    // rules/output.rs and extract.rs)
+    "output_analysis_overflow",
     "config_malformed",   // requires MCP config filename context in file scan
     "vet_not_configured", // requires cargo install without cargo-vet
     // Local-DB threat rules are covered via test-threatdb.dat; the rules below
@@ -1323,6 +1328,8 @@ rule_id_variant_registry! {
     PromptInjectionInOutput, IgnorePreviousInstructions, PromptInjectionObfuscated,
     // Output-side data-exfiltration rule (C7)
     OutputDataExfiltration,
+    // Output-side bounded-analysis gap (R2)
+    OutputAnalysisOverflow,
     // Operational-context rules (M8 ch1)
     ContextProdDestructiveCommand, ContextProdWriteOperation, ContextProdCredentialChange,
     // SSH operational-context rules (M8 ch2)

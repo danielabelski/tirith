@@ -285,6 +285,7 @@ pub fn retains(profile: LspProfile, rule_id: RuleId) -> bool {
                 | RuleId::OutputTitleManipulation
                 | RuleId::OutputClearScreen
                 | RuleId::OutputTruncatedEscapeSequence
+                | RuleId::OutputAnalysisOverflow
         ),
     }
 }

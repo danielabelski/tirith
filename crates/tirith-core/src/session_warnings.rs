@@ -194,13 +194,9 @@ fn cutoff_time(window_minutes: u64) -> String {
 /// Session IDs must be non-empty, <=128 chars, and contain only
 /// `[a-zA-Z0-9_-]` to prevent path traversal.
 pub fn session_state_path(session_id: &str) -> Option<PathBuf> {
-    if session_id.is_empty() || session_id.len() > 128 {
-        return None;
-    }
-    if !session_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    // repo-0339: one shared alphabet with the session resolver, so an ID the
+    // resolver accepted is always storable.
+    if !crate::session::is_valid_session_id(session_id) {
         return None;
     }
     let state = crate::policy::state_dir()?;
@@ -498,6 +494,10 @@ pub fn record_outcome(
 
     // Pre-compute redacted command outside the lock to minimise hold time.
     let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
+    // repo-0340: redaction strips secrets, not terminal controls. The stored
+    // record is printed later by `tirith warnings`, so scrub display-unsafe
+    // content BEFORE persisting.
+    let command_redacted = crate::mcp::output_filter::sanitize_for_display(&command_redacted);
     let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -513,7 +513,11 @@ pub fn record_outcome(
         .map(|f| FindingData {
             rule_id: f.rule_id.to_string(),
             severity: f.severity.to_string(),
-            title: crate::util::truncate_bytes(&f.title, 120),
+            // repo-0340: a repo-controlled custom-rule title can carry ESC/OSC.
+            title: crate::util::truncate_bytes(
+                &crate::mcp::output_filter::sanitize_for_display(&f.title),
+                120,
+            ),
             domains: extract_domains_from_evidence(&f.evidence),
         })
         .collect();
@@ -524,7 +528,10 @@ pub fn record_outcome(
         .map(|f| FindingData {
             rule_id: f.rule_id.to_string(),
             severity: f.severity.to_string(),
-            title: crate::util::truncate_bytes(&f.title, 120),
+            title: crate::util::truncate_bytes(
+                &crate::mcp::output_filter::sanitize_for_display(&f.title),
+                120,
+            ),
             domains: Vec::new(), // not needed for hidden events
         })
         .collect();
@@ -655,6 +662,8 @@ pub(crate) fn record_executed_typed_events(
 
     let now = chrono::Utc::now().to_rfc3339();
     let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
+    // repo-0340: strip terminal controls before persisting.
+    let command_redacted = crate::mcp::output_filter::sanitize_for_display(&command_redacted);
     let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
     with_session_locked(session_id, move |session| {
         for mut event in events.drain(..) {
@@ -707,6 +716,8 @@ pub fn correlate_session(
     // Redact + truncate the command once, outside the lock, to minimise hold time
     // (mirrors `record_outcome`); it is identical for every hit this call surfaces.
     let command_redacted = crate::redact::redact_command_text(cmd, dlp_patterns);
+    // repo-0340: strip terminal controls before persisting.
+    let command_redacted = crate::mcp::output_filter::sanitize_for_display(&command_redacted);
     let command_redacted = crate::util::truncate_bytes(&command_redacted, 120);
     with_session_locked_result(session_id, true, |session| {
         record_fresh_correlation_warnings(session, &now, &command_redacted, policy)

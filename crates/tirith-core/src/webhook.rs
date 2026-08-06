@@ -33,7 +33,7 @@ pub fn dispatch(
         if let Err(reason) = crate::url_validate::validate_server_url(&wh.url) {
             crate::audit::audit_diagnostic(format!(
                 "tirith: webhook: skipping {}: {reason}",
-                wh.url
+                webhook_url_origin(&wh.url)
             ));
             continue;
         }
@@ -45,10 +45,21 @@ pub fn dispatch(
         std::thread::spawn(move || {
             if let Err(e) = send_with_retry(&url, &payload, &headers, 3) {
                 crate::audit::audit_diagnostic(format!(
-                    "tirith: webhook delivery to {url} failed: {e}"
+                    "tirith: webhook delivery to {} failed: {e}",
+                    webhook_url_origin(&url)
                 ));
             }
         });
+    }
+}
+
+/// repo-0353: webhook URLs commonly embed the credential in the path or query
+/// (Slack/Discord tokens). Diagnostics log only the origin, never the
+/// credential-bearing components.
+fn webhook_url_origin(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) => parsed.origin().ascii_serialization(),
+        Err(_) => "<unparseable webhook URL>".to_string(),
     }
 }
 

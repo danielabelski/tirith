@@ -713,6 +713,54 @@ fn default_approval_fallback() -> String {
     "block".to_string()
 }
 
+/// SHA-256 hex digest of one projection value. Binds list CONTENT in the
+/// redacted security projection without placing free-text or identifying
+/// values in it (repo-0311).
+fn projection_value_digest(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(value.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Sorted per-rule digests of a serializable rule list, so rule-list content
+/// changes always change the security projection while order does not.
+fn projection_rule_digests<T: serde::Serialize>(rules: &[T]) -> Vec<String> {
+    let mut out: Vec<String> = rules
+        .iter()
+        .map(|rule| {
+            let value = serde_json::to_value(rule).unwrap_or(serde_json::Value::Null);
+            projection_value_digest(&crate::audit::canonical_json_for_hash(&value))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Canonical `key=v1,v2` pairs for a string→string-list map (sorted keys,
+/// sorted values), for projection binding of map-shaped settings.
+fn projection_string_vec_map(map: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = map
+        .iter()
+        .map(|(k, vals)| {
+            let mut vals = vals.clone();
+            vals.sort();
+            format!("{k}={}", vals.join(","))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Sorted `key=value` pairs for an override map, binding both the key AND the
+/// value (severity/action overrides: the value changes the verdict, so the
+/// projection must bind it — repo-0311).
+fn projection_override_pairs<V: std::fmt::Display>(map: &HashMap<String, V>) -> Vec<String> {
+    let mut pairs: Vec<String> = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    pairs
+}
+
 /// Webhook configuration for event notification.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebhookConfig {
@@ -1706,11 +1754,12 @@ impl Policy {
     ///   `exec_guard_enabled`, `hooks_guard_enabled`) — default `false`/off; a
     ///   repo can only turn them ON, which adds rules.
     ///   `context_destructive_verbs`, `env_guard_sensitive_vars` only WIDEN the
-    ///   destructive/sensitive sets. `sudo_require_reason` and
-    ///   `baseline_enabled` are reset because they respectively downgrade sudo
-    ///   findings and enable persistent observation writes.
+    ///   destructive/sensitive sets. `sudo_require_reason`, `sudo_session_ttl`,
+    ///   and `baseline_enabled` are reset because they respectively downgrade
+    ///   sudo findings, stretch that downgrade window, and enable persistent
+    ///   observation writes.
     /// * `agent_rules` — `deny` tightens; `allow` is NOT a bypass (escalation.rs).
-    /// * `checkpoints`, `sudo_session_ttl`, `scan.additional_config_files`/
+    /// * `checkpoints`, `scan.additional_config_files`/
     ///   `mcp_allowed_tools` — retention/coverage/tightening, never a guard relax.
     /// * `gateway_profile` — TIGHTENING: the enum has only the hardened `Secure`
     ///   variant, so a repo can opt the gateway INTO secure defaults but cannot
@@ -1837,6 +1886,13 @@ impl Policy {
         self.sudo_require_reason = defaults.sudo_require_reason;
         self.baseline_enabled = defaults.baseline_enabled;
 
+        // The session TTL pairs with the sudo-require-reason downgrade: a
+        // repository-controlled TTL stretches the window in which an active
+        // session demotes High sudo findings to Medium. Treat it as weakening
+        // and reset it for repository scope (repo-0314).
+        record!("sudo_session_ttl", sudo_session_ttl);
+        self.sudo_session_ttl = defaults.sudo_session_ttl;
+
         // MCP / scan suppression — a `trusted_mcp_servers` identity silences the four
         // MCP config rules + drift; `ignore_patterns`/`fail_on`/`profiles` suppress
         // the `tirith scan` walk or relax its CI gate. Reset the weakening scan
@@ -1914,20 +1970,25 @@ impl Policy {
     /// `gateway_profile`), the threat-intel enable flags, the package-policy
     /// scalar thresholds/toggles, and the SORTED values of the host/URL deny &
     /// allow lists (`blocklist`, `network_deny`, `network_allow`,
-    /// `additional_known_domains`) plus the sorted KEYS of `severity_overrides` /
-    /// `action_overrides`. The discovery `scope` is included so a repo-scoped
-    /// (sanitized) policy fingerprints differently from a user/org one.
+    /// `additional_known_domains`), the guard toggles, and the sorted
+    /// `key=value` pairs of `severity_overrides` / `action_overrides`. Every
+    /// verdict-affecting LIST is bound by sorted per-value SHA-256 digests
+    /// (repo-0311): two policies that differ in ANY allowlisted destination,
+    /// approval/custom/escalation rule, override VALUE, or guard field now
+    /// fingerprint differently — a policy can no longer be weakened while an
+    /// approval bound to `security_projection_hash` stays valid. The discovery
+    /// `scope` is included so a repo-scoped (sanitized) policy fingerprints
+    /// differently from a user/org one.
     ///
     /// # What is excluded (secrets + identifying + machine-specific)
     ///
     /// NEVER serialized here: `policy_server_url` / `policy_server_api_key` /
     /// `threat_intel` API keys (credentials), `webhooks` (a URL may embed a
-    /// token), the loaded `path` (a machine path), and the free-text/identifying
+    /// token), and the loaded `path` (a machine path). Free-text/identifying
     /// list VALUES (`dlp_custom_patterns`, `injection_seeds_custom`,
-    /// `package_policy.internal_package_names`), only their COUNTS are recorded,
-    /// so the fingerprint reflects "N custom seeds present" without leaking the
-    /// pattern text. Counts keep the projection sensitive to a posture change
-    /// while staying redaction-safe.
+    /// `package_policy.internal_package_names`, `env_guard_sensitive_vars`,
+    /// `scan.ignore_patterns`, …) appear ONLY as individual SHA-256 digests —
+    /// content-bound without leaking the pattern text.
     ///
     /// Keys are emitted in a fixed order and any list is sorted, so the value is
     /// canonical input for [`crate::audit::canonical_json_for_hash`]; the same
@@ -1938,49 +1999,177 @@ impl Policy {
             out.sort();
             out
         };
-        let override_keys = |m: &HashMap<String, String>| -> Vec<String> {
-            let mut keys: Vec<String> = m.keys().cloned().collect();
-            keys.sort();
-            keys
+        // repo-0311: counts and key-only entries made the binding hash collide
+        // across materially different policies (swapping one allowlisted
+        // destination or custom-rule expression while preserving the COUNT
+        // produced the same hash). Every verdict-affecting list is now bound by
+        // sorted PER-VALUE SHA-256 digests: the projection stays redaction-safe
+        // (no free text appears) while any content change flips the hash.
+        let hashed_sorted = |v: &[String]| -> Vec<String> {
+            let mut out: Vec<String> = v.iter().map(|s| projection_value_digest(s)).collect();
+            out.sort();
+            out
         };
-        let mut sev_keys: Vec<String> = self.severity_overrides.keys().cloned().collect();
-        sev_keys.sort();
-
         let pkg = &self.package_policy;
         let ti = &self.threat_intel;
+        let scan = &self.scan;
 
-        serde_json::json!({
-            "schema_version": self.schema_version,
-            "scope": format!("{:?}", self.scope),
-            "fail_mode": format!("{:?}", self.fail_mode),
-            "paranoia": self.paranoia,
-            "strict_warn": self.strict_warn,
-            "allow_bypass_env": self.allow_bypass_env,
-            "allow_bypass_env_noninteractive": self.allow_bypass_env_noninteractive,
-            "mcp_redact_injection": self.mcp_redact_injection,
-            "context_guard_enabled": self.context_guard_enabled,
-            "gateway_profile": self.gateway_profile.as_ref().map(|p| format!("{p:?}")),
-            "blocklist": sorted(&self.blocklist),
-            "network_deny": sorted(&self.network_deny),
-            "network_allow": sorted(&self.network_allow),
-            "additional_known_domains": sorted(&self.additional_known_domains),
-            "allowlist_len": self.allowlist.len(),
-            "allowlist_rules_len": self.allowlist_rules.len(),
-            "severity_override_keys": sev_keys,
-            "action_override_keys": override_keys(&self.action_overrides),
-            "approval_rules_len": self.approval_rules.len(),
-            "custom_rules_len": self.custom_rules.len(),
-            "escalation_rules_len": self.escalation.len(),
-            // Counts only for the free-text/identifying lists (values are redacted).
-            "dlp_custom_patterns_len": self.dlp_custom_patterns.len(),
-            "injection_seeds_custom_len": self.injection_seeds_custom.len(),
-            "internal_package_names_len": pkg.internal_package_names.len(),
-            "threat_intel": {
+        // Built incrementally: a single large `json!` literal exceeds the
+        // macro recursion limit at this size.
+        use serde_json::{json, Map, Value};
+        let mut m = Map::new();
+        let mut put = |k: &str, v: Value| {
+            m.insert(k.to_string(), v);
+        };
+
+        // Projection format version: 2 binds content (digests), 1 bound counts.
+        put("projection_version", json!(2));
+        put("schema_version", json!(self.schema_version));
+        put("scope", json!(format!("{:?}", self.scope)));
+        put("fail_mode", json!(format!("{:?}", self.fail_mode)));
+        put("policy_fetch_fail_mode", json!(self.policy_fetch_fail_mode));
+        put("enforce_fail_mode", json!(self.enforce_fail_mode));
+        put("paranoia", json!(self.paranoia));
+        put("strict_warn", json!(self.strict_warn));
+        put("allow_bypass_env", json!(self.allow_bypass_env));
+        put(
+            "allow_bypass_env_noninteractive",
+            json!(self.allow_bypass_env_noninteractive),
+        );
+        put("mcp_redact_injection", json!(self.mcp_redact_injection));
+        put("context_guard_enabled", json!(self.context_guard_enabled));
+        put(
+            "iac_require_plan_before_apply",
+            json!(self.iac_require_plan_before_apply),
+        );
+        put("env_guard_enabled", json!(self.env_guard_enabled));
+        put("exec_guard_enabled", json!(self.exec_guard_enabled));
+        put("hooks_guard_enabled", json!(self.hooks_guard_enabled));
+        put("baseline_enabled", json!(self.baseline_enabled));
+        // A live downgrade pair: enabling the reasoned-session mode and its
+        // TTL changes verdict severity, so both belong in the binding.
+        put("sudo_require_reason", json!(self.sudo_require_reason));
+        put("sudo_session_ttl", json!(self.sudo_session_ttl));
+        put(
+            "gateway_profile",
+            json!(self.gateway_profile.as_ref().map(|p| format!("{p:?}"))),
+        );
+        put("blocklist", json!(sorted(&self.blocklist)));
+        put("network_deny", json!(sorted(&self.network_deny)));
+        put("network_allow", json!(sorted(&self.network_allow)));
+        put(
+            "additional_known_domains",
+            json!(sorted(&self.additional_known_domains)),
+        );
+        put(
+            "allowed_install_domains",
+            json!(sorted(&self.allowed_install_domains)),
+        );
+        put("allowlist_len", json!(self.allowlist.len()));
+        put("allowlist_sha256", json!(hashed_sorted(&self.allowlist)));
+        put("allowlist_rules_len", json!(self.allowlist_rules.len()));
+        put(
+            "allowlist_rules_sha256",
+            json!(projection_rule_digests(&self.allowlist_rules)),
+        );
+        put(
+            "severity_overrides",
+            json!(projection_override_pairs(&self.severity_overrides)),
+        );
+        put(
+            "action_overrides",
+            json!(projection_override_pairs(&self.action_overrides)),
+        );
+        put("approval_rules_len", json!(self.approval_rules.len()));
+        put(
+            "approval_rules_sha256",
+            json!(projection_rule_digests(&self.approval_rules)),
+        );
+        put("custom_rules_len", json!(self.custom_rules.len()));
+        put(
+            "custom_rules_sha256",
+            json!(projection_rule_digests(&self.custom_rules)),
+        );
+        put("escalation_rules_len", json!(self.escalation.len()));
+        put(
+            "escalation_sha256",
+            json!(projection_rule_digests(&self.escalation)),
+        );
+        put(
+            "agent_rules_allow_sha256",
+            json!(projection_rule_digests(&self.agent_rules.allow)),
+        );
+        put(
+            "agent_rules_deny_sha256",
+            json!(projection_rule_digests(&self.agent_rules.deny)),
+        );
+        put(
+            "context_destructive_verbs",
+            json!(projection_string_vec_map(&self.context_destructive_verbs)),
+        );
+        put(
+            "env_guard_sensitive_vars_sha256",
+            json!(hashed_sorted(&self.env_guard_sensitive_vars)),
+        );
+        // Digests (never raw values) for the free-text/identifying lists.
+        put(
+            "dlp_custom_patterns_len",
+            json!(self.dlp_custom_patterns.len()),
+        );
+        put(
+            "dlp_custom_patterns_sha256",
+            json!(hashed_sorted(&self.dlp_custom_patterns)),
+        );
+        put(
+            "injection_seeds_custom_len",
+            json!(self.injection_seeds_custom.len()),
+        );
+        put(
+            "injection_seeds_custom_sha256",
+            json!(hashed_sorted(&self.injection_seeds_custom)),
+        );
+        put(
+            "internal_package_names_len",
+            json!(pkg.internal_package_names.len()),
+        );
+        put(
+            "internal_package_names_sha256",
+            json!(projection_rule_digests(&pkg.internal_package_names)),
+        );
+        put(
+            "share_customer_id_patterns_sha256",
+            json!(hashed_sorted(&self.share.customer_id_patterns)),
+        );
+        put(
+            "checkpoints",
+            json!({
+                "max_count": self.checkpoints.max_count,
+                "max_age_hours": self.checkpoints.max_age_hours,
+                "max_storage_bytes": self.checkpoints.max_storage_bytes,
+            }),
+        );
+        put(
+            "scan",
+            json!({
+                "additional_config_files_sha256": hashed_sorted(&scan.additional_config_files),
+                "trusted_mcp_servers": sorted(&scan.trusted_mcp_servers),
+                "mcp_allowed_tools": projection_string_vec_map(&scan.mcp_allowed_tools),
+                "ignore_patterns_sha256": hashed_sorted(&scan.ignore_patterns),
+                "fail_on": scan.fail_on,
+                "require_complete": scan.require_complete,
+            }),
+        );
+        put(
+            "threat_intel",
+            json!({
                 "osv_enabled": ti.osv_enabled,
                 "deps_dev_enabled": ti.deps_dev_enabled,
                 "phishing_army_enabled": ti.phishing_army_enabled,
-            },
-            "package_policy": {
+            }),
+        );
+        put(
+            "package_policy",
+            json!({
                 "block_not_found": pkg.block_not_found,
                 "block_newer_than_days": pkg.block_newer_than_days,
                 "warn_newer_than_days": pkg.warn_newer_than_days,
@@ -1994,8 +2183,9 @@ impl Policy {
                 "block_repo_mismatch": pkg.block_repo_mismatch,
                 "warn_install_script_network_call": pkg.warn_install_script_network_call,
                 "block_dependency_confusion": pkg.block_dependency_confusion,
-            },
-        })
+            }),
+        );
+        Value::Object(m)
     }
 
     /// The lowercase-hex SHA-256 of the canonicalized [`Self::security_projection`].
@@ -2475,21 +2665,60 @@ impl Policy {
                 );
             }
             let blocklist_path = org_dir.join("blocklist");
-            if let Ok(content) = std::fs::read_to_string(&blocklist_path) {
-                eprintln!(
-                    "tirith: loading repo-scoped blocklist from {}",
-                    blocklist_path.display()
-                );
-                for line in content.lines() {
-                    let line = line.trim();
-                    if !line.is_empty() && !line.starts_with('#') {
+            // repo-0312: the blocklist is attacker-controlled repo content, so
+            // load it through the hardened no-follow, capped reader — a
+            // committed symlink to a huge/endless file (e.g. /dev/zero) must
+            // not hang or OOM every analysis. Entries are also count-capped.
+            match crate::util::read_text_no_follow_capped(&blocklist_path, REPO_BLOCKLIST_READ_CAP)
+            {
+                Ok(bytes) => {
+                    let content = String::from_utf8_lossy(&bytes);
+                    eprintln!(
+                        "tirith: loading repo-scoped blocklist from {}",
+                        blocklist_path.display()
+                    );
+                    let mut entries = 0usize;
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if entries >= REPO_BLOCKLIST_MAX_ENTRIES {
+                            eprintln!(
+                                "tirith: warning: repo blocklist exceeds {REPO_BLOCKLIST_MAX_ENTRIES} entries; remaining entries ignored"
+                            );
+                            break;
+                        }
                         self.blocklist.push(line.to_string());
+                        entries += 1;
                     }
+                }
+                Err(crate::util::OpenRegularError::NotFound) => {}
+                Err(e) => {
+                    let reason = match &e {
+                        crate::util::OpenRegularError::NotRegularFile => {
+                            "not a regular file (symlink?)".to_string()
+                        }
+                        crate::util::OpenRegularError::TooLarge => "exceeds size cap".to_string(),
+                        crate::util::OpenRegularError::Io(io) => io.to_string(),
+                        crate::util::OpenRegularError::NotFound => unreachable!(),
+                    };
+                    eprintln!(
+                        "tirith: warning: refusing to load repo blocklist at {} ({reason}); file must be a regular, non-symlink file within {} bytes",
+                        blocklist_path.display(),
+                        REPO_BLOCKLIST_READ_CAP
+                    );
                 }
             }
         }
     }
 }
+
+/// Byte cap for the repository `.tirith/blocklist` (repo-0312). Generous for
+/// a lines-of-hosts file, small enough to stop memory/CPU exhaustion.
+const REPO_BLOCKLIST_READ_CAP: u64 = 256 * 1024;
+/// Entry cap for the repository `.tirith/blocklist` (repo-0312).
+const REPO_BLOCKLIST_MAX_ENTRIES: usize = 4096;
 
 /// Canonical trust-pattern classification shared by policy enforcement and the
 /// `tirith trust` UI.  Any class other than `Exact` can match more than one
@@ -5441,7 +5670,10 @@ custom_rules:
             sudo_require_reason, d.sudo_require_reason,
             "RESET: repo cannot enable the sudo-session severity downgrade"
         );
-        assert_eq!(sudo_session_ttl, Some(60), "KEPT: sudo_session_ttl");
+        assert_eq!(
+            sudo_session_ttl, d.sudo_session_ttl,
+            "RESET: repo cannot stretch the sudo-session downgrade window (repo-0314)"
+        );
         assert!(env_guard_enabled, "KEPT: env_guard_enabled");
         assert_eq!(
             env_guard_sensitive_vars,
@@ -5680,5 +5912,96 @@ custom_rules:
             b.security_projection_hash(),
             "list order must not affect the policy hash"
         );
+    }
+
+    #[test]
+    fn security_projection_hash_binds_content_not_counts() {
+        // Regression: repo-0311 — mutating any verdict-affecting CONTENT must
+        // change the binding hash even when every count and key set is
+        // preserved, so a weakened policy can never reuse an existing approval.
+        let base = Policy {
+            allowlist: vec!["https://trusted-a.example".to_string()],
+            custom_rules: vec![CustomRule {
+                id: "r1".into(),
+                pattern: Some("alpha".into()),
+                when: None,
+                context: vec!["exec".into()],
+                severity: Severity::High,
+                title: "r1".into(),
+                description: String::new(),
+                action: None,
+            }],
+            dlp_custom_patterns: vec!["PATTERN-A".to_string()],
+            ..Default::default()
+        };
+        let base_hash = base.security_projection_hash();
+
+        // Same allowlist LENGTH, different destination.
+        let mut swapped = base.clone();
+        swapped.allowlist = vec!["https://attacker.example".to_string()];
+        assert_ne!(
+            base_hash,
+            swapped.security_projection_hash(),
+            "allowlist content"
+        );
+
+        // Same custom-rule COUNT, different detection expression.
+        let mut swapped = base.clone();
+        swapped.custom_rules[0].pattern = Some("beta".into());
+        assert_ne!(
+            base_hash,
+            swapped.security_projection_hash(),
+            "custom rule content"
+        );
+
+        // Same override KEYS, different VALUES.
+        let mut a = base.clone();
+        a.severity_overrides.insert("rule_x".into(), Severity::High);
+        let mut b = base.clone();
+        b.severity_overrides.insert("rule_x".into(), Severity::Info);
+        assert_ne!(
+            a.security_projection_hash(),
+            b.security_projection_hash(),
+            "override values must be bound, not just keys"
+        );
+
+        // Guard-field flips change the hash.
+        for mutate in [
+            (|p: &mut Policy| p.sudo_require_reason = true) as fn(&mut Policy),
+            |p| p.sudo_session_ttl = Some(3600),
+            |p| p.env_guard_enabled = true,
+            |p| p.exec_guard_enabled = true,
+            |p| p.hooks_guard_enabled = true,
+            |p| p.iac_require_plan_before_apply = true,
+            |p| p.baseline_enabled = true,
+        ] {
+            let mut m = base.clone();
+            mutate(&mut m);
+            assert_ne!(
+                base_hash,
+                m.security_projection_hash(),
+                "guard-field mutation must change the binding hash"
+            );
+        }
+
+        // Approval/escalation content (not just count).
+        let mut a = base.clone();
+        a.approval_rules.push(ApprovalRule {
+            rule_ids: vec!["x".into()],
+            timeout_secs: 30,
+            fallback: "block".into(),
+        });
+        let mut b = a.clone();
+        b.approval_rules[0].timeout_secs = 31;
+        assert_ne!(
+            a.security_projection_hash(),
+            b.security_projection_hash(),
+            "approval-rule content must be bound"
+        );
+
+        // Redaction preserved: raw free text still never appears.
+        let projection = serde_json::to_string(&base.security_projection()).unwrap();
+        assert!(!projection.contains("PATTERN-A"));
+        assert!(!projection.contains("trusted-a.example"));
     }
 }

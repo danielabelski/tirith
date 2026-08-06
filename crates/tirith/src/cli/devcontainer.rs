@@ -105,9 +105,11 @@ pub fn inject(path: Option<&Path>, create: bool, json: bool) -> i32 {
             }
         },
     };
+    // Containment is proven against the canonical workspace root (repo-0376).
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
 
     let target = find_devcontainer_json(&cwd).unwrap_or_else(|| default_devcontainer_json(&cwd));
-    let outcome = inject_tirith_hook(&target, create);
+    let outcome = inject_tirith_hook(&target, &cwd, create);
     report_outcome("devcontainer inject", &outcome, json)
 }
 
@@ -197,10 +199,39 @@ fn resolve_policy_path() -> Result<PathBuf, i32> {
 }
 
 fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Confine the read-modify-write beneath the policy file's own directory
+    // (the repository `.tirith` directory or the user config dir): the
+    // contained writer refuses a symlinked final component AND any symlinked
+    // intermediate directory, and publishes atomically through a
+    // same-directory temporary file (repo-0376). A repository-planted symlink
+    // at `.tirith/policy.yaml` is refused instead of truncated, and an
+    // unreadable file is no longer silently treated as empty (which would
+    // have clobbered its real contents).
+    let root = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "policy path has no parent directory",
+            )
+        })?;
+    let prepared = tirith_core::util::ContainedAtomicFile::prepare(root, path, true)?;
+    let existing = match prepared.read_capped(1024 * 1024) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "policy file is not UTF-8; refusing to rewrite it",
+            )
+        })?,
+        Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to read unsafe policy file: {e:?}"),
+            ))
+        }
+    };
     let new_line = format!("{key}: {value}");
     let prefix = format!("{key}:");
 
@@ -225,15 +256,7 @@ fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()>
         out.push('\n');
     }
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(out.as_bytes())
+    prepared.write_atomic(out.as_bytes(), true)
 }
 
 #[cfg(test)]

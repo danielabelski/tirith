@@ -582,8 +582,11 @@ fn gather_api(
     let nf = matches!(existence, PackageExistence::NotFound);
     if let ApiSignals::Available { provenance } = &mut signals {
         provenance.package_existence = existence;
-        // Snapshot-store write — reuses the fetched response, no extra call.
-        let _ = tirith_core::registry_history::record_snapshot(eco, name, provenance);
+        // repo-0319: the snapshot is written inside `gather_api_signals` via
+        // `record_snapshot_with_maintainers` with the REAL maintainer list. A
+        // second write here carried no maintainers, which made every takeover
+        // diff compare against an empty set and never fire. Do not add a
+        // second, maintainer-less snapshot.
         // Diff vs the previous snapshot. `diff_and_transfer_recent` returns the
         // transfer ONLY when no original maintainer survives (a full takeover),
         // which is the honest signal `ownership_transfer` carries.
@@ -598,10 +601,20 @@ fn gather_api(
         // OSV correlation (needs a version). Capture `OsvLookupState` so the
         // explainer distinguishes "no advisories" from "check unavailable".
         if let Some(v) = version {
-            let result = tirith_core::osv_correlation::for_package_with_state(eco, name, v);
-            provenance.osv_state = result.state;
-            if !result.advisories.is_empty() {
-                provenance.osv_advisories = Some(result.advisories);
+            // repo-0306: OSV answers EXACT-version queries only. A range
+            // (`^18.0.0`, `>=1.2,<2.0`) or sigil-prefixed value must not be
+            // sent as if exact — an empty response would be misclassified as
+            // verified-clean. Mark the lookup unavailable instead.
+            if is_exact_osv_version(v) {
+                let result = tirith_core::osv_correlation::for_package_with_state(eco, name, v);
+                provenance.osv_state = result.state;
+                if !result.advisories.is_empty() {
+                    provenance.osv_advisories = Some(result.advisories);
+                }
+            } else {
+                provenance.osv_state = tirith_core::osv_correlation::OsvLookupState::Unavailable(
+                    "non-exact version range; exact-version OSV query not applicable".to_string(),
+                );
             }
         }
         // Dep-confusion (offline-safe heuristic).
@@ -1693,4 +1706,20 @@ mod tests {
         assert!(!out.contains("\nFORGED"));
         assert!(out.contains("api signals: unavailable"));
     }
+}
+/// repo-0306: `true` only for a canonical exact version (digits/dots, optional
+/// `v` prefix, pre-release/build suffix). Range sigils (`^~><*=`), comparators,
+/// and wildcards make the value unusable as an OSV exact-version query.
+fn is_exact_osv_version(v: &str) -> bool {
+    let v = v.trim();
+    if v.is_empty() {
+        return false;
+    }
+    if v.chars()
+        .any(|c| matches!(c, '^' | '~' | '>' | '<' | '=' | '*' | ',' | ' ' | '|'))
+    {
+        return false;
+    }
+    let first = v.as_bytes()[0];
+    first.is_ascii_digit() || (first == b'v' && v.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
 }

@@ -706,6 +706,13 @@ fn count_distinct(s: &[u8]) -> usize {
 }
 
 fn num_possible_outcomes(num_values: usize, num_distinct: usize, base: usize) -> f64 {
+    // repo-0324: `base - i` underflows once `num_distinct > base` (attacker-
+    // controlled paste values can carry up to 256 distinct bytes against a
+    // base as small as 16). More distinct values than the alphabet allows
+    // means zero such outcomes — and never a panic.
+    if num_distinct > base {
+        return 0.0;
+    }
     let mut res = base as f64;
     for i in 1..num_distinct {
         res *= (base - i) as f64;
@@ -761,6 +768,21 @@ fn factorial(n: usize) -> f64 {
         res *= i as f64;
     }
     res
+}
+
+#[cfg(test)]
+mod repo_0324_tests {
+    use super::num_possible_outcomes;
+
+    #[test]
+    fn distinct_over_alphabet_is_zero_not_underflow() {
+        // 20 distinct bytes against a base-16 alphabet: impossible outcome,
+        // previously an integer underflow (`base - i` with i > base).
+        assert_eq!(num_possible_outcomes(24, 20, 16), 0.0);
+        assert_eq!(num_possible_outcomes(90, 200, 64), 0.0);
+        // In-range still computes.
+        assert!(num_possible_outcomes(16, 8, 64) > 0.0);
+    }
 }
 
 #[cfg(test)]

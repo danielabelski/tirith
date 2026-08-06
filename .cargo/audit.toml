@@ -6,5 +6,8 @@
 # RUSTSEC-2026-0187: lopdf 0.34 stack-overflow DoS on deeply nested PDF objects
 # (uncatchable SIGABRT). Fix (lopdf >=0.42) needs Rust 1.85 > MSRV 1.83. The crash
 # path is preflight-blocked by the nesting-depth guard in check_pdf (rules/rendered.rs)
-# before load_mem runs. Keep in sync with deny.toml; remove when MSRV/lopdf move.
+# before load_mem runs; as of repo-0332 the preflight also decompresses and rescans
+# every /ObjStm compressed object stream (fail-closed on undecodable/over-cap), so
+# the compressed-stream bypass is closed too. Keep in sync with deny.toml; remove
+# when MSRV/lopdf move.
 ignore = ["RUSTSEC-2026-0009", "RUSTSEC-2026-0187"]

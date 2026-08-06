@@ -128,21 +128,21 @@ pub fn store_path() -> Option<PathBuf> {
 
 /// Generate a fresh, clearly-synthetic token for `kind`. Pure (RNG only) — the
 /// caller decides whether to persist it.
-pub fn generate_token(kind: CanaryKind) -> String {
-    match kind {
+pub fn generate_token(kind: CanaryKind) -> Option<String> {
+    Some(match kind {
         // Keep the recognizable `AKIA` prefix + an explicit `00CANARY` marker so
         // the token is clearly synthetic; suffix is base32 purely for shape.
-        CanaryKind::AwsLike => format!("AKIA00CANARY{}", random_chars(BASE32, 8)),
-        CanaryKind::GithubLike => format!("ghp_canary_{}", random_chars(ALNUM, 30)),
-        CanaryKind::GcpLike => format!("AIzaCANARY{}", random_chars(URLSAFE, 30)),
+        CanaryKind::AwsLike => format!("AKIA00CANARY{}", random_chars(BASE32, 8)?),
+        CanaryKind::GithubLike => format!("ghp_canary_{}", random_chars(ALNUM, 30)?),
+        CanaryKind::GcpLike => format!("AIzaCANARY{}", random_chars(URLSAFE, 30)?),
         CanaryKind::EnvLine => {
-            format!("TIRITH_CANARY_TOKEN=canary_{}", random_chars(HEX, 24))
+            format!("TIRITH_CANARY_TOKEN=canary_{}", random_chars(HEX, 24)?)
         }
         CanaryKind::PrivateKeyShaped => {
-            let body = format!("TIRITHCANARY{}", random_chars(BASE64ISH, 52));
+            let body = format!("TIRITHCANARY{}", random_chars(BASE64ISH, 52)?);
             format!("-----BEGIN TIRITH CANARY PRIVATE KEY-----\n{body}\n-----END TIRITH CANARY PRIVATE KEY-----")
         }
-    }
+    })
 }
 
 const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -158,7 +158,7 @@ const BASE64ISH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 /// If `getrandom` fails (astronomically unlikely) it falls back to a
 /// per-call-VARYING pseudo-random suffix ([`fill_fallback_bytes`]) so generation
 /// never panics and two calls don't collide (CodeRabbit R9 #H).
-fn random_chars(alphabet: &[u8], n: usize) -> String {
+fn random_chars(alphabet: &[u8], n: usize) -> Option<String> {
     let len = alphabet.len();
     debug_assert!((1..=256).contains(&len), "alphabet must be 1..=256 bytes");
     // Largest u8 multiple of `len`; bytes >= this are rejected for uniformity.
@@ -166,22 +166,18 @@ fn random_chars(alphabet: &[u8], n: usize) -> String {
 
     let mut out = String::with_capacity(n);
     let mut buf = [0u8; 64];
+    let mut entropy_failures = 0u32;
     while out.len() < n {
         if getrandom::fill(&mut buf).is_err() {
-            // Entropy unavailable. Fill from a per-call-varying source so the
-            // bytes differ each call (deterministic cycling made `new_id` repeat).
-            let mut fb = [0u8; 64];
-            fill_fallback_bytes(&mut fb);
-            for &b in fb.iter() {
-                if out.len() >= n {
-                    break;
-                }
-                if (b as usize) < limit {
-                    out.push(alphabet[(b as usize) % len] as char);
-                }
+            // repo-0253: a canary's documented property is that its suffix is
+            // UNGUESSABLE. The previous SplitMix64 fallback was seeded only by
+            // a counter and wall-clock nanos — predictable to an attacker who
+            // can estimate creation time. Fail closed instead of planting a
+            // forgeable honeytoken; retry briefly first for transient errors.
+            entropy_failures += 1;
+            if entropy_failures >= 3 {
+                return None;
             }
-            // The counter advances each call, so the loop makes progress; redraw
-            // on the next iteration if this buffer was fully rejected.
             continue;
         }
         for &b in buf.iter() {
@@ -193,7 +189,7 @@ fn random_chars(alphabet: &[u8], n: usize) -> String {
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// Fill `buf` with pseudo-random bytes from a per-call-VARYING seed, used ONLY
@@ -201,6 +197,7 @@ fn random_chars(alphabet: &[u8], n: usize) -> String {
 /// counter (distinct per call) + wall-clock nanos (distinct across processes),
 /// expanded with SplitMix64. NOT cryptographic — it only needs to produce
 /// DISTINCT tokens so repeated `new_id()` calls cannot collide.
+#[cfg(test)]
 fn fill_fallback_bytes(buf: &mut [u8; 64]) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -227,7 +224,7 @@ fn fill_fallback_bytes(buf: &mut [u8; 64]) {
 }
 
 /// A 12-hex-char random id.
-fn new_id() -> String {
+fn new_id() -> Option<String> {
     random_chars(HEX, 12)
 }
 
@@ -486,8 +483,12 @@ pub fn create_at(
     // concurrent store editor cannot be trusted.
     let callback_url = normalize_callback_url(callback_url)?;
     let entry = CanaryEntry {
-        id: new_id(),
-        token: generate_token(kind),
+        id: new_id().ok_or_else(|| {
+            std::io::Error::other("OS entropy unavailable; refusing to plant a predictable canary")
+        })?,
+        token: generate_token(kind).ok_or_else(|| {
+            std::io::Error::other("OS entropy unavailable; refusing to plant a predictable canary")
+        })?,
         kind: kind.as_str().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
         callback_url,
@@ -649,7 +650,12 @@ pub fn rotate_at(store: &Path, id: &str) -> std::io::Result<Option<CanaryEntry>>
                         entry.id, entry.kind
                     ))
                 })?;
-                entry.token = generate_token(kind);
+                entry.token = match generate_token(kind) {
+                    Some(token) => token,
+                    // Entropy failure: keep the previous token rather than
+                    // rotating to a predictable one.
+                    None => return Ok(None),
+                };
                 entry.created_at = chrono::Utc::now().to_rfc3339();
                 updated = Some(entry.clone());
                 out_lines.push(serde_json::to_string(&entry).map_err(std::io::Error::other)?);
@@ -832,6 +838,29 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
         return;
     }
 
+    // repo-0254: an adversary who has READ a planted canary can repeat it
+    // across outputs, and every repeat used to spawn a fresh detached worker +
+    // POST. Enforce a per-canary cooldown and a global in-flight cap so the
+    // alert flood cannot consume unbounded local resources or hammer the
+    // callback service.
+    {
+        let mut state = callback_rate_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.in_flight >= MAX_CALLBACK_IN_FLIGHT {
+            return;
+        }
+        if let Some(last) = state.last_fired.get(&hit.id) {
+            if last.elapsed() < CALLBACK_COOLDOWN {
+                return;
+            }
+        }
+        state
+            .last_fired
+            .insert(hit.id.clone(), std::time::Instant::now());
+        state.in_flight += 1;
+    }
+
     // Own everything the detached thread needs; nothing borrows from `hit`.
     let url = url.to_string();
     let kind = hit.kind.clone();
@@ -842,6 +871,7 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
     // Keep an `id` copy on this side of the move so a spawn failure can still be
     // audited (the closure consumes `id`).
     let id_for_spawn_failure = id.clone();
+    let id_for_completion = id.clone();
     // Detached, not joined — the verdict never waits on the network.
     let spawn_result = std::thread::Builder::new()
         .name("tirith-canary-callback".to_string())
@@ -858,13 +888,38 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
                 // maps to a coarse, URL-free audit reason here.
                 log_callback_failure(&id, &error.audit_reason());
             }
+            let _ = id_for_completion;
+            let mut state = callback_rate_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.in_flight = state.in_flight.saturating_sub(1);
         });
 
     // A spawn failure dropped the callback — route it through the same audit
     // sink with a coarse, URL-free reason.
     if spawn_result.is_err() {
+        let mut state = callback_rate_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.in_flight = state.in_flight.saturating_sub(1);
         log_callback_failure(&id_for_spawn_failure, "callback worker spawn failed");
     }
+}
+
+/// repo-0254: per-canary callback cooldown + global in-flight cap.
+const CALLBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_CALLBACK_IN_FLIGHT: usize = 8;
+
+#[derive(Default)]
+struct CallbackRateState {
+    last_fired: std::collections::HashMap<String, std::time::Instant>,
+    in_flight: usize,
+}
+
+fn callback_rate_state() -> &'static std::sync::Mutex<CallbackRateState> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<CallbackRateState>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(CallbackRateState::default()))
 }
 
 /// Map a `reqwest` send error to a coarse, URL-free reason category (the raw
@@ -987,7 +1042,7 @@ mod tests {
 
     #[test]
     fn aws_like_token_is_clearly_synthetic() {
-        let tok = generate_token(CanaryKind::AwsLike);
+        let tok = generate_token(CanaryKind::AwsLike).unwrap();
         assert!(tok.starts_with("AKIA00CANARY"), "got {tok}");
         // The `00CANARY` marker is the load-bearing "clearly-synthetic" property.
         assert!(tok.contains("00CANARY"));
@@ -996,15 +1051,19 @@ mod tests {
 
     #[test]
     fn github_and_gcp_tokens_carry_canary_markers() {
-        assert!(generate_token(CanaryKind::GithubLike).starts_with("ghp_canary_"));
-        assert!(generate_token(CanaryKind::GcpLike).starts_with("AIzaCANARY"));
+        assert!(generate_token(CanaryKind::GithubLike)
+            .unwrap()
+            .starts_with("ghp_canary_"));
+        assert!(generate_token(CanaryKind::GcpLike)
+            .unwrap()
+            .starts_with("AIzaCANARY"));
     }
 
     #[test]
     fn env_line_and_pem_are_synthetic() {
-        let env = generate_token(CanaryKind::EnvLine);
+        let env = generate_token(CanaryKind::EnvLine).unwrap();
         assert!(env.starts_with("TIRITH_CANARY_TOKEN=canary_"));
-        let pem = generate_token(CanaryKind::PrivateKeyShaped);
+        let pem = generate_token(CanaryKind::PrivateKeyShaped).unwrap();
         assert!(pem.contains("BEGIN TIRITH CANARY PRIVATE KEY"));
         assert!(pem.contains("TIRITHCANARY"));
     }
@@ -1047,8 +1106,8 @@ mod tests {
 
     #[test]
     fn tokens_are_unique_per_create() {
-        let a = generate_token(CanaryKind::GithubLike);
-        let b = generate_token(CanaryKind::GithubLike);
+        let a = generate_token(CanaryKind::GithubLike).unwrap();
+        let b = generate_token(CanaryKind::GithubLike).unwrap();
         assert_ne!(a, b, "two creates must not collide");
     }
 

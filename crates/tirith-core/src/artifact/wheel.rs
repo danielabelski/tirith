@@ -33,6 +33,15 @@ use serde::Deserialize;
 /// trimmed, and an empty value is treated as absent. Returns `(name, version)`
 /// with `name` required (the file is useless without it) and `version` optional.
 ///
+/// Core Metadata headers are RFC-style fields whose names are case-INSENSITIVE
+/// (a standards-compliant `name:` or `VERSION:` is valid and Python's tooling
+/// accepts it), so field names compare with `eq_ignore_ascii_case` — an exact
+/// `Name:`-only match would let a compliant-but-hostile distribution vanish
+/// from installed-package scoring (repo-0247). Duplicate fields resolve
+/// deterministically FIRST-wins (the same rule Python's `email` API applies to
+/// repeated unique fields); RFC folded continuation lines (leading whitespace)
+/// are skipped, which bounds `Name:`/`Version:` to their single-line values.
+///
 /// This is the promotion of `ecosystem_scan`'s former private header loop into a
 /// shared place, so the installed-tree scan and the artifact parsers agree on
 /// exactly what a METADATA name/version is.
@@ -43,16 +52,26 @@ pub fn parse_metadata_headers(text: &str) -> Option<(String, Option<String>)> {
         if line.is_empty() {
             break; // headers end at the first blank line
         }
-        if let Some(rest) = line.strip_prefix("Name:") {
-            let val = rest.trim();
-            if !val.is_empty() {
+        // RFC folding: a line starting with SP/HTAB continues the previous
+        // header; it can never begin a Name/Version field.
+        if matches!(line.as_bytes().first(), Some(b' ' | b'\t')) {
+            continue;
+        }
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        let field = field.trim();
+        let val = value.trim();
+        if val.is_empty() {
+            continue;
+        }
+        if field.eq_ignore_ascii_case("name") {
+            // First-wins: repeated unique fields keep their first occurrence.
+            if name.is_none() {
                 name = Some(val.to_string());
             }
-        } else if let Some(rest) = line.strip_prefix("Version:") {
-            let val = rest.trim();
-            if !val.is_empty() {
-                version = Some(val.to_string());
-            }
+        } else if field.eq_ignore_ascii_case("version") && version.is_none() {
+            version = Some(val.to_string());
         }
     }
     name.map(|n| (n, version))
@@ -290,6 +309,12 @@ pub enum RecordParseError {
     BadHash { row: usize, value: String },
     /// A size field was present but not a non-negative integer.
     BadSize { row: usize, value: String },
+    /// The RECORD had more rows than the materialization cap. A minimal row is
+    /// only a few bytes, so an unbounded row count is a memory-amplification
+    /// vector even under the 64 MiB input cap (repo-0248).
+    TooManyRows { limit: usize },
+    /// A single field exceeded the per-field byte cap.
+    FieldTooLong { row: usize, limit: usize },
 }
 
 impl std::fmt::Display for RecordParseError {
@@ -308,11 +333,30 @@ impl std::fmt::Display for RecordParseError {
             RecordParseError::BadSize { row, value } => {
                 write!(f, "RECORD row {row} has an unparseable size '{value}'")
             }
+            RecordParseError::TooManyRows { limit } => {
+                write!(f, "RECORD exceeds the {limit}-row materialization limit")
+            }
+            RecordParseError::FieldTooLong { row, limit } => {
+                write!(
+                    f,
+                    "RECORD row {row} has a field over the {limit}-byte limit"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for RecordParseError {}
+
+/// Hard cap on materialized RECORD rows (repo-0248). Legitimate wheels list
+/// one row per member and the archive reader already caps members at 10,000;
+/// 4x that is generous headroom while still bounding the heap amplification a
+/// 64 MiB RECORD of minimal `a,,` rows could otherwise cause.
+pub const MAX_RECORD_ROWS: usize = 40_000;
+
+/// Hard cap on a single RECORD field (path, hash, or size cell). Real wheel
+/// paths stay far under 1 KiB; 4 KiB bounds the per-row allocation.
+pub const MAX_RECORD_FIELD_BYTES: usize = 4096;
 
 /// Parse a `RECORD` file into its rows using the `csv` crate (RECORD has no
 /// header row, and a path field may legitimately contain a comma, so it MUST be
@@ -333,10 +377,24 @@ pub fn parse_record(text: &str) -> Result<Vec<RecordEntry>, RecordParseError> {
         if record.iter().all(|f| f.is_empty()) {
             continue;
         }
+        if entries.len() >= MAX_RECORD_ROWS {
+            return Err(RecordParseError::TooManyRows {
+                limit: MAX_RECORD_ROWS,
+            });
+        }
         if record.len() != 3 {
             return Err(RecordParseError::BadRow {
                 row,
                 columns: record.len(),
+            });
+        }
+        if record
+            .iter()
+            .any(|field| field.len() > MAX_RECORD_FIELD_BYTES)
+        {
+            return Err(RecordParseError::FieldTooLong {
+                row,
+                limit: MAX_RECORD_FIELD_BYTES,
             });
         }
         let path = record[0].to_string();
@@ -402,6 +460,47 @@ mod tests {
     #[test]
     fn metadata_without_name_is_none() {
         assert!(parse_metadata_headers("Version: 1.0\n\n").is_none());
+    }
+
+    #[test]
+    fn metadata_headers_are_case_insensitive_like_core_metadata() {
+        // RFC-style field names are case-insensitive; a compliant `name:` must
+        // not let a distribution evade installed-package scoring (repo-0247).
+        let text = "Metadata-Version: 2.1\nname: Evil-Pkg\nVERSION: 9.9.9\n";
+        let (name, version) = parse_metadata_headers(text).unwrap();
+        assert_eq!(name, "Evil-Pkg");
+        assert_eq!(version.as_deref(), Some("9.9.9"));
+    }
+
+    #[test]
+    fn metadata_duplicate_fields_first_wins_and_folds_are_skipped() {
+        let text = "Name: First\nName: second\nVersion:\n 1.0-folded-junk\nVersion: 2.0\n";
+        let (name, version) = parse_metadata_headers(text).unwrap();
+        assert_eq!(name, "First");
+        // The empty `Version:` header is absent; its fold line is skipped, so
+        // the real later Version header applies.
+        assert_eq!(version.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn record_row_and_field_caps_fail_closed() {
+        // Row cap: one over the limit is a hard error, not a truncation.
+        let mut big = String::new();
+        for i in 0..=MAX_RECORD_ROWS {
+            big.push_str(&format!("pkg/mod{i}.py,,\n"));
+        }
+        assert!(matches!(
+            parse_record(&big),
+            Err(RecordParseError::TooManyRows { .. })
+        ));
+
+        // Field cap: an absurd path is rejected.
+        let long_path = "x".repeat(MAX_RECORD_FIELD_BYTES + 1);
+        let text = format!("{long_path},,\n");
+        assert!(matches!(
+            parse_record(&text),
+            Err(RecordParseError::FieldTooLong { .. })
+        ));
     }
 
     #[test]

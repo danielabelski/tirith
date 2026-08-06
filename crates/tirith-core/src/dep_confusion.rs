@@ -4,7 +4,11 @@
 //!     (`package_policy.internal_package_names`, M6 ch7): a public-registry
 //!     resolution matching one is the textbook dep-confusion shape. Each
 //!     [`InternalPackageSpec`] may scope to an ecosystem; a trailing `@<org>/*`
-//!     wildcard is supported.
+//!     wildcard is supported. Patterns and candidate names are canonicalized
+//!     per the candidate ecosystem's own equivalence rules before matching
+//!     (PEP 503 for PyPI, lowercase for npm), so an attacker cannot evade a
+//!     block by registering the canonical spelling of a pattern written in a
+//!     different one (repo-0270).
 //!  2. Registry-namespace shape: without the operator list, fall back to
 //!     `@<reserved-org>/<name>` npm scopes (`@internal`, `@private`, …).
 //!     Conservative — false positives on legit scoped packages hurt more than
@@ -33,7 +37,7 @@ pub fn evaluate(eco: Ecosystem, name: &str, policy: &Policy) -> DepConfusionVerd
         if !ecosystem_matches(spec, eco) {
             continue;
         }
-        if matches_pattern(&spec.name, name) {
+        if matches_pattern(eco, &spec.name, name) {
             return DepConfusionVerdict {
                 risk: true,
                 reason: format!(
@@ -67,13 +71,45 @@ pub fn evaluate(eco: Ecosystem, name: &str, policy: &Policy) -> DepConfusionVerd
     }
 }
 
-/// `true` when `pattern` matches `name`. The only supported wildcard is a
-/// single trailing `*`: `@org/*` matches every `@org/<anything>` name.
-fn matches_pattern(pattern: &str, name: &str) -> bool {
+/// Canonicalize a package name per the candidate ecosystem's own equivalence
+/// rules (repo-0270): PyPI resolves names case-insensitively with every run of
+/// `-`, `_`, `.` collapsed to a single `-` (PEP 503), and npm lowercases. Other
+/// ecosystems keep byte-exact matching: their registries treat distinct
+/// spellings as distinct packages, so folding them would over-block.
+fn canonicalize(eco: Ecosystem, name: &str) -> String {
+    match eco {
+        Ecosystem::PyPI => {
+            let lower = name.to_lowercase();
+            let mut out = String::with_capacity(lower.len());
+            let mut in_separator_run = false;
+            for ch in lower.chars() {
+                if matches!(ch, '-' | '_' | '.') {
+                    if !in_separator_run {
+                        out.push('-');
+                    }
+                    in_separator_run = true;
+                } else {
+                    out.push(ch);
+                    in_separator_run = false;
+                }
+            }
+            out
+        }
+        Ecosystem::Npm => name.to_lowercase(),
+        _ => name.to_string(),
+    }
+}
+
+/// `true` when `pattern` matches `name` after both are canonicalized under the
+/// CANDIDATE's ecosystem rules ([`canonicalize`]) — the matching semantics of
+/// the registry that would resolve the candidate. The only supported wildcard
+/// is a single trailing `*` (kept verbatim): `@org/*` matches every
+/// `@org/<anything>` name.
+fn matches_pattern(eco: Ecosystem, pattern: &str, name: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
-        name.starts_with(prefix)
+        canonicalize(eco, name).starts_with(&canonicalize(eco, prefix))
     } else {
-        pattern == name
+        canonicalize(eco, pattern) == canonicalize(eco, name)
     }
 }
 
@@ -219,9 +255,54 @@ mod tests {
 
     #[test]
     fn pattern_matcher_handles_trailing_star() {
-        assert!(matches_pattern("@foo/*", "@foo/bar"));
-        assert!(!matches_pattern("@foo/*", "@bar/baz"));
-        assert!(matches_pattern("exact", "exact"));
-        assert!(!matches_pattern("exact", "exact-different"));
+        assert!(matches_pattern(Ecosystem::Npm, "@foo/*", "@foo/bar"));
+        assert!(!matches_pattern(Ecosystem::Npm, "@foo/*", "@bar/baz"));
+        assert!(matches_pattern(Ecosystem::Npm, "exact", "exact"));
+        assert!(!matches_pattern(Ecosystem::Npm, "exact", "exact-different"));
+    }
+
+    #[test]
+    fn pypi_pattern_matches_pep503_canonical_spelling() {
+        // repo-0270: PyPI resolves case and `-_.` variants as the same project
+        // (PEP 503), so an operator pattern in one spelling must match the
+        // registry's canonical resolution of another.
+        let p = policy_with(&["Acme_Internal"]);
+        for spelling in [
+            "acme-internal",
+            "Acme_Internal",
+            "acme.internal",
+            "ACME--INTERNAL",
+            "acme_.-internal",
+        ] {
+            let v = evaluate(Ecosystem::PyPI, spelling, &p);
+            assert!(v.risk, "PEP 503 spelling {spelling:?} must match");
+        }
+        // A genuinely different project still does not match.
+        assert!(!evaluate(Ecosystem::PyPI, "acme-internal-extra", &p).risk);
+    }
+
+    #[test]
+    fn pypi_wildcard_prefix_is_canonicalized() {
+        let p = policy_with(&["Acme_*"]);
+        assert!(evaluate(Ecosystem::PyPI, "acme-foo", &p).risk);
+        assert!(evaluate(Ecosystem::PyPI, "ACME.FOO", &p).risk);
+        assert!(!evaluate(Ecosystem::PyPI, "other-foo", &p).risk);
+    }
+
+    #[test]
+    fn npm_pattern_matches_case_insensitively() {
+        let p = policy_with(&["MyLib"]);
+        assert!(evaluate(Ecosystem::Npm, "mylib", &p).risk);
+        assert!(evaluate(Ecosystem::Npm, "MYLIB", &p).risk);
+        // npm does not fold separators, so distinct spellings stay distinct.
+        assert!(!evaluate(Ecosystem::Npm, "my_lib", &p).risk);
+    }
+
+    #[test]
+    fn other_ecosystems_keep_exact_matching() {
+        let p = policy_with(&["Acme_Internal"]);
+        // RubyGems treats spellings as distinct packages; no canonicalization.
+        assert!(!evaluate(Ecosystem::RubyGems, "acme-internal", &p).risk);
+        assert!(evaluate(Ecosystem::RubyGems, "Acme_Internal", &p).risk);
     }
 }

@@ -430,7 +430,22 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
 /// the nearest shallow (depth ≤ 1) in-code property keyword before it: a SEND
 /// keyword (body/data/json/params/payload) fires (false), anything else
 /// suppresses (true), and no keyword (direct-arg / URL-concat) fires (false).
-fn should_suppress_exfil(arg_span: &str, pos_in_span: usize) -> bool {
+///
+/// repo-0322: the header/auth suppression is only valid for same-origin
+/// requests. When the call target is an ABSOLUTE URL (potentially attacker-
+/// controlled origin), a secret in `headers`/`Authorization` is exactly the
+/// exfiltration channel and must NOT be suppressed.
+/// repo-0322: whether the call target contains an absolute `http(s)://` URL —
+/// the destination could then be attacker-controlled, so header-channel
+/// suppression no longer applies.
+fn has_absolute_url(arg_span: &str) -> bool {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static ABS_URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"["']https?://[^"']+"#).unwrap());
+    ABS_URL.is_match(arg_span)
+}
+
+fn should_suppress_exfil(arg_span: &str, pos_in_span: usize, absolute_target: bool) -> bool {
     let before = &arg_span[..pos_in_span];
     let bytes = before.as_bytes();
 
@@ -446,6 +461,9 @@ fn should_suppress_exfil(arg_span: &str, pos_in_span: usize) -> bool {
     match nearest_prop {
         Some(m) => {
             if SEND_PROPS.is_match(m.as_str()) {
+                return false;
+            }
+            if absolute_target {
                 return false;
             }
             // headers/auth/meta/token/unknown — too noisy to flag.
@@ -488,7 +506,7 @@ fn check_js_exfiltration(input: &str, findings: &mut Vec<Finding>) {
         let arg_span = &input[http_match.end()..arg_end];
 
         for sens_match in JS_SENSITIVE.find_iter(arg_span) {
-            if should_suppress_exfil(arg_span, sens_match.start()) {
+            if should_suppress_exfil(arg_span, sens_match.start(), has_absolute_url(arg_span)) {
                 continue;
             }
             let snippet_end = safe_end(input, call_end.min(input.len()));
@@ -511,7 +529,7 @@ fn check_py_exfiltration(input: &str, findings: &mut Vec<Finding>) {
         let arg_span = &input[http_match.end()..arg_end];
 
         for sens_match in PY_SENSITIVE.find_iter(arg_span) {
-            if should_suppress_exfil(arg_span, sens_match.start()) {
+            if should_suppress_exfil(arg_span, sens_match.start(), has_absolute_url(arg_span)) {
                 continue;
             }
             let snippet_end = safe_end(input, call_end.min(input.len()));

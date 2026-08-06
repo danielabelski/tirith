@@ -842,15 +842,18 @@ pub fn analyze_output_finalize(state: &OutputAnalyzerState) -> Verdict {
 /// the byte-scanner's in-flight phase (the `tirith view` path).
 pub fn analyze_output_finalize_mut(state: &mut OutputAnalyzerState) -> Verdict {
     let start = Instant::now();
+    // Finalize the byte-scanner FIRST: this flushes a trailing zero-width run
+    // into the scan result (repo-0328) so `rules::output::check` below sees it,
+    // and reports any truncated escape sequence (Sev-5).
+    let fin = extract::finalize_scan_state(&mut state.scan_state, Some(&mut state.scan_result));
     let mut findings = crate::rules::output::check(&state.scan_result);
     // Fold in chunk-level findings evicted from `tail_text` before finalize.
     findings.append(&mut state.accumulated_chunk_findings);
     findings.extend(finalize_output_chunks(state));
 
-    // Silent-failure fix (Sev-5): flush the byte-scanner so a truncated
-    // `\e]52;<base64>` at EOF is detected, not dropped. Medium severity so
-    // fail-closed callers can DENY on a partial dangerous sequence.
-    let fin = extract::finalize_scan_state(&mut state.scan_state);
+    // Silent-failure fix (Sev-5): a truncated `\e]52;<base64>` at EOF is
+    // detected, not dropped. Medium severity so fail-closed callers can DENY
+    // on a partial dangerous sequence.
     if fin.truncated_escape {
         let severity = if fin.truncated_osc52 {
             crate::verdict::Severity::High
@@ -939,6 +942,7 @@ struct ScanSnapshot {
     hyperlinks: usize,
     sgr: usize,
     zero_width_runs: usize,
+    dropped_hits: u64,
 }
 
 impl ScanSnapshot {
@@ -951,6 +955,7 @@ impl ScanSnapshot {
             hyperlinks: r.hyperlinks.len(),
             sgr: r.sgr.len(),
             zero_width_runs: r.zero_width_runs.len(),
+            dropped_hits: r.dropped_hits,
         }
     }
 
@@ -974,6 +979,9 @@ impl ScanSnapshot {
         slice
             .zero_width_runs
             .extend_from_slice(&r.zero_width_runs[self.zero_width_runs..]);
+        // Propagate newly-dropped evidence so the per-chunk rule pass emits
+        // the analyzer-overflow finding exactly once (repo-0279).
+        slice.dropped_hits = r.dropped_hits.saturating_sub(self.dropped_hits);
         crate::rules::output::check(&slice)
     }
 }

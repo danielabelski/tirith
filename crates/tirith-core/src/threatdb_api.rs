@@ -20,6 +20,46 @@ const KEV_CACHE_TTL_SECS: u64 = 24 * 3600;
 const KEV_URL: &str =
     "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
 
+/// Per-analysis caps on remote enrichment work (repo-0348): an attacker can
+/// stuff arbitrary package/URL values into a command, but each analysis may
+/// only spend this many unique lookups of paid/quota APIs and cache files.
+const MAX_ENRICH_PACKAGES: usize = 32;
+const MAX_ENRICH_URLS: usize = 64;
+/// Response body caps (repo-0347): bodies are streamed through a bounded
+/// reader BEFORE deserialization so a hostile or compromised upstream cannot
+/// force unbounded allocation.
+const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const KEV_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+/// Decoded-collection caps applied after parsing (repo-0347).
+const MAX_DECODED_ITEMS: usize = 4096;
+/// Persistent cache bounds (repo-0348): eviction is age-based AND size-based —
+/// oldest entries are removed once either bound is exceeded.
+const MAX_CACHE_ENTRIES: usize = 512;
+const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// Safe Browsing batches this many URL entries per request (API limit 500).
+const GSB_BATCH_SIZE: usize = 450;
+
+/// Read a JSON response body through a `limit + 1` bounded reader and only
+/// then deserialize. A missing or dishonest Content-Length cannot bypass the
+/// streaming cap.
+fn read_json_bounded<T: DeserializeOwned>(
+    resp: reqwest::blocking::Response,
+    max_bytes: u64,
+) -> Option<T> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes {
+            return None;
+        }
+    }
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    resp.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > max_bytes {
+        return None;
+    }
+    serde_json::from_slice(&buf).ok()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum RuntimeThreatMode {
     Inline,
@@ -54,7 +94,12 @@ pub fn enrich_command(
     let packages = threatintel::extract_packages_for_shell(&segments, shell);
     let urls = extract::extract_urls(input, shell);
 
-    for package in packages {
+    let mut queried_packages: HashSet<(u8, String)> = HashSet::new();
+    for package in packages.into_iter().take(MAX_ENRICH_PACKAGES) {
+        // Deduplicate before spending any remote request on a value.
+        if !queried_packages.insert((package.ecosystem as u8, package.name.clone())) {
+            continue;
+        }
         // Only a CONCRETE version (Exact/Resolved) is a valid OSV `version`; a range
         // or constraint must NOT be sent as one (OSV would treat the range text as a
         // literal version, degrading matching and skipping deps.dev fallback). A
@@ -62,7 +107,59 @@ pub fn enrich_command(
         let effective_version = if let Some(version) = package.version.exact_version() {
             Some(version.to_string())
         } else if config.deps_dev_enabled {
-            resolve_default_version(package.ecosystem, &package.name, deadline)
+            match &package.version {
+                // A range/constraint: substituting the registry's default
+                // version is only sound when that version verifiably satisfies
+                // the requested constraint — otherwise `foo<2` would be
+                // checked as `foo@3` and a relevant advisory suppressed.
+                crate::version_intent::VersionIntent::Constraint { parsed, raw } => {
+                    let resolved =
+                        resolve_default_version(package.ecosystem, &package.name, deadline);
+                    let satisfies = match (parsed, resolved.as_deref()) {
+                        (Some(constraint), Some(candidate)) => {
+                            crate::version_intent::ReleaseVersion::parse(candidate)
+                                .map(|rv| constraint.matches(&rv))
+                                .unwrap_or(false)
+                        }
+                        _ => false,
+                    };
+                    if satisfies {
+                        resolved
+                    } else {
+                        if seen.insert(format!(
+                            "unresolved:{}:{}",
+                            package.ecosystem as u8, package.name
+                        )) {
+                            findings.push(Finding {
+                                rule_id: RuleId::ThreatUnresolvedMaliciousPackage,
+                                severity: Severity::Medium,
+                                title: "Version constraint could not be verified".to_string(),
+                                description: format!(
+                                    "Package '{}' is requested with version constraint '{}' that \
+                                     tirith could not resolve to a concrete, constraint-satisfying \
+                                     version; OSV/KEV correlation was NOT performed against a \
+                                     substituted default version.",
+                                    package.name, raw
+                                ),
+                                evidence: vec![Evidence::ThreatIntel {
+                                    source: "version-resolution".to_string(),
+                                    threat_type: "unresolved_constraint".to_string(),
+                                    confidence: Confidence::Medium,
+                                    reference: None,
+                                }],
+                                human_view: None,
+                                agent_view: None,
+                                mitre_id: None,
+                                custom_rule_id: None,
+                            });
+                        }
+                        None
+                    }
+                }
+                // No version requested at all: the resolver will install the
+                // registry's current default, so checking that version is sound.
+                _ => resolve_default_version(package.ecosystem, &package.name, deadline),
+            }
         } else {
             None
         };
@@ -128,31 +225,44 @@ pub fn enrich_command(
     }
 
     if let Some(api_key) = config.google_safe_browsing_key.as_deref() {
-        for url_info in urls {
+        // Privacy scrub BEFORE anything is transmitted or cached: userinfo,
+        // query (presigned tokens, reset links, bearer params), and fragments
+        // never leave the process, and private/credential-bearing URLs are not
+        // sent to a third party at all (repo-0346). Scrubbed URLs are also
+        // deduplicated, capped, and batched into as few requests as possible
+        // (repo-0348).
+        let mut candidates: Vec<String> = Vec::new();
+        let mut candidate_set: HashSet<String> = HashSet::new();
+        for url_info in urls.into_iter().take(MAX_ENRICH_URLS) {
             if let Some(url) = safe_browsing_candidate_url(&url_info.parsed, &url_info.raw) {
-                if let Some(match_type) = query_safe_browsing(&url, api_key, deadline) {
-                    let key = format!("safe-browsing:{url}");
-                    if seen.insert(key) {
-                        findings.push(Finding {
-                            rule_id: RuleId::ThreatSafeBrowsing,
-                            severity: Severity::High,
-                            title: "Google Safe Browsing match".to_string(),
-                            description: format!(
-                                "URL '{}' matched Google Safe Browsing threat type '{}'.",
-                                url, match_type
-                            ),
-                            evidence: vec![Evidence::ThreatIntel {
-                                source: "Google Safe Browsing".to_string(),
-                                threat_type: "safe_browsing".to_string(),
-                                confidence: Confidence::Confirmed,
-                                reference: Some(url.to_string()),
-                            }],
-                            human_view: None,
-                            agent_view: None,
-                            mitre_id: None,
-                            custom_rule_id: None,
-                        });
-                    }
+                if candidate_set.insert(url.clone()) {
+                    candidates.push(url);
+                }
+            }
+        }
+        for batch in candidates.chunks(GSB_BATCH_SIZE) {
+            for (url, match_type) in query_safe_browsing_batch(batch, api_key, deadline) {
+                let key = format!("safe-browsing:{url}");
+                if seen.insert(key) {
+                    findings.push(Finding {
+                        rule_id: RuleId::ThreatSafeBrowsing,
+                        severity: Severity::High,
+                        title: "Google Safe Browsing match".to_string(),
+                        description: format!(
+                            "URL '{}' matched Google Safe Browsing threat type '{}'.",
+                            url, match_type
+                        ),
+                        evidence: vec![Evidence::ThreatIntel {
+                            source: "Google Safe Browsing".to_string(),
+                            threat_type: "safe_browsing".to_string(),
+                            confidence: Confidence::Confirmed,
+                            reference: Some(url.to_string()),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
                 }
             }
         }
@@ -224,20 +334,43 @@ fn evict_stale_cache_once(cache_dir: &std::path::Path) {
         Ok(e) => e,
         Err(_) => return,
     };
+    let mut live: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let age = path
+        let (modified, len) = match path
             .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|m| m.modified().map(|t| (t, m.len())))
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let age = modified
+            .duration_since(std::time::UNIX_EPOCH)
             .map(|d| now.saturating_sub(d.as_secs()))
             .unwrap_or(0);
         if age > CACHE_EVICT_MAX_AGE_SECS {
             let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        live.push((path, modified, len));
+    }
+
+    // Bounded-size LRU: age-only eviction lets an attacker stuffing fresh
+    // cache keys grow the directory without limit, so also enforce entry-count
+    // and total-byte bounds, evicting oldest-first.
+    live.sort_by_key(|(_, modified, _)| *modified);
+    let mut total_bytes: u64 = live.iter().map(|(_, _, len)| *len).sum();
+    let mut count = live.len();
+    for (path, _, len) in &live {
+        if count <= MAX_CACHE_ENTRIES && total_bytes <= MAX_CACHE_BYTES {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            count -= 1;
+            total_bytes = total_bytes.saturating_sub(*len);
         }
     }
 }
@@ -304,17 +437,18 @@ fn query_osv(
         "version": version,
     });
 
-    let response = client
-        .post("https://api.osv.dev/v1/query")
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<OsvQueryResponse>()
-        .ok()?;
-
+    let mut response: OsvQueryResponse = read_json_bounded(
+        client
+            .post("https://api.osv.dev/v1/query")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .ok()?
+            .error_for_status()
+            .ok()?,
+        MAX_RESPONSE_BYTES,
+    )?;
+    response.vulns.truncate(MAX_DECODED_ITEMS);
     store_cache("osv", &cache_key, &response);
     Some(response.vulns)
 }
@@ -355,16 +489,18 @@ fn deps_package(
     }
 
     let client = build_client(deadline)?;
-    let response = client
-        .get(format!(
-            "https://api.deps.dev/v3/systems/{system}/packages/{encoded}"
-        ))
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<DepsPackageResponse>()
-        .ok()?;
+    let mut response: DepsPackageResponse = read_json_bounded(
+        client
+            .get(format!(
+                "https://api.deps.dev/v3/systems/{system}/packages/{encoded}"
+            ))
+            .send()
+            .ok()?
+            .error_for_status()
+            .ok()?,
+        MAX_RESPONSE_BYTES,
+    )?;
+    response.versions.truncate(MAX_DECODED_ITEMS);
     store_cache("deps-package", &cache_key, &response);
     Some(response)
 }
@@ -403,16 +539,18 @@ fn ecosystems_package(
     }
 
     let client = build_client(deadline)?;
-    let response = client
-        .get(format!(
-            "https://packages.ecosyste.ms/api/v1/registries/{registry}/packages/{encoded}"
-        ))
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<EcosystemsPackageResponse>()
-        .ok()?;
+    let mut response: EcosystemsPackageResponse = read_json_bounded(
+        client
+            .get(format!(
+                "https://packages.ecosyste.ms/api/v1/registries/{registry}/packages/{encoded}"
+            ))
+            .send()
+            .ok()?
+            .error_for_status()
+            .ok()?,
+        MAX_RESPONSE_BYTES,
+    )?;
+    response.maintainers.truncate(MAX_DECODED_ITEMS);
     store_cache("ecosystems-package", &cache_key, &response);
     Some(response)
 }
@@ -479,14 +617,10 @@ fn kev_aliases(deadline: Instant) -> Option<HashSet<String>> {
         return Some(cached.into_iter().collect());
     }
     let client = build_client(deadline)?;
-    let response = client
-        .get(KEV_URL)
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<KevCatalog>()
-        .ok()?;
+    let response: KevCatalog = read_json_bounded(
+        client.get(KEV_URL).send().ok()?.error_for_status().ok()?,
+        KEV_MAX_RESPONSE_BYTES,
+    )?;
     let aliases: Vec<String> = response
         .vulnerabilities
         .into_iter()
@@ -516,17 +650,49 @@ struct SafeBrowsingResponse {
 struct SafeBrowsingMatch {
     #[serde(default, rename = "threatType")]
     threat_type: String,
+    #[serde(default, rename = "threatEntry")]
+    threat_entry: SafeBrowsingThreatEntry,
 }
 
-fn query_safe_browsing(url: &str, api_key: &str, deadline: Instant) -> Option<String> {
-    let cache_key = url.to_string();
-    if let Some(response) =
-        load_cache::<SafeBrowsingResponse>("safe-browsing", &cache_key, CACHE_TTL_SECS)
-    {
-        return response.matches.first().map(|m| m.threat_type.clone());
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+struct SafeBrowsingThreatEntry {
+    #[serde(default)]
+    url: String,
+}
+
+/// Batch form of the Safe Browsing lookup (repo-0348): one request carries
+/// the whole chunk of scrubbed candidate URLs instead of one request per URL.
+/// Returns `(url, threat_type)` for every matched entry. Per-URL results are
+/// cached individually; a full cache hit avoids the network entirely.
+fn query_safe_browsing_batch(
+    urls: &[String],
+    api_key: &str,
+    deadline: Instant,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for url in urls {
+        if let Some(response) =
+            load_cache::<SafeBrowsingResponse>("safe-browsing", url, CACHE_TTL_SECS)
+        {
+            if let Some(m) = response.matches.first() {
+                out.push((url.clone(), m.threat_type.clone()));
+            }
+        } else {
+            missing.push(url);
+        }
+    }
+    if missing.is_empty() {
+        return out;
     }
 
-    let client = build_client(deadline)?;
+    let Some(client) = build_client(deadline) else {
+        return out;
+    };
+    let entries: Vec<serde_json::Value> = missing
+        .iter()
+        .map(|url| serde_json::json!({ "url": url }))
+        .collect();
     let body = serde_json::json!({
         "client": {
             "clientId": "tirith",
@@ -536,22 +702,42 @@ fn query_safe_browsing(url: &str, api_key: &str, deadline: Instant) -> Option<St
             "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"],
             "platformTypes": ["ANY_PLATFORM"],
             "threatEntryTypes": ["URL"],
-            "threatEntries": [{ "url": url }],
+            "threatEntries": entries,
         },
     });
 
-    let response = client
+    let Some(response) = client
         .post("https://safebrowsing.googleapis.com/v4/threatMatches:find")
         .header("x-goog-api-key", api_key)
         .json(&body)
         .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<SafeBrowsingResponse>()
-        .ok()?;
-    store_cache("safe-browsing", &cache_key, &response);
-    response.matches.first().map(|m| m.threat_type.clone())
+        .ok()
+        .and_then(|r| r.error_for_status().ok())
+    else {
+        return out;
+    };
+    let Some(mut parsed) = read_json_bounded::<SafeBrowsingResponse>(response, MAX_RESPONSE_BYTES)
+    else {
+        return out;
+    };
+    parsed.matches.truncate(MAX_DECODED_ITEMS);
+    // Cache the per-URL outcome (positive match or confirmed-clean empty
+    // response) so repeated scans of the same URL stay offline.
+    for m in parsed.matches.drain(..) {
+        let url = m.threat_entry.url.clone();
+        if url.is_empty() {
+            continue;
+        }
+        let single = SafeBrowsingResponse {
+            matches: vec![SafeBrowsingMatch {
+                threat_type: m.threat_type.clone(),
+                threat_entry: m.threat_entry.clone(),
+            }],
+        };
+        store_cache("safe-browsing", &url, &single);
+        out.push((url, m.threat_type));
+    }
+    out
 }
 
 fn build_osv_finding(
@@ -665,15 +851,70 @@ fn parse_rfc3339_secs(raw: &str) -> Option<i64> {
 }
 
 fn safe_browsing_candidate_url(parsed: &UrlLike, raw: &str) -> Option<String> {
-    match parsed {
+    let candidate = match parsed {
         UrlLike::Standard { parsed, .. } if matches!(parsed.scheme(), "http" | "https") => {
-            Some(parsed.as_str().to_string())
+            parsed.as_str()
         }
         UrlLike::Unparsed { .. } if raw.starts_with("http://") || raw.starts_with("https://") => {
-            Some(raw.to_string())
+            raw
         }
-        _ => None,
+        _ => return None,
+    };
+    privacy_scrub_url(candidate)
+}
+
+/// Reduce a URL to the minimum form Safe Browsing can evaluate, and refuse
+/// URLs that must never leave the machine (repo-0346):
+///
+///  * userinfo, query string, and fragment are stripped — presigned URLs,
+///    password-reset links, and bearer tokens must not be transmitted to a
+///    third party (or persisted in the on-disk cache);
+///  * private, loopback, link-local, and otherwise non-public destinations
+///    are excluded entirely via the server-URL validator;
+///  * anything that does not parse as an http(s) URL is excluded.
+fn privacy_scrub_url(raw: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(raw).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
     }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    // Local-only classification (no DNS — we never connect to the candidate,
+    // we only transmit its scrubbed string): reject non-public IP literals and
+    // intranet-style hostnames so internal URLs never leave the machine.
+    match parsed.host()? {
+        url::Host::Ipv4(v4) => {
+            if !crate::url_validate::is_public_addr(&std::net::SocketAddr::new(
+                std::net::IpAddr::V4(v4),
+                0,
+            )) {
+                return None;
+            }
+        }
+        url::Host::Ipv6(v6) => {
+            if !crate::url_validate::is_public_addr(&std::net::SocketAddr::new(
+                std::net::IpAddr::V6(v6),
+                0,
+            )) {
+                return None;
+            }
+        }
+        url::Host::Domain(domain) => {
+            let lower = domain.to_ascii_lowercase();
+            let intranet = !lower.contains('.')
+                || lower == "localhost"
+                || lower.ends_with(".local")
+                || lower.ends_with(".internal")
+                || lower.ends_with(".lan")
+                || lower.ends_with(".corp");
+            if intranet {
+                return None;
+            }
+        }
+    }
+    Some(parsed.into())
 }
 
 fn ecosystem_label(ecosystem: Ecosystem) -> Option<&'static str> {
@@ -781,7 +1022,9 @@ mod tests {
         };
         assert_eq!(
             safe_browsing_candidate_url(&unparsed, "http://phish.example"),
-            Some("http://phish.example".to_string())
+            // The scrubber parses and re-serializes; an empty path normalizes
+            // to `/`.
+            Some("http://phish.example/".to_string())
         );
 
         let docker = UrlLike::DockerRef {
@@ -803,6 +1046,39 @@ mod tests {
         assert_eq!(
             safe_browsing_candidate_url(&scp, "git@github.com:owner/repo.git"),
             None
+        );
+    }
+
+    #[test]
+    fn privacy_scrub_strips_secrets_and_rejects_internal_urls() {
+        // Userinfo, query, and fragment are removed before transmission.
+        assert_eq!(
+            privacy_scrub_url("https://user:pass@example.com/reset?token=secret123#frag"),
+            Some("https://example.com/reset".to_string())
+        );
+        assert_eq!(
+            privacy_scrub_url(
+                "https://storage.example/x.tar.gz?X-Amz-Signature=abc&X-Amz-Expires=60"
+            ),
+            Some("https://storage.example/x.tar.gz".to_string())
+        );
+        // Private / loopback / link-local literals and intranet names never leave.
+        for raw in [
+            "http://192.168.1.1/admin",
+            "http://127.0.0.1:8080/debug",
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.4/internal",
+            "http://localhost:9000/x",
+            "http://printer.local/status",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://intranet/hr",
+        ] {
+            assert_eq!(privacy_scrub_url(raw), None, "must not transmit: {raw}");
+        }
+        // Public destinations survive (with scheme/host intact).
+        assert_eq!(
+            privacy_scrub_url("https://downloads.example.com/pkg.tar.gz"),
+            Some("https://downloads.example.com/pkg.tar.gz".to_string())
         );
     }
 

@@ -170,6 +170,21 @@ pub fn inspect_response(
     kind: ResponseKind,
     ctx: &OutputFilterContext,
 ) -> InspectOutcome {
+    // repo-0296: every http(s) string screened below goes through blocking DNS
+    // validation. Cap the number of resolutions per response so a URL-dense
+    // hostile reply cannot stall the sole upstream-response path; overflowing
+    // URIs are violations (fail-closed), not skips.
+    URI_SCREEN_BUDGET.with(|b| b.set(Some(MAX_URI_SCREENS_PER_RESPONSE)));
+    let outcome = inspect_response_inner(result, kind, ctx);
+    URI_SCREEN_BUDGET.with(|b| b.set(None));
+    outcome
+}
+
+fn inspect_response_inner(
+    result: &Value,
+    kind: ResponseKind,
+    ctx: &OutputFilterContext,
+) -> InspectOutcome {
     // 1. Text scan over every string leaf (keys + values), via the shared
     //    streaming analyzer the C2 tool-result filter uses.
     let verdict = crate::mcp::output_filter::scan_value_leaves(result, ctx);
@@ -180,8 +195,10 @@ pub fn inspect_response(
     let mut violations = Vec::new();
     collect_uri_violations(result, kind, &mut violations);
 
-    // 3. MIME vs sniffed bytes + size cap for inline blobs (read responses).
-    if matches!(kind, ResponseKind::ResourcesRead) {
+    // 3. MIME vs sniffed bytes + size cap for inline blobs. repo-0294: this
+    // covers prompts/get too — `walk_for_embedded_blobs` handles the nested
+    // `{type: resource, resource: {blob}}` shape a rendered prompt carries.
+    if matches!(kind, ResponseKind::ResourcesRead | ResponseKind::PromptsGet) {
         collect_blob_violations(result, &mut violations);
     }
 
@@ -406,6 +423,28 @@ const FORBIDDEN_URI_SCHEMES: &[&str] = &[
     "jar",
 ];
 
+/// repo-0296: per-response URI-resolution budget (blocking DNS per unique URL).
+const MAX_URI_SCREENS_PER_RESPONSE: usize = 64;
+
+thread_local! {
+    static URI_SCREEN_BUDGET: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Consume one unit of URI-screening budget. Returns `false` when an
+/// `inspect_response` budget is active and exhausted.
+fn take_uri_screen_budget() -> bool {
+    URI_SCREEN_BUDGET.with(|b| match b.get() {
+        Some(0) => false,
+        Some(n) => {
+            b.set(Some(n - 1));
+            true
+        }
+        None => true, // outside inspect_response (tests, direct callers)
+    })
+}
+
 /// Screen one URI through the SSRF fetch validator.
 ///
 /// * `http(s)://` → the full SSRF screen
@@ -441,6 +480,13 @@ fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
     // network URL and must reach this branch. Reject the ambiguous spelling even
     // if the normalized destination would otherwise be public.
     if matches!(scheme.as_deref(), Some("http" | "https")) {
+        if !take_uri_screen_budget() {
+            out.push(ResponseViolation {
+                code,
+                detail: "too many URIs to validate in one response; refusing to forward an unscreened URL".to_string(),
+            });
+            return;
+        }
         let result = if trimmed.contains('\\') {
             Err("backslashes are not allowed in HTTP(S) resource URLs".to_string())
         } else {
@@ -528,6 +574,13 @@ fn screen_uri_template(template: &str, code: &'static str, out: &mut Vec<Respons
 
     match target {
         UriTemplateTarget::HttpBase(base) => {
+            if !take_uri_screen_budget() {
+                out.push(ResponseViolation {
+                    code,
+                    detail: "too many URIs to validate in one response; refusing to forward an unscreened URL".to_string(),
+                });
+                return;
+            }
             if let Err(e) = crate::url_validate::validate_fetch_url(&base) {
                 out.push(ResponseViolation {
                     code,
@@ -911,9 +964,17 @@ fn check_blob(blob_b64: &str, declared: Option<&str>, out: &mut Vec<ResponseViol
             });
             return;
         }
-        // Not valid base64: not a blob we can sniff. Don't manufacture a
-        // violation (the text scan still saw the string); just skip the MIME check.
-        Err(BlobDecodeError::Invalid) => return,
+        // repo-0297: fail CLOSED on undecodable base64. Common downstream
+        // decoders ignore non-alphabet characters, so a payload that defeats
+        // our strict decoder can still decode client-side; skipping the MIME
+        // check here was a fail-open smuggling channel.
+        Err(BlobDecodeError::Invalid) => {
+            out.push(ResponseViolation {
+                code: "blob_undecodable",
+                detail: "resource blob is not strictly decodable base64; a permissive client-side decoder may still materialize it".to_string(),
+            });
+            return;
+        }
     };
 
     let sniffed = sniff_dangerous_kind(&decoded);
@@ -1018,6 +1079,16 @@ fn sniff_dangerous_kind(bytes: &[u8]) -> Option<DangerousKind> {
 /// matching binaries; `text/*`, `image/*`, `audio/*`, `application/json`, etc.
 /// never admit an executable/script/archive and so a mismatch there IS a spoof.
 fn mime_admits_dangerous(declared: &str, kind: DangerousKind) -> bool {
+    // repo-0295: only the media TYPE decides honesty — parameters are
+    // attacker-controlled free text, so a benign primary type with
+    // `; name=x-executable` must not whitewash an ELF blob.
+    let declared = declared
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let declared = declared.as_str();
     if declared.is_empty() {
         // No declared type at all: treat a dangerous magic as a spoof (a benign
         // resource read should declare its type; an undeclared executable is the

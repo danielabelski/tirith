@@ -820,6 +820,21 @@ pub enum ThreatDbError {
     /// the DB never loads from a corrupt v2 trailer (fail closed for v2 data).
     #[error("invalid v2 trailer: {0}")]
     InvalidTrailer(&'static str),
+    /// A field, record count, offset, or total size exceeded the on-disk
+    /// format limit during a build. The writer refuses to emit (and sign) a
+    /// truncated or internally corrupt database.
+    #[error("database build limit exceeded: {0}")]
+    BuildLimitExceeded(&'static str),
+}
+
+/// Checked narrowing to the format's u16 length prefix.
+fn u16_len(len: usize, what: &'static str) -> Result<u16, ThreatDbError> {
+    u16::try_from(len).map_err(|_| ThreatDbError::BuildLimitExceeded(what))
+}
+
+/// Checked narrowing to the format's u32 offsets and counts.
+fn u32_off(len: usize, what: &'static str) -> Result<u32, ThreatDbError> {
+    u32::try_from(len).map_err(|_| ThreatDbError::BuildLimitExceeded(what))
 }
 
 /// Package index entry (8 bytes): offset_into_data(u32 LE) + key_hash(u32 LE,
@@ -2180,20 +2195,46 @@ impl ThreatDb {
     /// Check a hostname against the threat DB.
     pub fn check_hostname(&self, host: &str) -> Option<ThreatMatch> {
         let normalized = canonical_threat_hostname(host)?;
-        if self.hostname_index_count == 0 {
-            return self
-                .supplemental
-                .as_deref()
-                .and_then(|db| db.check_hostname(&normalized));
+        if let Some(m) = self.lookup_hostname_with_domain_scope(&normalized) {
+            return Some(m);
         }
-        let target_hash = fnv1a_hash(normalized.as_bytes());
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_hostname(&normalized))
+    }
 
-        let Some(idx) = self.binary_search_hostname_index(&normalized, target_hash) else {
-            return self
-                .supplemental
-                .as_deref()
-                .and_then(|db| db.check_hostname(&normalized));
-        };
+    /// Exact lookup, plus label-boundary suffix matching: an indicator for
+    /// `bad.example` also covers `random.bad.example`, because whoever
+    /// controls a listed zone controls every subdomain of it. The walk stops
+    /// before a suffix with fewer than two labels, so a bare TLD can never be
+    /// used as the matching indicator. The indicator name is returned as the
+    /// queried (full) hostname so callers report what was actually seen.
+    fn lookup_hostname_with_domain_scope(&self, normalized: &str) -> Option<ThreatMatch> {
+        let mut candidate = normalized;
+        loop {
+            if let Some(m) = self.lookup_hostname_exact(normalized, candidate) {
+                return Some(m);
+            }
+            let dot = candidate.find('.')?;
+            let parent = &candidate[dot + 1..];
+            if !parent.contains('.') {
+                // The remaining suffix is (at or below) the public-suffix
+                // boundary; never match a single-label indicator.
+                return None;
+            }
+            candidate = parent;
+        }
+    }
+
+    /// Exact-match `candidate` against this database's hostname index,
+    /// reporting the match under the originally queried `normalized` name.
+    fn lookup_hostname_exact(&self, normalized: &str, candidate: &str) -> Option<ThreatMatch> {
+        if self.hostname_index_count == 0 {
+            return None;
+        }
+        let target_hash = fnv1a_hash(candidate.as_bytes());
+
+        let idx = self.binary_search_hostname_index(candidate, target_hash)?;
         let base = self.hostname_index_offset as usize + idx as usize * HOSTNAME_INDEX_ENTRY_SIZE;
         let data_off = read_u32_le(&self.data, base)? as usize;
 
@@ -2208,7 +2249,7 @@ impl ThreatDb {
 
         Some(ThreatMatch {
             ecosystem: None,
-            name: normalized,
+            name: normalized.to_string(),
             confidence: source.default_confidence(),
             source,
             reference_url: None,
@@ -3264,6 +3305,9 @@ struct WriterPopular {
 struct StringTable {
     data: Vec<u8>,
     index: std::collections::HashMap<String, u32>,
+    /// Set when an interned string exceeded a format limit. The build fails
+    /// instead of emitting a table whose length prefix wrapped.
+    overflowed: bool,
 }
 
 impl StringTable {
@@ -3271,18 +3315,32 @@ impl StringTable {
         Self {
             data: Vec::new(),
             index: std::collections::HashMap::new(),
+            overflowed: false,
         }
     }
 
-    /// Intern a string, returning its offset.
+    /// Intern a string, returning its offset. Strings that exceed the u16
+    /// length prefix, or a table that exceeds the u32 offset space, mark the
+    /// table overflowed: the build then fails closed instead of serializing a
+    /// corrupt prefix. Returns the no-reference sentinel on overflow.
     fn intern(&mut self, s: &str) -> u32 {
         if let Some(&off) = self.index.get(s) {
             return off;
         }
-        let off = self.data.len() as u32;
         let bytes = s.as_bytes();
-        self.data
-            .extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        let Ok(len) = u16_len(bytes.len(), "string table entry too long") else {
+            self.overflowed = true;
+            return 0xFFFF_FFFF;
+        };
+        let Ok(off) = u32_off(self.data.len(), "string table too large") else {
+            self.overflowed = true;
+            return 0xFFFF_FFFF;
+        };
+        if self.data.len() + 2 + bytes.len() > u32::MAX as usize {
+            self.overflowed = true;
+            return 0xFFFF_FFFF;
+        }
+        self.data.extend_from_slice(&len.to_le_bytes());
         self.data.extend_from_slice(bytes);
         self.index.insert(s.to_string(), off);
         off
@@ -3577,25 +3635,64 @@ impl ThreatDbWriter {
         self.popular
             .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name);
 
+        // Fail closed before serializing: any string-table overflow recorded
+        // at intern time, any field that cannot fit its u16 length prefix, and
+        // any count or offset that cannot fit u32 must abort the build rather
+        // than emit a signed but internally corrupt database.
+        if self.string_table.overflowed {
+            return Err(ThreatDbError::BuildLimitExceeded(
+                "string table entry or total size exceeds format limits",
+            ));
+        }
+        u32_off(self.packages.len(), "too many package records")?;
+        u32_off(self.hostnames.len(), "too many hostname records")?;
+        u32_off(self.ips.len(), "too many IP records")?;
+        u32_off(self.typosquats.len(), "too many typosquat records")?;
+        u32_off(self.popular.len(), "too many popular records")?;
+        for pkg in &self.packages {
+            u16_len(pkg.name.len(), "package name too long")?;
+            u16_len(pkg.versions.len(), "too many versions for one package")?;
+            for v in &pkg.versions {
+                u16_len(v.len(), "version string too long")?;
+            }
+        }
+        for hn in &self.hostnames {
+            u16_len(hn.name.len(), "hostname too long")?;
+        }
+        for ts in &self.typosquats {
+            u16_len(ts.malicious_name.len(), "typosquat name too long")?;
+            u16_len(ts.target_name.len(), "typosquat target name too long")?;
+        }
+        for pop in &self.popular {
+            u16_len(pop.name.len(), "popular package name too long")?;
+        }
+
         let mut pkg_data: Vec<u8> = Vec::new();
         let mut pkg_index: Vec<(u32, u32)> = Vec::new(); // (data_offset, key_hash)
 
         for pkg in &self.packages {
-            let data_offset = (HEADER_SIZE + pkg_data.len()) as u32;
+            let data_offset =
+                u32_off(HEADER_SIZE + pkg_data.len(), "package data offset overflow")?;
             let key_hash = pkg_key_hash(pkg.ecosystem, pkg.name.as_bytes());
 
             pkg_data.push(pkg.ecosystem as u8);
             let name_bytes = pkg.name.as_bytes();
-            pkg_data.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            pkg_data.extend_from_slice(
+                &u16_len(name_bytes.len(), "package name too long")?.to_le_bytes(),
+            );
             pkg_data.extend_from_slice(name_bytes);
             pkg_data.push(pkg.source as u8);
             pkg_data.push(pkg.confidence as u8);
             let flags: u8 = if pkg.all_versions_malicious { 1 } else { 0 };
             pkg_data.push(flags);
-            pkg_data.extend_from_slice(&(pkg.versions.len() as u16).to_le_bytes());
+            pkg_data.extend_from_slice(
+                &u16_len(pkg.versions.len(), "too many versions for one package")?.to_le_bytes(),
+            );
             for v in &pkg.versions {
                 let vbytes = v.as_bytes();
-                pkg_data.extend_from_slice(&(vbytes.len() as u16).to_le_bytes());
+                pkg_data.extend_from_slice(
+                    &u16_len(vbytes.len(), "version string too long")?.to_le_bytes(),
+                );
                 pkg_data.extend_from_slice(vbytes);
             }
             pkg_data.extend_from_slice(&pkg.reference_offset.to_le_bytes());
@@ -3613,10 +3710,14 @@ impl ThreatDbWriter {
 
             hostname_data.push(hn.source as u8);
             let name_bytes = hn.name.as_bytes();
-            hostname_data.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            hostname_data
+                .extend_from_slice(&u16_len(name_bytes.len(), "hostname too long")?.to_le_bytes());
             hostname_data.extend_from_slice(name_bytes);
 
-            hostname_index.push((local_off as u32, key_hash));
+            hostname_index.push((
+                u32_off(local_off, "hostname data offset overflow")?,
+                key_hash,
+            ));
         }
 
         // Typosquat data region
@@ -3629,13 +3730,20 @@ impl ThreatDbWriter {
 
             typo_data.push(ts.ecosystem as u8);
             let mal_bytes = ts.malicious_name.as_bytes();
-            typo_data.extend_from_slice(&(mal_bytes.len() as u16).to_le_bytes());
+            typo_data.extend_from_slice(
+                &u16_len(mal_bytes.len(), "typosquat name too long")?.to_le_bytes(),
+            );
             typo_data.extend_from_slice(mal_bytes);
             let tgt_bytes = ts.target_name.as_bytes();
-            typo_data.extend_from_slice(&(tgt_bytes.len() as u16).to_le_bytes());
+            typo_data.extend_from_slice(
+                &u16_len(tgt_bytes.len(), "typosquat target name too long")?.to_le_bytes(),
+            );
             typo_data.extend_from_slice(tgt_bytes);
 
-            typo_index.push((local_off as u32, key_hash));
+            typo_index.push((
+                u32_off(local_off, "typosquat data offset overflow")?,
+                key_hash,
+            ));
         }
 
         // Popular data region
@@ -3648,10 +3756,15 @@ impl ThreatDbWriter {
 
             popular_data.push(pop.ecosystem as u8);
             let name_bytes = pop.name.as_bytes();
-            popular_data.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            popular_data.extend_from_slice(
+                &u16_len(name_bytes.len(), "popular package name too long")?.to_le_bytes(),
+            );
             popular_data.extend_from_slice(name_bytes);
 
-            popular_index.push((local_off as u32, key_hash));
+            popular_index.push((
+                u32_off(local_off, "popular data offset overflow")?,
+                key_hash,
+            ));
         }
 
         // IP records
@@ -3672,48 +3785,60 @@ impl ThreatDbWriter {
 
         let mut offset = HEADER_SIZE;
 
-        let pkg_index_offset = offset as u32;
+        let pkg_index_offset = u32_off(offset, "package index offset overflow")?;
         offset += pkg_index_size;
         let pkg_data_offset = offset;
         offset += pkg_data.len();
 
-        let hostname_index_offset = offset as u32;
+        let hostname_index_offset = u32_off(offset, "hostname index offset overflow")?;
         offset += hostname_index_size;
         let hostname_data_offset = offset;
         offset += hostname_data.len();
 
-        let ip_data_offset = offset as u32;
+        let ip_data_offset = u32_off(offset, "IP data offset overflow")?;
         offset += ip_data.len();
 
-        let typo_index_offset = offset as u32;
+        let typo_index_offset = u32_off(offset, "typosquat index offset overflow")?;
         offset += typo_index_size;
         let typo_data_offset = offset;
         offset += typo_data.len();
 
-        let popular_index_offset = offset as u32;
+        let popular_index_offset = u32_off(offset, "popular index offset overflow")?;
         offset += popular_index_size;
         let popular_data_offset = offset;
         offset += popular_data.len();
 
-        let string_table_offset = offset as u32;
+        let string_table_offset = u32_off(offset, "string table offset overflow")?;
+        // The u32 offset space is the hard format limit for the whole file.
+        offset += self.string_table.len() as usize;
+        u32_off(offset, "total database size exceeds format limit")?;
 
         // Fix up data offsets to be absolute. pkg_index was built as
         // HEADER_SIZE + local; rebase onto the real pkg_data_offset.
         for (data_off, _) in &mut pkg_index {
             let local_off = *data_off as usize - HEADER_SIZE;
-            *data_off = (pkg_data_offset + local_off) as u32;
+            *data_off = u32_off(pkg_data_offset + local_off, "package data offset overflow")?;
         }
 
         for (data_off, _) in &mut hostname_index {
-            *data_off = (hostname_data_offset + *data_off as usize) as u32;
+            *data_off = u32_off(
+                hostname_data_offset + *data_off as usize,
+                "hostname data offset overflow",
+            )?;
         }
 
         for (data_off, _) in &mut typo_index {
-            *data_off = (typo_data_offset + *data_off as usize) as u32;
+            *data_off = u32_off(
+                typo_data_offset + *data_off as usize,
+                "typosquat data offset overflow",
+            )?;
         }
 
         for (data_off, _) in &mut popular_index {
-            *data_off = (popular_data_offset + *data_off as usize) as u32;
+            *data_off = u32_off(
+                popular_data_offset + *data_off as usize,
+                "popular data offset overflow",
+            )?;
         }
 
         // Sort index vectors by hash so binary search works (data was sorted by
@@ -3748,15 +3873,23 @@ impl ThreatDbWriter {
         buf[12..20].copy_from_slice(&self.build_timestamp.to_le_bytes());
         buf[20..28].copy_from_slice(&self.build_sequence.to_le_bytes());
         buf[28..32].copy_from_slice(&pkg_index_offset.to_le_bytes());
-        buf[32..36].copy_from_slice(&(self.packages.len() as u32).to_le_bytes());
+        buf[32..36].copy_from_slice(
+            &u32_off(self.packages.len(), "too many package records")?.to_le_bytes(),
+        );
         buf[36..40].copy_from_slice(&hostname_index_offset.to_le_bytes());
-        buf[40..44].copy_from_slice(&(self.hostnames.len() as u32).to_le_bytes());
+        buf[40..44].copy_from_slice(
+            &u32_off(self.hostnames.len(), "too many hostname records")?.to_le_bytes(),
+        );
         buf[44..48].copy_from_slice(&ip_data_offset.to_le_bytes());
-        buf[48..52].copy_from_slice(&(self.ips.len() as u32).to_le_bytes());
+        buf[48..52].copy_from_slice(&u32_off(self.ips.len(), "too many IP records")?.to_le_bytes());
         buf[52..56].copy_from_slice(&typo_index_offset.to_le_bytes());
-        buf[56..60].copy_from_slice(&(self.typosquats.len() as u32).to_le_bytes());
+        buf[56..60].copy_from_slice(
+            &u32_off(self.typosquats.len(), "too many typosquat records")?.to_le_bytes(),
+        );
         buf[60..64].copy_from_slice(&popular_index_offset.to_le_bytes());
-        buf[64..68].copy_from_slice(&(self.popular.len() as u32).to_le_bytes());
+        buf[64..68].copy_from_slice(
+            &u32_off(self.popular.len(), "too many popular records")?.to_le_bytes(),
+        );
         buf[68..72].copy_from_slice(&string_table_offset.to_le_bytes());
         buf[72..76].copy_from_slice(&self.string_table.len().to_le_bytes());
 
@@ -3809,7 +3942,7 @@ impl ThreatDbWriter {
         // signed range covers it with no change to `SIG_OFFSET`. A v1 build skips
         // this entirely and is byte-for-byte the legacy layout.
         if format == ThreatDbFormat::V2 {
-            self.append_v2_sections(&mut buf);
+            self.append_v2_sections(&mut buf)?;
         }
 
         // Sign: header before sig ++ all data after header. Unchanged from v1:
@@ -3839,7 +3972,7 @@ impl ThreatDbWriter {
     /// descriptor trailer      (one [`Descriptor`] per present section)
     /// fixed EOF footer        (magic + trailer_offset/length + version + flags)
     /// ```
-    fn append_v2_sections(&mut self, buf: &mut Vec<u8>) {
+    fn append_v2_sections(&mut self, buf: &mut Vec<u8>) -> Result<(), ThreatDbError> {
         // Build a dedicated v2 campaign string table. Both campaign labels and
         // malicious-URL strings live here; the index records carry offsets into
         // it. Keep it separate from the v1 string table so v1 offsets are
@@ -3910,6 +4043,11 @@ impl ThreatDbWriter {
         }
 
         // The campaign table is now final (all interns done above).
+        if campaign_table.overflowed {
+            return Err(ThreatDbError::BuildLimitExceeded(
+                "campaign/URL string table entry or total size exceeds format limits",
+            ));
+        }
         let campaign_bytes = campaign_table.bytes().to_vec();
 
         // Behavior-tag bitset section: an OR of every emitted file-hash record's
@@ -3989,6 +4127,7 @@ impl ThreatDbWriter {
         buf.extend_from_slice(&trailer_length.to_le_bytes());
         buf.extend_from_slice(&TRAILER_VERSION.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes()); // flags (reserved)
+        Ok(())
     }
 }
 

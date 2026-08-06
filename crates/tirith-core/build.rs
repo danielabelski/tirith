@@ -1134,6 +1134,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "output_truncated_escape_sequence",
         "OutputTruncatedEscapeSequence",
     ),
+    ("output_analysis_overflow", "OutputAnalysisOverflow"),
     // M7 ch5 — prompt-injection seed phrases.
     ("prompt_injection_in_output", "PromptInjectionInOutput"),
     ("ignore_previous_instructions", "IgnorePreviousInstructions"),
