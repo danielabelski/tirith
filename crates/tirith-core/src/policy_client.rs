@@ -32,6 +32,13 @@ pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFet
     if let Err(reason) = crate::url_validate::validate_server_url(url) {
         return Err(PolicyFetchError::NetworkError(reason));
     }
+    // TIRITH_ALLOW_HTTP relaxes transport for a local server, not credential
+    // handling: this request carries an API key, so it requires TLS regardless.
+    if url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() != "https") {
+        return Err(PolicyFetchError::NetworkError(
+            "policy fetch sends an API key and therefore requires https://".into(),
+        ));
+    }
 
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
