@@ -394,11 +394,15 @@ fn unique_bound_root(
     Ok(first)
 }
 
+/// Which of the bound read/write root slots a policy root maps to, plus the
+/// single descriptor both sides share.
+type BoundPolicyRoot = (Option<usize>, Option<usize>, i32);
+
 fn bound_fd_for_policy_root(
     root: &Path,
     bound_read_roots: &[(&Path, i32)],
     bound_write_roots: &[(&Path, i32)],
-) -> Result<Option<(Option<usize>, Option<usize>, i32)>, ContainError> {
+) -> Result<Option<BoundPolicyRoot>, ContainError> {
     let read = unique_bound_root(bound_read_roots, root, "read")?;
     let write = unique_bound_root(bound_write_roots, root, "write")?;
     match (read, write) {
@@ -864,10 +868,10 @@ struct PostExecRuntime;
 
 #[cfg(target_arch = "x86_64")]
 const SAFE_TERMINAL_IOCTL_REQUESTS: &[u64] = &[
-    libc::TCGETS as u64,
-    libc::TIOCGWINSZ as u64,
-    libc::TIOCGPGRP as u64,
-    libc::FIONREAD as u64,
+    libc::TCGETS,
+    libc::TIOCGWINSZ,
+    libc::TIOCGPGRP,
+    libc::FIONREAD,
 ];
 
 #[cfg(target_arch = "x86_64")]
@@ -1424,8 +1428,8 @@ mod tests {
         let rules = SafeDescriptorControls.conditional_rules();
         let ioctl_rules = rules.get(&Sysno::ioctl).expect("conditional ioctl rules");
         assert_eq!(ioctl_rules.len(), SAFE_TERMINAL_IOCTL_REQUESTS.len());
-        assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&(libc::TIOCSTI as u64)));
-        assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&(libc::TIOCLINUX as u64)));
+        assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&{ libc::TIOCSTI }));
+        assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&{ libc::TIOCLINUX }));
         for rule in ioctl_rules {
             assert_eq!(rule.argument_filters.len(), 2);
             assert!(rule
@@ -1674,7 +1678,7 @@ mod tests {
         const MODE: &str = "TIRITH_SECCOMP_GUARD_DEATH_MODE";
         const MARKER: &str = "TIRITH_SECCOMP_GUARD_DEATH_MARKER";
         match std::env::var(MODE).ok().as_deref() {
-            None => return,
+            None => (),
             Some("guard") => {
                 let marker = std::path::PathBuf::from(
                     std::env::var_os(MARKER).expect("guard-death marker path"),
@@ -1746,7 +1750,7 @@ mod tests {
                             0o600,
                         );
                         if fd >= 0 {
-                            let marker_byte = [b'x'];
+                            let marker_byte = *b"x";
                             let _ = libc::write(fd, marker_byte.as_ptr().cast::<libc::c_void>(), 1);
                             libc::close(fd);
                         }

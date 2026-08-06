@@ -1679,7 +1679,12 @@ fn available_bytes(path: &Path) -> Option<u64> {
     }
     // SAFETY: successful statvfs initialized the struct.
     let stat = unsafe { stat.assume_init() };
-    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize))
+    // statvfs field widths differ by platform (both u64 on Linux, f_bavail u32
+    // on macOS), so widen through From rather than a target-specific cast. The
+    // conversion is genuinely redundant on whichever target already has u64,
+    // which is why the lint is allowed here rather than on one platform's shape.
+    #[allow(clippy::useless_conversion)]
+    Some(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
 }
 
 /// Backup a single file to the checkpoint files directory.

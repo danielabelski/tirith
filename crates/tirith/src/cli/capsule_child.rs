@@ -768,8 +768,8 @@ fn prepare_bound_inputs(
     // SAFETY: fstat initialized the structure on success.
     let target_stat = unsafe { target_stat.assume_init() };
     if target_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || target_metadata.dev() != target_stat.st_dev as u64
-        || target_metadata.ino() != target_stat.st_ino as u64
+        || target_metadata.dev() != target_stat.st_dev
+        || target_metadata.ino() != target_stat.st_ino
     {
         return Err(
             "target pathname no longer identifies the retained target directory capability"
@@ -2242,8 +2242,8 @@ fn validate_held_ephemeral_directory(
         || visible.uid() != unsafe { libc::geteuid() }
         || visible.mode() & 0o777 != 0o700
         || held.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || visible.dev() != held.st_dev as u64
-        || visible.ino() != held.st_ino as u64
+        || visible.dev() != held.st_dev
+        || visible.ino() != held.st_ino
     {
         return Err(format!(
             "visible {label} path does not identify the retained owner-only directory capability"
@@ -3306,7 +3306,7 @@ mod tests {
                 std::arch::asm!("int3", options(nomem, nostack));
                 #[cfg(target_arch = "aarch64")]
                 std::arch::asm!("brk #0", options(nomem, nostack));
-                let byte = [b'x'];
+                let byte = *b"x";
                 let fd = libc::open(
                     marker_c.as_ptr(),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,

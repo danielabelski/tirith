@@ -225,7 +225,7 @@ impl InstallTargetBinding {
     pub fn parent_identity(&self) -> String {
         #[cfg(target_os = "linux")]
         {
-            return format!("linux-devino-v1:{}:{}", self.parent_dev, self.parent_ino);
+            format!("linux-devino-v1:{}:{}", self.parent_dev, self.parent_ino)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -310,11 +310,14 @@ enum CheckpointTestPoint {
     AfterPublish,
 }
 
+/// Test-only observer invoked at each checkpoint of the install sequence.
+#[cfg(all(test, target_os = "linux"))]
+type CheckpointTestHook = Box<dyn FnMut(CheckpointTestPoint) -> std::io::Result<()>>;
+
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
-    static CHECKPOINT_TEST_HOOK: std::cell::RefCell<
-        Option<Box<dyn FnMut(CheckpointTestPoint) -> std::io::Result<()>>>
-    > = std::cell::RefCell::new(None);
+    static CHECKPOINT_TEST_HOOK: std::cell::RefCell<Option<CheckpointTestHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -627,10 +630,10 @@ impl EnvironmentCheckpoint {
     pub fn publication_crossed(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            return matches!(
+            matches!(
                 self.state,
                 CheckpointState::PublishedUnconfirmed | CheckpointState::Committed
-            );
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -648,7 +651,7 @@ impl EnvironmentCheckpoint {
         #[cfg(target_os = "linux")]
         {
             self.verify_private_identity()?;
-            return self.target_handle.try_clone();
+            self.target_handle.try_clone()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -708,7 +711,7 @@ impl EnvironmentCheckpoint {
                 Some((self.target_dev, self.target_ino)),
             )?;
             self.journal.sync_all()?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -754,7 +757,7 @@ impl EnvironmentCheckpoint {
             // interrupted, the tiny committed journal remains and a later attempt
             // fails closed; no environment tree is duplicated.
             let _ = cleanup_checkpoint_journal(&self.parent, &self.journal, &self.journal_name);
-            return Ok(proof.into_recorded());
+            Ok(proof.into_recorded())
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -812,7 +815,7 @@ impl EnvironmentCheckpoint {
             self.journal.sync_all()?;
             cleanup_checkpoint_journal(&self.parent, &self.journal, &self.journal_name)?;
             self.state = CheckpointState::RolledBack;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -1116,7 +1119,7 @@ fn entry_identity_at(dir_fd: i32, component: &OsStr) -> std::io::Result<Option<(
             "install target exists but is not an ordinary directory",
         ));
     }
-    Ok(Some((stat.st_dev as u64, stat.st_ino as u64)))
+    Ok(Some((stat.st_dev, stat.st_ino)))
 }
 
 #[cfg(target_os = "linux")]
@@ -1128,7 +1131,7 @@ fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
     }
     // SAFETY: `fstat` returned success and initialized `stat`.
     let stat = unsafe { stat.assume_init() };
-    Ok((stat.st_dev as u64, stat.st_ino as u64))
+    Ok((stat.st_dev, stat.st_ino))
 }
 
 #[cfg(target_os = "linux")]
