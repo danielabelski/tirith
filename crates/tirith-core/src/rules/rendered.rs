@@ -1112,15 +1112,27 @@ fn strict_pdf_pages(doc: &lopdf::Document) -> Result<Vec<(u32, lopdf::ObjectId)>
         .collect())
 }
 
+/// Cap on a single decoded PDF stream. lopdf 0.34 has no output limit of its
+/// own (`max_decompressed_size` arrives in 0.44), so a small FlateDecode stream
+/// can otherwise expand without bound.
+const PDF_STREAM_DECODE_CAP: usize = 16 * 1024 * 1024;
+
 fn decode_pdf_stream_strict(stream: &lopdf::Stream) -> Result<Vec<u8>, lopdf::Error> {
     // lopdf reports a missing /Filter as DictKey even though it means the stream
     // is legitimately uncompressed. Preserve that supported case; when a Filter
     // is declared, require it to decode successfully instead of falling back to
     // the encoded bytes.
     if stream.dict.get(b"Filter").is_err() {
+        if stream.content.len() > PDF_STREAM_DECODE_CAP {
+            return Err(lopdf::Error::Type);
+        }
         Ok(stream.content.clone())
     } else {
-        stream.decompressed_content()
+        let decoded = stream.decompressed_content()?;
+        if decoded.len() > PDF_STREAM_DECODE_CAP {
+            return Err(lopdf::Error::Type);
+        }
+        Ok(decoded)
     }
 }
 
