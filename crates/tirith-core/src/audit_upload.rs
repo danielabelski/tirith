@@ -222,6 +222,50 @@ fn rewrite_spool(path: &std::path::Path, remaining: &[String]) {
     });
 }
 
+/// repo-0194: coalesce bursts into ONE drainer. A thread per event lets a burst
+/// create unbounded concurrent workers in a long-lived process.
+static DRAIN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The running drainer snapshots the spool once, so an event appended after that
+/// snapshot is not covered by it. Record that the spool changed and let the
+/// drainer take another pass; without this the event waits for an unrelated
+/// later append and retention can drop it undelivered.
+static DRAIN_RESCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Releases the drainer claim even if the worker panics or never starts.
+/// Without it a failed spawn or a panic inside `drain_spool` would leave
+/// `DRAIN_ACTIVE` set forever and every later event would only flag a rescan
+/// nobody performs, stranding the durable queue until the process restarts.
+struct DrainOwnership {
+    held: bool,
+}
+
+impl DrainOwnership {
+    fn release(&mut self) {
+        if self.held {
+            self.held = false;
+            DRAIN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn retake(&mut self) -> bool {
+        self.held = DRAIN_ACTIVE
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        self.held
+    }
+}
+
+impl Drop for DrainOwnership {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Primary entry point: append the event to the durable spool, then spawn a
 /// background thread to attempt uploading accumulated events.
 pub fn spool_and_upload(
@@ -243,14 +287,6 @@ pub fn spool_and_upload(
     let max_b = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     trim_spool_to_retention(max_ev, max_b);
 
-    // repo-0194: coalesce bursts into ONE drainer. A thread per event lets a
-    // burst create unbounded concurrent workers in a long-lived process.
-    static DRAIN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    // The running drainer snapshots the spool once, so an event appended after
-    // that snapshot is not covered by it. Record that the spool changed and let
-    // the drainer take another pass; without this the event waits for an
-    // unrelated later append and retention can drop it undelivered.
-    static DRAIN_RESCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DRAIN_ACTIVE
         .compare_exchange(
             false,
@@ -267,33 +303,35 @@ pub fn spool_and_upload(
     // Drain runs on a background thread — the CLI path must never block on network I/O.
     let url = server_url.to_string();
     let key = api_key.to_string();
-    std::thread::spawn(move || {
-        loop {
-            // Clear before draining: an append during this pass sets the flag
-            // again and earns another one.
-            DRAIN_RESCAN.store(false, std::sync::atomic::Ordering::Release);
-            drain_spool(&url, &key, max_ev, max_b);
-            if DRAIN_RESCAN.load(std::sync::atomic::Ordering::Acquire) {
-                continue;
+    let spawned = std::thread::Builder::new()
+        .name("tirith-audit-drain".to_string())
+        .spawn(move || {
+            let mut ownership = DrainOwnership { held: true };
+            loop {
+                // Clear before draining: an append during this pass sets the
+                // flag again and earns another one.
+                DRAIN_RESCAN.store(false, std::sync::atomic::Ordering::Release);
+                drain_spool(&url, &key, max_ev, max_b);
+                if DRAIN_RESCAN.load(std::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
+                ownership.release();
+                // An append between the load above and that release saw an
+                // active drainer and only set the flag, so re-take ownership for
+                // it. If another caller already became the drainer, it owns the
+                // work.
+                if !DRAIN_RESCAN.load(std::sync::atomic::Ordering::Acquire) || !ownership.retake() {
+                    break;
+                }
             }
-            DRAIN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
-            // An append between the load above and this release saw an active
-            // drainer and only set the flag, so re-take ownership for it. If
-            // another caller already became the drainer, it owns the work.
-            if !DRAIN_RESCAN.load(std::sync::atomic::Ordering::Acquire)
-                || DRAIN_ACTIVE
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_err()
-            {
-                break;
-            }
-        }
-    });
+        });
+    if spawned.is_err() {
+        // Never leave the claim set for a worker that does not exist.
+        DRAIN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        crate::audit::audit_diagnostic(
+            "tirith: audit-upload: could not start the drain worker; the spool is retained",
+        );
+    }
 }
 
 /// Trim the spool file to the retention bounds (event count and total bytes),
