@@ -1712,7 +1712,7 @@ fn available_bytes(path: &Path) -> Option<u64> {
     }
     // SAFETY: successful statvfs initialized the struct.
     let stat = unsafe { stat.assume_init() };
-    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize))
 }
 
 /// Backup a single file to the checkpoint files directory.
