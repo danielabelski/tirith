@@ -12256,14 +12256,28 @@ fn init_prompt_status_is_idempotent_when_run_twice() {
     // single-snippet output each time — repeat invocations are idempotent (the snippet itself is
     // also guarded by _TIRITH_PROMPT_STATUS_LOADED so eval-ing it twice in one shell doesn't
     // double-wrap PROMPT either).
-    let out_a = tirith()
-        .args(["init", "--shell", "zsh", "--prompt-status"])
-        .output()
-        .expect("failed to run tirith (run 1)");
-    let out_b = tirith()
-        .args(["init", "--shell", "zsh", "--prompt-status"])
-        .output()
-        .expect("failed to run tirith (run 2)");
+    // Idempotence is a property of repeating the command in ONE environment.
+    // The hermetic helper hands every command its own root, and the emitted
+    // `source <root>/.../zsh-hook.zsh` line carries that root, so both runs have
+    // to share one home for the comparison below to mean anything.
+    let shared = tempfile::tempdir().expect("shared prompt-status home");
+    for relative in ["config", "data", "state", "cache"] {
+        fs::create_dir_all(shared.path().join(relative)).expect("shared home layout");
+    }
+    let run = || {
+        tirith()
+            .env("HOME", shared.path())
+            .env("USERPROFILE", shared.path())
+            .env("XDG_CONFIG_HOME", shared.path().join("config"))
+            .env("XDG_DATA_HOME", shared.path().join("data"))
+            .env("XDG_STATE_HOME", shared.path().join("state"))
+            .env("XDG_CACHE_HOME", shared.path().join("cache"))
+            .args(["init", "--shell", "zsh", "--prompt-status"])
+            .output()
+            .expect("failed to run tirith")
+    };
+    let out_a = run();
+    let out_b = run();
     assert_eq!(
         out_a.status.code(),
         Some(0),
