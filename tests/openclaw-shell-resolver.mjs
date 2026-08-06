@@ -475,7 +475,15 @@ try {
   if (originalExpectedTokenizer === undefined) delete process.env.TIRITH_TEST_EXPECTED_TOKENIZER;
   else process.env.TIRITH_TEST_EXPECTED_TOKENIZER = originalExpectedTokenizer;
   process.chdir(originalCwd);
-  await rm(fakeTirithDir, { recursive: true, force: true });
+  // Windows runners hold fresh temp entries briefly (antivirus and the old
+  // process cwd release), which surfaces as EBUSY from rmdir. Retry with
+  // backoff, and treat a still-held leftover as non-fatal: every assertion
+  // above has already passed and the runner temp dir is disposable.
+  try {
+    await rm(fakeTirithDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (error) {
+    console.warn(`leaving temp dir behind after retries: ${error?.message ?? error}`);
+  }
 }
 
 console.log("OpenClaw shell resolver: all parser/executor mappings passed");
