@@ -982,11 +982,39 @@ impl TerminalSanitizer {
 /// chars from `chunk` into `out`. This one-shot byte API remains for existing
 /// callers; multi-leaf MCP paths use [`TerminalSanitizer`] directly.
 pub fn sanitize_text_into(chunk: &[u8], out: &mut Vec<u8>) {
-    let decoded = String::from_utf8_lossy(chunk);
+    // Sanitize each valid UTF-8 run and pass invalid bytes through unchanged.
+    // `from_utf8_lossy` would rewrite them as U+FFFD, which silently destroys
+    // byte fidelity for a caller handing this arbitrary output bytes — and the
+    // sanitizer has nothing to say about a byte that is not a character.
     let mut sanitizer = TerminalSanitizer::default();
-    let sanitized = sanitizer.sanitize_chunk(&decoded);
+    let mut rest = chunk;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.extend_from_slice(sanitizer.sanitize_chunk(text).as_bytes());
+                break;
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                // SAFETY-adjacent: `valid_up_to` is exactly the valid prefix.
+                let text = std::str::from_utf8(valid).unwrap_or_default();
+                out.extend_from_slice(sanitizer.sanitize_chunk(text).as_bytes());
+                match error.error_len() {
+                    Some(len) => {
+                        out.extend_from_slice(&after[..len]);
+                        rest = &after[len..];
+                    }
+                    // An incomplete sequence at the end of the chunk: keep the
+                    // bytes verbatim rather than guessing at a continuation.
+                    None => {
+                        out.extend_from_slice(after);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     sanitizer.finish();
-    out.extend_from_slice(sanitized.as_bytes());
 }
 
 fn is_strippable_zero_width(ch: char) -> bool {
@@ -2007,5 +2035,32 @@ mod tests {
                 "seed phrase must be gone: {body:?}"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_text_into_keeps_invalid_utf8_bytes_verbatim() {
+        // The byte API is public, so a caller can hand it arbitrary output.
+        // from_utf8_lossy would rewrite every invalid byte as U+FFFD and
+        // silently change the bytes the caller gets back.
+        let mut out = Vec::new();
+        sanitize_text_into(b"before\xff\xfeafter", &mut out);
+        assert_eq!(out, b"before\xff\xfeafter");
+
+        // Control sequences inside the valid runs are still sanitized.
+        let mut out = Vec::new();
+        sanitize_text_into(b"a\x1b[31mred\xffz", &mut out);
+        assert!(
+            !out.windows(2).any(|pair| pair == b"\x1b["),
+            "a CSI inside a valid run must still be stripped: {out:?}"
+        );
+        assert!(
+            out.contains(&0xff),
+            "the invalid byte must survive: {out:?}"
+        );
+
+        // An incomplete sequence at the very end is kept, not guessed at.
+        let mut out = Vec::new();
+        sanitize_text_into(b"tail\xe2\x82", &mut out);
+        assert_eq!(out, b"tail\xe2\x82");
     }
 }
