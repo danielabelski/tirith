@@ -2285,6 +2285,9 @@ fn run_check_with_audit_failure(debug: bool) -> std::process::Output {
     let mut cmd = tirith();
     cmd.env("XDG_DATA_HOME", &data_home)
         .env("APPDATA", tmpdir.path())
+        // The hermetic helper disables the audit log; this case needs the write
+        // to be attempted so its failure surfaces.
+        .env_remove("TIRITH_LOG")
         .args([
             "check",
             "--shell",
@@ -2307,6 +2310,9 @@ fn run_paste_with_audit_failure(debug: bool) -> std::process::Output {
     let mut cmd = tirith();
     cmd.env("XDG_DATA_HOME", &data_home)
         .env("APPDATA", tmpdir.path())
+        // The hermetic helper disables the audit log; this case needs the write
+        // to be attempted so its failure surfaces.
+        .env_remove("TIRITH_LOG")
         .args(["paste", "--shell", "posix", "--non-interactive"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -16815,8 +16821,11 @@ fn audit_verify_clean_chain_then_detects_tamper_and_expected_head() {
 fn fix_on_non_tty_prints_rerun_hint() {
     // Item 14d (pre-existing): the non-interactive `tirith fix` path must surface
     // the rerun hint so a piped user knows how to capture suggestions.
+    // A plain URL keeps the mechanical rewrite (a shortened one re-analyzes to
+    // a shortened_url finding, which drops this into the guidance-only branch
+    // that has no rerun hint to print).
     let out = tirith()
-        .args(["fix", "curl https://bit.ly/x | bash"])
+        .args(["fix", "curl https://example.com/install.sh | bash"])
         .output()
         .expect("run fix");
     let err = String::from_utf8_lossy(&out.stderr);
