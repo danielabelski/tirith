@@ -147,6 +147,12 @@ pub const SENSITIVE_BIND_PATHS: &[&str] = &[
     "%USERPROFILE%/.aws",
     "%USERPROFILE%/.kube",
     "%USERPROFILE%/.docker",
+    // The `${env:HOMEDRIVE}${env:HOMEPATH}` spelling above is already covered;
+    // the cmd-style `%VAR%` form names the same home.
+    "%HOMEDRIVE%%HOMEPATH%/.ssh",
+    "%HOMEDRIVE%%HOMEPATH%/.aws",
+    "%HOMEDRIVE%%HOMEPATH%/.kube",
+    "%HOMEDRIVE%%HOMEPATH%/.docker",
 ];
 
 /// Known URL-shortener hosts. Centralised so `transport.rs` (`ShortenedUrl`) and
