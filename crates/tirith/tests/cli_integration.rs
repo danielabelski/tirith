@@ -9476,7 +9476,12 @@ fn init_prompt_status_emits_marker_wrapped_snippet_zsh() {
         .args(["init", "--shell", "zsh", "--prompt-status"])
         .output()
         .expect("failed to run tirith");
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Hook source line still emitted.
     assert!(
@@ -9518,8 +9523,18 @@ fn init_prompt_status_is_idempotent_when_run_twice() {
         .args(["init", "--shell", "zsh", "--prompt-status"])
         .output()
         .expect("failed to run tirith (run 2)");
-    assert_eq!(out_a.status.code(), Some(0));
-    assert_eq!(out_b.status.code(), Some(0));
+    assert_eq!(
+        out_a.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_a.stderr)
+    );
+    assert_eq!(
+        out_b.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_b.stderr)
+    );
 
     let stdout_a = String::from_utf8_lossy(&out_a.stdout).into_owned();
     let stdout_b = String::from_utf8_lossy(&out_b.stdout).into_owned();
@@ -9578,7 +9593,12 @@ fn init_prompt_status_supports_bash_and_fish_and_powershell() {
             .args(["init", "--shell", shell, "--prompt-status"])
             .output()
             .expect("failed to run tirith");
-        assert_eq!(out.status.code(), Some(0), "shell={shell}");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "shell={shell} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             stdout.contains("# >>> tirith prompt-status (M8 ch6) >>>"),
