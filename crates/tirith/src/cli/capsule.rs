@@ -3491,7 +3491,9 @@ mod tests {
         assert!((3..70).contains(&inherited));
         assert!(dense.iter().all(|fd| fd.as_raw_fd() != inherited));
 
-        let mut command = Command::new("/bin/sh");
+        // Ubuntu's /bin/sh is dash, which rejects multi-digit fd redirections
+        // ("Bad fd number"); bash handles the full descriptor range under test.
+        let mut command = Command::new("/bin/bash");
         command
             .args(["-c", &format!("cat <&{inherited}")])
             .stdin(Stdio::piped())
@@ -3568,7 +3570,7 @@ mod tests {
              [ -p /proc/self/fd/{status_fd} ] && [ -S /proc/self/fd/{ack_fd} ] && \
              printf 'interpreter|script|pipe|socket'"
         );
-        let mut command = Command::new("/bin/sh");
+        let mut command = Command::new("/bin/bash");
         command
             .args(["-c", shell.as_str()])
             .stdin(Stdio::piped())
