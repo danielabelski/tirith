@@ -549,15 +549,14 @@ fn hash_path_within_budget(path: &Path) -> Option<String> {
     }
 }
 
-/// Scan a single file and return its [`ScanFileOutcome`].
-///
-
 /// repo-0422: path text in diagnostics comes from the scanned tree and can
 /// contain ANSI/OSC control bytes — sanitize before writing to stderr.
 fn sanitized_display(path: &Path) -> String {
     crate::mcp::output_filter::sanitize_for_display(&path.display().to_string())
 }
 
+/// Scan a single file and return its [`ScanFileOutcome`].
+///
 /// A2d — ONE handle, bounded hash. We open ONCE (no-follow, refusing a symlinked
 /// final component so a planted symlink can't redirect the read outside the
 /// tree), `fstat` THAT open fd, and read/hash from the SAME handle — closing the

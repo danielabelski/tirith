@@ -197,6 +197,7 @@ fn check_hyperlink_mismatch(scan: &OutputScanResult) -> Vec<Finding> {
 ///   sequence now compares the EFFECTIVE colors;
 /// * basic/bright/indexed/RGB forms are normalized through the xterm 256
 ///   palette so equivalent spellings compare equal.
+///
 /// A finding fires on each TRANSITION into a hidden state.
 fn check_hidden_text_via_sgr(scan: &OutputScanResult) -> Vec<Finding> {
     let mut findings = Vec::new();

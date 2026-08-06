@@ -1125,6 +1125,22 @@ fn write_breakdown_human(
     )?;
     Ok(())
 }
+/// repo-0306: `true` only for a canonical exact version (digits/dots, optional
+/// `v` prefix, pre-release/build suffix). Range sigils (`^~><*=`), comparators,
+/// and wildcards make the value unusable as an OSV exact-version query.
+fn is_exact_osv_version(v: &str) -> bool {
+    let v = v.trim();
+    if v.is_empty() {
+        return false;
+    }
+    if v.chars()
+        .any(|c| matches!(c, '^' | '~' | '>' | '<' | '=' | '*' | ',' | ' ' | '|'))
+    {
+        return false;
+    }
+    let first = v.as_bytes()[0];
+    first.is_ascii_digit() || (first == b'v' && v.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1706,20 +1722,4 @@ mod tests {
         assert!(!out.contains("\nFORGED"));
         assert!(out.contains("api signals: unavailable"));
     }
-}
-/// repo-0306: `true` only for a canonical exact version (digits/dots, optional
-/// `v` prefix, pre-release/build suffix). Range sigils (`^~><*=`), comparators,
-/// and wildcards make the value unusable as an OSV exact-version query.
-fn is_exact_osv_version(v: &str) -> bool {
-    let v = v.trim();
-    if v.is_empty() {
-        return false;
-    }
-    if v.chars()
-        .any(|c| matches!(c, '^' | '~' | '>' | '<' | '=' | '*' | ',' | ' ' | '|'))
-    {
-        return false;
-    }
-    let first = v.as_bytes()[0];
-    first.is_ascii_digit() || (first == b'v' && v.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
 }
