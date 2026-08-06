@@ -261,14 +261,37 @@ fn copy_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn copy_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
     let target = std::fs::read_link(source)?;
-    if std::fs::metadata(source)
+    let created = if std::fs::metadata(source)
         .map(|m| m.is_dir())
         .unwrap_or(false)
     {
-        std::os::windows::fs::symlink_dir(target, destination)
+        std::os::windows::fs::symlink_dir(&target, destination)
     } else {
-        std::os::windows::fs::symlink_file(target, destination)
+        std::os::windows::fs::symlink_file(&target, destination)
+    };
+    // ERROR_PRIVILEGE_NOT_HELD. Creating a symlink needs Developer Mode or
+    // SeCreateSymbolicLinkPrivilege, which a standard account does not have.
+    // The checkpoint must reproduce the environment exactly, and copying the
+    // link's contents instead would silently turn a link that points outside
+    // the environment into a real copy, so fail closed and name the privilege.
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    if let Err(error) = created {
+        if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "cannot checkpoint the symlink {} -> {}: creating a symlink requires \
+                     Developer Mode or SeCreateSymbolicLinkPrivilege. Enable one of them, \
+                     or install into a target with no symlinks — copying the link's \
+                     contents instead would not reproduce the environment.",
+                    source.display(),
+                    target.display()
+                ),
+            ));
+        }
+        return Err(error);
     }
+    Ok(())
 }
 
 /// The outcome of a contained install-from-digest: the child's exit code plus the
