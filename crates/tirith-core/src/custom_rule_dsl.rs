@@ -753,7 +753,13 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
                 .any(|p| normalize_ecosystem(&p.ecosystem) == e)
         }
         WhenClause::PackageNameMatches(pat) => match cached_regex(pat) {
-            Some(re) => ctx.packages.iter().any(|p| re.is_match(p.name)),
+            // `canonical_package_name` preserves case for npm/Go/Maven/RubyGems,
+            // so also match the lowercased spelling: a rule written `^left-pad$`
+            // must keep matching a `Left-Pad` install.
+            Some(re) => ctx
+                .packages
+                .iter()
+                .any(|p| re.is_match(p.name) || re.is_match(&p.name.to_lowercase())),
             None => false,
         },
         WhenClause::PackageReputation(rep) => ctx.packages.iter().any(|p| match rep {
