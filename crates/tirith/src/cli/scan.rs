@@ -519,15 +519,16 @@ fn explicit_target_exists(path: &std::path::Path, target_kind: &str) -> bool {
     match path.try_exists() {
         Ok(true) => true,
         Ok(false) => {
-            eprintln!("tirith scan: {target_kind} not found: {}", path.display());
+            // The target is an argument, so it can carry terminal control
+            // sequences that would rewrite this diagnostic.
+            let shown = super::sanitize_for_human_output(&path.display().to_string(), false);
+            eprintln!("tirith scan: {target_kind} not found: {shown}");
             eprintln!("  try: tirith scan ./  (scan the current directory)");
             false
         }
         Err(error) => {
-            eprintln!(
-                "tirith scan: cannot access requested {target_kind} {}: {error}",
-                path.display()
-            );
+            let shown = super::sanitize_for_human_output(&path.display().to_string(), false);
+            eprintln!("tirith scan: cannot access requested {target_kind} {shown}: {error}");
             false
         }
     }
