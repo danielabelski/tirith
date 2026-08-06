@@ -718,45 +718,28 @@ fn download_output_paths(tool: &str, args: &[String]) -> Vec<String> {
     while let Some((_i, arg)) = iter.next() {
         let a = strip_outer_quotes(arg);
         match tool {
+            // Both downloaders accept the option clustered with other short
+            // flags (`curl -fsSLo PATH`, `wget -qO PATH`), which is the spelling
+            // install scripts actually use. Matching only at token start missed
+            // every one of them, so share the install rule's cluster-aware
+            // collector instead.
             "curl" => {
-                if let Some(rest) = a.strip_prefix("--output=") {
-                    if !rest.is_empty() {
-                        outputs.push(rest.to_string());
-                    }
-                    continue;
-                }
-                if a == "-o" || a == "--output" {
-                    if let Some((_, next)) = iter.next() {
-                        outputs.push(strip_outer_quotes(next).to_string());
-                    }
-                    continue;
-                }
-                if let Some(rest) = a.strip_prefix("-o") {
-                    let rest = rest.strip_prefix('=').unwrap_or(rest);
-                    if !rest.is_empty() {
-                        outputs.push(rest.to_string());
-                    }
-                }
+                return crate::rules::install::collect_command_option_values(
+                    args,
+                    ShellType::Posix,
+                    "--output",
+                    'o',
+                    "AbcCdDeEFhHKmPQrTtUuwxXyYz",
+                );
             }
             "wget" => {
-                if let Some(rest) = a.strip_prefix("--output-document=") {
-                    if !rest.is_empty() {
-                        outputs.push(rest.to_string());
-                    }
-                    continue;
-                }
-                if a == "-O" || a == "--output-document" {
-                    if let Some((_, next)) = iter.next() {
-                        outputs.push(strip_outer_quotes(next).to_string());
-                    }
-                    continue;
-                }
-                if let Some(rest) = a.strip_prefix("-O") {
-                    let rest = rest.strip_prefix('=').unwrap_or(rest);
-                    if !rest.is_empty() {
-                        outputs.push(rest.to_string());
-                    }
-                }
+                return crate::rules::install::collect_command_option_values(
+                    args,
+                    ShellType::Posix,
+                    "--output-document",
+                    'O',
+                    "aABeIiIloPQRTtUuwWX",
+                );
             }
             "fetch" => {
                 if a == "-o" || a == "--output" {
@@ -1412,6 +1395,34 @@ mod tests {
         assert!(is_broad_path("/var/spool/cron"));
         assert!(!is_broad_path("/etc/cron.d"));
         assert!(!is_broad_path("/home/me"));
+    }
+
+    #[test]
+    fn download_output_paths_reads_clustered_short_options() {
+        // The spelling install scripts actually use: the destination option
+        // clustered behind other short flags.
+        assert_eq!(
+            download_output_paths(
+                "curl",
+                &[
+                    "-fsSLo".to_string(),
+                    "/usr/local/bin/kubectl".to_string(),
+                    "https://example.com/k".to_string(),
+                ]
+            ),
+            vec!["/usr/local/bin/kubectl"],
+        );
+        assert_eq!(
+            download_output_paths(
+                "wget",
+                &[
+                    "-qO".to_string(),
+                    "/etc/cron.d/payload".to_string(),
+                    "https://example.com/p".to_string(),
+                ]
+            ),
+            vec!["/etc/cron.d/payload"],
+        );
     }
 
     #[test]
