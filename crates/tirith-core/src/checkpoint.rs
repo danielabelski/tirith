@@ -669,14 +669,32 @@ fn verify_checkpoint_dir_identity(
 fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(dir)
+        // Record which components are missing BEFORE creating anything, so only
+        // the directories this call creates get tightened and pre-existing ones
+        // keep their current mode.
+        let mut fresh: Vec<PathBuf> = Vec::new();
+        let mut probe: Option<&Path> = Some(dir);
+        while let Some(candidate) = probe {
+            if candidate.exists() {
+                break;
+            }
+            fresh.push(candidate.to_path_buf());
+            probe = candidate.parent();
+        }
+        // Traverse through pinned O_NOFOLLOW parent descriptors. The path-based
+        // recursive DirBuilder followed a symlinked ancestor, so a symlink
+        // planted anywhere above the restore target redirected the whole
+        // creation outside the restore tree — the same discipline the sibling
+        // file-write path already uses.
+        crate::util::create_dir_durable(dir)?;
+        for created in fresh.iter().rev() {
+            set_dir_mode_no_follow(created, 0o700)?;
+        }
+        Ok(())
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(dir)
+        crate::util::create_dir_durable(dir)
     }
 }
 
