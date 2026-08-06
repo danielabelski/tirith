@@ -217,9 +217,15 @@ fn open_repo_trust_dir(path: &std::path::Path, create: bool) -> Result<std::fs::
         .parent()
         .and_then(std::path::Path::parent)
         .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
+    // No O_NOFOLLOW on the root itself. The root comes from the operator's own
+    // layout, and a checkout reached through a symlinked directory is ordinary;
+    // O_NOFOLLOW there fails with ELOOP and takes out every repo-scope trust
+    // operation. The components that carry repository content — `.tirith` and
+    // `trust.json` — keep O_NOFOLLOW below, which is where the protection
+    // matters.
     let root_fd = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(root)
         .map_err(|e| format!("cannot open repository root {}: {e}", root.display()))?;
     let name = CString::new(".tirith").expect("static component has no NUL");
@@ -2068,6 +2074,34 @@ fn extract_host(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_trust_dir_opens_through_a_symlinked_checkout_but_not_a_symlinked_tirith() {
+        use std::os::unix::fs::symlink;
+
+        let holder = tempfile::tempdir().unwrap();
+        let real_root = holder.path().join("checkout");
+        std::fs::create_dir(&real_root).unwrap();
+        std::fs::create_dir(real_root.join(".tirith")).unwrap();
+
+        // A checkout reached through a symlinked directory is an ordinary
+        // developer layout and must keep working.
+        let linked_root = holder.path().join("link-to-checkout");
+        symlink(&real_root, &linked_root).unwrap();
+        open_repo_trust_dir(&linked_root.join(".tirith").join("trust.json"), false)
+            .expect("a symlinked checkout root is the operator's own layout");
+
+        // The components that carry repository content still refuse a symlink.
+        let hostile = holder.path().join("hostile");
+        std::fs::create_dir(&hostile).unwrap();
+        let swapped = holder.path().join("swapped");
+        std::fs::create_dir(&swapped).unwrap();
+        symlink(&hostile, swapped.join(".tirith")).unwrap();
+        let error = open_repo_trust_dir(&swapped.join(".tirith").join("trust.json"), false)
+            .expect_err("a symlinked .tirith component must still be refused");
+        assert!(error.contains("symlinked"), "unexpected error: {error}");
+    }
 
     #[test]
     fn test_parse_ttl_days() {
