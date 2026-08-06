@@ -473,7 +473,7 @@ fn run_command(command: &[String]) -> std::io::Result<i32> {
                 libc::signal(libc::SIGTTOU, libc::SIG_DFL);
             }
         }
-        return Ok(status.code().unwrap_or(128));
+        Ok(status.code().unwrap_or(128))
     }
     #[cfg(not(unix))]
     let status = cmd.status()?;

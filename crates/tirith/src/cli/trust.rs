@@ -225,10 +225,13 @@ fn lock_trust_store(path: &std::path::Path) -> Result<std::fs::File, String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create directory {}: {e}", parent.display()))?;
     }
+    // The lock file carries no content; keep whatever is already there rather
+    // than truncating a lock another process is holding.
     let file = fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|e| format!("cannot open trust-store lock: {e}"))?;
     file.lock_exclusive()

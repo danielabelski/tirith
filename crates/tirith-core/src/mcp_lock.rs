@@ -3148,10 +3148,8 @@ fn compute_drift_static(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDr
     let mut drifts: Vec<McpDrift> = Vec::with_capacity(kept.len());
     let mut add_iter = used_adds.iter();
     for d in kept {
-        if matches!(d, McpDrift::Added { .. }) {
-            if add_iter.next() == Some(&true) {
-                continue;
-            }
+        if matches!(d, McpDrift::Added { .. }) && add_iter.next() == Some(&true) {
+            continue;
         }
         drifts.push(d);
     }

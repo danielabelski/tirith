@@ -1788,7 +1788,6 @@ fn backup_file(
         (digest, (tmp, dst))
     };
     let (tmp, dst) = dst;
-    let sha = sha;
 
     // Content-addressed dedup: two checkpointed files with identical contents
     // share a single on-disk copy. Only a REAL copy draws down the cumulative

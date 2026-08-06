@@ -141,9 +141,7 @@ pub fn write_last_trigger(
                     .set_permissions(std::fs::Permissions::from_mode(0o600));
             }
             if tmp_file.write_all(json.as_bytes()).is_err() {
-                tirith_core::audit::audit_diagnostic(
-                    "tirith: warning: last-trigger write failed".to_string(),
-                );
+                tirith_core::audit::audit_diagnostic("tirith: warning: last-trigger write failed");
                 return;
             }
             if let Err(e) = tmp_file.persist(&path) {

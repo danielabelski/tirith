@@ -73,10 +73,13 @@ fn write_row(eco: Ecosystem, name: &str, row: &SnapshotRow) -> bool {
         "{}.lock",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
+    // The lock file carries no content; keep whatever is already there rather
+    // than truncating a lock another process is holding.
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path);
     let lock_file = match lock_file {
         Ok(f) => f,
