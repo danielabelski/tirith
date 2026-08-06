@@ -937,7 +937,7 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         .read_exact(&mut observed)
         .expect("read kernel OBSERVED status");
     assert_eq!(observed, [b'O'], "target must remain stopped until ACK");
-    let ack = [b'A'];
+    let ack = *b"A";
     assert_eq!(
         unsafe {
             libc::send(
@@ -1441,7 +1441,7 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
         .read_exact(&mut observed)
         .expect("read stopped exec observation");
     assert_eq!(observed, [b'O']);
-    let invalid = [b'X'];
+    let invalid = *b"X";
     assert_eq!(
         unsafe {
             libc::send(
