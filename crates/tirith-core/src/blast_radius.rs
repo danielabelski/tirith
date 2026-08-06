@@ -425,20 +425,26 @@ fn simulate_with_work_limit(
                 report.writes_system_path = true;
             }
 
-            // Expand the target (glob against cwd, else literal) to concrete paths.
-            let Some(expanded) = expand_target(&resolved_target, cwd, &mut report, &mut budget)
-            else {
-                report.classification_incomplete = true;
-                return report;
-            };
+            // Expand the target (glob against cwd, else literal) to concrete
+            // paths. A spent budget yields no expansion, but the target still
+            // needs the free lexical containment check below, and so do the
+            // targets after it.
+            let expanded = expand_target(&resolved_target, cwd, &mut report, &mut budget)
+                .unwrap_or_else(|| {
+                    report.classification_incomplete = true;
+                    vec![resolve_relative(&resolved_target, cwd)]
+                });
 
             for path in expanded {
-                if !walk_into(&path, &mut report, &mut budget) {
-                    report.classification_incomplete = true;
-                    return report;
-                }
+                // Classify BEFORE walking. `walk_into` stops on an exhausted
+                // budget, and a dropped repo-escape signal turns a Block into an
+                // Allow. Both budget helpers charge before touching the disk, so
+                // continuing past a refusal does no further filesystem work.
                 if path_escapes_repo(&path, cwd, repo_root) {
                     report.paths_outside_repo = true;
+                }
+                if !walk_into(&path, &mut report, &mut budget) {
+                    report.classification_incomplete = true;
                 }
             }
         }

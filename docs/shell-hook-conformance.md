@@ -114,8 +114,9 @@ cleanly** — never fails — when a prerequisite is missing:
   bash tests entirely if none is found. To run them, put a modern bash first
   on `PATH`: `PATH=/opt/homebrew/bin:$PATH cargo test`.
 - Fish tests **skip** when fish is not installed.
-- zsh / PowerShell / nushell coverage is a documented **follow-up** (see
-  below); those tests are `#[ignore]`d stubs today.
+- zsh tests **skip** when zsh is not installed.
+- PowerShell / nushell coverage is a documented **follow-up** (see below);
+  those tests are `#[ignore]`d stubs today.
 
 ## Current coverage
 
@@ -126,7 +127,7 @@ cleanly** — never fails — when a prerequisite is missing:
 | bash — enter (`bind -x` Enter override) | f | Passing |
 | bash — #111 capability gate | a, b, d | Passing |
 | fish | a, b, c, d, e, g | Passing |
-| zsh | — | Follow-up |
+| zsh — ZLE accept-line (protocol v3) | a, b, d, e | Passing |
 | PowerShell | — | Follow-up |
 | nushell | — | Follow-up |
 | bash / zsh / fish protocol-v3 capability and receipt state | replay, identity, process-scoped one-time registration, terminal conflict, CLI-owned approval/ack | Unit and CLI integration passing; PTY delivery remains as above |
