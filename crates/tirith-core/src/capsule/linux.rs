@@ -1749,20 +1749,30 @@ mod tests {
                         // exit_notify), so on another CPU this EOF can win the
                         // race against the pending SIGKILL and the target would
                         // exit normally, flaking the controller's WIFSIGNALED
-                        // proof (a timed grace window only narrows the race —
-                        // it lost once under MSRV CI load). Block on `pause`
-                        // instead: it returns only for a CAUGHT signal, and the
-                        // parent-death SIGKILL cannot be caught, so a working
-                        // PDEATHSIG ends the process here no matter how delayed,
-                        // with no exit racing the kill. A broken PDEATHSIG is
-                        // caught by the controller's own wait deadline, not by
-                        // this side. The bounded count keeps the marker path
-                        // reachable for a catastrophically broken host (only if
-                        // 4096 catchable signals arrive with no SIGKILL) so the
-                        // "uncommitted code survived" evidence is preserved.
-                        // Already inside the enclosing `unsafe` fork-child block.
-                        for _ in 0..4096 {
-                            libc::pause();
+                        // proof. A bounded grace window only narrowed the race
+                        // (it lost once under MSRV CI load), and `pause` is not
+                        // in the seccomp allow-set — the filter's EPERM default
+                        // makes it return instantly, which would spin and exit.
+                        // `nanosleep` IS allowed, so sleep far past the
+                        // controller's own 2s wait deadline: a working PDEATHSIG
+                        // delivers SIGKILL (fatal — the process dies mid-sleep,
+                        // never returning here) no matter how delayed, and a
+                        // broken one is caught by that controller deadline
+                        // instead of by a normal exit racing the kill. EINTR
+                        // resumes the leftover so a stray wakeup cannot shorten
+                        // the window; the marker path stays reachable only if
+                        // the full sleep elapses uninterrupted.
+                        let mut remaining = libc::timespec {
+                            tv_sec: 30,
+                            tv_nsec: 0,
+                        };
+                        loop {
+                            if libc::nanosleep(&remaining, &mut remaining) == 0 {
+                                break;
+                            }
+                            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                                break;
+                            }
                         }
                         let fd = libc::open(
                             marker_c.as_ptr(),
