@@ -1134,7 +1134,11 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         "<bash:feature value>:home-ok:xdg-nested-ok:outside-mkdir-denied:closed:descriptor-controls-ok:network-eperm",
         "argv0, inherited-fd closure, nested HOME/XDG I/O, Landlock write confinement, ioctl filtering, and direct socket denial must all be proven"
     );
-    assert_eq!(output.stderr, b"err");
+    assert_eq!(
+        capsule_stderr_without_coverage_notes(&output.stderr),
+        "err",
+        "only the script's own stderr should reach the parent"
+    );
     assert_eq!(
         fs::read(temp_home_path.join("probe")).expect("read contained HOME probe"),
         b"home"
