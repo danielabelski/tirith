@@ -1134,7 +1134,11 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         "<bash:feature value>:home-ok:xdg-nested-ok:outside-mkdir-denied:closed:descriptor-controls-ok:network-eperm",
         "argv0, inherited-fd closure, nested HOME/XDG I/O, Landlock write confinement, ioctl filtering, and direct socket denial must all be proven"
     );
-    assert_eq!(output.stderr, b"err");
+    assert_eq!(
+        capsule_stderr_without_coverage_notes(&output.stderr),
+        "err",
+        "only the script's own stderr should reach the parent"
+    );
     assert_eq!(
         fs::read(temp_home_path.join("probe")).expect("read contained HOME probe"),
         b"home"
@@ -1946,8 +1950,15 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         // `CLD_KILLED`; under `CLD_EXITED` it is the exit code, so both shapes
         // are legitimate here and asserting one alone asserts the wrong thing.
         let absorbed = 128 + attack_signal;
+        // A stopped target is not left hanging: the capsule's own deadline
+        // cleanup SIGKILLs it, and the guard absorbs THAT and exits carrying
+        // `128 + SIGKILL`. The final assertion in this test names the same two
+        // outcomes ("the hostile SIGKILL or the deadline cleanup SIGKILL").
+        let absorbed_cleanup = 128 + libc::SIGKILL;
         assert!(
-            observed.is_some_and(|status| status == attack_signal || status == absorbed),
+            observed.is_some_and(|status| status == attack_signal
+                || status == absorbed
+                || status == absorbed_cleanup),
             "clone child must deliver its selected signal to the contained guard: \
              observed {observed:?}, expected the signal ({attack_signal}) or its \
              absorbed form ({absorbed})"
