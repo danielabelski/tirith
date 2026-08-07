@@ -1710,6 +1710,24 @@ impl PlatformTransaction {
                             .is_ok_and(|live| rollback_landed(live.as_ref(), displaced.as_ref()))
                         && generation_at(&temp.path).is_ok_and(|live| live == installed)
                     {
+                        // The rollback replace rewrote the restored competitor's
+                        // descriptor exactly the way publication rewrote ours.
+                        // Its identity and bytes are proven back above; put the
+                        // descriptor that was observed on it back too, so the
+                        // competitor is restored in full. Best-effort by
+                        // design — the identity proof is what the error claims.
+                        if let (Ok(Some(live)), Some(displaced_generation)) =
+                            (generation_at(&self.destination), displaced.as_ref())
+                        {
+                            if live.security_descriptor != displaced_generation.security_descriptor
+                            {
+                                let _ = restore_preserved_security(
+                                    &self.destination,
+                                    &live,
+                                    &displaced_generation.security_descriptor,
+                                );
+                            }
+                        }
                         return Err(format!(
                             "{} or its prepared replacement changed at publication ({}); restored the competing destination and published nothing",
                             self.destination.display(),
@@ -3221,7 +3239,17 @@ mod tests {
         assert_eq!(generation_at(&path).unwrap(), Some(original_generation));
         let attacker_path = attacker_path.unwrap();
         assert_eq!(fs::read_to_string(&attacker_path).unwrap(), "attacker-temp");
-        assert_eq!(generation_at(&attacker_path).unwrap(), attacker_generation);
+        // The aborted publication briefly installed the attacker's file at the
+        // destination, where ReplaceFileW rewrote that file's own security
+        // descriptor (the merge behavior the restore path exists to undo for
+        // OUR files). Retention promises the attacker's exact identity and
+        // bytes were kept out of the destination — not that the attacker's
+        // descriptor survived the attempt unchanged.
+        let mut retained = generation_at(&attacker_path).unwrap().unwrap();
+        let mut expected = attacker_generation.unwrap();
+        retained.security_descriptor.clear();
+        expected.security_descriptor.clear();
+        assert_eq!(retained, expected);
         assert_eq!(fs::read_to_string(&held_prepared).unwrap(), "tirith-update");
         assert_eq!(generation_at(&held_prepared).unwrap(), prepared_generation);
     }
