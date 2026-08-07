@@ -28,15 +28,17 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetSecurityDescriptorOwner,
-    GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
-    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorGroup, GetSecurityDescriptorLength,
+    GetSecurityDescriptorOwner, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL,
+    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FlushFileBuffers,
@@ -46,7 +48,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_WRITE_THROUGH,
-    OPEN_EXISTING, READ_CONTROL,
+    OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject, INFINITE,
@@ -236,6 +238,106 @@ fn current_user_sid_string() -> Result<String, String> {
         }
         decoded
     })?
+}
+
+/// Re-apply a preserved owner + DACL to the file `ReplaceFileW` just published.
+///
+/// `ReplaceFileW` MERGES ACLs rather than preserving them: the replaced file's
+/// ACEs are copied onto the replacement as EXPLICIT entries,
+/// `SE_DACL_PROTECTED` is cleared so the destination parent's inheritable ACEs
+/// re-apply, and the owner is not restored at all. Asserting byte-identity
+/// after the call therefore asserts something the API never promised — it holds
+/// only where the parent has no inheritable ACEs AND the owner happens to
+/// match. Restore the preserved descriptor explicitly so the publication
+/// contract is TRUE on every host, and let the caller's byte-for-byte
+/// comparison verify that this landed.
+///
+/// The handle is opened no-reparse, share-read only, and its generation must
+/// equal the replacement that was just installed, so the restore cannot be
+/// redirected onto a different file between the replace and this call.
+fn restore_preserved_security(
+    path: &Path,
+    installed: &FileGeneration,
+    preserved: &[u8],
+) -> Result<(), String> {
+    let path_wide = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            (FILE_GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC | WRITE_OWNER).0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|error| {
+        format!(
+            "reopen {} to restore its preserved security descriptor: {error}",
+            path.display()
+        )
+    })?;
+    let held = OwnedHandle(handle).into_file();
+    let (held, _, generation) = capture_stable_file(held, path)?;
+    if !generation.same_identity(installed) {
+        return Err(format!(
+            "{} is no longer the identity just published; refusing to write its security descriptor",
+            path.display()
+        ));
+    }
+
+    let mut owned = preserved.to_vec();
+    let descriptor = PSECURITY_DESCRIPTOR(owned.as_mut_ptr().cast());
+
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }
+        .map_err(|error| format!("read preserved descriptor control: {error}"))?;
+
+    let mut owner = PSID::default();
+    let mut defaulted = BOOL(0);
+    unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) }
+        .map_err(|error| format!("read preserved owner: {error}"))?;
+    let mut group = PSID::default();
+    unsafe { GetSecurityDescriptorGroup(descriptor, &mut group, &mut defaulted) }
+        .map_err(|error| format!("read preserved group: {error}"))?;
+
+    let mut dacl_present = BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    unsafe { GetSecurityDescriptorDacl(descriptor, &mut dacl_present, &mut dacl, &mut defaulted) }
+        .map_err(|error| format!("read preserved DACL: {error}"))?;
+
+    // Carry the preserved inheritance decision across. A protected DACL must
+    // stay protected, and an unprotected one must be re-inherited rather than
+    // frozen, or the restored descriptor would not equal the preserved bytes.
+    let inheritance = if control & SE_DACL_PROTECTED.0 != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let status = unsafe {
+        SetSecurityInfo(
+            HANDLE(held.as_raw_handle()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | GROUP_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | inheritance,
+            (!owner.is_invalid()).then_some(owner),
+            (!group.is_invalid()).then_some(group),
+            (dacl_present.as_bool() && !dacl.is_null()).then_some(dacl as *const ACL),
+            None,
+        )
+    };
+    if status.0 != 0 {
+        return Err(format!(
+            "restore preserved security descriptor on {}: error {}",
+            path.display(),
+            status.0
+        ));
+    }
+    Ok(())
 }
 
 /// Render a self-relative security descriptor as SDDL for diagnostics.
@@ -1401,6 +1503,20 @@ impl PlatformTransaction {
                     ));
                 }
 
+                // ReplaceFileW merged the ACLs rather than preserving them, and
+                // did not restore the owner at all. Put the preserved
+                // descriptor back before observing, so the comparison below
+                // verifies a contract that is now TRUE rather than one the API
+                // only satisfies by accident. A failure here is a publication
+                // failure: the bytes are live but their access control is not
+                // what was preserved, and the mismatch path below handles it.
+                let restore_failure = restore_preserved_security(
+                    &self.destination,
+                    &temp.generation,
+                    &expected_generation.security_descriptor,
+                )
+                .err();
+
                 let installed = match generation_at(&self.destination) {
                     Ok(generation) => generation,
                     Err(observation_error) => {
@@ -1446,6 +1562,11 @@ impl PlatformTransaction {
                 // descriptor, and an opaque "changed at publication" gives a
                 // caller nothing to act on.
                 let mut mismatches = Vec::new();
+                if let Some(reason) = restore_failure {
+                    mismatches.push(format!(
+                        "preserved security descriptor not restored: {reason}"
+                    ));
+                }
                 match installed.as_ref() {
                     None => mismatches.push("destination absent after replace".to_string()),
                     Some(generation) => {
