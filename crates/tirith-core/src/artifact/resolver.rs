@@ -1309,27 +1309,20 @@ fn windows_path_exts() -> Vec<String> {
 
 /// Split an editable-requirement option from its target.
 ///
-/// `-e` and `--editable` take their target either as the next token (already
-/// joined by the caller, so a space here) or attached with `=`. Matching the
-/// prefix WITHOUT requiring one of those delimiters treated any option starting
-/// with the same letters as editable: `-editable-pkg` parsed as `-e` plus the
-/// target `ditable-pkg`, and both classifiers then reported success for an
-/// option-form token the resolver child would reject. Return the target only
-/// when a real delimiter follows, or the option is exactly the flag.
+/// One helper for both classifiers so they cannot drift apart. The target may
+/// be attached (`-e./pkg`), joined with `=`, or the next token: pip's
+/// requirements parser is optparse-backed, where the attached `-eVALUE` form is
+/// standard, so an option-shaped token like `-editable-pkg` genuinely means
+/// `-e ditable-pkg` to the resolver child. Tirith models what the child does,
+/// so this deliberately does NOT require a delimiter — demanding one would
+/// refuse `-e./pkg`, which pip accepts. The extracted target is re-validated by
+/// the caller, so the VCS, direct-URL, and local-path controls still apply.
 fn editable_requirement_target(trimmed: &str) -> Option<&str> {
     let lower = trimmed.to_ascii_lowercase();
     for flag in ["--editable", "-e"] {
-        if !lower.starts_with(flag) {
-            continue;
+        if lower.starts_with(flag) {
+            return Some(&trimmed[flag.len()..]);
         }
-        let rest = &trimmed[flag.len()..];
-        // Exactly the flag, `=target`, or ` target`. Anything else — another
-        // option that merely starts with these letters — is not editable.
-        if rest.is_empty() || rest.starts_with('=') || rest.starts_with(|c: char| c.is_whitespace())
-        {
-            return Some(rest);
-        }
-        return None;
     }
     None
 }
