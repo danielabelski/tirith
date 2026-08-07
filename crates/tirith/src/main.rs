@@ -847,7 +847,7 @@ Examples:
     /// Suggest a concrete safer rewrite for a command and (interactively) apply one
     #[command(after_help = "\
 Thin presenter over `tirith_core::safe_command::suggest_verified_with_policy()`
-— the same verified engine backing `tirith check --suggest-safe-command`. Compatible
+— the same verified engine backing `tirith check --suggest`. Compatible
 remediations are composed and the exact final command is re-analyzed under the
 same shell, context, and policy. Only an Allow result is exposed as
 `safe_command` or printed on stdout, so you can wrap `$(tirith fix -- '<cmd>')`
@@ -2061,7 +2061,7 @@ What it protects:
   When `guard` is ON, the exec hot path flags (i) a sensitive env var set while
   a command pipes remote content into a shell (curl|bash), and (ii) printenv/env
   piped into a network sink (curl/nc). The sensitive list is the same one the
-  `--suggest-safe-command` env-scrub rewrite uses; extend it via
+  `--suggest` env-scrub rewrite uses; extend it via
   policy.env_guard_sensitive_vars.
 
 Value safety (load-bearing):

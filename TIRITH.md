@@ -615,7 +615,7 @@ Developers forgive warnings when they come with a clean fix.
 This remediation surface is now concrete: every finding carries a per-rule
 remediation (shown as a `Fix:` line and in `--format json`); `tirith explain
 --rule <id> --fix` prints a rule's remediation on its own; and `tirith check
---suggest-safe-command` rewrites the actual command into a safer one wherever a
+--suggest` rewrites the actual command into a safer one wherever a
 transformation is genuinely correct (pipe-to-shell → download-review-run,
 insecure-TLS flag dropped, `http://` → `https://`). Where there is no safe
 mechanical rewrite, tirith says so plainly rather than inventing one.
