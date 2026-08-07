@@ -10970,15 +10970,22 @@ fn bounded_wait_kills_and_reaps_the_child_process_group() {
     let child = command.spawn().expect("spawn process-tree fixture");
     let direct_pid = child.id() as libc::pid_t;
 
+    // Wait for a pid, not for the file: the redirection creates the file before
+    // the shell writes into it, so `exists()` is true while it is still empty.
     let pid_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !descendant_pid_path.exists() && std::time::Instant::now() < pid_deadline {
+    let descendant_pid: libc::pid_t = loop {
+        if let Some(pid) = fs::read_to_string(&descendant_pid_path)
+            .ok()
+            .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < pid_deadline,
+            "fixture must publish descendant pid"
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let descendant_pid: libc::pid_t = fs::read_to_string(&descendant_pid_path)
-        .expect("fixture must publish descendant pid")
-        .trim()
-        .parse()
-        .expect("descendant pid must be numeric");
+    };
 
     let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = wait_for_output_bounded(
