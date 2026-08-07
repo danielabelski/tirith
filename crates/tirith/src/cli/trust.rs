@@ -444,13 +444,13 @@ mod windows_repo_store {
         CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, FileDispositionInfo, FileRenameInfo,
-        GetFileInformationByHandle, GetFinalPathNameByHandleW, SetFileInformationByHandle,
-        BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO_0,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
+        CreateDirectoryW, CreateFileW, FileDispositionInfo, GetFileInformationByHandle,
+        GetFinalPathNameByHandleW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO_0, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+        OPEN_EXISTING,
     };
 
     struct OwnedHandle(HANDLE);
@@ -847,14 +847,27 @@ mod windows_repo_store {
             _file_name_length: (TRUST_FILE_NAME_UTF16.len() * std::mem::size_of::<u16>()) as u32,
             _file_name: TRUST_FILE_NAME_UTF16,
         };
-        if let Err(error) = unsafe {
-            SetFileInformationByHandle(
+        // The Win32 wrapper (SetFileInformationByHandle + FileRenameInfo)
+        // rejects a non-NULL RootDirectory with ERROR_INVALID_PARAMETER: it
+        // accepts full destination paths only. The retained directory handle
+        // IS the anchor of this publish (no by-name re-resolution), so call
+        // the NT service directly — FileRenameInformation honors
+        // handle-relative names, and TrustRenameInfo's layout doubles as the
+        // kernel struct (the pinned layout test below covers the shared
+        // offsets).
+        let mut io_status = windows::Win32::System::IO::IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            windows::Wdk::Storage::FileSystem::NtSetInformationFile(
                 HANDLE(file.as_raw_handle()),
-                FileRenameInfo,
+                &mut io_status,
                 (&rename as *const TrustRenameInfo).cast(),
                 std::mem::size_of::<TrustRenameInfo>() as u32,
+                windows::Wdk::Storage::FileSystem::FileRenameInformation,
             )
-        } {
+        };
+        if status.0 < 0 {
+            let code = unsafe { windows::Win32::Foundation::RtlNtStatusToDosError(status) };
+            let error = std::io::Error::from_raw_os_error(code as i32);
             let cleanup = cleanup_suffix(&file);
             return Err(format!(
                 "failed to atomically publish repo trust store: {error}{cleanup}"
