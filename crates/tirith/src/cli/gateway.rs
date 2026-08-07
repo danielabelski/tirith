@@ -6095,6 +6095,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exact_launch_fingerprint_binds_args_and_containment() {
+        // The launch fingerprint binds the resolved environment, which includes
+        // TMPDIR. `macos_contained_command_refuses_when_temp_home_creation_fails`
+        // poisons TMPDIR under ENV_LOCK, so without the lock a concurrent poison
+        // could flip TMPDIR between the two "identical" builds and break their
+        // equality. Hold ENV_LOCK for a stable environment across both builds.
+        let _lock = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let repo = tempfile::tempdir().unwrap();
         let args = vec!["--stdio".to_string()];
         let command = ["/usr/bin/true", "/bin/true", "/usr/bin/env"]
