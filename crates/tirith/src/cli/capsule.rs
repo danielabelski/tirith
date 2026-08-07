@@ -100,6 +100,12 @@ pub fn supervised_stdin_spec() -> CapsuleSpec {
         max_processes: Some(256),
         #[cfg(not(target_os = "linux"))]
         max_processes: None,
+        #[cfg(windows)]
+        // Job Objects expose no open-handle cap, so a Windows backend can never
+        // honestly enforce a file-descriptor limit. Requesting one here would
+        // make every supervised stdin plan correctly refuse before launch.
+        max_open_files: None,
+        #[cfg(not(windows))]
         max_open_files: Some(256),
         max_output_bytes: Some(16 * 1024 * 1024),
         wall_clock_seconds: Some(300),
