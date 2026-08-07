@@ -684,7 +684,23 @@ fn read_capsule_observation(
         Ok(()) => observed,
         Err(error) => {
             let status = child.wait();
-            panic!("{what}: {error}; the capsule child exited with {status:?}");
+            // The child reports WHY it refused on stderr, and the harness
+            // captures it out of reach of this panic, so read it back here.
+            // Drain before reporting: the exit status alone ("exited with 2")
+            // names none of the dozen refusal paths.
+            let reason = child
+                .stderr
+                .take()
+                .map(|mut pipe| {
+                    let mut buffer = String::new();
+                    let _ = pipe.read_to_string(&mut buffer);
+                    buffer
+                })
+                .unwrap_or_default();
+            panic!(
+                "{what}: {error}; the capsule child exited with {status:?}; stderr: {}",
+                reason.trim()
+            );
         }
     }
 }
@@ -983,6 +999,7 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
             Ok(())
         });
     }
+    command.stderr(std::process::Stdio::piped());
     let mut child = command.spawn().expect("spawn real hidden capsule launcher");
     drop(status_writer);
     drop(ack_guard);
@@ -1295,6 +1312,7 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         });
     }
 
+    command.stderr(std::process::Stdio::piped());
     let mut child = command
         .spawn()
         .expect("spawn production reviewed-file hidden launcher");
@@ -1488,6 +1506,7 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
             Ok(())
         });
     }
+    command.stderr(std::process::Stdio::piped());
     let mut child = command.spawn().expect("spawn invalid-ACK capsule guard");
     let group = child.id();
     drop(status_writer);
