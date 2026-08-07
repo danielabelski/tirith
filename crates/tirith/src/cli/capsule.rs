@@ -7810,6 +7810,12 @@ mod tests {
     fn supervised_stdin_refuses_before_launch_when_complete_tree_ownership_is_unavailable() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        // `macos_contained_command_refuses_when_temp_home_creation_fails`
+        // poisons global TMPDIR with an uncreatable path for the length of its
+        // ENV_LOCK critical section. `tempfile::tempdir()` reads TMPDIR, so this
+        // macOS-only test must take the same lock or it can observe the poison
+        // and fail to create its probe dir. Serializing removes the race.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("executed");
         let interpreter = temp.path().join("interpreter");
