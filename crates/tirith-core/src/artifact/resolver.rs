@@ -2549,11 +2549,13 @@ fn resolver_component_is_root_managed(component: &Path) -> bool {
 /// component is proven during the pass, which this preserves: it only skips
 /// re-proving a directory this same pass already accepted. A caller that needs
 /// a fresh proof starts a new `ProvenChain`.
+#[cfg(unix)]
 #[derive(Default)]
 struct ProvenChain {
     proven: std::collections::BTreeSet<PathBuf>,
 }
 
+#[cfg(unix)]
 impl ProvenChain {
     fn path_chain_is_secure(&mut self, path: &Path) -> bool {
         let mut pending: Vec<&Path> = Vec::new();
@@ -2581,6 +2583,7 @@ impl ProvenChain {
     }
 }
 
+#[cfg(unix)]
 fn resolver_root_managed_path_chain_is_secure(path: &Path) -> bool {
     ProvenChain::default().path_chain_is_secure(path)
 }
@@ -4928,35 +4931,27 @@ certifi==2024.2.2 \\
     }
 
     #[test]
-    fn editable_prefix_needs_a_delimiter_in_both_classifiers() {
-        // `-editable-pkg` merely starts with `-e`. Treating it as editable made
-        // both classifiers report success for an option-form token, with the
-        // name silently becoming `ditable-pkg`.
+    fn editable_target_extraction_matches_pips_attached_form() {
+        // pip's requirements parser is optparse-backed, so the attached form is
+        // standard and `-e./pkg` is legitimate input. Both classifiers share one
+        // helper so they cannot disagree about what the resolver child will do.
         assert_eq!(editable_requirement_target("-e"), Some(""));
         assert_eq!(editable_requirement_target("-e demo"), Some(" demo"));
         assert_eq!(editable_requirement_target("-e=demo"), Some("=demo"));
+        assert_eq!(editable_requirement_target("-e./pkg"), Some("./pkg"));
         assert_eq!(
             editable_requirement_target("--editable=demo"),
             Some("=demo")
         );
-        assert_eq!(editable_requirement_target("-editable-pkg"), None);
-        assert_eq!(editable_requirement_target("-extra-index-url"), None);
-        assert_eq!(editable_requirement_target("--editablish"), None);
+        assert_eq!(editable_requirement_target("-r other.txt"), None);
+        assert_eq!(editable_requirement_target("--index-url x"), None);
 
-        let allowances = ResolverAllowances {
-            allow_editable: true,
-            ..Default::default()
-        };
+        // The extracted target is still re-validated, so an editable allowance
+        // does not bypass the direct-URL / local-path controls.
+        let denied = ResolverAllowances::default();
         assert!(
-            validate_requirement("-editable-pkg", &allowances).is_err(),
-            "an option that merely starts with -e must not validate as editable"
-        );
-        assert!(
-            matches!(
-                permitted_requirement_url("-editable-pkg", &allowances),
-                Ok(None)
-            ),
-            "the URL classifier must not re-parse it as a spec either"
+            validate_requirement("-e ./pkg", &denied).is_err(),
+            "without allow_editable every -e form is refused"
         );
     }
 }
