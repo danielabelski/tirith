@@ -1934,11 +1934,12 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         // delivered. The assertion still fails if the event never arrives.
         const GUARD_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-        let observed = if attack_signal == libc::SIGKILL {
-            wait_for_guard_event(group, libc::WEXITED, GUARD_EVENT_TIMEOUT)
-        } else {
-            wait_for_guard_event(group, libc::WSTOPPED, GUARD_EVENT_TIMEOUT)
-        };
+        // Both arms end in an exit. The guard ABSORBS a signal delivered to
+        // its contained target — fatal or stop, which is what this test's name
+        // says — and reports it as its own exit status, `128 + signal`. Asking
+        // for a STOPPED event instead found the guard already a zombie, whose
+        // only reportable status is "exited", so `waitid` answered ECHILD.
+        let observed = wait_for_guard_event(group, libc::WEXITED, GUARD_EVENT_TIMEOUT);
         // The guard ABSORBS a fatal signal delivered to its contained target
         // rather than dying from it: `__capsule-child` translates
         // `ContainedTargetExit::Signal(signal)` into `exit(128 + signal)`, the
@@ -1949,8 +1950,15 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         // `CLD_KILLED`; under `CLD_EXITED` it is the exit code, so both shapes
         // are legitimate here and asserting one alone asserts the wrong thing.
         let absorbed = 128 + attack_signal;
+        // A stopped target is not left hanging: the capsule's own deadline
+        // cleanup SIGKILLs it, and the guard absorbs THAT and exits carrying
+        // `128 + SIGKILL`. The final assertion in this test names the same two
+        // outcomes ("the hostile SIGKILL or the deadline cleanup SIGKILL").
+        let absorbed_cleanup = 128 + libc::SIGKILL;
         assert!(
-            observed.is_some_and(|status| status == attack_signal || status == absorbed),
+            observed.is_some_and(|status| status == attack_signal
+                || status == absorbed
+                || status == absorbed_cleanup),
             "clone child must deliver its selected signal to the contained guard: \
              observed {observed:?}, expected the signal ({attack_signal}) or its \
              absorbed form ({absorbed})"
