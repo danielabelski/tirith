@@ -2754,6 +2754,13 @@ fn canonical_network_host(host: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
+    // `url::Host::parse` expects bracketed IPv6 in URL contexts, while policy
+    // files and extracted SCP/SSH destinations use the ordinary bare literal.
+    // Accept IP literals first so validation and enforcement share that form —
+    // otherwise both sides fail to canonicalize and no IPv6 entry ever matches.
+    if let Ok(address) = trimmed.parse::<std::net::IpAddr>() {
+        return Some(address.to_string());
+    }
     let parsed = url::Host::parse(trimmed).ok()?;
     Some(match parsed {
         url::Host::Domain(domain) => domain.trim_end_matches('.').to_ascii_lowercase(),
@@ -5873,6 +5880,29 @@ mod tests {
                     && f.title.contains("Execution-wrapper analysis")
             }),
             "a resolvable chain must not be reported as too deep: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ipv6_network_policy_matches_in_both_spellings() {
+        // url::Host::parse only takes bracketed IPv6, and both the extracted
+        // host and the policy entry carry the bare literal, so every IPv6
+        // deny entry silently failed to match.
+        assert_eq!(canonical_network_host("::1"), Some("::1".to_string()));
+        assert_eq!(canonical_network_host("[::1]"), Some("::1".to_string()));
+        assert_eq!(
+            canonical_network_host("FD00::1"),
+            canonical_network_host("fd00::1"),
+            "an IPv6 literal canonicalizes independently of case"
+        );
+        // IPv4 and domains are unchanged.
+        assert_eq!(
+            canonical_network_host("10.0.0.1"),
+            Some("10.0.0.1".to_string())
+        );
+        assert_eq!(
+            canonical_network_host("Example.COM."),
+            Some("example.com".to_string())
         );
     }
 }
