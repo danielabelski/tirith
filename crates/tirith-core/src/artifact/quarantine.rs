@@ -2516,9 +2516,7 @@ fn open_windows_lock_file(path: &Path, share_delete: bool) -> Result<File, Quara
 fn windows_rename_held_file(file: &File, parent: &File, name: &str) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_RENAME_INFO, FILE_RENAME_INFO_0};
 
     validate_component(name).map_err(|()| {
         std::io::Error::new(
@@ -2567,16 +2565,26 @@ fn windows_rename_held_file(file: &File, parent: &File, name: &str) -> std::io::
             wide_name.len(),
         );
     }
-    if unsafe {
-        SetFileInformationByHandle(
+    // The Win32 wrapper (SetFileInformationByHandle + FileRenameInfo) rejects a
+    // non-NULL RootDirectory with ERROR_INVALID_PARAMETER: it accepts full
+    // destination paths only. The retained parent handle IS the point of this
+    // rename (no by-name re-resolution an attacker could redirect), so call
+    // the NT service directly — its FileRenameInformation honors
+    // handle-relative names, and this buffer layout doubles as the kernel
+    // struct (the union's first byte is the BOOLEAN the kernel reads).
+    let mut io_status = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile(
             file.as_raw_handle(),
-            FileRenameInfo,
+            &mut io_status,
             rename.cast(),
             buffer_bytes_u32,
+            windows_sys::Wdk::Storage::FileSystem::FileRenameInformation,
         )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error());
+    };
+    if status < 0 {
+        let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(code as i32));
     }
     Ok(())
 }
