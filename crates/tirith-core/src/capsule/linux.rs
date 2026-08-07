@@ -1391,8 +1391,9 @@ mod tests {
                         // reachable for a catastrophically broken host (only if
                         // 4096 catchable signals arrive with no SIGKILL) so the
                         // "uncommitted code survived" evidence is preserved.
+                        // Already inside the enclosing `unsafe` fork-child block.
                         for _ in 0..4096 {
-                            unsafe { libc::pause() };
+                            libc::pause();
                         }
                         let fd = libc::open(
                             marker_c.as_ptr(),
