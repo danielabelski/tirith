@@ -663,7 +663,10 @@ fn build_cloaking_response(
         // repo-0299: the comparison only ran when every agent returned a
         // non-empty body at the baseline status. If any agent's response was
         // empty/blocked, "no cloaking" was never established — say so.
-        let all_comparable = result.agent_responses.iter().all(|r| r.content_length > 0);
+        // `all` is vacuously true on an empty list, which would report a clean
+        // "no cloaking" for a check that compared nothing at all.
+        let all_comparable = !result.agent_responses.is_empty()
+            && result.agent_responses.iter().all(|r| r.content_length > 0);
         if all_comparable {
             format!("No cloaking detected for {}", result.url)
         } else {
