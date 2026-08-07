@@ -594,7 +594,7 @@ Developers forgive warnings when they come with a clean fix.
 This remediation surface is now concrete: every finding carries a per-rule
 remediation (shown as a `Fix:` line and in `--format json`); `tirith explain
 --rule <id> --fix` prints a rule's remediation on its own; and `tirith check
---suggest-safe-command` rewrites the actual command into a safer one wherever a
+--suggest` rewrites the actual command into a safer one wherever a
 transformation is genuinely correct (supported pipe-to-shell → typed
 `tirith run --capsule --script-stdin --interpreter <shell>` on the narrowly
 supported x86_64 Linux path). TLS-flag removal, HTTP-to-HTTPS changes, archive,
