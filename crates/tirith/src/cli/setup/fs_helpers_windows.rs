@@ -898,6 +898,26 @@ fn optional_reparse_tag(
     }
 }
 
+/// Whether a live observation proves the exact competing file object landed
+/// back, for the post-rollback verification specifically. The rollback is
+/// itself a `ReplaceFileW`, which rewrites the security descriptor of
+/// whichever file it installs (the same merge behavior the publication
+/// restore exists to undo), so byte-identical generations — descriptor and
+/// timestamps included — are not something a rollback can promise. Identity,
+/// size, content digest, and reparse state are what prove the competitor is
+/// back; the descriptor it then carries is its own business.
+fn rollback_landed(live: Option<&FileGeneration>, expected: Option<&FileGeneration>) -> bool {
+    match (live, expected) {
+        (Some(live), Some(expected)) => {
+            live.same_identity(expected)
+                && live.size == expected.size
+                && live.digest == expected.digest
+                && live.reparse_tag == expected.reparse_tag
+        }
+        _ => false,
+    }
+}
+
 fn capture_once(file: &mut fs::File, path: &Path) -> Result<(Vec<u8>, FileGeneration), String> {
     let handle = HANDLE(file.as_raw_handle());
     file.seek(SeekFrom::Start(0))
@@ -1686,7 +1706,8 @@ impl PlatformTransaction {
                         && generation_at(&temp.path).is_ok_and(|live| live.is_none());
                     if stable
                         && replace_file_call(&self.destination, &displaced_path, &temp.path).is_ok()
-                        && generation_at(&self.destination).is_ok_and(|live| live == displaced)
+                        && generation_at(&self.destination)
+                            .is_ok_and(|live| rollback_landed(live.as_ref(), displaced.as_ref()))
                         && generation_at(&temp.path).is_ok_and(|live| live == installed)
                     {
                         return Err(format!(
@@ -2681,17 +2702,76 @@ mod tests {
         );
     }
 
-    /// `cmd.exe` (and therefore `mklink`) rejects `\\?\`-verbatim paths with
-    /// "The filename, directory name, or volume label syntax is incorrect", and
-    /// CI runners hand tests a verbatim `TEMP`. Strip the prefix for the
-    /// command line only; the code under test still sees the original path.
-    fn cmd_compatible_display(path: &Path) -> String {
-        let rendered = path.display().to_string();
-        rendered
-            .strip_prefix(r"\\?\UNC\")
-            .map(|rest| format!(r"\\{rest}"))
-            .or_else(|| rendered.strip_prefix(r"\\?\").map(str::to_string))
-            .unwrap_or(rendered)
+    /// Create an NTFS junction (mount point) natively. `cmd.exe /c mklink /J`
+    /// rejects the runner's paths outright, so coverage builds the reparse
+    /// point through the same kernel interface Windows itself uses:
+    /// `FSCTL_SET_REPARSE_POINT` with a `MountPointReparseBuffer` payload.
+    /// Junctions, unlike symlinks, require no privilege.
+    fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
+        use windows::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        use windows::Win32::System::IO::DeviceIoControl;
+
+        std::fs::create_dir(link).map_err(|error| format!("create junction dir: {error}"))?;
+        let link_wide = wide(link);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(link_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|error| format!("open junction dir: {error}"))?;
+        let dir = OwnedHandle(handle).into_file();
+
+        let rendered = target.display().to_string();
+        let plain = rendered
+            .strip_prefix(r"\\?\")
+            .unwrap_or(rendered.as_str())
+            .to_string();
+        let substitute: Vec<u16> = format!(r"\??\{plain}").encode_utf16().collect();
+        let print: Vec<u16> = plain.encode_utf16().collect();
+
+        // REPARSE_DATA_BUFFER: tag u32, data-length u16, reserved u16, then the
+        // MountPointReparseBuffer (four u16 offsets/lengths + path buffer with
+        // NUL-terminated substitute and print names).
+        let sub_bytes = substitute.len() * 2;
+        let print_bytes = print.len() * 2;
+        let reparse_data_length = 8 + sub_bytes + 2 + print_bytes + 2;
+        let mut buffer = vec![0u8; 8 + reparse_data_length];
+        buffer[0..4].copy_from_slice(&0xA000_0003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+        buffer[4..6].copy_from_slice(&(reparse_data_length as u16).to_le_bytes());
+        buffer[8..10].copy_from_slice(&0u16.to_le_bytes());
+        buffer[10..12].copy_from_slice(&(sub_bytes as u16).to_le_bytes());
+        buffer[12..14].copy_from_slice(&((sub_bytes + 2) as u16).to_le_bytes());
+        buffer[14..16].copy_from_slice(&(print_bytes as u16).to_le_bytes());
+        let mut cursor = 16;
+        for unit in substitute
+            .iter()
+            .chain(std::iter::once(&0u16))
+            .chain(print.iter())
+            .chain(std::iter::once(&0u16))
+        {
+            buffer[cursor..cursor + 2].copy_from_slice(&unit.to_le_bytes());
+            cursor += 2;
+        }
+        let mut returned = 0u32;
+        unsafe {
+            DeviceIoControl(
+                HANDLE(dir.as_raw_handle()),
+                FSCTL_SET_REPARSE_POINT,
+                Some(buffer.as_ptr().cast()),
+                buffer.len() as u32,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|error| format!("set reparse point: {error}"))
     }
 
     #[test]
@@ -2699,20 +2779,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let junction = root.path().join("junction");
-        let command = format!(
-            "mklink /J \"{}\" \"{}\"",
-            cmd_compatible_display(&junction),
-            cmd_compatible_display(outside.path())
-        );
-        let output = std::process::Command::new("cmd.exe")
-            .args(["/D", "/S", "/C", &command])
-            .output()
-            .expect("cmd.exe is available on Windows");
-        assert!(
-            output.status.success(),
-            "junction coverage setup failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        create_junction(&junction, outside.path())
+            .unwrap_or_else(|error| panic!("junction coverage setup failed: {error}"));
         let path = junction.join("config.json");
         assert!(update_with_backup(&path, root.path(), "new").is_err());
         assert!(!outside.path().join("config.json").exists());
