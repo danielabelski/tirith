@@ -1749,18 +1749,19 @@ mod tests {
                         // exit_notify), so on another CPU this EOF can win the
                         // race against the pending SIGKILL and the target would
                         // exit normally, flaking the controller's WIFSIGNALED
-                        // proof. Grant the signal a bounded grace window: when
-                        // PDEATHSIG works the process dies inside this loop,
-                        // and only a genuine delivery failure reaches the
-                        // marker write.
-                        let mut grace = libc::timespec {
-                            tv_sec: 0,
-                            tv_nsec: 40_000_000,
-                        };
-                        for _ in 0..25 {
-                            let _ = libc::nanosleep(&grace, &mut grace as *mut libc::timespec);
-                            grace.tv_sec = 0;
-                            grace.tv_nsec = 40_000_000;
+                        // proof (a timed grace window only narrows the race —
+                        // it lost once under MSRV CI load). Block on `pause`
+                        // instead: it returns only for a CAUGHT signal, and the
+                        // parent-death SIGKILL cannot be caught, so a working
+                        // PDEATHSIG ends the process here no matter how delayed,
+                        // with no exit racing the kill. A broken PDEATHSIG is
+                        // caught by the controller's own wait deadline, not by
+                        // this side. The bounded count keeps the marker path
+                        // reachable for a catastrophically broken host (only if
+                        // 4096 catchable signals arrive with no SIGKILL) so the
+                        // "uncommitted code survived" evidence is preserved.
+                        for _ in 0..4096 {
+                            unsafe { libc::pause() };
                         }
                         let fd = libc::open(
                             marker_c.as_ptr(),
