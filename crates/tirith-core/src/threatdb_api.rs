@@ -94,12 +94,16 @@ pub fn enrich_command(
     let packages = threatintel::extract_packages_for_shell(&segments, shell);
     let urls = extract::extract_urls(input, shell);
 
+    // Deduplicate BEFORE the cap. Capping the raw list first let repeats
+    // consume the budget, so a command padded with duplicates pushed a real
+    // candidate out of the window without ever being looked up.
     let mut queried_packages: HashSet<(u8, String)> = HashSet::new();
-    for package in packages.into_iter().take(MAX_ENRICH_PACKAGES) {
-        // Deduplicate before spending any remote request on a value.
-        if !queried_packages.insert((package.ecosystem as u8, package.name.clone())) {
-            continue;
-        }
+    let packages_by_first_use: Vec<_> = packages
+        .into_iter()
+        .filter(|package| queried_packages.insert((package.ecosystem as u8, package.name.clone())))
+        .take(MAX_ENRICH_PACKAGES)
+        .collect();
+    for package in packages_by_first_use {
         // Only a CONCRETE version (Exact/Resolved) is a valid OSV `version`; a range
         // or constraint must NOT be sent as one (OSV would treat the range text as a
         // literal version, degrading matching and skipping deps.dev fallback). A
@@ -233,7 +237,12 @@ pub fn enrich_command(
         // (repo-0348).
         let mut candidates: Vec<String> = Vec::new();
         let mut candidate_set: HashSet<String> = HashSet::new();
-        for url_info in urls.into_iter().take(MAX_ENRICH_URLS) {
+        // Same ordering as the package budget: the cap counts candidates that
+        // will actually be looked up, so repeats cannot displace a distinct URL.
+        for url_info in urls {
+            if candidates.len() >= MAX_ENRICH_URLS {
+                break;
+            }
             if let Some(url) = safe_browsing_candidate_url(&url_info.parsed, &url_info.raw) {
                 if candidate_set.insert(url.clone()) {
                     candidates.push(url);

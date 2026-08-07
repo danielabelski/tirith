@@ -244,6 +244,27 @@ fn contrast_ratio(c1: (f64, f64, f64), c2: (f64, f64, f64)) -> f64 {
     (lighter + 0.05) / (darker + 0.05)
 }
 
+/// Byte offset of the `class` ATTRIBUTE NAME in a lowercased start tag.
+///
+/// A plain substring search also matches inside another attribute's name, so
+/// `<span hidden data-subclass='icon'>` claimed the a11y exemption while
+/// carrying no `class` attribute at all — the extraction simply read whatever
+/// value followed the match. Require the match to BEGIN an attribute name:
+/// preceded by whitespace, and followed (after optional whitespace) by `=`.
+fn find_class_attribute(tag_lower: &str) -> Option<usize> {
+    let bytes = tag_lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(offset) = tag_lower[from..].find("class") {
+        let start = from + offset;
+        let begins_an_attribute = start > 0 && bytes[start - 1].is_ascii_whitespace();
+        if begins_an_attribute && tag_lower[start + 5..].trim_start().starts_with('=') {
+            return Some(start);
+        }
+        from = start + 5;
+    }
+    None
+}
+
 /// repo-0331: the benign-hidden exemption is only valid for the genuine a11y
 /// shapes — an `<svg>` symbol def, or an inline `<span>`/`<i>` whose CLASS
 /// TOKEN (not substring) is `sr-only`/`icon`. A hidden `<div>` with
@@ -259,7 +280,7 @@ fn is_benign_hidden_element(tag_lower: &str) -> bool {
         return false;
     }
     // Extract the class attribute value and compare whole tokens.
-    let Some(class_start) = tag_lower.find("class") else {
+    let Some(class_start) = find_class_attribute(tag_lower) else {
         return false;
     };
     let after = &tag_lower[class_start + 5..];
