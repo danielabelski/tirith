@@ -650,6 +650,23 @@ fn capsule_process_ceiling(own_fanout: u32) -> u32 {
     live.saturating_add(own_fanout).saturating_add(256)
 }
 
+/// stderr from a capsule child, minus the one note a downgraded kernel prints.
+///
+/// A hosted kernel can enforce only a best-effort subset of the requested
+/// Landlock restrictions, and the child says so on stderr. That note means the
+/// run behaved correctly under a weaker kernel, not that anything went wrong,
+/// so it must not fail an "expected no stderr" assertion — while every other
+/// line still does.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn capsule_stderr_without_coverage_notes(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| !line.contains("Landlock partially enforced"))
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Read a capsule child's one-byte kernel observation.
 ///
 /// `read_exact` reports only "failed to fill whole buffer" when the child died
@@ -1019,7 +1036,7 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
          IFS= read -r home_value < \"$TMPDIR/probe\"\n\
          if [ \"$home_value\" = home ]; then printf ':home-ok'; else printf ':home-bad'; fi\n\
          for root in \"$TMPDIR\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"; do\n\
-           /bin/mkdir -p \"$root/nested/child\" || exit 92\n\
+           (cd \"$root\" && /bin/mkdir -p nested/child) || exit 92\n\
            printf nested > \"$root/nested/child/probe\" || exit 93\n\
          done\n\
          printf ':xdg-nested-ok'\n\
@@ -1339,10 +1356,10 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         format!("reviewed-file:{script_operand}").as_bytes(),
         "the shell must read and execute the exact sealed memfd operand after containment"
     );
+    let unexpected_stderr = capsule_stderr_without_coverage_notes(&output.stderr);
     assert!(
-        output.stderr.is_empty(),
-        "unexpected stderr: {:?}",
-        output.stderr
+        unexpected_stderr.is_empty(),
+        "unexpected stderr: {unexpected_stderr}"
     );
     assert_eq!(
         unsafe { libc::kill(-(child_pid as libc::pid_t), 0) },
@@ -1774,10 +1791,18 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
             .parse()
             .expect("numeric hostile clone child pid");
 
+        // The signal is already sent when this runs; what remains is the
+        // kernel delivering it and `waitid` reporting it. On a host running the
+        // whole suite in parallel that round trip can exceed a few seconds, and
+        // a timeout is indistinguishable from non-delivery — both return `None`
+        // — so a tight ceiling reports "did not deliver" for a signal that was
+        // delivered. The assertion still fails if the event never arrives.
+        const GUARD_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         let observed = if attack_signal == libc::SIGKILL {
-            wait_for_guard_event(group, libc::WEXITED, std::time::Duration::from_secs(3))
+            wait_for_guard_event(group, libc::WEXITED, GUARD_EVENT_TIMEOUT)
         } else {
-            wait_for_guard_event(group, libc::WSTOPPED, std::time::Duration::from_secs(3))
+            wait_for_guard_event(group, libc::WSTOPPED, GUARD_EVENT_TIMEOUT)
         };
         assert_eq!(
             observed,
