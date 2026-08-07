@@ -1999,15 +1999,20 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let isolated = tempfile::tempdir().expect("isolated approval runner state");
         std::fs::create_dir_all(isolated.path().join(".tirith")).unwrap();
+        // Plain concatenation, NOT `\`-continuations: a continuation strips the
+        // next line's leading whitespace, which silently deletes the YAML
+        // indentation and turns `severity_overrides` into an empty map.
         std::fs::write(
             isolated.path().join(".tirith/policy.yaml"),
-            "allow_bypass_env: true\n\
-             severity_overrides:\n\
-               dotfile_overwrite: INFO\n\
-             approval_rules:\n\
-               - rule_ids: [dotfile_overwrite]\n\
-                 timeout_secs: 30\n\
-                 fallback: block\n",
+            concat!(
+                "allow_bypass_env: true\n",
+                "severity_overrides:\n",
+                "  dotfile_overwrite: INFO\n",
+                "approval_rules:\n",
+                "  - rule_ids: [dotfile_overwrite]\n",
+                "    timeout_secs: 30\n",
+                "    fallback: block\n",
+            ),
         )
         .unwrap();
         let mut env = PendingApprovalEnvRestore(Vec::new());
