@@ -329,7 +329,7 @@ fn file_entry(key: &str, kind: PersistenceKind, path: &Path) -> PersistenceEntry
         // Existing but unsafe (symlink/special/over-cap): keep PRESENT so the
         // next diff reads as a modification, never as a clean removal
         // (repo-0407). No target bytes are disclosed.
-        SurfaceRead::Unsafe => (true, sha256_hex(b""), 0, String::new()),
+        SurfaceRead::Unsafe => (true, unsafe_surface_digest(), 0, String::new()),
     };
     PersistenceEntry {
         key: key.to_string(),
@@ -412,7 +412,7 @@ fn launch_agent_dir(dir: &Path, ext: &str) -> Vec<PersistenceEntry> {
                 let content = String::from_utf8_lossy(&bytes).into_owned();
                 (sha, size, content)
             }
-            SurfaceRead::Unsafe => (sha256_hex(b""), 0, String::new()),
+            SurfaceRead::Unsafe => (unsafe_surface_digest(), 0, String::new()),
             SurfaceRead::Absent => continue,
         };
         entries.push(PersistenceEntry {
@@ -552,7 +552,7 @@ fn collect_envrc_ancestry(cwd: &Path) -> Vec<PersistenceEntry> {
                 kind: PersistenceKind::Direnv,
                 location: envrc.display().to_string(),
                 present: true,
-                sha256: sha256_hex(b""),
+                sha256: unsafe_surface_digest(),
                 size: 0,
                 content: String::new(),
             }),
@@ -774,6 +774,18 @@ fn line_hashes(content: &str) -> Vec<String> {
 }
 
 /// Hex sha256 of a byte slice.
+/// Digest recorded for a surface that exists but was refused
+/// ([`SurfaceRead::Unsafe`]: symlink, special file, over-cap, or any
+/// non-NotFound read error). Distinct from the empty-content hash on purpose:
+/// an ABSENT baseline and an EMPTY baseline both hash empty content, so a
+/// later symlink at the same path would otherwise compare equal and the
+/// transition would never fire. The literal is versioned; changing it makes
+/// every already-unsafe baseline report one self-healing "modified" on the
+/// next diff.
+fn unsafe_surface_digest() -> String {
+    sha256_hex(b"tirith:persistence:unsafe-surface:v1")
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
@@ -1043,9 +1055,9 @@ mod tests {
             key: "shell_rc:.zshrc".to_string(),
             kind: PersistenceKind::ShellRc,
             location: "~/.zshrc".to_string(),
-            // SurfaceRead::Unsafe shape: present, empty hash, no content.
+            // SurfaceRead::Unsafe shape: present, sentinel digest, no content.
             present: true,
-            sha256: sha256_hex(b""),
+            sha256: unsafe_surface_digest(),
             size: 0,
             content: String::new(),
         }];
@@ -1055,7 +1067,28 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.rule_id == RuleId::PersistenceShellRcModified),
-            "presence flip with identical empty-content hashes must fire: {findings:?}"
+            "absent baseline replaced by an unsafe surface must fire: {findings:?}"
+        );
+
+        // An EMPTY baseline shares the empty-content hash AND the presence
+        // flag with the old Unsafe encoding, which is exactly why Unsafe now
+        // records a sentinel digest instead.
+        let empty_baseline = vec![PersistenceEntry {
+            key: "shell_rc:.zshrc".to_string(),
+            kind: PersistenceKind::ShellRc,
+            location: "~/.zshrc".to_string(),
+            present: true,
+            sha256: sha256_hex(b""),
+            size: 0,
+            content: String::new(),
+        }];
+        let snap = PersistenceSnapshot::from_entries(&empty_baseline);
+        let findings = diff_entries(&new, &snap);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PersistenceShellRcModified),
+            "empty file replaced by an unsafe surface must fire: {findings:?}"
         );
     }
 
