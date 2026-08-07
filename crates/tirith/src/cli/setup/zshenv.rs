@@ -33,11 +33,8 @@ pub fn offer_zshenv_guard(
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let zshenv_path = home.join(".zshenv");
     let mut completed_verb = "updated";
-    let outcome = super::fs_helpers::transactional_update(
-        &zshenv_path,
-        &home,
-        dry_run,
-        |snapshot| {
+    let outcome =
+        super::fs_helpers::transactional_update(&zshenv_path, &home, dry_run, |snapshot| {
             let existing = snapshot.text(&zshenv_path)?.unwrap_or_default();
             let begin_count = existing
                 .lines()
@@ -79,7 +76,7 @@ pub fn offer_zshenv_guard(
                 }
                 _ if !force => {
                     return Err(format!(
-                        "tirith: multiple tirith-guard blocks found in {} — use --force to deduplicate",
+                        "multiple tirith-guard blocks found in {} — use --force to deduplicate",
                         zshenv_path.display()
                     ));
                 }
@@ -101,8 +98,7 @@ pub fn offer_zshenv_guard(
             }
             content.push_str(&managed_block);
             Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644))
-        },
-    )?;
+        })?;
     if let Some(annotation) = outcome.completion_annotation() {
         eprintln!(
             "tirith: {completed_verb} tirith-guard block in {}{annotation}",
@@ -120,7 +116,7 @@ pub(crate) fn validate_marker_pairing(content: &str) -> Result<(), String> {
         if line.starts_with(BEGIN_PREFIX) {
             if in_block {
                 return Err(
-                    "tirith: corrupted tirith-guard block in ~/.zshenv — nested BEGIN markers, fix manually"
+                    "corrupted tirith-guard block in ~/.zshenv — nested BEGIN markers, fix manually"
                         .to_string(),
                 );
             }
@@ -128,7 +124,7 @@ pub(crate) fn validate_marker_pairing(content: &str) -> Result<(), String> {
         } else if line.starts_with(END_MARKER) {
             if !in_block {
                 return Err(
-                    "tirith: corrupted tirith-guard block in ~/.zshenv — END marker without BEGIN, fix manually"
+                    "corrupted tirith-guard block in ~/.zshenv — END marker without BEGIN, fix manually"
                         .to_string(),
                 );
             }
@@ -137,7 +133,7 @@ pub(crate) fn validate_marker_pairing(content: &str) -> Result<(), String> {
     }
     if in_block {
         return Err(
-            "tirith: corrupted tirith-guard block in ~/.zshenv — missing END marker, fix manually"
+            "corrupted tirith-guard block in ~/.zshenv — missing END marker, fix manually"
                 .to_string(),
         );
     }
@@ -183,7 +179,7 @@ pub(crate) fn validate_zsh_syntax(snippet: &str) -> Result<(), String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "tirith: zshenv guard snippet has invalid zsh syntax (bug in embedded asset): {stderr}"
+            "zshenv guard snippet has invalid zsh syntax (bug in embedded asset): {stderr}"
         ));
     }
     Ok(())

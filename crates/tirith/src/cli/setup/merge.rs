@@ -66,7 +66,7 @@ pub fn merge_mcp_json_with_key(
                     return Ok(super::fs_helpers::FileUpdate::unchanged());
                 }
                 return Err(format!(
-                    "tirith: {server_name} in {} has different config than expected — use --force to update",
+                    "{server_name} in {} has different config than expected — use --force to update",
                     path.display()
                 ));
             }
@@ -158,7 +158,7 @@ pub fn merge_hooks_json(
                         return Ok(super::fs_helpers::FileUpdate::unchanged());
                     }
                     return Err(format!(
-                        "tirith: hook entry in {} has different config than expected — use --force to update",
+                        "hook entry in {} has different config than expected — use --force to update",
                         path.display()
                     ));
                 }
@@ -175,7 +175,7 @@ pub fn merge_hooks_json(
                         return Ok(super::fs_helpers::FileUpdate::unchanged());
                     }
                     return Err(format!(
-                        "tirith: multiple tirith hook entries found in {} — use --force to deduplicate",
+                        "multiple tirith hook entries found in {} — use --force to deduplicate",
                         path.display()
                     ));
                 }
@@ -573,7 +573,7 @@ pub fn merge_vscode_settings(
                     path.display()
                 );
                 return Err(format!(
-                    "tirith: {} already has a \"hooks\" key — cannot safely merge. \
+                    "{} already has a \"hooks\" key — cannot safely merge. \
                  Add the hook entry shown above manually.",
                     path.display()
                 ));
@@ -682,7 +682,7 @@ fn remove_managed_block(
         }
         if line.contains(end_marker) {
             if !suppressing {
-                return Err("tirith: found END marker without BEGIN in managed block".to_string());
+                return Err("found END marker without BEGIN in managed block".to_string());
             }
             suppressing = false;
             continue;
@@ -693,9 +693,7 @@ fn remove_managed_block(
     }
 
     if suppressing {
-        return Err(
-            "tirith: corrupted tirith-hooks block — missing END marker, fix manually".to_string(),
-        );
+        return Err("corrupted tirith-hooks block — missing END marker, fix manually".to_string());
     }
 
     let mut out = result.join("\n");
