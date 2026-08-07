@@ -679,8 +679,6 @@ fn read_capsule_observation(
     child: &mut std::process::Child,
     what: &str,
 ) -> [u8; 1] {
-    use std::io::Read as _;
-
     let mut observed = [0u8; 1];
     match reader.read_exact(&mut observed) {
         Ok(()) => observed,
