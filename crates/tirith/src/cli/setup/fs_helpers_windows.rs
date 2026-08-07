@@ -27,8 +27,9 @@ use windows::Win32::Foundation::{
     WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
@@ -235,6 +236,39 @@ fn current_user_sid_string() -> Result<String, String> {
         }
         decoded
     })?
+}
+
+/// Render a self-relative security descriptor as SDDL for diagnostics.
+///
+/// A byte length names nothing an operator can act on. SDDL names the owner,
+/// the group, and every ACE, so a publication mismatch reports WHICH access
+/// changed. This is diagnostic only: on failure it falls back to the length so
+/// the renderer can never be the reason a mismatch goes unreported.
+fn describe_security_descriptor(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut owned = bytes.to_vec();
+    let descriptor = PSECURITY_DESCRIPTOR(owned.as_mut_ptr().cast());
+    let mut encoded = PWSTR::null();
+    if unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut encoded,
+            None,
+        )
+    }
+    .is_err()
+    {
+        return format!("{} bytes, unrenderable", bytes.len());
+    }
+    let rendered = unsafe { encoded.to_string() };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(encoded.0.cast())));
+    }
+    rendered.unwrap_or_else(|_| format!("{} bytes, undecodable", bytes.len()))
 }
 
 fn owner_is_current_user(owner: PSID) -> bool {
@@ -1440,9 +1474,11 @@ impl PlatformTransaction {
                         if generation.security_descriptor != expected_generation.security_descriptor
                         {
                             mismatches.push(format!(
-                                "installed security descriptor ({} bytes) is not the preserved one ({} bytes)",
-                                generation.security_descriptor.len(),
-                                expected_generation.security_descriptor.len()
+                                "installed security descriptor {} is not the preserved one {}",
+                                describe_security_descriptor(&generation.security_descriptor),
+                                describe_security_descriptor(
+                                    &expected_generation.security_descriptor
+                                )
                             ));
                         }
                     }
@@ -1451,10 +1487,10 @@ impl PlatformTransaction {
                     None => mismatches.push("no displaced backup was produced".to_string()),
                     Some(generation) if generation != expected_generation => {
                         mismatches.push(format!(
-                            "displaced identity differs (same_identity={}, sd_len {} vs {})",
+                            "displaced identity differs (same_identity={}, sd {} vs {})",
                             generation.same_identity(expected_generation),
-                            generation.security_descriptor.len(),
-                            expected_generation.security_descriptor.len()
+                            describe_security_descriptor(&generation.security_descriptor),
+                            describe_security_descriptor(&expected_generation.security_descriptor)
                         ));
                     }
                     Some(_) => {}
