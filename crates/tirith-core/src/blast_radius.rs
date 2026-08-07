@@ -930,7 +930,14 @@ fn is_system_path(path: &str, home: Option<&str>) -> bool {
     // root. Deterministic `~`/environment expansion happens before this helper,
     // so protected paths reached through those forms are absolute here and
     // remain covered; cwd-relative operands are left to `tirith preview`.
-    if !Path::new(path).is_absolute() {
+    //
+    // Absoluteness is POSIX-defined ("starts with `/`"), NOT host-defined: this
+    // analyzes shell commands whose targets are POSIX paths regardless of the
+    // OS tirith runs on, and the protected-root set below is entirely
+    // `/`-rooted. `Path::is_absolute()` is host-dependent (it rejects `/etc` on
+    // Windows because there is no drive letter), which silently disabled every
+    // system-path finding on Windows.
+    if !path.starts_with('/') {
         return false;
     }
 
