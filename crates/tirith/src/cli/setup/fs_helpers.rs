@@ -888,11 +888,26 @@ pub(crate) struct PlatformTransaction {
 
 impl PlatformTransaction {
     pub(crate) fn lock(_path: &Path, scope_root: &Path) -> Result<PlatformLock, String> {
+        // The anchor is `/`, which any local process can open and flock. A
+        // blocking `lock_exclusive()` therefore lets an unrelated process stall
+        // every setup command forever with no diagnostic. Bound the wait and
+        // report; failing to acquire is strictly more fail-closed than hanging.
+        const SETUP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         let anchor = open_lock_anchor(scope_root)?;
-        anchor
-            .lock_exclusive()
-            .map_err(|error| format!("lock setup scope without creating a lock file: {error}"))?;
-        Ok(PlatformLock { _anchor: anchor })
+        let deadline = std::time::Instant::now() + SETUP_LOCK_TIMEOUT;
+        loop {
+            match anchor.try_lock_exclusive() {
+                Ok(()) => return Ok(PlatformLock { _anchor: anchor }),
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    return Err(format!(
+                        "could not take the setup scope lock within {}s: {error}",
+                        SETUP_LOCK_TIMEOUT.as_secs()
+                    ))
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
     }
 
     pub(crate) fn begin(
