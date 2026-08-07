@@ -216,6 +216,16 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
         if i == baseline_idx {
             continue;
         }
+        // `0` is the sentinel this function pushes for a probe that never
+        // produced a response, not an HTTP status. A transient timeout or
+        // connect reset is not a server serving one agent something different,
+        // so it must not read as a cloaking signal. The agent-specific blocks
+        // this check targets — a 403 or a redirect served to one UA but not
+        // another — arrive as real status codes and still compare below. The
+        // failed probe stays visible in the per-agent evidence.
+        if *status == 0 {
+            continue;
+        }
         // repo-0321: an agent-specific STATUS difference is itself a cloaking
         // signal (identical text at a different status code).
         if *status != baseline_status {
