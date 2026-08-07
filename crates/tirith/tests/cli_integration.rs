@@ -661,6 +661,9 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     const SEALED_TARGET_FD: i32 = 63;
     const LAUNCH_STATUS_FD: i32 = 61;
     const LAUNCH_ACK_FD: i32 = 60;
+    // The child requires the temp HOME as a PAIR: the path names it, the
+    // descriptor proves the parent owns the directory it names.
+    const TEMP_HOME_FD: i32 = 59;
     let secret_dir = tempfile::tempdir().expect("private inherited-fd fixture");
     let secret_path = secret_dir.path().join("secret");
     fs::write(&secret_path, b"must not be inherited").expect("write inherited-fd fixture");
@@ -855,6 +858,8 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         .arg(LAUNCH_ACK_FD.to_string())
         .arg("--temp-home")
         .arg(&temp_home_path)
+        .arg("--temp-home-fd")
+        .arg(TEMP_HOME_FD.to_string())
         .arg("--")
         .arg(interpreter.launch_path())
         .args(["-s", "--", "feature value"])
@@ -868,6 +873,9 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     let interpreter_fd = interpreter
         .bound_launch_fd()
         .expect("Linux binding must retain a sealed executable descriptor");
+    let temp_home_dir = std::fs::File::open(&temp_home_path)
+        .expect("open the parent-owned temporary HOME for its descriptor");
+    let temp_home_dir_fd = temp_home_dir.as_raw_fd();
     let status_writer_fd = status_writer.as_raw_fd();
     let ack_guard_fd = ack_guard.as_raw_fd();
     // Destroy the pathname snapshot before spawn. The held descriptor remains
@@ -903,6 +911,11 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
             }
             if libc::dup2(ack_guard_fd, LAUNCH_ACK_FD) < 0
                 || libc::fcntl(LAUNCH_ACK_FD, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(temp_home_dir_fd, TEMP_HOME_FD) < 0
+                || libc::fcntl(TEMP_HOME_FD, libc::F_SETFD, 0) < 0
             {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1017,6 +1030,9 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
     const SEALED_SCRIPT_FD: i32 = 62;
     const LAUNCH_STATUS_FD: i32 = 61;
     const LAUNCH_ACK_FD: i32 = 60;
+    // The child requires the temp HOME as a PAIR: the path names it, the
+    // descriptor proves the parent owns the directory it names.
+    const TEMP_HOME_FD: i32 = 59;
 
     let interpreter = TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
         .expect("resolve canonical system shell")
@@ -1185,6 +1201,8 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         .arg(LAUNCH_ACK_FD.to_string())
         .arg("--temp-home")
         .arg(&temp_home_path)
+        .arg("--temp-home-fd")
+        .arg(TEMP_HOME_FD.to_string())
         .arg("--")
         .arg(interpreter.launch_path())
         .arg(&script_operand)
@@ -1197,6 +1215,9 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         .bound_launch_fd()
         .expect("Linux binding retains sealed interpreter descriptor");
     let reviewed_script_fd = reviewed_script.as_raw_fd();
+    let temp_home_dir = std::fs::File::open(&temp_home_path)
+        .expect("open the parent-owned temporary HOME for its descriptor");
+    let temp_home_dir_fd = temp_home_dir.as_raw_fd();
     let status_writer_fd = status_writer.as_raw_fd();
     let ack_guard_fd = ack_guard.as_raw_fd();
     unsafe {
@@ -1209,6 +1230,7 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
                 (reviewed_script_fd, SEALED_SCRIPT_FD),
                 (status_writer_fd, LAUNCH_STATUS_FD),
                 (ack_guard_fd, LAUNCH_ACK_FD),
+                (temp_home_dir_fd, TEMP_HOME_FD),
             ] {
                 if libc::dup2(source, destination) < 0
                     || libc::fcntl(destination, libc::F_SETFD, 0) < 0
