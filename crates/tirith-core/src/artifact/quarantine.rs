@@ -836,9 +836,17 @@ impl QuarantineStore {
             let aged_out = transaction
                 .metadata()
                 .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_some_and(|age| age >= max_age);
+                .map(|modified| {
+                    // A modified time at or slightly AFTER `now` (NTFS timestamp
+                    // granularity for a dir created microseconds ago, or a clock
+                    // adjustment) makes `duration_since` error. Treat that as age
+                    // zero rather than "unknown, skip": with `max_age == 0` every
+                    // unleased txn is eligible by contract, and a positive
+                    // threshold still (correctly) spares a brand-new directory.
+                    now.duration_since(modified).unwrap_or(Duration::ZERO)
+                })
+                .map(|age| age >= max_age)
+                .unwrap_or(false);
             if !aged_out {
                 continue;
             }
@@ -911,9 +919,17 @@ impl QuarantineStore {
             let aged_out = transaction
                 .metadata()
                 .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_some_and(|age| age >= max_age);
+                .map(|modified| {
+                    // A modified time at or slightly AFTER `now` (NTFS timestamp
+                    // granularity for a dir created microseconds ago, or a clock
+                    // adjustment) makes `duration_since` error. Treat that as age
+                    // zero rather than "unknown, skip": with `max_age == 0` every
+                    // unleased txn is eligible by contract, and a positive
+                    // threshold still (correctly) spares a brand-new directory.
+                    now.duration_since(modified).unwrap_or(Duration::ZERO)
+                })
+                .map(|age| age >= max_age)
+                .unwrap_or(false);
             if !aged_out {
                 continue;
             }
