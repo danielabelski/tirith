@@ -1251,8 +1251,16 @@ fn terminate_tree(child: &mut std::process::Child, _child_pid: u32, already_reap
 
 #[cfg(unix)]
 fn wait_for_process_group_exit(child_pid: u32) -> bool {
+    // SIGKILL is already delivered when this runs; what remains is waiting for
+    // the kernel — and, once the direct child is reaped, the reparenting init —
+    // to finish reaping descendants. A loaded host can take seconds, and timing
+    // out here reports a cleanup failure for a group that WAS killed. This is
+    // reached only when the group still had members at kill time, so a longer
+    // ceiling costs nothing in the common case.
+    const GROUP_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+
     let process_group = -(child_pid as libc::pid_t);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + GROUP_EXIT_TIMEOUT;
     loop {
         if unsafe { libc::kill(process_group, 0) } != 0 {
             let error = std::io::Error::last_os_error();
