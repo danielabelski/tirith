@@ -1653,6 +1653,24 @@ fn wait_for_guard_event(
                 event | libc::WNOWAIT | libc::WNOHANG,
             )
         };
+        if result != 0 {
+            // `waitid` failing here says something specific about the guard, and
+            // the bare errno does not distinguish "already reaped" from "never
+            // our child" — both are ECHILD. Report what the process table says
+            // so the failure names which one it is.
+            let error = std::io::Error::last_os_error();
+            let reachable = unsafe { libc::kill(guard_pid as libc::pid_t, 0) } == 0;
+            let stat = std::fs::read_to_string(format!("/proc/{guard_pid}/stat"))
+                .ok()
+                .and_then(|line| {
+                    line.rsplit_once(')')
+                        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("?").to_string())
+                });
+            panic!(
+                "observe capsule guard without reaping: {error}; guard_pid={guard_pid} \
+                 event={event:#x} signal-0-reachable={reachable} proc-state={stat:?}"
+            );
+        }
         assert_eq!(
             result,
             0,
