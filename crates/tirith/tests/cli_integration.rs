@@ -1107,7 +1107,7 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
          IFS= read -r home_value < \"$TMPDIR/probe\"\n\
          if [ \"$home_value\" = home ]; then printf ':home-ok'; else printf ':home-bad'; fi\n\
          for root in \"$TMPDIR\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"; do\n\
-           (cd \"$root\" && /bin/mkdir -p nested/child) || exit 92\n\
+           { /bin/mkdir \"$root/nested\" || [ -d \"$root/nested\" ]; } && { /bin/mkdir \"$root/nested/child\" || [ -d \"$root/nested/child\" ]; } || exit 92\n\
            printf nested > \"$root/nested/child/probe\" || exit 93\n\
          done\n\
          printf ':xdg-nested-ok'\n\
