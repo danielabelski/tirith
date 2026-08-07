@@ -962,12 +962,22 @@ impl FileIdentity {
 
     #[cfg(windows)]
     fn of(file: &std::fs::File) -> Option<Self> {
-        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
 
-        let metadata = file.metadata().ok()?;
+        // `MetadataExt::volume_serial_number` / `file_index` are still unstable
+        // (`windows_by_handle`), so read the same fields straight from the
+        // handle instead of pinning this to nightly.
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle is live for the call and `info` is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return None;
+        }
         Some(Self {
-            volume_serial: metadata.volume_serial_number()?,
-            file_index: metadata.file_index()?,
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         })
     }
 
