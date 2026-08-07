@@ -280,7 +280,12 @@ fn manifest_names_package(manifest: &str, name: &str, eco: Ecosystem) -> Manifes
             };
             match parsed.get("name").and_then(|v| v.as_str()) {
                 Some(found) if found == name => ManifestMatch::Names,
-                Some(_) | None => ManifestMatch::DoesNotName,
+                // A manifest that names a DIFFERENT package is conclusive; one
+                // with no name at all is a shape we cannot conclude from (a
+                // repo-root manifest for a workspace layout), mirroring the
+                // gemspec arm below.
+                Some(_) => ManifestMatch::DoesNotName,
+                None => ManifestMatch::Inconclusive,
             }
         }
         Ecosystem::Crates => {
@@ -294,7 +299,12 @@ fn manifest_names_package(manifest: &str, name: &str, eco: Ecosystem) -> Manifes
                 .and_then(|n| n.as_str())
             {
                 Some(found) if found == name => ManifestMatch::Names,
-                Some(_) | None => ManifestMatch::DoesNotName,
+                // A root Cargo.toml without a [package] table is the standard
+                // virtual-workspace layout (the crate publishes from a member
+                // directory), not evidence against the claim. Only a manifest
+                // that names a DIFFERENT package is conclusive.
+                Some(_) => ManifestMatch::DoesNotName,
+                None => ManifestMatch::Inconclusive,
             }
         }
         Ecosystem::PyPI => {
@@ -317,7 +327,10 @@ fn manifest_names_package(manifest: &str, name: &str, eco: Ecosystem) -> Manifes
                 Some(found) if pep503_normalize(found) == pep503_normalize(name) => {
                     ManifestMatch::Names
                 }
-                Some(_) | None => ManifestMatch::DoesNotName,
+                // No project/poetry name: a pyproject.toml that only configures
+                // tooling cannot be concluded from, mirroring the gemspec arm.
+                Some(_) => ManifestMatch::DoesNotName,
+                None => ManifestMatch::Inconclusive,
             }
         }
         Ecosystem::RubyGems => {
@@ -574,11 +587,13 @@ mod tests {
 
     #[test]
     fn manifest_names_package_npm_ignores_nested_and_broken_json() {
-        // A nested "name" member must not satisfy the identity check.
+        // A nested "name" member must not satisfy the identity check. With no
+        // TOP-LEVEL name at all the manifest cannot be concluded from either
+        // way (workspace-root package.json files commonly omit it).
         let nested = r#"{ "dependencies": { "evil": { "name": "react" } } }"#;
         assert_eq!(
             manifest_names_package(nested, "react", Ecosystem::Npm),
-            ManifestMatch::DoesNotName
+            ManifestMatch::Inconclusive
         );
         assert_eq!(
             manifest_names_package("not json", "react", Ecosystem::Npm),
@@ -601,14 +616,23 @@ mod tests {
 
     #[test]
     fn manifest_names_package_cargo_ignores_comments_and_other_tables() {
+        // Neither a commented-out name nor a name in an unrelated table may
+        // count as NAMING the package (anti-spoofing). With no [package] table
+        // at all, the shape is the virtual-workspace layout and cannot be
+        // concluded from either way — Inconclusive, never Names.
         let commented = "# name = \"serde\"\n[dependencies]\nfoo = \"1\"\n";
         assert_eq!(
             manifest_names_package(commented, "serde", Ecosystem::Crates),
-            ManifestMatch::DoesNotName
+            ManifestMatch::Inconclusive
         );
         let other_table = "[workspace]\nmembers = []\n[profile.dev]\nname = \"serde\"\n";
         assert_eq!(
             manifest_names_package(other_table, "serde", Ecosystem::Crates),
+            ManifestMatch::Inconclusive
+        );
+        let wrong_name = "[package]\nname = \"serde-clone\"\n";
+        assert_eq!(
+            manifest_names_package(wrong_name, "serde", Ecosystem::Crates),
             ManifestMatch::DoesNotName
         );
     }

@@ -588,8 +588,12 @@ pub fn diff_entries(
         // The prior content is gone (snapshot stores only hashes), so diff
         // against the prior per-line hash set.
         let (changed, prev_line_hashes, prev_present): (bool, &[String], bool) = match prev {
+            // Hash comparison alone cannot see every transition: an absent
+            // surface and an unsafe one (symlink/special/over-cap) both carry
+            // the empty-content hash, so a baseline-absent path replaced by a
+            // symlink would read as unchanged. Presence flips are changes.
             Some(p) => (
-                p.sha256 != entry.sha256,
+                p.sha256 != entry.sha256 || p.present != entry.present,
                 p.line_hashes.as_slice(),
                 p.present,
             ),
@@ -1016,6 +1020,43 @@ mod tests {
             .expect("expected crontab-modified finding");
         assert_eq!(f.severity, Severity::Medium);
         assert!(f.added_lines.iter().any(|l| l.contains("curl evil")));
+    }
+
+    #[test]
+    fn absent_baseline_replaced_by_unsafe_surface_fires() {
+        // A baseline-absent rc file and a later symlink/special/over-cap read
+        // both carry the empty-content hash, so the hash comparison alone sees
+        // no change. The presence flip IS the change: an attacker planting
+        // ~/.zshrc as a symlink to a payload must fire.
+        let old = vec![PersistenceEntry {
+            key: "shell_rc:.zshrc".to_string(),
+            kind: PersistenceKind::ShellRc,
+            location: "~/.zshrc".to_string(),
+            present: false,
+            sha256: sha256_hex(b""),
+            size: 0,
+            content: String::new(),
+        }];
+        let snap = PersistenceSnapshot::from_entries(&old);
+
+        let new = vec![PersistenceEntry {
+            key: "shell_rc:.zshrc".to_string(),
+            kind: PersistenceKind::ShellRc,
+            location: "~/.zshrc".to_string(),
+            // SurfaceRead::Unsafe shape: present, empty hash, no content.
+            present: true,
+            sha256: sha256_hex(b""),
+            size: 0,
+            content: String::new(),
+        }];
+
+        let findings = diff_entries(&new, &snap);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PersistenceShellRcModified),
+            "presence flip with identical empty-content hashes must fire: {findings:?}"
+        );
     }
 
     #[test]
