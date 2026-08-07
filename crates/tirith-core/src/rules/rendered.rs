@@ -946,6 +946,15 @@ fn strict_page_content(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Resul
                     .map_err(|err| format!("page content item {index} is not a stream: {err}"))?;
                 let decoded = decode_pdf_stream_strict(stream)
                     .map_err(|err| format!("page content item {index} decode failed: {err}"))?;
+                // Entries are REFERENCES, so `[1 0 R 1 0 R ...]` decodes the
+                // same stream once per entry. Capping each decode individually
+                // leaves the page unbounded; charge them all against one page
+                // budget. The caller turns this Err into a coverage gap.
+                if content.len().saturating_add(decoded.len()) > PDF_STREAM_DECODE_CAP {
+                    return Err(format!(
+                        "page content array exceeds the {PDF_STREAM_DECODE_CAP}-byte decode budget"
+                    ));
+                }
                 content.extend_from_slice(&decoded);
                 content.push(b'\n');
             }
