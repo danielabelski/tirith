@@ -19492,6 +19492,12 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
 // UX / transparency pass (feat/ux-transparency-pass)
 // ---------------------------------------------------------------------------
 
+// Unix-only: the contract under test is the BASH exported-protection signal
+// (`TIRITH_BASH_EFFECTIVE_PROTECTION`) combined with bash/zsh profile hook
+// detection. Windows protection runs through the PowerShell hook, a separate
+// surface with its own coverage, so seeding `.bashrc`/`.zshrc` cannot satisfy
+// hook detection there and `status` correctly reports NOT FULLY PROTECTED.
+#[cfg(unix)]
 #[test]
 fn status_guarded_via_exported_signal_exits_zero() {
     // repo-0436: the exported signal only proves protection when a hook is
