@@ -1917,10 +1917,21 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         } else {
             wait_for_guard_event(group, libc::WSTOPPED, GUARD_EVENT_TIMEOUT)
         };
-        assert_eq!(
-            observed,
-            Some(attack_signal),
-            "clone child must deliver its selected signal to the contained guard"
+        // The guard ABSORBS a fatal signal delivered to its contained target
+        // rather than dying from it: `__capsule-child` translates
+        // `ContainedTargetExit::Signal(signal)` into `exit(128 + signal)`, the
+        // conventional shell encoding. So a SIGKILL surfaces as an EXITED event
+        // carrying 128+9 rather than a KILLED event carrying 9 — which is the
+        // absorption this test exists to verify. A stop arrives as the signal
+        // itself. `waitid` only reports `si_status` as the signal number under
+        // `CLD_KILLED`; under `CLD_EXITED` it is the exit code, so both shapes
+        // are legitimate here and asserting one alone asserts the wrong thing.
+        let absorbed = 128 + attack_signal;
+        assert!(
+            observed.is_some_and(|status| status == attack_signal || status == absorbed),
+            "clone child must deliver its selected signal to the contained guard: \
+             observed {observed:?}, expected the signal ({attack_signal}) or its \
+             absorbed form ({absorbed})"
         );
 
         // This is the same safety ordering as the production supervisor: signal
