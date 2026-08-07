@@ -895,10 +895,34 @@ fn expand_known_path(
     Ok(out)
 }
 
-fn lexical_path_string(path: &str) -> String {
-    canonicalize_lexical(Path::new(path), Path::new("/"))
-        .to_string_lossy()
-        .into_owned()
+/// Lexically normalize a POSIX (`/`-separated) path as a string, resolving `.`
+/// and `..` without touching the filesystem and WITHOUT `std::path::Path` (whose
+/// separator, root, and absoluteness rules are host-defined — on Windows they
+/// rewrite `/etc` to `\etc` and treat it as relative, which silently defeated
+/// every system-path finding). A leading `/` is preserved; `..` cannot rise
+/// above root; the result has no trailing slash except bare root, which stays
+/// `/`.
+fn posix_lexical(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+/// The POSIX parent of a `/`-rooted path: everything up to the last `/`, or `/`
+/// when the path has a single component. String-only, host-independent.
+fn posix_parent(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(index) => &path[..index],
+    }
 }
 
 fn is_protected_root(path: &str) -> bool {
@@ -941,28 +965,34 @@ fn is_system_path(path: &str, home: Option<&str>) -> bool {
         return false;
     }
 
+    // POSIX-string classification only — never `std::path::Path`, whose
+    // host-defined semantics rewrite these `/`-rooted operands on Windows.
     let first_glob = path.find(['*', '?', '[']);
     let candidate = if let Some(index) = first_glob {
         let prefix = &path[..index];
         let directory = if prefix.ends_with('/') {
-            Path::new(prefix.trim_end_matches('/'))
+            let trimmed = prefix.trim_end_matches('/');
+            if trimmed.is_empty() {
+                "/"
+            } else {
+                trimmed
+            }
         } else {
-            Path::new(prefix)
-                .parent()
-                .unwrap_or_else(|| Path::new(prefix))
+            posix_parent(prefix)
         };
-        lexical_path_string(directory.to_string_lossy().as_ref())
+        posix_lexical(directory)
     } else {
-        lexical_path_string(path)
+        posix_lexical(path)
     };
     if is_protected_root(&candidate) {
         return true;
     }
     home.is_some_and(|home| {
-        let home = lexical_path_string(home);
+        let home = posix_lexical(home);
         candidate == home
             || (first_glob.is_some()
-                && Path::new(&candidate).strip_prefix(Path::new(&home)).is_ok())
+                && (candidate == home
+                    || candidate.starts_with(&format!("{}/", home.trim_end_matches('/')))))
     })
 }
 
