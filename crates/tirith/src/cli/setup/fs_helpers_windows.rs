@@ -1729,16 +1729,20 @@ impl PlatformTransaction {
                             }
                         }
                         // When the file back at the private temp name is OUR
-                        // OWN prepared replacement, its metadata (the restored
-                        // descriptor) no longer matches the generation the
-                        // cleanup guard captured at preparation, so the
-                        // scheduled scrub could not reacquire it and the
+                        // OWN prepared replacement, byte for byte, its metadata
+                        // (the restored descriptor) no longer matches the
+                        // generation the cleanup guard captured at preparation,
+                        // so the scheduled scrub could not reacquire it and the
                         // artifact would strand. Point the guard at the exact
-                        // identity verified above. A swapped-in foreign
-                        // replacement keeps the original expectation and is
+                        // identity verified above. Anything else at that name,
+                        // a swapped-in foreign file OR our identity carrying
+                        // tampered bytes, keeps the original expectation and is
                         // deliberately retained as evidence.
                         if let Some(generation) = installed.as_ref() {
-                            if generation.same_identity(&temp.generation) {
+                            if generation.same_identity(&temp.generation)
+                                && generation.digest == temp.generation.digest
+                                && generation.size == temp.generation.size
+                            {
                                 temp.generation = generation.clone();
                             }
                         }
