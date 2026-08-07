@@ -749,8 +749,9 @@ mod platform {
     // The Windows implementation follows the same retained-capability model as
     // the repo-trust and setup writers: each no-reparse directory is held,
     // temp identity is verified against that held parent before bytes are
-    // written, and SetFileInformationByHandle publishes relative to the held
-    // parent handle.
+    // written, and NtSetInformationFile(FileRenameInformation) publishes
+    // relative to the held parent handle (the Win32 rename wrapper refuses
+    // handle-relative names).
     use std::ffi::{OsStr, OsString};
     use std::fs::File;
     use std::io::{self, Read as _, Write as _};
@@ -762,8 +763,9 @@ mod platform {
     use super::OpenRegularError;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
+        FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, DuplicateHandle, RtlNtStatusToDosError, DUPLICATE_SAME_ACCESS,
@@ -771,13 +773,12 @@ mod platform {
         HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileDispositionInfo, FileRenameInfo, GetFileInformationByHandle,
-        SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
-        SYNCHRONIZE,
+        CreateFileW, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -1384,7 +1385,9 @@ mod platform {
         let mut storage = vec![0usize; words];
         let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         // SAFETY: storage is aligned for FILE_RENAME_INFO and sized through the
-        // variable filename payload.
+        // variable filename payload. The layout doubles as the kernel's
+        // FILE_RENAME_INFORMATION: the union's first byte is the BOOLEAN the
+        // kernel reads, and the zeroed remainder is inert padding.
         unsafe {
             (*info).Anonymous.ReplaceIfExists = overwrite;
             (*info).RootDirectory = parent;
@@ -1394,12 +1397,26 @@ mod platform {
                 std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
                 name.len(),
             );
-            if SetFileInformationByHandle(file, FileRenameInfo, info.cast(), bytes as u32) == 0 {
-                let error = io::Error::last_os_error();
-                if matches!(
-                    error.raw_os_error().map(|code| code as u32),
-                    Some(ERROR_ALREADY_EXISTS) | Some(ERROR_FILE_EXISTS)
-                ) {
+            // The Win32 wrapper (SetFileInformationByHandle + FileRenameInfo)
+            // rejects a non-NULL RootDirectory with ERROR_INVALID_PARAMETER: it
+            // accepts full destination paths only. The retained parent handle
+            // IS the point of this rename (no by-name re-resolution an attacker
+            // could redirect), so call the NT service directly — its
+            // FileRenameInformation honors handle-relative names.
+            let mut io_status = IO_STATUS_BLOCK::default();
+            let status = NtSetInformationFile(
+                file,
+                &mut io_status,
+                info.cast(),
+                bytes as u32,
+                FileRenameInformation,
+            );
+            if status < 0 {
+                // NTSTATUS values are not Win32 error codes. Translate before
+                // classifying, mirroring the NtCreateFile path above.
+                let code = RtlNtStatusToDosError(status);
+                let error = io::Error::from_raw_os_error(code as i32);
+                if matches!(code, ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) {
                     return Err(io::Error::new(io::ErrorKind::AlreadyExists, error));
                 }
                 return Err(with_context(

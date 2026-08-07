@@ -28,17 +28,17 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
-    SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
     GetSecurityDescriptorDacl, GetSecurityDescriptorGroup, GetSecurityDescriptorLength,
-    GetSecurityDescriptorOwner, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL,
-    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
-    UNPROTECTED_DACL_SECURITY_INFORMATION,
+    GetSecurityDescriptorOwner, GetTokenInformation, SetKernelObjectSecurity,
+    SetSecurityDescriptorControl, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_AUTO_INHERITED,
+    SE_DACL_AUTO_INHERIT_REQ, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FlushFileBuffers,
@@ -240,44 +240,109 @@ fn current_user_sid_string() -> Result<String, String> {
     })?
 }
 
-/// Re-apply a preserved owner + DACL to the file `ReplaceFileW` just published.
+/// Re-apply a preserved owner + group + DACL to the file `ReplaceFileW` just
+/// published, and return the refreshed generation observed through the same
+/// held handle after the write.
 ///
 /// `ReplaceFileW` MERGES ACLs rather than preserving them: the replaced file's
-/// ACEs are copied onto the replacement as EXPLICIT entries,
-/// `SE_DACL_PROTECTED` is cleared so the destination parent's inheritable ACEs
-/// re-apply, and the owner is not restored at all. Asserting byte-identity
-/// after the call therefore asserts something the API never promised — it holds
-/// only where the parent has no inheritable ACEs AND the owner happens to
-/// match. Restore the preserved descriptor explicitly so the publication
-/// contract is TRUE on every host, and let the caller's byte-for-byte
-/// comparison verify that this landed.
+/// ACEs are copied onto the replacement as EXPLICIT entries, auto-inheritance
+/// re-applies the parent's inheritable ACEs on top, and the owner is not
+/// restored at all. Asserting byte-identity after the call therefore asserts
+/// something the API never promised — it holds only where the parent has no
+/// inheritable ACEs AND the owner happens to match. The same trap applies to
+/// `SetSecurityInfo`: it feeds the provided DACL through the auto-inheritance
+/// machinery, which strips `INHERITED_ACE` flags into explicit entries and
+/// appends freshly recomputed inherited ACEs — the result is never the
+/// preserved bytes. `SetKernelObjectSecurity` writes the descriptor literally
+/// (no inheritance recomputation), so the preserved DACL — including its
+/// `INHERITED_ACE`-flagged entries and `SE_DACL_PROTECTED` state — lands
+/// byte-for-byte. `SE_DACL_AUTO_INHERITED` is the one control bit a literal
+/// write clears unless explicitly re-requested, so it is carried across via
+/// `SE_DACL_AUTO_INHERIT_REQ`. The caller's byte-for-byte comparison then
+/// verifies that all of this actually landed.
 ///
 /// The handle is opened no-reparse, share-read only, and its generation must
 /// equal the replacement that was just installed, so the restore cannot be
 /// redirected onto a different file between the replace and this call.
+/// `WRITE_OWNER` is requested only when the owner or group actually needs to
+/// change, so an unprivileged publication over a file the caller owns never
+/// demands rights it does not have.
 fn restore_preserved_security(
     path: &Path,
     installed: &FileGeneration,
     preserved: &[u8],
-) -> Result<(), String> {
+) -> Result<FileGeneration, String> {
+    let mut owned = preserved.to_vec();
+    let descriptor = PSECURITY_DESCRIPTOR(owned.as_mut_ptr().cast());
+
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }
+        .map_err(|error| format!("read preserved descriptor control: {error}"))?;
+
+    let mut preserved_owner = PSID::default();
+    let mut defaulted = BOOL(0);
+    unsafe { GetSecurityDescriptorOwner(descriptor, &mut preserved_owner, &mut defaulted) }
+        .map_err(|error| format!("read preserved owner: {error}"))?;
+    let mut preserved_group = PSID::default();
+    unsafe { GetSecurityDescriptorGroup(descriptor, &mut preserved_group, &mut defaulted) }
+        .map_err(|error| format!("read preserved group: {error}"))?;
+
+    // Decide whether the principal components actually changed, using the
+    // installed descriptor the caller just captured. Owner/group writes need
+    // `WRITE_OWNER`; a DACL write only needs `WRITE_DAC`, which the file's
+    // owner always holds. Restoring only what drifted keeps the common
+    // unprivileged path (same owner, merged DACL) working.
+    let mut installed_bytes = installed.security_descriptor.clone();
+    let installed_descriptor = PSECURITY_DESCRIPTOR(installed_bytes.as_mut_ptr().cast());
+    let mut installed_owner = PSID::default();
+    unsafe {
+        GetSecurityDescriptorOwner(installed_descriptor, &mut installed_owner, &mut defaulted)
+    }
+    .map_err(|error| format!("read installed owner: {error}"))?;
+    let mut installed_group = PSID::default();
+    unsafe {
+        GetSecurityDescriptorGroup(installed_descriptor, &mut installed_group, &mut defaulted)
+    }
+    .map_err(|error| format!("read installed group: {error}"))?;
+    let sids_equal = |a: PSID, b: PSID| -> bool {
+        if a.is_invalid() || b.is_invalid() {
+            return a.is_invalid() && b.is_invalid();
+        }
+        unsafe { EqualSid(a, b) }.is_ok()
+    };
+    let owner_changes = !sids_equal(preserved_owner, installed_owner);
+    let group_changes = !sids_equal(preserved_group, installed_group);
+    let needs_write_owner = owner_changes || group_changes;
+
     let path_wide = wide(path);
-    let handle = unsafe {
+    let open_with = |rights: u32| unsafe {
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
-            (FILE_GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC | WRITE_OWNER).0,
+            rights,
             FILE_SHARE_READ,
             None,
             OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
-    }
-    .map_err(|error| {
-        format!(
-            "reopen {} to restore its preserved security descriptor: {error}",
-            path.display()
-        )
-    })?;
+    };
+    let base_rights = FILE_GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC;
+    let handle = if needs_write_owner {
+        open_with((base_rights | WRITE_OWNER).0).map_err(|error| {
+            format!(
+                "reopen {} with WRITE_OWNER to restore its preserved owner: {error}",
+                path.display()
+            )
+        })?
+    } else {
+        open_with(base_rights.0).map_err(|error| {
+            format!(
+                "reopen {} to restore its preserved security descriptor: {error}",
+                path.display()
+            )
+        })?
+    };
     let held = OwnedHandle(handle).into_file();
     let (held, _, generation) = capture_stable_file(held, path)?;
     if !generation.same_identity(installed) {
@@ -287,57 +352,45 @@ fn restore_preserved_security(
         ));
     }
 
-    let mut owned = preserved.to_vec();
-    let descriptor = PSECURITY_DESCRIPTOR(owned.as_mut_ptr().cast());
+    // A literal descriptor write stores `SE_DACL_AUTO_INHERITED` only when the
+    // request bit accompanies it; without this, restoring a descriptor from an
+    // auto-inherited tree would drop the flag and fail the byte comparison.
+    if control & SE_DACL_AUTO_INHERITED.0 != 0 {
+        unsafe {
+            SetSecurityDescriptorControl(
+                descriptor,
+                SE_DACL_AUTO_INHERIT_REQ,
+                SE_DACL_AUTO_INHERIT_REQ,
+            )
+        }
+        .map_err(|error| format!("request preserved auto-inherit state: {error}"))?;
+    }
 
-    let mut control = 0u16;
-    let mut revision = 0u32;
-    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }
-        .map_err(|error| format!("read preserved descriptor control: {error}"))?;
+    let mut information = DACL_SECURITY_INFORMATION;
+    if owner_changes {
+        information |= OWNER_SECURITY_INFORMATION;
+    }
+    if group_changes {
+        information |= GROUP_SECURITY_INFORMATION;
+    }
+    unsafe { SetKernelObjectSecurity(HANDLE(held.as_raw_handle()), information, descriptor) }
+        .map_err(|error| {
+            format!(
+                "restore preserved security descriptor on {}: {error}",
+                path.display()
+            )
+        })?;
 
-    let mut owner = PSID::default();
-    let mut defaulted = BOOL(0);
-    unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) }
-        .map_err(|error| format!("read preserved owner: {error}"))?;
-    let mut group = PSID::default();
-    unsafe { GetSecurityDescriptorGroup(descriptor, &mut group, &mut defaulted) }
-        .map_err(|error| format!("read preserved group: {error}"))?;
-
-    let mut dacl_present = BOOL(0);
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    unsafe { GetSecurityDescriptorDacl(descriptor, &mut dacl_present, &mut dacl, &mut defaulted) }
-        .map_err(|error| format!("read preserved DACL: {error}"))?;
-
-    // Carry the preserved inheritance decision across. A protected DACL must
-    // stay protected, and an unprotected one must be re-inherited rather than
-    // frozen, or the restored descriptor would not equal the preserved bytes.
-    let inheritance = if control & SE_DACL_PROTECTED.0 != 0 {
-        PROTECTED_DACL_SECURITY_INFORMATION
-    } else {
-        UNPROTECTED_DACL_SECURITY_INFORMATION
-    };
-    let status = unsafe {
-        SetSecurityInfo(
-            HANDLE(held.as_raw_handle()),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | GROUP_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | inheritance,
-            (!owner.is_invalid()).then_some(owner),
-            (!group.is_invalid()).then_some(group),
-            (dacl_present.as_bool() && !dacl.is_null()).then_some(dacl as *const ACL),
-            None,
-        )
-    };
-    if status.0 != 0 {
+    // Re-observe through the SAME handle so the caller compares the exact
+    // post-restore state with no path re-resolution in between.
+    let (_held, _, refreshed) = capture_stable_file(held, path)?;
+    if !refreshed.same_identity(installed) {
         return Err(format!(
-            "restore preserved security descriptor on {}: error {}",
-            path.display(),
-            status.0
+            "{} changed identity while its security descriptor was being restored",
+            path.display()
         ));
     }
-    Ok(())
+    Ok(refreshed)
 }
 
 /// Render a self-relative security descriptor as SDDL for diagnostics.
@@ -842,6 +895,26 @@ fn optional_reparse_tag(
         Ok(None)
     } else {
         reparse_tag(handle).map(Some)
+    }
+}
+
+/// Whether a live observation proves the exact competing file object landed
+/// back, for the post-rollback verification specifically. The rollback is
+/// itself a `ReplaceFileW`, which rewrites the security descriptor of
+/// whichever file it installs (the same merge behavior the publication
+/// restore exists to undo), so byte-identical generations — descriptor and
+/// timestamps included — are not something a rollback can promise. Identity,
+/// size, content digest, and reparse state are what prove the competitor is
+/// back; the descriptor it then carries is its own business.
+fn rollback_landed(live: Option<&FileGeneration>, expected: Option<&FileGeneration>) -> bool {
+    match (live, expected) {
+        (Some(live), Some(expected)) => {
+            live.same_identity(expected)
+                && live.size == expected.size
+                && live.digest == expected.digest
+                && live.reparse_tag == expected.reparse_tag
+        }
+        _ => false,
     }
 }
 
@@ -1503,7 +1576,7 @@ impl PlatformTransaction {
                     ));
                 }
 
-                let installed = match generation_at(&self.destination) {
+                let mut installed = match generation_at(&self.destination) {
                     Ok(generation) => generation,
                     Err(observation_error) => {
                         let recovery_path = recovery
@@ -1523,6 +1596,27 @@ impl PlatformTransaction {
                         ));
                     }
                 };
+                // `ReplaceFileW` rewrote the installed file's security metadata
+                // (merged DACL, creator owner). Put the preserved descriptor
+                // back — but only on the exact identity that was just
+                // installed, so a swapped-in competitor never gets its
+                // descriptor rewritten. The byte-for-byte comparison below then
+                // verifies against the refreshed post-restore observation.
+                let mut restore_failure: Option<String> = None;
+                if let Some(generation) = installed.as_ref() {
+                    if generation.same_identity(&temp.generation)
+                        && generation.security_descriptor != expected_generation.security_descriptor
+                    {
+                        match restore_preserved_security(
+                            &self.destination,
+                            generation,
+                            &expected_generation.security_descriptor,
+                        ) {
+                            Ok(refreshed) => installed = Some(refreshed),
+                            Err(error) => restore_failure = Some(error),
+                        }
+                    }
+                }
                 let displaced = match generation_at(&displaced_path) {
                     Ok(generation) => generation,
                     Err(observation_error) => {
@@ -1597,6 +1691,11 @@ impl PlatformTransaction {
                     }
                     Some(_) => {}
                 }
+                if let Some(error) = restore_failure {
+                    mismatches.push(format!(
+                        "preserved security descriptor could not be restored ({error})"
+                    ));
+                }
                 if !mismatches.is_empty() {
                     // ReplaceFileW's backup captured the exact competing file.
                     // Atomically restore it and keep our attempted replacement
@@ -1607,9 +1706,28 @@ impl PlatformTransaction {
                         && generation_at(&temp.path).is_ok_and(|live| live.is_none());
                     if stable
                         && replace_file_call(&self.destination, &displaced_path, &temp.path).is_ok()
-                        && generation_at(&self.destination).is_ok_and(|live| live == displaced)
+                        && generation_at(&self.destination)
+                            .is_ok_and(|live| rollback_landed(live.as_ref(), displaced.as_ref()))
                         && generation_at(&temp.path).is_ok_and(|live| live == installed)
                     {
+                        // The rollback replace rewrote the restored competitor's
+                        // descriptor exactly the way publication rewrote ours.
+                        // Its identity and bytes are proven back above; put the
+                        // descriptor that was observed on it back too, so the
+                        // competitor is restored in full. Best-effort by
+                        // design — the identity proof is what the error claims.
+                        if let (Ok(Some(live)), Some(displaced_generation)) =
+                            (generation_at(&self.destination), displaced.as_ref())
+                        {
+                            if live.security_descriptor != displaced_generation.security_descriptor
+                            {
+                                let _ = restore_preserved_security(
+                                    &self.destination,
+                                    &live,
+                                    &displaced_generation.security_descriptor,
+                                );
+                            }
+                        }
                         return Err(format!(
                             "{} or its prepared replacement changed at publication ({}); restored the competing destination and published nothing",
                             self.destination.display(),
@@ -2665,25 +2783,85 @@ mod tests {
         );
     }
 
+    /// Create an NTFS junction (mount point) natively. `cmd.exe /c mklink /J`
+    /// rejects the runner's paths outright, so coverage builds the reparse
+    /// point through the same kernel interface Windows itself uses:
+    /// `FSCTL_SET_REPARSE_POINT` with a `MountPointReparseBuffer` payload.
+    /// Junctions, unlike symlinks, require no privilege.
+    fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
+        use windows::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        use windows::Win32::System::IO::DeviceIoControl;
+
+        std::fs::create_dir(link).map_err(|error| format!("create junction dir: {error}"))?;
+        let link_wide = wide(link);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(link_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|error| format!("open junction dir: {error}"))?;
+        let dir = OwnedHandle(handle).into_file();
+
+        let rendered = target.display().to_string();
+        let plain = rendered
+            .strip_prefix(r"\\?\")
+            .unwrap_or(rendered.as_str())
+            .to_string();
+        let substitute: Vec<u16> = format!(r"\??\{plain}").encode_utf16().collect();
+        let print: Vec<u16> = plain.encode_utf16().collect();
+
+        // REPARSE_DATA_BUFFER: tag u32, data-length u16, reserved u16, then the
+        // MountPointReparseBuffer (four u16 offsets/lengths + path buffer with
+        // NUL-terminated substitute and print names).
+        let sub_bytes = substitute.len() * 2;
+        let print_bytes = print.len() * 2;
+        let reparse_data_length = 8 + sub_bytes + 2 + print_bytes + 2;
+        let mut buffer = vec![0u8; 8 + reparse_data_length];
+        buffer[0..4].copy_from_slice(&0xA000_0003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+        buffer[4..6].copy_from_slice(&(reparse_data_length as u16).to_le_bytes());
+        buffer[8..10].copy_from_slice(&0u16.to_le_bytes());
+        buffer[10..12].copy_from_slice(&(sub_bytes as u16).to_le_bytes());
+        buffer[12..14].copy_from_slice(&((sub_bytes + 2) as u16).to_le_bytes());
+        buffer[14..16].copy_from_slice(&(print_bytes as u16).to_le_bytes());
+        let mut cursor = 16;
+        for unit in substitute
+            .iter()
+            .chain(std::iter::once(&0u16))
+            .chain(print.iter())
+            .chain(std::iter::once(&0u16))
+        {
+            buffer[cursor..cursor + 2].copy_from_slice(&unit.to_le_bytes());
+            cursor += 2;
+        }
+        let mut returned = 0u32;
+        unsafe {
+            DeviceIoControl(
+                HANDLE(dir.as_raw_handle()),
+                FSCTL_SET_REPARSE_POINT,
+                Some(buffer.as_ptr().cast()),
+                buffer.len() as u32,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|error| format!("set reparse point: {error}"))
+    }
+
     #[test]
     fn junction_parent_swap_is_rejected() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let junction = root.path().join("junction");
-        let command = format!(
-            "mklink /J \"{}\" \"{}\"",
-            junction.display(),
-            outside.path().display()
-        );
-        let output = std::process::Command::new("cmd.exe")
-            .args(["/D", "/S", "/C", &command])
-            .output()
-            .expect("cmd.exe is available on Windows");
-        assert!(
-            output.status.success(),
-            "junction coverage setup failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        create_junction(&junction, outside.path())
+            .unwrap_or_else(|error| panic!("junction coverage setup failed: {error}"));
         let path = junction.join("config.json");
         assert!(update_with_backup(&path, root.path(), "new").is_err());
         assert!(!outside.path().join("config.json").exists());
@@ -3061,7 +3239,17 @@ mod tests {
         assert_eq!(generation_at(&path).unwrap(), Some(original_generation));
         let attacker_path = attacker_path.unwrap();
         assert_eq!(fs::read_to_string(&attacker_path).unwrap(), "attacker-temp");
-        assert_eq!(generation_at(&attacker_path).unwrap(), attacker_generation);
+        // The aborted publication briefly installed the attacker's file at the
+        // destination, where ReplaceFileW rewrote that file's own security
+        // descriptor (the merge behavior the restore path exists to undo for
+        // OUR files). Retention promises the attacker's exact identity and
+        // bytes were kept out of the destination — not that the attacker's
+        // descriptor survived the attempt unchanged.
+        let mut retained = generation_at(&attacker_path).unwrap().unwrap();
+        let mut expected = attacker_generation.unwrap();
+        retained.security_descriptor.clear();
+        expected.security_descriptor.clear();
+        assert_eq!(retained, expected);
         assert_eq!(fs::read_to_string(&held_prepared).unwrap(), "tirith-update");
         assert_eq!(generation_at(&held_prepared).unwrap(), prepared_generation);
     }
