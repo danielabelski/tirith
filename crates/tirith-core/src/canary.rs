@@ -650,12 +650,20 @@ pub fn rotate_at(store: &Path, id: &str) -> std::io::Result<Option<CanaryEntry>>
                         entry.id, entry.kind
                     ))
                 })?;
-                entry.token = match generate_token(kind) {
-                    Some(token) => token,
-                    // Entropy failure: keep the previous token rather than
-                    // rotating to a predictable one.
-                    None => return Ok(None),
-                };
+                entry.token =
+                    match generate_token(kind) {
+                        Some(token) => token,
+                        // Entropy failure: keep the previous token rather than
+                        // rotating to a predictable one — but report it as a
+                        // refusal, not as `Ok(None)`. That value already means "no
+                        // such id" here, so reusing it would tell an operator their
+                        // canary does not exist while it silently keeps its old
+                        // token. `create_at` refuses the same condition this way.
+                        // The store is not rewritten on this path.
+                        None => return Err(std::io::Error::other(
+                            "OS entropy unavailable; refusing to rotate to a predictable canary",
+                        )),
+                    };
                 entry.created_at = chrono::Utc::now().to_rfc3339();
                 updated = Some(entry.clone());
                 out_lines.push(serde_json::to_string(&entry).map_err(std::io::Error::other)?);
