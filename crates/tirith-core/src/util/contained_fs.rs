@@ -1289,7 +1289,31 @@ mod platform {
             ) {
                 Ok(Some(handle)) => handle,
                 Ok(None) => return Err(OpenRegularError::NotFound),
-                Err(error) => return Err(OpenRegularError::Io(error)),
+                Err(error) => {
+                    // `FILE_NON_DIRECTORY_FILE` makes the open ITSELF fail when
+                    // a directory sits at the leaf, unlike the Unix arm where
+                    // the open succeeds and fstat classifies. Probe the name
+                    // once with directories permitted so a directory or reparse
+                    // point classifies as NotRegularFile, exactly as it would
+                    // have via `inspect_regular`.
+                    if let Ok(probe) = nt_open_relative(
+                        self.parent.handle.0,
+                        &self.parent.path,
+                        &self.name,
+                        FILE_READ_ATTRIBUTES,
+                        FILE_OPEN,
+                        0,
+                        FILE_ATTRIBUTE_NORMAL,
+                    ) {
+                        if inspect_regular(probe.0, &self.display)
+                            .err()
+                            .is_some_and(|error| error.kind() == io::ErrorKind::InvalidInput)
+                        {
+                            return Err(OpenRegularError::NotRegularFile);
+                        }
+                    }
+                    return Err(OpenRegularError::Io(error));
+                }
             };
             let size = inspect_regular(handle.0, &self.display).map_err(|error| {
                 if error.kind() == io::ErrorKind::InvalidInput {

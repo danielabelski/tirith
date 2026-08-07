@@ -10127,6 +10127,11 @@ policy:
         );
     }
 
+    // Strict execution-state preparation is Unix-only; on Windows every guarded
+    // call is denied `strict_state_unavailable` BEFORE the pending-table check,
+    // so the duplicate envelope this test pins is unreachable there (and the
+    // fail-closed platform denial is itself the contract).
+    #[cfg(unix)]
     #[test]
     fn test_handle_guarded_call_duplicate_active_id_denies() {
         // End to end: a guarded forward whose id is already pending is denied with

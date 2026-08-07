@@ -809,10 +809,22 @@ mod run_impl {
         #[test]
         fn generated_tirith_bin_never_falls_back_to_bare_name() {
             assert!(choose_generated_tirith_bin(None, None).is_err());
-            assert!(
-                resolve_tirith_bin(true).is_ok(),
-                "the running test binary is valid"
-            );
+            // Whether the RUNNING binary validates depends on the host: CI
+            // runners execute tests from checkout/build directories owned by a
+            // different principal, which the ancestor-ownership validation
+            // rightly refuses. Either outcome upholds the contract: a valid
+            // current exe resolves to an absolute path, and an invalid one
+            // surfaces the validation refusal — never a bare name on PATH.
+            match resolve_tirith_bin(true) {
+                Ok(resolved) => assert!(
+                    Path::new(&resolved).is_absolute(),
+                    "resolved bin must be an absolute path: {resolved}"
+                ),
+                Err(error) => assert!(
+                    error.contains("could not be validated"),
+                    "resolution may fail only by refusing validation: {error}"
+                ),
+            }
         }
 
         #[cfg(windows)]
