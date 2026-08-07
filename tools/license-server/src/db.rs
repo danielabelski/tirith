@@ -201,7 +201,7 @@ impl Db {
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
-                   status=CASE WHEN subscriptions.status='revoked' THEN 'revoked' ELSE subscriptions.status END,
+                   status=CASE WHEN subscriptions.status='revoked' THEN 'revoked' ELSE 'active' END,
                    email=excluded.email, product_id=excluded.product_id, tier=excluded.tier,
                    last_event_at=MAX(COALESCE(subscriptions.last_event_at,''), excluded.last_event_at),
                    updated_at=datetime('now')",
