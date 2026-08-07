@@ -1160,6 +1160,29 @@ mod platform {
         }
     }
 
+    /// Whether the named leaf currently holds something that is not a regular
+    /// file (a directory or a reparse point), probed with directories
+    /// permitted. Used to classify a failed regular-file open into
+    /// `NotRegularFile` and to keep `prepare` from refusing the parent bind
+    /// over the leaf's shape. `false` on any probe failure so callers fall
+    /// back to the original error.
+    fn non_regular_leaf(parent: &HeldDirectory, name: &OsStr, display: &Path) -> bool {
+        match nt_open_relative(
+            parent.handle.0,
+            &parent.path,
+            name,
+            FILE_READ_ATTRIBUTES,
+            FILE_OPEN,
+            0,
+            FILE_ATTRIBUTE_NORMAL,
+        ) {
+            Ok(probe) => inspect_regular(probe.0, display)
+                .err()
+                .is_some_and(|error| error.kind() == io::ErrorKind::InvalidInput),
+            Err(_) => false,
+        }
+    }
+
     fn inspect_regular(handle: HANDLE, display: &Path) -> io::Result<u64> {
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: handle is live and `info` is writable.
@@ -1233,7 +1256,17 @@ mod platform {
                         )
                     })?;
             }
-            inspect_destination(&parent, name, &absolute_path)?;
+            match inspect_destination(&parent, name, &absolute_path) {
+                Ok(_) => {}
+                // A directory or reparse point AT THE LEAF must not fail the
+                // bind: prepare's guarantee is the retained parent capability,
+                // and the leaf's shape classifies at read/write time as
+                // NotRegularFile — the same deferred classification the Unix
+                // arm gets from fstat after a successful open. Any other
+                // inspection failure still refuses the bind.
+                Err(_) if non_regular_leaf(&parent, name, &absolute_path) => {}
+                Err(error) => return Err(error),
+            }
             Ok(Self {
                 _root: root_handle,
                 parent,
@@ -1258,21 +1291,8 @@ mod platform {
                     // once with directories permitted so a directory or reparse
                     // point classifies as NotRegularFile, exactly as it would
                     // have via `inspect_regular`.
-                    if let Ok(probe) = nt_open_relative(
-                        self.parent.handle.0,
-                        &self.parent.path,
-                        &self.name,
-                        FILE_READ_ATTRIBUTES,
-                        FILE_OPEN,
-                        0,
-                        FILE_ATTRIBUTE_NORMAL,
-                    ) {
-                        if inspect_regular(probe.0, &self.display)
-                            .err()
-                            .is_some_and(|error| error.kind() == io::ErrorKind::InvalidInput)
-                        {
-                            return Err(OpenRegularError::NotRegularFile);
-                        }
+                    if non_regular_leaf(&self.parent, &self.name, &self.display) {
+                        return Err(OpenRegularError::NotRegularFile);
                     }
                     return Err(OpenRegularError::Io(error));
                 }
