@@ -2549,11 +2549,13 @@ fn resolver_component_is_root_managed(component: &Path) -> bool {
 /// component is proven during the pass, which this preserves: it only skips
 /// re-proving a directory this same pass already accepted. A caller that needs
 /// a fresh proof starts a new `ProvenChain`.
+#[cfg(unix)]
 #[derive(Default)]
 struct ProvenChain {
     proven: std::collections::BTreeSet<PathBuf>,
 }
 
+#[cfg(unix)]
 impl ProvenChain {
     fn path_chain_is_secure(&mut self, path: &Path) -> bool {
         let mut pending: Vec<&Path> = Vec::new();
@@ -2581,6 +2583,7 @@ impl ProvenChain {
     }
 }
 
+#[cfg(unix)]
 fn resolver_root_managed_path_chain_is_secure(path: &Path) -> bool {
     ProvenChain::default().path_chain_is_secure(path)
 }

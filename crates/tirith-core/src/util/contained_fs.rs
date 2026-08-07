@@ -884,13 +884,15 @@ mod platform {
                 hook(display_parent, name);
             }
         });
-        let mut name = relative_name(name)?;
-        let byte_len = u16::try_from(name.len() * std::mem::size_of::<u16>())
+        // Keep the caller's `name` in scope: the error path below joins it onto
+        // `display_parent` for the diagnostic, and a UTF-16 buffer is not a path.
+        let mut encoded_name = relative_name(name)?;
+        let byte_len = u16::try_from(encoded_name.len() * std::mem::size_of::<u16>())
             .map_err(|_| invalid_input("descriptor-relative Windows name is too long"))?;
         let unicode_name = UNICODE_STRING {
             Length: byte_len,
             MaximumLength: byte_len,
-            Buffer: name.as_mut_ptr(),
+            Buffer: encoded_name.as_mut_ptr(),
         };
         let object_attributes = OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
