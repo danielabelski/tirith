@@ -1675,12 +1675,17 @@ mod tests {
     #[test]
     fn bash_s_double_dash_reads_reviewed_bytes_from_stdin() {
         let content = b"#!/usr/bin/env node\nprintf '<%s>\\n' \"$1\"\n";
-        let mut child = Command::new("bash")
+        // A Unix host without bash is a real target (busybox on Alpine), so a
+        // missing interpreter is not a failure of this contract.
+        let Ok(mut child) = Command::new("bash")
             .args(["-s", "--", "feature"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
-            .expect("spawn bash stdin contract");
+        else {
+            eprintln!("skipping: bash is not installed on this host");
+            return;
+        };
         child
             .stdin
             .take()
