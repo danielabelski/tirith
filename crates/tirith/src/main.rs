@@ -983,7 +983,7 @@ Examples:
     /// Show remediation and interactively apply a verified rewrite when available
     #[command(after_help = "\
 Thin presenter over `tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_and_session()`
-— the same verified engine backing `tirith check --suggest-safe-command`. Compatible
+— the same verified engine backing `tirith check --suggest`. Compatible
 remediations are composed and the exact final command is re-analyzed under the
 same shell, context, and policy. Only a verified Allow result from the typed,
 fail-closed pipe runner is exposed as `safe_command` or printed on stdout. This
@@ -2210,7 +2210,7 @@ What it protects:
   When `guard` is ON, the exec hot path flags (i) a sensitive env var set while
   a command pipes remote content into a shell (curl|bash), and (ii) printenv/env
   piped into a network sink (curl/nc). The sensitive list is the same one the
-  `--suggest-safe-command` environment-scrubbing guidance uses; extend it via
+  `--suggest` environment-scrubbing guidance uses; extend it via
   policy.env_guard_sensitive_vars.
 
 Value safety (load-bearing):
