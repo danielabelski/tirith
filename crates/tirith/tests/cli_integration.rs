@@ -1950,10 +1950,20 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
             );
         }
         let status = guard.wait().expect("reap guarded capsule leader");
-        assert_eq!(
+        // Same contract as the earlier observation: the guard ABSORBS a fatal
+        // signal delivered to its contained target and reports it as its own
+        // exit status, `128 + signal`. So it may either die by the SIGKILL —
+        // when the group kill reaches it before it has absorbed anything — or
+        // exit carrying the absorbed form. `ExitStatus::signal()` is `None` in
+        // the second case, which is why asserting only the first asserted the
+        // shape the guard is built not to produce.
+        let absorbed_sigkill = 128 + libc::SIGKILL;
+        assert!(
+            status.signal() == Some(libc::SIGKILL) || status.code() == Some(absorbed_sigkill),
+            "guard must die by the hostile SIGKILL or report its absorbed form \
+             ({absorbed_sigkill}); observed signal={:?} code={:?}",
             status.signal(),
-            Some(libc::SIGKILL),
-            "guard must die by the hostile SIGKILL or the deadline cleanup SIGKILL"
+            status.code()
         );
         assert!(
             process_group_disappears(group, std::time::Duration::from_secs(5)),
