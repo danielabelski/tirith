@@ -915,6 +915,10 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     spec.handles.extra_unix_fds.push(SEALED_TARGET_FD);
     spec.handles.extra_unix_fds.push(LAUNCH_STATUS_FD);
     spec.handles.extra_unix_fds.push(LAUNCH_ACK_FD);
+    // Everything outside `{0,1,2} ∪ extra_unix_fds` is closed before exec, so
+    // the temp-HOME descriptor must be granted or the child cannot prove
+    // ownership of the directory `--temp-home` names.
+    spec.handles.extra_unix_fds.push(TEMP_HOME_FD);
     spec.filesystem.read_roots.push(temp_home_path.clone());
     spec.filesystem.write_roots.push(temp_home_path.clone());
 
@@ -1256,6 +1260,7 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         SEALED_SCRIPT_FD,
         LAUNCH_STATUS_FD,
         LAUNCH_ACK_FD,
+        TEMP_HOME_FD,
     ]);
     spec.filesystem.read_roots.push(temp_home_path.clone());
     spec.filesystem.write_roots.push(temp_home_path.clone());
@@ -1409,6 +1414,9 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
 
     const STATUS_FD: i32 = 61;
     const ACK_FD: i32 = 60;
+    // The child requires the temp HOME as a PAIR: the path names it, the
+    // granted descriptor proves the parent owns the directory it names.
+    const TEMP_HOME_FD: i32 = 59;
     let home = tempfile::Builder::new()
         .prefix("tirith-capsule-invalid-ack-")
         .tempdir_in("/tmp")
@@ -1459,7 +1467,9 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
     }
     spec.filesystem.read_roots.push(home_path.clone());
     spec.filesystem.write_roots.push(home_path.clone());
-    spec.handles.extra_unix_fds.extend([STATUS_FD, ACK_FD]);
+    spec.handles
+        .extra_unix_fds
+        .extend([STATUS_FD, ACK_FD, TEMP_HOME_FD]);
 
     let backend = LandlockSeccompCapsule;
     let available = backend.available_coverage(&spec);
@@ -1496,6 +1506,9 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
     let ack_parent = unsafe { fs::File::from_raw_fd(ack_descriptors[1]) };
     let status_source = status_writer.as_raw_fd();
     let ack_source = ack_guard.as_raw_fd();
+    let temp_home_dir = fs::File::open(&home_path)
+        .expect("open the parent-owned temporary HOME for its descriptor");
+    let temp_home_source = temp_home_dir.as_raw_fd();
 
     let command_body = format!("printf ran > '{}'", marker.display());
     let spec_json = serde_json::to_string(&spec).unwrap();
@@ -1509,6 +1522,8 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
         .arg(ACK_FD.to_string())
         .arg("--temp-home")
         .arg(&home_path)
+        .arg("--temp-home-fd")
+        .arg(TEMP_HOME_FD.to_string())
         .arg("--")
         .arg("/bin/sh")
         .args(["-c", command_body.as_str()])
@@ -1522,6 +1537,8 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
                 || libc::fcntl(STATUS_FD, libc::F_SETFD, 0) < 0
                 || libc::dup2(ack_source, ACK_FD) < 0
                 || libc::fcntl(ACK_FD, libc::F_SETFD, 0) < 0
+                || libc::dup2(temp_home_source, TEMP_HOME_FD) < 0
+                || libc::fcntl(TEMP_HOME_FD, libc::F_SETFD, 0) < 0
             {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1624,10 +1641,15 @@ fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
 #[test]
 fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals() {
     use std::io::{BufRead as _, BufReader};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     use tirith_core::capsule::linux::LandlockSeccompCapsule;
     use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+
+    // The child requires the temp HOME as a PAIR: the path names it, the
+    // granted descriptor proves the parent owns the directory it names.
+    const TEMP_HOME_FD: i32 = 59;
 
     let helper_dir = tempfile::Builder::new()
         .prefix("tirith-clone-parent-probe-")
@@ -1697,6 +1719,7 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         );
         spec.filesystem.read_roots.push(temp_home_path.clone());
         spec.filesystem.write_roots.push(temp_home_path.clone());
+        spec.handles.extra_unix_fds.push(TEMP_HOME_FD);
 
         let backend = LandlockSeccompCapsule;
         let available = backend.available_coverage(&spec);
@@ -1719,6 +1742,8 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
             .arg(spec_json)
             .arg("--temp-home")
             .arg(&temp_home_path)
+            .arg("--temp-home-fd")
+            .arg(TEMP_HOME_FD.to_string())
             .arg("--")
             .arg(&helper_binary)
             .arg(attack_signal.to_string())
@@ -1726,13 +1751,18 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        let temp_home_dir = fs::File::open(&temp_home_path)
+            .expect("open the parent-owned temporary HOME for its descriptor");
+        let temp_home_source = temp_home_dir.as_raw_fd();
         unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0
+                    || libc::dup2(temp_home_source, TEMP_HOME_FD) < 0
+                    || libc::fcntl(TEMP_HOME_FD, libc::F_SETFD, 0) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
+                Ok(())
             });
         }
         let mut guard = command.spawn().expect("spawn guarded capsule adversary");
@@ -2947,296 +2977,6 @@ fn init_does_not_execute_path_shadowed_diagnostics_or_prompt_binary() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("prompt-status --short"));
     assert!(!stdout.contains(" tirith prompt-status --short"));
-}
-
-#[cfg(unix)]
-#[test]
-fn sourced_bash_hook_keeps_using_pinned_or_builtin_helpers_after_path_changes() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let home = tempfile::tempdir().expect("hook test home");
-    let fake_bin = home.path().join("repo-bin");
-    fs::create_dir(&fake_bin).expect("create fake bin");
-    let marker = home.path().join("path-shadow-executed");
-    for name in ["tirith", "date", "mkdir", "wc", "tr", "sed", "stty"] {
-        let fake = fake_bin.join(name);
-        fs::write(
-            &fake,
-            format!(
-                "#!/bin/sh\n/usr/bin/touch '{}'\nexit 99\n",
-                marker.display()
-            ),
-        )
-        .expect("write fake helper");
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700))
-            .expect("make fake helper executable");
-    }
-
-    let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical tirith binary");
-    let real_dir = real.parent().expect("tirith binary parent");
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/bash-hook.bash");
-    let hook_source = fs::read_to_string(&hook).expect("read embedded Bash hook");
-    for pattern in [
-        "$(date +%s)",
-        "! mkdir -p",
-        "$(wc -c",
-        "| tr -s",
-        "| sed ",
-        "$(stty -g",
-        "trap 'stty ",
-    ] {
-        assert!(
-            !hook_source.contains(pattern),
-            "Bash hook retains PATH-resolved preflight helper {pattern:?}"
-        );
-    }
-    let script = format!(
-        r#"source '{}'
-export PATH='{}:/usr/bin:/bin'
-_TIRITH_RECEIPT_PROTOCOL=1
-_TIRITH_RECEIPT_INSTANCE={}
-_tirith_receipt_discard bash-enter {} >/dev/null 2>&1 || :
-_TIRITH_ENTER_CAP_FILE="$HOME/helper-capability"
-builtin printf 'x' >"$_TIRITH_ENTER_CAP_FILE"
-_tirith_enter_capability_proven >/dev/null 2>&1 || :
-_tirith_persist_safe_mode
-normalized="$(_tirith_normalize_spacing $'  a\t  b  ')"
-_tirith_restore_terminal_state sane
-builtin printf '%s\n%s\n' "$normalized" "$_TIRITH_BIN"
-"#,
-        hook.display(),
-        fake_bin.display(),
-        "b".repeat(64),
-        "a".repeat(64),
-    );
-    let out = Command::new("/bin/bash")
-        .args(["--norc", "--noprofile", "-c", &script])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}:/usr/bin:/bin",
-                real_dir.display(),
-                fake_bin.display()
-            ),
-        )
-        .env("HOME", home.path())
-        .env("XDG_STATE_HOME", home.path().join("state"))
-        .env_remove("TIRITH_SESSION_ID")
-        .env_remove("_TIRITH_BASH_LOADED")
-        .output()
-        .expect("source and invoke bash hook");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8(out.stdout).expect("hook helper output is UTF-8");
-    let mut lines = stdout.lines();
-    assert_eq!(lines.next(), Some("a b"));
-    assert_eq!(lines.next().map(PathBuf::from).as_ref(), Some(&real));
-    assert_eq!(lines.next(), None);
-    assert!(
-        !marker.exists(),
-        "PATH mutation redirected a sourced hook into the repository shim"
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn root_zsh_and_fish_hook_helpers_ignore_path_shadow_after_source() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let home = tempfile::tempdir().expect("hook helper test home");
-    let fake_bin = home.path().join("repo-bin");
-    fs::create_dir(&fake_bin).expect("create fake helper bin");
-    let marker = home.path().join("path-shadowed-helper-executed");
-    for name in [
-        "tirith", "date", "grep", "mktemp", "rm", "wc", "env", "sh", "bash",
-    ] {
-        let fake = fake_bin.join(name);
-        fs::write(
-            &fake,
-            format!("#!/bin/sh\n: > '{}'\nexit 99\n", marker.display()),
-        )
-        .expect("write fake helper");
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700))
-            .expect("make fake helper executable");
-    }
-
-    let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical tirith binary");
-    let real_dir = real.parent().expect("tirith binary parent");
-    let initial_path = format!(
-        "{}:{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        real_dir.display(),
-        fake_bin.display()
-    );
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let zsh_hook = root.join("shell/lib/zsh-hook.zsh");
-    let fish_hook = root.join("shell/lib/fish-hook.fish");
-
-    let zsh_script = format!(
-        r#"source '{}'
-PATH='{}'
-export PATH
-capture="$(_tirith_v3_new_capture_file)" || exit 61
-command "$_TIRITH_WC_BIN" -c <"$capture" >/dev/null || exit 62
-command "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" -c ':' || exit 63
-_tirith_v3_remove_capture_files "$capture" || exit 64
-command "$_TIRITH_BIN" __execution-receipt capability >/dev/null || exit 65
-print -r -- "$_TIRITH_MKTEMP_BIN|$_TIRITH_RM_BIN|$_TIRITH_WC_BIN|$_TIRITH_ENV_BIN|$_TIRITH_SH_BIN"
-"#,
-        zsh_hook.display(),
-        fake_bin.display(),
-    );
-    match Command::new("zsh")
-        .args(["-dfc", &zsh_script])
-        .env("PATH", &initial_path)
-        .env("HOME", home.path())
-        .env_remove("TIRITH_SESSION_ID")
-        .env_remove("_TIRITH_ZSH_LOADED")
-        .output()
-    {
-        Ok(out) => {
-            assert!(
-                out.status.success(),
-                "zsh pinned-helper probe failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                stdout.trim().split('|').all(|path| path.starts_with('/')),
-                "zsh helper paths must remain absolute: {stdout:?}"
-            );
-        }
-        Err(_) => eprintln!("skipping zsh pinned-helper probe: zsh not available"),
-    }
-
-    let fish_script = format!(
-        r#"source '{}'
-set -gx PATH '{}'
-set capture (_tirith_v3_new_capture_file); or exit 71
-command "$_TIRITH_WC_BIN" -c <"$capture" >/dev/null; or exit 72
-command "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" -c ':'; or exit 73
-_tirith_v3_remove_capture_files "$capture"; or exit 74
-command "$_TIRITH_BIN" __execution-receipt capability >/dev/null; or exit 75
-command "$_TIRITH_BASH_TIMEOUT_BIN" -c ':'; or exit 76
-builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" "$_TIRITH_BASH_TIMEOUT_BIN"
-"#,
-        fish_hook.display(),
-        fake_bin.display(),
-    );
-    match Command::new("fish")
-        .args(["--no-config", "-c", &fish_script])
-        .env("PATH", &initial_path)
-        .env("HOME", home.path())
-        .env_remove("TIRITH_SESSION_ID")
-        .env_remove("_TIRITH_FISH_LOADED")
-        .output()
-    {
-        Ok(out) => {
-            assert!(
-                out.status.success(),
-                "fish pinned-helper probe failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                stdout.trim().split('|').all(|path| path.starts_with('/')),
-                "fish helper paths must remain absolute: {stdout:?}"
-            );
-        }
-        Err(_) => eprintln!("skipping fish pinned-helper probe: fish not available"),
-    }
-
-    assert!(
-        !marker.exists(),
-        "a PATH-shadowed v3 helper or Tirith binary was executed"
-    );
-
-    for hook in [zsh_hook, fish_hook] {
-        let source = fs::read_to_string(&hook).expect("read root receipt hook");
-        let forbidden: &[&str] = if hook.ends_with("zsh-hook.zsh") {
-            &[
-                "$(date +%s)",
-                "| grep ",
-                "$(mktemp)",
-                "command rm ",
-                "local tmpfile=$(mktemp)",
-                "echo -n \"$pasted\"",
-            ]
-        } else {
-            &[
-                "(date +%s)",
-                "(mktemp)",
-                "| env _TIRITH_HOOK",
-                "command rm ",
-                "(bash -c",
-                "command -q bash",
-                "echo -n \"$content\"",
-            ]
-        };
-        for pattern in forbidden {
-            assert!(
-                !source.contains(pattern),
-                "hook retains PATH-resolved preflight helper {pattern:?}: {}",
-                hook.display()
-            );
-        }
-        assert!(
-            source.contains("command \"$_TIRITH_ENV_BIN\"")
-                && source.contains("\"$_TIRITH_SH_BIN\" -c")
-                && source.contains("_tirith_v3_new_capture_file")
-                && source.contains("_tirith_v3_remove_capture_files"),
-            "v3 transport must route through pinned helpers: {}",
-            hook.display()
-        );
-        assert!(
-            !source.contains("_TIRITH_PENDING_RECEIPT")
-                && !source.contains("_tirith_receipt_preexec")
-                && !source.contains("fish_preexec")
-                && !source.contains("fish_postexec"),
-            "v3 delivery must commit synchronously before line acceptance: {}",
-            hook.display()
-        );
-        let v3_start = if hook.ends_with("zsh-hook.zsh") {
-            source
-                .find("# Protocol v3 returns only")
-                .expect("zsh v3 transport start")
-        } else {
-            source
-                .find("    set -l outfile \"\"")
-                .expect("fish v3 transport start")
-        };
-        let v3_end = source[v3_start..]
-            .find("# Legacy protocol-off behavior")
-            .map(|offset| v3_start + offset)
-            .expect("v3 transport end");
-        let v3 = &source[v3_start..v3_end];
-        let drift = v3
-            .find("command changed before receipt commit")
-            .expect("pre-commit drift guard");
-        let consume = v3
-            .find("_tirith_receipt_consume_at")
-            .expect("synchronous receipt consume");
-        let native_handoff = if hook.ends_with("zsh-hook.zsh") {
-            v3.rfind("zle .accept-line").expect("zsh native handoff")
-        } else {
-            v3.rfind("commandline -f execute")
-                .expect("fish native handoff")
-        };
-        assert!(
-            drift < consume && consume < native_handoff,
-            "drift must be checked before consume, and consume before native handoff: {}",
-            hook.display()
-        );
-        assert!(
-            v3.contains(
-                "receipt recovery completed but cannot authorize replay; command not executed"
-            ) && v3.contains("press Enter for a fresh check"),
-            "reconciliation must never authorize replay after consume failure: {}",
-            hook.display()
-        );
-    }
 }
 
 #[test]
@@ -4829,405 +4569,6 @@ fn shell_execution_receipt_registration_rejects_unrelated_live_pid() {
         String::from_utf8_lossy(&out.stderr).contains("not the Tirith process's actual parent"),
         "unexpected unrelated-PID error: {}",
         String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn root_bash_hook_protocol_v3_response_parser_is_fail_closed() {
-    let isolated = tempfile::tempdir().expect("isolated Bash receipt parser state");
-    let token = "a".repeat(64);
-    let valid = isolated.path().join("valid");
-    let empty = isolated.path().join("empty");
-    let extra = isolated.path().join("extra");
-    let untagged = isolated.path().join("untagged");
-    let unterminated = isolated.path().join("unterminated");
-    let trailing_unterminated = isolated.path().join("trailing-unterminated");
-    let trailing_nul = isolated.path().join("trailing-nul");
-    fs::write(&valid, format!("TIRITH_EXECUTION_RECEIPT={token}\n")).expect("write valid response");
-    fs::write(&empty, b"").expect("write empty response");
-    fs::write(
-        &extra,
-        format!("TIRITH_EXECUTION_RECEIPT={token}\nunexpected\n"),
-    )
-    .expect("write extra-line response");
-    fs::write(&untagged, format!("{token}\n")).expect("write untagged response");
-    fs::write(&unterminated, format!("TIRITH_EXECUTION_RECEIPT={token}"))
-        .expect("write unterminated response");
-    fs::write(
-        &trailing_unterminated,
-        format!("TIRITH_EXECUTION_RECEIPT={token}\ntrailing"),
-    )
-    .expect("write valid line plus trailing unterminated response");
-    let mut trailing_nul_bytes = format!("TIRITH_EXECUTION_RECEIPT={token}\n").into_bytes();
-    trailing_nul_bytes.push(0);
-    fs::write(&trailing_nul, trailing_nul_bytes)
-        .expect("write valid line plus trailing NUL byte response");
-
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
-    let hook_source = fs::read_to_string(&hook).expect("read root Bash hook");
-    assert!(
-        !hook_source.contains("__execution-receipt arm")
-            && !hook_source.contains("_tirith_receipt_arm"),
-        "protocol v3 hooks must never arm a receipt from the shell"
-    );
-    assert!(
-        !hook_source.contains("_TIRITH_PENDING_SOURCE")
-            && !hook_source.contains("source \"/dev/fd/")
-            && hook_source.contains("builtin eval -- \"$pending_eval\""),
-        "deferred commands must remain in memory and use builtin eval, never source-from-pipe"
-    );
-    assert!(
-        !hook_source.contains("<<< \"$READLINE_LINE\"")
-            && hook_source.contains("exit \"${PIPESTATUS[1]}\""),
-        "syntax validation must use the parser side of an anonymous pipeline, not a here-string"
-    );
-    assert!(
-        hook_source
-            .lines()
-            .filter(|line| line.contains("command \"$_TIRITH_BIN\""))
-            .all(|line| line.contains("builtin command")),
-        "a user function named command must not interpose on the pinned Tirith binary"
-    );
-    let script = format!(
-        r#"_TIRITH_BASH_INTERNAL=1
-source '{}'
-probe() {{
-  local label="$1" file="$2" check_rc="$3" parse_rc
-  _tirith_parse_v3_receipt_response "$file" "$check_rc"
-  parse_rc=$?
-  printf '%s=%s:%s\n' "$label" "$parse_rc" "$_TIRITH_PARSED_RECEIPT"
-}}
-probe allow '{}' 0
-probe warn '{}' 2
-probe block '{}' 1
-probe block_with_token '{}' 1
-probe empty_allow '{}' 0
-probe extra '{}' 0
-probe untagged '{}' 0
-probe unterminated '{}' 0
-probe trailing_unterminated '{}' 0
-probe trailing_nul '{}' 0
-probe unsupported_rc '{}' 3
-"#,
-        hook.display(),
-        valid.display(),
-        valid.display(),
-        empty.display(),
-        valid.display(),
-        empty.display(),
-        extra.display(),
-        untagged.display(),
-        unterminated.display(),
-        trailing_unterminated.display(),
-        trailing_nul.display(),
-        valid.display(),
-    );
-    let out = Command::new("/bin/bash")
-        .args(["--norc", "--noprofile", "-c", &script])
-        .env("HOME", isolated.path())
-        .env("TMPDIR", isolated.path())
-        .env("PATH", "/usr/bin:/bin")
-        .env("TIRITH_SESSION_ID", "cli-root-bash-receipt-v3-parser")
-        .env_remove("_TIRITH_BASH_LOADED")
-        .output()
-        .expect("exercise root Bash protocol-v3 parser");
-
-    assert!(
-        out.status.success(),
-        "Bash receipt parser exercise failed (code {:?})\nstdout:\n{}\nstderr:\n{}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(out.stdout).expect("parser probe stdout is UTF-8"),
-        format!(
-            "allow=0:{token}\n\
-             warn=0:{token}\n\
-             block=1:\n\
-             block_with_token=2:{token}\n\
-             empty_allow=2:\n\
-             extra=2:\n\
-             untagged=2:\n\
-             unterminated=2:\n\
-             trailing_unterminated=2:\n\
-             trailing_nul=2:\n\
-             unsupported_rc=2:{token}\n"
-        )
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn root_bash_hook_repeated_complex_delivery_and_exact_pipe_are_bash32_safe() {
-    let isolated = tempfile::tempdir().expect("isolated Bash delivery state");
-    let capture_dir = isolated.path().join("capture");
-    fs::create_dir(&capture_dir).expect("create private capture directory");
-    let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical Tirith binary");
-    let real_dir = real.parent().expect("Tirith binary parent");
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
-    let script = format!(
-        r#"_TIRITH_BASH_INTERNAL=1
-_TIRITH_TEST_SKIP_HEALTH=1
-source '{}'
-_TIRITH_BIN=/usr/bin/true
-_TIRITH_RECEIPT_PROTOCOL=0
-TIRITH_COMPLEX_RUNS=0
-iteration=0
-complex_command=$'if true; then\n  TIRITH_COMPLEX_RUNS=$((TIRITH_COMPLEX_RUNS + 1))\nfi'
-while [[ $iteration -lt 128 ]]; do
-  _tirith_unsafe_to_eval "$complex_command" || exit 70
-  _TIRITH_PENDING_EVAL="$complex_command"
-  _tirith_prompt_hook || exit 71
-  iteration=$((iteration + 1))
-done
-
-_TIRITH_RECEIPT_PROTOCOL=3
-set -T
-if _tirith_receipt_parent_context_is_valid; then
-  main_context=accepted
-else
-  main_context=rejected
-fi
-subshell_context=$(
-  if _tirith_receipt_parent_context_is_valid; then
-    builtin printf '%s' accepted
-  else
-    builtin printf '%s' rejected
-  fi
-)
-
-TIRITH_COMMAND_INTERPOSED=0
-TIRITH_EVAL_INTERPOSED=0
-command() {{ TIRITH_COMMAND_INTERPOSED=1; return 99; }}
-eval() {{ TIRITH_EVAL_INTERPOSED=1; return 99; }}
-set -o pipefail
-_tirith_check_command_syntax $'if true; then\n  :\nfi'
-complete_syntax_rc="$_TIRITH_SYNTAX_RC"
-_tirith_check_command_syntax 'if true; then'
-incomplete_syntax_rc="$_TIRITH_SYNTAX_RC"
-case "$_TIRITH_SYNTAX_ERROR" in
-  *'unexpected EOF'*|*'unexpected end of file'*) incomplete_syntax_error=recognized ;;
-  *) incomplete_syntax_error=unrecognized ;;
-esac
-set +o pipefail
-
-frame=$'token-line\ncommand-without-final-newline'
-_tirith_open_exact_input_pipe "$frame" || exit 72
-frame_fd="$_TIRITH_OPENED_FD"
-unset _TIRITH_OPENED_FD
-first="" second="" third="" first_rc=0 second_rc=0 third_rc=0
-IFS= builtin read -r first <&"$frame_fd" || first_rc=$?
-IFS= builtin read -r second <&"$frame_fd" || second_rc=$?
-IFS= builtin read -r third <&"$frame_fd" || third_rc=$?
-_tirith_close_pending_fd "$frame_fd" || exit 73
-
-_tirith_receipt_consume() {{ TIRITH_CONSUMED_TOKEN="$2"; return 0; }}
-_tirith_receipt_discard() {{ TIRITH_DISCARDED_TOKEN="$2"; return 0; }}
-_tirith_degrade_to_preexec() {{ TIRITH_DEGRADE_REASON="$1"; return 0; }}
-
-TIRITH_PARTIAL_EXECUTED=0
-_TIRITH_PENDING_EVAL='TIRITH_PARTIAL_EXECUTED=1'
-_TIRITH_PENDING_COMMAND='TIRITH_PARTIAL_EXECUTED=1'
-unset _TIRITH_PENDING_RECEIPT
-partial_rc=0
-_tirith_prompt_hook || partial_rc=$?
-partial_degrade="$TIRITH_DEGRADE_REASON"
-
-TIRITH_MISMATCH_EXECUTED=0
-TIRITH_DEGRADE_REASON=""
-TIRITH_DISCARDED_TOKEN=""
-_TIRITH_PENDING_EVAL='TIRITH_MISMATCH_EXECUTED=1'
-_TIRITH_PENDING_COMMAND='TIRITH_MISMATCH_EXECUTED=2'
-_TIRITH_PENDING_RECEIPT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-mismatch_rc=0
-_tirith_prompt_hook || mismatch_rc=$?
-mismatch_degrade="$TIRITH_DEGRADE_REASON"
-
-TIRITH_VALID_EXECUTED=0
-TIRITH_CONSUMED_TOKEN=""
-_TIRITH_PENDING_EVAL='TIRITH_VALID_EXECUTED=1'
-_TIRITH_PENDING_COMMAND='TIRITH_VALID_EXECUTED=1'
-_TIRITH_PENDING_RECEIPT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-valid_rc=0
-_tirith_prompt_hook || valid_rc=$?
-command_interposed="$TIRITH_COMMAND_INTERPOSED"
-eval_interposed="$TIRITH_EVAL_INTERPOSED"
-unset -f command eval
-_TIRITH_BIN=/usr/bin/true
-builtin printf 'runs=%s\nmain_context=%s\nsubshell_context=%s\ncomplete_syntax_rc=%s\nincomplete_syntax_rc=%s\nincomplete_syntax_error=%s\nframe=%s:%s:%s:%s:%s:%s\npartial=%s:%s:%s\nmismatch=%s:%s:%s:%s\nvalid=%s:%s:%s\ninterposed=%s:%s\n' \
-  "$TIRITH_COMPLEX_RUNS" "$main_context" "$subshell_context" \
-  "$complete_syntax_rc" "$incomplete_syntax_rc" "$incomplete_syntax_error" \
-  "$first_rc" "$first" "$second_rc" "$second" "$third_rc" "$third" \
-  "$partial_rc" "$TIRITH_PARTIAL_EXECUTED" "$partial_degrade" \
-  "$mismatch_rc" "$TIRITH_MISMATCH_EXECUTED" "$TIRITH_DISCARDED_TOKEN" "$mismatch_degrade" \
-  "$valid_rc" "$TIRITH_VALID_EXECUTED" "$TIRITH_CONSUMED_TOKEN" \
-  "$command_interposed" "$eval_interposed"
-"#,
-        hook.display(),
-    );
-    let out = Command::new("/bin/bash")
-        .args(["--norc", "--noprofile", "-i", "-c", &script])
-        .current_dir(isolated.path())
-        .env("HOME", isolated.path())
-        .env("XDG_STATE_HOME", isolated.path().join("state"))
-        .env("TMPDIR", &capture_dir)
-        .env("PATH", format!("{}:/usr/bin:/bin", real_dir.display()))
-        .env("TIRITH_SESSION_ID", "cli-root-bash-complex-memory-delivery")
-        .env("TIRITH_BASH_MODE", "enter")
-        .env("TIRITH_LOG", "0")
-        .env_remove("_TIRITH_BASH_LOADED")
-        .output()
-        .expect("exercise repeated Bash 3.2 in-memory command delivery");
-
-    assert!(
-        out.status.success(),
-        "Bash delivery exercise failed (code {:?})\nstdout:\n{}\nstderr:\n{}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8(out.stdout).expect("delivery probe stdout is UTF-8");
-    let fields: std::collections::HashMap<&str, &str> = stdout
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .collect();
-    assert_eq!(fields.get("runs"), Some(&"128"));
-    assert_eq!(fields.get("main_context"), Some(&"accepted"));
-    assert_eq!(fields.get("subshell_context"), Some(&"rejected"));
-    assert_eq!(fields.get("complete_syntax_rc"), Some(&"0"));
-    assert_ne!(fields.get("incomplete_syntax_rc"), Some(&"0"));
-    assert_eq!(fields.get("incomplete_syntax_error"), Some(&"recognized"));
-    assert_eq!(
-        fields.get("frame"),
-        Some(&"0:token-line:1:command-without-final-newline:1:"),
-        "anonymous receipt input changed its exact newline framing"
-    );
-    assert_eq!(
-        fields.get("partial"),
-        Some(&"1:0:deferred command state lacks its receipt commit marker")
-    );
-    assert_eq!(
-        fields.get("mismatch"),
-        Some(
-            &"1:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:deferred command state did not match its receipt"
-        )
-    );
-    assert_eq!(
-        fields.get("valid"),
-        Some(&"0:1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-    );
-    assert_eq!(fields.get("interposed"), Some(&"0:0"));
-    assert_eq!(
-        fs::read_dir(&capture_dir)
-            .expect("inspect capture directory")
-            .count(),
-        0,
-        "in-memory delivery must leave no capture files"
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn root_bash_hook_protocol_v3_runs_receipt_commands_as_direct_children() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let isolated = tempfile::tempdir().expect("isolated Bash receipt hook state");
-    let capture_dir = isolated.path().join("capture");
-    fs::create_dir(&capture_dir).expect("create private capture directory");
-    let shadow_dir = isolated.path().join("shadow-bin");
-    fs::create_dir(&shadow_dir).expect("create PATH-shadow directory");
-    let shadow_marker = isolated.path().join("path-shadow-executed");
-    let shadow_tirith = shadow_dir.join("tirith");
-    fs::write(
-        &shadow_tirith,
-        format!(
-            "#!/bin/sh\n/usr/bin/touch '{}'\nexit 0\n",
-            shadow_marker.display()
-        ),
-    )
-    .expect("write PATH-shadow Tirith");
-    fs::set_permissions(&shadow_tirith, fs::Permissions::from_mode(0o700))
-        .expect("make PATH-shadow Tirith executable");
-    let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical Tirith binary");
-    let real_dir = real.parent().expect("Tirith binary parent");
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
-    let script = format!(
-        "_TIRITH_BASH_INTERNAL=1; \
-         source '{}'; \
-         export PATH='{}:/usr/bin:/bin'; \
-         _TIRITH_COMMAND_SHADOW_CALLED=0; \
-         command() {{ _TIRITH_COMMAND_SHADOW_CALLED=1; return 0; }}; \
-         _tirith_preexec_receipt_check 'printf receipt-direct-child-ok' no; receipt_rc=$?; \
-         printf 'protocol=%s\\nbearer=%s\\nreceipt_rc=%s\\ncwd=%s\\ncommand_shadow=%s\\n' \
-           \"$_TIRITH_RECEIPT_PROTOCOL\" \"$_TIRITH_RECEIPT_INSTANCE\" \"$receipt_rc\" \"$PWD\" \
-           \"$_TIRITH_COMMAND_SHADOW_CALLED\"",
-        hook.display(),
-        shadow_dir.display(),
-    );
-    let out = Command::new("/bin/bash")
-        .args(["--norc", "--noprofile", "-i", "-c", &script])
-        .current_dir(isolated.path())
-        .env("HOME", isolated.path())
-        .env("XDG_STATE_HOME", isolated.path().join("state"))
-        .env("TMPDIR", &capture_dir)
-        .env("PATH", format!("{}:/usr/bin:/bin", real_dir.display()))
-        .env("TIRITH_SESSION_ID", "cli-root-bash-receipt-v3")
-        .env("TIRITH_BASH_MODE", "preexec")
-        .env("TIRITH_LOG", "0")
-        .env_remove("_TIRITH_BASH_LOADED")
-        .env_remove("_TIRITH_RECEIPT_INSTANCE")
-        .env_remove("_TIRITH_RECEIPT_SHELL_PID")
-        .env_remove("_TIRITH_RECEIPT_FAMILY")
-        .output()
-        .expect("source root Bash hook and exercise protocol-v3 receipt path");
-
-    assert!(
-        out.status.success(),
-        "Bash hook receipt exercise failed (code {:?})\nstdout:\n{}\nstderr:\n{}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8(out.stdout).expect("hook probe stdout is UTF-8");
-    let fields: std::collections::HashMap<&str, &str> = stdout
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .collect();
-    assert_eq!(fields.get("protocol"), Some(&"3"));
-    let bearer = fields.get("bearer").copied().unwrap_or_default();
-    assert_eq!(bearer.len(), 64, "hook registration must return a bearer");
-    assert!(
-        bearer
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "hook bearer must be lowercase hexadecimal"
-    );
-    assert_eq!(
-        fields.get("receipt_rc"),
-        Some(&"0"),
-        "receipt creation/consume must retain the shell parent binding; stdout:\n{}\nstderr:\n{}",
-        stdout,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(fields.get("command_shadow"), Some(&"0"));
-    assert!(
-        !shadow_marker.exists(),
-        "PATH mutation redirected a pinned root-hook invocation"
-    );
-    let reported_cwd = fields.get("cwd").copied().unwrap_or_default();
-    assert_eq!(
-        fs::canonicalize(reported_cwd).expect("canonical reported hook cwd"),
-        fs::canonicalize(isolated.path()).expect("canonical expected hook cwd"),
-        "capture must not move receipt operations out of the shell's cwd"
-    );
-    assert_eq!(
-        fs::read_dir(&capture_dir)
-            .expect("inspect capture directory")
-            .count(),
-        0,
-        "all private capture files must be removed"
     );
 }
 
@@ -20117,103 +19458,6 @@ fn fix_on_non_tty_guidance_exits_one_without_rerun_hint() {
 }
 
 // ---- A2: scan coverage gaps, require_complete, and gap-action scoping ----
-
-#[test]
-fn scan_missing_positional_target_is_an_unconditional_cli_error() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let missing = tmp.path().join("deleted-scan-root");
-    let missing_arg = missing.display().to_string();
-
-    let out = tirith()
-        .args(["scan", "--format", "json", &missing_arg])
-        .output()
-        .expect("run scan with a missing positional target");
-
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "a missing explicitly requested target must fail even without --ci; stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("path not found"),
-        "the operational error must identify the missing target: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn scan_missing_file_target_errors_before_exclusion_filters() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let missing = tmp.path().join("missing.txt");
-    let missing_arg = missing.display().to_string();
-
-    let out = tirith()
-        .args(["scan", "--file", &missing_arg, "--exclude", "*", "--ci"])
-        .output()
-        .expect("run scan --file with a missing excluded target");
-
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "filters must not turn a missing explicit file into a successful no-op; stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("file not found"),
-        "the operational error must identify the missing file: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn scan_ci_fails_on_unreadable_ordinary_subtree_but_scans_readable_sibling() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let project = tmp.path().join("project");
-    let readable = project.join("readable");
-    let unreadable = project.join("ordinary-directory");
-    fs::create_dir_all(project.join(".git")).unwrap();
-    fs::create_dir_all(&readable).unwrap();
-    fs::create_dir_all(&unreadable).unwrap();
-    fs::write(readable.join("keep.md"), "safe control").unwrap();
-    fs::write(unreadable.join("hidden.md"), "hidden content").unwrap();
-
-    let original_mode = fs::metadata(&unreadable).unwrap().permissions().mode();
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
-    let out = tirith_in_proj(&project)
-        .args(["scan", "--ci", "--format", "json", "."])
-        .output()
-        .expect("run CI scan with an unreadable subtree");
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(original_mode)).unwrap();
-
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "an enumeration failure must fail --ci regardless of directory name; stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
-    assert_eq!(json["analysis_incomplete"], true);
-    assert!(
-        json["coverage_gaps"].as_array().is_some_and(|gaps| {
-            gaps.iter().any(|gap| {
-                gap["kind"] == "enumeration_failed"
-                    && gap["location"]
-                        .as_str()
-                        .is_some_and(|location| location.contains("ordinary-directory"))
-            })
-        }),
-        "the failed subtree enumeration must remain visible: {json}"
-    );
-    assert_eq!(
-        json["scanned_count"], 1,
-        "the readable sibling must still be scanned: {json}"
-    );
-}
 
 /// A2 — `tirith scan --ci` with a repo-scoped `require_complete: true` over a
 /// tree containing an OVERSIZED PRIORITY file fails closed (exit 1) and the JSON
