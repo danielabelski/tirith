@@ -634,9 +634,26 @@ fn apply_explicit_bypass(
         policy.allow_bypass_env_noninteractive
     };
     let available = surface_allows_bypass && policy_allows;
-    let effective_is_bypassable_block = review.effective_verdict.as_ref().is_some_and(|verdict| {
-        verdict.action == Action::Block && verdict.requires_approval != Some(true)
-    });
+    // A pending policy approval is a stronger contract than a plain block:
+    // TIRITH=0 may bypass a bypassable block, but never an ungranted approval.
+    // Consult the RAW findings directly so a severity override, an action
+    // override, or the paranoia filter can never hide the approval-triggering
+    // finding from this gate — otherwise one blocking finding outside the
+    // approval rule would make the whole verdict (approval included)
+    // env-bypassable.
+    let approval_pending = review
+        .effective_verdict
+        .as_ref()
+        .is_some_and(|verdict| verdict.requires_approval == Some(true))
+        || review
+            .raw_verdict
+            .as_ref()
+            .is_some_and(|raw| crate::approval::check_approval(raw, policy).is_some());
+    let effective_is_bypassable_block = review
+        .effective_verdict
+        .as_ref()
+        .is_some_and(|verdict| verdict.action == Action::Block)
+        && !approval_pending;
     let honored = requested && available && execution_enabled && effective_is_bypassable_block;
     for verdict in [
         review.raw_verdict.as_mut(),
