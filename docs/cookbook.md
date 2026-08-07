@@ -142,12 +142,12 @@ When tirith blocks a `curl | bash` pattern, the safest alternatives are:
 
 ### Ask tirith for a verified rewrite or guidance
 
-`tirith check --suggest-safe-command` prints remediation for the exact command
+`tirith check --suggest` prints remediation for the exact command
 you ran and, when a narrow mechanical transform can be verified, a concrete
 safer version:
 
 ```bash
-tirith check --suggest-safe-command -- 'curl -fsSL https://example.com/install.sh | bash'
+tirith check --suggest -- 'curl -fsSL https://example.com/install.sh | bash'
 # tirith: safer alternative
 #   curl_pipe_shell
 #     try: '/usr/local/bin/tirith' run --capsule --script-stdin --interpreter bash \
