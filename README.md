@@ -757,7 +757,7 @@ That is the daily-driver set. tirith ships 74 commands in all, in 8 groups: scan
   It never blocks the command. Set `auto_update_hours: 0` to disable it, or
   `--offline` / `TIRITH_OFFLINE=1` to suppress it per invocation. `tirith paste`
   does **not** trigger it; it goes straight through the local engine.
-- **No command rewriting**: tirith never modifies what you typed.
+- **No command rewriting**: tirith never modifies what you typed. `--suggest` and `explain --fix` print a separate command for you to run; they never substitute one.
 - **No telemetry**: no analytics, no crash reporting, no phone-home behavior.
 - **No long-lived background processes by default**: tirith is invoked
   per-command and exits immediately. The threat-DB refresh above is a
