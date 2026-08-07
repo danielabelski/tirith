@@ -915,6 +915,10 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     spec.handles.extra_unix_fds.push(SEALED_TARGET_FD);
     spec.handles.extra_unix_fds.push(LAUNCH_STATUS_FD);
     spec.handles.extra_unix_fds.push(LAUNCH_ACK_FD);
+    // Everything outside `{0,1,2} ∪ extra_unix_fds` is closed before exec, so
+    // the temp-HOME descriptor must be granted or the child cannot prove
+    // ownership of the directory `--temp-home` names.
+    spec.handles.extra_unix_fds.push(TEMP_HOME_FD);
     spec.filesystem.read_roots.push(temp_home_path.clone());
     spec.filesystem.write_roots.push(temp_home_path.clone());
 
@@ -1256,6 +1260,7 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         SEALED_SCRIPT_FD,
         LAUNCH_STATUS_FD,
         LAUNCH_ACK_FD,
+        TEMP_HOME_FD,
     ]);
     spec.filesystem.read_roots.push(temp_home_path.clone());
     spec.filesystem.write_roots.push(temp_home_path.clone());
@@ -1409,6 +1414,9 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
 
     const STATUS_FD: i32 = 61;
     const ACK_FD: i32 = 60;
+    // The child requires the temp HOME as a PAIR: the path names it, the
+    // granted descriptor proves the parent owns the directory it names.
+    const TEMP_HOME_FD: i32 = 59;
     let home = tempfile::Builder::new()
         .prefix("tirith-capsule-invalid-ack-")
         .tempdir_in("/tmp")
@@ -1459,7 +1467,9 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
     }
     spec.filesystem.read_roots.push(home_path.clone());
     spec.filesystem.write_roots.push(home_path.clone());
-    spec.handles.extra_unix_fds.extend([STATUS_FD, ACK_FD]);
+    spec.handles
+        .extra_unix_fds
+        .extend([STATUS_FD, ACK_FD, TEMP_HOME_FD]);
 
     let backend = LandlockSeccompCapsule;
     let available = backend.available_coverage(&spec);
@@ -1496,6 +1506,9 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
     let ack_parent = unsafe { fs::File::from_raw_fd(ack_descriptors[1]) };
     let status_source = status_writer.as_raw_fd();
     let ack_source = ack_guard.as_raw_fd();
+    let temp_home_dir = fs::File::open(&home_path)
+        .expect("open the parent-owned temporary HOME for its descriptor");
+    let temp_home_source = temp_home_dir.as_raw_fd();
 
     let command_body = format!("printf ran > '{}'", marker.display());
     let spec_json = serde_json::to_string(&spec).unwrap();
@@ -1509,6 +1522,8 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
         .arg(ACK_FD.to_string())
         .arg("--temp-home")
         .arg(&home_path)
+        .arg("--temp-home-fd")
+        .arg(TEMP_HOME_FD.to_string())
         .arg("--")
         .arg("/bin/sh")
         .args(["-c", command_body.as_str()])
@@ -1522,6 +1537,8 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
                 || libc::fcntl(STATUS_FD, libc::F_SETFD, 0) < 0
                 || libc::dup2(ack_source, ACK_FD) < 0
                 || libc::fcntl(ACK_FD, libc::F_SETFD, 0) < 0
+                || libc::dup2(temp_home_source, TEMP_HOME_FD) < 0
+                || libc::fcntl(TEMP_HOME_FD, libc::F_SETFD, 0) < 0
             {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1624,10 +1641,15 @@ fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
 #[test]
 fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals() {
     use std::io::{BufRead as _, BufReader};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     use tirith_core::capsule::linux::LandlockSeccompCapsule;
     use tirith_core::capsule::{Capsule as _, CapsuleSpec, ResourceLimits};
+
+    // The child requires the temp HOME as a PAIR: the path names it, the
+    // granted descriptor proves the parent owns the directory it names.
+    const TEMP_HOME_FD: i32 = 59;
 
     let helper_dir = tempfile::Builder::new()
         .prefix("tirith-clone-parent-probe-")
@@ -1697,6 +1719,7 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         );
         spec.filesystem.read_roots.push(temp_home_path.clone());
         spec.filesystem.write_roots.push(temp_home_path.clone());
+        spec.handles.extra_unix_fds.push(TEMP_HOME_FD);
 
         let backend = LandlockSeccompCapsule;
         let available = backend.available_coverage(&spec);
@@ -1719,6 +1742,8 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
             .arg(spec_json)
             .arg("--temp-home")
             .arg(&temp_home_path)
+            .arg("--temp-home-fd")
+            .arg(TEMP_HOME_FD.to_string())
             .arg("--")
             .arg(&helper_binary)
             .arg(attack_signal.to_string())
@@ -1726,13 +1751,18 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        let temp_home_dir = fs::File::open(&temp_home_path)
+            .expect("open the parent-owned temporary HOME for its descriptor");
+        let temp_home_source = temp_home_dir.as_raw_fd();
         unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0
+                    || libc::dup2(temp_home_source, TEMP_HOME_FD) < 0
+                    || libc::fcntl(TEMP_HOME_FD, libc::F_SETFD, 0) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
+                Ok(())
             });
         }
         let mut guard = command.spawn().expect("spawn guarded capsule adversary");
