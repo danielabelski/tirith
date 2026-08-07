@@ -615,6 +615,41 @@ fn commands_check_reconstructs_only_proven_posix_multi_argv() {
         .is_some_and(|reason| reason.contains("multi-argument Fish/PowerShell/Cmd")));
 }
 
+/// A process ceiling that accounts for the UID this test already shares.
+///
+/// `RLIMIT_NPROC` is counted PER-UID, not per-process-tree. Under `cargo test`
+/// the UID owns the harness, this binary's threads, and every other test's
+/// children, so a fixed small ceiling sits below the live count and the
+/// contained `fork()` fails with EAGAIN before the target execs. Measure the
+/// live count and bound the fixture's own fan-out on top of it: still far
+/// below the host default, so a runaway fork is still capped, but immune to
+/// whatever else the UID happens to be running.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn capsule_process_ceiling(own_fanout: u32) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let uid = unsafe { libc::geteuid() };
+    let live = fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+                })
+                .filter(|entry| fs::metadata(entry.path()).is_ok_and(|meta| meta.uid() == uid))
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX)
+        })
+        .unwrap_or(0u32);
+    // The slack absorbs processes other tests start between this measurement
+    // and the contained fork.
+    live.saturating_add(own_fanout).saturating_add(256)
+}
+
 /// Read a capsule child's one-byte kernel observation.
 ///
 /// `read_exact` reports only "failed to fill whole buffer" when the child died
@@ -812,7 +847,7 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     spec.resources = ResourceLimits {
         cpu_seconds: Some(10),
         memory_bytes: Some(512 * 1024 * 1024),
-        max_processes: Some(64),
+        max_processes: Some(capsule_process_ceiling(64)),
         max_open_files: Some(64),
         max_output_bytes: None,
         wall_clock_seconds: None,
@@ -1152,7 +1187,7 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
     spec.resources = ResourceLimits {
         cpu_seconds: Some(10),
         memory_bytes: Some(256 * 1024 * 1024),
-        max_processes: Some(32),
+        max_processes: Some(capsule_process_ceiling(32)),
         max_open_files: Some(64),
         max_output_bytes: None,
         wall_clock_seconds: None,
@@ -1355,7 +1390,7 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
     spec.resources = ResourceLimits {
         cpu_seconds: Some(10),
         memory_bytes: Some(512 * 1024 * 1024),
-        max_processes: Some(32),
+        max_processes: Some(capsule_process_ceiling(32)),
         max_open_files: Some(64),
         max_output_bytes: None,
         wall_clock_seconds: None,
@@ -1589,7 +1624,7 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         spec.resources = ResourceLimits {
             cpu_seconds: Some(10),
             memory_bytes: Some(512 * 1024 * 1024),
-            max_processes: Some(64),
+            max_processes: Some(capsule_process_ceiling(64)),
             max_open_files: Some(64),
             max_output_bytes: None,
             wall_clock_seconds: None,
