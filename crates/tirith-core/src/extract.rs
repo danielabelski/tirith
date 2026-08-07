@@ -1768,6 +1768,36 @@ fn resolve_segment_command(segment: &Segment) -> Option<ResolvedCommand<'_>> {
 /// length. Exhaustion is unresolved, never a partially trusted inner command.
 const MAX_WRAPPED_COMMAND_DEPTH: usize = 64;
 
+/// Whether a segment nests execution wrappers deeper than
+/// [`MAX_WRAPPED_COMMAND_DEPTH`], counted independently of resolution.
+///
+/// `resolve_wrapped_command` collapses "too deep" into the same `None` it
+/// returns for "no command here", so a caller that skips an unresolvable
+/// segment — `check_network_policy` and the package-threat lookup both do —
+/// cannot tell a 65-wrapper chain from an irrelevant one, and the inner command
+/// escapes those rules. This lets the caller fail closed on the difference.
+pub fn wrapper_chain_exceeds_depth(segment: &Segment) -> bool {
+    let Some(command) = segment.command.as_deref() else {
+        return false;
+    };
+    let mut name = command_base_name(command);
+    let mut args = segment.args.as_slice();
+    for _ in 0..MAX_WRAPPED_COMMAND_DEPTH {
+        // Only the peeling wrappers continue the chain; anything else is the
+        // real command and the chain ended within budget.
+        if !matches!(name.as_str(), "env" | "command" | "time" | "sudo" | "doas") {
+            return false;
+        }
+        let Some(next) = args.iter().position(|arg| !arg.starts_with('-')) else {
+            // A wrapper with no command word is terminal, not over-deep.
+            return false;
+        };
+        name = command_base_name(&args[next]);
+        args = &args[next + 1..];
+    }
+    true
+}
+
 /// Resolve a segment's command through wrappers (`env`, `command`, `time`,
 /// `sudo`/`doas`, `tirith`) and return the resolved name and the wrapped
 /// command's args. Callers outside the extractor (e.g. `check_network_policy`)

