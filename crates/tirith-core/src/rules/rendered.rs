@@ -1023,6 +1023,12 @@ fn strict_pdf_pages(doc: &lopdf::Document) -> Result<Vec<(u32, lopdf::ObjectId)>
 /// can otherwise expand without bound.
 const PDF_STREAM_DECODE_CAP: usize = 16 * 1024 * 1024;
 
+/// Retention bound for hidden-text fragments. Evidence renders a handful,
+/// so holding every fragment only grows memory with attacker-controlled
+/// input. The total is counted separately, so the finding still reports the
+/// real number and records that the sample was truncated.
+const MAX_HIDDEN_TEXT_FRAGMENTS: usize = 64;
+
 fn decode_pdf_stream_strict(stream: &lopdf::Stream) -> Result<Vec<u8>, lopdf::Error> {
     // lopdf reports a missing /Filter as DictKey even though it means the stream
     // is legitimately uncompressed. Preserve that supported case; when a Filter
@@ -1373,6 +1379,7 @@ fn analyze_pdf_operations<'a>(
     page_num: u32,
     mut state: PdfGraphicsState,
     hidden_texts: &mut Vec<(u32, String, &'static str)>,
+    hidden_text_total: &mut usize,
     incomplete_reasons: &mut Vec<String>,
     active_forms: &mut std::collections::HashSet<lopdf::ObjectId>,
     recursion_depth: usize,
@@ -1603,6 +1610,7 @@ fn analyze_pdf_operations<'a>(
                         page_num,
                         form_state,
                         hidden_texts,
+                        hidden_text_total,
                         incomplete_reasons,
                         active_forms,
                         recursion_depth + 1,
@@ -1650,7 +1658,13 @@ fn analyze_pdf_operations<'a>(
                 if let Some(reason) = hidden_reason {
                     let text = extract_text_from_operands(&op.operands);
                     if !text.trim().is_empty() {
-                        hidden_texts.push((page_num, text, reason));
+                        *hidden_text_total = hidden_text_total.saturating_add(1);
+                        if hidden_texts.len() < MAX_HIDDEN_TEXT_FRAGMENTS {
+                            // Truncate on the way in: evidence renders at most
+                            // 100 chars, and one fragment can be arbitrarily
+                            // long.
+                            hidden_texts.push((page_num, truncate_str(&text, 200), reason));
+                        }
                     }
                 }
             }
@@ -1709,6 +1723,7 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
     };
 
     let mut hidden_texts: Vec<(u32, String, &'static str)> = Vec::new();
+    let mut hidden_text_total: usize = 0;
     let mut incomplete_reasons: Vec<String> = Vec::new();
 
     let pages = match strict_pdf_pages(&doc) {
@@ -1762,18 +1777,32 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
             page_num,
             PdfGraphicsState::default(),
             &mut hidden_texts,
+            &mut hidden_text_total,
             &mut incomplete_reasons,
             &mut active_forms,
             0,
         );
     }
     if !hidden_texts.is_empty() {
-        let page_list: Vec<String> = hidden_texts
+        let mut pages: Vec<u32> = hidden_texts
             .iter()
-            .map(|(p, _, _)| p.to_string())
+            .map(|(p, _, _)| *p)
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        // A HashSet iterates in nondeterministic order; sort so the finding
+        // text is stable across runs.
+        pages.sort_unstable();
+        let page_list: Vec<String> = pages.iter().map(u32::to_string).collect();
+        if hidden_text_total > hidden_texts.len() {
+            push_pdf_incomplete_reason(
+                &mut incomplete_reasons,
+                format!(
+                    "hidden-text evidence retained {} of {hidden_text_total} fragment(s)",
+                    hidden_texts.len()
+                ),
+            );
+        }
 
         findings.push(Finding {
             rule_id: RuleId::PdfHiddenText,
@@ -1782,7 +1811,7 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
             description: format!(
                 "PDF contains {} text fragment(s) rendered invisibly or at sub-pixel size \
                  on page(s): {}",
-                hidden_texts.len(),
+                hidden_text_total,
                 page_list.join(", ")
             ),
             evidence: hidden_texts
