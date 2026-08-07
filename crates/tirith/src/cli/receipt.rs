@@ -70,7 +70,10 @@ pub fn verify(sha256: &str, json: bool) -> i32 {
                     let out = serde_json::json!({
                         "sha256": sha256,
                         "valid": valid,
-                        "url": r.url,
+                        // Same discipline as `last --json` / `list --json`:
+                        // stored URLs may carry userinfo and machine-readable
+                        // output must never re-emit credentials.
+                        "url": tirith_core::receipt::redact_url_userinfo(&r.url),
                     });
                     if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
                         eprintln!("tirith: failed to write JSON output");

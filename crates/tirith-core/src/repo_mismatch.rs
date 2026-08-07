@@ -163,6 +163,17 @@ fn sanitize_repo_url(url: &str) -> String {
     if let Some(rest) = s.strip_prefix("git://") {
         s = format!("https://{rest}");
     }
+    // Normalize the `ssh://` transport the same way. npm's registry commonly
+    // normalizes `repository.url` to `git+ssh://git@github.com/owner/repo.git`,
+    // which the `git+` strip above reduces to this form; without the rewrite a
+    // genuine GitHub repository reads as unverifiable-or-worse. Only the
+    // canonical `git@` userinfo is stripped: any other userinfo survives so the
+    // deliberate non-empty-username rejection in `parse_known_git_host` still
+    // catches lookalike tricks.
+    if let Some(rest) = s.strip_prefix("ssh://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        s = format!("https://{rest}");
+    }
     // Convert `git@host:owner/repo.git` to `https://host/owner/repo` so we can
     // attempt a known-host parse.
     if s.starts_with("git@") {
@@ -467,6 +478,25 @@ mod tests {
         assert_eq!(
             sanitize_repo_url("git+https://github.com/o/r.git"),
             "https://github.com/o/r"
+        );
+    }
+
+    #[test]
+    fn sanitize_repo_url_normalizes_ssh_scheme_with_git_userinfo() {
+        // npm's registry normalization for a GitHub repository field.
+        assert_eq!(
+            sanitize_repo_url("git+ssh://git@github.com/org/repo.git"),
+            "https://github.com/org/repo"
+        );
+        assert_eq!(
+            sanitize_repo_url("ssh://git@gitlab.com/org/repo.git"),
+            "https://gitlab.com/org/repo"
+        );
+        // Non-canonical userinfo survives, so the known-host parse still
+        // rejects lookalike tricks by its non-empty-username rule.
+        assert_eq!(
+            sanitize_repo_url("ssh://evil@github.com/org/repo"),
+            "https://evil@github.com/org/repo"
         );
     }
 
