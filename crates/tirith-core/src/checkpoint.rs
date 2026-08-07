@@ -261,7 +261,6 @@ fn write_checkpoint_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result
 
 /// Create a checkpoint of the given paths.
 pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<CheckpointMeta, String> {
-    require_pro()?;
     create_with_config(paths, trigger_command, &CheckpointConfig::default())
 }
 
@@ -275,6 +274,11 @@ pub fn create_with_config(
     trigger_command: Option<&str>,
     config: &CheckpointConfig,
 ) -> Result<CheckpointMeta, String> {
+    // The entitlement gate lives on the WORKER, not only the convenience
+    // wrapper: this function is `pub`, so a caller reaching it directly must
+    // hit the same gate `create`, `restore_reported`, and the other entry
+    // points enforce.
+    require_pro()?;
     let base_dir = secure_checkpoints_dir()?;
     let id = uuid::Uuid::new_v4().to_string();
     let cp_dir = base_dir.join(&id);

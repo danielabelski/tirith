@@ -226,6 +226,19 @@ impl ResolverBroker {
                                         active,
                                         connections: Arc::clone(&connections),
                                     };
+                                    // Drop's cancellation is a stop store
+                                    // followed by a registry shutdown sweep. A
+                                    // session whose registration missed that
+                                    // sweep would sit in its read deadline
+                                    // unobserved and stall the listener join,
+                                    // so complete the handshake from this side:
+                                    // registration happened above, re-check the
+                                    // flag, and self-cancel when it was already
+                                    // raised.
+                                    if stop.load(Ordering::Acquire) {
+                                        let _ = stream.shutdown(Shutdown::Both);
+                                        return;
+                                    }
                                     let _ = serve_connection(
                                         stream,
                                         &permitted,

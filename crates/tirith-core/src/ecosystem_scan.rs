@@ -2448,10 +2448,7 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     // verdict assembly is mode-independent (the byte-identical-JSON invariant).
     let (mut manifest_labels, mut declared, scan_gaps) = match &request.mode {
         ScanMode::Manifests => collect_from_manifests(request, &mut notes),
-        ScanMode::Installed => {
-            let (labels, deps) = collect_from_installed_tree(request, &mut notes);
-            (labels, deps, Vec::new())
-        }
+        ScanMode::Installed => collect_from_installed_tree(request, &mut notes),
         ScanMode::SpecificLockfile(path) => collect_from_specific_lockfile(path, &mut notes),
     };
 
@@ -2733,7 +2730,11 @@ fn collect_from_specific_lockfile(
 fn collect_from_installed_tree(
     request: &ScanRequest,
     notes: &mut Vec<ScanNote>,
-) -> (Vec<String>, Vec<(DeclaredDependency, String)>) {
+) -> (
+    Vec<String>,
+    Vec<(DeclaredDependency, String)>,
+    Vec<crate::scan::CoverageGap>,
+) {
     let mut declared: Vec<(DeclaredDependency, String)> = Vec::new();
     let mut manifest_labels: Vec<String> = Vec::new();
     let cap = if request.installed_max_entries == 0 {
@@ -2807,6 +2808,7 @@ fn collect_from_installed_tree(
         }
     }
 
+    let mut gaps: Vec<crate::scan::CoverageGap> = Vec::new();
     if let Some(at) = truncated_at {
         notes.push(ScanNote {
             manifest: None,
@@ -2814,6 +2816,15 @@ fn collect_from_installed_tree(
                 "results truncated at {at} installed entries; pass \
                  `--max-installed-entries 0` to disable the cap (slow)."
             ),
+        });
+        // A note is advisory; the invariant is that a budget-capped input can
+        // never look provably clean. Surface the truncation as a coverage gap
+        // so it becomes a policy-aware AnalysisIncomplete finding, exactly as
+        // manifests mode reports its own caps.
+        gaps.push(crate::scan::CoverageGap {
+            location: crate::location::SubjectLocation::installed(request.root),
+            kind: crate::scan::CoverageGapKind::EntryCountCapped,
+            sha256: None,
         });
     }
 
@@ -2826,7 +2837,7 @@ fn collect_from_installed_tree(
         });
     }
 
-    (manifest_labels, declared)
+    (manifest_labels, declared, gaps)
 }
 
 /// Parse one [`DiscoveredManifest`] into `out`, recording a note on any read
@@ -6063,6 +6074,19 @@ gem 'toplevelgem'
             report.notes.iter().any(|n| n.note.contains("truncated")),
             "a truncation note must be recorded: {:?}",
             report.notes
+        );
+        // The note is advisory; the contract is that a budget-capped scan can
+        // never look provably clean. The truncation must surface as a
+        // policy-aware AnalysisIncomplete finding, as manifests mode does.
+        assert!(
+            report
+                .verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::AnalysisIncomplete
+                    && f.description.contains("entry_count_capped")),
+            "a truncated installed scan must carry an AnalysisIncomplete finding: {:?}",
+            report.verdict.findings
         );
     }
 

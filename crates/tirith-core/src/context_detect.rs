@@ -252,9 +252,15 @@ pub fn detect_all() -> DetectionResult {
         }
     }
 
+    // Snapshot the provider inputs BEFORE detection runs. Sampling afterwards
+    // would record an input that changed mid-detection as fresh, serving the
+    // stale result for the whole TTL — the exact staleness repo-0266's
+    // fingerprint check exists to prevent. (`detect_provider` below already
+    // samples first.)
+    let fingerprint = current_fingerprint();
     let fresh = refresh_all();
     guard.captured_at = Some(now);
-    guard.fingerprint = current_fingerprint();
+    guard.fingerprint = fingerprint;
     guard.result = fresh.clone();
     fresh
 }

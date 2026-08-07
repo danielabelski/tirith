@@ -38,6 +38,11 @@ pub fn offer_zshenv_guard(
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let zshenv_path = home.join(".zshenv");
     let mut completed_verb = "updated";
+    // `transactional_update` may run the transform twice (preflight, then a
+    // locked recompute when the destination drifted in between). The managed
+    // block is snapshot-independent, so one successful `zsh -n` proves it for
+    // both runs — never spawn the validator a second time.
+    let mut block_validated = false;
     let outcome = super::fs_helpers::transactional_update(
         &zshenv_path,
         &home,
@@ -58,8 +63,9 @@ pub fn offer_zshenv_guard(
                             "[dry-run] would append tirith-guard block to {}",
                             zshenv_path.display()
                         );
-                    } else {
+                    } else if !block_validated {
                         validate_zsh_syntax(&managed_block)?;
+                        block_validated = true;
                     }
                     existing.to_string()
                 }
@@ -85,8 +91,9 @@ pub fn offer_zshenv_guard(
                             "[dry-run] would replace tirith-guard block in {}",
                             zshenv_path.display()
                         );
-                    } else {
+                    } else if !block_validated {
                         validate_zsh_syntax(&managed_block)?;
+                        block_validated = true;
                     }
                     remove_guard_blocks(existing)
                 }
@@ -103,8 +110,9 @@ pub fn offer_zshenv_guard(
                             "[dry-run] would deduplicate tirith-guard blocks in {}",
                             zshenv_path.display()
                         );
-                    } else {
+                    } else if !block_validated {
                         validate_zsh_syntax(&managed_block)?;
+                        block_validated = true;
                     }
                     remove_guard_blocks(existing)
                 }
