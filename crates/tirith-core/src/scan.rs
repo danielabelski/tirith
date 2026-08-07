@@ -1757,9 +1757,13 @@ mod tests {
             .expect("an in-root config symlink is a linked candidate");
         assert!(candidate.identity.is_some(), "identity must be recorded");
 
-        // The same path, a different file.
-        std::fs::remove_file(&validated).unwrap();
-        std::fs::write(&validated, "swapped instructions").unwrap();
+        // The same path, a different file. Rename a second, still-live file
+        // over it rather than deleting and recreating: a freed inode can be
+        // reused immediately on Linux, which would hand the recreated file the
+        // same identity and make this test filesystem-dependent.
+        let attacker = root.path().join("attacker.txt");
+        std::fs::write(&attacker, "swapped instructions").unwrap();
+        std::fs::rename(&attacker, &validated).unwrap();
 
         let outcome = scan_single_file_at(
             &candidate.read_path,
