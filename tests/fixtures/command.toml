@@ -62,8 +62,8 @@ name = "wrapper_chain_too_deep_sudo_then_envs"
 min_milestone = 13
 input = 'cat /tmp/x | sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo sudo env -S "bash"'
 context = "exec"
-expected_action = "warn"
-expected_rules = ["wrapper_chain_too_deep"]
+expected_action = "block"
+expected_rules = ["wrapper_chain_too_deep", "analysis_incomplete"]
 # The interpreter is unresolvable (depth exhausted), so the High pipe-to-shell
 # rules CANNOT fire — only the visible "obfuscated beyond analysis" signal does.
 forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter", "sudo_shell_spawn"]
