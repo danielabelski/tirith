@@ -569,6 +569,7 @@ pub fn run_to_completion(
     )
 }
 
+#[cfg(unix)]
 /// Run a contained process with exact caller-supplied bytes on stdin while
 /// forwarding bounded stdout/stderr to the current process. This enforcing
 /// surface accepts only an already-validated absolute executable and has no
@@ -595,6 +596,7 @@ pub fn run_to_completion_with_stdin(
     forward_captured_outcome(captured)
 }
 
+#[cfg(unix)]
 /// Execute file-mode script bytes only through their fully sealed anonymous
 /// descriptor. The interpreter is likewise content-bound; neither executable
 /// input is reopened through an attacker-replaceable pathname.
@@ -1329,6 +1331,7 @@ fn create_parent_owned_temp_home(
     Ok(Some(directory))
 }
 
+#[cfg(unix)]
 fn run_to_completion_with_stdin_captured(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
@@ -1501,6 +1504,7 @@ fn run_to_completion_with_stdin_captured(
     }
 }
 
+#[cfg(unix)]
 fn run_to_completion_with_reviewed_file_captured(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,

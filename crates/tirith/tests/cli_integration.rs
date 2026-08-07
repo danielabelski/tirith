@@ -615,6 +615,43 @@ fn commands_check_reconstructs_only_proven_posix_multi_argv() {
         .is_some_and(|reason| reason.contains("multi-argument Fish/PowerShell/Cmd")));
 }
 
+/// Read a capsule child's one-byte kernel observation.
+///
+/// `read_exact` reports only "failed to fill whole buffer" when the child died
+/// before publishing, which says nothing about why the sandbox refused to come
+/// up. Reap the child and name its exit status instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_capsule_observation(
+    reader: &mut impl std::io::Read,
+    child: &mut std::process::Child,
+    what: &str,
+) -> [u8; 1] {
+    let mut observed = [0u8; 1];
+    match reader.read_exact(&mut observed) {
+        Ok(()) => observed,
+        Err(error) => {
+            let status = child.wait();
+            // The child reports WHY it refused on stderr, and the harness
+            // captures it out of reach of this panic, so read it back here.
+            // Drain before reporting: the exit status alone ("exited with 2")
+            // names none of the dozen refusal paths.
+            let reason = child
+                .stderr
+                .take()
+                .map(|mut pipe| {
+                    let mut buffer = String::new();
+                    let _ = pipe.read_to_string(&mut buffer);
+                    buffer
+                })
+                .unwrap_or_default();
+            panic!(
+                "{what}: {error}; the capsule child exited with {status:?}; stderr: {}",
+                reason.trim()
+            );
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
@@ -637,7 +674,7 @@ fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("temporary_home requires paired parent-owned --temp-home"),
+            .contains("temporary_home requires a parent-owned, policy-granted --temp-home"),
         "unexpected refusal: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -661,9 +698,6 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     const SEALED_TARGET_FD: i32 = 63;
     const LAUNCH_STATUS_FD: i32 = 61;
     const LAUNCH_ACK_FD: i32 = 60;
-    // The child requires the temp HOME as a PAIR: the path names it, the
-    // descriptor proves the parent owns the directory it names.
-    const TEMP_HOME_FD: i32 = 59;
     let secret_dir = tempfile::tempdir().expect("private inherited-fd fixture");
     let secret_path = secret_dir.path().join("secret");
     fs::write(&secret_path, b"must not be inherited").expect("write inherited-fd fixture");
@@ -858,8 +892,6 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         .arg(LAUNCH_ACK_FD.to_string())
         .arg("--temp-home")
         .arg(&temp_home_path)
-        .arg("--temp-home-fd")
-        .arg(TEMP_HOME_FD.to_string())
         .arg("--")
         .arg(interpreter.launch_path())
         .args(["-s", "--", "feature value"])
@@ -873,9 +905,6 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     let interpreter_fd = interpreter
         .bound_launch_fd()
         .expect("Linux binding must retain a sealed executable descriptor");
-    let temp_home_dir = std::fs::File::open(&temp_home_path)
-        .expect("open the parent-owned temporary HOME for its descriptor");
-    let temp_home_dir_fd = temp_home_dir.as_raw_fd();
     let status_writer_fd = status_writer.as_raw_fd();
     let ack_guard_fd = ack_guard.as_raw_fd();
     // Destroy the pathname snapshot before spawn. The held descriptor remains
@@ -914,21 +943,17 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
             {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::dup2(temp_home_dir_fd, TEMP_HOME_FD) < 0
-                || libc::fcntl(TEMP_HOME_FD, libc::F_SETFD, 0) < 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
             Ok(())
         });
     }
     let mut child = command.spawn().expect("spawn real hidden capsule launcher");
     drop(status_writer);
     drop(ack_guard);
-    let mut observed = [0u8; 1];
-    status_reader
-        .read_exact(&mut observed)
-        .expect("read kernel OBSERVED status");
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read kernel OBSERVED status",
+    );
     assert_eq!(observed, [b'O'], "target must remain stopped until ACK");
     let ack = *b"A";
     assert_eq!(
@@ -1030,9 +1055,6 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
     const SEALED_SCRIPT_FD: i32 = 62;
     const LAUNCH_STATUS_FD: i32 = 61;
     const LAUNCH_ACK_FD: i32 = 60;
-    // The child requires the temp HOME as a PAIR: the path names it, the
-    // descriptor proves the parent owns the directory it names.
-    const TEMP_HOME_FD: i32 = 59;
 
     let interpreter = TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
         .expect("resolve canonical system shell")
@@ -1201,8 +1223,6 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         .arg(LAUNCH_ACK_FD.to_string())
         .arg("--temp-home")
         .arg(&temp_home_path)
-        .arg("--temp-home-fd")
-        .arg(TEMP_HOME_FD.to_string())
         .arg("--")
         .arg(interpreter.launch_path())
         .arg(&script_operand)
@@ -1215,9 +1235,6 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         .bound_launch_fd()
         .expect("Linux binding retains sealed interpreter descriptor");
     let reviewed_script_fd = reviewed_script.as_raw_fd();
-    let temp_home_dir = std::fs::File::open(&temp_home_path)
-        .expect("open the parent-owned temporary HOME for its descriptor");
-    let temp_home_dir_fd = temp_home_dir.as_raw_fd();
     let status_writer_fd = status_writer.as_raw_fd();
     let ack_guard_fd = ack_guard.as_raw_fd();
     unsafe {
@@ -1230,7 +1247,6 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
                 (reviewed_script_fd, SEALED_SCRIPT_FD),
                 (status_writer_fd, LAUNCH_STATUS_FD),
                 (ack_guard_fd, LAUNCH_ACK_FD),
-                (temp_home_dir_fd, TEMP_HOME_FD),
             ] {
                 if libc::dup2(source, destination) < 0
                     || libc::fcntl(destination, libc::F_SETFD, 0) < 0
@@ -1242,16 +1258,17 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
         });
     }
 
-    let child = command
+    let mut child = command
         .spawn()
         .expect("spawn production reviewed-file hidden launcher");
     let child_pid = child.id();
     drop(status_writer);
     drop(ack_guard);
-    let mut observed = [0u8; 1];
-    status_reader
-        .read_exact(&mut observed)
-        .expect("read stopped target EXEC observation");
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read stopped target EXEC observation",
+    );
     assert_eq!(observed, [b'O']);
     assert_eq!(
         unsafe {
@@ -1434,14 +1451,15 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
             Ok(())
         });
     }
-    let child = command.spawn().expect("spawn invalid-ACK capsule guard");
+    let mut child = command.spawn().expect("spawn invalid-ACK capsule guard");
     let group = child.id();
     drop(status_writer);
     drop(ack_guard);
-    let mut observed = [0u8; 1];
-    status_reader
-        .read_exact(&mut observed)
-        .expect("read stopped exec observation");
+    let observed = read_capsule_observation(
+        &mut status_reader,
+        &mut child,
+        "read stopped exec observation",
+    );
     assert_eq!(observed, [b'O']);
     let invalid = *b"X";
     assert_eq!(
