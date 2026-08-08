@@ -5574,6 +5574,11 @@ mod tests {
         assert_eq!(bypass.action, crate::verdict::Action::Block);
     }
 
+    // Strict execution-state preparation is Unix-only (`prepare_execution`
+    // returns "not supported on this platform" under cfg(not(unix))), and this
+    // test `.expect()`s a formed draft, so the mechanism does not exist on
+    // Windows.
+    #[cfg(unix)]
     #[test]
     fn honored_interactive_bypass_retains_available_evidence_for_execution_drafts() {
         let isolated = isolate_state();
