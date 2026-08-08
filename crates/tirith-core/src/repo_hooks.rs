@@ -1619,7 +1619,25 @@ fn tracked_hook_roots(repo_root: &Path) -> Result<Vec<String>, &'static str> {
     if effective.is_empty() {
         return Err("repository effective hook path is empty and cannot be inspected safely");
     }
-    if let Some(relative) = repo_relative_hook_root(repo_root, effective)? {
+    // Git's own worktree root, in git's spelling, so the prefix comparison in
+    // `repo_relative_hook_root` can compare like with like. Resolved LAZILY:
+    // the cheap local comparison already succeeds wherever the two spellings
+    // agree (every Unix host), so this spawns no extra git process there and
+    // runs only when that comparison would otherwise lose the root.
+    let git_toplevel = || {
+        let toplevel_args = vec![
+            "rev-parse".to_string(),
+            "--path-format=absolute".to_string(),
+            "--show-toplevel".to_string(),
+        ];
+        run_trusted_git_for_hook_location(repo_root, &toplevel_args, 4096)
+            .ok()
+            .filter(|output| output.success)
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(relative) = repo_relative_hook_root(repo_root, effective, git_toplevel)? {
         if relative != ".git/hooks" && !roots.contains(&relative) {
             roots.push(relative);
         }
@@ -1630,11 +1648,13 @@ fn tracked_hook_roots(repo_root: &Path) -> Result<Vec<String>, &'static str> {
 fn repo_relative_hook_root(
     repo_root: &Path,
     configured: &str,
+    git_toplevel: impl FnOnce() -> Option<String>,
 ) -> Result<Option<String>, &'static str> {
     if configured.chars().any(char::is_control) || configured.len() > 4096 {
         return Err("repository core.hooksPath contains an unsafe path");
     }
     let configured_path = Path::new(configured);
+    let owned_relative;
     let relative = if configured_path.is_absolute() {
         // `git rev-parse --path-format=absolute` normalizes the worktree path.
         // Compare it to the same physical root so a logical symlink or `..`
@@ -1646,7 +1666,26 @@ fn repo_relative_hook_root(
             .or_else(|_| configured_path.strip_prefix(repo_root))
         {
             Ok(relative) => relative,
-            Err(_) => return Ok(None),
+            // Both local spellings failed. Ask GIT for the worktree root so the
+            // two strings come from the same command family in the same
+            // spelling — the case that matters on Windows, where git emits
+            // `C:/repo/...` while `canonicalize` yields a `\\?\C:\repo`
+            // verbatim path, and a verbatim prefix never compares equal to a
+            // plain disk prefix. Without this every in-repo core.hooksPath
+            // silently vanished from incoming scans.
+            Err(_) => {
+                let Some(toplevel) = git_toplevel() else {
+                    return Ok(None);
+                };
+                let Some(rest) = configured
+                    .strip_prefix(toplevel.trim_end_matches('/'))
+                    .and_then(|rest| rest.strip_prefix('/'))
+                else {
+                    return Ok(None);
+                };
+                owned_relative = PathBuf::from(rest);
+                owned_relative.as_path()
+            }
         }
     } else {
         configured_path

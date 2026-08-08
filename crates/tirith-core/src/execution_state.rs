@@ -4950,6 +4950,10 @@ mod tests {
         );
     }
 
+    // Strict execution-state preparation is Unix-only (`prepare_execution`
+    // returns "not supported on this platform" under cfg(not(unix))), so this
+    // test exercises a mechanism that does not exist on Windows.
+    #[cfg(unix)]
     #[test]
     fn cross_channel_unresolved_upgrade_is_rejected_without_mutation() {
         isolated_state(|_| {
@@ -5020,6 +5024,10 @@ mod tests {
         });
     }
 
+    // Strict execution-state preparation is Unix-only (`prepare_execution`
+    // returns "not supported on this platform" under cfg(not(unix))), so this
+    // test exercises a mechanism that does not exist on Windows.
+    #[cfg(unix)]
     #[test]
     fn in_memory_replay_is_idempotent_and_mismatch_is_rejected() {
         isolated_state(|_| {
