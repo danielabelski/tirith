@@ -4327,6 +4327,12 @@ custom_rules:
         let isolated = tempfile::tempdir().unwrap();
         let config_home = isolated.path().join("config");
         let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        // `config_dir()` resolves through etcetera, which reads APPDATA on
+        // Windows and ignores XDG_CONFIG_HOME entirely. Without these the user
+        // baseline is never found there, discovery falls through to the repo,
+        // and the scope assertion below sees `Repo` instead of `User`.
+        let _appdata = EnvVarGuard::set("APPDATA", &config_home);
+        let _local_appdata = EnvVarGuard::set("LOCALAPPDATA", &config_home);
         let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
         let _url = EnvVarGuard::unset("TIRITH_SERVER_URL");
         let _key = EnvVarGuard::unset("TIRITH_API_KEY");

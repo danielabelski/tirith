@@ -1000,8 +1000,24 @@ fn is_system_path(path: &str, home: Option<&str>) -> bool {
 /// wildcard patterns after resolving them against that cwd. The hot-path helper
 /// above deliberately cannot do this because it has no trustworthy cwd input.
 fn is_system_path_for_preview(path: &str, cwd: &Path, home: Option<&str>) -> bool {
-    let resolved = resolve_relative(path, cwd);
-    is_system_path(resolved.to_string_lossy().as_ref(), home)
+    // Resolve in POSIX-string space, never through `std::path::Path`: on Windows
+    // `PathBuf::join`/`is_absolute` rewrite these `/`-rooted operands with `\`
+    // and drop the leading `/`, so the resolved string failed `is_system_path`'s
+    // `starts_with('/')` gate and every preview classification went dark. The
+    // classification is POSIX-only by contract (its protected-root set is
+    // `/`-rooted), so resolve the same way.
+    let cwd = cwd.to_string_lossy();
+    let resolved = if let Some(rest) = path.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => format!("{}/{rest}", home.trim_end_matches('/')),
+            Err(_) => path.to_string(),
+        }
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{path}", cwd.trim_end_matches('/'))
+    };
+    is_system_path(&resolved, home)
 }
 
 fn target_is_glob(target: &str) -> bool {
