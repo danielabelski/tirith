@@ -1320,6 +1320,20 @@ mod tests {
                     unsafe { libc::pipe2(lifetime.as_mut_ptr(), libc::O_CLOEXEC) },
                     0
                 );
+                // A second pipe whose WRITE end the target keeps open itself, so
+                // reading it can never reach EOF. That is the target's blocking
+                // primitive after it observes parent death: `read` is in the
+                // seccomp allow-set (SystemIO::allow_read) while `nanosleep`,
+                // `clock_nanosleep`, and `pause` are all absent from every
+                // enabled rule set, so the filter's EPERM default made those
+                // return instantly and the target exited normally instead of
+                // waiting to be killed. Created BEFORE `apply_seccomp` because
+                // `pipe2` is itself not permitted afterwards.
+                let mut hold = [0i32; 2];
+                assert_eq!(
+                    unsafe { libc::pipe2(hold.as_mut_ptr(), libc::O_CLOEXEC) },
+                    0
+                );
                 assert_eq!(
                     unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
                     0
@@ -1377,28 +1391,30 @@ mod tests {
                         );
                         // A dying parent closes its descriptors BEFORE it sends
                         // the death signal (exit_files runs ahead of
-                        // exit_notify), so on another CPU this EOF can win the
-                        // race against the pending SIGKILL and the target would
-                        // exit normally, flaking the controller's WIFSIGNALED
-                        // proof. A bounded grace window only narrowed the race
-                        // (it lost once under MSRV CI load), and `pause` is not
-                        // in the seccomp allow-set — the filter's EPERM default
-                        // makes it return instantly, which would spin and exit.
-                        // `nanosleep` IS allowed, so sleep far past the
-                        // controller's own 2s wait deadline: a working PDEATHSIG
-                        // delivers SIGKILL (fatal — the process dies mid-sleep,
-                        // never returning here) no matter how delayed, and a
-                        // broken one is caught by that controller deadline
-                        // instead of by a normal exit racing the kill. EINTR
-                        // resumes the leftover so a stray wakeup cannot shorten
-                        // the window; the marker path stays reachable only if
-                        // the full sleep elapses uninterrupted.
-                        let mut remaining = libc::timespec {
-                            tv_sec: 30,
-                            tv_nsec: 0,
-                        };
+                        // exit_notify), so on another CPU the EOF above can win
+                        // the race against the pending SIGKILL. Exiting here
+                        // would then report a normal exit and defeat the
+                        // controller's WIFSIGNALED proof.
+                        //
+                        // Block instead — on `read`, which IS permitted
+                        // (SystemIO::allow_read). `nanosleep`, `clock_nanosleep`
+                        // and `pause` are in NO enabled rule set, so the seccomp
+                        // default action returns EPERM immediately and any
+                        // sleep-based wait degenerates into an instant normal
+                        // exit; that, not signal latency, is what kept failing.
+                        // This process holds `hold[1]` open itself, so `hold[0]`
+                        // can never reach EOF and only the parent-death SIGKILL
+                        // ends the wait, however delayed it is. A genuinely
+                        // broken PDEATHSIG is caught by the controller's own
+                        // wait deadline. The read is retried on EINTR so a stray
+                        // catchable signal cannot release it.
                         loop {
-                            if libc::nanosleep(&remaining, &mut remaining) == 0 {
+                            let waited = libc::read(
+                                hold[0],
+                                (&mut byte as *mut u8).cast::<libc::c_void>(),
+                                1,
+                            );
+                            if waited >= 0 {
                                 break;
                             }
                             if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
@@ -1457,7 +1473,13 @@ mod tests {
                 let guard_status = guard.wait().expect("reap killed guard");
                 assert!(!guard_status.success());
 
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                // Generous of PDEATHSIG delivery latency: under MSRV CI load the
+                // parent-death signal can take seconds to reach the target, and
+                // a 2s cap raced that legitimately-slow delivery to a spurious
+                // "survived" failure. The target now blocks on a pipe that can
+                // never EOF, so it cannot self-exit inside this window — a
+                // genuinely undelivered signal still trips the assertion below.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
                 let mut target_status = 0;
                 loop {
                     let waited =
