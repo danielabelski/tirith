@@ -5494,6 +5494,55 @@ mod tests {
             }
         }
     }
+    /// Clear every ambient package-manager context variable for a test's
+    /// lifetime, restoring them on drop.
+    ///
+    /// `environment_redirects_package_context` deliberately treats an ambient
+    /// `npm_config_*` as a lifecycle redirect and fails closed before the
+    /// package scan runs. GitHub's Windows runner image sets `npm_config_prefix`
+    /// machine-wide, so on that host the guard fires for every package-manager
+    /// leader and a lifecycle-scan fixture measures the runner's environment
+    /// instead of the scan it names. Names are discovered from the live
+    /// environment rather than hardcoded, because Windows spells the variable
+    /// lowercase and the predicate uppercases before matching.
+    struct AmbientPackageEnv {
+        previous: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl AmbientPackageEnv {
+        fn cleared() -> Self {
+            let lock = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+                .filter(|(name, _)| {
+                    name.to_str()
+                        .is_some_and(is_package_context_environment_name)
+                })
+                .collect();
+            // SAFETY: serialized by TEST_ENV_LOCK held in this guard.
+            unsafe {
+                for (name, _) in &previous {
+                    std::env::remove_var(name);
+                }
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+    impl Drop for AmbientPackageEnv {
+        fn drop(&mut self) {
+            // SAFETY: serialized by TEST_ENV_LOCK held in this guard.
+            unsafe {
+                for (name, value) in &self.previous {
+                    std::env::set_var(name, value);
+                }
+            }
+        }
+    }
+
     /// Isolate every XDG directory and HOME under TEST_ENV_LOCK, and disable
     /// ambient org/remote-policy overrides. This keeps the analysis fixtures from
     /// reading a developer's real policy, lists, trust store, state, or cache.
@@ -7048,6 +7097,7 @@ mod tests {
 
     #[test]
     fn repo_hook_hot_path_preserves_high_severity_and_surfaces_fetch_fallback() {
+        let _package_env = AmbientPackageEnv::cleared();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
         if !runtime_git_is_the_trusted_inspector(root.path()) {
@@ -7100,6 +7150,7 @@ mod tests {
 
     #[test]
     fn repo_hook_hot_path_scans_effective_cwd_without_git_and_inside_monorepos() {
+        let _package_env = AmbientPackageEnv::cleared();
         let unpacked = tempfile::tempdir().unwrap();
         std::fs::write(
             unpacked.path().join("package.json"),

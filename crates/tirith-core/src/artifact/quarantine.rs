@@ -851,18 +851,36 @@ impl QuarantineStore {
                 continue;
             }
 
-            // The collector's lock handle must share deletion: it remains held
-            // across tombstone rename and recursive deletion so a new same-id
-            // lease cannot make cleanup target the replacement directory.
-            let lock = match open_windows_lock_file(&path.join(LOCK_FILE), true) {
-                Ok(lock) => lock,
-                Err(_) => continue,
-            };
-            if lock.try_lock_exclusive().is_err() {
-                continue;
+            // Probe the lease to prove no other holder is mid-install, then
+            // CLOSE it before the tombstone rename below.
+            //
+            // [MS-FSA] 2.1.5.14.11 fails a DirectoryFile FileRenameInformation
+            // with STATUS_ACCESS_DENIED whenever 2.1.4.2's open-file census
+            // finds ANY open handle to a child of that directory, and that
+            // census has no FILE_SHARE_DELETE exemption — share-delete governs
+            // the 2.1.4.1 check when OPENING a file, not the rename of its
+            // parent. Holding `.lock` across the rename therefore failed every
+            // directory rename and left GC silently collecting nothing.
+            //
+            // Exclusion does not depend on this handle. `transaction` is open
+            // with DELETE and share = READ|WRITE only, so a concurrent same-id
+            // `begin_transaction` cannot get past its own directory open
+            // (STATUS_SHARING_VIOLATION, 2.1.4.1) for as long as the collector
+            // holds it — that is the pin which keeps cleanup off a replacement
+            // directory. Closing the lease also lets the content sweep below
+            // actually unlink `.lock`, so the directory is genuinely empty when
+            // its own delete is set (a directory delete hits the same census).
+            {
+                let lock = match open_windows_lock_file(&path.join(LOCK_FILE), true) {
+                    Ok(lock) => lock,
+                    Err(_) => continue,
+                };
+                if lock.try_lock_exclusive().is_err() {
+                    continue;
+                }
+                harden_windows_handle_owner_only(&lock)?;
             }
             harden_windows_handle_owner_only(&transaction)?;
-            harden_windows_handle_owner_only(&lock)?;
 
             let tombstone_name = gc_tombstone_name();
             if windows_rename_held_file(
@@ -882,11 +900,6 @@ impl QuarantineStore {
                 }
             });
             windows_remove_dir_contents(&tombstone)?;
-            // `.lock` is delete-pending but remains present until its held lease
-            // handle closes. The old directory is already detached and pinned by
-            // `transaction`, so releasing the lock here cannot redirect cleanup
-            // to a fresh public transaction with the same id.
-            drop(lock);
             windows_delete_held_file(&transaction)?;
             drop(transaction);
             removed += 1;
