@@ -62,9 +62,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::{
-    canonicalize_and_validate_filesystem_policy, CapabilityLevel, Capsule, CapsuleCoverage,
-    CapsuleSpec, EnvironmentPolicy, FilesystemPolicy, HandlePolicy, ResourceLimitSupport,
-    ResourceLimits,
+    CapabilityLevel, Capsule, CapsuleCoverage, CapsuleSpec, EnvironmentPolicy, HandlePolicy,
+    ResourceLimitSupport, ResourceLimits,
 };
 
 /// The stable backend identifier reported in receipts and `tirith doctor`.
@@ -156,9 +155,9 @@ fn best_effort_abi() -> Option<u8> {
 }
 
 /// Derive the coverage the backend can honestly claim for `spec`, given the
-/// Landlock probe result and whether seccomp is supported on this arch. It performs
-/// only read-only filesystem canonicalization of the requested policy (no process
-/// mutation), so every branch of the honesty contract remains unit-testable.
+/// Landlock probe result and whether seccomp is supported on this arch. **Pure**
+/// (no syscalls), so every branch of the honesty contract is unit-testable on any
+/// platform.
 ///
 /// Rules:
 /// - `fs_read_enforced` / `fs_write_enforced`: true only when Landlock is usable.
@@ -177,13 +176,9 @@ fn best_effort_abi() -> Option<u8> {
 /// - `env_isolated` / `handles_isolated`: true (the launcher always scrubs the
 ///   environment and closes inherited fds down to the policy set).
 pub fn derive_coverage(spec: &CapsuleSpec, fs: &LandlockProbe, seccomp: bool) -> CapsuleCoverage {
-    let filesystem_policy_valid =
-        canonicalize_and_validate_filesystem_policy(&spec.filesystem).is_ok();
     CapsuleCoverage {
-        // Landlock cannot carve a denied child out of a covering positive grant.
-        // Never claim filesystem coverage for an ambiguous/unrepresentable policy.
-        fs_read_enforced: fs.usable && filesystem_policy_valid,
-        fs_write_enforced: fs.usable && filesystem_policy_valid,
+        fs_read_enforced: fs.usable,
+        fs_write_enforced: fs.usable,
         // PR_SET_NO_NEW_PRIVS is always available on Linux; seccomp tightens it.
         exec_limited: true,
         // Raw sockets are denied only by the seccomp policy.
@@ -299,194 +294,6 @@ pub fn apply_containment(
     spec: &CapsuleSpec,
     temp_home: Option<&Path>,
 ) -> Result<CapsuleCoverage, ContainError> {
-    apply_containment_inner(spec, temp_home, &[], &[])
-}
-
-/// Apply containment while attaching one read-only filesystem grant to an
-/// already-open directory descriptor instead of reopening its pathname. The
-/// caller must keep `bound_read_root_fd` in `HandlePolicy::extra_unix_fds`, must
-/// have entered that same directory with `fchdir`, and must supply its observed
-/// canonical path as `bound_read_root`. This closes the final pathname swap
-/// window for quarantine-backed package installs.
-pub fn apply_containment_with_bound_read_root(
-    spec: &CapsuleSpec,
-    temp_home: Option<&Path>,
-    bound_read_root: &Path,
-    bound_read_root_fd: i32,
-) -> Result<CapsuleCoverage, ContainError> {
-    if !spec.handles.extra_unix_fds.contains(&bound_read_root_fd) {
-        return Err(ContainError::Handles(format!(
-            "bound read-root descriptor {bound_read_root_fd} is absent from the handle allow-list"
-        )));
-    }
-    apply_containment_inner(
-        spec,
-        temp_home,
-        &[(bound_read_root, bound_read_root_fd)],
-        &[],
-    )
-}
-
-/// Apply containment with independently held read and write directory
-/// capabilities. The write grant is installed from `bound_write_root_fd`
-/// directly; the diagnostic pathname is never reopened to determine authority.
-/// This is the capability seam used by package installation: a same-UID rename
-/// or replacement of the public target path cannot redirect the Landlock grant.
-pub fn apply_containment_with_bound_roots(
-    spec: &CapsuleSpec,
-    temp_home: Option<&Path>,
-    bound_read_root: Option<(&Path, i32)>,
-    bound_write_root: Option<(&Path, i32)>,
-) -> Result<CapsuleCoverage, ContainError> {
-    for (kind, bound) in [("read", bound_read_root), ("write", bound_write_root)] {
-        if let Some((_, fd)) = bound {
-            if !spec.handles.extra_unix_fds.contains(&fd) {
-                return Err(ContainError::Handles(format!(
-                    "bound {kind}-root descriptor {fd} is absent from the handle allow-list"
-                )));
-            }
-        }
-    }
-    let bound_read_roots = bound_read_root.into_iter().collect::<Vec<_>>();
-    let bound_write_roots = bound_write_root.into_iter().collect::<Vec<_>>();
-    apply_containment_inner(spec, temp_home, &bound_read_roots, &bound_write_roots)
-}
-
-/// Apply containment with any number of independently held directory grants.
-/// Every diagnostic path must be one exact canonical policy root and every
-/// descriptor must be explicitly retained by `HandlePolicy`. Landlock rules are
-/// created from these descriptors, never by reopening the diagnostic paths.
-pub fn apply_containment_with_bound_root_sets(
-    spec: &CapsuleSpec,
-    temp_home: Option<&Path>,
-    bound_read_roots: &[(&Path, i32)],
-    bound_write_roots: &[(&Path, i32)],
-) -> Result<CapsuleCoverage, ContainError> {
-    for (kind, roots) in [("read", bound_read_roots), ("write", bound_write_roots)] {
-        for (_, fd) in roots {
-            if !spec.handles.extra_unix_fds.contains(fd) {
-                return Err(ContainError::Handles(format!(
-                    "bound {kind}-root descriptor {fd} is absent from the handle allow-list"
-                )));
-            }
-        }
-    }
-    apply_containment_inner(spec, temp_home, bound_read_roots, bound_write_roots)
-}
-
-fn unique_bound_root(
-    roots: &[(&Path, i32)],
-    root: &Path,
-    kind: &str,
-) -> Result<Option<(usize, i32)>, ContainError> {
-    let mut matches = roots
-        .iter()
-        .enumerate()
-        .filter(|(_, (candidate, _))| *candidate == root)
-        .map(|(index, (_, fd))| (index, *fd));
-    let first = matches.next();
-    if matches.next().is_some() {
-        return Err(ContainError::Landlock(format!(
-            "bound {kind} root {} was supplied more than once",
-            root.display()
-        )));
-    }
-    Ok(first)
-}
-
-/// Which of the bound read/write root slots a policy root maps to, plus the
-/// single descriptor both sides share.
-type BoundPolicyRoot = (Option<usize>, Option<usize>, i32);
-
-fn bound_fd_for_policy_root(
-    root: &Path,
-    bound_read_roots: &[(&Path, i32)],
-    bound_write_roots: &[(&Path, i32)],
-) -> Result<Option<BoundPolicyRoot>, ContainError> {
-    let read = unique_bound_root(bound_read_roots, root, "read")?;
-    let write = unique_bound_root(bound_write_roots, root, "write")?;
-    match (read, write) {
-        (None, None) => Ok(None),
-        (Some((read_index, fd)), None) => Ok(Some((Some(read_index), None, fd))),
-        (None, Some((write_index, fd))) => Ok(Some((None, Some(write_index), fd))),
-        (Some((read_index, read_fd)), Some((write_index, write_fd))) if read_fd == write_fd => {
-            Ok(Some((Some(read_index), Some(write_index), read_fd)))
-        }
-        (Some((_, read_fd)), Some((_, write_fd))) => Err(ContainError::Landlock(format!(
-            "exact read/write bound root {} uses different descriptors ({read_fd} and {write_fd})",
-            root.display()
-        ))),
-    }
-}
-
-fn apply_containment_inner(
-    spec: &CapsuleSpec,
-    temp_home: Option<&Path>,
-    bound_read_roots: &[(&Path, i32)],
-    bound_write_roots: &[(&Path, i32)],
-) -> Result<CapsuleCoverage, ContainError> {
-    // Canonicalize and reject ambiguous allow/deny roots BEFORE touching process
-    // state. Use these normalized spellings for both overlap validation and
-    // Landlock rule construction.
-    let filesystem = canonicalize_and_validate_filesystem_policy(&spec.filesystem)
-        .map_err(|error| ContainError::Landlock(format!("filesystem policy: {error}")))?;
-    for (bound_root, _) in bound_read_roots {
-        unique_bound_root(bound_read_roots, bound_root, "read")?;
-        let matches = filesystem
-            .read_roots
-            .iter()
-            .filter(|root| root.as_path() == *bound_root)
-            .count();
-        if matches != 1 {
-            return Err(ContainError::Landlock(format!(
-                "bound read root {} must be one exact canonical read grant (found {matches})",
-                bound_root.display()
-            )));
-        }
-        for root in &filesystem.write_roots {
-            if bound_root.starts_with(root) || root.starts_with(bound_root) {
-                if root.as_path() != *bound_root {
-                    return Err(ContainError::Landlock(format!(
-                        "bound read root {} overlaps a non-exact writable grant {}",
-                        bound_root.display(),
-                        root.display()
-                    )));
-                }
-                // An exact read/write duplicate is safe only because both rules
-                // below are sourced from the same retained descriptor. This also
-                // lets a write-bound HOME replace a legacy duplicate read grant
-                // without reopening either pathname.
-                bound_fd_for_policy_root(root, bound_read_roots, bound_write_roots)?;
-            }
-        }
-    }
-    for (bound_root, _) in bound_write_roots {
-        unique_bound_root(bound_write_roots, bound_root, "write")?;
-        let matches = filesystem
-            .write_roots
-            .iter()
-            .filter(|root| root.as_path() == *bound_root)
-            .count();
-        if matches != 1 {
-            return Err(ContainError::Landlock(format!(
-                "bound write root {} must be one exact canonical write grant (found {matches})",
-                bound_root.display()
-            )));
-        }
-        for root in &filesystem.read_roots {
-            if bound_root.starts_with(root) || root.starts_with(bound_root) {
-                if root.as_path() != *bound_root {
-                    return Err(ContainError::Landlock(format!(
-                        "bound write root {} overlaps a non-exact readable grant {}",
-                        bound_root.display(),
-                        root.display()
-                    )));
-                }
-                bound_fd_for_policy_root(root, bound_read_roots, bound_write_roots)?;
-            }
-        }
-    }
-
     // Refuse a level we cannot honestly enforce, BEFORE touching the process.
     if spec.capability_level() == CapabilityLevel::AllowListedDomains {
         return Err(ContainError::Unsupported(
@@ -511,7 +318,7 @@ fn apply_containment_inner(
     set_no_new_privs()?;
 
     // 4. Landlock filesystem confinement.
-    let fs_outcome = apply_landlock(&filesystem, bound_read_roots, bound_write_roots)?;
+    let fs_outcome = apply_landlock(spec)?;
     if fs_outcome == LandlockOutcome::Partially {
         // Honest signal: FS is still confined to the grants (default-deny holds in
         // the safe direction), but the kernel honored only a subset of the
@@ -640,19 +447,17 @@ impl LandlockOutcome {
     }
 }
 
-/// Build and apply the Landlock ruleset from validated canonical read/write roots. Returns
+/// Build and apply the Landlock ruleset from the spec's read/write roots. Returns
 /// the [`LandlockOutcome`] (full / partial / not enforced) so the caller can record
 /// the honest status instead of coercing a partial result into a full-enforcement
 /// claim.
 ///
-/// Landlock is default-deny: only the granted roots are reachable. The shared
-/// validator has already proved every deny root disjoint from those grants because
-/// v1 Landlock cannot carve a denied subtree out of a broader grant.
-fn apply_landlock(
-    filesystem: &FilesystemPolicy,
-    bound_read_roots: &[(&Path, i32)],
-    bound_write_roots: &[(&Path, i32)],
-) -> Result<LandlockOutcome, ContainError> {
+/// Landlock is default-deny: only the granted roots are reachable. Roots in
+/// `deny_roots` that are not under any grant are therefore already denied. (v1
+/// Landlock cannot carve a denied subtree OUT of a broader grant; a caller that
+/// needs that must not grant the parent. The locked-down default grants nothing,
+/// so the sensitive subtrees are denied.)
+fn apply_landlock(spec: &CapsuleSpec) -> Result<LandlockOutcome, ContainError> {
     use landlock::{
         Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetStatus, ABI,
     };
@@ -673,51 +478,11 @@ fn apply_landlock(
     let write_access = AccessFs::from_all(abi);
 
     // Read roots: read access. Write roots imply read, so grant them the full set.
-    let mut bound_read_rules_used = vec![false; bound_read_roots.len()];
-    let mut bound_write_rules_used = vec![false; bound_write_roots.len()];
-    for root in &filesystem.read_roots {
-        if let Some((read_index, write_index, fd)) =
-            bound_fd_for_policy_root(root, bound_read_roots, bound_write_roots)?
-        {
-            ruleset = add_fd_rule(ruleset, fd, root, read_access)?;
-            if let Some(index) = read_index {
-                bound_read_rules_used[index] = true;
-            }
-            if let Some(index) = write_index {
-                bound_write_rules_used[index] = true;
-            }
-            continue;
-        }
+    for root in &spec.filesystem.read_roots {
         ruleset = add_path_rule(ruleset, root, read_access)?;
     }
-    for root in &filesystem.write_roots {
-        if let Some((read_index, write_index, fd)) =
-            bound_fd_for_policy_root(root, bound_read_roots, bound_write_roots)?
-        {
-            ruleset = add_fd_rule(ruleset, fd, root, write_access)?;
-            if let Some(index) = read_index {
-                bound_read_rules_used[index] = true;
-            }
-            if let Some(index) = write_index {
-                bound_write_rules_used[index] = true;
-            }
-            continue;
-        }
+    for root in &spec.filesystem.write_roots {
         ruleset = add_path_rule(ruleset, root, write_access)?;
-    }
-    let read_used = bound_read_rules_used.iter().filter(|used| **used).count();
-    if read_used != bound_read_roots.len() {
-        return Err(ContainError::Landlock(format!(
-            "only {read_used} of {} bound read roots were exact canonical grants",
-            bound_read_roots.len()
-        )));
-    }
-    let write_used = bound_write_rules_used.iter().filter(|used| **used).count();
-    if write_used != bound_write_roots.len() {
-        return Err(ContainError::Landlock(format!(
-            "only {write_used} of {} bound write roots were exact canonical grants",
-            bound_write_roots.len()
-        )));
     }
 
     let status = ruleset
@@ -733,82 +498,6 @@ fn apply_landlock(
         RulesetStatus::PartiallyEnforced => LandlockOutcome::Partially,
         RulesetStatus::NotEnforced => LandlockOutcome::NotEnforced,
     })
-}
-
-/// Add a path-beneath rule from the caller's already-validated directory
-/// descriptor. Landlock consumes the descriptor identity during `add_rule`; it
-/// does not reopen the potentially replaceable pathname.
-fn add_fd_rule<R>(
-    ruleset: R,
-    fd: i32,
-    diagnostic_path: &Path,
-    access: landlock::BitFlags<landlock::AccessFs>,
-) -> Result<R, ContainError>
-where
-    R: landlock::RulesetCreatedAttr,
-{
-    use landlock::PathBeneath;
-    use std::os::fd::BorrowedFd;
-
-    // SAFETY: the hidden launcher validated this live descriptor, keeps it in
-    // the handle allow-list through this call, and does not close it until the
-    // completed ruleset has restricted the process.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    ruleset
-        .add_rule(PathBeneath::new(borrowed, access))
-        .map_err(|error| {
-            ContainError::Landlock(format!(
-                "add bound descriptor rule {}: {error}",
-                diagnostic_path.display()
-            ))
-        })
-}
-
-/// Restrict the calling thread to one already-open directory tree.
-///
-/// This is intentionally thread-scoped: the CLI uses it in a short-lived
-/// cleanup worker so an attacker can rename a directory while it is being
-/// removed without turning descriptor-relative `..` traversal into authority
-/// over an unrelated parent.  The rule is anchored to the retained directory
-/// capability, never to a replaceable pathname, and hard-requires the complete
-/// Landlock ABI-v1 filesystem access set used by the cleanup walker.
-pub fn restrict_cleanup_thread_to_directory(directory_fd: i32) -> std::io::Result<()> {
-    use landlock::{
-        Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, ABI,
-    };
-    use std::os::fd::BorrowedFd;
-
-    if directory_fd < 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "cleanup Landlock root descriptor is negative",
-        ));
-    }
-
-    let abi = ABI::V1;
-    let access = AccessFs::from_all(abi);
-    let ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(access)
-        .map_err(|error| std::io::Error::other(format!("handle cleanup access: {error}")))?
-        .create()
-        .map_err(|error| std::io::Error::other(format!("create cleanup ruleset: {error}")))?;
-    // SAFETY: the caller owns or borrows this live descriptor through the
-    // complete ruleset construction and restriction sequence.
-    let directory = unsafe { BorrowedFd::borrow_raw(directory_fd) };
-    let ruleset = ruleset
-        .add_rule(PathBeneath::new(directory, access))
-        .map_err(|error| std::io::Error::other(format!("grant cleanup root: {error}")))?;
-    let status = ruleset
-        .restrict_self()
-        .map_err(|error| std::io::Error::other(format!("restrict cleanup thread: {error}")))?;
-    if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
-        return Err(std::io::Error::other(format!(
-            "cleanup Landlock restriction was not fully enforced: {status:?}"
-        )));
-    }
-    Ok(())
 }
 
 /// Add one path-beneath rule to the ruleset, ignoring only a path that is already
@@ -1233,31 +922,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_read_write_duplicate_selects_one_held_descriptor() {
-        let root = Path::new("/tmp/tirith-held-home");
-        let read_roots = [(root, 57)];
-        let write_roots = [(root, 57)];
-        assert_eq!(
-            bound_fd_for_policy_root(root, &read_roots, &write_roots)
-                .expect("one exact held descriptor"),
-            Some((Some(0), Some(0), 57))
-        );
-
-        assert_eq!(
-            bound_fd_for_policy_root(root, &[], &write_roots)
-                .expect("write-bound HOME also supplies its exact duplicate read rule"),
-            Some((None, Some(0), 57))
-        );
-    }
-
-    #[test]
-    fn exact_read_write_duplicate_rejects_different_or_duplicate_descriptors() {
-        let root = Path::new("/tmp/tirith-held-home");
-        assert!(bound_fd_for_policy_root(root, &[(root, 57)], &[(root, 58)]).is_err());
-        assert!(bound_fd_for_policy_root(root, &[(root, 57), (root, 57)], &[]).is_err());
-    }
-
-    #[test]
     fn derive_coverage_denyall_with_full_backend() {
         // Landlock usable + seccomp supported + a locked-down spec -> FS
         // enforced, raw-net denied, NEVER egress, and env + handles set. The
@@ -1292,39 +956,6 @@ mod tests {
         assert!(!cov.fs_read_enforced);
         assert!(!cov.fs_write_enforced);
         assert!(cov.network_raw_denied);
-    }
-
-    #[test]
-    fn derive_coverage_does_not_claim_fs_for_overlapping_deny_policy() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let denied = temp.path().join(".ssh");
-        std::fs::create_dir(&denied).expect("create denied root");
-        let mut spec = CapsuleSpec::locked_down();
-        spec.filesystem.read_roots = vec![temp.path().to_path_buf()];
-        spec.filesystem.deny_roots = vec![denied];
-        let fs = LandlockProbe {
-            usable: true,
-            abi: Some(4),
-        };
-
-        let coverage = derive_coverage(&spec, &fs, true);
-        assert!(!coverage.fs_read_enforced);
-        assert!(!coverage.fs_write_enforced);
-        assert!(coverage.is_degraded_against(&spec.required_coverage()));
-    }
-
-    #[test]
-    fn derive_coverage_does_not_claim_fs_for_unresolved_deny_root() {
-        let mut spec = CapsuleSpec::locked_down();
-        spec.filesystem.deny_roots = vec![PathBuf::new()];
-        let fs = LandlockProbe {
-            usable: true,
-            abi: Some(4),
-        };
-
-        let coverage = derive_coverage(&spec, &fs, true);
-        assert!(!coverage.fs_read_enforced);
-        assert!(!coverage.fs_write_enforced);
     }
 
     #[test]
@@ -1689,6 +1320,20 @@ mod tests {
                     unsafe { libc::pipe2(lifetime.as_mut_ptr(), libc::O_CLOEXEC) },
                     0
                 );
+                // A second pipe whose WRITE end the target keeps open itself, so
+                // reading it can never reach EOF. That is the target's blocking
+                // primitive after it observes parent death: `read` is in the
+                // seccomp allow-set (SystemIO::allow_read) while `nanosleep`,
+                // `clock_nanosleep`, and `pause` are all absent from every
+                // enabled rule set, so the filter's EPERM default made those
+                // return instantly and the target exited normally instead of
+                // waiting to be killed. Created BEFORE `apply_seccomp` because
+                // `pipe2` is itself not permitted afterwards.
+                let mut hold = [0i32; 2];
+                assert_eq!(
+                    unsafe { libc::pipe2(hold.as_mut_ptr(), libc::O_CLOEXEC) },
+                    0
+                );
                 assert_eq!(
                     unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
                     0
@@ -1746,28 +1391,30 @@ mod tests {
                         );
                         // A dying parent closes its descriptors BEFORE it sends
                         // the death signal (exit_files runs ahead of
-                        // exit_notify), so on another CPU this EOF can win the
-                        // race against the pending SIGKILL and the target would
-                        // exit normally, flaking the controller's WIFSIGNALED
-                        // proof. A bounded grace window only narrowed the race
-                        // (it lost once under MSRV CI load), and `pause` is not
-                        // in the seccomp allow-set — the filter's EPERM default
-                        // makes it return instantly, which would spin and exit.
-                        // `nanosleep` IS allowed, so sleep far past the
-                        // controller's own 2s wait deadline: a working PDEATHSIG
-                        // delivers SIGKILL (fatal — the process dies mid-sleep,
-                        // never returning here) no matter how delayed, and a
-                        // broken one is caught by that controller deadline
-                        // instead of by a normal exit racing the kill. EINTR
-                        // resumes the leftover so a stray wakeup cannot shorten
-                        // the window; the marker path stays reachable only if
-                        // the full sleep elapses uninterrupted.
-                        let mut remaining = libc::timespec {
-                            tv_sec: 30,
-                            tv_nsec: 0,
-                        };
+                        // exit_notify), so on another CPU the EOF above can win
+                        // the race against the pending SIGKILL. Exiting here
+                        // would then report a normal exit and defeat the
+                        // controller's WIFSIGNALED proof.
+                        //
+                        // Block instead — on `read`, which IS permitted
+                        // (SystemIO::allow_read). `nanosleep`, `clock_nanosleep`
+                        // and `pause` are in NO enabled rule set, so the seccomp
+                        // default action returns EPERM immediately and any
+                        // sleep-based wait degenerates into an instant normal
+                        // exit; that, not signal latency, is what kept failing.
+                        // This process holds `hold[1]` open itself, so `hold[0]`
+                        // can never reach EOF and only the parent-death SIGKILL
+                        // ends the wait, however delayed it is. A genuinely
+                        // broken PDEATHSIG is caught by the controller's own
+                        // wait deadline. The read is retried on EINTR so a stray
+                        // catchable signal cannot release it.
                         loop {
-                            if libc::nanosleep(&remaining, &mut remaining) == 0 {
+                            let waited = libc::read(
+                                hold[0],
+                                (&mut byte as *mut u8).cast::<libc::c_void>(),
+                                1,
+                            );
+                            if waited >= 0 {
                                 break;
                             }
                             if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
@@ -1827,14 +1474,11 @@ mod tests {
                 assert!(!guard_status.success());
 
                 // Generous of PDEATHSIG delivery latency: under MSRV CI load the
-                // parent-death signal can take seconds to reach the target, and a
-                // 2s cap raced that legitimately-slow delivery to a spurious
-                // "survived" failure. The target's own EOF fallback blocks in a
-                // 30s nanosleep, so any deadline < 30s still fails closed if the
-                // signal genuinely never arrives (the target self-exits at 30s and
-                // is reaped as a normal exit, which the WIFSIGNALED assertion
-                // rejects). 25s tolerates real delivery latency without weakening
-                // that proof.
+                // parent-death signal can take seconds to reach the target, and
+                // a 2s cap raced that legitimately-slow delivery to a spurious
+                // "survived" failure. The target now blocks on a pipe that can
+                // never EOF, so it cannot self-exit inside this window — a
+                // genuinely undelivered signal still trips the assertion below.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
                 let mut target_status = 0;
                 loop {
