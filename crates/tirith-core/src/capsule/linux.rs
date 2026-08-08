@@ -1826,7 +1826,16 @@ mod tests {
                 let guard_status = guard.wait().expect("reap killed guard");
                 assert!(!guard_status.success());
 
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                // Generous of PDEATHSIG delivery latency: under MSRV CI load the
+                // parent-death signal can take seconds to reach the target, and a
+                // 2s cap raced that legitimately-slow delivery to a spurious
+                // "survived" failure. The target's own EOF fallback blocks in a
+                // 30s nanosleep, so any deadline < 30s still fails closed if the
+                // signal genuinely never arrives (the target self-exits at 30s and
+                // is reaped as a normal exit, which the WIFSIGNALED assertion
+                // rejects). 25s tolerates real delivery latency without weakening
+                // that proof.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
                 let mut target_status = 0;
                 loop {
                     let waited =
