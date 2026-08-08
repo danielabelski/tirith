@@ -1620,9 +1620,14 @@ mod tests {
         std::fs::write(&path, "apiVersion: v1\ncurrent-context: prod-from-env\n")
             .expect("write kubeconfig");
         let kube = policy_with_label("kube:prod-from-env", "critical");
+        // The command is parsed as a POSIX shell string, where a backslash
+        // escapes the next character — embedding a Windows `C:\...` path would
+        // dissolve its separators and leave an unreadable KUBECONFIG. Windows
+        // accepts forward slashes in filesystem paths, so this spelling names
+        // the same file on every host while staying POSIX-quotable.
         let kube_command = format!(
             "env KUBECONFIG={} kubectl delete namespace payments",
-            path.display()
+            path.display().to_string().replace('\\', "/")
         );
         let findings = check(&kube_command, ShellType::Posix, &kube);
         assert!(findings
