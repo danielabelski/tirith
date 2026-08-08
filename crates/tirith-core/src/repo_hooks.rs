@@ -1619,7 +1619,21 @@ fn tracked_hook_roots(repo_root: &Path) -> Result<Vec<String>, &'static str> {
     if effective.is_empty() {
         return Err("repository effective hook path is empty and cannot be inspected safely");
     }
-    if let Some(relative) = repo_relative_hook_root(repo_root, effective)? {
+    // Git's own worktree root, in git's spelling, so the prefix comparison
+    // below compares like with like (see `repo_relative_hook_root`). Absent or
+    // unreadable, the helper falls back to canonicalizing `repo_root`.
+    let toplevel_args = vec![
+        "rev-parse".to_string(),
+        "--path-format=absolute".to_string(),
+        "--show-toplevel".to_string(),
+    ];
+    let toplevel = run_trusted_git_for_hook_location(repo_root, &toplevel_args, 4096)
+        .ok()
+        .filter(|output| output.success)
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(relative) = repo_relative_hook_root(repo_root, effective, toplevel.as_deref())? {
         if relative != ".git/hooks" && !roots.contains(&relative) {
             roots.push(relative);
         }
@@ -1630,6 +1644,7 @@ fn tracked_hook_roots(repo_root: &Path) -> Result<Vec<String>, &'static str> {
 fn repo_relative_hook_root(
     repo_root: &Path,
     configured: &str,
+    git_toplevel: Option<&str>,
 ) -> Result<Option<String>, &'static str> {
     if configured.chars().any(char::is_control) || configured.len() > 4096 {
         return Err("repository core.hooksPath contains an unsafe path");
@@ -1639,14 +1654,35 @@ fn repo_relative_hook_root(
         // `git rev-parse --path-format=absolute` normalizes the worktree path.
         // Compare it to the same physical root so a logical symlink or `..`
         // component cannot make an in-repo effective hooksPath disappear.
-        let comparison_root = std::fs::canonicalize(repo_root)
-            .map_err(|_| "repository root could not be resolved safely")?;
-        match configured_path
-            .strip_prefix(&comparison_root)
-            .or_else(|_| configured_path.strip_prefix(repo_root))
-        {
-            Ok(relative) => relative,
-            Err(_) => return Ok(None),
+        //
+        // Prefer GIT's own toplevel as that root. Both strings then come from
+        // the same command family in the same spelling, which is what makes the
+        // comparison sound on Windows: git emits `C:/repo/...` while
+        // `std::fs::canonicalize` yields a `\\?\C:\repo` verbatim path, and a
+        // verbatim prefix never compares equal to a plain disk prefix — so
+        // `strip_prefix` failed for every in-repo hooksPath and the root
+        // silently vanished from the scan. The canonicalize/raw attempts remain
+        // as fallbacks for callers with no git toplevel.
+        let toplevel_relative = git_toplevel.and_then(|toplevel| {
+            let toplevel = toplevel.trim_end_matches('/');
+            configured
+                .strip_prefix(toplevel)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(Path::new)
+        });
+        match toplevel_relative {
+            Some(relative) => relative,
+            None => {
+                let comparison_root = std::fs::canonicalize(repo_root)
+                    .map_err(|_| "repository root could not be resolved safely")?;
+                match configured_path
+                    .strip_prefix(&comparison_root)
+                    .or_else(|_| configured_path.strip_prefix(repo_root))
+                {
+                    Ok(relative) => relative,
+                    Err(_) => return Ok(None),
+                }
+            }
         }
     } else {
         configured_path
