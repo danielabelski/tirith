@@ -169,6 +169,53 @@ fn check_web3_address_in_url(url: &UrlLike, findings: &mut Vec<Finding>) {
     }
 }
 
+fn check_git_typosquat(url: &UrlLike, findings: &mut Vec<Finding>) {
+    if let Some(path) = url.path() {
+        if let Some(host) = url.host() {
+            let host_lower = host.to_lowercase();
+            if !(host_lower == "github.com"
+                || host_lower == "gitlab.com"
+                || host_lower == "bitbucket.org")
+            {
+                return;
+            }
+            let segments: Vec<&str> = path
+                .trim_start_matches('/')
+                .trim_end_matches(".git")
+                .split('/')
+                .collect();
+            if segments.len() >= 2 {
+                let owner = segments[0].to_lowercase();
+                let repo = segments[1].to_lowercase();
+                for &(pop_owner, pop_repo) in crate::data::POPULAR_REPOS {
+                    let po = pop_owner.to_lowercase();
+                    let pr = pop_repo.to_lowercase();
+                    // Single-edit typosquat: one half is one edit off, the other verbatim.
+                    if (owner == po && levenshtein(&repo, &pr) == 1)
+                        || (repo == pr && levenshtein(&owner, &po) == 1)
+                    {
+                        findings.push(Finding {
+                            rule_id: RuleId::GitTyposquat,
+                            severity: Severity::Medium,
+                            title: "Possible git repository typosquat".to_string(),
+                            description: format!(
+                                "Repository '{}/{}' is one edit from popular repo '{}/{}'",
+                                segments[0], segments[1], pop_owner, pop_repo
+                            ),
+                            evidence: vec![Evidence::Url { raw: url.raw_str() }],
+                            human_view: None,
+                            agent_view: None,
+                            mitre_id: None,
+                            custom_rule_id: None,
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,52 +265,5 @@ mod tests {
             &format!("https://example.com/{address}f"),
             RuleId::Web3AddressInUrl
         ));
-    }
-}
-
-fn check_git_typosquat(url: &UrlLike, findings: &mut Vec<Finding>) {
-    if let Some(path) = url.path() {
-        if let Some(host) = url.host() {
-            let host_lower = host.to_lowercase();
-            if !(host_lower == "github.com"
-                || host_lower == "gitlab.com"
-                || host_lower == "bitbucket.org")
-            {
-                return;
-            }
-            let segments: Vec<&str> = path
-                .trim_start_matches('/')
-                .trim_end_matches(".git")
-                .split('/')
-                .collect();
-            if segments.len() >= 2 {
-                let owner = segments[0].to_lowercase();
-                let repo = segments[1].to_lowercase();
-                for &(pop_owner, pop_repo) in crate::data::POPULAR_REPOS {
-                    let po = pop_owner.to_lowercase();
-                    let pr = pop_repo.to_lowercase();
-                    // Single-edit typosquat: one half is one edit off, the other verbatim.
-                    if (owner == po && levenshtein(&repo, &pr) == 1)
-                        || (repo == pr && levenshtein(&owner, &po) == 1)
-                    {
-                        findings.push(Finding {
-                            rule_id: RuleId::GitTyposquat,
-                            severity: Severity::Medium,
-                            title: "Possible git repository typosquat".to_string(),
-                            description: format!(
-                                "Repository '{}/{}' is one edit from popular repo '{}/{}'",
-                                segments[0], segments[1], pop_owner, pop_repo
-                            ),
-                            evidence: vec![Evidence::Url { raw: url.raw_str() }],
-                            human_view: None,
-                            agent_view: None,
-                            mitre_id: None,
-                            custom_rule_id: None,
-                        });
-                        return;
-                    }
-                }
-            }
-        }
     }
 }
