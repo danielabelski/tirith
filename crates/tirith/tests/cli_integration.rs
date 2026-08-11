@@ -9693,9 +9693,8 @@ fn seed_agent_deny_policy(dir: &std::path::Path, tool: &str) {
 }
 
 /// A custom `injection_seeds_custom` regex that passes the lenient policy shape
-/// check but fails the real regex compile must be surfaced to the operator on the
-/// paste CLI path, not silently dropped. The engine compiles + drops it (it is a
-/// library and does not print); the CLI surfaces it via `warn_bad_injection_seeds`.
+/// check but fails the real regex compile must be surfaced categorically to the
+/// operator on the paste CLI path, without echoing the attacker-controlled regex.
 #[cfg(unix)]
 #[test]
 fn paste_surfaces_bad_injection_seed_to_stderr() {
@@ -9731,8 +9730,9 @@ fn paste_surfaces_bad_injection_seed_to_stderr() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("invalid injection_seeds_custom regex") && stderr.contains("(unclosed"),
-        "paste must surface a bad injection_seeds_custom regex to stderr: {stderr}"
+        stderr.contains("injection_seeds_custom[0] was rejected (regex_rejected)")
+            && !stderr.contains("(unclosed"),
+        "paste must surface a categorical bad-seed warning without echoing the regex: {stderr}"
     );
 }
 
@@ -9764,8 +9764,56 @@ fn check_surfaces_bad_injection_seed_to_stderr() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("invalid injection_seeds_custom regex") && stderr.contains("(unclosed"),
-        "check must surface a bad injection_seeds_custom regex to stderr: {stderr}"
+        stderr.contains("injection_seeds_custom[0] was rejected (regex_rejected)")
+            && !stderr.contains("(unclosed"),
+        "check must surface a categorical bad-seed warning without echoing the regex: {stderr}"
+    );
+}
+
+/// Policy-health diagnostics precede the honored `TIRITH=0` fast return. The
+/// bypass still succeeds, but it cannot suppress or de-categorize an invalid
+/// custom injection seed warning.
+#[cfg(unix)]
+#[test]
+fn check_surfaces_bad_injection_seed_before_honored_tirith_bypass() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let policy_root = tmp.path().join("repo");
+    let tirith_dir = policy_root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "allow_bypass_env: true\n\
+         allow_bypass_env_noninteractive: true\n\
+         injection_seeds_custom:\n  - \"(unclosed\"\n",
+    )
+    .expect("write policy");
+
+    let out = tirith()
+        .env("TIRITH", "0")
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("TIRITH_LOG", "0")
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("run bypassed tirith check");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "bypass was not honored: {stderr}"
+    );
+    assert!(
+        stderr.contains("injection_seeds_custom[0] was rejected (regex_rejected)")
+            && !stderr.contains("(unclosed"),
+        "bypass must retain the indexed categorical warning without raw regex text: {stderr}"
     );
 }
 
@@ -15920,23 +15968,39 @@ fn commands_list_human_output_sanitizes_manifest_fields() {
         "manifest newlines must not forge catalogue rows: {stdout:?}"
     );
     assert!(
-        stdout.contains("safeFORGED-NAME")
-            && stdout.contains("echo REDFORGED-COMMAND")
-            && stdout.contains("*badFORGED-PATTERN*"),
+        stdout.contains(r"safe\nFORGED-NAME")
+            && stdout.contains(r"echo RED\nFORGED-COMMAND")
+            && stdout.contains(r"*bad\nFORGED-PATTERN*"),
         "sanitization must preserve the readable manifest text: {stdout:?}"
     );
 
-    // The structured boundary remains lossless: sanitization is a human-output
-    // projection, not a mutation of the manifest values.
+    // Structured output is also a forwarding boundary: preserve readable text
+    // while stripping terminal controls and preventing physical row injection.
     let structured = commands_tirith(root.path())
         .args(["commands", "list", "--json"])
         .output()
         .expect("commands list json");
     assert_eq!(structured.status.code(), Some(0));
     let json: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
-    assert_eq!(json["allowed"][0]["name"], hostile_name);
-    assert_eq!(json["allowed"][0]["command"], hostile_command);
-    assert_eq!(json["dangerous"][0]["pattern"], hostile_pattern);
+    for value in [
+        &json["allowed"][0]["name"],
+        &json["allowed"][0]["command"],
+        &json["dangerous"][0]["pattern"],
+    ] {
+        let value = value.as_str().expect("manifest field remains a string");
+        assert!(
+            !value.contains('\x1b'),
+            "ANSI survived JSON projection: {value:?}"
+        );
+        assert!(
+            !value.contains('\n'),
+            "newline survived JSON projection: {value:?}"
+        );
+        assert!(
+            value.contains(r"\nFORGED-"),
+            "readable escaped row was lost: {value:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -15972,7 +16036,9 @@ fn commands_run_human_banner_sanitizes_manifest_fields() {
         "manifest newlines must not forge run-output rows: {stderr:?}"
     );
     assert!(
-        stderr.contains("Running allowed command 'safeFORGED-NAME': : 'commandREDFORGED-COMMAND'"),
+        stderr.contains(
+            r"Running allowed command 'safe\nFORGED-NAME': : 'commandRED\nFORGED-COMMAND'"
+        ),
         "the safe banner must retain readable manifest text: {stderr:?}"
     );
 }
@@ -20331,6 +20397,33 @@ fn scan_missing_file_target_errors_before_exclusion_filters() {
     );
 }
 
+#[test]
+fn scan_missing_target_with_unavailable_target_policy_fully_redacts_json_stderr_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let secret = "C02_SCAN_TARGET_POLICY_SECRET";
+    let split = format!("{}\u{200b}{}", &secret[..14], &secret[14..]);
+    let repo = tmp.path().join(format!("target-{split}"));
+    fs::create_dir_all(repo.join(".git")).expect("create target repo marker");
+    fs::create_dir_all(repo.join(".tirith")).expect("create target policy directory");
+    fs::create_dir_all(repo.join("nested")).expect("create nearest existing ancestor");
+    fs::write(repo.join(".tirith/policy.yaml"), "[").expect("write malformed target policy");
+    let missing = repo.join("nested").join("not-created.txt");
+    let missing_arg = missing.display().to_string();
+
+    let out = tirith()
+        .args(["scan", "--format", "json", &missing_arg])
+        .output()
+        .expect("run scan against missing target with unavailable policy");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("path not found"), "stderr: {stderr}");
+    assert!(stderr.contains("[REDACTED:custom]"), "stderr: {stderr}");
+    assert!(!stderr.contains(secret), "stderr: {stderr}");
+    assert!(!stderr.contains('\u{200b}'), "stderr: {stderr}");
+    assert!(out.stdout.is_empty(), "stdout must stay protocol-clean");
+}
+
 #[cfg(unix)]
 #[test]
 fn scan_ci_fails_on_unreadable_ordinary_subtree_but_scans_readable_sibling() {
@@ -21401,9 +21494,9 @@ fn pkg_receipt_show_accepts_an_untampered_receipt() {
 // PR1: human-output sanitization sweep.
 //
 // These drive REAL attacker bytes into the CLI human renderers (paths, finding
-// descriptions, scan roots) and assert the display scrub neutralizes them, while
-// machine (JSON) output is intentionally left intact. The unit tests beside the
-// helper cover the per-codepoint matrix; these prove the WIRING end-to-end.
+// descriptions, scan roots) and assert every forwarded human/JSON boundary
+// neutralizes them. The unit tests beside the helper cover the per-codepoint
+// matrix; these prove the WIRING end-to-end.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// One representative of every class the display scrub must drop, bracketed by
@@ -21462,6 +21555,23 @@ fn assert_attack_codepoints_stripped(human: &[u8]) {
     );
 }
 
+fn collect_json_string_leaves<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(value) => out.push(value),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_string_leaves(value, out);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_json_string_leaves(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn install_human_output_neutralizes_hostile_command_and_package_name() {
     let out = tirith_install()
@@ -21482,7 +21592,7 @@ fn install_human_output_neutralizes_hostile_command_and_package_name() {
 }
 
 #[test]
-fn install_machine_json_preserves_raw_structured_command_text() {
+fn install_machine_json_sanitizes_forwarded_command_text() {
     let out = tirith_install()
         .args([
             "install",
@@ -21497,25 +21607,17 @@ fn install_machine_json_preserves_raw_structured_command_text() {
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("install machine output must remain valid JSON");
     assert_eq!(parsed["analysis"]["argv"]["program"], "npm");
-    assert_eq!(
-        parsed["analysis"]["argv"]["args"],
-        serde_json::json!(["install", ATTACK_PAYLOAD]),
-        "structured JSON argv must preserve exact argument identity"
-    );
+    let argument = parsed["analysis"]["argv"]["args"][1]
+        .as_str()
+        .expect("package argument remains a JSON string");
+    assert_attack_codepoints_stripped(argument.as_bytes());
     let command = parsed["analysis"]["command"]
         .as_str()
         .expect("analysis command must be a JSON string");
-    assert!(
-        command.contains('\x1b'),
-        "raw ESC must survive in JSON data"
-    );
-    assert!(
-        command.contains('\u{202e}'),
-        "raw bidi codepoint must survive in JSON data"
-    );
+    assert_attack_codepoints_stripped(command.as_bytes());
     assert!(
         command.contains('\n'),
-        "raw argument newline must survive in JSON data"
+        "argument separation remains visible after the unsafe controls are stripped"
     );
 }
 
@@ -21585,7 +21687,7 @@ fn scan_human_output_neutralizes_attacker_finding_description() {
 }
 
 #[test]
-fn scan_machine_json_is_not_display_sanitized() {
+fn scan_machine_json_sanitizes_forwarded_finding_text() {
     let dir = tempfile::tempdir().unwrap();
     let mcp = write_attacker_mcp_config(dir.path());
 
@@ -21601,17 +21703,16 @@ fn scan_machine_json_is_not_display_sanitized() {
         serde_json::from_slice(&out.stdout).expect("scan --format json must emit valid JSON");
     assert!(parsed.is_object(), "scan JSON root should be an object");
 
-    // ... and must NOT be display-sanitized: the control byte survives JSON-escaped
-    // and the bidi override survives as a raw codepoint (serde only escapes C0).
-    let raw = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        raw.contains("\\u001b"),
-        "machine JSON must PRESERVE the ESC byte (JSON-escaped), not strip it"
-    );
-    assert!(
-        raw.contains('\u{202e}'),
-        "machine JSON must PRESERVE the bidi override codepoint (it is not a terminal)"
-    );
+    // ... and must apply the same forwarding-boundary scrub as human output;
+    // JSON escaping is not a substitute for removing terminal/bidi controls.
+    // Inspect the decoded leaf so `\\u001b` cannot make a leaking test pass.
+    let mut strings = Vec::new();
+    collect_json_string_leaves(&parsed, &mut strings);
+    let attacker_projection = strings
+        .into_iter()
+        .find(|value| value.contains("evilSTART") && value.contains("ENDvis"))
+        .expect("the sanitized attacker-controlled finding text remains present");
+    assert_attack_codepoints_stripped(attacker_projection.as_bytes());
 }
 
 #[test]

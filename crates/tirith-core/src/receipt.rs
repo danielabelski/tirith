@@ -158,6 +158,43 @@ impl Receipt {
             git_branch: self.git_branch.clone(),
         }
     }
+
+    /// Clone this receipt for a public DTO using one frozen analysis DLP plan.
+    /// Stored receipts retain full local fidelity; the returned clone removes
+    /// cwd and structurally strips URL credentials/query/fragment/provider
+    /// tokens while DLP-redacting and bounding every free-text path field.
+    pub fn presentation_clone_with_compiled(
+        &self,
+        compiled: &crate::redact::CompiledCustomPatterns,
+    ) -> Self {
+        let text =
+            |value: &str| crate::redact::sanitize_provenance_text_with_compiled(value, compiled);
+        let url =
+            |value: &str| crate::redact::sanitize_provenance_url_with_compiled(value, compiled);
+        Self {
+            url: url(&self.url),
+            final_url: self.final_url.as_deref().map(&url),
+            redirects: self.redirects.iter().map(|value| url(value)).collect(),
+            sha256: self.sha256.clone(),
+            size: self.size,
+            domains_referenced: self
+                .domains_referenced
+                .iter()
+                .map(|value| text(value))
+                .collect(),
+            paths_referenced: self
+                .paths_referenced
+                .iter()
+                .map(|value| text(value))
+                .collect(),
+            analysis_method: text(&self.analysis_method),
+            privilege: text(&self.privilege),
+            timestamp: text(&self.timestamp),
+            cwd: None,
+            git_repo: self.git_repo.as_deref().map(url),
+            git_branch: self.git_branch.as_deref().map(text),
+        }
+    }
 }
 
 /// Redact the userinfo component (`user:password@`) of an absolute URL while
@@ -1124,6 +1161,52 @@ mod tests {
         let blob = v.to_string();
         assert!(!blob.contains("pat-token-123"), "{blob}");
         assert!(!blob.contains("secret-project"), "{blob}");
+    }
+
+    #[test]
+    fn presentation_clone_uses_frozen_dlp_and_shared_url_sanitizer() {
+        let canary = "C02_RECEIPT_PRESENTATION_CANARY";
+        let provider_token = "provider-token-0123456789";
+        let patterns = vec![regex::escape(canary)];
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let mut receipt = script_receipt("a".repeat(64));
+        receipt.url = format!(
+            "https://user:password@mainnet.infura.io/v3/{provider_token}?token={canary}#fragment"
+        );
+        receipt.final_url = Some(format!(
+            "https://eth-mainnet.g.alchemy.com/v2/{provider_token}?token={canary}"
+        ));
+        receipt.redirects = vec![format!(
+            "https://rpc.ankr.com/eth/{provider_token}?token={canary}"
+        )];
+        receipt.paths_referenced = vec![format!("/private/{canary}/wallet.json")];
+        receipt.git_repo = Some(format!(
+            "https://user:password@github.com/org/repo?token={canary}#fragment"
+        ));
+        receipt.git_branch = Some(format!("branch-{canary}"));
+
+        let projected = receipt.presentation_clone_with_compiled(&compiled);
+        let serialized = serde_json::to_string(&projected).unwrap();
+
+        for secret in [
+            canary,
+            provider_token,
+            "user:password",
+            "token=",
+            "#fragment",
+        ] {
+            assert!(!serialized.contains(secret), "receipt leaked {secret}");
+        }
+        assert!(serialized.contains("[REDACTED:custom]"));
+        assert!(projected.cwd.is_none());
+        assert!(
+            receipt.url.contains(canary),
+            "raw receipt must remain intact"
+        );
+        assert!(
+            receipt.cwd.is_some(),
+            "stored receipt must retain local cwd"
+        );
     }
 
     #[test]
