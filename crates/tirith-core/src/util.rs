@@ -7,6 +7,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 mod contained_fs;
+pub(crate) mod dirfd;
 
 pub(crate) use contained_fs::ContainedFilePreimage;
 #[doc(hidden)]
