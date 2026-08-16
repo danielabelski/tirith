@@ -6560,6 +6560,13 @@ mod tests {
         "posix".to_string()
     }
 
+    /// Files under `tests/fixtures/` that are TOML but are not engine goldens:
+    /// they drive a different public API and carry no `[[fixture]]` array.
+    /// Named one by one on purpose. A blanket "skip anything that fails to
+    /// parse" would also swallow a real golden file whose syntax broke, and the
+    /// whole value of this gate is that it covers every golden there is.
+    const NON_ENGINE_FIXTURE_FILES: &[&str] = &["task_provenance.toml"];
+
     #[test]
     fn every_exec_and_paste_golden_has_full_security_projection_equivalence() {
         let (_lock, _environment) = hermetic_tier1_environment();
@@ -6576,6 +6583,10 @@ mod tests {
             .filter(|path| {
                 path.extension()
                     .is_some_and(|extension| extension == "toml")
+                    && !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| NON_ENGINE_FIXTURE_FILES.contains(&name))
             })
             .collect::<Vec<_>>();
         paths.sort();

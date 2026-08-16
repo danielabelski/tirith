@@ -12932,6 +12932,10 @@ policy:
     fn test_handle_guarded_call_duplicate_active_id_denies() {
         // End to end: a guarded forward whose id is already pending is denied with
         // a `duplicate_active_id` envelope and is NOT written upstream.
+        // C19 isolation: this call reaches `prepare_execution`, which drafts a
+        // durable strict-execution ledger keyed by session id. Keep the ledger
+        // and its separate tamper-evidence sidecar beneath a per-run state root
+        // so an ambient newer-schema ledger cannot affect this test.
         use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
         let _lock = ENV_LOCK
@@ -13001,6 +13005,24 @@ policy:
             v["result"]["structuredContent"]["reason"],
             "duplicate_active_id"
         );
+
+        // Prove the isolation rather than assuming it: whatever this call
+        // drafted has to be inside the per-run directory. `state_dir()` is read
+        // while the guard is still live, so it resolves to the fresh root.
+        let state_root = tirith_core::policy::state_dir().expect("isolated state dir");
+        assert_eq!(
+            state_root, isolated_state_root,
+            "strict execution state must resolve to the shared guard's isolated root"
+        );
+        assert!(
+            isolated_sessions
+                .join(format!("{session_id}.execution"))
+                .exists(),
+            "strict execution preparation must stay inside the isolated state root"
+        );
+        if let Some(ambient_state_path) = ambient_state_path {
+            assert_ne!(ambient_state_path, isolated_state_path);
+        }
     }
 
     #[test]

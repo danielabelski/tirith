@@ -2,11 +2,71 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Once, RwLock};
 
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::Action;
+
+/// Point every base directory the engine resolves at runtime into this test
+/// binary's own `CARGO_TARGET_TMPDIR`, exactly once per process.
+///
+/// `engine::analyze` resolves the OPERATOR's policy on every call
+/// (`discover_fully_resolved_policy` -> `config_dir()/allowlist` and
+/// `/blocklist`) and the installed threat DB (`ThreatDb::cached`). Without this
+/// the golden corpus is a property of the developer's machine, not of the
+/// build: a `~/.config/tirith/blocklist` line naming any fixture host turns
+/// benign fixtures into CRITICAL `policy_blocklisted`, and every
+/// `<pm> install <name>` fixture flips the day a DB build lists that name.
+/// `HermeticTier1Environment` in `engine.rs` redirects the same set for the
+/// same reason.
+///
+/// Set once and never restored, so no test in this binary can observe the
+/// un-redirected value, and every test calls it before it analyzes anything.
+fn isolate_engine_environment() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("engine-env");
+        fs::create_dir_all(&root).expect("isolated engine environment root");
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
+            std::env::set_var(key, &root);
+        }
+        // An ambient operator override would defeat the redirect above.
+        // `TIRITH_POLICY_ROOT` is cleared rather than repointed: the context /
+        // ssh / iac tests below set it to their own tempdir and clear it again,
+        // so a value planted here would not survive them anyway.
+        for key in [
+            "TIRITH_THREATDB_PATH",
+            "TIRITH_THREATDB_SUPPLEMENTAL_PATH",
+            "TIRITH_POLICY_ROOT",
+        ] {
+            std::env::remove_var(key);
+        }
+        tirith_core::threatdb::ThreatDb::refresh_cache();
+    });
+}
+
+/// Guards the process-global threat-DB cache for the whole binary.
+///
+/// `test_threatintel_fixtures` repoints `TIRITH_THREATDB_PATH` /
+/// `TIRITH_THREATDB_SUPPLEMENTAL_PATH` and calls `ThreatDb::refresh_cache()`,
+/// swapping a process-global that every other fixture driver reads through
+/// `engine::analyze`. `ThreatDbCache::get` additionally re-resolves its source
+/// from the environment once `MTIME_CHECK_INTERVAL_SECS` has elapsed, so a
+/// sibling driver could pick the fixture DB up part-way through its own run and
+/// lose it again a moment later. Readers take the shared half; the single
+/// writer takes it exclusively.
+static THREAT_DB_SWAP: RwLock<()> = RwLock::new(());
 
 #[derive(Debug, Deserialize)]
 struct FixtureFile {
@@ -315,6 +375,17 @@ fn load_fixtures(filename: &str) -> Vec<Fixture> {
 }
 
 fn run_fixture(fixture: &Fixture) {
+    isolate_engine_environment();
+    let _db = THREAT_DB_SWAP
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    run_fixture_against_current_db(fixture);
+}
+
+/// The body of [`run_fixture`] with no lock of its own, for the one caller that
+/// already holds [`THREAT_DB_SWAP`] exclusively. `std::sync::RwLock` is not
+/// reentrant, so taking the read half under the write half would deadlock.
+fn run_fixture_against_current_db(fixture: &Fixture) {
     let shell = fixture
         .shell
         .parse::<ShellType>()
@@ -417,6 +488,7 @@ fn run_fixture(fixture: &Fixture) {
 
 #[test]
 fn test_hostname_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("hostname.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -427,6 +499,7 @@ fn test_hostname_fixtures() {
 
 #[test]
 fn test_path_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("path.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -437,6 +510,7 @@ fn test_path_fixtures() {
 
 #[test]
 fn test_transport_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("transport.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -447,6 +521,7 @@ fn test_transport_fixtures() {
 
 #[test]
 fn test_terminal_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("terminal.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -457,6 +532,7 @@ fn test_terminal_fixtures() {
 
 #[test]
 fn test_command_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("command.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -467,6 +543,7 @@ fn test_command_fixtures() {
 
 #[test]
 fn test_ecosystem_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("ecosystem.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -477,6 +554,7 @@ fn test_ecosystem_fixtures() {
 
 #[test]
 fn test_environment_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("environment.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -487,6 +565,7 @@ fn test_environment_fixtures() {
 
 #[test]
 fn test_clean_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("clean.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -497,6 +576,7 @@ fn test_clean_fixtures() {
 
 #[test]
 fn test_shell_weirdness_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("shell_weirdness.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -507,6 +587,7 @@ fn test_shell_weirdness_fixtures() {
 
 #[test]
 fn test_configfile_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("configfile.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -517,6 +598,7 @@ fn test_configfile_fixtures() {
 
 #[test]
 fn test_policy_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("policy.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -529,6 +611,7 @@ fn test_policy_fixtures() {
 /// fixture encodes a contract promised in the README/TIRITH.md.
 #[test]
 fn test_documented_commands_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("documented_commands.toml");
     let count = fixtures.len();
     assert!(
@@ -543,6 +626,7 @@ fn test_documented_commands_fixtures() {
 
 #[test]
 fn test_rendered_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("rendered.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -553,6 +637,7 @@ fn test_rendered_fixtures() {
 
 #[test]
 fn test_credential_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("credential.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -566,6 +651,7 @@ fn test_credential_fixtures() {
 /// source-only/sink-only boundary among the legacy command fixtures.
 #[test]
 fn test_web3_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("web3.toml");
     let count = fixtures.len();
     assert!(count > 0, "web3.toml must contain C05 boundary fixtures");
@@ -577,6 +663,7 @@ fn test_web3_fixtures() {
 
 #[test]
 fn test_codefile_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("codefile.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -587,6 +674,7 @@ fn test_codefile_fixtures() {
 
 #[test]
 fn test_cifile_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("cifile.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -597,6 +685,7 @@ fn test_cifile_fixtures() {
 
 #[test]
 fn test_aifile_fixtures() {
+    isolate_engine_environment();
     let fixtures = load_fixtures("aifile.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -607,9 +696,18 @@ fn test_aifile_fixtures() {
 
 #[test]
 fn test_threatintel_fixtures() {
+    isolate_engine_environment();
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbWriter, ThreatSource};
+
+    isolate_engine_environment();
+    // Exclusive for the whole swap-run-restore window: the two env vars and the
+    // DB cache below are process-global, and every sibling driver reads them
+    // through `engine::analyze`.
+    let _db = THREAT_DB_SWAP
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
 
     // Point the threat DB cache at the test fixture DB so DB-dependent rules can fire.
     let test_db_path = fixtures_dir().join("test-threatdb.dat");
@@ -646,7 +744,7 @@ fn test_threatintel_fixtures() {
     let fixtures = load_fixtures("threatintel.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
-        run_fixture(fixture);
+        run_fixture_against_current_db(fixture);
     }
     eprintln!("Passed {count} threatintel fixtures");
 
@@ -655,8 +753,74 @@ fn test_threatintel_fixtures() {
     tirith_core::threatdb::ThreatDb::refresh_cache();
 }
 
+/// The exclusion the shared/exclusive split exists for.
+///
+/// A fixture driver holds the shared half for its whole loop, so the
+/// process-global threat DB cannot be swapped out from under it part-way
+/// through. `test_threatintel_fixtures` is the one writer. Drop the write half
+/// from that writer and this test fails: the swap lands, signals, and the
+/// sampled action flips while the reader is still running. `ThreatDbCache::get`
+/// re-resolves its source from the environment every
+/// `MTIME_CHECK_INTERVAL_SECS`, so this is not hypothetical for a long driver.
+#[test]
+fn a_fixture_driver_never_observes_a_threat_db_swap_mid_run() {
+    isolate_engine_environment();
+
+    let sensitive = |input: &str| AnalysisContext {
+        input: input.to_string(),
+        shell: ShellType::Posix,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: true,
+        cwd: None,
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+        card_ref: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+    };
+    let ctx = sensitive("npm install evil-package@1.0.0");
+
+    let reader = THREAT_DB_SWAP
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    let before = engine::analyze(&ctx).action;
+
+    let fixture_db = fixtures_dir().join("test-threatdb.dat");
+    assert!(fixture_db.exists(), "fixture threat DB is missing");
+
+    let (swapped_tx, swapped_rx) = std::sync::mpsc::channel::<()>();
+    let swapper = std::thread::spawn(move || {
+        let _write = THREAT_DB_SWAP
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        std::env::set_var("TIRITH_THREATDB_PATH", &fixture_db);
+        tirith_core::threatdb::ThreatDb::refresh_cache();
+        let _ = swapped_tx.send(());
+        std::env::remove_var("TIRITH_THREATDB_PATH");
+        tirith_core::threatdb::ThreatDb::refresh_cache();
+    });
+
+    assert!(
+        swapped_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "the threat-DB swap completed while a fixture driver held the shared half"
+    );
+    assert_eq!(
+        engine::analyze(&ctx).action,
+        before,
+        "the DB under a fixture driver changed part-way through its run"
+    );
+
+    drop(reader);
+    swapper.join().expect("threat-DB swapper thread");
+}
+
 #[test]
 fn test_fixture_count() {
+    isolate_engine_environment();
     let files = [
         "hostname.toml",
         "path.toml",
@@ -716,6 +880,7 @@ fn public_sensitive_asset_gate(input: &str) -> bool {
 /// are deliberately not duplicated in PATTERN_TABLE.
 #[test]
 fn test_tier1_coverage() {
+    isolate_engine_environment();
     let files = [
         "hostname.toml",
         "path.toml",
@@ -1465,6 +1630,7 @@ fn collect_output_fixture_rules() -> HashSet<String> {
 /// dedicated fixtures — the analogue of [`test_hostname_fixtures`] etc.
 #[test]
 fn test_output_fixtures() {
+    isolate_engine_environment();
     use tirith_core::engine::{analyze_output, OutputContext};
 
     for file in OUTPUT_FIXTURE_FILES {
@@ -1526,6 +1692,7 @@ fn test_output_fixtures() {
 /// Pins `output.toml` coverage for the 6 output + 2 prompt-injection rules.
 #[test]
 fn test_output_rule_ids_have_fixture_coverage() {
+    isolate_engine_environment();
     let covered = collect_output_fixture_rules();
     let required = [
         // M7 ch1
@@ -1560,6 +1727,7 @@ fn test_output_rule_ids_have_fixture_coverage() {
 
 #[test]
 fn test_all_rule_ids_have_fixture_coverage() {
+    isolate_engine_environment();
     let covered = collect_fixture_rules();
     let excluded: HashSet<&str> = EXTERNALLY_TRIGGERED_RULES.iter().copied().collect();
 
@@ -1742,6 +1910,7 @@ rule_id_variant_registry! {
 /// enum-derived via the compile-time-enforced [`all_rule_id_variants`]).
 #[test]
 fn test_rule_id_list_is_complete() {
+    isolate_engine_environment();
     let all_variants = all_rule_id_variants();
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
 
@@ -1765,6 +1934,7 @@ fn test_rule_id_list_is_complete() {
 
 #[test]
 fn test_no_url_rules_have_no_url_fixtures() {
+    isolate_engine_environment();
     // Rules that fire with no URL — they need their own tier-1 pattern (not :// or git@).
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
@@ -1864,6 +2034,7 @@ fn test_no_url_rules_have_no_url_fixtures() {
 
 #[test]
 fn test_extractor_ids_cover_rule_triggers() {
+    isolate_engine_environment();
     let ids: HashSet<&str> = tirith_core::extract::extractor_ids()
         .iter()
         .copied()
@@ -1949,6 +2120,7 @@ fn test_extractor_ids_cover_rule_triggers() {
 
 #[test]
 fn test_tier1_does_not_gate_findings() {
+    isolate_engine_environment();
     let all_fixtures = load_all_fixtures();
     let mut gated = Vec::new();
 
@@ -2010,6 +2182,7 @@ fn test_tier1_does_not_gate_findings() {
 /// (no URLs/commands) must resolve to Allow.
 #[test]
 fn test_non_ascii_paste_not_sole_warn() {
+    isolate_engine_environment();
     let non_ascii_inputs = [
         "café au lait",
         "日本語テスト",
@@ -2056,6 +2229,7 @@ fn test_non_ascii_paste_not_sole_warn() {
 /// detection (command.rs) would silently gate real attacks.
 #[test]
 fn test_tier1_matches_all_interpreters() {
+    isolate_engine_environment();
     use tirith_core::extract::{tier1_scan, ScanContext};
     use tirith_core::rules::command::INTERPRETERS;
 
@@ -2143,6 +2317,7 @@ fn default_lab_shell() -> String {
 
 #[test]
 fn test_lab_corpus_reaches_tier3() {
+    isolate_engine_environment();
     // Walk from `crates/tirith-core` into the sibling `tirith` crate's corpus.
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -2263,6 +2438,7 @@ static CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
+    isolate_engine_environment();
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
@@ -2344,6 +2520,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
 
 #[test]
 fn context_rule_allows_kubectl_get_in_labeled_prod() {
+    isolate_engine_environment();
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
@@ -2425,6 +2602,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
 
 #[test]
 fn ssh_rule_blocks_destructive_on_labeled_host() {
+    isolate_engine_environment();
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
@@ -2484,6 +2662,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
 
 #[test]
 fn ssh_rule_emits_info_on_bare_labeled_host() {
+    isolate_engine_environment();
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
@@ -2541,6 +2720,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
 
 #[test]
 fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
+    isolate_engine_environment();
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
@@ -2605,6 +2785,7 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
 
 #[test]
 fn iac_rule_blocks_apply_without_plan_when_policy_on() {
+    isolate_engine_environment();
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
@@ -2659,6 +2840,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
 
 #[test]
 fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
+    isolate_engine_environment();
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
@@ -2728,6 +2910,7 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
 /// mismatch on the unchanged file, modify it, confirm the mismatch then fires.
 #[test]
 fn iac_rule_detects_plan_modification_after_record() {
+    isolate_engine_environment();
     use tirith_core::iac_plan::{self, PlanSummary};
 
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2834,6 +3017,7 @@ fn iac_rule_detects_plan_modification_after_record() {
 // the record is genuinely matchable. Shares `CONTEXT_TEST_LOCK` (mutates XDG_STATE_HOME).
 #[test]
 fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
+    isolate_engine_environment();
     use tirith_core::clipboard::ClipboardSourceState;
     use tirith_core::verdict::RuleId;
 
@@ -2942,6 +3126,7 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
 // host); the finding firing proves the in-memory record won. Shares `CONTEXT_TEST_LOCK`.
 #[test]
 fn paste_source_loaded_uses_in_memory_record_not_disk() {
+    isolate_engine_environment();
     use tirith_core::clipboard::{ClipboardSourceRecord, ClipboardSourceState};
     use tirith_core::verdict::RuleId;
 
@@ -3060,6 +3245,7 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
 // bails at the step-1 guard. Shares `CONTEXT_TEST_LOCK`.
 #[test]
 fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
+    isolate_engine_environment();
     use tirith_core::clipboard::{ClipboardSourceRecord, ClipboardSourceState};
     use tirith_core::verdict::RuleId;
 

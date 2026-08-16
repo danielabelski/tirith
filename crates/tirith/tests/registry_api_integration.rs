@@ -10,6 +10,28 @@ use tirith_core::package_risk::{self, ApiSignals, NameVsPopular, PackageSignals}
 use tirith_core::registry_api::{HttpRegistryClient, RegistryClient};
 use tirith_core::threatdb::Ecosystem;
 
+/// Point `state_dir()` at this test binary's own `CARGO_TARGET_TMPDIR`.
+///
+/// A successful registry lookup records a `registry_history` snapshot as a
+/// best-effort side effect (`registry_api::gather_api_signals` ->
+/// `registry_history::record_snapshot_with_maintainers`), and these tests use
+/// real package names. Without the redirect every `cargo test` appended a
+/// fixture maintainer set to the developer's own
+/// `~/.local/state/tirith/registry_snapshots/`, evicting a real row at
+/// `MAX_SNAPSHOTS_PER_PACKAGE` and leaving two adjacent rows that
+/// `diff_two_snapshots` reads as an ownership transfer. Set once per process
+/// and never restored, so no test can observe the un-redirected value.
+///
+/// Every `#[test]` in this file calls it first; a new one must too.
+fn isolate_state_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("registry-state");
+        std::fs::create_dir_all(&root).expect("isolated state root");
+        std::env::set_var("XDG_STATE_HOME", &root);
+    });
+}
+
 /// A trimmed-but-realistic npm full package document, parameterized so a test
 /// can make the package new/old, deprecated/current, etc.
 fn npm_doc(name: &str, latest: &str, created: &str, latest_time: &str, deprecated: bool) -> String {
@@ -39,6 +61,7 @@ fn npm_doc(name: &str, latest: &str, created: &str, latest_time: &str, deprecate
 
 #[test]
 fn npm_fetch_parses_established_package() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let body = npm_doc(
         "react",
@@ -72,6 +95,7 @@ fn npm_fetch_parses_established_package() {
 
 #[test]
 fn npm_deprecated_latest_version_is_flagged() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let body = npm_doc(
         "somepkg",
@@ -96,6 +120,7 @@ fn npm_deprecated_latest_version_is_flagged() {
 
 #[test]
 fn npm_exact_version_uses_only_selected_release_scripts() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let body = r#"{
         "name": "scripted",
@@ -142,6 +167,7 @@ fn npm_exact_version_uses_only_selected_release_scripts() {
 
 #[test]
 fn npm_exact_missing_version_does_not_reuse_latest() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let body = npm_doc(
         "scripted",
@@ -171,6 +197,7 @@ fn npm_exact_missing_version_does_not_reuse_latest() {
 
 #[test]
 fn npm_exact_wrong_package_identity_does_not_authorize_same_version() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let body = npm_doc(
         "different-package",
@@ -203,6 +230,7 @@ fn npm_exact_wrong_package_identity_does_not_authorize_same_version() {
 
 #[test]
 fn npm_404_degrades_to_unavailable() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let _m = server
         .mock("GET", "/ghost-package")
@@ -227,6 +255,7 @@ fn npm_404_degrades_to_unavailable() {
 
 #[test]
 fn npm_500_degrades_to_unavailable() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let _m = server
         .mock("GET", "/broken")
@@ -247,6 +276,7 @@ fn npm_500_degrades_to_unavailable() {
 
 #[test]
 fn npm_garbage_body_degrades_to_unavailable() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let _m = server
         .mock("GET", "/weird")
@@ -265,6 +295,7 @@ fn npm_garbage_body_degrades_to_unavailable() {
 
 #[test]
 fn pypi_fetch_parses_and_picks_repo_url() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let body = r#"{
         "info": {
@@ -299,6 +330,7 @@ fn pypi_fetch_parses_and_picks_repo_url() {
 
 #[test]
 fn pypi_yanked_latest_version_is_flagged() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let body = r#"{
         "info": { "name": "badpkg", "version": "1.0.0", "yanked": true },
@@ -319,6 +351,7 @@ fn pypi_yanked_latest_version_is_flagged() {
 
 #[test]
 fn crates_fetch_parses_downloads_and_yanked() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let body = r#"{
         "crate": {
@@ -350,6 +383,7 @@ fn crates_fetch_parses_downloads_and_yanked() {
 
 #[test]
 fn online_score_folds_in_api_factors_end_to_end() {
+    isolate_state_dir();
     // A brand-new crate with low downloads, no repo, and a version spike.
     let mut server = mockito::Server::new();
     let now = std::time::SystemTime::now()
@@ -434,6 +468,7 @@ fn online_score_folds_in_api_factors_end_to_end() {
 
 #[test]
 fn unsupported_ecosystem_degrades_without_network() {
+    isolate_state_dir();
     // Go has no registry API wired up — must degrade gracefully, and must not
     // even attempt a request (the mock server has no matching route).
     let server = mockito::Server::new();
@@ -453,6 +488,7 @@ fn unsupported_ecosystem_degrades_without_network() {
 
 #[test]
 fn npm_ownerless_established_package_flags_ownership() {
+    isolate_state_dir();
     // An established npm package with ZERO maintainers must fire the ownership
     // signal (npm DOES expose maintainers).
     let mut server = mockito::Server::new();
@@ -494,6 +530,7 @@ fn npm_ownerless_established_package_flags_ownership() {
 
 #[test]
 fn pypi_ownership_signal_is_unknown_not_false_positive() {
+    isolate_state_dir();
     // PyPI carries no maintainer field, so the ownership signal must be `None`,
     // never a false `Some(true)` (the flask false-positive regression guard).
     let mut server = mockito::Server::new();
@@ -548,6 +585,7 @@ fn pypi_ownership_signal_is_unknown_not_false_positive() {
 
 #[test]
 fn npm_response_over_size_cap_degrades() {
+    isolate_state_dir();
     // A response whose Content-Length exceeds the 8 MiB cap must degrade, not
     // load into memory.
     let mut server = mockito::Server::new();

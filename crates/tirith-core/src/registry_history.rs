@@ -259,6 +259,45 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Restores `XDG_STATE_HOME` on Drop. Test-only; see [`isolated_state_dir`].
+#[cfg(test)]
+pub(crate) struct StateDirGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Drop for StateDirGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+}
+
+/// Point [`crate::policy::state_dir`] at a fresh temp root for one test.
+///
+/// Recording a snapshot is a best-effort side effect of a lookup that otherwise
+/// looks pure ([`crate::registry_api::gather_api_signals`] passes
+/// `record_history = true`), so a unit test that feeds a fixture packument for
+/// a real package name writes a fixture maintainer set into the developer's own
+/// `~/.local/state/tirith/registry_snapshots/`. That evicts a real row at
+/// [`MAX_SNAPSHOTS_PER_PACKAGE`] and leaves two adjacent rows that
+/// [`diff_two_snapshots`] reads as an ownership transfer, which
+/// `tirith package --online` then reports.
+///
+/// The caller MUST already hold [`crate::TEST_ENV_LOCK`]: `XDG_STATE_HOME` is
+/// process-global.
+#[cfg(test)]
+pub(crate) fn isolated_state_dir() -> (tempfile::TempDir, StateDirGuard) {
+    let root = tempfile::tempdir().expect("isolated state root");
+    let guard = StateDirGuard {
+        previous: std::env::var_os("XDG_STATE_HOME"),
+    };
+    std::env::set_var("XDG_STATE_HOME", root.path());
+    (root, guard)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

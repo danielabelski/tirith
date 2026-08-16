@@ -331,10 +331,15 @@ mod tests {
 
     impl CwdGuard {
         pub(crate) fn enter(to: &std::path::Path) -> Self {
-            // A process-global lock so cwd-mutating tests in this module never
-            // run concurrently (cwd is process-global, like std::env).
-            static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // C19: this used to take a module-private `CWD_LOCK`, so two
+            // different locks guarded one process-global cwd. `cli::setup` runs
+            // under `test_harness::ENV_LOCK` and chdirs into a tempdir that is
+            // deleted when its test ends; a preview test holding only the other
+            // lock could therefore observe a deleted cwd and panic in
+            // `current_dir: NotFound`. One lock owns the process-global cwd.
+            let lock = crate::cli::test_harness::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::current_dir().unwrap();
             // Canonicalize so macOS `/var` → `/private/var` symlink does not
             // make the repo-root `starts_with` check fail.

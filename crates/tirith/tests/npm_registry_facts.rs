@@ -18,6 +18,28 @@ use tirith_core::provenance::npm_facts::{
 use tirith_core::registry_api::{self, HttpRegistryClient, RegistryClient};
 use tirith_core::threatdb::Ecosystem;
 
+/// Point `state_dir()` at this test binary's own `CARGO_TARGET_TMPDIR`.
+///
+/// A successful registry lookup records a `registry_history` snapshot as a
+/// best-effort side effect (`registry_api::gather_api_signals` ->
+/// `registry_history::record_snapshot_with_maintainers`), and these tests use
+/// real package names. Without the redirect every `cargo test` appended a
+/// fixture maintainer set to the developer's own
+/// `~/.local/state/tirith/registry_snapshots/`, evicting a real row at
+/// `MAX_SNAPSHOTS_PER_PACKAGE` and leaving two adjacent rows that
+/// `diff_two_snapshots` reads as an ownership transfer. Set once per process
+/// and never restored, so no test can observe the un-redirected value.
+///
+/// Every `#[test]` in this file calls it first; a new one must too.
+fn isolate_state_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("registry-state");
+        std::fs::create_dir_all(&root).expect("isolated state root");
+        std::env::set_var("XDG_STATE_HOME", &root);
+    });
+}
+
 /// A packument whose single release carries a caller-chosen `dist` object.
 fn npm_doc_with_dist(name: &str, version: &str, dist: &str) -> String {
     format!(
@@ -54,6 +76,7 @@ fn fetch_facts(doc_name: &str, body: &str) -> NpmDistFacts {
 
 #[test]
 fn dist_facts_parse_integrity_shasum_signatures_and_attestations() {
+    isolate_state_dir();
     let dist = r#"{
         "tarball": "TARBALL",
         "integrity": "sha512-YQtDqm9F8N3RGdaTZBWFAtxg0k7SF0Mz0Q9uAWlNGr0Yg==",
@@ -115,6 +138,7 @@ fn dist_facts_parse_integrity_shasum_signatures_and_attestations() {
 
 #[test]
 fn absent_dist_fields_read_as_not_published_not_as_a_failed_check() {
+    isolate_state_dir();
     let facts = fetch_facts(
         "bare-pkg",
         &npm_doc_with_dist("bare-pkg", "1.0.0", r#"{ "tarball": "" }"#),
@@ -128,6 +152,7 @@ fn absent_dist_fields_read_as_not_published_not_as_a_failed_check() {
 
 #[test]
 fn a_legacy_shasum_alone_is_display_status_never_integrity() {
+    isolate_state_dir();
     let facts = fetch_facts(
         "legacy-pkg",
         &npm_doc_with_dist(
@@ -151,6 +176,7 @@ fn a_legacy_shasum_alone_is_display_status_never_integrity() {
 /// actually shipped. A mirror or a hostile packument reaches all three shapes.
 #[test]
 fn a_datum_tirith_cannot_read_is_never_reported_as_a_datum_never_published() {
+    isolate_state_dir();
     // A signature entry with no `keyid`: present, uncheckable, NOT absent.
     let facts = fetch_facts(
         "unkeyed-pkg",
@@ -208,6 +234,7 @@ fn a_datum_tirith_cannot_read_is_never_reported_as_a_datum_never_published() {
 /// response never carried, which is also what the field's own doc promises.
 #[test]
 fn a_record_with_no_dist_object_reports_no_facts_at_all() {
+    isolate_state_dir();
     let mut server = mockito::Server::new();
     let _mock = server
         .mock("GET", "/no-dist-pkg")
@@ -261,6 +288,7 @@ fn a_record_with_no_dist_object_reports_no_facts_at_all() {
 /// all rejected.
 #[test]
 fn a_tarball_off_the_packument_origin_is_rejected() {
+    isolate_state_dir();
     for (label, tarball) in [
         (
             "different host",
@@ -302,6 +330,7 @@ fn a_tarball_off_the_packument_origin_is_rejected() {
 /// unresolved-version coverage gap, not a rejection.
 #[test]
 fn a_nonexistent_name_is_distinguishable_from_a_missing_exact_version() {
+    isolate_state_dir();
     use tirith_core::package_risk::PackageExistence;
 
     let mut server = mockito::Server::new();
@@ -350,6 +379,7 @@ fn a_nonexistent_name_is_distinguishable_from_a_missing_exact_version() {
 /// re-deriving them.
 #[test]
 fn lifecycle_and_loader_facts_surface_from_the_existing_analyzers() {
+    isolate_state_dir();
     let doc = r#"{
         "name": "hooked-pkg",
         "dist-tags": { "latest": "1.0.0" },
@@ -397,6 +427,7 @@ fn lifecycle_and_loader_facts_surface_from_the_existing_analyzers() {
 /// `node-gyp rebuild`. Regression guard for the implicit-hook path.
 #[test]
 fn an_implicit_node_gyp_rebuild_is_still_a_lifecycle_fact() {
+    isolate_state_dir();
     let doc = r#"{
         "name": "native-pkg",
         "dist-tags": { "latest": "1.0.0" },
@@ -427,6 +458,7 @@ fn an_implicit_node_gyp_rebuild_is_still_a_lifecycle_fact() {
 /// is simply not recorded, which is not the same thing.
 #[test]
 fn lockfile_integrity_disagreement_is_distinct_from_absence() {
+    isolate_state_dir();
     let lock = r#"{
         "lockfileVersion": 3,
         "packages": {
@@ -586,6 +618,7 @@ fn the_legacy_dependencies_mirror_cannot_replace_a_corroborated_entry() {
 /// a well-formed integrity line.
 #[test]
 fn present_provenance_never_lowers_a_score_or_suppresses_a_signal() {
+    isolate_state_dir();
     use tirith_core::package_risk::{
         self, ApiProvenance, ApiSignals, ContentSignals, NameVsPopular, PackageSignals,
     };
@@ -649,6 +682,7 @@ fn present_provenance_never_lowers_a_score_or_suppresses_a_signal() {
 /// signal, which is what "not an allowlist" means operationally.
 #[test]
 fn a_recognized_anchor_name_still_carries_its_malicious_signal() {
+    isolate_state_dir();
     use tirith_core::package_risk::{
         self, ApiSignals, ContentSignals, NameVsPopular, PackageSignals,
     };
@@ -685,6 +719,7 @@ fn a_recognized_anchor_name_still_carries_its_malicious_signal() {
 /// detection logic rather than a fact.
 #[test]
 fn wildcard_scope_impostors_are_outside_the_distance_one_comparison() {
+    isolate_state_dir();
     fn levenshtein(a: &str, b: &str) -> usize {
         let a: Vec<char> = a.chars().collect();
         let b: Vec<char> = b.chars().collect();

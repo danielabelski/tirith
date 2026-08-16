@@ -1,12 +1,20 @@
 name: Fuzz
 
 on:
+  # C19: a PR smoke run at a duration that actually completes. A weekly-only
+  # fuzz job cannot gate a merge, so a target that starts panicking on the
+  # branch is only found days later.
+  pull_request:
   schedule:
     - cron: "0 3 * * 1" # Monday 3am UTC
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   fuzz:
@@ -23,6 +31,14 @@ jobs:
           - extractor
           - normalizer
           - byte_scanner
+          # Registered in fuzz/Cargo.toml since the artifact work but never
+          # listed here, so it had never actually run in CI.
+          - artifact_wheel
+          # C19: the parsers this stack introduced.
+          - npm_command
+          - task_envelope
+          - workflow_artifact
+          - web3_command
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -35,12 +51,20 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
+      # 60s per target on a pull request, 300s on the scheduled and manual runs.
+      # The PR number is the one that has to finish inside a merge gate; the
+      # weekly number is the one that finds anything deep.
+      #
+      # The duration is selected in `env:` rather than by a shell `if` inside
+      # `run:`. Tirith's own workflow analysis reports an unresolvable `run:`
+      # body as High `AnalysisIncomplete`, and a security tool should not be
+      # the reason its own repository has an unexplained High finding.
       - name: Run fuzzer
-        run: |
-          cd fuzz
-          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+        run: cd fuzz && cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_SECONDS"
         env:
           RUSTFLAGS: "-C debuginfo=0"
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && 60 || 300 }}
 
       - name: Upload crash artifacts
         if: failure()

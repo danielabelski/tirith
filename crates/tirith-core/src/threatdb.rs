@@ -4136,9 +4136,18 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// The crate-wide env mutex, NOT a module-private one.
+    ///
+    /// The tests below repoint `TIRITH_THREATDB_PATH` and swap the
+    /// process-global DB cache. A second lock gives no mutual exclusion over
+    /// one process environment: `ThreatDbCache::get` re-resolves its source
+    /// from the environment every `MTIME_CHECK_INTERVAL_SECS`, so a sibling
+    /// test whose re-check landed inside one of these windows analyzed against
+    /// the fixture DB, or against no DB at all while
+    /// `test_refresh_cache_clears_when_current_source_disappears` has the
+    /// primary pointed at a missing file.
+    use crate::TEST_ENV_LOCK;
 
     /// Helper: create a writer, add test data, build, and return a ThreatDb.
     fn build_test_db(signing_key: &SigningKey) -> ThreatDb {
@@ -5407,7 +5416,7 @@ mod tests {
 
     #[test]
     fn test_combined_mtime_requires_primary_db() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let primary = tmp.path().join("primary.dat");
         let supplemental = tmp.path().join("supplemental.dat");
@@ -5438,7 +5447,7 @@ mod tests {
 
     #[test]
     fn test_refresh_cache_reloads_when_only_supplemental_changes() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = signed_fixture_db_path();
         let tmp = tempfile::tempdir().unwrap();
         let supplemental = tmp.path().join("supplemental.dat");
@@ -5494,7 +5503,7 @@ mod tests {
 
     #[test]
     fn test_refresh_cache_clears_when_current_source_disappears() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = signed_fixture_db_path();
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("missing-primary.dat");
@@ -6772,7 +6781,7 @@ mod tests {
     fn resolve_primary_path_falls_back_to_v1_for_self_signed_v2() {
         // End-to-end through resolve_primary_path (which requires a valid
         // signature): a self-signed v2 beside a v1 resolves to v1.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let key = SigningKey::generate(&mut OsRng);
         let tmp = tempfile::tempdir().unwrap();
         let v1_path = tmp.path().join("tirith-threatdb.dat");

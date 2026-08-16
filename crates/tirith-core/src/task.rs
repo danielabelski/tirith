@@ -569,6 +569,37 @@ pub struct InferredEffects {
     pub complete: bool,
 }
 
+/// Whether a config-write path names Tirith's own policy document.
+///
+/// Rewriting the policy is not the generic persistent write `PersistenceChange`
+/// covers: it is the control that decides every later answer, which is why
+/// `PolicyChange` is the effect the default task gate refuses to an untrusted
+/// source outright ([`TaskGatePolicy`]). Without this derivation nothing in the
+/// crate ever produced the variant, so that denial was unreachable and a
+/// `.tirith/policy.yaml` write was indistinguishable from writing any other
+/// config file.
+///
+/// Matched structurally on the last two components so a policy path mentioned
+/// elsewhere in a longer string cannot count: `<...>/.tirith/policy.yaml` (repo
+/// scope) and `<...>/tirith/policy.yaml` (user and org scope), plus the `.yml`
+/// spelling `Policy::discover` also accepts. Both separators are split because
+/// the path is envelope content, not a path resolved on this host.
+fn names_tirith_policy(path: &str) -> bool {
+    let mut components = path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".")
+        .rev();
+    let Some(file) = components.next() else {
+        return false;
+    };
+    if !file.eq_ignore_ascii_case("policy.yaml") && !file.eq_ignore_ascii_case("policy.yml") {
+        return false;
+    }
+    components.next().is_some_and(|parent| {
+        parent.eq_ignore_ascii_case(".tirith") || parent.eq_ignore_ascii_case("tirith")
+    })
+}
+
 /// Infer the effects an action actually has.
 ///
 /// Deliberately ignores anything the envelope says about itself. A task that
@@ -719,6 +750,9 @@ pub fn infer_effects_detailed_with_context(
                 effects.insert(CommandEffectKind::SecretRead);
             }
             effects.insert(CommandEffectKind::PersistenceChange);
+            if names_tirith_policy(path) {
+                effects.insert(CommandEffectKind::PolicyChange);
+            }
         }
         // Natural language is not a grant and not an effect. It is recorded by
         // the caller as an unmodelled request, nothing more.
@@ -1266,6 +1300,46 @@ mod tests {
             !mixed.complete,
             "the exfiltration half is not modelled, so the line is not complete"
         );
+    }
+
+    #[test]
+    fn writing_the_tirith_policy_is_its_own_effect() {
+        // `PolicyChange` is the effect the default gate refuses to an untrusted
+        // source outright, and until this derivation existed nothing in the
+        // crate produced it: a `.tirith/policy.yaml` write inferred exactly the
+        // same set as writing any other config file, so the denial was
+        // unreachable.
+        for path in [
+            ".tirith/policy.yaml",
+            ".tirith/policy.yml",
+            "/repo/.tirith/policy.yaml",
+            "/etc/tirith/policy.yaml",
+            "~/.config/tirith/policy.yaml",
+            r"C:\Users\dev\repo\.tirith\policy.yaml",
+        ] {
+            let effects = infer_effects(&ProposedAction::ConfigWrite { path: path.into() });
+            assert!(
+                effects.contains(&CommandEffectKind::PolicyChange),
+                "{path:?} is a policy write but did not infer PolicyChange: {effects:?}"
+            );
+        }
+
+        // And the derivation stays structural: a neighbouring name, a policy
+        // file under some other tool, or the word in prose is not a match.
+        for path in [
+            "notes.md",
+            ".tirith/trust.json",
+            "docs/policy.yaml",
+            "other-tool/policy.yaml",
+            ".tirith/policy.yaml.bak",
+            "policy.yaml",
+        ] {
+            let effects = infer_effects(&ProposedAction::ConfigWrite { path: path.into() });
+            assert!(
+                !effects.contains(&CommandEffectKind::PolicyChange),
+                "{path:?} is not a Tirith policy write but inferred PolicyChange: {effects:?}"
+            );
+        }
     }
 
     #[test]

@@ -19,9 +19,22 @@ new instructions:
 # ── role-override / jailbreak family → PromptInjectionInOutput ─────────
 act as <role>
 you are now
-system:
 do anything now
 DAN mode
+#
+# The `system:` role header, gated the same way "act as if you" is. A bare
+# `system:` substring is not a role header: it sits inside ordinary words
+# (`package-ecosystem:`, `Filesystem:`, `subsystem:`) and inside every
+# Kubernetes RBAC principal (`system:serviceaccount:kube-system:default`), and
+# each of those matches was a High block that dropped the whole tool result.
+# A real role header is followed by an instruction addressed to the model, so
+# the seed requires the `\b` word boundary, the whitespace that separates a
+# header from its body, and a second-person or imperative continuation. The
+# continuation list deliberately omits ignore/disregard/forget/override/new
+# instructions: `classify` routes any seed containing one of those to
+# IgnorePreviousInstructions, and those shapes already have their own seeds
+# above, so listing them here would only relabel this rule.
+\bsystem:\s+(?:you\b|your\b|from now on\b|do not\b|don't\b|never\b|always\b|act\b|respond\b|reply\b|output\b|print\b|reveal\b|repeat\b|execute\b|run\b|assistant\b)
 #
 # Contextual override openers. Anchored to a following directive word so prose
 # like "from now on the build is faster" or "act as if nothing happened" in a
