@@ -218,9 +218,17 @@ path operand was eaten by a `head`/`tail` option table; and `openssl enc -out` /
 `gpg -o` / `age -o` staged outputs carrying no lineage. The eighth is gap 1
 above, deferred with its reproduction recorded rather than quietly dropped.
 
-## Merge and release gates still open
+## Merge and release gates
 
-These belong to the release owner and are not claimed by this branch:
+Measured results for everything run on the branch tip are in
+`docs/release-evidence-web3-task-boundary.md`. In short, these are closed with
+numbers: the workspace suite (8,094 passed, 0 failed), the MSRV 1.83 job exactly
+as CI runs it, stable clippy and fmt, Windows and Linux cross-compiles,
+`cargo deny` (advisories, bans, licences, sources all ok), the Criterion budget
+gate (23 of 23 inside budget), and fuzz smoke for all 12 registered targets
+(zero crashes).
+
+These remain open, belong to the release owner, and are NOT claimed here:
 
 - pause and independently verify the disabled state of the scheduled ThreatDB
   workflow, run the shadow build and the `@solana/web3.js` boundary regression,
@@ -228,10 +236,12 @@ These belong to the release owner and are not claimed by this branch:
 - retarget onto the post-predecessor-stack `main` tip and recompute the merge
   tree;
 - a fresh review of any conflict resolution the retarget produces;
-- full core, CLI, integration, workspace, and release suites on the final tree,
-  plus Linux, macOS, Windows, and MSRV 1.83 gates;
-- fuzz smoke for every registered target and the Criterion budget gate;
-- `cargo deny`, dependency and licence verification, and binary-size review;
+- the full CI matrix on the final tree. Every measurement above is from ONE
+  macOS arm64 host, and several capabilities in this branch are Linux-only by
+  construction, so their enforcing paths have never executed anywhere;
+- binary-size review against the last released artifact. This branch records
+  28.3 MiB on that host, but there is no prior figure in the repository to
+  compare it against;
 - release-owner sign-off on the merge window and the rollback playbook in
   `docs/web3-task-rollout.md`.
 
