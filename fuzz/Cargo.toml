@@ -75,6 +75,11 @@ path = "fuzz_targets/web3_command.rs"
 doc = false
 
 [[bin]]
+name = "task_envelope"
+path = "fuzz_targets/task_envelope.rs"
+doc = false
+
+[[bin]]
 name = "workflow_artifact"
 path = "fuzz_targets/workflow_artifact.rs"
 doc = false
