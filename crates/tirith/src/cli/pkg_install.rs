@@ -2639,7 +2639,7 @@ mod tests {
             EnvGuard::set("HOME", root.path()),
             EnvGuard::set("USERPROFILE", root.path()),
         ];
-        std::env::set_var("TIRITH_LOG", "1");
+        let _log = EnvGuard::set("TIRITH_LOG", std::path::Path::new("1"));
 
         // A policy carrying a secret that must NOT reach the receipt's policy hash.
         let policy = Policy {
@@ -2680,8 +2680,6 @@ mod tests {
             !json.contains("ghp_SECRET_TOKEN_42"),
             "the receipt must never serialize the policy server API key: {json}"
         );
-
-        std::env::remove_var("TIRITH_LOG");
     }
 
     #[test]
@@ -2696,7 +2694,7 @@ mod tests {
             EnvGuard::set("HOME", root.path()),
             EnvGuard::set("USERPROFILE", root.path()),
         ];
-        std::env::set_var("TIRITH_LOG", "1");
+        let _log = EnvGuard::set("TIRITH_LOG", std::path::Path::new("1"));
 
         let mut outcome = ok_outcome();
         outcome.exit_code = 1;
@@ -2717,7 +2715,5 @@ mod tests {
             json.contains("\"post_install_record\": null"),
             "a failed install records no post-install RECORD summary: {json}"
         );
-
-        std::env::remove_var("TIRITH_LOG");
     }
 }

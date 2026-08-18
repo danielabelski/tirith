@@ -12,7 +12,8 @@
 //!   * never panic;
 //!   * every fact collection stays inside its declared bound, so an
 //!     attacker-chosen line cannot drive unbounded allocation;
-//!   * parsing is deterministic and its facts are idempotent;
+//!   * the complete parse result, including effects, completeness, and
+//!     truncation state, is deterministic in one fixed no-I/O context;
 //!   * findings carry categorical evidence only, so no argv word from the input
 //!     may appear verbatim in a finding, which is what keeps a private key or a
 //!     destination address out of every downstream surface;
@@ -63,15 +64,15 @@ fn project(findings: &[tirith_core::verdict::Finding]) -> Vec<String> {
 }
 
 fuzz_target!(|data: &str| {
+    let context = Web3ParseContextV2::without_filesystem();
+
     for shell in [ShellType::Posix, ShellType::PowerShell] {
-        let context = Web3ParseContextV2::without_filesystem();
         let first = parse_web3_commands_v2(data, shell, &context);
         let second = parse_web3_commands_v2(data, shell, &context);
 
         assert_eq!(
-            first.commands.len(),
-            second.commands.len(),
-            "the Web3 grammar is not deterministic in command count"
+            first, second,
+            "the complete Web3 parse result is not deterministic in a fixed no-I/O context"
         );
         assert!(
             first.commands.len() <= MAX_SHELL_SEGMENTS,

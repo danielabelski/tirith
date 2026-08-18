@@ -15980,7 +15980,7 @@ mod tests {
     #[test]
     fn an_unset_that_can_reach_a_tracked_function_still_fails_closed() {
         // The conservative half: once a function of that name is tracked in the
-        // same buffer, `unset name` really is ambiguous (POSIX picks the
+        // same buffer, `unset name` really is ambiguous (Bash selects the
         // variable first, and ambient variable state is outside this buffer),
         // so the walk must still report the gap. A name this walk cannot read
         // literally is unresolvable for the same reason.

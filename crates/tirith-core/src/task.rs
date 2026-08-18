@@ -571,33 +571,51 @@ pub struct InferredEffects {
 
 /// Whether a config-write path names Tirith's own policy document.
 ///
-/// Rewriting the policy is not the generic persistent write `PersistenceChange`
-/// covers: it is the control that decides every later answer, which is why
-/// `PolicyChange` is the effect the default task gate refuses to an untrusted
-/// source outright ([`TaskGatePolicy`]). Without this derivation nothing in the
-/// crate ever produced the variant, so that denial was unreachable and a
-/// `.tirith/policy.yaml` write was indistinguishable from writing any other
-/// config file.
-///
-/// Matched structurally on the last two components so a policy path mentioned
-/// elsewhere in a longer string cannot count: `<...>/.tirith/policy.yaml` (repo
-/// scope) and `<...>/tirith/policy.yaml` (user and org scope), plus the `.yml`
-/// spelling `Policy::discover` also accepts. Both separators are split because
-/// the path is envelope content, not a path resolved on this host.
+/// Policy writes control every later authorization answer and therefore carry
+/// [`CommandEffectKind::PolicyChange`] in addition to the generic persistent
+/// write effects. Classification is lexical because an envelope path is not
+/// resolved on this host: normalize separators and dot components, reject
+/// unresolved traversal and ambiguous/device roots, then match the terminal
+/// Tirith policy components using the input dialect's case rules.
 fn names_tirith_policy(path: &str) -> bool {
-    let mut components = path
-        .split(['/', '\\'])
-        .filter(|component| !component.is_empty() && *component != ".")
-        .rev();
-    let Some(file) = components.next() else {
-        return false;
-    };
-    if !file.eq_ignore_ascii_case("policy.yaml") && !file.eq_ignore_ascii_case("policy.yml") {
+    if path.is_empty() || path.ends_with('/') || path.ends_with('\\') {
         return false;
     }
-    components.next().is_some_and(|parent| {
-        parent.eq_ignore_ascii_case(".tirith") || parent.eq_ignore_ascii_case("tirith")
-    })
+    let Ok(path) = crate::lexical_path::LexicalPath::parse_auto(path) else {
+        return false;
+    };
+    if !path.parent_state().is_clean() {
+        return false;
+    }
+    match path.root_class() {
+        crate::lexical_path::RootClass::Relative
+        | crate::lexical_path::RootClass::PosixRoot
+        | crate::lexical_path::RootClass::DriveAbsolute
+        | crate::lexical_path::RootClass::Unc => {}
+        crate::lexical_path::RootClass::Verbatim if path.is_fully_qualified() => {}
+        crate::lexical_path::RootClass::DriveRelative
+        | crate::lexical_path::RootClass::RootedNoDrive
+        | crate::lexical_path::RootClass::Verbatim
+        | crate::lexical_path::RootClass::Device => return false,
+    }
+
+    let components = path.components();
+    if components.len() < 2 {
+        return false;
+    }
+    let parent = &components[components.len() - 2];
+    let file = &components[components.len() - 1];
+    match path.dialect() {
+        crate::lexical_path::PathDialect::Posix => {
+            matches!(parent.as_str(), ".tirith" | "tirith")
+                && matches!(file.as_str(), "policy.yaml" | "policy.yml")
+        }
+        crate::lexical_path::PathDialect::Windows => {
+            // Windows components are already ASCII-folded by LexicalPath.
+            matches!(parent.as_str(), ".tirith" | "tirith")
+                && matches!(file.as_str(), "policy.yaml" | "policy.yml")
+        }
+    }
 }
 
 /// Infer the effects an action actually has.
@@ -1303,41 +1321,52 @@ mod tests {
     }
 
     #[test]
-    fn writing_the_tirith_policy_is_its_own_effect() {
-        // `PolicyChange` is the effect the default gate refuses to an untrusted
-        // source outright, and until this derivation existed nothing in the
-        // crate produced it: a `.tirith/policy.yaml` write inferred exactly the
-        // same set as writing any other config file, so the denial was
-        // unreachable.
+    fn normalized_tirith_policy_writes_are_policy_changes() {
         for path in [
             ".tirith/policy.yaml",
             ".tirith/policy.yml",
+            ".tirith/x/../policy.yaml",
             "/repo/.tirith/policy.yaml",
-            "/etc/tirith/policy.yaml",
+            "/etc/tirith/policy.yml",
             "~/.config/tirith/policy.yaml",
-            r"C:\Users\dev\repo\.tirith\policy.yaml",
+            r"C:\Users\dev\repo\.TIRITH\x\..\POLICY.YAML",
+            r"\\Server\Share\.TIRITH\POLICY.YML",
+            r"\\?\C:\repo\.TIRITH\POLICY.YAML",
         ] {
-            let effects = infer_effects(&ProposedAction::ConfigWrite { path: path.into() });
+            let inferred = infer_effects(&ProposedAction::ConfigWrite { path: path.into() });
             assert!(
-                effects.contains(&CommandEffectKind::PolicyChange),
-                "{path:?} is a policy write but did not infer PolicyChange: {effects:?}"
+                inferred.contains(&CommandEffectKind::PolicyChange),
+                "normalized Tirith policy path {path:?} was not classified as a policy change"
             );
+            assert!(inferred.contains(&CommandEffectKind::FilesystemWrite));
+            assert!(inferred.contains(&CommandEffectKind::PersistenceChange));
         }
+    }
 
-        // And the derivation stays structural: a neighbouring name, a policy
-        // file under some other tool, or the word in prose is not a match.
+    #[test]
+    fn escaped_ambiguous_or_nonpolicy_paths_are_not_policy_changes() {
         for path in [
-            "notes.md",
-            ".tirith/trust.json",
-            "docs/policy.yaml",
-            "other-tool/policy.yaml",
+            ".tirith/../policy.yaml",
+            ".TIRITH/policy.yaml",
+            ".tirith/Policy.yaml",
+            "tirith/POLICY.YAML",
+            "../repo/.tirith/policy.yaml",
+            "/../../repo/.tirith/policy.yaml",
+            r"..\repo\.tirith\policy.yaml",
+            r"C:repo\.tirith\policy.yaml",
+            r"\repo\.tirith\policy.yaml",
+            r"\\.\C:\repo\.tirith\policy.yaml",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\.tirith\policy.yaml",
+            ".tirith/policy.yaml/",
             ".tirith/policy.yaml.bak",
+            "docs/policy.yaml",
             "policy.yaml",
+            ".tirith/policy.yaml\0suffix",
         ] {
-            let effects = infer_effects(&ProposedAction::ConfigWrite { path: path.into() });
+            let inferred = infer_effects(&ProposedAction::ConfigWrite { path: path.into() });
             assert!(
-                !effects.contains(&CommandEffectKind::PolicyChange),
-                "{path:?} is not a Tirith policy write but inferred PolicyChange: {effects:?}"
+                !inferred.contains(&CommandEffectKind::PolicyChange),
+                "non-policy or unsafe path {path:?} was classified as a policy change"
             );
         }
     }

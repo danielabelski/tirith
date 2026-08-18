@@ -4136,18 +4136,22 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
+    use tirith_test_support::GlobalStateGuard;
 
-    /// The crate-wide env mutex, NOT a module-private one.
-    ///
-    /// The tests below repoint `TIRITH_THREATDB_PATH` and swap the
-    /// process-global DB cache. A second lock gives no mutual exclusion over
-    /// one process environment: `ThreatDbCache::get` re-resolves its source
-    /// from the environment every `MTIME_CHECK_INTERVAL_SECS`, so a sibling
-    /// test whose re-check landed inside one of these windows analyzed against
-    /// the fixture DB, or against no DB at all while
-    /// `test_refresh_cache_clears_when_current_source_disappears` has the
-    /// primary pointed at a missing file.
-    use crate::TEST_ENV_LOCK;
+    fn invalidate_global_test_caches() {
+        if let Some(cache) = CACHE.get() {
+            cache.clear();
+            cache.last_mtime_check.store(0, Ordering::Relaxed);
+        }
+        crate::context_detect::invalidate_cache();
+    }
+
+    fn isolated_global_state() -> GlobalStateGuard {
+        let mut guard = GlobalStateGuard::new().expect("isolate process-global ThreatDB state");
+        invalidate_global_test_caches();
+        guard.after_restore(invalidate_global_test_caches);
+        guard
+    }
 
     /// Helper: create a writer, add test data, build, and return a ThreatDb.
     fn build_test_db(signing_key: &SigningKey) -> ThreatDb {
@@ -5266,10 +5270,11 @@ mod tests {
 
     #[test]
     fn test_cache_returns_none_when_no_file() {
-        // Fail-open smoke test: cached() must not panic regardless of whether a
-        // DB file happens to exist in the test environment.
-        let result = ThreatDb::cached();
-        let _ = result;
+        let _guard = isolated_global_state();
+        assert!(
+            ThreatDb::cached().is_none(),
+            "a fresh isolated ThreatDB root must not inherit an ambient cache"
+        );
     }
 
     #[test]
@@ -5416,15 +5421,9 @@ mod tests {
 
     #[test]
     fn test_combined_mtime_requires_primary_db() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let primary = tmp.path().join("primary.dat");
-        let supplemental = tmp.path().join("supplemental.dat");
-
-        unsafe {
-            std::env::set_var("TIRITH_THREATDB_PATH", &primary);
-            std::env::set_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH", &supplemental);
-        }
+        let guard = isolated_global_state();
+        let primary = guard.roots().threatdb.clone();
+        let supplemental = guard.roots().threatdb_supplemental.clone();
 
         assert_eq!(combined_mtime_epoch(), None);
 
@@ -5438,25 +5437,17 @@ mod tests {
         std::fs::write(&supplemental, b"overlay-updated").unwrap();
         let combined = combined_mtime_epoch().expect("combined mtime");
         assert_ne!(primary_only, combined);
-
-        unsafe {
-            std::env::remove_var("TIRITH_THREATDB_PATH");
-            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
-        }
     }
 
     #[test]
     fn test_refresh_cache_reloads_when_only_supplemental_changes() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = isolated_global_state();
         let fixture = signed_fixture_db_path();
-        let tmp = tempfile::tempdir().unwrap();
-        let supplemental = tmp.path().join("supplemental.dat");
+        let primary = guard.roots().threatdb.clone();
+        let supplemental = guard.roots().threatdb_supplemental.clone();
         let signing_key = SigningKey::generate(&mut OsRng);
 
-        unsafe {
-            std::env::set_var("TIRITH_THREATDB_PATH", &fixture);
-            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
-        }
+        std::fs::copy(&fixture, &primary).expect("install primary fixture in isolated root");
         ThreatDb::refresh_cache();
 
         let before = ThreatDb::cached().expect("fixture DB should load");
@@ -5481,9 +5472,6 @@ mod tests {
             .write_to(&supplemental, &signing_key)
             .expect("write supplemental DB");
 
-        unsafe {
-            std::env::set_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH", &supplemental);
-        }
         ThreatDb::refresh_cache();
 
         let after = ThreatDb::cached().expect("fixture DB with supplemental should load");
@@ -5493,42 +5481,24 @@ mod tests {
                 .is_some(),
             "refresh_cache should pick up supplemental changes even when the primary sequence is unchanged"
         );
-
-        unsafe {
-            std::env::remove_var("TIRITH_THREATDB_PATH");
-            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
-        }
-        ThreatDb::refresh_cache();
     }
 
     #[test]
     fn test_refresh_cache_clears_when_current_source_disappears() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = isolated_global_state();
         let fixture = signed_fixture_db_path();
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = tmp.path().join("missing-primary.dat");
+        let primary = guard.roots().threatdb.clone();
 
-        unsafe {
-            std::env::set_var("TIRITH_THREATDB_PATH", &fixture);
-            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
-        }
+        std::fs::copy(&fixture, &primary).expect("install primary fixture in isolated root");
         ThreatDb::refresh_cache();
         assert!(ThreatDb::cached().is_some(), "fixture DB should load");
 
-        unsafe {
-            std::env::set_var("TIRITH_THREATDB_PATH", &missing);
-        }
+        std::fs::remove_file(&primary).expect("remove isolated primary fixture");
         ThreatDb::refresh_cache();
         assert!(
             ThreatDb::cached().is_none(),
             "refresh_cache should clear the cached DB when the configured primary file disappears"
         );
-
-        unsafe {
-            std::env::remove_var("TIRITH_THREATDB_PATH");
-            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
-        }
-        ThreatDb::refresh_cache();
     }
 
     #[test]
@@ -6781,28 +6751,21 @@ mod tests {
     fn resolve_primary_path_falls_back_to_v1_for_self_signed_v2() {
         // End-to-end through resolve_primary_path (which requires a valid
         // signature): a self-signed v2 beside a v1 resolves to v1.
-        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = isolated_global_state();
         let key = SigningKey::generate(&mut OsRng);
-        let tmp = tempfile::tempdir().unwrap();
-        let v1_path = tmp.path().join("tirith-threatdb.dat");
-        let v2_path = tmp.path().join("tirith-threatdb-v2.dat");
+        let v1_path = guard.roots().threatdb.clone();
+        let v2_path = v2_sibling(&v1_path);
         ThreatDbWriter::new(1, 1)
             .write_to(&v1_path, &key)
             .expect("write v1");
         ThreatDbWriter::new(2, 2)
             .write_to_format(ThreatDbFormat::V2, &v2_path, &key)
             .expect("write v2");
-        unsafe {
-            std::env::set_var("TIRITH_THREATDB_PATH", &v1_path);
-        }
         // v2 exists and parses but is self-signed, so the signed-primary resolver
         // falls back to the v1 path.
         assert_eq!(ThreatDb::resolve_primary_path(), Some(v1_path.clone()));
         // With no v2 at all, still v1.
         std::fs::remove_file(&v2_path).unwrap();
         assert_eq!(ThreatDb::resolve_primary_path(), Some(v1_path.clone()));
-        unsafe {
-            std::env::remove_var("TIRITH_THREATDB_PATH");
-        }
     }
 }

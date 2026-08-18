@@ -4696,10 +4696,8 @@ mod tests {
 
     #[test]
     fn fake_registry_client_drives_resolver_without_network() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (_root, _state) = crate::registry_history::isolated_state_dir();
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate registry-history side effects");
         // The resolver seam works with a fixture client — no network.
         let client = FakeClient {
             result: Ok(RegistryMetadata {

@@ -1242,29 +1242,6 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    /// Hold the crate-wide env lock and point `state_dir()` at a temp root.
-    ///
-    /// A successful `gather_api` records a `registry_history` snapshot as a
-    /// best-effort side effect, and these tests feed a fixture packument under
-    /// the real npm name `react`. Without the redirect every `cargo test`
-    /// appended `maintainers: [], latest_version: "1.0.0"` to the developer's
-    /// own `~/.local/state/tirith/registry_snapshots/npm/react.jsonl`, evicting
-    /// a real row at `MAX_SNAPSHOTS_PER_PACKAGE` and leaving a pair that
-    /// `diff_two_snapshots` reads as an ownership transfer for a package the
-    /// operator actually depends on.
-    fn isolated_state_dir() -> (
-        std::sync::MutexGuard<'static, ()>,
-        tempfile::TempDir,
-        crate::cli::test_harness::EnvGuard,
-    ) {
-        let lock = crate::cli::test_harness::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let root = tempdir().expect("isolated state root");
-        let guard = crate::cli::test_harness::EnvGuard::set("XDG_STATE_HOME", root.path());
-        (lock, root, guard)
-    }
-
     fn render(breakdown: &RiskBreakdown) -> String {
         let mut buf: Vec<u8> = Vec::new();
         write_breakdown_human(breakdown, &mut buf).expect("write to Vec never fails");
@@ -1645,6 +1622,12 @@ mod tests {
 
     use tirith_core::registry_api::{FetchError, RegistryMetadata};
 
+    fn isolate_registry_state() -> tirith_test_support::GlobalStateGuard {
+        crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     /// A fixture-fed [`RegistryClient`].
     struct FakeClient {
         result: Result<RegistryMetadata, FetchError>,
@@ -1666,7 +1649,7 @@ mod tests {
 
     #[test]
     fn gather_api_offline_flag_skips_network() {
-        let (_lock, _root, _state) = isolated_state_dir();
+        let _global = isolate_registry_state();
         // CR12: `--offline` must short-circuit without calling `fetch` (the
         // exploding client would panic) and report NotComputed, not Unavailable.
         let sig = gather_api(&ExplodingClient, Ecosystem::Npm, "react", None, true);
@@ -1680,7 +1663,7 @@ mod tests {
 
     #[test]
     fn gather_api_success_returns_available() {
-        let (_lock, _root, _state) = isolated_state_dir();
+        let _global = isolate_registry_state();
         let meta = RegistryMetadata {
             source: "npm".to_string(),
             package_name: Some("react".to_string()),
@@ -1694,7 +1677,7 @@ mod tests {
 
     #[test]
     fn gather_api_failure_degrades_to_unavailable() {
-        let (_lock, _root, _state) = isolated_state_dir();
+        let _global = isolate_registry_state();
         let client = FakeClient {
             result: Err(FetchError::Network("connection refused".to_string())),
         };
@@ -1704,7 +1687,7 @@ mod tests {
 
     #[test]
     fn online_run_offline_flag_still_exits_zero_without_network() {
-        let (_lock, _root, _state) = isolated_state_dir();
+        let _global = isolate_registry_state();
         // `--online --offline` scores offline and exits 0 with no network call,
         // exercising the public `run` end-to-end.
         let code = run(

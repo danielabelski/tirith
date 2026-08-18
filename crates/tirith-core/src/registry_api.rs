@@ -1657,10 +1657,8 @@ mod tests {
 
     #[test]
     fn gather_available_on_success() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (_root, _state) = crate::registry_history::isolated_state_dir();
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate registry-history side effects");
         let client = FakeClient {
             result: Ok(meta_clean()),
         };
@@ -1669,63 +1667,41 @@ mod tests {
         assert_eq!(existence, PackageExistence::Exists);
     }
 
-    /// The lookup above records a registry-history row as a side effect. Pin
-    /// where that row lands: with no redirect it went to the operator's own
-    /// `~/.local/state/tirith/registry_snapshots/npm/react.jsonl`, one fixture
-    /// maintainer set per `cargo test --workspace`, evicting a real row each
-    /// time and leaving a pair that `diff_two_snapshots` reads as an ownership
-    /// transfer.
     #[test]
-    fn a_successful_lookup_records_its_snapshot_only_under_the_isolated_state_dir() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+    fn successful_fixture_lookup_records_history_only_under_isolated_state() {
+        let global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate registry-history side effects");
+        let state = crate::policy::state_dir().expect("isolated state directory");
+        assert!(
+            state.starts_with(&global.roots().root),
+            "registry history resolved outside the shared isolated root: {}",
+            state.display()
+        );
 
-        // Resolved BEFORE the redirect, so this is the path the binary would
-        // really use on this machine.
-        let operator_row = crate::policy::state_dir().map(|dir| {
-            dir.join("registry_snapshots")
-                .join("npm")
-                .join("react.jsonl")
-        });
-        let before = operator_row
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok());
-
-        let (root, _state) = crate::registry_history::isolated_state_dir();
+        let mut metadata = meta_clean();
+        metadata.package_name = Some("react-isolation-fixture".to_string());
         let client = FakeClient {
-            result: Ok(meta_clean()),
+            result: Ok(metadata),
         };
-        let (sig, _existence) = gather_api_signals(&client, Ecosystem::Npm, "react");
-        assert!(matches!(sig, ApiSignals::Available { .. }));
+        let (signals, existence) =
+            gather_api_signals(&client, Ecosystem::Npm, "react-isolation-fixture");
+        assert!(matches!(signals, ApiSignals::Available { .. }));
+        assert_eq!(existence, PackageExistence::Exists);
 
-        let isolated_row = root
-            .path()
-            .join("tirith")
+        let row = state
             .join("registry_snapshots")
             .join("npm")
-            .join("react.jsonl");
+            .join("react-isolation-fixture.jsonl");
         assert!(
-            isolated_row.exists(),
-            "the snapshot did not land under the isolated state dir ({})",
-            isolated_row.display()
+            row.is_file(),
+            "fixture registry snapshot was not written below isolated state: {}",
+            row.display()
         );
-
-        let after = operator_row
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok());
-        assert_eq!(
-            before, after,
-            "the lookup wrote the operator's own registry-history store"
-        );
+        assert_eq!(crate::registry_history::read_rows(&row).len(), 1);
     }
 
     #[test]
     fn gather_unavailable_on_network_error() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (_root, _state) = crate::registry_history::isolated_state_dir();
         let client = FakeClient {
             result: Err(FetchError::Network("connection refused".to_string())),
         };
@@ -1741,10 +1717,6 @@ mod tests {
 
     #[test]
     fn gather_unavailable_on_not_found_sets_existence_not_found() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (_root, _state) = crate::registry_history::isolated_state_dir();
         let client = FakeClient {
             result: Err(FetchError::NotFound),
         };
@@ -1797,10 +1769,6 @@ mod tests {
 
     #[test]
     fn exact_lookup_never_reuses_different_latest_version() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (_root, _state) = crate::registry_history::isolated_state_dir();
         let mut metadata = meta_clean();
         metadata.latest_version = Some("2.0.0".to_string());
         let client = FakeClient {
@@ -1880,9 +1848,6 @@ mod tests {
     fn registry_client_rejects_connect_time_private_dns_rebind() {
         use crate::ssrf_guard::test_support::EnvironmentRestore;
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
         let url = "http://registry-public.example.test:8080/package";
@@ -1915,9 +1880,6 @@ mod tests {
             http_response, EnvironmentRestore, ScriptedHttpServer,
         };
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
         let fixture = ScriptedHttpServer::start(vec![http_response(
@@ -1969,9 +1931,6 @@ mod tests {
             http_response, EnvironmentRestore, ProxyTrap, ScriptedHttpServer,
         };
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = ScriptedHttpServer::start(vec![
             http_response("302 Found", &[("Location", "/final")], b""),
             http_response("200 OK", &[("Content-Type", "application/json")], b"{}"),
@@ -2014,10 +1973,6 @@ mod tests {
 
     #[test]
     fn unsupported_ecosystem_degrades_gracefully() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (_root, _state) = crate::registry_history::isolated_state_dir();
         // Go has no registry API — a graceful Unavailable.
         let err = FetchError::UnsupportedEcosystem(Ecosystem::Go);
         assert!(err.reason().contains("go"));
@@ -2366,10 +2321,6 @@ mod tests {
 
     #[test]
     fn fetch_rejects_traversal_name_without_a_request() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (_root, _state) = crate::registry_history::isolated_state_dir();
         // F2 end-to-end: a traversal name short-circuits to `InvalidName` before
         // any URL is built, so this test issues no request.
         let client = HttpRegistryClient::without_cache();
