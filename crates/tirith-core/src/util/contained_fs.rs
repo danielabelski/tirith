@@ -2126,7 +2126,7 @@ mod platform {
             inspect_regular(handle.0, &self.display)?;
             let mut file = handle.into_file();
             let mut bytes = Vec::new();
-            file.by_ref()
+            std::io::Read::by_ref(&mut file)
                 .take(expected.len().saturating_add(1) as u64)
                 .read_to_end(&mut bytes)?;
             if bytes != expected {
