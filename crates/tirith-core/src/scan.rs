@@ -638,6 +638,7 @@ fn run_workflow_artifact_post_pass(
             path,
             findings: verdict.findings,
             is_config_file: false,
+            coverage_gaps: Vec::new(),
         });
     }
 
