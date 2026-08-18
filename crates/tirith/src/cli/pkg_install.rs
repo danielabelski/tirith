@@ -2000,9 +2000,10 @@ mod tests {
         let _launch = checkpoint
             .take_authorized_launch()
             .expect("the exact authorization reaches one launch transaction");
-        let reused = checkpoint
-            .take_authorized_launch()
-            .expect_err("the task permit must not authorize a retry");
+        let reused = match checkpoint.take_authorized_launch() {
+            Ok(_) => panic!("the task permit must not authorize a retry"),
+            Err(error) => error,
+        };
         assert_eq!(reused.kind(), std::io::ErrorKind::PermissionDenied);
         checkpoint.rollback().unwrap();
     }

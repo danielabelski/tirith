@@ -219,9 +219,8 @@ fn validate_keyring_directory(
         return Err(TrustedReceiptKeyringError::InvalidFile);
     }
     let owner_is_trusted = metadata.uid() == expected_uid || metadata.uid() == 0;
-    let root_sticky_directory = metadata.uid() == 0
-        && metadata.mode() & libc::S_ISVTX as u32 != 0
-        && metadata.mode() & 0o022 != 0;
+    let root_sticky_directory =
+        metadata.uid() == 0 && metadata.mode() & 0o1000 != 0 && metadata.mode() & 0o022 != 0;
     if !owner_is_trusted || (metadata.mode() & 0o022 != 0 && !root_sticky_directory) {
         return Err(TrustedReceiptKeyringError::UnsafePermissions);
     }

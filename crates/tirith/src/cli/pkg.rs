@@ -2908,14 +2908,14 @@ mod tests {
             &["https://index.example/simple".to_string()],
             &[],
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("valid resolver request was rejected: {error}"));
         let permit = resolver_permit(&original, &[], &target);
         let changed = validated_resolver_request(
             &["demo==1.0".to_string()],
             &["https://other.example/simple".to_string()],
             &[],
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("valid resolver request was rejected: {error}"));
 
         let result = prepare_plan_authorized(
             permit,
@@ -2937,7 +2937,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let target_path = root.path().join("target");
         let target = InstallTargetBinding::bind(&target_path).unwrap();
-        let request = validated_resolver_request(&["demo==1.0".to_string()], &[], &[]).unwrap();
+        let request = validated_resolver_request(&["demo==1.0".to_string()], &[], &[])
+            .unwrap_or_else(|error| panic!("valid resolver request was rejected: {error}"));
         let approved_origins = ["https://cdn.example/wheels".to_string()];
         let permit = resolver_permit(&request, &approved_origins, &target);
         let changed_origins = ["https://other.example/wheels".to_string()];
