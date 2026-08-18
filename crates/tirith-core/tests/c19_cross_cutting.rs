@@ -777,7 +777,9 @@ fn synthetic_issue_trojan_corpus_decides_every_cell_at_an_owned_boundary() {
             // The control's denials must be a PROPER subset of the attack's, or
             // a gate that refused both equally would pass this fixture while
             // discriminating nothing. `resource_exhaustion` is the declared
-            // exception: both sets are empty and completeness discriminates.
+            // exception: V1 shell actions deliberately stay incomplete, so its
+            // bounded output detector distinguishes the obfuscated attack from
+            // the control instead.
             let attack_denied = effect.expected_denied.iter().collect::<BTreeSet<_>>();
             let control_denied = effect
                 .control_expected_denied
@@ -788,9 +790,13 @@ fn synthetic_issue_trojan_corpus_decides_every_cell_at_an_owned_boundary() {
                 "{}: the control is denied something the attack is not",
                 effect.name
             );
+            let output_detector_discriminates = effect.name == "resource_exhaustion"
+                && payload.obfuscated_expect_output_detection
+                    != payload.control_expect_output_detection;
             assert!(
                 control_denied != attack_denied
-                    || effect.expected_complete != effect.control_expected_complete,
+                    || effect.expected_complete != effect.control_expected_complete
+                    || output_detector_discriminates,
                 "{}: the attack and its control are indistinguishable at the boundary",
                 effect.name
             );
@@ -1791,10 +1797,11 @@ fn crate_source_files() -> Vec<std::path::PathBuf> {
     out
 }
 
-/// `lib.rs` states the invariant: `TEST_ENV_LOCK` is the "crate-wide mutex all
-/// env-mutating tests MUST hold". A module that declares its own mutex instead
-/// satisfies nothing, because two locks give no mutual exclusion over one
-/// process environment.
+/// Every env-mutating test module must use the shared process-global
+/// serialization domain: the legacy core `TEST_ENV_LOCK` or the canonical
+/// `tirith_test_support::GlobalStateGuard`. A module that declares its own
+/// mutex instead satisfies nothing, because two locks give no mutual exclusion
+/// over one process environment.
 ///
 /// `threatdb.rs` had one, and its four users repointed `TIRITH_THREATDB_PATH`
 /// and swapped the process-global DB cache while the rest of the crate's
@@ -1806,7 +1813,7 @@ fn crate_source_files() -> Vec<std::path::PathBuf> {
 /// This is a source scan rather than a runtime assertion because the failure it
 /// prevents is a race: by the time it is observable the evidence is gone.
 #[test]
-fn every_env_mutating_test_module_holds_the_crate_wide_lock() {
+fn every_env_mutating_test_module_uses_shared_global_state_serialization() {
     let mut offenders = Vec::new();
     let mut scanned = 0usize;
 
@@ -1826,10 +1833,12 @@ fn every_env_mutating_test_module_holds_the_crate_wide_lock() {
             continue;
         }
         scanned += 1;
-        // The fully-qualified path, not a bare name: a module-private static
-        // called `TEST_ENV_LOCK` would satisfy a bare-name check while still
-        // being a second lock over one process environment.
-        if !module.contains("crate::TEST_ENV_LOCK") {
+        // Require a fully-qualified owner from the one shared serialization
+        // domain. A module-private lock or lookalike guard name would satisfy a
+        // bare-name check while still racing the rest of the process.
+        if !(module.contains("crate::TEST_ENV_LOCK")
+            || module.contains("tirith_test_support::GlobalStateGuard"))
+        {
             offenders.push(
                 path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
                     .unwrap_or(&path)
@@ -1841,14 +1850,16 @@ fn every_env_mutating_test_module_holds_the_crate_wide_lock() {
 
     assert!(
         offenders.is_empty(),
-        "{} test module(s) mutate the process environment without the crate-wide \
-         TEST_ENV_LOCK:\n  {}",
+        "{} test module(s) mutate the process environment without shared \
+         TEST_ENV_LOCK/GlobalStateGuard serialization:\n  {}",
         offenders.len(),
         offenders.join("\n  ")
     );
-    // A scan that matched nothing would pass for the wrong reason.
+    // A scan that matched nothing would pass for the wrong reason. Most tests
+    // now mutate through GlobalStateGuard's safe API; these two modules still
+    // perform guarded direct mutations and keep this source contract live.
     assert!(
-        scanned >= 20,
+        scanned >= 2,
         "the env-lock scan unexpectedly covered only {scanned} test modules"
     );
 }

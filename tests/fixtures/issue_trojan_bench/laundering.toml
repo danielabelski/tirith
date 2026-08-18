@@ -36,7 +36,7 @@ sources = [
 ]
 action = { kind = "package_install", ecosystem = "npm", package = "example-vendor-sdk" }
 boundary = "enforceable"
-expect_denied = ["package_install"]
+expect_denied = ["package_install", "persistence_change"]
 expect_allowed = ["network_egress", "filesystem_write"]
 expect_complete = true
 
@@ -65,7 +65,7 @@ boundary = "enforceable"
 # the on-chain write nor the credential access.
 expect_denied = ["secret_read", "web3_signer_use", "web3_write"]
 expect_allowed = ["network_egress"]
-expect_complete = true
+expect_complete = false
 
 # Untrusted content quoted by a trusted tool stays untrusted. The operator
 # handed this over deliberately (`operator_ingest`), which makes the KIND
@@ -77,7 +77,7 @@ sources = [
 ]
 action = { kind = "package_install", ecosystem = "npm", package = "example-quoted-dep" }
 boundary = "enforceable"
-expect_denied = ["package_install"]
+expect_denied = ["package_install", "persistence_change"]
 expect_allowed = ["network_egress", "filesystem_write"]
 expect_complete = true
 
@@ -91,7 +91,7 @@ sources = [
 ]
 action = { kind = "package_install", ecosystem = "npm", package = "example-approved-dep" }
 boundary = "enforceable"
-expect_denied = ["package_install"]
+expect_denied = ["package_install", "persistence_change"]
 expect_allowed = ["network_egress", "filesystem_write"]
 expect_complete = true
 
@@ -110,18 +110,18 @@ expect_denied = ["persistence_change"]
 expect_allowed = ["filesystem_write"]
 expect_complete = true
 
-# A verified operator receipt is a binding, not a grant. The driver signs this
-# hop with a trusted key so the status really is `Verified`, then asserts that
-# the effect the policy never authorized is still denied while the effect it
-# gated on provenance is now permitted.
+# A legacy v1 operator receipt is diagnostic, not authorization-grade. The
+# driver signs this hop with a trusted key so its diagnostic status is
+# `Verified`, then asserts that it still cannot satisfy a provenance-gated
+# package install. Owned execution boundaries require the strict v2 verifier.
 [[chain]]
-name = "verified_receipt_binds_content_but_grants_only_policy_authorized_effects"
+name = "legacy_verified_receipt_remains_diagnostic_only"
 sign_receipt = true
 sources = [
   { claimed_source = "agent_config", adapter = "operator_ingest", content = "operator-attested bootstrap content" },
 ]
-action = { kind = "shell", command = "npm install example-attested-dep" }
+action = { kind = "package_install", ecosystem = "npm", package = "example-attested-dep" }
 boundary = "enforceable"
-expect_denied = []
-expect_allowed = ["package_install", "network_egress", "filesystem_write"]
-expect_complete = false
+expect_denied = ["package_install", "persistence_change"]
+expect_allowed = ["network_egress", "filesystem_write"]
+expect_complete = true

@@ -11,7 +11,7 @@
 # pairing proves nothing: a gate that refused both equally would pass a
 # same-denial pair while being useless. The one exception is
 # `resource_exhaustion`, where both denial sets are empty by construction and
-# the discriminator is completeness instead.
+# the bounded output detector's obfuscated/control result is the discriminator.
 #
 # `expected_complete = false` is a first-class outcome, not a gap in the
 # fixture. An action the grammar does not model must leave the assessment
@@ -20,8 +20,8 @@
 [[effect]]
 name = "package_install"
 action = { kind = "package_install", ecosystem = "npm", package = "example-telemetry-shim" }
-expected_inferred = ["package_install", "network_egress", "filesystem_write"]
-expected_denied = ["package_install"]
+expected_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expected_denied = ["package_install", "persistence_change"]
 expected_complete = true
 # Reading the dependency diff is the benign request in the same neighbourhood.
 control_action = { kind = "narrative", text = "summarize the dependency changes in this pull request" }
@@ -59,17 +59,19 @@ control_expected_complete = true
 # Resource exhaustion has no derivation in the shell grammar. The contract this
 # cell pins is that the absence of a derivation reads as INCOMPLETE, never as
 # "this command has no effects". Its control is a fully modelled read-only Web3
-# call, so the pair differs on completeness rather than on denial.
+# call. V1 shell actions have no Tirith-owned interpreter identity, so both
+# actions remain incomplete; the bounded output detector distinguishes the
+# obfuscated attack from the control instead.
 [[effect]]
 name = "resource_exhaustion"
 action = { kind = "shell", command = "yes | head -c 40000000000 > /tmp/example-fill" }
 expected_inferred = []
 expected_denied = []
 expected_complete = false
-control_action = { kind = "shell", command = "cast call 0x0000000000000000000000000000000000000001 'name()'" }
+control_action = { kind = "shell", command = "cast call 0x0000000000000000000000000000000000000001 'name()' --rpc-url https://rpc.example.invalid" }
 control_expected_inferred = ["network_egress"]
 control_expected_denied = []
-control_expected_complete = true
+control_expected_complete = false
 
 # Writing into the credential file reads the credentials on the way past, so the
 # inferrer adds `secret_read`. The control writes a document instead: same
@@ -92,8 +94,8 @@ name = "production_web3_write"
 action = { kind = "shell", command = "cast send 0x0000000000000000000000000000000000000002 --rpc-url https://rpc.example.invalid --keystore /tmp/example-keystore" }
 expected_inferred = ["network_egress", "secret_read", "web3_signer_use", "web3_write"]
 expected_denied = ["secret_read", "web3_signer_use", "web3_write"]
-expected_complete = true
-control_action = { kind = "shell", command = "cast call 0x0000000000000000000000000000000000000002 'totalSupply()'" }
+expected_complete = false
+control_action = { kind = "shell", command = "cast call 0x0000000000000000000000000000000000000002 'totalSupply()' --rpc-url https://rpc.example.invalid" }
 control_expected_inferred = ["network_egress"]
 control_expected_denied = []
-control_expected_complete = true
+control_expected_complete = false
