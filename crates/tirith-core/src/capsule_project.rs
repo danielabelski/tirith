@@ -132,6 +132,20 @@ const ARGV_DIGEST_TAG: &str = "tirith-capsule-argv-v1\n";
 /// submodule pointer FILE of the same name.
 const EXCLUDED_NAME: &str = ".git";
 
+/// Normalize the platform `dev_t` representation without assuming its width.
+///
+/// Keeping the conversion generic is intentional: `libc::dev_t` is already
+/// `u64` on Linux, but differs on other supported Unix targets. A direct
+/// platform-specific conversion either trips Clippy on Linux or loses the
+/// checked-conversion behavior elsewhere.
+#[cfg(unix)]
+fn device_id<T>(value: T) -> u64
+where
+    T: TryInto<u64>,
+{
+    value.try_into().unwrap_or(u64::MAX)
+}
+
 /// Why the strict project copy refused. Every variant is a refusal: the copier
 /// has no "skipped it" outcome, because a silently partial copy is the failure
 /// this type exists to prevent.
@@ -571,7 +585,7 @@ fn first_stable_pass(
         let observed = fd::stat_at(source_dir, &component).map_err(|error| {
             ProjectCopyError::Io(format!("inspect project entry '{relative}': {error}"))
         })?;
-        if u64::try_from(observed.st_dev).unwrap_or(u64::MAX) != root_device {
+        if device_id(observed.st_dev) != root_device {
             return Err(ProjectCopyError::Escape(relative));
         }
         let kind = observed.st_mode & libc::S_IFMT;
@@ -585,9 +599,7 @@ fn first_stable_pass(
             let child = fd::open_directory_at(source_dir, &component)
                 .map_err(|_| ProjectCopyError::ChangedDuringScan(relative.clone()))?;
             let facts = fd::stable_directory_facts(&child, &relative)?;
-            if facts.device != u64::try_from(observed.st_dev).unwrap_or(u64::MAX)
-                || facts.inode != observed.st_ino
-            {
+            if facts.device != device_id(observed.st_dev) || facts.inode != observed.st_ino {
                 return Err(ProjectCopyError::ChangedDuringScan(relative));
             }
             let names = fd::read_entry_names(
@@ -746,7 +758,7 @@ fn copy_tree_impl_observed_excluding(
         let observed = fd::stat_at(source_dir, &component).map_err(|error| {
             ProjectCopyError::Io(format!("inspect project entry '{relative}': {error}"))
         })?;
-        if u64::try_from(observed.st_dev).unwrap_or(u64::MAX) != root_device {
+        if device_id(observed.st_dev) != root_device {
             return Err(ProjectCopyError::Escape(relative));
         }
         let kind = observed.st_mode & libc::S_IFMT;
@@ -762,9 +774,7 @@ fn copy_tree_impl_observed_excluding(
             // The descriptor we will actually traverse must be the inode the
             // entry scan saw, or the name was swapped between the two calls.
             let opened = fd::stable_directory_facts(&child_source, &relative)?;
-            if opened.device != u64::try_from(observed.st_dev).unwrap_or(u64::MAX)
-                || opened.inode != observed.st_ino
-            {
+            if opened.device != device_id(observed.st_dev) || opened.inode != observed.st_ino {
                 return Err(ProjectCopyError::ChangedDuringScan(relative));
             }
             let child_names = fd::read_entry_names(
@@ -858,7 +868,7 @@ mod fd {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::fs::MetadataExt as _;
 
-    use super::{ProjectCopyError, StableEntry};
+    use super::{device_id, ProjectCopyError, StableEntry};
 
     const DIRECTORY_FLAGS: libc::c_int =
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
@@ -1042,9 +1052,7 @@ mod fd {
             ProjectCopyError::Io(format!("open copied directory '{relative}': {error}"))
         })?;
         let opened = stable_directory_facts(&directory, relative)?;
-        if opened.device != u64::try_from(created.st_dev).unwrap_or(u64::MAX)
-            || opened.inode != created.st_ino
-        {
+        if opened.device != device_id(created.st_dev) || opened.inode != created.st_ino {
             return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
         }
         // umask may clear requested bits. The copy contract is exact 0700, so
@@ -1197,9 +1205,7 @@ mod fd {
         if !metadata.is_file() {
             return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
         }
-        if opened.device != u64::try_from(observed.st_dev).unwrap_or(u64::MAX)
-            || opened.inode != observed.st_ino
-        {
+        if opened.device != device_id(observed.st_dev) || opened.inode != observed.st_ino {
             return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
         }
         // Read from the OPENED inode, so the count cannot be raced after the
