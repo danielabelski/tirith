@@ -403,15 +403,12 @@ fn the_preset_binds_the_project_copy_by_descriptor_not_by_pathname() {
 fn home_directory() -> Option<std::path::PathBuf> {
     // The authenticated OS home, matching what `deny_default_paths` anchors to.
     // Deliberately not `$HOME`: the test harness redirects that.
-    std::process::Command::new("/bin/sh")
-        .args(["-c", "cd ~ && pwd"])
-        .env_remove("HOME")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| {
-            std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        })
+    tirith_core::capsule::try_deny_default_paths()
+        .ok()?
+        .into_iter()
+        .find(|path| path.file_name().is_some_and(|name| name == ".ssh"))?
+        .parent()
+        .map(std::path::Path::to_path_buf)
         .filter(|path| path.is_dir())
 }
 
@@ -426,7 +423,10 @@ fn an_unwritable_receipt_path_is_reported_and_never_reads_as_success() {
     // asked for a file and it could not be written, the command must say so
     // rather than print a receipt id over nothing.
     let fixture = fixture();
-    let unwritable = fixture.project.join("no-such-directory").join("run.json");
+    let non_directory = fixture.project.join("not-a-directory");
+    std::fs::write(&non_directory, "blocks receipt parent creation\n")
+        .expect("write non-directory parent");
+    let unwritable = non_directory.join("run.json");
     let (code, value) = run_json(
         &fixture,
         &[

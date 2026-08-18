@@ -619,6 +619,11 @@ fn contained_run(
         },
         &child_environment(),
         crate::cli::capsule::DegradedPolicy::FailClosed,
+        if json {
+            crate::cli::capsule::BoundOutputPresentation::Suppress
+        } else {
+            crate::cli::capsule::BoundOutputPresentation::ForwardSanitized
+        },
     );
     let outcome = match launched {
         Ok(outcome) => outcome,

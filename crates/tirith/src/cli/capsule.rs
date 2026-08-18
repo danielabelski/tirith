@@ -4696,6 +4696,7 @@ pub fn run_to_completion_bound_work_directory(
     work: BoundWorkDirectory<'_>,
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
+    output_presentation: BoundOutputPresentation,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     if degraded != DegradedPolicy::FailClosed {
         return Err(CapsuleRefused {
@@ -4704,7 +4705,16 @@ pub fn run_to_completion_bound_work_directory(
                 .to_string(),
         });
     }
-    linux_run_to_completion_supervised(spec, program, args, None, extra_env, degraded, Some(work))
+    linux_run_to_completion_supervised(
+        spec,
+        program,
+        args,
+        None,
+        extra_env,
+        degraded,
+        Some(work),
+        output_presentation,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -4716,6 +4726,7 @@ fn linux_run_to_completion_supervised(
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
     work: Option<BoundWorkDirectory<'_>>,
+    output_presentation: BoundOutputPresentation,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     // The launch owns the temporary HOME, so the launch is what can prove it was
     // removed. Holding it here rather than inside the body means there is exactly
@@ -4729,6 +4740,7 @@ fn linux_run_to_completion_supervised(
         extra_env,
         degraded,
         work,
+        output_presentation,
         &mut temp_home,
     );
     let home_confirmed = confirm_temp_home_cleanup(&mut temp_home, spec.environment.temporary_home);
@@ -4770,6 +4782,7 @@ fn linux_supervised_launch(
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
     work: Option<BoundWorkDirectory<'_>>,
+    output_presentation: BoundOutputPresentation,
     temp_home: &mut Option<HeldTempHome>,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
@@ -4941,7 +4954,7 @@ fn linux_supervised_launch(
             },
             &output.stdout,
             &output.stderr,
-            BoundOutputPresentation::ForwardSanitized,
+            output_presentation,
         )),
         Err(reason) => {
             let termination = supervision_termination(reason);
@@ -4974,7 +4987,16 @@ pub fn run_to_completion_os(
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     #[cfg(target_os = "linux")]
     {
-        linux_run_to_completion_supervised(spec, program, args, cwd, extra_env, degraded, None)
+        linux_run_to_completion_supervised(
+            spec,
+            program,
+            args,
+            cwd,
+            extra_env,
+            degraded,
+            None,
+            BoundOutputPresentation::ForwardSanitized,
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
