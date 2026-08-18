@@ -3016,6 +3016,9 @@ mod tests {
 
     #[test]
     fn test_store_roundtrip() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trust.json");
 
@@ -3044,6 +3047,9 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn repo_store_roundtrip_is_atomic_and_leaves_no_temp_files() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join(".tirith/trust.json");
         assert!(load_repo_store(&path).unwrap().entries.is_empty());

@@ -3123,9 +3123,9 @@ mod tests {
         };
         let mut inventory = installed(&["node_modules/a"]);
         inventory.capped = true;
-        // The coverage-cap upgrade only applies to an otherwise Clean answer.
-        // An empty audit is NotAudited first; give the installed package a
-        // verified membership so the cap is the only remaining gap.
+        // Isolate the inventory-level gap: the package itself has explicit
+        // positive audit membership, so omission/NotAudited is not a separate
+        // and correctly higher-priority reason for Partial.
         let report = NpmAuditReport {
             verified: vec![audit_entry("a", "node_modules/a", "1.0.0", None)],
             ..NpmAuditReport::default()
