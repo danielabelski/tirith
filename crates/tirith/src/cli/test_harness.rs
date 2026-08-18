@@ -41,17 +41,6 @@ impl EnvGuard {
         Self { key, old }
     }
 
-    /// Set `key` to a non-path value. `set` takes a `&Path` because almost
-    /// every caller redirects a directory base; identifiers such as
-    /// `TIRITH_SESSION_ID` are not paths and round-tripping them through `Path`
-    /// would be a lie about what the value is.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn set_value(key: &'static str, val: &str) -> Self {
-        let old = std::env::var_os(key);
-        unsafe { std::env::set_var(key, val) };
-        Self { key, old }
-    }
-
     /// Remove `key` for the test's duration, restoring the prior value on Drop.
     pub(crate) fn remove(key: &'static str) -> Self {
         let old = std::env::var_os(key);
