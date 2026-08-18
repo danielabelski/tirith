@@ -206,6 +206,22 @@ pub fn gather_api_signals(
     gather_api_signals_result(client.fetch(ecosystem, name), ecosystem, name, true)
 }
 
+/// Resolve only whether `name` exists in its native registry.
+///
+/// This preserves the same response-identity validation and failure mapping as
+/// [`gather_api_signals`], but deliberately does not write a registry-history
+/// snapshot. Install authorization uses this narrow seam for unpinned package
+/// names: the approved effect is one registry request, not a filesystem write.
+pub fn gather_name_existence(
+    client: &dyn RegistryClient,
+    ecosystem: Ecosystem,
+    name: &str,
+) -> PackageExistence {
+    let (_signals, existence) =
+        gather_api_signals_result(client.fetch(ecosystem, name), ecosystem, name, false);
+    existence
+}
+
 /// Version-bound registry provenance for an install. A successful result is
 /// accepted only for `version`; metadata for latest or another release is never
 /// substituted. The package existence remains `Exists` when only the requested
@@ -1675,6 +1691,44 @@ mod tests {
             existence,
             PackageExistence::NotFound,
             "404 must surface as NotFound, distinct from Unknown"
+        );
+    }
+
+    #[test]
+    fn name_existence_validates_identity_without_recording_registry_history() {
+        use crate::ssrf_guard::test_support::EnvironmentRestore;
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let mut restore = EnvironmentRestore::new();
+        restore.set(
+            "XDG_STATE_HOME",
+            Some(state.path().to_str().expect("UTF-8 temp state path")),
+        );
+
+        let client = FakeClient {
+            result: Ok(meta_clean()),
+        };
+        assert_eq!(
+            gather_name_existence(&client, Ecosystem::Npm, "react"),
+            PackageExistence::Exists
+        );
+        assert!(
+            !state.path().join("tirith/registry_snapshots").exists(),
+            "an existence-only lookup must not create registry-history state"
+        );
+
+        let mut mismatched = meta_clean();
+        mismatched.package_name = Some("replacement".to_string());
+        let client = FakeClient {
+            result: Ok(mismatched),
+        };
+        assert_eq!(
+            gather_name_existence(&client, Ecosystem::Npm, "react"),
+            PackageExistence::Unknown,
+            "a successful response for another package cannot prove existence"
         );
     }
 

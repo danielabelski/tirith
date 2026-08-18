@@ -2208,8 +2208,7 @@ impl<'a> AuthorizedRegistrySession<'a> {
             return Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch);
         }
         permit.authorize_effect_at(&operation, chrono::Utc::now())?;
-        let (_signals, existence) = registry_api::gather_api_signals(client, ecosystem, name);
-        Ok(existence)
+        Ok(registry_api::gather_name_existence(client, ecosystem, name))
     }
 }
 
@@ -6679,6 +6678,35 @@ mod tests {
             Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch)
         ));
         assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn authorized_name_only_registry_lookup_does_not_write_history() {
+        let _lock = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        let _state_guard = crate::cli::test_harness::EnvGuard::set("XDG_STATE_HOME", state.path());
+        let client = CountingRegistryClient {
+            calls: std::cell::Cell::new(0),
+        };
+        let argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec!["install".to_string(), "demo".to_string()],
+        };
+        let policy = Policy::default();
+        let resolver = AuthorizedRegistryResolver::new(&client, &policy, &argv);
+
+        assert_eq!(
+            resolver.resolve_name(Ecosystem::Npm, "demo"),
+            tirith_core::package_risk::PackageExistence::Exists
+        );
+        assert_eq!(client.calls.get(), 1);
+        assert!(resolver.refusal.borrow().is_none());
+        assert!(
+            !state.path().join("tirith/registry_snapshots").exists(),
+            "a network-only authorization must not publish registry-history state"
+        );
     }
 
     #[test]
