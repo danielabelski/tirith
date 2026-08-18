@@ -1731,17 +1731,8 @@ mod tests {
 
     #[test]
     fn name_existence_validates_identity_without_recording_registry_history() {
-        use crate::ssrf_guard::test_support::EnvironmentRestore;
-
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = tempfile::tempdir().unwrap();
-        let mut restore = EnvironmentRestore::new();
-        restore.set(
-            "XDG_STATE_HOME",
-            Some(state.path().to_str().expect("UTF-8 temp state path")),
-        );
+        let global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate registry-history side effects");
 
         let client = FakeClient {
             result: Ok(meta_clean()),
@@ -1751,7 +1742,11 @@ mod tests {
             PackageExistence::Exists
         );
         assert!(
-            !state.path().join("tirith/registry_snapshots").exists(),
+            !global
+                .roots()
+                .xdg_state
+                .join("tirith/registry_snapshots")
+                .exists(),
             "an existence-only lookup must not create registry-history state"
         );
 
