@@ -3674,6 +3674,7 @@ fn enrich_team(findings: &mut [Finding]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verdict::RuleId;
 
     #[test]
     fn pdf_reassembly_scans_both_spaced_and_concatenated_views() {
