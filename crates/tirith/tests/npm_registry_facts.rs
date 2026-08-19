@@ -478,6 +478,58 @@ fn lockfile_integrity_disagreement_is_distinct_from_absence() {
     );
 }
 
+/// A leaf `name` that contradicts its own install path is a re-keying attempt,
+/// not an alias. Honouring it would file the attacker's digest under the
+/// impersonated package and leave the real one unrecorded, which the provenance
+/// comparison reads as "nothing to check".
+#[test]
+fn a_leaf_name_cannot_rekey_an_installed_package_in_the_integrity_index() {
+    let lock = r#"{
+        "lockfileVersion": 3,
+        "packages": {
+            "": { "name": "root" },
+            "node_modules/evil": {
+                "name": "lodash",
+                "version": "1.0.0",
+                "integrity": "sha512-ATTACKER"
+            }
+        }
+    }"#;
+    let index = tirith_core::ecosystem_scan::npm_lock_integrity_index(lock);
+    assert!(
+        !index.contains_key(&("lodash".to_string(), "1.0.0".to_string())),
+        "an unaliased leaf name must not index another package's integrity: {index:?}"
+    );
+    assert!(
+        index.is_empty(),
+        "a lockfile that contradicts its own install path records nothing: {index:?}"
+    );
+
+    // A genuine alias, declared by the parent, still indexes under the target.
+    let aliased = r#"{
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "root",
+                "dependencies": { "local-alias": "npm:real-pkg@1.2.3" }
+            },
+            "node_modules/local-alias": {
+                "name": "real-pkg",
+                "version": "1.2.3",
+                "integrity": "sha512-ALIASED"
+            }
+        }
+    }"#;
+    let index = tirith_core::ecosystem_scan::npm_lock_integrity_index(aliased);
+    assert_eq!(
+        index
+            .get(&("real-pkg".to_string(), "1.2.3".to_string()))
+            .map(String::as_str),
+        Some("sha512-ALIASED"),
+        "a declared alias indexes under the target package: {index:?}"
+    );
+}
+
 /// Valid provenance is evidence, never suppression. A package with clean,
 /// present `dist` facts must score exactly as it would without them, so no
 /// behavioral, ThreatDB, typosquat or lifecycle signal can be bought off with

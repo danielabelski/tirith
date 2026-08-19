@@ -652,10 +652,17 @@ const MAX_LOCK_INTEGRITY_ENTRIES: usize = 8192;
 /// only the provenance comparison needs. Entries with no `integrity` are simply
 /// absent from the index; absence is "not recorded", never "mismatch".
 ///
-/// The name comes from `meta.name` when the lockfile supplies it and from the
-/// install path otherwise, matching the identity rules the dependency parser
-/// already uses, so an aliased entry indexes under the TARGET package rather
-/// than the alias.
+/// Identity comes from the same resolver the dependency parser uses, so an
+/// aliased entry indexes under the TARGET package rather than the alias, and a
+/// leaf `name` that contradicts its install path cannot re-key the entry. That
+/// last part is what keeps the index honest: trusting `meta.name` outright let
+/// a crafted lockfile put `"name": "lodash"` on `node_modules/evil`, so the
+/// attacker's digest was compared against lodash while the real `evil` entry
+/// went unrecorded and therefore unchecked.
+///
+/// Contradictory identity metadata is a malformed lockfile, not a reason to
+/// index part of it: the whole index is empty in that case, which reads as
+/// "nothing recorded" rather than as agreement.
 pub fn npm_lock_integrity_index(text: &str) -> BTreeMap<(String, String), String> {
     let mut index = BTreeMap::new();
     let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -663,15 +670,18 @@ pub fn npm_lock_integrity_index(text: &str) -> BTreeMap<(String, String), String
     };
 
     if let Some(packages) = json.get("packages").and_then(|value| value.as_object()) {
+        let Some(aliases) = npm_lock_alias_claims(packages) else {
+            return BTreeMap::new();
+        };
         for (path_key, meta) in packages {
             let Some(installed_name) = package_lock_name_from_path(path_key) else {
                 continue;
             };
-            let name = meta
-                .get("name")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .unwrap_or(installed_name);
+            let Some((name, _alias, _version)) =
+                npm_lock_v2_identity(path_key, &installed_name, meta, aliases.get(path_key))
+            else {
+                return BTreeMap::new();
+            };
             insert_lock_integrity(&mut index, &name, meta);
         }
     }
