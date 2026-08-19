@@ -1468,6 +1468,19 @@ enum ArchiveVerdict {
 /// if `cosign` is available and the release shipped a signature — verify the
 /// cosign signature over `checksums.txt`.
 fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) -> ArchiveVerdict {
+    let cosign = cosign_program();
+    verify_archive_against_checksums_with_program(release, archive_name, cosign.as_deref())
+}
+
+/// Internal exact-executable seam for archive verification. Production reaches
+/// this only through [`cosign_program`], which preserves the trusted fixed-path
+/// policy on Linux. Tests pass a private fixture path directly so they can
+/// exercise a non-zero verifier result without weakening that resolver.
+fn verify_archive_against_checksums_with_program(
+    release: &ReleaseSet,
+    archive_name: &str,
+    cosign: Option<&Path>,
+) -> ArchiveVerdict {
     // 1. Archive bytes vs the digest in checksums.txt.
     let archive_bytes = match std::fs::read(&release.archive_path) {
         Ok(b) => b,
@@ -1496,7 +1509,7 @@ fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) ->
     }
 
     // 2. cosign signature over checksums.txt, if possible.
-    match verify_cosign_signature(release) {
+    match verify_cosign_signature_with_program(release, cosign) {
         CosignOutcomeInternal::Verified => ArchiveVerdict::Ok {
             signed: ChecksumStrength::Signed,
             archive_sha256: expected,
@@ -1566,13 +1579,16 @@ enum CosignOutcomeInternal {
 /// and OIDC issuer. Missing cosign / no signature → `Unavailable` (honest, never
 /// a false pass); the cases are reported distinctly so JSON consumers can tell
 /// "cosign absent" from "cosign broken".
-fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
+fn verify_cosign_signature_with_program(
+    release: &ReleaseSet,
+    cosign: Option<&Path>,
+) -> CosignOutcomeInternal {
     let (sig, cert) = match (&release.sig_path, &release.cert_path) {
         (Some(s), Some(c)) => (s, c),
         _ => return CosignOutcomeInternal::Unavailable(CosignUnavailable::NoSignaturePublished),
     };
 
-    let Some(cosign) = cosign_program() else {
+    let Some(cosign) = cosign else {
         return CosignOutcomeInternal::Unavailable(CosignUnavailable::NotInstalled);
     };
 
@@ -2953,20 +2969,19 @@ mod tests {
         assert!(extracted.starts_with(pre.canonicalize().unwrap()));
     }
 
-    /// F19: a `cosign` on `PATH` that EXITS NON-ZERO must yield
-    /// `ArchiveVerdict::Failed` — never folded into a checksum-only pass.
-    /// Mutates `PATH`, so it holds the crate-wide `ENV_LOCK` and restores via
-    /// `EnvGuard`.
+    /// F19: an exact `cosign` executable that EXITS NON-ZERO must yield
+    /// `ArchiveVerdict::Failed` — never folded into a checksum-only pass. The
+    /// test injects the executable through the internal seam rather than PATH;
+    /// Linux production continues to accept only its trusted fixed paths.
     #[cfg(unix)]
     #[test]
     fn cosign_failure_makes_archive_verdict_failed() {
-        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
 
-        // A fake `cosign` that always exits 1. MUST be executable or PATH
-        // resolution would skip it.
+        // A fake `cosign` that always exits 1. It is passed as the exact program
+        // under test; production resolution is not involved.
         let fake_bin_dir = dir.path().join("fakebin");
         std::fs::create_dir_all(&fake_bin_dir).unwrap();
         let fake_cosign = fake_bin_dir.join("cosign");
@@ -2999,20 +3014,11 @@ mod tests {
             checksums_path: checksums,
         };
 
-        let verdict = {
-            // Serialize against every other env-mutating test in the crate.
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // Prepend (not replace) the fake-cosign dir so `sh` stays
-            // resolvable; `EnvGuard` restores PATH on Drop.
-            let mut entries = vec![fake_bin_dir.clone()];
-            if let Some(p) = std::env::var_os("PATH") {
-                entries.extend(std::env::split_paths(&p));
-            }
-            let joined = std::env::join_paths(entries).expect("join PATH");
-            let _path_guard = EnvGuard::set("PATH", std::path::Path::new(&joined));
-
-            verify_archive_against_checksums(&release, "tirith-x86_64-unknown-linux-gnu.tar.gz")
-        };
+        let verdict = verify_archive_against_checksums_with_program(
+            &release,
+            "tirith-x86_64-unknown-linux-gnu.tar.gz",
+            Some(&fake_cosign),
+        );
 
         match verdict {
             ArchiveVerdict::Failed(reason) => {
