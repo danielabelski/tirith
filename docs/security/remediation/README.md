@@ -41,14 +41,15 @@ python3 docs/security/remediation/validate_ledger.py --structural
 # In a PR, also protect append-only history and mappings against the base.
 python3 docs/security/remediation/validate_ledger.py --structural --base-ref origin/main
 
-# The owning branch binds all owned findings to its exact head and a downloaded CI artifact.
-python3 docs/security/remediation/validate_ledger.py --layer poststack-state-integrity --base-ref origin/main --evidence-bundle /path/to/downloaded-evidence.json
+# The owning branch binds all owned findings to an explicit reviewed code candidate.
+# A later checked-out HEAD may add only tracker/evidence files.
+python3 docs/security/remediation/validate_ledger.py --layer poststack-state-integrity --candidate-sha "$CANDIDATE_SHA" --base-ref origin/main --evidence-bundle /path/to/downloaded-evidence.json
 
 # The settled stack binds every root to the exact release candidate and downloaded CI artifact.
-python3 docs/security/remediation/validate_ledger.py --release-candidate "$(git rev-parse HEAD)" --evidence-bundle /path/to/downloaded-evidence.json
+python3 docs/security/remediation/validate_ledger.py --release-candidate --candidate-sha "$CANDIDATE_SHA" --evidence-bundle /path/to/downloaded-evidence.json
 
 # Final verification requires the configured committed closure bundle.
-python3 docs/security/remediation/validate_ledger.py --merged-main "$(git rev-parse HEAD)" --evidence-bundle docs/security/closure-evidence.json
+python3 docs/security/remediation/validate_ledger.py --merged-main --candidate-sha "$CANDIDATE_SHA" --evidence-bundle docs/security/closure-evidence.json
 ```
 
 The release gate deliberately does not claim CI success. Required CI and release workflows must separately pass for the exact candidate.
@@ -63,7 +64,9 @@ Lifecycle is strictly:
 
 Advancement is gated by progressively stronger evidence. Implementation requires fix commits and regression-test locators. Every verification attempt binds its base, head, synthetic merge tree, workflow revision, platform/toolchain, command, outcome, external log or attestation, and a subject-tree hash. Layer verification requires exact-head passed focused, benign, and adversarial attempts; stack verification adds platform evidence; ready-to-merge and merged verification additionally require exact-head performance, UX, packaging, review, and release attempts. Failed or `blocked_native` attempts are retained but never satisfy a transition. Migrated consumers are retained alongside regression-test locators.
 
-The validator computes the synthetic merge using `git merge-tree --write-tree BASE HEAD` and hashes sorted `<mode> <object> <path>` entries from that tree, excluding exactly `main.md`, `docs/security/remediation/**`, and `docs/security/closure-evidence.json`. It rejects conflicts, stale hashes, stale fix/verification commits after a rebase, missing external evidence, and non-passing/neutral/skipped/cancelled evidence. It also enforces append-only history and source mappings when `--base-ref` is supplied.
+The validator computes the synthetic merge using `git merge-tree --write-tree BASE CANDIDATE` and hashes sorted `<mode> <object> <path>` entries from that tree, excluding exactly `main.md`, `docs/security/remediation/**`, and `docs/security/closure-evidence.json`. Every layer, release-candidate, and merged-main invocation requires an explicit full `--candidate-sha`. That candidate must be an ancestor of the checked-out HEAD, and the candidate and checkout must have identical non-tracker subject trees; this permits a later ledger/evidence commit without silently changing the reviewed code candidate.
+
+The synthetic merge must also have a non-tracker subject-tree delta from the evidence bundle's base, and `BASE..CANDIDATE` must contain at least one fix commit recorded for the selected owner (or the release ledger in aggregate). Empty or tracker-only validation layers therefore cannot advance lifecycle. The validator also rejects conflicts, stale hashes, stale fix/verification commits after a rebase, missing external evidence, and non-passing/neutral/skipped/cancelled evidence. It enforces append-only history and source mappings when `--base-ref` is supplied.
 
 Layer and release-candidate modes accept a downloaded external evidence bundle at any explicit file path. Merged-main mode alone requires the configured committed `docs/security/closure-evidence.json`. The minimal versioned bundle schema is `evidence-bundle.schema.json`; its payload digest and checks are independently rebound to the exact candidate and ledger attempts.
 

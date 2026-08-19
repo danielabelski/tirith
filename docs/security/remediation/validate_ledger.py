@@ -408,6 +408,79 @@ def subject_tree_hash(tree_sha: str, closure_bundle_path: str) -> str:
     return sha256(payload)
 
 
+def commit_tree(commit: str) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", f"{commit}^{{tree}}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(result.returncode == 0, f"{commit}: cannot resolve candidate tree")
+    tree = result.stdout.strip()
+    require(COMMIT_RE.fullmatch(tree) is not None, f"{commit}: invalid candidate tree SHA")
+    return tree
+
+
+def commits_in_range(base_sha: str, candidate: str) -> set[str]:
+    result = subprocess.run(
+        ["git", "rev-list", f"{base_sha}..{candidate}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(result.returncode == 0, f"{base_sha}..{candidate}: cannot enumerate candidate commits")
+    commits = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    require(all(COMMIT_RE.fullmatch(commit) for commit in commits), "candidate range returned an invalid commit SHA")
+    return commits
+
+
+def validate_candidate_checkout(candidate: str, head: str, closure_bundle_path: str) -> None:
+    require(COMMIT_RE.fullmatch(candidate) is not None, "--candidate-sha must be a full commit")
+    require(
+        git_is_ancestor(candidate, head),
+        "--candidate-sha must be an ancestor of the checked-out HEAD",
+    )
+    candidate_subject = subject_tree_hash(commit_tree(candidate), closure_bundle_path)
+    checkout_subject = subject_tree_hash(commit_tree(head), closure_bundle_path)
+    require(
+        candidate_subject == checkout_subject,
+        "checked-out HEAD has non-tracker changes after --candidate-sha",
+    )
+
+
+def validate_candidate_delta(
+    base_sha: str,
+    candidate: str,
+    merge_tree_sha: str,
+    ledger: dict[str, Any],
+    owner: str | None,
+) -> None:
+    closure_bundle_path = ledger["closure_evidence_bundle_path"]
+    require(
+        subject_tree_hash(commit_tree(base_sha), closure_bundle_path)
+        != subject_tree_hash(merge_tree_sha, closure_bundle_path),
+        "candidate synthetic merge has no non-tracker subject-tree delta from its base",
+    )
+    candidate_commits = commits_in_range(base_sha, candidate)
+    scoped_findings = [
+        finding
+        for finding in ledger["findings"]
+        if owner is None or finding["owner"] == owner
+    ]
+    owned_fix_commits = {
+        commit
+        for finding in scoped_findings
+        for commit in finding["remediation"]["fix_commits"]
+    }
+    scope = owner or "release ledger"
+    require(
+        bool(candidate_commits & owned_fix_commits),
+        f"{base_sha}..{candidate}: no fix commit owned by {scope}",
+    )
+
+
 def validate_attempt(value: Any, label: str, closure_bundle_path: str) -> None:
     require(isinstance(value, dict), f"{label}: object required")
     exact_keys(value, ATTEMPT_KEYS, label)
@@ -804,6 +877,13 @@ def validate_evidence_bundle(
         subject_tree_hash(bundle["merge_tree_sha"], ledger["closure_evidence_bundle_path"]) == bundle["subject_tree_hash"],
         "evidence bundle: subject tree hash mismatch",
     )
+    validate_candidate_delta(
+        bundle["base_sha"],
+        candidate,
+        bundle["merge_tree_sha"],
+        ledger,
+        owner,
+    )
     require(isinstance(bundle["checks"], list) and bundle["checks"], "evidence bundle: checks required")
     for index, check in enumerate(bundle["checks"]):
         exact_keys(check, BUNDLE_CHECK_KEYS, f"evidence bundle checks[{index}]")
@@ -863,8 +943,9 @@ def main() -> int:
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--structural", action="store_true")
     modes.add_argument("--layer", choices=sorted(OWNERS), metavar="OWNER")
-    modes.add_argument("--release-candidate", metavar="COMMIT")
-    modes.add_argument("--merged-main", metavar="COMMIT")
+    modes.add_argument("--release-candidate", action="store_true")
+    modes.add_argument("--merged-main", action="store_true")
+    parser.add_argument("--candidate-sha", metavar="COMMIT")
     parser.add_argument("--base-ref")
     parser.add_argument("--evidence-bundle")
     parser.add_argument("--skip-render", action="store_true")
@@ -872,8 +953,19 @@ def main() -> int:
     try:
         ledger, head = run_check(args.base_ref, not args.skip_render)
         if args.structural:
+            require(args.candidate_sha is None, "structural mode does not accept --candidate-sha")
             print("structural ledger validation passed: 135 source rows, 131 owned canonical roots")
-        elif args.layer:
+            return 0
+
+        require(args.candidate_sha is not None, "selected gate requires explicit --candidate-sha")
+        candidate = args.candidate_sha
+        validate_candidate_checkout(
+            candidate,
+            head,
+            ledger["closure_evidence_bundle_path"],
+        )
+
+        if args.layer:
             require(args.evidence_bundle is not None, "layer gate requires --evidence-bundle")
             owned = [item for item in ledger["findings"] if item["owner"] == args.layer]
             require(owned, f"layer gate: owner {args.layer} has no findings")
@@ -884,16 +976,13 @@ def main() -> int:
             ]
             require(not incomplete, f"layer gate: {len(incomplete)} owned findings are below layer_verified")
             require(
-                all(item["verification"]["layer_commit"] == head for item in owned),
-                "layer gate: every owned finding must bind layer_commit to exact HEAD",
+                all(item["verification"]["layer_commit"] == candidate for item in owned),
+                "layer gate: every owned finding must bind layer_commit to exact candidate",
             )
-            validate_evidence_bundle(args.evidence_bundle, "layer", head, ledger, owner=args.layer)
-            print(f"layer ledger gate passed for {args.layer} at exact HEAD")
+            validate_evidence_bundle(args.evidence_bundle, "layer", candidate, ledger, owner=args.layer)
+            print(f"layer ledger gate passed for {args.layer} at exact candidate {candidate}")
         elif args.release_candidate:
             require(args.evidence_bundle is not None, "release-candidate gate requires --evidence-bundle")
-            candidate = args.release_candidate
-            require(COMMIT_RE.fullmatch(candidate) is not None, "release candidate must be a full commit")
-            require(candidate == head, "release candidate must equal checked-out HEAD")
             incomplete = [
                 item["finding_id"]
                 for item in ledger["findings"]
@@ -910,9 +999,6 @@ def main() -> int:
             print("release-candidate ledger gate passed; CI and release workflows remain separate required checks")
         else:
             require(args.evidence_bundle is not None, "merged-main gate requires --evidence-bundle")
-            candidate = args.merged_main
-            require(COMMIT_RE.fullmatch(candidate) is not None, "merged-main candidate must be a full commit")
-            require(candidate == head, "merged-main candidate must equal checked-out HEAD")
             incomplete = [
                 item["finding_id"]
                 for item in ledger["findings"]

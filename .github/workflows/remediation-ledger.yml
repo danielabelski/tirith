@@ -31,6 +31,8 @@ jobs:
           persist-credentials: false
       - name: Validate immutable sources, mappings, ownership, and lifecycle
         run: python3 docs/security/remediation/validate_ledger.py --structural
+      - name: Test candidate ancestry, tracker-only, and real-fix binding
+        run: python3 -m unittest discover -s docs/security/remediation/tests -p 'test_*.py'
       - name: Verify generated human tracker
         run: python3 docs/security/remediation/render_main.py --check
       - name: Reject generated drift
