@@ -315,7 +315,7 @@ pub fn run(
 
     let context = resolve_task_context(argv);
     let mut prepared = None;
-    let outcome = evaluate_and_run(&source, argv, &context, receipt_path, &mut prepared);
+    let outcome = evaluate_and_run(&source, argv, &context, receipt_path, &mut prepared, json);
     let receipt = build_receipt(&outcome, argv, &context.dlp);
     let recorded = match prepared.as_ref() {
         Some(prepared) => receipt.record_prepared(prepared),
@@ -331,6 +331,7 @@ fn evaluate_and_run(
     context: &PresetContext,
     receipt_path: Option<&Path>,
     prepared_receipt: &mut Option<tirith_core::capsule_receipt::PreparedCapsuleReceipt>,
+    json: bool,
 ) -> PresetOutcome {
     let probe_spec = preset_spec(source, context);
     let backend_id = crate::cli::capsule::select_backend(&probe_spec).backend_id;
@@ -396,6 +397,7 @@ fn evaluate_and_run(
         backend_id,
         &probe_spec,
         receipt_exclusion.as_deref(),
+        json,
     )
 }
 
@@ -407,6 +409,7 @@ fn contained_run(
     backend_id: &'static str,
     probe_spec: &CapsuleSpec,
     _receipt_exclusion: Option<&Path>,
+    _json: bool,
 ) -> PresetOutcome {
     // Unreachable in practice: `preflight_run_to_completion` refuses on every
     // non-Linux host above. Kept as a hard refusal rather than a `todo!()` so a
@@ -464,6 +467,7 @@ fn contained_run(
     backend_id: &'static str,
     probe_spec: &CapsuleSpec,
     receipt_exclusion: Option<&Path>,
+    json: bool,
 ) -> PresetOutcome {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};

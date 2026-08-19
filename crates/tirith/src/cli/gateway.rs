@@ -12932,8 +12932,14 @@ policy:
     fn test_handle_guarded_call_duplicate_active_id_denies() {
         // End to end: a guarded forward whose id is already pending is denied with
         // a `duplicate_active_id` envelope and is NOT written upstream.
-        let global = tirith_test_support::GlobalStateGuard::new()
-            .expect("isolate duplicate-id gateway state");
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::tempdir().expect("isolate duplicate-id gateway state");
+        let _state = EnvGuard::set("XDG_STATE_HOME", root.path());
+        let _home = EnvGuard::set("HOME", root.path());
 
         // The session resolver is intentionally cached for the whole process, so
         // a test-local TIRITH_SESSION_ID assignment cannot reliably replace an ID
@@ -12942,32 +12948,15 @@ policy:
         let session_id = tirith_core::session::resolve_session_id();
         assert_eq!(tirith_core::session::resolve_session_id(), session_id);
 
-        let ambient_state_root = global
-            .previous_env("XDG_STATE_HOME")
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| std::path::PathBuf::from(value.trim()).join("tirith"))
-            .or_else(|| {
-                global
-                    .previous_env("HOME")
-                    .map(std::path::PathBuf::from)
-                    .map(|home| home.join(".local/state/tirith"))
-            });
-        let ambient_state_path =
-            ambient_state_root.map(|root| root.join("sessions").join(format!("{session_id}.json")));
-
-        let isolated_state_root = global.roots().xdg_state.join("tirith");
+        let isolated_state_root = root.path().join("tirith");
         assert_eq!(
             tirith_core::policy::state_dir().as_deref(),
             Some(isolated_state_root.as_path()),
-            "gateway state must resolve beneath the fresh shared-guard root"
+            "gateway state must resolve beneath the isolated XDG_STATE_HOME"
         );
         let isolated_state_path = tirith_core::session_warnings::session_state_path(&session_id)
             .expect("isolated gateway session path");
         assert!(isolated_state_path.starts_with(&isolated_state_root));
-        let isolated_sessions = isolated_state_path
-            .parent()
-            .expect("gateway session path has a parent");
 
         let config = test_config();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
