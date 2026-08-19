@@ -287,6 +287,8 @@ impl PreparedCapsuleReceipt {
                 let path = crate::capsule_project::trusted_platform_root_alias(
                     &absolute_path(path).map_err(CapsuleReceiptError::Io)?,
                 );
+                // Alias the project root the same way as `path`, or strip_prefix
+                // fails on macOS where /var is a symlink to /private/var.
                 let project_root = project_root
                     .map(absolute_path)
                     .transpose()
@@ -318,13 +320,6 @@ impl PreparedCapsuleReceipt {
                         return Err(CapsuleReceiptError::Io(error))
                     }
                 }
-                // Alias the project root the same way as `path`, or strip_prefix
-                // fails on macOS where /var is a symlink to /private/var.
-                let project_root = project_root
-                    .map(absolute_path)
-                    .transpose()
-                    .map_err(CapsuleReceiptError::Io)?
-                    .map(|root| crate::capsule_project::trusted_platform_root_alias(&root));
                 let project_exclusion = project_root
                     .as_deref()
                     .and_then(|root| path.strip_prefix(root).ok())
