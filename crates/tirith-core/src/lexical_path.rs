@@ -332,22 +332,9 @@ fn parse_posix(input: &str, preserve_parents: bool) -> LexicalPath {
     }
 }
 
-/// Drop `.` segments that sit between the leading separator and the rest of the
-/// path. Normalization discards them, so a namespace prefix has to be detected
-/// on the same form the renderer emits: without this, `/./??/x` classifies as a
-/// rooted-no-drive path, renders as `/??/x`, and then re-parses into the device
-/// namespace, so the root class would change across a round trip.
-fn strip_rooted_no_op_segments(slashed: &str) -> &str {
-    let mut cursor = slashed;
-    while cursor.starts_with("/./") {
-        cursor = &cursor[2..];
-    }
-    cursor
-}
-
 fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, LexicalPathError> {
     let replaced = input.replace('\\', "/");
-    let slashed = strip_rooted_no_op_segments(&replaced);
+    let slashed = replaced.as_str();
 
     if let Some(rest) = slashed.strip_prefix("//?/") {
         return parse_verbatim(rest, preserve_parents);
@@ -414,6 +401,15 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
     if let Some(stripped) = slashed.strip_prefix('/') {
         let (components, parent_state) =
             normalize_components(stripped, true, true, preserve_parents);
+        // A rooted path renders as `/` + components, so a leading `??` would
+        // re-parse as the `\\??\\` object-manager root and change the root class
+        // across a normalization round trip. `?` is not a legal Windows filename
+        // character, so such a component is either that namespace spelled with
+        // droppable leading segments (`/./??/x`, `/../??/x`) or a path that
+        // cannot exist. Refuse it rather than pick one of the two readings.
+        if first_named_component(&components) == Some("??") {
+            return Err(LexicalPathError::InvalidDeviceRoot);
+        }
         return Ok(LexicalPath {
             dialect: PathDialect::Windows,
             root_class: RootClass::RootedNoDrive,
@@ -433,6 +429,16 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
         parent_state,
         parents_preserved: preserve_parents,
     })
+}
+
+/// First component that is not a retained `..` token. Parent-preserving parses
+/// keep those tokens in `components`, so both parse modes have to skip them to
+/// reach the same decision about the leading name.
+fn first_named_component(components: &[String]) -> Option<&str> {
+    components
+        .iter()
+        .map(String::as_str)
+        .find(|component| *component != "..")
 }
 
 fn parse_verbatim(rest: &str, preserve_parents: bool) -> Result<LexicalPath, LexicalPathError> {
@@ -596,31 +602,52 @@ mod tests {
     }
 
     #[test]
-    fn no_op_segments_do_not_hide_the_windows_device_namespace() {
-        // `.` segments are dropped by normalization, so a rooted path that only
-        // reaches `??` through one would render as `/??/...` and re-parse into
-        // the device namespace. Classify the prefix on the normalized form.
-        // `/./??/\u{44a}.` is the input the `lexical_path` fuzz target minimised
-        // to when it caught this as "normalization changed the root class".
+    fn a_normalized_leading_object_manager_component_is_refused() {
+        // Droppable leading segments normalize away, so each of these renders as
+        // `/??/...` and would re-parse as the device namespace, changing the root
+        // class across a round trip. The last two are the inputs the
+        // `lexical_path` fuzz target minimised to.
         for input in [
             "/./??/COM1",
             "/././??/COM1",
             "\\.\\??\\COM1",
+            "/../??/COM1",
             "/./??/\u{44a}.",
+            "/.././??/po/.ti7.",
         ] {
-            let path = parsed(input, PathDialect::Windows);
-            assert_eq!(path.root_class(), RootClass::Device, "{input}");
-            let reparsed = parsed(&path.to_slash_string(), PathDialect::Windows);
-            assert_eq!(reparsed.root_class(), path.root_class(), "{input}");
-            assert_eq!(reparsed, path, "{input}");
+            assert_eq!(
+                LexicalPath::parse(input, PathDialect::Windows),
+                Err(LexicalPathError::InvalidDeviceRoot),
+                "{input}"
+            );
+            // Both parse modes must agree, or the round-trip contract splits.
+            assert_eq!(
+                LexicalPath::parse_preserving_parents(input, PathDialect::Windows),
+                Err(LexicalPathError::InvalidDeviceRoot),
+                "{input} (parent-preserving)"
+            );
         }
+
+        // The namespace spelled directly is still a device root, not an error.
+        let device = parsed("/??/COM1", PathDialect::Windows);
+        assert_eq!(device.root_class(), RootClass::Device);
+        assert_eq!(
+            parsed(&device.to_slash_string(), PathDialect::Windows),
+            device
+        );
+
+        // `??` away from the leading position is an ordinary component: the
+        // rendering cannot reconstruct the prefix, so nothing is ambiguous.
+        let nested = parsed("/dir/??/x", PathDialect::Windows);
+        assert_eq!(nested.root_class(), RootClass::RootedNoDrive);
+        assert_eq!(nested.to_slash_string(), "/dir/??/x");
 
         // A rooted path that is not a namespace prefix keeps its class.
         let rooted = parsed("/./rooted", PathDialect::Windows);
         assert_eq!(rooted.root_class(), RootClass::RootedNoDrive);
         assert_eq!(rooted.to_slash_string(), "/rooted");
 
-        // A `.` segment that is not a whole segment must not be consumed.
+        // A `.` that is not a whole segment must not be consumed.
         let dotted = parsed("/.hidden/x", PathDialect::Windows);
         assert_eq!(dotted.root_class(), RootClass::RootedNoDrive);
         assert_eq!(dotted.to_slash_string(), "/.hidden/x");
