@@ -425,7 +425,10 @@ fn trusted_project_root(source: &Path) -> Result<PathBuf, ProjectCopyError> {
             .map_err(|error| ProjectCopyError::Io(format!("resolve current directory: {error}")))?
             .join(source)
     };
-    Ok(trusted_platform_root_alias(&absolute))
+    let aliased = trusted_platform_root_alias(&absolute);
+    // Canonicalize so Windows 8.3 vs long paths and macOS /var vs /private/var
+    // compare equal in the destination-inside-project checks.
+    Ok(std::fs::canonicalize(&aliased).unwrap_or(aliased))
 }
 
 /// Resolve only the platform-owned root alias Tirith explicitly trusts before

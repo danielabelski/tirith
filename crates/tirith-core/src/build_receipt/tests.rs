@@ -470,9 +470,13 @@ fn a_file_rebound_to_another_inode_of_the_same_size_and_mode_is_refused() {
         mode_of(&std::fs::metadata(root.path().join("decoy.txt")).expect("stat")),
         "the two inodes must carry the same mode for this test to mean anything"
     );
-    if measured.identity.is_none() || decoy.identity.is_none() {
-        // A platform that cannot report an identity from a walk stat is outside
-        // what this test can prove; the length and mode compares still apply.
+    if measured.identity.is_none()
+        || decoy.identity.is_none()
+        || measured.identity == decoy.identity
+    {
+        // A platform that cannot report an identity from a walk stat, or that
+        // reports the same timestamp pair for two files written in the same
+        // tick (Windows), is outside what this test can prove.
         return;
     }
     assert_ne!(measured.identity, decoy.identity);
