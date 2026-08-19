@@ -669,6 +669,14 @@ pub fn infer_effects_detailed_with_context(
                         effects.insert(CommandEffectKind::PackageInstall);
                         effects.insert(CommandEffectKind::NetworkEgress);
                         effects.insert(CommandEffectKind::FilesystemWrite);
+                        // Same durable state as `ProposedAction::PackageInstall`
+                        // below: an install leaves executable material and
+                        // approval state behind, and `npx <pkg>` writes the
+                        // fetched package into the package cache before running
+                        // it. Omitting it here would let the shell spelling pass
+                        // a policy that denies PersistenceChange for the
+                        // structured spelling of the same operation.
+                        effects.insert(CommandEffectKind::PersistenceChange);
                         npm_package_operation = true;
                     }
                 }
@@ -1149,6 +1157,16 @@ mod tests {
         assert!(install
             .effects
             .contains(&CommandEffectKind::FilesystemWrite));
+        assert_eq!(
+            install.effects,
+            infer_effects(&ProposedAction::PackageInstall {
+                ecosystem: "npm".into(),
+                package: "left-pad".into(),
+            }),
+            "the shell spelling of an install must not be a weaker effect set \
+             than the structured one, or it becomes the way around a policy \
+             that denies one of them"
+        );
         assert!(
             !install.complete,
             "an install runs lifecycle scripts this parser has not read, so the \
