@@ -205,13 +205,15 @@ fn attest_build_binds_both_trees_and_exits_clean() {
     );
     assert_eq!(receipt["coverage"]["audit_chain_anchored"], false);
     assert_eq!(receipt["evidence"]["execution"]["verdict"], "observed");
-    // The sandbox sits inside this repository, so git answers with tirith's own
-    // HEAD. The receipt must SAY that the commit describes a containing
-    // repository rather than the digested tree.
-    assert_eq!(
-        receipt["subject"]["git"]["source_is_repository_root"], false,
-        "a commit taken from a containing repository must be labelled as such"
-    );
+    // The sandbox sits inside this repository, so when trusted git is
+    // available it answers with tirith's own HEAD. That commit must be
+    // labelled as describing a containing repository, not the digested tree.
+    if !receipt["subject"]["git"]["commit"].is_null() {
+        assert_eq!(
+            receipt["subject"]["git"]["source_is_repository_root"], false,
+            "a commit taken from a containing repository must be labelled as such"
+        );
+    }
     // The honesty caveats are part of the document, not only of the rendering.
     let caveats = receipt["caveats"].as_array().expect("caveats");
     assert!(caveats.iter().any(|caveat| caveat

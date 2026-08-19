@@ -679,6 +679,20 @@ fn a_tree_that_is_not_a_repository_records_no_commit() {
 }
 
 #[test]
+fn a_subdirectory_commit_is_labelled_as_not_the_repository_root() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let binding = capture_git_binding(crate_dir);
+    if binding.commit.is_none() {
+        return;
+    }
+    assert_eq!(
+        binding.source_is_repository_root,
+        Some(false),
+        "tirith-core lives inside the repository, not at its root"
+    );
+}
+
+#[test]
 fn lockfiles_are_digested_from_the_root_only() {
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "Cargo.lock", "# lock\n");

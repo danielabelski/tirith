@@ -954,7 +954,11 @@ pub fn capture_git_binding(root: &Path) -> GitBinding {
     // own semantics and it is not wrong, but a receipt that reported the commit
     // without reporting this would let a reader take the commit as describing
     // exactly the bytes that were digested.
-    let source_is_repository_root = commit.as_ref().and(
+    // A recorded commit must carry this label. If we cannot prove the scanned
+    // tree is the repository root (Windows canonicalize of git's toplevel,
+    // a missing path), treat it as a containing repository rather than omit
+    // the field and let a reader take the commit as describing the digest.
+    let source_is_repository_root = commit.as_ref().map(|_| {
         crate::repo_hooks::run_trusted_git_bounded(
             root,
             &["rev-parse".to_string(), "--show-toplevel".to_string()],
@@ -969,8 +973,9 @@ pub fn capture_git_binding(root: &Path) -> GitBinding {
             let top = std::fs::canonicalize(&top).ok()?;
             let source = std::fs::canonicalize(root).ok()?;
             Some(top == source)
-        }),
-    );
+        })
+        .unwrap_or(false)
+    });
 
     GitBinding {
         commit,
