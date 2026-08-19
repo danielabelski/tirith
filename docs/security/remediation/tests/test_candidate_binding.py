@@ -150,9 +150,14 @@ class CandidateBindingTests(unittest.TestCase):
                 "poststack-gateway-runtime",
             )
 
-    def test_missing_base_blob_fails_closed(self) -> None:
-        with self.assertRaisesRegex(validator.ValidationError, "cannot read"):
+    def test_missing_base_blob_is_bootstrap(self) -> None:
+        self.assertIsNone(
             validator.git_show_json(self.base, "docs/security/remediation/findings.json")
+        )
+
+    def test_unreadable_base_ref_fails_closed(self) -> None:
+        with self.assertRaisesRegex(validator.ValidationError, "cannot read"):
+            validator.git_show_json("not-a-real-commit", "docs/security/remediation/findings.json")
 
 
 if __name__ == "__main__":
