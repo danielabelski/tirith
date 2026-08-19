@@ -25,7 +25,7 @@ pub enum RootClass {
     Unc,
     RootedNoDrive,
     Verbatim,
-    Device,
+    Device(String),
 }
 
 /// Parent traversal that cannot be represented by normalized components.
@@ -183,7 +183,7 @@ impl LexicalPath {
                 rooted(format!("//?/unc/{server}/{share}"))
             }
             RootIdentity::VerbatimOpaque(anchor) => rooted(format!("//?/{anchor}")),
-            RootIdentity::Device => rooted("//./".to_string()),
+            RootIdentity::Device(anchor) => rooted(format!("//./{anchor}")),
         }
     }
 
@@ -239,7 +239,7 @@ impl LexicalPath {
             RootIdentity::DriveRelative(_)
             | RootIdentity::RootedNoDrive
             | RootIdentity::VerbatimOpaque(_)
-            | RootIdentity::Device => return false,
+            | RootIdentity::Device(_) => return false,
         }
 
         base.components.len() <= self.components.len()
@@ -343,14 +343,15 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
         .or_else(|| slashed.strip_prefix("/??/"))
         .or_else(|| slashed.strip_prefix("//??/"))
     {
-        if rest.is_empty() {
+        let (anchor, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if anchor.is_empty() || matches!(anchor, "." | "..") {
             return Err(LexicalPathError::InvalidDeviceRoot);
         }
-        let (components, parent_state) = normalize_components(rest, true, true, preserve_parents);
+        let (components, parent_state) = normalize_components(tail, true, true, preserve_parents);
         return Ok(LexicalPath {
             dialect: PathDialect::Windows,
             root_class: RootClass::Device,
-            root_identity: RootIdentity::Device,
+            root_identity: RootIdentity::Device(ascii_fold(anchor)),
             components,
             parent_state,
             parents_preserved: preserve_parents,
@@ -637,6 +638,42 @@ mod tests {
         assert_eq!(unc.root_class(), RootClass::Unc);
         assert!(unc.parent_state().above_root);
         assert_eq!(unc.components(), &["x"]);
+    }
+
+    #[test]
+    fn device_root_is_integral_and_normalizes_idempotently() {
+        for invalid in [r"\\.\", "//./", "//.//", "//./.", "//./../x"] {
+            assert!(
+                LexicalPath::parse(invalid, PathDialect::Windows).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let ordinary = parsed(r"\\.\PhysicalDrive0\dir\..", PathDialect::Windows);
+        assert_eq!(ordinary.to_slash_string(), "//./physicaldrive0");
+        assert_eq!(
+            parsed(&ordinary.to_slash_string(), PathDialect::Windows),
+            ordinary
+        );
+
+        let preserved = LexicalPath::parse_preserving_parents(
+            r"\\.\PhysicalDrive0\dir\..",
+            PathDialect::Windows,
+        )
+        .unwrap();
+        assert_eq!(
+            LexicalPath::parse_preserving_parents(
+                &preserved.to_slash_string(),
+                PathDialect::Windows
+            )
+            .unwrap(),
+            preserved
+        );
+
+        assert_eq!(
+            parsed(r"\\.\COM1", PathDialect::Windows).to_slash_string(),
+            "//./com1"
+        );
     }
 
     #[test]

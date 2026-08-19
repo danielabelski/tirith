@@ -1145,6 +1145,7 @@ const SUB_CONTAINERS_AND_OBJECTS_INHERIT: u32 = 0x3;
 mod tests {
     use super::*;
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+    use std::path::Path;
     use tirith_core::capsule::windows::windows_launch_plan;
     use tirith_core::capsule::CapsuleSpec;
 
