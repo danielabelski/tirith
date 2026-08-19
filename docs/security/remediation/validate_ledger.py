@@ -757,7 +757,7 @@ def validate_findings(ledger: dict[str, Any], source_rows: dict[str, dict[str, A
             current = EXACT_DUPLICATES[current]
 
 
-def git_show_json(base_ref: str, relative_path: str) -> Any | None:
+def git_show_json(base_ref: str, relative_path: str) -> Any:
     result = subprocess.run(
         ["git", "show", f"{base_ref}:{relative_path}"],
         cwd=ROOT,
@@ -765,16 +765,19 @@ def git_show_json(base_ref: str, relative_path: str) -> Any | None:
         text=True,
         check=False,
     )
-    if result.returncode:
-        return None
-    return json.loads(result.stdout)
+    require(
+        result.returncode == 0,
+        f"cannot read {relative_path} at {base_ref}",
+    )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"{relative_path} at {base_ref} is not JSON: {error}")
 
 
 def validate_append_only(base_ref: str, ledger: dict[str, Any]) -> None:
     relative = str(FINDINGS_PATH.relative_to(ROOT))
     base = git_show_json(base_ref, relative)
-    if base is None:
-        return
     current_by_id = {item["finding_id"]: item for item in ledger["findings"]}
     for old in base["findings"]:
         finding_id = old["finding_id"]
