@@ -324,7 +324,7 @@ main() {
   if command -v install >/dev/null 2>&1; then
     if ! install -m 755 "${tmpdir}/tirith" "${INSTALL_DIR}/tirith"; then
       if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
-        restore_package_approval_helper "$helper_backup" "$helper_had_previous"
+        restore_package_approval_helper "$helper_backup" "$helper_had_previous" || true
         [ -z "$helper_backup" ] || run_root /bin/rm -f "$helper_backup" || true
       fi
       if [ "$main_had_previous" = "1" ]; then
@@ -338,7 +338,7 @@ main() {
     if ! cp "${tmpdir}/tirith" "${INSTALL_DIR}/tirith" || \
        ! chmod 755 "${INSTALL_DIR}/tirith"; then
       if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
-        restore_package_approval_helper "$helper_backup" "$helper_had_previous"
+        restore_package_approval_helper "$helper_backup" "$helper_had_previous" || true
         [ -z "$helper_backup" ] || run_root /bin/rm -f "$helper_backup" || true
       fi
       if [ "$main_had_previous" = "1" ]; then

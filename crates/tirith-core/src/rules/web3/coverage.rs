@@ -191,10 +191,24 @@ pub(crate) fn analyze_task_coverage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn trusted() -> TaskAnalysisContext {
         TaskAnalysisContext::trusted(ShellType::Posix, Some(Path::new("/repo")), Some("policy-a"))
+    }
+
+    fn trusted_absolute(cwd: &str, policy: &str) -> TaskAnalysisContext {
+        let cwd = if cfg!(windows) {
+            PathBuf::from(format!("C:{cwd}"))
+        } else {
+            PathBuf::from(cwd)
+        };
+        assert!(
+            cwd.is_absolute(),
+            "coverage identity must bind an absolute cwd: {}",
+            cwd.display()
+        );
+        TaskAnalysisContext::trusted(ShellType::Posix, Some(&cwd), Some(policy))
     }
 
     #[test]
@@ -242,21 +256,9 @@ mod tests {
             )
         }
 
-        let base = TaskAnalysisContext::trusted(
-            ShellType::Posix,
-            Some(Path::new("/repo/a")),
-            Some("policy-a"),
-        );
-        let other_cwd = TaskAnalysisContext::trusted(
-            ShellType::Posix,
-            Some(Path::new("/repo/b")),
-            Some("policy-a"),
-        );
-        let other_policy = TaskAnalysisContext::trusted(
-            ShellType::Posix,
-            Some(Path::new("/repo/a")),
-            Some("policy-b"),
-        );
+        let base = trusted_absolute("/repo/a", "policy-a");
+        let other_cwd = trusted_absolute("/repo/b", "policy-a");
+        let other_policy = trusted_absolute("/repo/a", "policy-b");
         assert_ne!(
             first_identity(ShellType::Posix, &base),
             first_identity(ShellType::Posix, &other_cwd)

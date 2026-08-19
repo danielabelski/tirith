@@ -9705,6 +9705,12 @@ mod tests {
         )
     }
 
+    /// POSIX command strings treat `\` as an escape. Fold Windows separators so
+    /// interpolated HOME/XDG assignments stay one token and remain absolute.
+    fn posix_command_path(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
     fn only(command: &str) -> Web3CommandFactsV2 {
         let result = parse(command);
         assert_eq!(result.commands.len(), 1, "{result:?}");
@@ -13220,7 +13226,10 @@ mod tests {
         )
         .unwrap();
         let rehomed = parse_web3_commands(
-            &format!("exec -c env HOME={} solana balance 111", new_home.display()),
+            &format!(
+                "exec -c env HOME={} solana balance 111",
+                posix_command_path(&new_home)
+            ),
             ShellType::Posix,
             &context,
         );
@@ -13244,7 +13253,10 @@ mod tests {
             .insert("HOME".to_string(), new_home.to_string_lossy().into_owned());
         context.solana_config_path = Some(solana_dir.join("config.yml"));
         let xdg_ignored = parse_web3_commands(
-            &format!("env XDG_CONFIG_HOME={} solana balance 111", xdg.display()),
+            &format!(
+                "env XDG_CONFIG_HOME={} solana balance 111",
+                posix_command_path(&xdg)
+            ),
             ShellType::Posix,
             &context,
         );
@@ -13404,7 +13416,10 @@ mod tests {
         }
 
         let home_assignment = parse_web3_commands(
-            &format!("HOME={}; cd && cast balance 0xabc", nested.display()),
+            &format!(
+                "HOME={}; cd && cast balance 0xabc",
+                posix_command_path(&nested)
+            ),
             ShellType::Posix,
             &context,
         );
@@ -13419,7 +13434,7 @@ mod tests {
         let background_home = parse_web3_commands(
             &format!(
                 "HOME={} && true & cd && cast balance 0xabc",
-                nested.display()
+                posix_command_path(&nested)
             ),
             ShellType::Posix,
             &context,
@@ -13460,7 +13475,7 @@ mod tests {
         let conditional_home = parse_web3_commands(
             &format!(
                 "false && HOME={}; cd && cast balance 0xabc",
-                nested.display()
+                posix_command_path(&nested)
             ),
             ShellType::Posix,
             &context,
@@ -13536,7 +13551,7 @@ mod tests {
         .unwrap();
         context.solana_config_path = Some(root_solana.join("config.yml"));
         let reassigned_home = parse_web3_commands(
-            &format!("HOME={}; solana balance 111", nested.display()),
+            &format!("HOME={}; solana balance 111", posix_command_path(&nested)),
             ShellType::Posix,
             &context,
         );

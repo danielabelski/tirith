@@ -1789,7 +1789,10 @@ fn run_as_root(program: &str, args: &[&std::ffi::OsStr]) -> Result<(), String> {
     let mut command = if unsafe { libc::geteuid() } == 0 {
         std::process::Command::new(program)
     } else {
-        let mut command = std::process::Command::new("/usr/bin/sudo");
+        let sudo = Path::new("/usr/bin/sudo");
+        super::package_approval_authority_native::validate_root_owned_executable(sudo)
+            .map_err(|error| error.to_string())?;
+        let mut command = std::process::Command::new(sudo);
         command.arg("--").arg(program);
         command
     };
@@ -1812,7 +1815,10 @@ fn run_as_root_output(
     let mut command = if unsafe { libc::geteuid() } == 0 {
         std::process::Command::new(program)
     } else {
-        let mut command = std::process::Command::new("/usr/bin/sudo");
+        let sudo = Path::new("/usr/bin/sudo");
+        super::package_approval_authority_native::validate_root_owned_executable(sudo)
+            .map_err(|error| error.to_string())?;
+        let mut command = std::process::Command::new(sudo);
         command.arg("--").arg(program);
         command
     };

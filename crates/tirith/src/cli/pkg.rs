@@ -63,9 +63,10 @@ use tirith_core::policy::Policy;
 use tirith_core::receipt::ArtifactScanReceipt;
 use tirith_core::task_analysis::TaskAnalysisContext;
 use tirith_core::task_boundary::{
-    BoundaryAuthorizationError, BoundaryMarker, BoundaryOperation, PackageApprovalBoundary,
-    PackageInstallApprovalChannel, PackageInstallPreparationBoundary, PackageOperationBinding,
-    PackageResolveBoundary, PendingBoundaryAuthorization, TaskBoundaryPermit,
+    BoundaryAuthorizationError, BoundaryMarker, BoundaryOperation, OwnedBoundary,
+    PackageApprovalBoundary, PackageInstallApprovalChannel, PackageInstallPreparationBoundary,
+    PackageOperationBinding, PackageResolveBoundary, PendingBoundaryAuthorization,
+    TaskBoundaryPermit,
 };
 use tirith_core::threatdb::ThreatDb;
 
@@ -974,12 +975,18 @@ fn approve_error_json(phase: &'static str, reason: &str) -> serde_json::Value {
 }
 
 fn report_approve_authorization_error(error: &BoundaryAuthorizationError, json: bool) -> i32 {
-    let reason = error
-        .assessment()
-        .and_then(|assessment| assessment.refusal(false))
-        .map(str::to_string)
-        .unwrap_or_else(|| error.to_string());
-    report_approve_error("task_gate", &reason, json, 1)
+    if json {
+        // Keep the approve JSON contract (`success`, `command`, `error_phase`,
+        // `target_executed`, `target_published`, `reason`) that
+        // `pkg_approve_json_reports_the_refusal_as_structured_output` freezes.
+        let reason = error
+            .assessment()
+            .and_then(|assessment| assessment.refusal(false))
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        return report_approve_error("task_gate", &reason, true, 1);
+    }
+    report_task_authorization_error("approve", OwnedBoundary::PackageApproval, error, false)
 }
 
 fn run_approve(

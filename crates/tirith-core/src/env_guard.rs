@@ -2242,7 +2242,17 @@ mod tests {
         let serialized = serde_json::to_string(&public).unwrap();
         assert!(!serialized.contains("AKIALEAKEDSECRET"), "{serialized}");
         let rc_path = home.join(".zshrc").display().to_string();
-        assert!(serialized.contains(&rc_path), "{serialized}");
+        assert!(
+            description.contains(&rc_path),
+            "benign rc path must remain diagnostic: {description}"
+        );
+        // JSON string encoding turns Windows `\` into `\\`. Assert the encoded
+        // diagnostic path, not the raw display form.
+        let encoded_rc_path = serde_json::to_string(&rc_path).expect("encode rc path");
+        assert!(
+            serialized.contains(&encoded_rc_path[1..encoded_rc_path.len() - 1]),
+            "{serialized}"
+        );
         assert!(
             serialized.contains("export AWS_SECRET_ACCESS_KEY=[REDACTED]"),
             "{serialized}"

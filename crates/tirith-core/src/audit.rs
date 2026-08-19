@@ -533,7 +533,9 @@ fn append_to_audit_log_inner(
     }
 
     let mut open_opts = OpenOptions::new();
-    open_opts.create(true).append(true);
+    // Windows LockFileEx requires GENERIC_READ or GENERIC_WRITE. Opening with
+    // FILE_APPEND_DATA alone fails with ERROR_ACCESS_DENIED (os error 5).
+    open_opts.create(true).append(true).read(true).write(true);
     #[cfg(unix)]
     {
         open_opts.mode(0o600);

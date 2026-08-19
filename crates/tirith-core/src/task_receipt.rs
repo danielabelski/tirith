@@ -2760,6 +2760,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn durable_replay_store_survives_reopen_and_rejects_corruption() {
         let temp = tempfile::tempdir().unwrap();

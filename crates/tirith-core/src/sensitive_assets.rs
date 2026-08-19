@@ -3108,7 +3108,10 @@ mod tests {
     #[test]
     fn bip39_wordlist_count_checksum_and_nfkd_normalization() {
         assert_eq!(BIP39_ENGLISH.len(), 2048);
-        let digest = Sha256::digest(include_bytes!("../assets/data/bip39_english.txt"));
+        let canonical = include_str!("../assets/data/bip39_english.txt")
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        let digest = Sha256::digest(canonical.as_bytes());
         assert_eq!(hex::encode(digest), BIP39_ENGLISH_SHA256);
         let source = include_str!("../assets/data/bip39_english.SOURCE");
         assert!(source.contains(BIP39_ENGLISH_SHA256));
