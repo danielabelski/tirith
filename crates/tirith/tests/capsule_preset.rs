@@ -664,6 +664,12 @@ fn a_configured_signing_key_produces_a_verifiable_receipt_signature() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let fixture = fixture();
+    if !host_can_enforce_the_preset(&fixture.project) {
+        eprintln!(
+            "skipping signed contained receipt: this host lacks required Landlock/seccomp coverage"
+        );
+        return;
+    }
     let config = fixture.state.join("config").join("tirith");
     std::fs::create_dir_all(&config).expect("config dir");
     let signing = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
@@ -694,8 +700,10 @@ fn a_configured_signing_key_produces_a_verifiable_receipt_signature() {
         "the receipt signature must verify against the configured audit key"
     );
 
-    // The signature binds the content address, so an edit invalidates it.
+    // The signature binds the canonical payload, so a content edit invalidates
+    // it. Do not flip `status` to Contained: a successful `echo` already has
+    // that status, which would be a no-op and keep the signature valid.
     let mut tampered = receipt;
-    tampered.status = tirith_core::capsule_receipt::CapsuleRunStatus::Contained;
+    tampered.tirith_version.push_str("-tampered");
     assert!(!tampered.signature_verifies(&signing.verifying_key().to_bytes()));
 }
