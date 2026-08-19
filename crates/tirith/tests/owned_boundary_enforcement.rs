@@ -59,7 +59,10 @@ impl Workspace {
             .env("XDG_CONFIG_HOME", home.join("config"))
             .env("XDG_DATA_HOME", home.join("data"))
             .env("XDG_STATE_HOME", home.join("state"))
-            .env("XDG_CACHE_HOME", home.join("cache"));
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("USERPROFILE", &home)
+            .env("APPDATA", home.join("appdata"))
+            .env("LOCALAPPDATA", home.join("localappdata"));
         cmd
     }
 
@@ -75,6 +78,7 @@ impl Workspace {
     /// Run a fetch-shaped command against a closed loopback port. The explicit
     /// private-fetch allowance makes the URL valid, while clearing every proxy
     /// spelling ensures the control can never send bytes beyond loopback.
+    #[cfg(unix)]
     fn run_local_fetch(&self, args: &[&str]) -> (i32, String, String) {
         let mut command = self.command();
         command.env("TIRITH_PRIVATE_FETCH_ALLOW", "localhost");
@@ -154,10 +158,14 @@ const DENY_PACKAGE_INSTALL: &str =
 /// invalid request can never consume a one-time receipt. The boundary controls
 /// use the same valid loopback URL on a closed port; reaching its download
 /// failure proves the authorization boundary was crossed without external I/O.
+#[cfg(unix)]
 const PURE_URL_REJECTED: &str = "fetch URL must use http:// or https://";
+#[cfg(unix)]
 const DOWNLOAD_REACHED: &str = "download failed:";
+#[cfg(unix)]
 const LOCAL_REMOTE_URL: &str = "http://localhost:0/install.sh";
 
+#[cfg(unix)]
 #[test]
 fn run_without_the_gate_rejects_an_invalid_request_in_pure_preflight() {
     let workspace = Workspace::new(None);
@@ -168,6 +176,7 @@ fn run_without_the_gate_rejects_an_invalid_request_in_pure_preflight() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn run_without_the_gate_reaches_the_authorized_download_boundary() {
     let workspace = Workspace::new(None);
@@ -178,6 +187,7 @@ fn run_without_the_gate_reaches_the_authorized_download_boundary() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn run_denies_a_valid_request_before_dns_or_download() {
     let workspace = Workspace::new(Some(DENY_NETWORK));
@@ -198,6 +208,7 @@ fn run_denies_a_valid_request_before_dns_or_download() {
 /// A gate that covers one and not the other is a gate an agent walks around by
 /// swapping two words, so the control and the enforcing case are asserted for
 /// both commands, not just for `tirith run`.
+#[cfg(unix)]
 #[test]
 fn install_url_without_the_gate_rejects_an_invalid_request_in_pure_preflight() {
     let workspace = Workspace::new(None);
@@ -208,6 +219,7 @@ fn install_url_without_the_gate_rejects_an_invalid_request_in_pure_preflight() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_url_without_the_gate_reaches_the_authorized_download_boundary() {
     let workspace = Workspace::new(None);
@@ -219,6 +231,7 @@ fn install_url_without_the_gate_reaches_the_authorized_download_boundary() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_url_denies_a_valid_request_before_dns_or_download() {
     let workspace = Workspace::new(Some(DENY_NETWORK));
@@ -241,6 +254,7 @@ fn install_url_denies_a_valid_request_before_dns_or_download() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_url_under_observe_mode_reaches_the_authorized_download_boundary() {
     let workspace = Workspace::new(Some(OBSERVE_NETWORK));
@@ -253,6 +267,7 @@ fn install_url_under_observe_mode_reaches_the_authorized_download_boundary() {
     assert!(!stderr.contains("task gate refused"), "stderr: {stderr}");
 }
 
+#[cfg(unix)]
 #[test]
 fn run_under_observe_mode_reaches_the_authorized_download_boundary() {
     let workspace = Workspace::new(Some(OBSERVE_NETWORK));
@@ -264,6 +279,7 @@ fn run_under_observe_mode_reaches_the_authorized_download_boundary() {
     assert!(!stderr.contains("task gate refused"), "stderr: {stderr}");
 }
 
+#[cfg(unix)]
 #[test]
 fn run_with_a_populated_denial_set_but_no_mode_is_inert() {
     let workspace = Workspace::new(Some(OFF_BUT_POPULATED));
@@ -271,6 +287,31 @@ fn run_with_a_populated_denial_set_but_no_mode_is_inert() {
     assert!(
         stderr.contains(DOWNLOAD_REACHED),
         "a default-off gate enforced before the download boundary: {stderr}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_refuses_the_unavailable_remote_script_surfaces() {
+    let workspace = Workspace::new(None);
+    let (run_code, _, run_stderr) =
+        workspace.run(&["run", "https://example.invalid/install.sh", "--no-exec"]);
+    assert_eq!(run_code, 2, "stderr: {run_stderr}");
+    assert!(
+        run_stderr.contains("unrecognized subcommand"),
+        "the unavailable run surface must be rejected by the parser: {run_stderr}"
+    );
+
+    let (install_code, _, install_stderr) = workspace.run(&[
+        "install",
+        "--no-exec",
+        "url",
+        "https://example.invalid/install.sh",
+    ]);
+    assert_eq!(install_code, 2, "stderr: {install_stderr}");
+    assert!(
+        install_stderr.contains("url form is only available on Unix"),
+        "the unsupported install-url surface must fail explicitly: {install_stderr}"
     );
 }
 
@@ -621,7 +662,11 @@ fn a_denied_mcp_policy_init_leaves_no_scaffold_behind() {
 /// get to authorise the writes that govern it, so every gated config write
 /// discovers its policy offline and repo-local YAML is not consulted.
 fn deny_persistence_in_operator_policy(workspace: &Workspace) {
-    let config = workspace.home().join("config/tirith");
+    let config = if cfg!(windows) {
+        workspace.home().join("appdata/tirith")
+    } else {
+        workspace.home().join("config/tirith")
+    };
     fs::create_dir_all(&config).expect("create config dir");
     fs::write(
         config.join("policy.yaml"),
