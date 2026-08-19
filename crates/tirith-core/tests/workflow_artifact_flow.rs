@@ -338,13 +338,16 @@ fn workflow_count_bound_records_a_truncated_gap_and_blocks_the_downgrade() {
         "exceeding the workflow ceiling must record a Truncated gap"
     );
     for gap in &truncated {
-        let path = gap
-            .primary_path()
-            .expect("gap has a path")
-            .to_string_lossy();
+        let path = gap.primary_path().expect("gap has a path");
+        // Compare by path components. A textual `.github/workflows/` match
+        // fails on Windows, where the recorded path uses `\` separators.
         assert!(
-            path.contains(".github/workflows/") && path.ends_with(".yml"),
-            "the gap must be located at the workflow it dropped: {path}"
+            path.extension().is_some_and(|extension| extension == "yml")
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with(".github/workflows")),
+            "the gap must be located at the workflow it dropped: {}",
+            path.display()
         );
     }
     assert!(
