@@ -4718,6 +4718,7 @@ pub fn run_to_completion_bound_work_directory(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn linux_run_to_completion_supervised(
     spec: &CapsuleSpec,
     program: &OsStr,
