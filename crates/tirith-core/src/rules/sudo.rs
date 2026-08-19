@@ -1744,6 +1744,25 @@ mod tests {
 
     #[test]
     fn preserve_env_uses_exact_posix_identity_for_aws_secret_prefixes() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_sock = std::env::var_os("SSH_AUTH_SOCK");
+        // SAFETY: this test holds TEST_ENV_LOCK for the duration of the body.
+        unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
+        struct RestoreSock(Option<std::ffi::OsString>);
+        impl Drop for RestoreSock {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("SSH_AUTH_SOCK", value),
+                        None => std::env::remove_var("SSH_AUTH_SOCK"),
+                    }
+                }
+            }
+        }
+        let _restore_sock = RestoreSock(previous_sock);
+
         let policy = Policy::default();
         for command in [
             "AWS_SECRET_CUSTOM=hunter2 awsSecretCustom='' sudo --preserve-env=AWS_SECRET_CUSTOM pip install foo",

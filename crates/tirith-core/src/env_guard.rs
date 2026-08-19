@@ -1342,6 +1342,14 @@ mod tests {
             unsafe { std::env::set_var(&name, value) };
             self.0.push((name, previous));
         }
+
+        fn remove(&mut self, name: std::ffi::OsString) {
+            let previous = std::env::var_os(&name);
+            // SAFETY: the test owns the crate-wide environment lock until this
+            // guard restores every entry.
+            unsafe { std::env::remove_var(&name) };
+            self.0.push((name, previous));
+        }
     }
 
     #[cfg(unix)]
@@ -1456,6 +1464,9 @@ mod tests {
         let name = "TIRITH_C04_POLICY_SECRET";
         let first = "wallet-secret-first-value";
         let replacement = "wallet-secret-replacement-value";
+        // Host runners often export SSH_AUTH_SOCK. It is a default sensitive
+        // name, so leaving it installed would add a second unavailable marker.
+        restore.remove("SSH_AUTH_SOCK".into());
         restore.set(name.into(), first.into());
 
         let sensitive = vec![s(name)];

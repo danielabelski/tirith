@@ -4676,6 +4676,14 @@ mod tests {
                 // SAFETY: this test holds the crate-wide environment mutex.
                 unsafe { std::env::set_var(name, value) };
             }
+
+            fn remove(&mut self, name: &'static str) {
+                if !self.0.iter().any(|(seen, _)| *seen == name) {
+                    self.0.push((name, std::env::var_os(name)));
+                }
+                // SAFETY: this test holds the crate-wide environment mutex.
+                unsafe { std::env::remove_var(name) };
+            }
         }
         impl Drop for PendingApprovalEnvRestore {
             fn drop(&mut self) {
@@ -4713,6 +4721,7 @@ mod tests {
         )
         .unwrap();
         let mut env = PendingApprovalEnvRestore(Vec::new());
+        env.remove("SSH_AUTH_SOCK");
         env.set("TIRITH", "0");
         env.set("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
         env.set("TIRITH_POLICY_ROOT", isolated.path());
