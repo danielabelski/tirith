@@ -1741,6 +1741,11 @@ mod tests {
     fn preserve_env_uses_exact_posix_identity_for_aws_secret_prefixes() {
         let mut global = tirith_test_support::GlobalStateGuard::new()
             .expect("isolate sudo preserve-env identity");
+        // The shared guard installs a KUBECONFIG fixture, which is itself a
+        // registered sensitive name. This test asserts on AWS alias identity
+        // alone, so drop that unrelated fixture (and the SSH agent socket host
+        // runners export) while keeping the guard's serialization.
+        global.remove_env("KUBECONFIG");
         global.remove_env("SSH_AUTH_SOCK");
 
         let policy = Policy::default();
