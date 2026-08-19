@@ -332,8 +332,22 @@ fn parse_posix(input: &str, preserve_parents: bool) -> LexicalPath {
     }
 }
 
+/// Drop `.` segments that sit between the leading separator and the rest of the
+/// path. Normalization discards them, so a namespace prefix has to be detected
+/// on the same form the renderer emits: without this, `/./??/x` classifies as a
+/// rooted-no-drive path, renders as `/??/x`, and then re-parses into the device
+/// namespace, so the root class would change across a round trip.
+fn strip_rooted_no_op_segments(slashed: &str) -> &str {
+    let mut cursor = slashed;
+    while cursor.starts_with("/./") {
+        cursor = &cursor[2..];
+    }
+    cursor
+}
+
 fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, LexicalPathError> {
-    let slashed = input.replace('\\', "/");
+    let replaced = input.replace('\\', "/");
+    let slashed = strip_rooted_no_op_segments(&replaced);
 
     if let Some(rest) = slashed.strip_prefix("//?/") {
         return parse_verbatim(rest, preserve_parents);
@@ -410,7 +424,7 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
         });
     }
 
-    let (components, parent_state) = normalize_components(&slashed, true, false, preserve_parents);
+    let (components, parent_state) = normalize_components(slashed, true, false, preserve_parents);
     Ok(LexicalPath {
         dialect: PathDialect::Windows,
         root_class: RootClass::Relative,
@@ -579,6 +593,37 @@ mod tests {
         assert!(!parsed("/rooted", PathDialect::Windows).is_fully_qualified());
         assert!(!parsed("//./COM1", PathDialect::Windows).is_fully_qualified());
         assert!(parsed("//server/share", PathDialect::Windows).is_fully_qualified());
+    }
+
+    #[test]
+    fn no_op_segments_do_not_hide_the_windows_device_namespace() {
+        // `.` segments are dropped by normalization, so a rooted path that only
+        // reaches `??` through one would render as `/??/...` and re-parse into
+        // the device namespace. Classify the prefix on the normalized form.
+        // `/./??/\u{44a}.` is the input the `lexical_path` fuzz target minimised
+        // to when it caught this as "normalization changed the root class".
+        for input in [
+            "/./??/COM1",
+            "/././??/COM1",
+            "\\.\\??\\COM1",
+            "/./??/\u{44a}.",
+        ] {
+            let path = parsed(input, PathDialect::Windows);
+            assert_eq!(path.root_class(), RootClass::Device, "{input}");
+            let reparsed = parsed(&path.to_slash_string(), PathDialect::Windows);
+            assert_eq!(reparsed.root_class(), path.root_class(), "{input}");
+            assert_eq!(reparsed, path, "{input}");
+        }
+
+        // A rooted path that is not a namespace prefix keeps its class.
+        let rooted = parsed("/./rooted", PathDialect::Windows);
+        assert_eq!(rooted.root_class(), RootClass::RootedNoDrive);
+        assert_eq!(rooted.to_slash_string(), "/rooted");
+
+        // A `.` segment that is not a whole segment must not be consumed.
+        let dotted = parsed("/.hidden/x", PathDialect::Windows);
+        assert_eq!(dotted.root_class(), RootClass::RootedNoDrive);
+        assert_eq!(dotted.to_slash_string(), "/.hidden/x");
     }
 
     #[test]
