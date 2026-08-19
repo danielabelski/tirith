@@ -70,10 +70,14 @@ impl SystemDnsResolver {
                             return;
                         }
                     };
-                    let resolver = match {
+                    // The runtime guard has to stay alive across the constructor,
+                    // which registers IO/timer drivers, so scope it to the block
+                    // that builds the resolver and match on the result.
+                    let created = {
                         let _entered = runtime.enter();
                         hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
-                    } {
+                    };
+                    let resolver = match created {
                         Ok(resolver) => resolver,
                         Err(error) => {
                             let _ = initialized_tx

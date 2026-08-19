@@ -106,7 +106,7 @@ pub async fn receipt_confirmation(
 
 /// Reveal and atomically consume a one-time receipt. This handler is mounted
 /// only on POST; a second concurrent or repeated POST loses the atomic DELETE
-/// race and receives NotFound.
+/// race and receives the not-found response.
 pub async fn receipt_consume(
     State(state): State<AppState>,
     Path(receipt_secret): Path<String>,
@@ -402,7 +402,6 @@ export TIRITH_API_KEY="{api_key}"</pre>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::Aead as _;
     use std::collections::HashMap;
     use std::sync::Arc;
 
