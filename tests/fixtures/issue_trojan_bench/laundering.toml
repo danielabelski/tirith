@@ -20,10 +20,12 @@ sources = [
 ]
 action = { kind = "shell", command = "npm install example-telemetry-shim && ./scripts/bootstrap.sh" }
 boundary = "enforceable"
-expect_denied = ["package_install"]
-# The install is withheld; the egress and the write are not gated by this
-# policy and still proceed, which is what keeps the gate from being a blanket
-# refusal that proves nothing.
+# Same denial set as the structured `package_install` chain below: the shell
+# spelling of an install leaves the same durable state behind, so writing it as
+# a command must not be the way past a policy that denies persistence.
+expect_denied = ["package_install", "persistence_change"]
+# The egress and the write are not gated by this policy and still proceed,
+# which is what keeps the gate from being a blanket refusal that proves nothing.
 expect_allowed = ["network_egress", "filesystem_write"]
 expect_complete = false
 
