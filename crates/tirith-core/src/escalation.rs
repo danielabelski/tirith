@@ -3029,6 +3029,29 @@ mod tests {
         assert_eq!(later_block.approval_description, None);
     }
 
+    #[test]
+    fn pending_approval_cannot_remain_an_executable_allow() {
+        // The CLI prompt channel may keep a live approval contract, but it
+        // must not report Action::Allow: that would look executable before
+        // the operator answers. MCP has no prompt, so the same contract is
+        // a Block with the approval metadata cleared.
+        let mut raw = raw_verdict_with(Action::Allow, vec![], None);
+        raw.requires_approval = Some(true);
+        raw.approval_timeout_secs = Some(30);
+        raw.approval_fallback = Some("block".into());
+        raw.approval_rule = Some("curl_pipe_shell".into());
+        raw.approval_description = Some("pending review".into());
+        let policy = crate::policy::Policy::default();
+
+        let cli = apply_stateless_policy_effects(&raw, &policy, CallerContext::Cli);
+        assert_eq!(cli.action, Action::Warn);
+        assert_eq!(cli.requires_approval, Some(true));
+
+        let mcp = apply_stateless_policy_effects(&raw, &policy, CallerContext::McpServer);
+        assert_eq!(mcp.action, Action::Block);
+        assert_eq!(mcp.requires_approval, None);
+    }
+
     // --- W7: derive_typed_events -------------------------------------------
 
     fn kinds(events: &[TypedEvent]) -> Vec<EventKind> {

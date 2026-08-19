@@ -1424,6 +1424,11 @@ mod tests {
         });
         let mut raw = engine::analyze_with_policy_without_bypass(&ctx, &policy);
         raw.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
+        assert_eq!(
+            raw.action,
+            Action::Allow,
+            "the Info override must make the scan itself Allow: {raw:?}"
+        );
         let effective = crate::escalation::post_process_verdict_for_verification(
             &raw,
             &policy,
@@ -1431,7 +1436,8 @@ mod tests {
             "safe-command-pending-approval",
             crate::escalation::CallerContext::Cli,
         );
-        assert_eq!(effective.action, Action::Allow);
+        // A live CLI approval contract is not an executable Allow.
+        assert_eq!(effective.action, Action::Warn);
         assert_eq!(effective.requires_approval, Some(true));
 
         let runner = Path::new("/usr/local/bin/tirith");

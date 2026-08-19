@@ -543,7 +543,7 @@ fn append_to_audit_log_inner(
     }
     let file = open_opts.open(&path);
 
-    let file = match file {
+    let mut file = match file {
         Ok(f) => f,
         Err(e) => {
             let reason = format!("cannot open {}: {e}", path.display());
@@ -584,15 +584,12 @@ fn append_to_audit_log_inner(
         }
     }
 
-    // C1: capture the LOCKED fd's identity (device + inode) via fstat so the
-    // path-based reads below (`read_last_line` / `count_lines`, which reopen the
-    // log BY PATHNAME) can confirm they read the SAME inode we hold the lock on and
-    // will append to. If the log is rotated/replaced between `open()` and those
-    // reads, the path would resolve to a DIFFERENT inode and `prev_hash`/`count`
-    // would come from a file we are not appending to, poisoning the chain. On unix
-    // we stat the path before each such read and fail closed on a mismatch; on
-    // non-unix there is no portable dev/ino, so we keep the prior best-effort
-    // behavior (None disables the check).
+    // C1: capture the LOCKED fd's identity (device + inode) via fstat. Tail
+    // and line-count reads go through this same handle so Windows exclusive
+    // LockFileEx does not fail a second open with ERROR_LOCK_VIOLATION
+    // (os error 33). On unix we still stat the path before each such read
+    // and fail closed on a mismatch if the log is rotated under the lock.
+    // On non-unix there is no portable dev/ino (None disables the check).
     #[cfg(unix)]
     let locked_ident: Option<(u64, u64)> = {
         use std::os::unix::fs::MetadataExt;
@@ -646,7 +643,7 @@ fn append_to_audit_log_inner(
         let _ = fs2::FileExt::unlock(&file);
         return AuditWrite::Failed(reason);
     }
-    let prev_line = match read_last_line(&path) {
+    let prev_line = match read_last_line_from(&mut file) {
         Ok(line) => line,
         Err(reason) => {
             audit_diagnostic(format!("tirith: audit: {reason}"));
@@ -666,15 +663,15 @@ fn append_to_audit_log_inner(
     let prev_count = match (&head_before, &prev_hash) {
         (Some(h), Some(ph)) if &h.head_hash == ph => h.count,
         _ => {
-            // The fallback path reopens the log by pathname to count lines; re-verify
-            // identity immediately before it so a rotation between the tail read and
-            // here cannot feed a count from a different inode.
+            // The fallback path counts through the locked handle; re-verify
+            // identity immediately before it so a rotation between the tail read
+            // and here cannot feed a count from a different inode.
             if let Err(reason) = verify_log_identity(&path) {
                 audit_diagnostic(format!("tirith: audit: {reason}"));
                 let _ = fs2::FileExt::unlock(&file);
                 return AuditWrite::Failed(reason);
             }
-            match count_lines(&path) {
+            match count_lines_from(&mut file) {
                 Ok(count) => count,
                 Err(reason) => {
                     audit_diagnostic(format!("tirith: audit: {reason}"));
@@ -947,10 +944,17 @@ fn line_hash(line: &str) -> Option<String> {
 
 /// Read the last physical line of `path` without loading the whole file. Refuse
 /// a newline-free/oversized tail instead of growing a buffer back to byte zero.
+#[cfg(test)]
 fn read_last_line(path: &std::path::Path) -> Result<Option<String>, String> {
-    use std::io::{Read, Seek, SeekFrom};
     let mut f = fs::File::open(path).map_err(|e| format!("cannot read audit tail: {e}"))?;
-    let len = f
+    read_last_line_from(&mut f)
+}
+
+/// Same as [`read_last_line`] on an already-open handle. Persist holds an
+/// exclusive lock on Windows; a second `File::open` would fail with os error 33.
+fn read_last_line_from(file: &mut fs::File) -> Result<Option<String>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file
         .metadata()
         .map_err(|e| format!("cannot stat audit tail: {e}"))?
         .len();
@@ -961,10 +965,10 @@ fn read_last_line(path: &std::path::Path) -> Result<Option<String>, String> {
     // One byte for a preceding delimiter and one for a possible trailing newline.
     let window_len = len.min((MAX_AUDIT_TAIL_BYTES as u64).saturating_add(2));
     let window_start = len - window_len;
-    f.seek(SeekFrom::Start(window_start))
+    file.seek(SeekFrom::Start(window_start))
         .map_err(|e| format!("cannot seek audit tail: {e}"))?;
     let mut buf = vec![0u8; window_len as usize];
-    f.read_exact(&mut buf)
+    file.read_exact(&mut buf)
         .map_err(|e| format!("cannot read audit tail: {e}"))?;
 
     let trimmed_end = if buf.last() == Some(&b'\n') {
@@ -1000,14 +1004,23 @@ fn read_last_line(path: &std::path::Path) -> Result<Option<String>, String> {
 /// line-count, and read failures are explicit so append never silently creates a
 /// new root after an unbounded/corrupt prefix. The result remains the number of
 /// newline bytes, preserving the existing no-trailing-newline semantics.
+#[cfg(test)]
 fn count_lines(path: &std::path::Path) -> Result<u64, String> {
-    use std::io::Read;
-    let f = match fs::File::open(path) {
+    let mut f = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(format!("cannot count audit lines: {error}")),
     };
-    let metadata = f
+    count_lines_from(&mut f)
+}
+
+/// Same as [`count_lines`] on an already-open handle. Persist holds an
+/// exclusive lock on Windows; a second `File::open` would fail with os error 33.
+fn count_lines_from(file: &mut fs::File) -> Result<u64, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("cannot rewind audit log while counting lines: {e}"))?;
+    let metadata = file
         .metadata()
         .map_err(|e| format!("cannot stat audit log while counting lines: {e}"))?;
     if metadata.len() > MAX_AUDIT_LOG_BYTES {
@@ -1018,7 +1031,7 @@ fn count_lines(path: &std::path::Path) -> Result<u64, String> {
     }
     // Bound actual reads as well as the pre-read metadata snapshot. A writer that
     // ignores the advisory lock can grow the inode after `metadata()`.
-    let mut limited = f.take(MAX_AUDIT_LOG_BYTES + 1);
+    let mut limited = Read::take(&mut *file, MAX_AUDIT_LOG_BYTES + 1);
     let mut buf = [0u8; 64 * 1024];
     let mut count: u64 = 0;
     let mut bytes_read = 0u64;
@@ -4566,6 +4579,23 @@ mod tests {
             5000,
             "lines spanning multiple read chunks must all be counted"
         );
+    }
+
+    #[test]
+    fn exclusive_lock_still_counts_lines_on_the_locked_handle() {
+        // Windows LockFileEx is mandatory: a second File::open of the locked
+        // log fails with os error 33. Persist must count through the handle
+        // it already locked.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.jsonl");
+        let mut open_opts = OpenOptions::new();
+        open_opts.create(true).append(true).read(true).write(true);
+        let mut file = open_opts.open(&path).unwrap();
+        file.lock_exclusive().unwrap();
+        writeln!(file, "{{\"action\":\"Allow\"}}").unwrap();
+        file.flush().unwrap();
+        assert_eq!(count_lines_from(&mut file).unwrap(), 1);
+        let _ = FileExt::unlock(&file);
     }
 
     #[test]

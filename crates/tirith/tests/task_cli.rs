@@ -31,12 +31,16 @@ fn run_stdin(envelope: &str, args: &[&str]) -> (i32, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn tirith task check");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(envelope.as_bytes())
-        .expect("write envelope");
+    // Clap may reject flags (unknown --adapter) before reading stdin. Writing
+    // to a closed pipe is BrokenPipe on macOS; that is not a test failure.
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin.write_all(envelope.as_bytes()) {
+            assert!(
+                error.kind() == std::io::ErrorKind::BrokenPipe,
+                "write envelope: {error}"
+            );
+        }
+    }
     let out = child.wait_with_output().expect("wait");
     (
         out.status.code().unwrap_or(-1),

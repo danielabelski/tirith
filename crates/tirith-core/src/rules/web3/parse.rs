@@ -4197,7 +4197,12 @@ fn default_solana_keypair(context: &Web3ParseContextV2) -> SignerReferenceV2 {
         .filter(|value| !value.is_empty())
         .map(|value| PathBuf::from(value).join(".config"))
         .filter(|path| path.is_absolute())
-        .map(|path| path.join("solana/id.json").to_string_lossy().into_owned());
+        .map(|path| {
+            path.join("solana")
+                .join("id.json")
+                .to_string_lossy()
+                .into_owned()
+        });
     SignerReferenceV2::reference(
         SignerKindV2::KeypairFile,
         SelectorSource::ToolDefault,
@@ -13286,7 +13291,9 @@ mod tests {
         let default_keypair =
             parse_web3_commands("solana address", ShellType::Posix, &default_keypair_context);
         let expected_default_keypair = new_home
-            .join(".config/solana/id.json")
+            .join(".config")
+            .join("solana")
+            .join("id.json")
             .to_string_lossy()
             .into_owned();
         assert_eq!(

@@ -4790,7 +4790,9 @@ mod tests {
         assert_eq!(result.exit_code, Some(Action::Block.exit_code()));
         assert!(!executor_called.load(Ordering::Acquire));
         let verdict = result.verdict.expect("pending approval verdict");
-        assert_eq!(verdict.action, Action::Allow);
+        // The scan is Info-overridden, but a live approval contract must not
+        // remain Action::Allow (that would look executable before the prompt).
+        assert_eq!(verdict.action, Action::Warn);
         assert_eq!(verdict.requires_approval, Some(true));
         assert!(verdict.bypass_requested);
         assert!(verdict.bypass_available);
