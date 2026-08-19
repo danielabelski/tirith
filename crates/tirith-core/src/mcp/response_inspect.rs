@@ -600,11 +600,16 @@ fn resolve_host_blocking(host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
     Ok(ips)
 }
 
+/// Per-response memo of host/port lookups, keyed so a repeated authority in one
+/// response costs a single resolution. Failures are cached too: a host that
+/// already failed must not be retried against the budget.
+type ResolutionCache = RefCell<HashMap<(String, u16), Result<Vec<IpAddr>, String>>>;
+
 struct ResponseDnsBudget {
     deadline: Instant,
     screens_remaining: Cell<usize>,
     exhausted: Cell<bool>,
-    cache: RefCell<HashMap<(String, u16), Result<Vec<IpAddr>, String>>>,
+    cache: ResolutionCache,
     last_resolver_error: RefCell<Option<String>>,
     resolver: HostResolver,
 }
