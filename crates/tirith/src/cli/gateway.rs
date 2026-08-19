@@ -12997,7 +12997,11 @@ policy:
             .to_path_buf();
         let ambient_state_path = previous_xdg
             .map(std::path::PathBuf::from)
-            .map(|root| root.join("tirith").join("sessions").join(format!("{session_id}.json")))
+            .map(|root| {
+                root.join("tirith")
+                    .join("sessions")
+                    .join(format!("{session_id}.json"))
+            })
             .or_else(|| {
                 previous_home.map(std::path::PathBuf::from).map(|home| {
                     home.join(".local/state/tirith/sessions")
