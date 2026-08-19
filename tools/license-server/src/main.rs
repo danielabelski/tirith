@@ -448,11 +448,22 @@ async fn upload_to_r2(
     }
 }
 
+/// Matches the tirith-core runner download client so a stalled R2 PUT cannot
+/// hang the sequential backup loop forever.
+const R2_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn r2_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    r2_http_client_with_timeout(R2_HTTP_TIMEOUT)
+}
+
+fn r2_http_client_with_timeout(
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
     // A presigned URL is a bearer credential and PUT bodies are the private
     // database backup. Never replay either to a redirect-selected origin.
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
         .build()
 }
 
@@ -516,5 +527,33 @@ mod r2_tests {
             .expect("redirect observer result"));
         origin_thread.join().expect("origin thread");
         target_thread.join().expect("target thread");
+    }
+
+    #[tokio::test]
+    async fn backup_client_times_out_instead_of_hanging() {
+        assert_eq!(super::R2_HTTP_TIMEOUT, Duration::from_secs(30));
+
+        let stall = TcpListener::bind("127.0.0.1:0").expect("bind stall listener");
+        let stall_address = stall.local_addr().expect("stall address");
+        let stall_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = stall.accept() {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+
+        let error = super::r2_http_client_with_timeout(Duration::from_millis(200))
+            .expect("build R2 client")
+            .put(format!("http://{stall_address}/backup"))
+            .body("private database bytes")
+            .send()
+            .await
+            .expect_err("a stalled R2 PUT must time out");
+        assert!(
+            error.is_timeout(),
+            "expected a request timeout, got: {error:?}"
+        );
+        let _ = stall_thread.join();
     }
 }

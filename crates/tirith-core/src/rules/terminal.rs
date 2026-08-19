@@ -316,15 +316,27 @@ pub fn check_bytes_with_ignore(
     }
 
     if dropped_details > 0 {
-        if let Some(first) = findings.first_mut() {
-            first.evidence.push(Evidence::Text {
+        findings.push(Finding {
+            rule_id: RuleId::AnalysisIncomplete,
+            severity: Severity::High,
+            title: "Terminal byte scan retained only part of its evidence".to_string(),
+            description: "The input produced more byte-level detail records than Tirith's \
+                          bounded retention cap. Records kept before the cap were analyzed, \
+                          and the omitted records are reported instead of being treated as \
+                          absent."
+                .to_string(),
+            evidence: vec![Evidence::Text {
                 detail: format!(
                     "byte_detail_omitted_count={} retained_cap={}",
                     dropped_details,
                     extract::ByteScanResult::MAX_RETAINED_DETAILS
                 ),
-            });
-        }
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
     }
 
     findings
@@ -846,9 +858,44 @@ mod tests {
             evidence,
             Evidence::ByteSequence { hex, .. } if hex == "U+200B"
         )));
-        assert!(finding.evidence.iter().any(|evidence| matches!(
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete
+                    && finding.evidence.iter().any(|evidence| {
+                        matches!(
+                            evidence,
+                            Evidence::Text { detail } if detail.contains("byte_detail_omitted_count=")
+                        )
+                    })
+            }),
+            "omitted byte-scan details must be their own AnalysisIncomplete finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_byte_details_emit_analysis_incomplete_even_without_other_findings() {
+        // Joiner-script ZWJ is legitimate, so the class flag is set but no
+        // ZeroWidthChars finding is emitted. Overflowing the per-class detail
+        // cap must still surface the gap instead of failing open.
+        let input =
+            "ا\u{200d}ا ".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS * 3);
+        let findings = check_bytes(input.as_bytes());
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "benign joiner flood must not emit a security finding besides the gap: {findings:?}"
+        );
+        let incomplete = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+            .expect("exceeding the byte-scan detail cap must emit AnalysisIncomplete");
+        assert_eq!(incomplete.severity, Severity::High);
+        assert!(incomplete.evidence.iter().any(|evidence| matches!(
             evidence,
-            Evidence::Text { detail } if detail.contains("byte_detail_omitted_count=")
+            Evidence::Text { detail }
+                if detail.contains("byte_detail_omitted_count=")
+                    && detail.contains("retained_cap=")
         )));
     }
 
