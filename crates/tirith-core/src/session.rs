@@ -377,6 +377,13 @@ mod tests {
 
     #[test]
     fn test_resolve_session_id_stable_on_repeated_calls() {
+        // The fallback id is scoped by `compute_scope`, which hashes the
+        // process-global cwd and reads the state directory. Without the shared
+        // guard a concurrent test that moves either one between these two calls
+        // changes the scope, and the "stable" assertion fails for a reason that
+        // has nothing to do with session resolution.
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global session state");
         let id1 = resolve_session_id();
         let id2 = resolve_session_id();
         // Within the same process, should be the same (from cache or env)
