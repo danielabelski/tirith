@@ -25,7 +25,7 @@ pub enum RootClass {
     Unc,
     RootedNoDrive,
     Verbatim,
-    Device(String),
+    Device,
 }
 
 /// Parent traversal that cannot be represented by normalized components.
@@ -57,7 +57,7 @@ enum RootIdentity {
     VerbatimDrive(u8),
     VerbatimUnc { server: String, share: String },
     VerbatimOpaque(String),
-    Device,
+    Device(String),
 }
 
 /// A separator- and dot-normalized lexical path.
