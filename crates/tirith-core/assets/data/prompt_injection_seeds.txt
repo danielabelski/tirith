@@ -21,7 +21,11 @@ act as <role>
 you are now
 # A bare `system:` label is common in logs, configuration, and prose. Require a
 # line-framed role label plus a high-signal override/jailbreak continuation.
-(?m)^\s*system:\s*(?:ignore|disregard|forget|override|new instructions|you are now|act as|do anything now|DAN mode)\b
+# Split by family: the seed text itself decides the reported rule, so keeping
+# both continuations on one line would route every role-override match to
+# IgnorePreviousInstructions because the alternation spells "ignore".
+(?m)^\s*system:\s*(?:ignore|disregard|forget|override|new instructions)\b
+(?m)^\s*system:\s*(?:you are now|you must|act as|do anything now|DAN mode)\b
 do anything now
 DAN mode
 #
