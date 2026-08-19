@@ -12969,6 +12969,8 @@ policy:
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_xdg = std::env::var_os("XDG_STATE_HOME");
+        let previous_home = std::env::var_os("HOME");
         let root = tempfile::tempdir().expect("isolate duplicate-id gateway state");
         let _state = EnvGuard::set("XDG_STATE_HOME", root.path());
         let _home = EnvGuard::set("HOME", root.path());
@@ -12989,6 +12991,19 @@ policy:
         let isolated_state_path = tirith_core::session_warnings::session_state_path(&session_id)
             .expect("isolated gateway session path");
         assert!(isolated_state_path.starts_with(&isolated_state_root));
+        let isolated_sessions = isolated_state_path
+            .parent()
+            .expect("gateway session path has a parent")
+            .to_path_buf();
+        let ambient_state_path = previous_xdg
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("tirith").join("sessions").join(format!("{session_id}.json")))
+            .or_else(|| {
+                previous_home.map(std::path::PathBuf::from).map(|home| {
+                    home.join(".local/state/tirith/sessions")
+                        .join(format!("{session_id}.json"))
+                })
+            });
 
         let config = test_config();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
