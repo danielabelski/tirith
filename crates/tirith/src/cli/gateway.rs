@@ -2423,20 +2423,11 @@ fn static_interpreted_entrypoint(
         &args[1]
     } else if let Some(first) = args.first().filter(|value| !value.starts_with('-')) {
         // A root-owned custom interpreter cannot be identified exhaustively by
-        // basename. If its leading operand names an existing repo file, treat
-        // that operand conservatively as interpreted code. Native servers that
-        // take only flags retain the ordinary executable-only binding.
-        let candidate = Path::new(first);
-        let candidate = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            repo_root.join(candidate)
-        };
-        if candidate.is_file() {
-            first
-        } else {
-            return Ok(None);
-        }
+        // basename. Treat a leading positional operand as interpreted code
+        // without consulting its current existence: an absent path could be
+        // created after classification and otherwise escape the code binding.
+        // Native servers that take only flags retain executable-only binding.
+        first
     } else {
         return Ok(None);
     };
@@ -9110,6 +9101,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("file limit"));
+    }
+
+    #[test]
+    fn custom_interpreter_classification_does_not_depend_on_path_existence() {
+        let repo = tempfile::tempdir().unwrap();
+        let entrypoint = static_interpreted_entrypoint(
+            Path::new("/usr/local/bin/custom-runtime"),
+            &["created-after-classification.script".to_string()],
+            repo.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            entrypoint,
+            Some(PathBuf::from("created-after-classification.script"))
+        );
+    }
+
+    #[test]
+    fn interpreted_snapshot_excludes_self_referential_descriptor_lock() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("server.py"), b"pass\n").unwrap();
+        std::fs::create_dir(repo.path().join(".tirith")).unwrap();
+        let lock = repo
+            .path()
+            .join(".tirith")
+            .join(tirith_core::mcp_lock::MCP_LOCK_FILENAME);
+        std::fs::write(&lock, b"before approval\n").unwrap();
+        let before = InterpretedCodeSnapshot::capture(repo.path(), Path::new("server.py")).unwrap();
+        std::fs::write(&lock, b"after approval with launch fingerprint\n").unwrap();
+        let after = InterpretedCodeSnapshot::capture(repo.path(), Path::new("server.py")).unwrap();
+        assert_eq!(before, after);
     }
 
     #[cfg(unix)]
