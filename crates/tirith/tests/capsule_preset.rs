@@ -27,6 +27,7 @@ use tirith_core::capsule::ResourceLimits;
 fn tirith(state: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
     cmd.env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_LOG", "0")
         .env("HOME", state)
         .env("USERPROFILE", state)
         .env("XDG_DATA_HOME", state.join("data"))
@@ -250,7 +251,11 @@ fn the_refusal_receipt_is_content_addressed_signed_shape_and_tamper_evident() {
             "hi",
         ],
     );
-    assert!(fixture.receipt.exists(), "a refusal still writes a receipt");
+    assert!(
+        fixture.receipt.exists(),
+        "a refusal still writes a receipt; receipt_error={:?}",
+        value.get("receipt_error")
+    );
 
     let bytes = std::fs::read(&fixture.receipt).expect("read receipt");
     let receipt: tirith_core::capsule_receipt::CapsuleRunReceipt =

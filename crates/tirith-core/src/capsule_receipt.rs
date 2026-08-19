@@ -284,7 +284,9 @@ impl PreparedCapsuleReceipt {
         let requested = requested_path
             .map(|path| {
                 let reported_path = path.to_path_buf();
-                let path = absolute_path(path).map_err(CapsuleReceiptError::Io)?;
+                let path = crate::capsule_project::trusted_platform_root_alias(
+                    &absolute_path(path).map_err(CapsuleReceiptError::Io)?,
+                );
                 let anchor = filesystem_anchor(&path).ok_or_else(|| {
                     CapsuleReceiptError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
