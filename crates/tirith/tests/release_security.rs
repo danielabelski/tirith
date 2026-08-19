@@ -108,7 +108,9 @@ fn composite_action_keeps_third_party_actions_pinned_to_full_commit_shas() {
 
 #[test]
 fn mutable_docker_tags_are_not_immutable_pins() {
-    assert!(!uses_is_immutably_pinned("docker://ghcr.io/example/tool:latest"));
+    assert!(!uses_is_immutably_pinned(
+        "docker://ghcr.io/example/tool:latest"
+    ));
     assert!(uses_is_immutably_pinned(&format!(
         "docker://ghcr.io/example/tool@sha256:{}",
         "ab".repeat(32)
