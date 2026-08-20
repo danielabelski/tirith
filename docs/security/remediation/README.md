@@ -36,9 +36,13 @@ python3 docs/security/remediation/manage.py bootstrap
 python3 docs/security/remediation/render_main.py
 
 # Independent structural, provenance, lifecycle, and freshness checks.
-python3 docs/security/remediation/validate_ledger.py --structural
+# `--base-ref` is required: append-only enforcement is the only check that
+# rejects deleted findings, rewritten history, and a mutated source index, so
+# the validator refuses to skip it silently. Locally, where there is nothing to
+# diff against, say so explicitly with `--allow-missing-base`.
+python3 docs/security/remediation/validate_ledger.py --structural --allow-missing-base
 
-# In a PR, also protect append-only history and mappings against the base.
+# In a PR, protect append-only history and mappings against the base instead.
 python3 docs/security/remediation/validate_ledger.py --structural --base-ref origin/main
 
 # The owning branch binds all owned findings to an explicit reviewed code candidate.
