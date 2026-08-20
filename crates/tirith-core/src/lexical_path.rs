@@ -405,9 +405,24 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
         // re-parse as the `\\??\\` object-manager root and change the root class
         // across a normalization round trip. `?` is not a legal Windows filename
         // character, so such a component is either that namespace spelled with
-        // droppable leading segments (`/./??/x`, `/../??/x`) or a path that
-        // cannot exist. Refuse it rather than pick one of the two readings.
-        if first_named_component(&components) == Some("??") {
+        // droppable segments (`/./??/x`, `/../??/x`, `/a/../??/x`) or a path
+        // that cannot exist. Refuse it rather than pick one of the two readings.
+        //
+        // Decide on the RESOLVED components in both modes. A parent-preserving
+        // parse retains the tokens that cancel earlier names, so reading its own
+        // component list would let `/a/../??/x` parse in one mode and fail in
+        // the other, and the two modes have to agree about that.
+        let leads_with_object_manager = if preserve_parents {
+            normalize_components(stripped, true, true, false)
+                .0
+                .first()
+                .is_some_and(|component| component == "??")
+        } else {
+            components
+                .first()
+                .is_some_and(|component| component == "??")
+        };
+        if leads_with_object_manager {
             return Err(LexicalPathError::InvalidDeviceRoot);
         }
         return Ok(LexicalPath {
@@ -429,16 +444,6 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
         parent_state,
         parents_preserved: preserve_parents,
     })
-}
-
-/// First component that is not a retained `..` token. Parent-preserving parses
-/// keep those tokens in `components`, so both parse modes have to skip them to
-/// reach the same decision about the leading name.
-fn first_named_component(components: &[String]) -> Option<&str> {
-    components
-        .iter()
-        .map(String::as_str)
-        .find(|component| *component != "..")
 }
 
 fn parse_verbatim(rest: &str, preserve_parents: bool) -> Result<LexicalPath, LexicalPathError> {
@@ -612,6 +617,7 @@ mod tests {
             "/././??/COM1",
             "\\.\\??\\COM1",
             "/../??/COM1",
+            "/a/../??/COM1",
             "/./??/\u{44a}.",
             "/.././??/po/.ti7.",
         ] {
