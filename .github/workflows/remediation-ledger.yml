@@ -36,7 +36,10 @@ jobs:
           if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
             python3 docs/security/remediation/validate_ledger.py --structural --base-ref "$BASE_SHA"
           else
-            python3 docs/security/remediation/validate_ledger.py --structural
+            # No base commit to diff against (a first push has an empty
+            # `before`). Say so explicitly: the validator now refuses to skip
+            # append-only enforcement unless the caller states this.
+            python3 docs/security/remediation/validate_ledger.py --structural --allow-missing-base
           fi
       - name: Test candidate ancestry, tracker-only, and real-fix binding
         run: python3 -m unittest discover -s docs/security/remediation/tests -p 'test_*.py'

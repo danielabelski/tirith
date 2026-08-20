@@ -930,14 +930,43 @@ def current_head() -> str:
     return head
 
 
-def run_check(base_ref: str | None, check_render: bool) -> tuple[dict[str, Any], str]:
+def usable_base_ref(base_ref: str | None) -> str | None:
+    """A base ref that append-only enforcement can actually diff against.
+
+    An absent, blank, or all-zero value is not one: `actions/checkout` reports
+    all zeros for a branch with no `before` commit, and `github.event.before`
+    is empty for a first push.
+    """
+    if base_ref is None:
+        return None
+    stripped = base_ref.strip()
+    if not stripped or set(stripped) == {"0"}:
+        return None
+    return stripped
+
+
+def run_check(
+    base_ref: str | None, check_render: bool, allow_missing_base: bool = False
+) -> tuple[dict[str, Any], str]:
     source_index = load_canonical(SOURCE_INDEX_PATH)
     source_rows = validate_source_index(source_index)
     ledger = load_canonical(FINDINGS_PATH)
     head = current_head()
     validate_findings(ledger, source_rows, head)
-    if base_ref:
-        validate_append_only(base_ref, ledger)
+    resolved_base = usable_base_ref(base_ref)
+    if resolved_base:
+        validate_append_only(resolved_base, ledger)
+    else:
+        # `validate_append_only` is the only check that rejects deleted
+        # findings, rewritten history events, removed source mappings, and a
+        # mutated source-index. Skipping it silently turns this validator into
+        # a structural linter while still exiting 0, so the caller has to say
+        # out loud that no base exists.
+        require(
+            allow_missing_base,
+            "append-only enforcement needs a usable --base-ref; pass "
+            "--allow-missing-base to state that no base commit exists",
+        )
     if check_render:
         result = subprocess.run([sys.executable, str(RENDERER), "--check"], cwd=ROOT, check=False)
         require(result.returncode == 0, "generated main.md is stale")
@@ -953,11 +982,18 @@ def main() -> int:
     modes.add_argument("--merged-main", action="store_true")
     parser.add_argument("--candidate-sha", metavar="COMMIT")
     parser.add_argument("--base-ref")
+    parser.add_argument(
+        "--allow-missing-base",
+        action="store_true",
+        help="proceed without append-only enforcement; only for a ref that has no base commit",
+    )
     parser.add_argument("--evidence-bundle")
     parser.add_argument("--skip-render", action="store_true")
     args = parser.parse_args()
     try:
-        ledger, head = run_check(args.base_ref, not args.skip_render)
+        ledger, head = run_check(
+            args.base_ref, not args.skip_render, args.allow_missing_base
+        )
         if args.structural:
             require(args.candidate_sha is None, "structural mode does not accept --candidate-sha")
             print("structural ledger validation passed: 135 source rows, 131 owned canonical roots")
