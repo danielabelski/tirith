@@ -1485,6 +1485,49 @@ fn is_lower_snake_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+/// Closed vocabulary of `rules::web3_gate::signer_kind_token`. Shape alone is
+/// not enough for a field that grants a byte-for-byte redaction exemption:
+/// `[a-z0-9_]{1,48}` also matches 40 lowercase hexadecimal characters, which is
+/// an Ethereum address with its `0x` removed. A public `Evidence::Text` value
+/// spelling a signer record could otherwise carry an address straight past DLP.
+fn is_web3_signer_kind_token(value: &str) -> bool {
+    matches!(
+        value,
+        "raw_private_key"
+            | "raw_keypair"
+            | "mnemonic"
+            | "keypair_file"
+            | "keystore"
+            | "ledger"
+            | "trezor"
+            | "aws_kms"
+            | "unlocked_node"
+            | "account_alias"
+            | "stdin"
+            | "prompt"
+            | "unknown"
+    )
+}
+
+/// Closed vocabulary of `rules::web3_gate::signer_role_token`.
+fn is_web3_signer_role_token(value: &str) -> bool {
+    matches!(
+        value,
+        "default" | "keypair" | "authority" | "fee_payer" | "program_id" | "wallet"
+    )
+}
+
+/// The operation vocabulary is deliberately open: `operation_token` normalizes a
+/// growing enum rather than enumerating it, and degrades anything unexpected to
+/// `unknown`. It still must not accept secret-shaped material, so reject a long
+/// unbroken run of hexadecimal. A snake-cased enum name of that length carries
+/// an underscore, which is not a hex digit; a 16+ character pure-hex token is an
+/// address or a key with its prefix stripped.
+fn is_open_categorical_token(value: &str) -> bool {
+    is_lower_snake_token(value)
+        && !(value.len() >= 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 fn take_categorical_field<'a>(
     input: &mut &'a str,
     field: &str,
@@ -1629,7 +1672,7 @@ pub(crate) fn is_internal_categorical_evidence_record(detail: &str) -> bool {
         };
         return tail.is_empty()
             && is_web3_tool_token(tool)
-            && is_lower_snake_token(operation)
+            && is_open_categorical_token(operation)
             && write == "state_changing"
             && matches!(bypass, "yes" | "no");
     }
@@ -1645,8 +1688,8 @@ pub(crate) fn is_internal_categorical_evidence_record(detail: &str) -> bool {
         };
         return tail.is_empty()
             && is_web3_tool_token(tool)
-            && is_lower_snake_token(kind)
-            && is_lower_snake_token(role);
+            && is_web3_signer_kind_token(kind)
+            && is_web3_signer_role_token(role);
     }
     if let Some(mut tail) = detail.strip_prefix("tirith:v1:web3_policy;") {
         let Some(tool) = take_categorical_field(&mut tail, "tool=", false) else {
@@ -3242,6 +3285,74 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_signer_record_cannot_smuggle_an_address_through_a_shape_only_field() {
+        // A validated record is preserved byte-for-byte instead of being
+        // redacted, so a shape-only check on `kind` / `role` / `operation` was
+        // enough to carry secret material past DLP: `[a-z0-9_]` also spells 40
+        // lowercase hexadecimal characters, an Ethereum address without `0x`.
+        let address = "d8da6bf26964af9d7eed9e03e53415d37aa96045";
+        for forged in [
+            format!("tirith:v1:web3_signer;tool=cast;kind={address};role=wallet"),
+            format!("tirith:v1:web3_signer;tool=cast;kind=keystore;role={address}"),
+            format!(
+                "tirith:v1:web3_operation;tool=cast;operation={address};\
+                 write=state_changing;safety_bypass=no"
+            ),
+        ] {
+            assert!(
+                !is_internal_categorical_evidence_record(&forged),
+                "secret-shaped field granted a redaction exemption: {forged}"
+            );
+        }
+
+        // Every token the producers actually emit must still validate, or the
+        // enumerations here have drifted from `rules::web3_gate`.
+        for kind in [
+            "raw_private_key",
+            "raw_keypair",
+            "mnemonic",
+            "keypair_file",
+            "keystore",
+            "ledger",
+            "trezor",
+            "aws_kms",
+            "unlocked_node",
+            "account_alias",
+            "stdin",
+            "prompt",
+            "unknown",
+        ] {
+            for role in [
+                "default",
+                "keypair",
+                "authority",
+                "fee_payer",
+                "program_id",
+                "wallet",
+            ] {
+                let detail = format!("tirith:v1:web3_signer;tool=cast;kind={kind};role={role}");
+                assert!(
+                    is_internal_categorical_evidence_record(&detail),
+                    "producer token rejected: {detail}"
+                );
+            }
+        }
+
+        // An ordinary operation name is still accepted, including a long one
+        // whose underscores keep it out of the hexadecimal shape.
+        for operation in ["send", "deploy", "send_transaction_with_confirmation"] {
+            let detail = format!(
+                "tirith:v1:web3_operation;tool=cast;operation={operation};\
+                 write=state_changing;safety_bypass=no"
+            );
+            assert!(
+                is_internal_categorical_evidence_record(&detail),
+                "ordinary operation rejected: {detail}"
+            );
         }
     }
 
