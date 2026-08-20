@@ -1665,12 +1665,24 @@ pub fn regroup_file_finding_projection(value: &mut serde_json::Value) {
     let original = std::mem::take(files);
     let mut grouped: Vec<serde_json::Value> = Vec::new();
     let mut positions = std::collections::HashMap::<(String, bool), usize>::new();
-    for item in original {
-        let Some(object) = item.as_object() else {
+    for mut item in original {
+        let Some(object) = item.as_object_mut() else {
             grouped.push(item);
             continue;
         };
-        let Some(path) = object.get("path").and_then(serde_json::Value::as_str) else {
+        // Internal grouping detail, never part of the public projection. Take it
+        // before any branch below can carry the item out with the key intact:
+        // an item that has the id but no `path` used to leave through the early
+        // return and reach the output with it.
+        let projection_file_id = object
+            .remove("_projection_file_id")
+            .as_ref()
+            .and_then(serde_json::Value::as_u64);
+        let Some(path) = object
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
             grouped.push(item);
             continue;
         };
@@ -1683,11 +1695,9 @@ pub fn regroup_file_finding_projection(value: &mut serde_json::Value) {
             .and_then(serde_json::Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let grouping_path = object
-            .get("_projection_file_id")
-            .and_then(serde_json::Value::as_u64)
+        let grouping_path = projection_file_id
             .map(|id| format!("internal:{id}"))
-            .unwrap_or_else(|| path.to_string());
+            .unwrap_or(path);
         let key = (grouping_path, is_config);
         if let Some(index) = positions.get(&key).copied() {
             if let Some(existing) = grouped[index]
@@ -1698,10 +1708,6 @@ pub fn regroup_file_finding_projection(value: &mut serde_json::Value) {
             }
         } else {
             positions.insert(key, grouped.len());
-            let mut item = item;
-            if let Some(object) = item.as_object_mut() {
-                object.remove("_projection_file_id");
-            }
             grouped.push(item);
         }
     }
