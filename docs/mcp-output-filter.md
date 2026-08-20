@@ -87,9 +87,12 @@ The prepended notice has the shape:
 
 ## Fail-mode
 
-Unsafe output always blocks once the filter is engaged. The gateway's
-`policy.fail_mode` governs separate response-lifecycle failures; it does not
-turn a detected injection or malformed guarded tool result into an allow.
+A Block decision is final once the filter is engaged: the gateway's
+`policy.fail_mode` governs separate response-lifecycle failures and never turns
+a detected injection or a malformed guarded tool result into an allow. Which
+findings block is a severity question, not a fail-mode one — Critical and High
+findings block and have their content replaced, Medium and Low findings warn
+and keep sanitized content, per the two sections above.
 `tirith mcp-server` engages the filter for tool and resource-read output by
 default. Only the explicitly named `--unsafe-unsanitized-tool-output`
 compatibility flag disables that local-server boundary.

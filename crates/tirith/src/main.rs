@@ -1111,10 +1111,13 @@ Examples:
 Used by MCP client configurations to run tirith as a local tool server.
 
 Tool and resource-read output is routed through the output-direction analyzer
-before reaching the calling agent. It blocks OSC52 / hyperlink-mismatch /
-hidden-text / fake-prompt payloads and returns a safe placeholder citing the
-audit event_id. `--unsafe-unsanitized-tool-output` restores the legacy
-pass-through only for compatibility and is not recommended."
+before reaching the calling agent. A high-severity finding blocks: OSC52
+clipboard writes and hyperlink mismatches among them, where the content is
+replaced by a safe placeholder citing the audit event_id. A medium-severity
+finding warns: hidden text and fake shell prompts among them, where the content
+is byte-sanitized and carries a notice citing the same event_id.
+`--unsafe-unsanitized-tool-output` restores the legacy pass-through only for
+compatibility and is not recommended."
     )]
     McpServer {
         /// Compatibility spelling retained from the former opt-in behavior.
