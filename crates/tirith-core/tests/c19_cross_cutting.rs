@@ -1820,6 +1820,11 @@ fn every_env_mutating_test_module_uses_shared_global_state_serialization() {
     for path in crate_source_files() {
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        // `.gitattributes` pins LF for the embedded assets only, so a Windows
+        // checkout materializes CRLF for ordinary sources. Every marker below is
+        // LF-anchored; normalize first or the scan matches nothing at all and
+        // the contract silently stops being enforced on that platform.
+        let source = source.replace("\r\n", "\n");
         // The declaration is the only stable marker of a test module in this
         // crate; both spellings in use are matched.
         let Some(start) = source
