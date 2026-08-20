@@ -90,7 +90,8 @@
       },
       "maxItems": 4,
       "minItems": 4,
-      "type": "array"
+      "type": "array",
+      "uniqueItems": true
     },
     "schema_version": {
       "const": 1
@@ -225,7 +226,8 @@
       },
       "maxItems": 135,
       "minItems": 135,
-      "type": "array"
+      "type": "array",
+      "uniqueItems": true
     }
   },
   "required": [
