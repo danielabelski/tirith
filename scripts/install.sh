@@ -248,7 +248,11 @@ install_package_approval_helper() {
     run_root /bin/rm -rf "$helper_stage" || true
     return 1
   fi
-  run_root /bin/rm -rf "$helper_stage" || return 1
+  # The helper is already installed by this point. A failed staging cleanup
+  # leaves a temp directory behind; it is not a reason to return non-zero and
+  # have the caller roll back a successful installation. Every other cleanup in
+  # this function already tolerates failure the same way.
+  run_root /bin/rm -rf "$helper_stage" || warn "could not remove the helper staging directory ${helper_stage}"
 }
 
 restore_package_approval_helper() {
