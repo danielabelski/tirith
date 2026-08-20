@@ -268,7 +268,7 @@ pub fn check_dns_blocklist_with(
             let query = format!("{reversed}.{zone}");
             if budget
                 .resolve_query(resolver, &query)
-                .is_some_and(|addresses| !addresses.is_empty())
+                .is_some_and(|addresses| addresses.iter().any(is_dnsbl_listing))
                 && !matches.iter().any(|present| present == display_name)
             {
                 matches.push(display_name.to_string());
@@ -276,6 +276,24 @@ pub fn check_dns_blocklist_with(
         }
     }
     matches
+}
+
+/// A DNSBL reports a listing with a `127.0.0.0/8` answer, but the zones also
+/// answer in band with `127.255.255.0/24` for a query they refused: Spamhaus
+/// returns that range for a blocked or rate-limited querier, which is the
+/// normal response when the lookup comes from a public resolver. Treating any
+/// non-empty answer as a listing turns "we declined your query" into a
+/// High-severity blocklist finding against an innocent host.
+fn is_dnsbl_listing(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            octets[0] == 127 && !(octets[1] == 255 && octets[2] == 255)
+        }
+        // No zone in DNS_BLOCKLISTS publishes AAAA listings; an answer outside
+        // the documented response space is not evidence of one.
+        IpAddr::V6(_) => false,
+    }
 }
 
 fn reverse_ipv4(ip: std::net::Ipv4Addr) -> String {
@@ -331,6 +349,38 @@ mod tests {
             .resolve_subject(&resolver, "attacker.example")
             .is_none());
         assert!(resolver.calls().is_empty());
+    }
+
+    #[test]
+    fn a_reserved_dnsbl_answer_is_not_read_as_a_listing() {
+        // Spamhaus answers `127.255.255.x` when it refuses the query — a blocked
+        // or rate-limited querier, which is the normal reply when the lookup
+        // comes from a public resolver. That must not become a blocklist hit.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let refused = FakeResolver::default()
+            .with_answer("host.example", vec!["192.0.2.10".parse().unwrap()])
+            .with_answer(
+                "10.2.0.192.zen.spamhaus.org",
+                vec!["127.255.255.254".parse().unwrap()],
+            );
+        let mut budget = DnsRequestBudget::new(deadline, 4, 8);
+        assert!(
+            check_dns_blocklist_with("host.example", &refused, &mut budget).is_empty(),
+            "an in-band refusal code is not evidence that the host is listed"
+        );
+
+        // A real listing code inside 127.0.0.0/8 still reports.
+        let listed = FakeResolver::default()
+            .with_answer("host.example", vec!["192.0.2.10".parse().unwrap()])
+            .with_answer(
+                "10.2.0.192.zen.spamhaus.org",
+                vec!["127.0.0.2".parse().unwrap()],
+            );
+        let mut budget = DnsRequestBudget::new(deadline, 4, 8);
+        assert_eq!(
+            check_dns_blocklist_with("host.example", &listed, &mut budget),
+            vec!["Spamhaus ZEN".to_string()]
+        );
     }
 
     #[test]
