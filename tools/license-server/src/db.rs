@@ -466,6 +466,40 @@ impl Db {
                         ?reason,
                         "subscription.revoked did not carry a provably newer timestamp; state unchanged"
                     );
+                    // `Stale` is an ordinary non-advance: the stored state is
+                    // already at or past this event, so declining it is right.
+                    // The other variants mean the event could not be ordered at
+                    // all, and marking it processed below is what makes that
+                    // terminal — the handler answers 200, Polar never
+                    // redelivers, and the subscription stays active with its API
+                    // key unrevoked. Revocation is the one action where silently
+                    // declining keeps paid access open, so record those for the
+                    // dead-letter retry tooling instead of only warning.
+                    if !matches!(reason, EventTimestampError::Stale) {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO dead_letter \
+                             (event_id, subscription_id, event_type, reason, occurred_at, payload) \
+                             VALUES (?1, ?2, 'subscription.revoked', ?3, ?4, ?5)",
+                            params![
+                                data.event_id,
+                                data.subscription_id,
+                                format!("unorderable revoked timestamp: {reason:?}"),
+                                data.occurred_at,
+                                serde_json::json!({
+                                    "subscription_id": data.subscription_id,
+                                    "customer_id": data.customer_id,
+                                    "email": data.email,
+                                    "tier": data.tier,
+                                    "product_id": data.product_id,
+                                    "occurred_at": data.occurred_at,
+                                })
+                                .to_string(),
+                            ],
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!("db dead-letter revoked: {e}"))
+                        })?;
+                    }
                     tx.execute(
                         "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, 'subscription.revoked')",
                         params![data.event_id],
