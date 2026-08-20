@@ -93,12 +93,14 @@ fn composite_action_keeps_third_party_actions_pinned_to_full_commit_shas() {
 
     for step in steps {
         let step = step.as_mapping().expect("composite action step mapping");
-        let Some(uses) = step
-            .get(serde_yaml::Value::String("uses".to_string()))
-            .and_then(serde_yaml::Value::as_str)
-        else {
+        // Skip only when the key is absent. Folding a non-string value into the
+        // same `continue` would let `uses: 123` pass the pinning gate unchecked.
+        let Some(value) = step.get(serde_yaml::Value::String("uses".to_string())) else {
             continue;
         };
+        let uses = value
+            .as_str()
+            .unwrap_or_else(|| panic!("composite-action `uses` must be a string, got {value:?}"));
         assert!(
             uses_is_immutably_pinned(uses),
             "composite-action reference {uses:?} must be a local path, a full commit SHA, or a sha256-digest container"
