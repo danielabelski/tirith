@@ -729,10 +729,13 @@ fn insert_lock_integrity(
     if name.is_empty() || version.is_empty() || integrity.trim().is_empty() {
         return;
     }
-    index.insert(
-        (name.to_string(), version.to_string()),
-        integrity.trim().to_string(),
-    );
+    // First write wins. A v2 lockfile carries both `packages` and the legacy
+    // `dependencies` mirror, and only the `packages` pass corroborates identity
+    // against the install path. Overwriting would let the uncorroborated mirror
+    // replace an entry the hardened pass already resolved.
+    index
+        .entry((name.to_string(), version.to_string()))
+        .or_insert_with(|| integrity.trim().to_string());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

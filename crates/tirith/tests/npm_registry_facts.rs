@@ -530,6 +530,56 @@ fn a_leaf_name_cannot_rekey_an_installed_package_in_the_integrity_index() {
     );
 }
 
+/// A v2 lockfile carries both `packages` and the legacy `dependencies` mirror.
+/// Only the `packages` pass corroborates identity against the install path, so
+/// the mirror must not be able to overwrite what it resolved.
+#[test]
+fn the_legacy_dependencies_mirror_cannot_replace_a_corroborated_entry() {
+    let lock = r#"{
+        "lockfileVersion": 2,
+        "packages": {
+            "": { "name": "root" },
+            "node_modules/real-pkg": {
+                "version": "1.2.3",
+                "integrity": "sha512-CORROBORATED"
+            }
+        },
+        "dependencies": {
+            "real-pkg": {
+                "version": "1.2.3",
+                "integrity": "sha512-ATTACKER"
+            }
+        }
+    }"#;
+    let index = tirith_core::ecosystem_scan::npm_lock_integrity_index(lock);
+    assert_eq!(
+        index
+            .get(&("real-pkg".to_string(), "1.2.3".to_string()))
+            .map(String::as_str),
+        Some("sha512-CORROBORATED"),
+        "the uncorroborated mirror overwrote the install-path-resolved entry: {index:?}"
+    );
+
+    // With no `packages` block there is nothing to corroborate against, so the
+    // legacy mirror is still the only source and must still be read.
+    let legacy_only = r#"{
+        "lockfileVersion": 1,
+        "dependencies": {
+            "real-pkg": {
+                "version": "1.2.3",
+                "integrity": "sha512-LEGACY"
+            }
+        }
+    }"#;
+    let index = tirith_core::ecosystem_scan::npm_lock_integrity_index(legacy_only);
+    assert_eq!(
+        index
+            .get(&("real-pkg".to_string(), "1.2.3".to_string()))
+            .map(String::as_str),
+        Some("sha512-LEGACY")
+    );
+}
+
 /// Valid provenance is evidence, never suppression. A package with clean,
 /// present `dist` facts must score exactly as it would without them, so no
 /// behavioral, ThreatDB, typosquat or lifecycle signal can be bought off with
