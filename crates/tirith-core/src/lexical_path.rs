@@ -414,9 +414,13 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
         // parse retains the tokens that cancel earlier names, so reading its own
         // component list would let `/a/../??/x` parse in one mode and fail in
         // the other, and the two modes have to agree about that.
-        if resolved_leading_component(stripped, true, preserve_parents, &components)
-            .is_some_and(|leading| leading == "??")
-        {
+        if leads_with_reconstructed_root(
+            stripped,
+            true,
+            preserve_parents,
+            &components,
+            is_object_manager_anchor,
+        ) {
             return Err(LexicalPathError::InvalidDeviceRoot);
         }
         return Ok(LexicalPath {
@@ -436,9 +440,13 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
     // a component names a drive or an alternate data stream, never a file that
     // could exist under this name. Same reasoning, and the same resolved-form
     // decision, as the object-manager case above.
-    if resolved_leading_component(slashed, false, preserve_parents, &components)
-        .is_some_and(|leading| is_drive_prefixed(&leading))
-    {
+    if leads_with_reconstructed_root(
+        slashed,
+        false,
+        preserve_parents,
+        &components,
+        is_drive_prefixed,
+    ) {
         return Err(LexicalPathError::InvalidDriveRoot);
     }
     Ok(LexicalPath {
@@ -451,27 +459,42 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
     })
 }
 
-/// Leading component of the RESOLVED normalization, which is the form rendering
-/// emits. A parent-preserving parse keeps the tokens that cancel earlier names,
-/// so it has to re-resolve rather than read its own component list: otherwise
-/// the two parse modes disagree about whether a path parses at all.
-fn resolved_leading_component<'a>(
+/// Whether either normalization of `body` leads with a component that would
+/// reconstruct a root once rendered.
+///
+/// Both forms have to be consulted, and the same union in both parse modes.
+/// Ordinary rendering emits the resolved components, parent-preserving
+/// rendering emits the retained ones, and they differ exactly when a parent
+/// token cancels a name: `./C:/..` resolves to nothing but preserves as
+/// `C:/..`, while `/a/../??/x` preserves harmlessly but resolves to `??/x`.
+/// Deciding from one form alone lets a path parse in one mode and fail in the
+/// other, which breaks the contract that the two modes agree about whether a
+/// root is parseable at all.
+fn leads_with_reconstructed_root(
     body: &str,
     absolute: bool,
     preserve_parents: bool,
-    already_resolved: &'a [String],
-) -> Option<std::borrow::Cow<'a, str>> {
-    if preserve_parents {
-        normalize_components(body, true, absolute, false)
-            .0
-            .into_iter()
-            .next()
-            .map(std::borrow::Cow::Owned)
-    } else {
-        already_resolved
-            .first()
-            .map(|component| std::borrow::Cow::Borrowed(component.as_str()))
+    already: &[String],
+    hazard: fn(&str) -> bool,
+) -> bool {
+    if already.first().is_some_and(|component| hazard(component)) {
+        return true;
     }
+    // Without a parent token the two normalizations agree, so the list above
+    // was both of them.
+    if !body.contains("..") {
+        return false;
+    }
+    normalize_components(body, true, absolute, !preserve_parents)
+        .0
+        .first()
+        .is_some_and(|component| hazard(component))
+}
+
+/// `??` in the leading position, the shape the `\??\` object-manager root
+/// parses from once a `/` is rendered in front of it.
+fn is_object_manager_anchor(component: &str) -> bool {
+    component == "??"
 }
 
 /// `x:` in the leading position, the shape a Windows drive root parses from.
@@ -687,7 +710,10 @@ mod tests {
         // `a://b` is NOT one of these: it leads with a drive spelling, so it is
         // a drive path from the start. The hazard is a path that is not drive-
         // shaped until normalization resolves it into one.
-        for input in ["%./../a://b\n", "x/../c:/y", "./c:/y"] {
+        // `./C:/..` is the parent-preserving half of the same defect: it
+        // resolves to nothing, but the preserved form renders as `C:/..`, which
+        // re-parses as a drive root.
+        for input in ["%./../a://b\n", "x/../c:/y", "./c:/y", "./C:/.."] {
             assert_eq!(
                 LexicalPath::parse(input, PathDialect::Windows),
                 Err(LexicalPathError::InvalidDriveRoot),
