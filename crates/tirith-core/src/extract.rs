@@ -6474,8 +6474,11 @@ fn posix_body_calls_parent_function(
             return true;
         }
 
-        let (nested_bodies, nested_gap) =
-            lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+        let (nested_bodies, nested_gap) = lexical_executable_substitutions_bounded(
+            &segment.raw,
+            ShellType::Posix,
+            remaining_bodies,
+        );
         if nested_gap.is_some() && !function_names.is_empty() {
             return true;
         }
@@ -7202,9 +7205,31 @@ fn posix_reserved_time_word_at(
         })
 }
 
+/// Arm a fresh dispatch-scan budget for a top-level scan.
 fn lexical_executable_substitutions(
     raw: &str,
     shell: ShellType,
+) -> (Vec<String>, Option<ShellExecutionGap>) {
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    lexical_executable_substitutions_bounded(raw, shell, &mut remaining_bodies)
+}
+
+/// As above, drawing from a caller-owned budget.
+///
+/// This scan and `posix_body_calls_parent_function` call each other, and each
+/// used to arm its own counter, so every nesting level paid the full budget
+/// again and the total cost doubled per level. A line of unmatched `(`
+/// characters therefore took the Web3 parser exponential — 8 of them cost 73ms
+/// and 20 cost 266s, and the `web3_command` fuzz target found it as an OOM.
+/// Threading one budget through the cycle makes the total linear in it.
+///
+/// Exhaustion is fail-closed at every consumer: the scans answer "this body may
+/// reach the parent's dispatch state", and running out returns that answer, so a
+/// tighter effective budget can only widen the reported gap, never narrow it.
+fn lexical_executable_substitutions_bounded(
+    raw: &str,
+    shell: ShellType,
+    remaining_bodies: &mut usize,
 ) -> (Vec<String>, Option<ShellExecutionGap>) {
     let bytes = raw.as_bytes();
     let mut bodies = Vec::new();
@@ -7672,10 +7697,9 @@ fn lexical_executable_substitutions(
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
-        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
         if invoked_function_needs_context
             || bodies.iter().any(|body| {
-                posix_body_calls_parent_function(body, &function_names, 0, &mut remaining_bodies)
+                posix_body_calls_parent_function(body, &function_names, 0, remaining_bodies)
             })
             || function_body_indices.iter().any(|index| {
                 bodies
@@ -15198,5 +15222,42 @@ mod tests {
                 "finalize must report the wedged terminal for {introducer:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_scan_budget_tests {
+    use super::{lexical_executable_substitutions, ShellExecutionGap, ShellType};
+
+    /// The scan and `posix_body_calls_parent_function` call each other. While
+    /// each re-armed its own budget, every nesting level paid the full budget
+    /// again and the cost doubled per level: 8 unmatched `(` characters cost
+    /// 73ms and 20 cost 266s, which the `web3_command` fuzz target found as an
+    /// out-of-memory. One shared budget makes it flat.
+    #[test]
+    fn a_deep_unmatched_group_run_does_not_blow_up() {
+        let deep = format!(
+            "{}cast send 0x111a-keysre .-/vallet.json --rpc-urlscales://rpc.example\n",
+            "(".repeat(49)
+        );
+        let started = std::time::Instant::now();
+        let _ = lexical_executable_substitutions(&deep, ShellType::Posix);
+        let elapsed = started.elapsed();
+        // Generous next to the old curve, which could not finish this input at
+        // all, and still far below anything an exponential could reach.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "nested-group scan took {elapsed:?}; the shared budget is not holding"
+        );
+    }
+
+    /// Exhausting the budget must not quietly turn into "nothing to see": the
+    /// scans answer "this body may reach the parent's dispatch state", so
+    /// running out has to keep reporting the gap.
+    #[test]
+    fn an_ordinary_dispatch_body_is_still_reported() {
+        let (_, gap) =
+            lexical_executable_substitutions("f() { alias ls=rm; }; f", ShellType::Posix);
+        assert_eq!(gap, Some(ShellExecutionGap::AmbiguousExecutableBody));
     }
 }
