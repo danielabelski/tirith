@@ -183,15 +183,89 @@ pub(crate) fn analyze_task_coverage(
             && parsed.coverage_complete
             && parsed.result.completeness.is_complete()
             && !expected.is_empty()
-            && expected == modelled,
+            && expected == modelled
+            && every_occurrence_is_modelled(&parsed.occurrences),
         parse: parsed.result,
     }
+}
+
+/// Require every occurrence to be modelled, per occurrence rather than per
+/// identity.
+///
+/// Set equality between the two identity sets is not sufficient on its own.
+/// `modelled` is built from a subset of the same occurrences as `expected`, so
+/// it is always a subset, and equality therefore only proves that each identity
+/// has AT LEAST ONE modelled occurrence. Two occurrences that produce an equal
+/// `SegmentIdentity` collapse to a single element, so an unmodelled occurrence
+/// sitting beside a modelled twin leaves both sets equal and coverage reads
+/// complete — the exact fail-open the module header rules out.
+fn every_occurrence_is_modelled(occurrences: &[super::parse::ParserCoverageOccurrence]) -> bool {
+    !occurrences.is_empty()
+        && occurrences
+            .iter()
+            .all(|occurrence| occurrence.is_modelled())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// Two occurrences with an identical `SegmentIdentity`, one modelled and
+    /// one not, collapse to a single element in both identity sets, so set
+    /// equality alone reports complete coverage while an unmodelled occurrence
+    /// exists. Coverage has to be decided per occurrence.
+    #[test]
+    fn an_unmodelled_twin_cannot_hide_behind_an_equal_identity() {
+        use super::super::parse::{
+            ParserControlBranch, ParserCoverageDisposition, ParserCoverageGap,
+            ParserCoverageOccurrence,
+        };
+
+        let occurrence = |disposition| ParserCoverageOccurrence {
+            frame_digest: [7u8; 32],
+            byte_start: 0,
+            byte_end: 4,
+            nested_path: Vec::new(),
+            incoming_separator: None,
+            outgoing_separator: None,
+            control_owner_index: None,
+            control_branch: ParserControlBranch::None,
+            shell: ShellType::Posix,
+            disposition,
+        };
+        let modelled_twin = occurrence(ParserCoverageDisposition::ModelledFacts);
+        let unmodelled_twin = occurrence(ParserCoverageDisposition::Unmodelled(
+            ParserCoverageGap::UnsupportedCommand,
+        ));
+
+        let context = trusted();
+        assert_eq!(
+            segment_identity(&modelled_twin, &context),
+            segment_identity(&unmodelled_twin, &context),
+            "the twins must share an identity for this to be the case under test"
+        );
+
+        // The old set comparison: both sets hold the one shared identity.
+        let occurrences = vec![modelled_twin, unmodelled_twin];
+        let expected = occurrences
+            .iter()
+            .map(|o| segment_identity(o, &context))
+            .collect::<BTreeSet<_>>();
+        let modelled = occurrences
+            .iter()
+            .filter(|o| o.is_modelled())
+            .map(|o| segment_identity(o, &context))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected, modelled, "set equality is exactly the fail-open");
+
+        assert!(
+            !every_occurrence_is_modelled(&occurrences),
+            "an unmodelled occurrence must keep coverage incomplete"
+        );
+        assert!(every_occurrence_is_modelled(&occurrences[..1]));
+        assert!(!every_occurrence_is_modelled(&[]));
+    }
 
     fn trusted() -> TaskAnalysisContext {
         TaskAnalysisContext::trusted(ShellType::Posix, Some(Path::new("/repo")), Some("policy-a"))
