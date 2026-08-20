@@ -7318,6 +7318,34 @@ fn update_allow_unsigned_and_rollback_conflict() {
     );
 }
 
+/// Run a binary this test just wrote, retrying `ETXTBSY`.
+///
+/// `fs::copy` closes its own descriptors before returning, but any sibling test
+/// thread that forks between that open and close inherits the write end, and
+/// Linux refuses to exec a file another process still holds open for writing.
+/// `cargo test` always has sibling threads spawning children, so this is a
+/// scheduling race against the harness rather than anything about the binary.
+#[cfg(unix)]
+fn run_freshly_written_binary(command: &mut Command) -> std::process::Output {
+    // ETXTBSY. Matched by number rather than `ErrorKind::ExecutableFileBusy`
+    // so this does not depend on that variant's stabilization at the MSRV.
+    const ETXTBSY: i32 = 26;
+    let mut last = String::new();
+    for attempt in 0..64u32 {
+        match command.output() {
+            Ok(output) => return output,
+            Err(error) if error.raw_os_error() == Some(ETXTBSY) => {
+                last = error.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(
+                    20 * u64::from(attempt.min(5) + 1),
+                ));
+            }
+            Err(error) => panic!("failed to run the staged tirith binary: {error}"),
+        }
+    }
+    panic!("the staged tirith binary stayed busy for the whole retry budget: {last}");
+}
+
 /// End-to-end rollback of a SELF-MANAGED install, with no network: a tirith binary placed under a
 /// `.local/bin` path (so it self-detects as self-managed) plus a `.tirith-previous` backup is
 /// rolled back, and the live binary's bytes become the backup's bytes. This exercises the real
@@ -7344,11 +7372,11 @@ fn update_rollback_self_managed_restores_previous_binary() {
     let sentinel = b"PREVIOUS-TIRITH-BINARY-SENTINEL";
     fs::write(&backup, sentinel).unwrap();
 
-    let out = Command::new(&live)
-        .args(["update", "--rollback", "--yes", "--format", "json"])
-        .env_remove("TIRITH")
-        .output()
-        .expect("failed to run the staged tirith binary");
+    let out = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["update", "--rollback", "--yes", "--format", "json"])
+            .env_remove("TIRITH"),
+    );
 
     assert_eq!(
         out.status.code(),
@@ -7393,11 +7421,11 @@ fn update_rollback_self_managed_without_backup_fails_cleanly() {
     fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
     let original_len = fs::metadata(&live).unwrap().len();
 
-    let out = Command::new(&live)
-        .args(["update", "--rollback", "--yes"])
-        .env_remove("TIRITH")
-        .output()
-        .expect("failed to run the staged tirith binary");
+    let out = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["update", "--rollback", "--yes"])
+            .env_remove("TIRITH"),
+    );
 
     assert_eq!(
         out.status.code(),
@@ -7436,11 +7464,11 @@ fn update_rollback_dry_run_changes_nothing() {
     let backup = bin_dir.join("tirith.tirith-previous");
     fs::write(&backup, b"BACKUP-BYTES").unwrap();
 
-    let out = Command::new(&live)
-        .args(["update", "--rollback", "--dry-run"])
-        .env_remove("TIRITH")
-        .output()
-        .expect("failed to run the staged tirith binary");
+    let out = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["update", "--rollback", "--dry-run"])
+            .env_remove("TIRITH"),
+    );
 
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
