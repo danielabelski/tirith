@@ -2079,6 +2079,17 @@ mod tests {
     fn registry_redirect_fixture_is_path_keyed_and_ignores_ambient_proxy() {
         use crate::ssrf_guard::test_support::{http_response, EnvironmentRestore, ProxyTrap};
 
+        // Take the process-global environment lock BEFORE starting the
+        // fixture. `PathKeyedRegistryServer::start` begins a five-second
+        // aggregate deadline at construction, and blocking on that lock under
+        // parallel contention can burn it before the first request is even
+        // made, which surfaces as a `fixture.finish()` panic that says nothing
+        // about redirect handling.
+        let mut restore = EnvironmentRestore::new();
+        restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+        let proxy = ProxyTrap::start();
+        restore.install_ambient_proxy(&proxy.url());
+
         let fixture = PathKeyedRegistryServer::start(
             vec![
                 (
@@ -2097,10 +2108,6 @@ mod tests {
         // fixture returns the `/final` response regardless of accept order.
         let early_final = direct_fixture_get(fixture.address(), "/final");
         assert!(early_final.starts_with(b"HTTP/1.1 200 OK\r\n"));
-        let proxy = ProxyTrap::start();
-        let mut restore = EnvironmentRestore::new();
-        restore.set("TIRITH_ALLOW_HTTP", Some("1"));
-        restore.install_ambient_proxy(&proxy.url());
         let address = fixture.address();
         let url = format!(
             "http://registry-public.example.test:{}/package",
