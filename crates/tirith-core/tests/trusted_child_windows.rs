@@ -348,6 +348,19 @@ fn system_shell_executable() -> Option<TrustedExecutable> {
     }
 }
 
+/// `cmd /c mkdir <path>` as the observable side effect, deliberately not a
+/// redirect. `cmd.exe` parses its own command line rather than following CRT
+/// argument rules, so an argument carrying `>` and embedded quotes gets escaped
+/// by Rust in a way `cmd` does not undo — that spelling ran but exited non-zero
+/// on the runner. Passing the path as its own argument leaves the quoting to
+/// Rust and the interpretation to `cmd`.
+fn marker_spec(marker: &std::path::Path, timeout: Duration) -> ChildSpec {
+    helper_spec(
+        &["/c", "mkdir", marker.to_str().expect("utf8 marker path")],
+        ChildLimits::new(timeout, 4096, 4096),
+    )
+}
+
 #[test]
 fn windows_supervisor_refuses_overflowing_deadline_before_child_code_executes() {
     let Some(executable) = system_shell_executable() else {
@@ -355,16 +368,7 @@ fn windows_supervisor_refuses_overflowing_deadline_before_child_code_executes() 
     };
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("overflow-child-ran");
-    let spec = helper_spec(
-        &[
-            "/c",
-            "echo spawned>\"%TIRITH_TRUSTED_CHILD_WINDOWS_MARKER%\"",
-        ],
-        ChildLimits::new(Duration::MAX, 4096, 4096),
-    )
-    .env("TIRITH_TRUSTED_CHILD_WINDOWS_MARKER", marker.as_os_str());
-
-    match run(&executable, &spec) {
+    match run(&executable, &marker_spec(&marker, Duration::MAX)) {
         ChildOutcome::SpawnError(reason) => {
             assert!(reason.contains("timeout deadline exceeds"), "{reason}");
         }
@@ -383,17 +387,13 @@ fn windows_supervisor_runs_with_a_representable_deadline() {
     };
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("normal-child-ran");
-    let spec = helper_spec(
-        &[
-            "/c",
-            "echo spawned>\"%TIRITH_TRUSTED_CHILD_WINDOWS_MARKER%\"",
-        ],
-        ChildLimits::new(Duration::from_secs(10), 4096, 4096),
-    )
-    .env("TIRITH_TRUSTED_CHILD_WINDOWS_MARKER", marker.as_os_str());
-
-    match run(&executable, &spec) {
-        ChildOutcome::Completed { status, .. } => assert!(status.success()),
+    // The control keeps the refusal test honest: the same spec under a
+    // representable deadline must actually create the marker, or the negative
+    // assertion would hold for a command that could never run at all.
+    match run(&executable, &marker_spec(&marker, Duration::from_secs(10))) {
+        ChildOutcome::Completed { status, .. } => {
+            assert!(status.success(), "control child failed: {status:?}");
+        }
         other => panic!("representable deadline was not executed normally: {other:?}"),
     }
     assert!(
