@@ -78,6 +78,7 @@ pub enum LexicalPathError {
     InvalidUncRoot,
     InvalidVerbatimRoot,
     InvalidDeviceRoot,
+    InvalidDriveRoot,
 }
 
 impl fmt::Display for LexicalPathError {
@@ -88,6 +89,7 @@ impl fmt::Display for LexicalPathError {
             Self::InvalidUncRoot => "UNC server/share root is invalid",
             Self::InvalidVerbatimRoot => "verbatim Windows root is invalid",
             Self::InvalidDeviceRoot => "Windows device root is invalid",
+            Self::InvalidDriveRoot => "relative Windows path leads with a drive-shaped component",
         })
     }
 }
@@ -412,17 +414,9 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
         // parse retains the tokens that cancel earlier names, so reading its own
         // component list would let `/a/../??/x` parse in one mode and fail in
         // the other, and the two modes have to agree about that.
-        let leads_with_object_manager = if preserve_parents {
-            normalize_components(stripped, true, true, false)
-                .0
-                .first()
-                .is_some_and(|component| component == "??")
-        } else {
-            components
-                .first()
-                .is_some_and(|component| component == "??")
-        };
-        if leads_with_object_manager {
+        if resolved_leading_component(stripped, true, preserve_parents, &components)
+            .is_some_and(|leading| leading == "??")
+        {
             return Err(LexicalPathError::InvalidDeviceRoot);
         }
         return Ok(LexicalPath {
@@ -436,6 +430,17 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
     }
 
     let (components, parent_state) = normalize_components(slashed, true, false, preserve_parents);
+    // A relative path renders as its components alone, so a leading `x:`
+    // component re-parses as a drive root and the class flips from Relative to
+    // DriveAbsolute/DriveRelative. `:` is reserved in Windows filenames, so such
+    // a component names a drive or an alternate data stream, never a file that
+    // could exist under this name. Same reasoning, and the same resolved-form
+    // decision, as the object-manager case above.
+    if resolved_leading_component(slashed, false, preserve_parents, &components)
+        .is_some_and(|leading| is_drive_prefixed(&leading))
+    {
+        return Err(LexicalPathError::InvalidDriveRoot);
+    }
     Ok(LexicalPath {
         dialect: PathDialect::Windows,
         root_class: RootClass::Relative,
@@ -444,6 +449,35 @@ fn parse_windows(input: &str, preserve_parents: bool) -> Result<LexicalPath, Lex
         parent_state,
         parents_preserved: preserve_parents,
     })
+}
+
+/// Leading component of the RESOLVED normalization, which is the form rendering
+/// emits. A parent-preserving parse keeps the tokens that cancel earlier names,
+/// so it has to re-resolve rather than read its own component list: otherwise
+/// the two parse modes disagree about whether a path parses at all.
+fn resolved_leading_component<'a>(
+    body: &str,
+    absolute: bool,
+    preserve_parents: bool,
+    already_resolved: &'a [String],
+) -> Option<std::borrow::Cow<'a, str>> {
+    if preserve_parents {
+        normalize_components(body, true, absolute, false)
+            .0
+            .into_iter()
+            .next()
+            .map(std::borrow::Cow::Owned)
+    } else {
+        already_resolved
+            .first()
+            .map(|component| std::borrow::Cow::Borrowed(component.as_str()))
+    }
+}
+
+/// `x:` in the leading position, the shape a Windows drive root parses from.
+fn is_drive_prefixed(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn parse_verbatim(rest: &str, preserve_parents: bool) -> Result<LexicalPath, LexicalPathError> {
@@ -647,6 +681,30 @@ mod tests {
         let nested = parsed("/dir/??/x", PathDialect::Windows);
         assert_eq!(nested.root_class(), RootClass::RootedNoDrive);
         assert_eq!(nested.to_slash_string(), "/dir/??/x");
+
+        // A relative path whose resolved leading component is drive-shaped
+        // renders as `a:/b`, which re-parses as a drive root. Same refusal.
+        // `a://b` is NOT one of these: it leads with a drive spelling, so it is
+        // a drive path from the start. The hazard is a path that is not drive-
+        // shaped until normalization resolves it into one.
+        for input in ["%./../a://b\n", "x/../c:/y", "./c:/y"] {
+            assert_eq!(
+                LexicalPath::parse(input, PathDialect::Windows),
+                Err(LexicalPathError::InvalidDriveRoot),
+                "{input}"
+            );
+            assert_eq!(
+                LexicalPath::parse_preserving_parents(input, PathDialect::Windows),
+                Err(LexicalPathError::InvalidDriveRoot),
+                "{input} (parent-preserving)"
+            );
+        }
+
+        // A drive-shaped component away from the leading position is ordinary:
+        // the rendering keeps a real root in front of it.
+        let nested_drive = parsed("dir/c:/y", PathDialect::Windows);
+        assert_eq!(nested_drive.root_class(), RootClass::Relative);
+        assert_eq!(nested_drive.to_slash_string(), "dir/c:/y");
 
         // A rooted path that is not a namespace prefix keeps its class.
         let rooted = parsed("/./rooted", PathDialect::Windows);
