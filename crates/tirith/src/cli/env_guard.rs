@@ -238,7 +238,11 @@ pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> s
     let mut out = String::new();
     let mut replaced = false;
     for line in existing.lines() {
-        if line.trim_start().starts_with("env_guard_enabled:") {
+        // Top-level only. An indented `env_guard_enabled:` is nested under some
+        // other key and means nothing, so rewriting it at column zero would
+        // corrupt the document AND set `replaced`, suppressing the real
+        // top-level append. Same rule `hooks.rs` and `exec.rs` already apply.
+        if line.starts_with("env_guard_enabled:") {
             out.push_str(&new_line);
             out.push('\n');
             replaced = true;
@@ -255,6 +259,12 @@ pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> s
         out.push('\n');
     }
 
+    // Verify BEFORE publishing, as `hooks.rs` and `exec.rs` do: the candidate
+    // must parse and its effective top-level `env_guard_enabled` must equal the
+    // requested value. Without it the operator is told the guard is ON while
+    // later loads fall back to the base policy with the guard disabled.
+    verify_guard_key_effective(&out, "env_guard_enabled", enable)?;
+
     // Atomic publish (temp + fsync + rename) through the retained parent
     // capability: a crash or full disk leaves the previous policy intact.
     super::write_prepared_config_file_permitted(
@@ -266,6 +276,27 @@ pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> s
         &policy,
         true,
     )
+}
+
+/// Parse the candidate policy and require the top-level `key` to equal
+/// `expected`. Guards against lookalike-key corruption and against pre-existing
+/// invalid YAML silently defeating the toggle.
+fn verify_guard_key_effective(candidate: &str, key: &str, expected: bool) -> std::io::Result<()> {
+    // An empty file parses as `Value::Null`; treat it as an empty mapping.
+    let parsed: serde_yaml::Value = serde_yaml::from_str(candidate).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("resulting policy would not parse as YAML: {e}"),
+        )
+    })?;
+    if parsed.get(key).and_then(serde_yaml::Value::as_bool) == Some(expected) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("resulting policy does not have the requested top-level {key} value"),
+        ))
+    }
 }
 
 /// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
@@ -566,6 +597,43 @@ mod tests {
         assert_eq!(body["value_comparison_complete"], false);
         assert_eq!(body["value_comparison_unavailable_count"], 1);
         assert_eq!(body["changes"][0]["delta"], "value_comparison_unavailable");
+    }
+
+    #[test]
+    fn an_indented_lookalike_key_is_not_rewritten_and_does_not_suppress_the_append() {
+        // `env_guard_enabled:` nested under another key means nothing. Matching
+        // it with `trim_start()` rewrote it at column zero, which corrupted the
+        // document and marked the key as already replaced, so the real
+        // top-level line was never appended and the guard silently stayed off.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &path,
+            "nested:\n  env_guard_enabled: false
+",
+        )
+        .unwrap();
+
+        update_policy_guard_key(&path, true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("  env_guard_enabled: false"),
+            "the nested key must be left exactly as it was: {content}"
+        );
+        assert!(
+            content
+                .lines()
+                .any(|line| line == "env_guard_enabled: true"),
+            "the real top-level key must still be appended: {content}"
+        );
+
+        // And the published document must actually mean what the operator was
+        // told, which is what the pre-publish verification exists to enforce.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed.get("env_guard_enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
