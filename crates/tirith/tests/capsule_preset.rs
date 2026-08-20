@@ -608,8 +608,8 @@ fn a_capable_host_denies_the_sensitive_roots_and_the_inherited_environment() {
     // says which one leaked if this ever regresses.
     let probe = format!(
         "[ -z \"${{GITHUB_TOKEN:-}}\" ] || exit 9; \
-         cat {project}/README.md >/dev/null 2>&1 && exit 10; \
-         ls {home}/.ssh >/dev/null 2>&1 && exit 11; \
+         cat \"{project}/README.md\" >/dev/null 2>&1 && exit 10; \
+         ls \"{home}/.ssh\" >/dev/null 2>&1 && exit 11; \
          exit 0",
         project = fixture.project.display(),
         home = home.display(),
