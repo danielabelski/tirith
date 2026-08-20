@@ -416,18 +416,27 @@ async fn upload_to_r2(
     let upload = bucket
         .put_object(Some(&credentials), &key)
         .sign(Duration::from_secs(300));
-    match client.put(upload).body(data).send().await {
+    let database_uploaded = match client.put(upload).body(data).send().await {
         Ok(response) if response.status().is_success() => {
             info!(key = %key, "backup uploaded to R2");
+            true
         }
         Ok(response) => {
             error!(status = %response.status(), "R2 upload returned error");
+            false
         }
         Err(_) => {
             // reqwest errors can retain the presigned bearer URL. Never render
             // them into durable logs.
             error!("R2 upload request failed");
+            false
         }
+    };
+
+    // A `.sha256` object with no `.db` beside it is not a partial success: a
+    // restore or verification job reads a digest it cannot resolve.
+    if !database_uploaded {
+        return;
     }
 
     let checksum_path = format!("{backup_path}.sha256");
