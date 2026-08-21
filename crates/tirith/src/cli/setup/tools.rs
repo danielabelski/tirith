@@ -4113,7 +4113,8 @@ mod tests {
                 "guard at $PI_CODING_AGENT_DIR/extensions/"
             );
             let content = std::fs::read_to_string(&guard_path).unwrap();
-            assert!(content.contains(&opts.tirith_bin));
+            let encoded_bin = serde_json::to_string(&opts.tirith_bin).unwrap();
+            assert!(content.contains(&format!("const TIRITH_BIN = {encoded_bin};")));
             assert!(!content.contains("__TIRITH_BIN__"));
             assert!(!content.contains("process.env.TIRITH_BIN"));
         });
@@ -4354,7 +4355,10 @@ mod tests {
             .unwrap();
             let error = setup_omp(&mcp_opts(Scope::User)).unwrap_err();
             assert!(error.contains("PI_CONFIG_DIR"), "{error}");
-            assert!(error.contains("profiles/work/.env"), "{error}");
+            assert!(
+                error.replace('\\', "/").contains("profiles/work/.env"),
+                "{error}"
+            );
             assert!(!home.join("relocated-by-profile").exists());
         });
     }
@@ -4456,7 +4460,10 @@ mod tests {
 
             let error = setup_omp(&mcp_opts(Scope::User)).unwrap_err();
             assert!(error.contains("OMP_PROFILE"), "{error}");
-            assert!(error.contains(".omp/agent/.env"), "{error}");
+            assert!(
+                error.replace('\\', "/").contains(".omp/agent/.env"),
+                "{error}"
+            );
             assert!(!home.join(".omp/agent/mcp.json").exists());
             assert!(!home.join(".omp/profiles/work/agent/mcp.json").exists());
         });
@@ -4748,7 +4755,10 @@ mod tests {
             .unwrap();
 
             let error = setup_opencode(&mcp_opts(Scope::Project)).unwrap_err();
-            assert!(error.contains(".opencode/opencode.json"), "{error}");
+            assert!(
+                error.replace('\\', "/").contains(".opencode/opencode.json"),
+                "{error}"
+            );
             assert!(error.contains("loaded after"), "{error}");
             assert_eq!(std::fs::read_to_string(target).unwrap(), target_raw);
         });
@@ -4771,7 +4781,12 @@ mod tests {
             let opts = mcp_opts(Scope::User);
 
             let error = setup_opencode(&opts).unwrap_err();
-            assert!(error.contains(".opencode/opencode.jsonc"), "{error}");
+            assert!(
+                error
+                    .replace('\\', "/")
+                    .contains(".opencode/opencode.jsonc"),
+                "{error}"
+            );
             assert!(!xdg.join("opencode/opencode.jsonc").exists());
 
             let desired = json!({
