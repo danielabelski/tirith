@@ -1171,17 +1171,31 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
             {
                 use std::ffi::OsStr;
                 if helper_restore.is_some() {
-                    let _ = run_as_root(
-                        "/bin/rm",
-                        &[OsStr::new("-f"), OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP)],
-                    );
-                    let _ = run_as_root(
-                        "/bin/rm",
-                        &[
-                            OsStr::new("-f"),
-                            OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
-                        ],
-                    );
+                    // These two markers describe what the helper looked like
+                    // BEFORE this rollback. Leaving one behind silently makes the
+                    // next rollback reason from stale state -- a stray
+                    // "previously absent" marker in particular tells it to delete
+                    // a helper the user legitimately has. Cleanup is still
+                    // best-effort (the rollback itself already succeeded, so this
+                    // must not turn into a failure), but it no longer happens
+                    // invisibly.
+                    for (marker, description) in [
+                        (PACKAGE_APPROVAL_HELPER_BACKUP, "helper backup"),
+                        (
+                            PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT,
+                            "helper previously-absent marker",
+                        ),
+                    ] {
+                        if let Err(e) =
+                            run_as_root("/bin/rm", &[OsStr::new("-f"), OsStr::new(marker)])
+                        {
+                            eprintln!(
+                                "tirith: warning: rolled back successfully but could not remove \
+                                 the stale {description} at {marker} ({e}); delete it manually -- \
+                                 a future rollback would otherwise act on out-of-date state"
+                            );
+                        }
+                    }
                 }
             }
             // Remove the now-stale backup (no longer "the previous version").
@@ -1214,7 +1228,13 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
             {
                 use std::ffi::OsStr;
                 if let Some(helper_restore) = helper_restore {
-                    let _ = run_as_root(
+                    // Same class as the marker cleanup above, and worse: this is
+                    // the compensating restore on the FAILED-rollback path. If it
+                    // also fails the system is left with neither the new helper
+                    // nor the old one, and the error we are about to report says
+                    // nothing about that. Still best-effort -- the rollback error
+                    // stays the primary result -- but it gets reported.
+                    if let Err(e) = run_as_root(
                         "/usr/bin/install",
                         &[
                             OsStr::new("-m"),
@@ -1222,7 +1242,13 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
                             helper_restore.path().as_os_str(),
                             OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
                         ],
-                    );
+                    ) {
+                        eprintln!(
+                            "tirith: warning: rollback failed AND the package-approval helper \
+                             could not be restored to {PACKAGE_APPROVAL_HELPER_PATH} ({e}); the \
+                             helper may now be missing -- reinstall before relying on it"
+                        );
+                    }
                 }
             }
             emit_update_error(json, &format!("rollback failed: {e}"));
@@ -1664,6 +1690,31 @@ fn cosign_program() -> Option<PathBuf> {
 /// `--no-same-owner`, and the produced path is canonicalized and asserted to lie
 /// INSIDE `extract_dir`, so an escaping symlink member is rejected here rather
 /// than hashed/installed.
+/// Root-managed system binary directories searched for `tar`, mirroring
+/// `TRUSTED_ZSH_SEARCH_DIRS`. Global root-owned locations only: no per-user
+/// profile, because a same-UID writer must not be able to choose the archiver
+/// that unpacks a release during self-update.
+#[cfg(unix)]
+const TRUSTED_TAR_SEARCH_DIRS: [&str; 4] = [
+    "/bin",
+    "/usr/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
+/// Note the privileged installer below still calls `/usr/bin/tar` (alongside
+/// `/usr/bin/install` and `/usr/bin/sha256sum`) through `run_as_root`. That is a
+/// separate, fully hardcoded helper set executed as root, where provenance is
+/// resolved under a different UID than this check runs as; it is deliberately
+/// left alone rather than half-converted here.
+#[cfg(unix)]
+fn resolve_trusted_tar() -> Result<tirith_core::trusted_child::TrustedExecutable, String> {
+    let search_path = std::env::join_paths(TRUSTED_TAR_SEARCH_DIRS)
+        .map_err(|error| format!("could not construct trusted tar search path: {error}"))?;
+    tirith_core::trusted_child::resolve_system_helper_on_path("tar", &search_path)
+        .map_err(|error| format!("trusted system tar not found: {error}"))
+}
+
 fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result<PathBuf, String> {
     let extract_dir = workdir.join("extracted");
     std::fs::create_dir_all(&extract_dir).map_err(|e| format!("create extract dir: {e}"))?;
@@ -1691,10 +1742,21 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
     } else {
         // `.tar.gz` via `tar`. `--no-same-owner` keeps extracted files owned by
         // the current user regardless of the archived uid/gid (matters as root).
+        // Resolve `tar` from a FIXED list of root-managed system directories
+        // instead of the single hardcoded `/usr/bin/tar`. Pinning one absolute
+        // path kept ambient PATH out of the self-update flow, which is the
+        // property worth keeping, but it also made self-update fail outright on
+        // any layout that ships tar elsewhere (/bin/tar, NixOS) -- and the
+        // update mechanism is the one thing you cannot fix remotely once it is
+        // broken. Searching a fixed list still keeps PATH out of it, and
+        // `resolve_system_helper_on_path` additionally applies the shared
+        // system-helper provenance policy that a bare path string never did.
         #[cfg(unix)]
-        let tar = "/usr/bin/tar";
+        let trusted_tar = resolve_trusted_tar()?;
+        #[cfg(unix)]
+        let tar = trusted_tar.path();
         #[cfg(not(unix))]
-        let tar = "tar";
+        let tar = std::path::Path::new("tar");
         let status = std::process::Command::new(tar)
             .arg("--no-same-owner")
             .arg("-xzf")
@@ -1912,7 +1974,18 @@ fn install_package_approval_helper_for_update(
         Ok::<(), String>(())
     })();
     if let Err(error) = preserve_result {
-        let _ = run_as_root("/bin/rm", &[OsStr::new("-rf"), transaction_dir.as_os_str()]);
+        // Best-effort: `error` is the result the caller acts on. But this is a
+        // root-owned directory, so say something rather than leaving it to be
+        // discovered later.
+        if let Err(cleanup) =
+            run_as_root("/bin/rm", &[OsStr::new("-rf"), transaction_dir.as_os_str()])
+        {
+            eprintln!(
+                "tirith: warning: could not remove the root-owned transaction directory {} \
+                 ({cleanup}); remove it manually",
+                transaction_dir.display()
+            );
+        }
         return Err(error);
     }
 
@@ -2340,6 +2413,30 @@ fn describe_status(status: &VerificationStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The archiver used by self-update must never be selectable by a same-UID
+    /// writer, so the search list stays fixed to global root-managed directories
+    /// and deliberately excludes per-user profiles. This mirrors the equivalent
+    /// guard on the trusted-zsh search path.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_tar_search_is_fixed_to_global_root_managed_directories() {
+        assert_eq!(
+            TRUSTED_TAR_SEARCH_DIRS,
+            [
+                "/bin",
+                "/usr/bin",
+                "/run/current-system/sw/bin",
+                "/nix/var/nix/profiles/default/bin",
+            ]
+        );
+        assert!(TRUSTED_TAR_SEARCH_DIRS.iter().all(|path| {
+            path.starts_with('/')
+                && !path.contains("per-user")
+                && !path.contains(".nix-profile")
+                && !path.contains("$HOME")
+        }));
+    }
 
     #[test]
     fn selfupdate_rejects_unsafe_initial_destinations() {

@@ -179,24 +179,35 @@ run_root() {
 }
 
 install_package_approval_helper() {
+  # Every failure in here must RETURN non-zero, never call `err`. `err` exits
+  # the script outright, which skips the caller's
+  # `restore_package_approval_helper` on the failure branch and leaves the
+  # machine with the new helper half-installed and the old one not put back.
   helper_archive="$1"
   helper_archive_sha256="$2"
   helper_dir="/usr/local/libexec"
   helper_dest="${helper_dir}/tirith-package-approval-authority"
   if [ ! -x /usr/bin/install ]; then
-    err "x86_64 Linux install requires the fixed /usr/bin/install utility"
+    printf 'error: %s\n' "x86_64 Linux install requires the fixed /usr/bin/install utility" >&2
+    return 1
   fi
   if [ ! -x /usr/bin/tar ] || [ ! -x /usr/bin/sha256sum ] || [ ! -x /usr/bin/mktemp ]; then
-    err "x86_64 Linux install requires fixed /usr/bin tar, sha256sum, and mktemp utilities"
+    printf 'error: %s\n' "x86_64 Linux install requires fixed /usr/bin tar, sha256sum, and mktemp utilities" >&2
+    return 1
   fi
   if [ "$(id -u)" -ne 0 ] && [ ! -x /usr/bin/sudo ]; then
-    err "x86_64 Linux install requires /usr/bin/sudo to install the root-owned approval helper"
+    printf 'error: %s\n' "x86_64 Linux install requires /usr/bin/sudo to install the root-owned approval helper" >&2
+    return 1
   fi
   case "$helper_archive_sha256" in
-    ""|*[!0-9a-f]*) err "verified release archive has an invalid SHA-256" ;;
+    ""|*[!0-9a-f]*)
+      printf 'error: %s\n' "verified release archive has an invalid SHA-256" >&2
+      return 1
+      ;;
   esac
   if [ "${#helper_archive_sha256}" -ne 64 ]; then
-    err "verified release archive has an invalid SHA-256"
+    printf 'error: %s\n' "verified release archive has an invalid SHA-256" >&2
+    return 1
   fi
 
   # Never promote an executable directly from the caller-owned extraction tree.
@@ -208,20 +219,23 @@ install_package_approval_helper() {
   root_local_check="$(run_root /usr/bin/find /usr/local -maxdepth 0 -type d -uid 0 ! -perm /022 -print)" \
     || return 1
   if [ "$root_local_check" != "/usr/local" ]; then
-    err "/usr/local is not a root-owned, non-writable directory; refusing privileged helper installation"
+    printf 'error: %s\n' "/usr/local is not a root-owned, non-writable directory; refusing privileged helper installation" >&2
+    return 1
   fi
   if [ -e "$helper_dir" ] || [ -L "$helper_dir" ]; then
     root_helper_dir_check="$(run_root /usr/bin/find "$helper_dir" -maxdepth 0 -type d -uid 0 ! -perm /022 -print)" \
       || return 1
     if [ "$root_helper_dir_check" != "$helper_dir" ]; then
-      err "$helper_dir is not a root-owned, non-writable directory; refusing privileged helper installation"
+      printf 'error: %s\n' "$helper_dir is not a root-owned, non-writable directory; refusing privileged helper installation" >&2
+      return 1
     fi
   fi
   run_root /usr/bin/install -d -m 755 "$helper_dir" || return 1
   root_helper_dir_check="$(run_root /usr/bin/find "$helper_dir" -maxdepth 0 -type d -uid 0 ! -perm /022 -print)" \
     || return 1
   if [ "$root_helper_dir_check" != "$helper_dir" ]; then
-    err "$helper_dir did not resolve to a protected root-owned directory"
+    printf 'error: %s\n' "$helper_dir did not resolve to a protected root-owned directory" >&2
+    return 1
   fi
   helper_stage="$(run_root /usr/bin/mktemp -d "${helper_dir}/.tirith-helper-stage.XXXXXX")" \
     || return 1
