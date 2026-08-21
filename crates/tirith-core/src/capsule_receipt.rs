@@ -761,9 +761,16 @@ fn is_absolute_host_path(token: &str) -> bool {
         return true;
     }
     let bytes = token.as_bytes();
-    // `C:\...` and `\\server\share`, so a Windows refusal receipt is covered by
-    // the same rule as a unix one.
-    (bytes[0].is_ascii_alphabetic() && bytes.get(1) == Some(&b':') && bytes.get(2) == Some(&b'\\'))
+    // `C:\...`, `C:/...` and `\\server\share`, so a Windows refusal receipt is
+    // covered by the same rule as a unix one. Both separators are accepted after
+    // the drive letter: `C:/x` is a fully valid absolute Windows path and is the
+    // spelling essentially every cross-platform producer writes (Rust, Node,
+    // Git, anything emitting JSON), so matching only the backslash form let a
+    // host path walk straight through a detector whose entire job is keeping it
+    // out of the receipt. A bare `C:` stays excluded: it is drive-RELATIVE.
+    (bytes[0].is_ascii_alphabetic()
+        && bytes.get(1) == Some(&b':')
+        && matches!(bytes.get(2), Some(&b'\\') | Some(&b'/')))
         || token.starts_with("\\\\")
 }
 
@@ -1065,6 +1072,24 @@ mod tests {
             redact_host_paths("open grant C:\\Users\\dev\\.ssh failed"),
             format!("open grant {REDACTED_PATH_MARKER} failed")
         );
+        // Forward-slash spelling of the same absolute Windows path. This is what
+        // any cross-platform producer writes, and it used to sail through the
+        // detector and put the operator's home layout into a shareable receipt.
+        assert_eq!(
+            redact_host_paths("open grant C:/Users/dev/.ssh failed"),
+            format!("open grant {REDACTED_PATH_MARKER} failed")
+        );
+        assert_eq!(
+            redact_host_paths("quoted \'D:/keys/id_ed25519\' denied"),
+            format!("quoted \'{REDACTED_PATH_MARKER}\' denied")
+        );
+        // UNC, both spellings.
+        assert_eq!(
+            redact_host_paths("share \\\\server\\secrets failed"),
+            format!("share {REDACTED_PATH_MARKER} failed")
+        );
+        // A bare drive letter is drive-RELATIVE, not a location, so it is prose.
+        assert_eq!(redact_host_paths("drive C: is full"), "drive C: is full");
         assert_eq!(
             redact_host_paths("read/write ratio is 3/4 and a / separates them"),
             "read/write ratio is 3/4 and a / separates them"

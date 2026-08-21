@@ -132,7 +132,16 @@ impl SriDigest {
         // separated by whitespace. Take the first that parses so a trailing
         // unknown algorithm cannot erase a usable one.
         for entry in value.split_ascii_whitespace() {
-            let (algorithm, digest) = entry.split_once('-')?;
+            let Some((algorithm, digest)) = entry.split_once('-') else {
+                // Skip, do not abandon. Every other malformed shape in this loop
+                // `continue`s; only this one used `?`, which returned None for
+                // the WHOLE value. Since the loop exists precisely so "a trailing
+                // unknown algorithm cannot erase a usable one", a single
+                // separator-less token in an attacker-influenced `integrity`
+                // field ("garbage sha512-<valid>") switched provenance
+                // comparison off wholesale instead of failing that one entry.
+                continue;
+            };
             let algorithm = algorithm.to_ascii_lowercase();
             if !matches!(algorithm.as_str(), "sha256" | "sha384" | "sha512") {
                 continue;
@@ -358,6 +367,24 @@ mod tests {
         // A leading unknown algorithm must not erase the usable entry.
         let multi = SriDigest::parse("md5-zzz sha512-abcdef").expect("second entry parses");
         assert_eq!(multi.algorithm, "sha512");
+
+        // Nor may a leading token with no separator at all. This one used to
+        // abandon the whole value, so an attacker-influenced `integrity` field
+        // could switch provenance comparison off just by prefixing a junk word.
+        for value in [
+            "garbage sha512-abcdef",
+            "  sha512-abcdef",
+            "!!! ??? sha512-abcdef",
+            "sha512 sha512-abcdef",
+        ] {
+            let recovered = SriDigest::parse(value)
+                .unwrap_or_else(|| panic!("a usable entry must survive: {value}"));
+            assert_eq!(recovered.canonical(), "sha512-abcdef", "{value}");
+        }
+
+        // Skipping must not become coercion: with nothing usable it is still None.
+        assert!(SriDigest::parse("garbage nonsense").is_none());
+        assert!(SriDigest::parse("garbage md5-zzz").is_none());
     }
 
     #[test]

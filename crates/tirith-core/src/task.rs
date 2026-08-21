@@ -654,6 +654,7 @@ pub fn infer_effects_detailed_with_context(
             // Web3 parser above. Falling back to POSIX here would analyze a
             // trusted PowerShell or Cmd boundary under the wrong grammar.
             let mut npm_package_operation = false;
+            let mut npm_unmodelled_behaviour = false;
             for shell in shells {
                 let segments = crate::tokenize::tokenize(command, *shell);
                 for segment in &segments {
@@ -661,29 +662,46 @@ pub fn infer_effects_detailed_with_context(
                     else {
                         continue;
                     };
-                    if matches!(
-                        invocation.operation,
+                    // Matched exhaustively, with no `_` arm, so a new
+                    // `NpmOperation` variant has to be classified here rather
+                    // than silently inheriting "fully modelled".
+                    match invocation.operation {
                         crate::npm_command::NpmOperation::Install
-                            | crate::npm_command::NpmOperation::Exec
-                    ) {
-                        effects.insert(CommandEffectKind::PackageInstall);
-                        effects.insert(CommandEffectKind::NetworkEgress);
-                        effects.insert(CommandEffectKind::FilesystemWrite);
-                        // Same durable state as `ProposedAction::PackageInstall`
-                        // below: an install leaves executable material and
-                        // approval state behind, and `npx <pkg>` writes the
-                        // fetched package into the package cache before running
-                        // it. Omitting it here would let the shell spelling pass
-                        // a policy that denies PersistenceChange for the
-                        // structured spelling of the same operation.
-                        effects.insert(CommandEffectKind::PersistenceChange);
-                        npm_package_operation = true;
+                        | crate::npm_command::NpmOperation::Exec => {
+                            effects.insert(CommandEffectKind::PackageInstall);
+                            effects.insert(CommandEffectKind::NetworkEgress);
+                            effects.insert(CommandEffectKind::FilesystemWrite);
+                            // Same durable state as `ProposedAction::PackageInstall`
+                            // below: an install leaves executable material and
+                            // approval state behind, and `npx <pkg>` writes the
+                            // fetched package into the package cache before running
+                            // it. Omitting it here would let the shell spelling pass
+                            // a policy that denies PersistenceChange for the
+                            // structured spelling of the same operation.
+                            effects.insert(CommandEffectKind::PersistenceChange);
+                            npm_package_operation = true;
+                        }
+                        // Recognized, but the behaviour is behind an indirection
+                        // this grammar does not follow: `LocalExec` runs an
+                        // already-installed binary it has not read, `RunScript`
+                        // resolves through a `package.json` it never opens, and
+                        // `Other` is unmodelled by definition. None of them can
+                        // contribute effects, which is exactly why none of them
+                        // may leave `complete` set -- claiming a complete
+                        // assessment for an operation whose target is unknown is
+                        // the same silent coverage claim as an unmodelled parser
+                        // occurrence reporting itself as modelled.
+                        crate::npm_command::NpmOperation::LocalExec
+                        | crate::npm_command::NpmOperation::RunScript
+                        | crate::npm_command::NpmOperation::Other => {
+                            npm_unmodelled_behaviour = true;
+                        }
                     }
                 }
             }
             // Even when the launcher is recognized, install lifecycle scripts
             // and fetched entrypoints remain unanalyzed.
-            complete &= !npm_package_operation;
+            complete &= !npm_package_operation && !npm_unmodelled_behaviour;
         }
         ProposedAction::PackageInstall { .. } => {
             effects.insert(CommandEffectKind::PackageInstall);
@@ -1210,6 +1228,29 @@ mod tests {
             assert!(
                 !other.effects.contains(&CommandEffectKind::PackageInstall),
                 "{command} names no package and fetches nothing"
+            );
+            // Contributing no effects is exactly why these must not claim a
+            // complete assessment. `npm run` resolves through a package.json
+            // this grammar never opens and `pnpm exec` runs a local binary it
+            // has never read, so "no effects found" is ignorance, not evidence.
+            // Leaving `complete` set let either of them assert it has no
+            // secret-read, persistence, or Web3 effect.
+            assert!(
+                !other.complete,
+                "{command} runs code behind an indirection this parser does not \
+                 follow, so it cannot claim a complete assessment"
+            );
+        }
+
+        // `Other` is a recognized launcher doing something unmodelled by
+        // definition, so it is the clearest case of all.
+        for command in ["npm doctor", "pnpm store prune", "yarn why left-pad"] {
+            let unmodelled = infer_effects_detailed(&ProposedAction::Shell {
+                command: command.into(),
+            });
+            assert!(
+                !unmodelled.complete,
+                "{command} is a recognized launcher doing something unmodelled"
             );
         }
 

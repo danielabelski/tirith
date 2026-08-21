@@ -425,14 +425,18 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
                         file_results.append(&mut result.file_results);
                     }
                     GuardedCandidateOutcome::RulePanic(gap) => {
-                        skipped_count += 1;
                         if is_workflow {
                             // A workflow that panicked mid-scan is a workflow the
                             // flow analysis never saw.
                             workflow_budget.complete = false;
                         }
-                        panic_files.push(logical_path);
-                        coverage_gaps.push(gap);
+                        record_panicked_subject(
+                            logical_path,
+                            gap,
+                            &mut panic_files,
+                            &mut skipped_count,
+                            &mut coverage_gaps,
+                        );
                     }
                 }
             }
@@ -461,6 +465,8 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         workflow_coverage_complete,
         &mut file_results,
         &mut coverage_gaps,
+        &mut panic_files,
+        &mut skipped_count,
     );
     diagnostics.drain_policy_diagnostics();
 
@@ -577,6 +583,27 @@ impl WorkflowBudget {
     }
 }
 
+/// Record one panicked subject everywhere a consumer looks for it.
+///
+/// A `Panicked` coverage gap is the typed, detailed form, but it is not the only
+/// form: `panic_files` is what the existing JSON shape exposes and
+/// `skipped_count` is the candidate-level counter, and a reader consulting
+/// either of those sees a clean scan if only the gap is recorded. Both panic
+/// sites (the per-candidate guard and the workflow post-pass) route through here
+/// so they cannot drift apart again -- they already had, which is the bug this
+/// exists to prevent.
+fn record_panicked_subject(
+    logical_path: PathBuf,
+    gap: CoverageGap,
+    panic_files: &mut Vec<PathBuf>,
+    skipped_count: &mut usize,
+    coverage_gaps: &mut Vec<CoverageGap>,
+) {
+    *skipped_count += 1;
+    panic_files.push(logical_path);
+    coverage_gaps.push(gap);
+}
+
 /// Run the C15 cross-workflow artifact-flow analysis over every modelled
 /// workflow and fold its output into the scan result.
 ///
@@ -595,6 +622,8 @@ fn run_workflow_artifact_post_pass(
     coverage_complete: bool,
     file_results: &mut Vec<FileScanResult>,
     coverage_gaps: &mut Vec<CoverageGap>,
+    panic_files: &mut Vec<PathBuf>,
+    skipped_count: &mut usize,
 ) {
     if models.is_empty() {
         return;
@@ -606,11 +635,17 @@ fn run_workflow_artifact_post_pass(
     let Some(flow) = catch_panic_scanning(&anchor, || {
         crate::rules::workflow_artifacts::analyze_repository(models, coverage_complete)
     }) else {
-        coverage_gaps.push(CoverageGap {
-            location: SubjectLocation::from_path(anchor),
+        // Goes through the same recorder as the per-candidate arm. This branch
+        // used to push the coverage gap ALONE, which left `panic_files` and
+        // `skipped_count` untouched -- and those are the fields the existing
+        // JSON shape and the downstream completeness checks actually read, so a
+        // panicked post-pass presented as a clean, complete scan.
+        let gap = CoverageGap {
+            location: SubjectLocation::from_path(anchor.clone()),
             kind: CoverageGapKind::Panicked,
             sha256: None,
-        });
+        };
+        record_panicked_subject(anchor, gap, panic_files, skipped_count, coverage_gaps);
         return;
     };
 
@@ -3307,6 +3342,55 @@ mod tests {
         let path = Path::new("dummy");
         let result = catch_panic_scanning(path, || 42_i32);
         assert_eq!(result, Some(42));
+    }
+
+    /// A panicked subject has to be visible to every consumer, not just the one
+    /// that reads the typed coverage gaps. The workflow post-pass used to push
+    /// the `Panicked` gap alone, leaving `panic_files` empty and `skipped_count`
+    /// unchanged -- and those two are what the JSON projection and the
+    /// completeness notes actually read, so the scan reported itself clean.
+    #[test]
+    fn recording_a_panicked_subject_updates_every_completeness_signal() {
+        let mut panic_files: Vec<PathBuf> = Vec::new();
+        let mut skipped_count = 0_usize;
+        let mut coverage_gaps: Vec<CoverageGap> = Vec::new();
+
+        let path = PathBuf::from("/repo/.github/workflows/release.yml");
+        let gap = CoverageGap {
+            location: SubjectLocation::from_path(path.clone()),
+            kind: CoverageGapKind::Panicked,
+            sha256: None,
+        };
+        record_panicked_subject(
+            path.clone(),
+            gap,
+            &mut panic_files,
+            &mut skipped_count,
+            &mut coverage_gaps,
+        );
+
+        assert_eq!(panic_files, vec![path], "the JSON-visible list");
+        assert_eq!(skipped_count, 1, "the candidate-level counter");
+        assert_eq!(coverage_gaps.len(), 1, "the typed gap");
+        assert_eq!(coverage_gaps[0].kind, CoverageGapKind::Panicked);
+
+        // Two panicked subjects count twice; nothing here dedupes or saturates.
+        let second = PathBuf::from("/repo/.github/workflows/ci.yml");
+        let gap = CoverageGap {
+            location: SubjectLocation::from_path(second.clone()),
+            kind: CoverageGapKind::Panicked,
+            sha256: None,
+        };
+        record_panicked_subject(
+            second,
+            gap,
+            &mut panic_files,
+            &mut skipped_count,
+            &mut coverage_gaps,
+        );
+        assert_eq!(panic_files.len(), 2);
+        assert_eq!(skipped_count, 2);
+        assert_eq!(coverage_gaps.len(), 2);
     }
 
     /// Serializes tests that mutate the global panic hook so concurrent swaps
