@@ -1119,23 +1119,47 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
             );
             return 1;
         }
-        let current = match tempfile::Builder::new()
-            .prefix("tirith-helper-rollback-")
-            .tempfile()
-        {
-            Ok(file) => file,
+        // Stage inside a root-owned 0700 directory, not the system temp dir.
+        // The preserved path is handed to `run_as_root("/usr/bin/install", ...)`
+        // further down, so root re-opens it BY NAME. In a world-writable /tmp
+        // that name is one an unprivileged process can race, and the file being
+        // installed is the binary that authorises package installs, so the
+        // failure mode is as bad as it gets. `install_package_approval_helper_for_update`
+        // already solves this; this mirrors it rather than inventing a variant.
+        let transaction_dir = match stage_helper_rollback_dir() {
+            Ok(dir) => dir,
             Err(error) => {
                 emit_update_error(json, &format!("could not stage helper rollback: {error}"));
                 return 1;
             }
         };
-        if let Err(error) = std::fs::copy(PACKAGE_APPROVAL_HELPER_PATH, current.path()) {
-            emit_update_error(
-                json,
-                &format!("could not preserve the current helper: {error}"),
-            );
-            return 1;
-        }
+        // Only preserve a helper that is actually there. The guard above admits
+        // this block when merely the backup or the previously-absent marker
+        // exists, and copying an absent live helper made `fs::copy` return
+        // NotFound and aborted the entire binary rollback with "could not
+        // preserve the current helper" for a wholly unrelated reason.
+        let preserved = if Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file() {
+            let staged = transaction_dir.join("live-before");
+            if let Err(error) = run_as_root(
+                "/usr/bin/install",
+                &[
+                    OsStr::new("-m"),
+                    OsStr::new("700"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
+                    staged.as_os_str(),
+                ],
+            ) {
+                let _ = remove_helper_rollback_dir(&transaction_dir);
+                emit_update_error(
+                    json,
+                    &format!("could not preserve the current helper: {error}"),
+                );
+                return 1;
+            }
+            Some(staged)
+        } else {
+            None
+        };
         let helper_result = if had_previous {
             run_as_root(
                 "/usr/bin/install",
@@ -1153,10 +1177,14 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
             )
         };
         if let Err(error) = helper_result {
+            let _ = remove_helper_rollback_dir(&transaction_dir);
             emit_update_error(json, &format!("helper rollback failed: {error}"));
             return 1;
         }
-        Some(current)
+        Some(HelperRollbackPreserve {
+            transaction_dir,
+            preserved,
+        })
     } else {
         None
     };
@@ -1197,6 +1225,15 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
                         }
                     }
                 }
+                if let Some(helper_restore) = helper_restore.as_ref() {
+                    if let Err(e) = remove_helper_rollback_dir(&helper_restore.transaction_dir) {
+                        eprintln!(
+                            "tirith: warning: rolled back successfully but could not remove the \
+                             root-owned helper rollback directory {} ({e}); remove it manually",
+                            helper_restore.transaction_dir.display()
+                        );
+                    }
+                }
             }
             // Remove the now-stale backup (no longer "the previous version").
             // A leftover `.tirith-previous` identical to the live binary would
@@ -1234,19 +1271,32 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
                     // nor the old one, and the error we are about to report says
                     // nothing about that. Still best-effort -- the rollback error
                     // stays the primary result -- but it gets reported.
-                    if let Err(e) = run_as_root(
-                        "/usr/bin/install",
-                        &[
-                            OsStr::new("-m"),
-                            OsStr::new("755"),
-                            helper_restore.path().as_os_str(),
-                            OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
-                        ],
-                    ) {
+                    //
+                    // Only reinstall what was actually captured. When the live
+                    // helper was absent there is nothing to put back, and trying
+                    // would install a path that was never written.
+                    if let Some(preserved) = helper_restore.preserved.as_deref() {
+                        if let Err(e) = run_as_root(
+                            "/usr/bin/install",
+                            &[
+                                OsStr::new("-m"),
+                                OsStr::new("755"),
+                                preserved.as_os_str(),
+                                OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
+                            ],
+                        ) {
+                            eprintln!(
+                                "tirith: warning: rollback failed AND the package-approval helper \
+                                 could not be restored to {PACKAGE_APPROVAL_HELPER_PATH} ({e}); the \
+                                 helper may now be missing -- reinstall before relying on it"
+                            );
+                        }
+                    }
+                    if let Err(e) = remove_helper_rollback_dir(&helper_restore.transaction_dir) {
                         eprintln!(
-                            "tirith: warning: rollback failed AND the package-approval helper \
-                             could not be restored to {PACKAGE_APPROVAL_HELPER_PATH} ({e}); the \
-                             helper may now be missing -- reinstall before relying on it"
+                            "tirith: warning: could not remove the root-owned helper rollback \
+                             directory {} ({e}); remove it manually",
+                            helper_restore.transaction_dir.display()
                         );
                     }
                 }
@@ -1893,6 +1943,67 @@ fn run_as_root_output(
     } else {
         Err("privileged package-approval helper installer failed".to_string())
     }
+}
+
+/// What the paired helper rollback preserved, and where.
+///
+/// The preserved copy lives in a root-owned `0700` directory rather than the
+/// system temp dir, because the path is later handed to a privileged
+/// `/usr/bin/install` that re-opens it by name.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct HelperRollbackPreserve {
+    transaction_dir: PathBuf,
+    /// `None` when there was no live helper to preserve. The caller enters the
+    /// preserve block when merely the backup or the previously-absent marker
+    /// exists, so "nothing captured" is a normal outcome, not a failure.
+    preserved: Option<PathBuf>,
+}
+
+/// Create the root-owned `0700` staging directory for a paired helper rollback.
+/// Same discipline as [`install_package_approval_helper_for_update`]: validate
+/// the admin hierarchy first, so root never creates anything beneath a path an
+/// unprivileged writer controls.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn stage_helper_rollback_dir() -> Result<PathBuf, String> {
+    use std::ffi::OsStr;
+
+    super::package_approval_authority_native::validate_admin_hierarchy(Path::new("/usr/local"), 0)
+        .map_err(|error| error.to_string())?;
+    run_as_root(
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("755"),
+            OsStr::new("/usr/local/libexec"),
+        ],
+    )?;
+    super::package_approval_authority_native::validate_admin_hierarchy(
+        Path::new("/usr/local/libexec"),
+        0,
+    )
+    .map_err(|error| error.to_string())?;
+    let directory = PathBuf::from(format!(
+        "/usr/local/libexec/.tirith-helper-rollback-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    run_as_root(
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("700"),
+            directory.as_os_str(),
+        ],
+    )?;
+    Ok(directory)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn remove_helper_rollback_dir(directory: &Path) -> Result<(), String> {
+    use std::ffi::OsStr;
+
+    run_as_root("/bin/rm", &[OsStr::new("-rf"), directory.as_os_str()])
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
