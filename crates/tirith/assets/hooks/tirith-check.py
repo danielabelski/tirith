@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Claude Code PreToolUse hook — runs tirith check on Bash tool calls.
+"""Claude Code / Grok Build PreToolUse hook for shell tool calls.
 
-Reads JSON from stdin (Claude Code hook protocol), extracts the command,
-and delegates to `tirith check --json` for security analysis.
+Reads JSON from stdin, extracts the command, and delegates to
+`tirith check --json` for security analysis. Claude Code is the default wire
+format; setup sets TIRITH_HOOK_PROTOCOL=grok-build for Grok's documented
+camelCase event and decision format.
 
 Exit codes:
   0 — hook completed successfully (decision in stdout JSON)
@@ -19,6 +21,7 @@ Output (stdout):
 
 Environment:
   TIRITH_BIN              — path to tirith binary (default: "tirith")
+  TIRITH_HOOK_PROTOCOL    — "claude-code" (default) or "grok-build"
   TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny"
 """
 
@@ -37,20 +40,34 @@ def get(data, *keys):
     return None
 
 
-def deny(reason):
-    """Print a deny decision using hookSpecificOutput and exit 0."""
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
+def protocol():
+    """Return the setup-selected host protocol."""
+    return os.environ.get("TIRITH_HOOK_PROTOCOL", "claude-code").lower()
+
+
+def decision(action, reason=None):
+    """Print one host-native PreToolUse decision and exit successfully."""
+    if protocol() == "grok-build":
+        output = {"decision": action}
+        if action == "deny" and reason:
+            output["reason"] = reason
+    else:
+        specific = {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": action,
+        }
+        if reason:
+            specific["permissionDecisionReason"] = reason
+            if action == "allow":
+                specific["additionalContext"] = reason
+        output = {"hookSpecificOutput": specific}
+    print(json.dumps(output))
     sys.exit(0)
+
+
+def deny(reason):
+    """Print a deny decision and exit 0 so the host parses stdout."""
+    decision("deny", reason)
 
 
 def fail_action():
@@ -75,7 +92,7 @@ def _hook_event(event, detail=None):
             tirith_bin,
             "hook-event",
             "--integration",
-            "claude-code",
+            protocol(),
             "--hook-type",
             "pre_tool_use",
             "--event",
@@ -131,8 +148,17 @@ def main():
     tool = get(data, "tool_name", "toolName")
     tool_input = get(data, "tool_input", "toolInput") or {}
 
-    # Only intercept PreToolUse + Bash
-    if event != "PreToolUse" or tool != "Bash":
+    # Grok's native envelope uses pre_tool_use/run_terminal_command while its
+    # Claude-compatible matcher is named PreToolUse/Bash. Accept both only
+    # when setup explicitly selected the Grok protocol.
+    if protocol() == "grok-build":
+        is_shell_pretool = event in ("pre_tool_use", "PreToolUse") and tool in (
+            "run_terminal_command",
+            "Bash",
+        )
+    else:
+        is_shell_pretool = event == "PreToolUse" and tool == "Bash"
+    if not is_shell_pretool:
         sys.exit(0)
 
     if not isinstance(tool_input, dict):
@@ -148,7 +174,7 @@ def main():
     tirith_bin = os.environ.get("TIRITH_BIN") or shutil.which("tirith") or "tirith"
 
     env = os.environ.copy()
-    env["TIRITH_INTEGRATION"] = "claude-code"
+    env["TIRITH_INTEGRATION"] = protocol()
 
     try:
         result = subprocess.run(
@@ -206,19 +232,7 @@ def main():
         if warn_action != "deny":
             _hook_event("warn_allowed")
             warning_text = _build_warning_text(result.stdout)
-            print(
-                json.dumps(
-                    {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "allow",
-                            "permissionDecisionReason": warning_text,
-                            "additionalContext": warning_text,
-                        }
-                    }
-                )
-            )
-            sys.exit(0)
+            decision("allow", warning_text)
 
     # Exit 1 = block, Exit 2 + deny = block
     if result.returncode == 1:
@@ -236,16 +250,5 @@ if __name__ == "__main__":
         # Fail-closed on unexpected errors (respects TIRITH_FAIL_OPEN)
         if os.environ.get("TIRITH_FAIL_OPEN") == "1":
             sys.exit(0)
-        # Deny — print structured output so Claude Code shows a message
-        print(
-            json.dumps(
-                {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": "tirith: unexpected hook error — blocked for safety",
-                    }
-                }
-            )
-        )
-        sys.exit(0)
+        # Deny with the selected host's structured output.
+        deny("tirith: unexpected hook error — blocked for safety")

@@ -162,7 +162,9 @@ impl ResponseViolation {
             | "blob_too_large"
             | "blob_undecodable"
             | "mime_spoof"
-            | "sanitized_key_collision" => self.code,
+            | "sanitized_key_collision"
+            | "cross_leaf_secret"
+            | "analysis_budget_exceeded" => self.code,
             _ => "response_policy_violation",
         };
         let detail = match code {
@@ -177,6 +179,10 @@ impl ResponseViolation {
             "mime_spoof" => "resource blob signature conflicts with declared MIME category",
             "sanitized_key_collision" => {
                 "distinct response keys collide after control sanitization"
+            }
+            "cross_leaf_secret" => "supported secret spans structured response leaves",
+            "analysis_budget_exceeded" => {
+                "structured response exceeded the bounded analysis budget"
             }
             _ => "upstream response violated policy",
         };
@@ -262,7 +268,8 @@ impl InspectOutcome {
 /// Inspect a listing/reading response `result` for the given [`ResponseKind`].
 ///
 /// * Streams every string leaf through the engine output analyzer (custom seeds
-///   from `ctx`), folding the verdict's action/findings into the outcome.
+///   from `ctx`), folding the verdict's action/findings into the outcome;
+///   excessive structural complexity becomes a blocking `AnalysisIncomplete`.
 /// * Walks the kind-appropriate URI fields and screens each through the
 ///   canonical outbound URL policy under one bounded response-wide DNS
 ///   deadline. Duplicate host/port pairs share a cached result.
@@ -2029,6 +2036,23 @@ mod tests {
                 assert!(!rendered.contains(canary), "{rendered}");
             }
             assert!(rendered.contains("response_policy_violation"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn structural_sanitization_failure_codes_remain_categorical() {
+        for code in [
+            "sanitized_key_collision",
+            "cross_leaf_secret",
+            "analysis_budget_exceeded",
+        ] {
+            let violation = ResponseViolation {
+                code,
+                detail: "PRIVATE_KEY=attacker-controlled".to_string(),
+            };
+            let rendered = serde_json::to_string(&violation).unwrap();
+            assert!(rendered.contains(code), "{rendered}");
+            assert!(!rendered.contains("attacker-controlled"), "{rendered}");
         }
     }
 

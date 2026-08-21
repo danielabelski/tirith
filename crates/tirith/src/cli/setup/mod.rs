@@ -35,13 +35,22 @@ mod run_impl {
     /// All tools recognized by `tirith setup`.
     const KNOWN_TOOLS: &[&str] = &[
         "claude-code",
+        "cline",
         "codex",
         "copilot-cli",
+        "continue",
         "cursor",
+        "fx",
         "gemini-cli",
+        "grok-build",
         "kiro",
+        "omp",
         "openclaw",
+        "opencode",
+        "openhands",
         "pi-cli",
+        "prime-agent",
+        "roo-code",
         "vscode",
         "windsurf",
     ];
@@ -138,9 +147,43 @@ mod run_impl {
 
         let tirith_bin = resolve_tirith_bin(dry_run)?;
 
-        // Most hook scripts are Python; codex/pi-cli/openclaw are not.
-        if tool != "codex" && tool != "pi-cli" && tool != "openclaw" {
+        // Most hook scripts are Python. MCP-only integrations and the native
+        // TypeScript integrations do not need Python.
+        let python_free = matches!(
+            tool,
+            "codex"
+                | "cline"
+                | "continue"
+                | "fx"
+                | "omp"
+                | "openclaw"
+                | "opencode"
+                | "openhands"
+                | "pi-cli"
+                | "prime-agent"
+                | "roo-code"
+        ) || (cfg!(not(unix)) && tool == "grok-build");
+        if !python_free {
             check_binary_on_path("python3", dry_run)?;
+        }
+
+        if install_zshenv
+            && matches!(
+                tool,
+                "cline"
+                    | "continue"
+                    | "fx"
+                    | "grok-build"
+                    | "omp"
+                    | "opencode"
+                    | "openhands"
+                    | "prime-agent"
+                    | "roo-code"
+            )
+        {
+            return Err(format!(
+                "--install-zshenv is not part of the {tool} integration; use Tirith's shell setup separately when you need a shell-level guard"
+            ));
         }
 
         if tool == "codex" {
@@ -166,13 +209,22 @@ mod run_impl {
 
         match tool {
             "claude-code" => setup_claude_code(&opts),
+            "cline" => setup_cline(&opts),
             "codex" => setup_codex(&opts),
             "copilot-cli" => setup_copilot_cli(&opts),
+            "continue" => setup_continue(&opts),
             "cursor" => setup_cursor(&opts),
             "gemini-cli" => setup_gemini_cli(&opts),
+            "grok-build" => setup_grok_build(&opts),
+            "fx" => setup_fx(&opts),
             "kiro" => setup_kiro(&opts),
+            "omp" => setup_omp(&opts),
             "openclaw" => setup_openclaw(&opts),
+            "opencode" => setup_opencode(&opts),
+            "openhands" => setup_openhands(&opts),
             "pi-cli" => setup_pi_cli(&opts),
+            "prime-agent" => setup_prime_agent(&opts),
+            "roo-code" => setup_roo_code(&opts),
             "vscode" => setup_vscode(&opts),
             "windsurf" => setup_windsurf(&opts),
             _ => Err(unknown_tool_error(tool)),
@@ -182,7 +234,14 @@ mod run_impl {
     /// Resolve scope for a given tool, applying defaults and validation.
     pub(super) fn resolve_scope(tool: &str, scope: Option<&str>) -> Result<Scope, String> {
         match tool {
-            "claude-code" | "cursor" | "gemini-cli" | "kiro" | "openclaw" | "pi-cli" => {
+            "claude-code"
+            | "cursor"
+            | "gemini-cli"
+            | "grok-build"
+            | "kiro"
+            | "openclaw"
+            | "opencode"
+            | "pi-cli" => {
                 match scope {
                     Some("project") | None => Ok(Scope::Project),
                     Some("user") => Ok(Scope::User),
@@ -214,6 +273,76 @@ mod run_impl {
                 Some("user") | None => Ok(Scope::User),
                 Some(other) => Err(format!(
                     "invalid scope '{other}' — expected 'user'\n  try: tirith setup codex --scope user"
+                )),
+            },
+            "cline" => match scope {
+                Some("project") => Err(
+                    "Cline's documented MCP registry is user-global — omit --scope or use --scope user"
+                        .into(),
+                ),
+                Some("user") | None => Ok(Scope::User),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup cline --scope user"
+                )),
+            },
+            "omp" => match scope {
+                Some("project") => Err(
+                    "OMP project MCP setup is deferred because OMP merges settings from multiple project providers that can suppress it — omit --scope or use --scope user"
+                        .into(),
+                ),
+                Some("user") | None => Ok(Scope::User),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup omp --scope user"
+                )),
+            },
+            "prime-agent" => match scope {
+                Some("project") => Err(
+                    "Prime Agent executes generic MCP servers from user settings only — omit --scope or use --scope user"
+                        .into(),
+                ),
+                Some("user") | None => Ok(Scope::User),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup prime-agent --scope user"
+                )),
+            },
+            "openhands" => match scope {
+                Some("project") => Err(
+                    "OpenHands CLI stores MCP servers in its user profile — omit --scope or use --scope user"
+                        .into(),
+                ),
+                Some("user") | None => Ok(Scope::User),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup openhands --scope user"
+                )),
+            },
+            "continue" => match scope {
+                Some("user") => Err(
+                    "Continue user config is shared YAML; Tirith safely owns only a workspace .continue/mcpServers block — omit --scope or use --scope project"
+                        .into(),
+                ),
+                Some("project") | None => Ok(Scope::Project),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'project'\n  try: tirith setup continue --scope project"
+                )),
+            },
+            "roo-code" => match scope {
+                Some("user") => Err(
+                    "Roo Code's global MCP path is editor-managed; Tirith safely writes the documented project .roo/mcp.json — omit --scope or use --scope project"
+                        .into(),
+                ),
+                Some("project") | None => Ok(Scope::Project),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'project'\n  try: tirith setup roo-code --scope project"
+                )),
+            },
+            "fx" => match scope {
+                Some("project") => Err(
+                    "Vercel Labs fx loads native MCP servers from its trusted user profile only — omit --scope or use --scope user"
+                        .into(),
+                ),
+                Some("user") | None => Ok(Scope::User),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup fx --scope user"
                 )),
             },
             "windsurf" => match scope {
@@ -625,6 +754,42 @@ mod run_impl {
         super::tools::setup_pi_cli(opts)
     }
 
+    fn setup_prime_agent(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_prime_agent(opts)
+    }
+
+    fn setup_cline(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_cline(opts)
+    }
+
+    fn setup_continue(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_continue(opts)
+    }
+
+    fn setup_grok_build(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_grok_build(opts)
+    }
+
+    fn setup_omp(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_omp(opts)
+    }
+
+    fn setup_opencode(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_opencode(opts)
+    }
+
+    fn setup_fx(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_fx(opts)
+    }
+
+    fn setup_openhands(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_openhands(opts)
+    }
+
+    fn setup_roo_code(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_roo_code(opts)
+    }
+
     fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
         super::tools::setup_windsurf(opts)
     }
@@ -960,6 +1125,26 @@ mod run_impl {
                 Scope::Project
             );
             assert_eq!(resolve_scope("kiro", Some("user")).unwrap(), Scope::User);
+        }
+
+        #[test]
+        fn resolve_scope_pins_mcp_only_clients_to_documented_trust_scope() {
+            for tool in ["prime-agent", "fx", "cline", "omp", "openhands"] {
+                assert_eq!(resolve_scope(tool, None).unwrap(), Scope::User, "{tool}");
+                assert!(resolve_scope(tool, Some("project")).is_err(), "{tool}");
+            }
+            for tool in ["continue", "roo-code"] {
+                assert_eq!(resolve_scope(tool, None).unwrap(), Scope::Project, "{tool}");
+                assert!(resolve_scope(tool, Some("user")).is_err(), "{tool}");
+            }
+            for tool in ["grok-build", "opencode"] {
+                assert_eq!(resolve_scope(tool, None).unwrap(), Scope::Project, "{tool}");
+                assert_eq!(
+                    resolve_scope(tool, Some("user")).unwrap(),
+                    Scope::User,
+                    "{tool}"
+                );
+            }
         }
     }
 }

@@ -32,6 +32,11 @@ case "$*" in
   *WARN_TOKEN*)   exit 2 ;;
   *BADRC_TOKEN*)  exit 99 ;;
 esac
+# Mirror the real CLI's clean-result text unless the shell hook's exported
+# suppression marker reached this child process (issue #175).
+if [[ "${{_TIRITH_HOOK:-0}}" != "1" && "${{_TIRITH_BASH_INTERNAL:-0}}" != "1" ]]; then
+  printf 'tirith: no issues\n'
+fi
 exit 0
 "#,
         log = shell_escape(log_path.to_string_lossy().as_ref()),
@@ -214,7 +219,7 @@ touch {sentinels}/ls_ran; sh -c 'touch {sentinels}/curl_ran' BLOCK_TOKEN-seq
 
 #[test]
 fn enforce_allows_clean_commands() {
-    let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
+    let (out, err, invocations, sentinel_dir) = run_with_sentinels(
         r#"
 echo clean_one && touch {sentinels}/one
 echo clean_two && touch {sentinels}/two
@@ -230,7 +235,334 @@ echo clean_two && touch {sentinels}/two
     // Tirith was called for each command.
     assert!(invocations.iter().any(|i| i.contains("clean_one")));
     assert!(invocations.iter().any(|i| i.contains("clean_two")));
+    assert!(
+        !out.contains("tirith: no issues") && !err.contains("tirith: no issues"),
+        "the hook marker must suppress clean-result spam; stdout={out:?}, stderr={err:?}"
+    );
     let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
+fn enforce_keeps_allowed_function_top_level_and_extdebug_lazy() {
+    let (stdout, stderr, invocations, _tmp) = run_with_sentinels(
+        r#"
+benign_fn() { printf 'FUNCTION_BODY_RAN\n'; }
+benign_fn
+printf 'PROT=%s STATUS=%s ENFORCE=%s OWNS=%s\n' \
+  "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" \
+  "$_TIRITH_PREEXEC_ENFORCE" "$_TIRITH_OWNS_EXTDEBUG" >&2
+if shopt -q extdebug; then printf 'EXTDEBUG=on\n' >&2; else printf 'EXTDEBUG=off\n' >&2; fi
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(
+        stdout.contains("FUNCTION_BODY_RAN"),
+        "an allowed function body must execute; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("PROT=blocks STATUS=blocks ENFORCE=1 OWNS=0")
+            && stderr.contains("EXTDEBUG=off"),
+        "allowed lines must leave lazy extdebug off without degrading: {stderr}"
+    );
+    assert!(
+        !stderr.contains("history no longer matches BASH_COMMAND")
+            && !stderr.contains("protection downgraded"),
+        "function internals must not be mistaken for typed lines: {stderr}"
+    );
+    let invocation_count = invocations
+        .iter()
+        .filter(|line| line.ends_with("-- benign_fn"))
+        .count();
+    assert_eq!(
+        invocation_count, 1,
+        "one typed function call must produce one decision, got {invocations:#?}"
+    );
+}
+
+#[test]
+fn enforce_blocks_malicious_function_line_before_body_runs() {
+    let (_stdout, stderr, invocations, sentinel_dir) = run_with_sentinels(
+        r#"
+malicious_fn() { touch {sentinels}/function_body_ran; }; malicious_fn BLOCK_TOKEN-function
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(
+        !sentinel_path(&sentinel_dir, "function_body_ran").exists(),
+        "the complete typed function line must be decided before its body runs; stderr={stderr:?}, invocations={invocations:#?}"
+    );
+    let matching_decisions = invocations
+        .iter()
+        .filter(|line| line.contains("malicious_fn") && line.contains("BLOCK_TOKEN-function"))
+        .count();
+    assert_eq!(
+        matching_decisions, 1,
+        "the fake checker must receive the complete typed function line exactly once: {invocations:#?}"
+    );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
+fn enforce_brackets_prompt_function_without_scanning_or_degrading_it() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+PROMPT_RUNS=0
+prompt_fn() {{ PROMPT_RUNS=$((PROMPT_RUNS + 1)); }}
+PROMPT_COMMAND=prompt_fn
+source '{hook}'
+printf 'PROMPT_RUNS=%s PROT=%s STATUS=%s ENFORCE=%s\n' \
+  "$PROMPT_RUNS" "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" \
+  "$_TIRITH_PREEXEC_ENFORCE" >&2
+"#
+    );
+    let (_stdout, stderr, invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(
+        stderr.contains("PROT=blocks STATUS=blocks ENFORCE=1"),
+        "PROMPT_COMMAND must leave enforcement active: {stderr}"
+    );
+    assert!(
+        !stderr.contains("history no longer matches BASH_COMMAND")
+            && !stderr.contains("protection downgraded"),
+        "prompt functions must not trigger history drift: {stderr}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|line| !line.ends_with("-- prompt_fn")),
+        "automatic prompt functions must not be scanned or receipted: {invocations:#?}"
+    );
+}
+
+#[test]
+fn prompt_owned_extdebug_degrades_before_the_next_user_command() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+ARM_EXTDEBUG=0
+prompt_fn() {{
+  if [[ "$ARM_EXTDEBUG" == "1" ]]; then shopt -s extdebug; fi
+  true
+}}
+PROMPT_COMMAND=prompt_fn
+source '{hook}'
+ARM_EXTDEBUG=1
+:
+printf 'PROT=%s STATUS=%s ENFORCE=%s OWNS=%s\n' \
+  "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" \
+  "$_TIRITH_PREEXEC_ENFORCE" "$_TIRITH_OWNS_EXTDEBUG" >&2
+if shopt -q extdebug; then printf 'PROMPT_OWNED_EXTDEBUG=on\n' >&2; else printf 'PROMPT_OWNED_EXTDEBUG=off\n' >&2; fi
+"#
+    );
+    let (_stdout, stderr, invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(
+        stderr.contains("extdebug became enabled by prompt code outside Tirith")
+            && stderr.contains("PROT=warn-only STATUS=degraded ENFORCE=0 OWNS=0")
+            && stderr.contains("PROMPT_OWNED_EXTDEBUG=on"),
+        "prompt-owned extdebug must be preserved and disable blocking before another user command: {stderr}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|line| !line.ends_with("-- prompt_fn")),
+        "the prompt function must never be scanned as typed input: {invocations:#?}"
+    );
+}
+
+#[test]
+fn prompt_string_guards_preserve_order_and_previous_status() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+PROMPT_ORDER=""
+PROMPT_AFTER_HOOK=0
+prompt_first() {{
+  local seen=$?
+  PROMPT_ORDER="${{PROMPT_ORDER}}1"
+  [[ "$PROMPT_AFTER_HOOK" == "1" ]] && printf 'FIRST_STATUS=%s\n' "$seen" >&2
+  return "$seen"
+}}
+prompt_second() {{ PROMPT_ORDER="${{PROMPT_ORDER}}2"; }}
+PROMPT_COMMAND='prompt_first;prompt_second'
+source '{hook}'
+PROMPT_AFTER_HOOK=1
+false
+printf 'PROMPT_ORDER_SUFFIX=%s\n' "${{PROMPT_ORDER:${{#PROMPT_ORDER}}-2}}" >&2
+"#
+    );
+    let (_stdout, stderr, _invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(
+        stderr.contains("FIRST_STATUS=1"),
+        "the first user PROMPT_COMMAND must see the typed command status: {stderr}"
+    );
+    assert!(
+        stderr.contains("PROMPT_ORDER_SUFFIX=12"),
+        "prompt command ordering must remain stable: {stderr}"
+    );
+}
+
+#[test]
+fn prompt_array_is_wrapped_only_when_bash_executes_every_element() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+prompt_first() {{ :; }}
+prompt_second() {{ :; }}
+PROMPT_COMMAND=(prompt_first prompt_second)
+source '{hook}'
+if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+  array_supported=1
+else
+  array_supported=0
+fi
+if [[ "${{PROMPT_COMMAND[1]:-}}" == "$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND" ]]; then bootstrap_ok=1; else bootstrap_ok=0; fi
+printf 'ARRAY_SUPPORTED=%s LEN=%s PC0=%s PC2=%s PC3=%s PC4=%s BOOTSTRAP=%s ENFORCE=%s GUARDS=%s\n' \
+  "$array_supported" "${{#PROMPT_COMMAND[@]}}" \
+  "${{PROMPT_COMMAND[0]:-}}" "${{PROMPT_COMMAND[2]:-}}" \
+  "${{PROMPT_COMMAND[3]:-}}" "${{PROMPT_COMMAND[4]:-}}" "$bootstrap_ok" \
+  "$_TIRITH_PREEXEC_ENFORCE" "$_TIRITH_PREEXEC_PROMPT_GUARDS" >&2
+[[ "$array_supported" == "0" ]] && printf 'UNSUPPORTED_PC1=%s\n' "${{PROMPT_COMMAND[1]:-}}" >&2
+"#
+    );
+    let (_stdout, stderr, _invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    if stderr.contains("ARRAY_SUPPORTED=1") {
+        assert!(
+            stderr.contains(
+                "LEN=5 PC0=_tirith_preexec_prompt_begin PC2=prompt_first PC3=prompt_second PC4=_tirith_preexec_prompt_end BOOTSTRAP=1 ENFORCE=1 GUARDS=1"
+            ),
+            "supported PROMPT_COMMAND arrays must retain order inside the guards: {stderr}"
+        );
+    } else {
+        assert!(
+            stderr.contains(
+                "ARRAY_SUPPORTED=0 LEN=2 PC0=prompt_first PC2= PC3= PC4= BOOTSTRAP=0 ENFORCE=0 GUARDS=0"
+            ) && stderr.contains("UNSUPPORTED_PC1=prompt_second")
+                && stderr.contains("PROMPT_COMMAND is readonly, associative, coercing, unsupported"),
+            "Bash without array PROMPT_COMMAND execution must preserve the array and refuse enforcement visibly: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn readonly_prompt_command_visibly_refuses_enforcement() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+USER_TRAP_COUNT=0
+trap 'USER_TRAP_COUNT=$((USER_TRAP_COUNT + 1)); true' DEBUG
+PROMPT_COMMAND=':'
+readonly PROMPT_COMMAND
+source '{hook}'
+USER_TRAP_COUNT=0
+echo after_refusal
+printf 'PROT=%s STATUS=%s ENFORCE=%s OWNS=%s\n' \
+  "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" \
+  "$_TIRITH_PREEXEC_ENFORCE" "$_TIRITH_OWNS_EXTDEBUG" >&2
+printf 'USER_TRAP_AFTER_REFUSAL=%s\n' "$USER_TRAP_COUNT" >&2
+trap -p DEBUG >&2
+"#
+    );
+    let (_stdout, stderr, _invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(
+        stderr.contains("PROMPT_COMMAND is readonly")
+            && stderr.contains("PROT=off STATUS=degraded ENFORCE=0 OWNS=0")
+            && stderr.contains("trap -- 'USER_TRAP_COUNT=$((USER_TRAP_COUNT + 1)); true' DEBUG"),
+        "unsafe prompt bracketing must fail visibly without replacing the user trap or touching extdebug: {stderr}"
+    );
+    let count = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("USER_TRAP_AFTER_REFUSAL="))
+        .next_back()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    assert!(
+        count >= 1,
+        "the preserved user DEBUG trap must still run: {stderr}"
+    );
+}
+
+#[test]
+fn removed_prompt_guards_degrade_but_functions_continue_without_prompt_scans() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+PROMPT_RUNS=0
+prompt_fn() {{ PROMPT_RUNS=$((PROMPT_RUNS + 1)); }}
+benign_after_degrade() {{ printf 'POST_DEGRADE_FUNCTION_RAN\n'; }}
+PROMPT_COMMAND=prompt_fn
+source '{hook}'
+PROMPT_COMMAND=prompt_fn
+benign_after_degrade
+printf 'POST_PROT=%s STATUS=%s ENFORCE=%s OWNS=%s\n' \
+  "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" \
+  "$_TIRITH_PREEXEC_ENFORCE" "$_TIRITH_OWNS_EXTDEBUG" >&2
+if shopt -q extdebug; then printf 'POST_EXTDEBUG=on\n' >&2; else printf 'POST_EXTDEBUG=off\n' >&2; fi
+"#
+    );
+    let (stdout, stderr, invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(stdout.contains("POST_DEGRADE_FUNCTION_RAN"));
+    assert!(
+        stderr.contains("PROMPT_COMMAND no longer contains Tirith's prompt-boundary guards")
+            && stderr.contains("POST_PROT=warn-only STATUS=degraded ENFORCE=0 OWNS=0")
+            && stderr.contains("POST_EXTDEBUG=off"),
+        "guard loss must degrade visibly, restore debugger state, and keep functions usable: {stderr}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|line| !line.ends_with("-- prompt_fn")),
+        "automatic prompt functions must not become warn-only scans after degradation: {invocations:#?}"
+    );
 }
 
 #[test]
@@ -257,6 +589,10 @@ fn unexpected_rc_blocks_then_degrades_session() {
         r#"
 echo BADRC_TOKEN-first && touch {sentinels}/badrc_ran
 echo post_degrade && touch {sentinels}/post_ran
+printf 'POST_PROT=%s STATUS=%s ENFORCE=%s OWNS=%s\n' \
+  "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" \
+  "$_TIRITH_PREEXEC_ENFORCE" "$_TIRITH_OWNS_EXTDEBUG" >&2
+if shopt -q extdebug; then printf 'POST_EXTDEBUG=on\n' >&2; else printf 'POST_EXTDEBUG=off\n' >&2; fi
 "#,
         &[
             ("TIRITH_BASH_MODE", "preexec"),
@@ -275,6 +611,11 @@ echo post_degrade && touch {sentinels}/post_ran
     assert!(
         stderr.contains("preexec enforcement failed unexpectedly"),
         "expected unexpected-rc banner on stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("POST_PROT=warn-only STATUS=degraded ENFORCE=0 OWNS=0")
+            && stderr.contains("POST_EXTDEBUG=off"),
+        "the first post-degrade prompt must release Tirith-owned extdebug: {stderr}"
     );
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
@@ -436,10 +777,13 @@ fn debug_trap_chains_user_trap() {
     let (_out, stderr, _inv, _tmp) = run_with_sentinels(
         r#"
 USER_TRAP_COUNT=0
-trap 'USER_TRAP_COUNT=$((USER_TRAP_COUNT + 1))' DEBUG
+trap 'USER_TRAP_COUNT=$((USER_TRAP_COUNT + 1)); if [[ "$BASH_COMMAND" == *"trap -p DEBUG"* ]]; then printf "CAPTURE_NOISE\n"; fi; true' DEBUG
 # Re-source hook AFTER the user's DEBUG trap so we verify the wrap path.
 unset _TIRITH_BASH_LOADED
 source '__HOOK__'
+# Discard every fire caused by re-sourcing itself. Only post-install commands
+# count, so a clobbered (rather than chained) user trap cannot pass vacuously.
+USER_TRAP_COUNT=0
 echo chain_test_one
 echo chain_test_two
 printf 'USER_TRAP_COUNT=%s\n' "$USER_TRAP_COUNT" >&2
@@ -490,7 +834,10 @@ fn extdebug_left_alone_when_user_enabled_it_first() {
             r#"
 shopt -s extdebug
 source '{hook}'
-printf 'OWNS=%s\n' "$_TIRITH_OWNS_EXTDEBUG" >&2
+printf 'OWNS=%s PROT=%s STATUS=%s ENFORCE=%s\n' \
+  "$_TIRITH_OWNS_EXTDEBUG" "$TIRITH_BASH_EFFECTIVE_PROTECTION" \
+  "$TIRITH_STATUS" "$_TIRITH_PREEXEC_ENFORCE" >&2
+if shopt -q extdebug; then printf 'EXTDEBUG=on\n' >&2; else printf 'EXTDEBUG=off\n' >&2; fi
             "#
         )
         .as_str(),
@@ -500,8 +847,10 @@ printf 'OWNS=%s\n' "$_TIRITH_OWNS_EXTDEBUG" >&2
         ],
     );
     assert!(
-        stderr.contains("OWNS=0"),
-        "tirith must not claim ownership of user-enabled extdebug, got: {stderr}"
+        stderr.contains("OWNS=0 PROT=off STATUS=degraded ENFORCE=0")
+            && stderr.contains("EXTDEBUG=on")
+            && stderr.contains("extdebug is already user-enabled"),
+        "tirith must preserve user extdebug and refuse interception visibly, got: {stderr}"
     );
 }
 

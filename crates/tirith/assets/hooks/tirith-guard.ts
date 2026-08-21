@@ -8,17 +8,17 @@
 // not surface stderr to the user.
 //
 // Environment:
-//   TIRITH_BIN              — path to tirith binary (default: "tirith")
 //   TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny"
 //   TIRITH_FAIL_OPEN        — "1" to allow on error (default: deny)
 
 import { execFile, execFileSync } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+const TIRITH_BIN = "__TIRITH_BIN__";
+
 function hookEvent(event: string, detail?: string) {
   try {
-    const tirithBin = process.env.TIRITH_BIN || "tirith";
-    execFile(tirithBin, [
+    execFile(TIRITH_BIN, [
       "hook-event", "--integration", "pi-cli",
       "--hook-type", "tool_call", "--event", event,
       ...(detail ? ["--detail", detail] : []),
@@ -33,11 +33,9 @@ export default function (pi: ExtensionAPI) {
     const command = event.input?.command as string | undefined;
     if (typeof command !== "string" || !command.trim()) return undefined;
 
-    const tirithBin = process.env.TIRITH_BIN || "tirith";
-
     try {
       execFileSync(
-        tirithBin,
+        TIRITH_BIN,
         ["check", "--json", "--non-interactive", "--shell", "posix", "--", command],
         { timeout: 10_000, encoding: "utf-8", env: { ...process.env, TIRITH_INTEGRATION: "pi-cli" } },
       );
@@ -50,7 +48,7 @@ export default function (pi: ExtensionAPI) {
         if (process.env.TIRITH_FAIL_OPEN === "1") return undefined;
         return {
           block: true,
-          reason: `tirith: ${tirithBin} not found — install tirith or set TIRITH_FAIL_OPEN=1`,
+          reason: `tirith: ${TIRITH_BIN} not found — reinstall the Pi integration or set TIRITH_FAIL_OPEN=1`,
         };
       }
 
