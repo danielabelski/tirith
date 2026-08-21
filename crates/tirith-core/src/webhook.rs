@@ -572,5 +572,26 @@ mod tests {
         );
         assert!(payload.contains("curl_pipe_shell"));
         assert!(payload.contains("curl evil.com"));
+
+        // TIRITH-SEC-0066 again, but through the TEMPLATE path. The default
+        // payload already pins this; template rendering is a separate
+        // serialization route to the same webhook receiver, and it was only
+        // ever exercised with a command containing no credential at all.
+        let canary = "tiny-password";
+        let command = format!("PASSWORD={canary} deploy");
+        let payload = build_payload(
+            &verdict,
+            &command,
+            &wh,
+            &crate::redact::CompiledCustomPatterns::new(&[]),
+        );
+        assert!(
+            payload.contains("PASSWORD=[REDACTED]"),
+            "template payload must carry the redaction marker: {payload}"
+        );
+        assert!(
+            !payload.contains(canary),
+            "secret survived template rendering in {payload}"
+        );
     }
 }
