@@ -1274,7 +1274,9 @@ fn cleanup_fd_link_count(fd: i32) -> std::io::Result<u64> {
     // libc exposes nlink_t as u64 on x86_64 Linux and u32 on aarch64 Linux.
     // Normalize with a lossless widening conversion so both shipped GNU
     // targets enforce the same link-count invariant.
-    Ok(stat.st_nlink.into())
+    #[allow(clippy::useless_conversion)]
+    let link_count = stat.st_nlink.into();
+    Ok(link_count)
 }
 
 #[cfg(target_os = "linux")]

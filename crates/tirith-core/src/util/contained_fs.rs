@@ -1269,7 +1269,6 @@ mod platform {
     mod tests {
         use std::cell::Cell;
         use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::FileTypeExt as _;
         use std::os::unix::net::UnixListener;
         use std::rc::Rc;
@@ -1281,7 +1280,7 @@ mod platform {
         }
 
         fn make_fifo(path: &Path) {
-            let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let encoded = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
             // SAFETY: `encoded` is a live NUL-terminated path and mkfifo does
             // not retain the pointer.
             assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
