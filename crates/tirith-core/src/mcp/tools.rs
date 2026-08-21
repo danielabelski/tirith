@@ -799,6 +799,12 @@ fn build_cloaking_response_with_compiled(
         object.insert("analysis_incomplete".into(), json!(analysis_incomplete));
     }
     crate::redact::redact_json_strings(&mut structured, compiled);
+    // Bound AFTER redaction, like every other structured projection in this
+    // module. `to_json(true)` embeds every diff plus its optional `diff_text`,
+    // all of it remote-controlled, so an oversized upstream diff would otherwise
+    // push the response past the MCP presentation limit. This was the only
+    // structured path here missing the bound.
+    let structured = crate::verdict::bound_json_value_for_output(structured);
 
     ToolCallResult {
         content: vec![ContentItem {
@@ -1488,6 +1494,46 @@ mod tests {
         assert!(
             !detected.is_error,
             "detected cloaking is a finding, not an incomplete analysis: {detected:?}"
+        );
+    }
+
+    /// `to_json(true)` embeds every diff and its `diff_text`, all of it supplied
+    /// by the remote origin, and this was the only structured projection in the
+    /// module that skipped `bound_json_value_for_output`. A hostile or merely
+    /// verbose upstream could push the response past the presentation limit.
+    #[test]
+    fn an_oversized_cloaking_diff_is_bounded_like_every_other_projection() {
+        use crate::rules::cloaking::{AgentResponse, CloakingResult, DiffPair};
+
+        let result = CloakingResult {
+            url: "https://example.com".into(),
+            cloaking_detected: true,
+            findings: vec![],
+            agent_responses: vec![AgentResponse {
+                agent_name: "Chrome".into(),
+                status_code: 200,
+                content_length: 100,
+            }],
+            diff_pairs: (0..64)
+                .map(|index| DiffPair {
+                    agent_a: "Chrome".into(),
+                    agent_b: format!("ClaudeBot-{index}"),
+                    diff_chars: 50,
+                    diff_text: Some("remote-controlled diff payload ".repeat(400)),
+                })
+                .collect(),
+        };
+
+        let response = build_cloaking_response(result, &[]);
+        let structured = response
+            .structured_content
+            .as_ref()
+            .expect("structured content present");
+        let serialized = serde_json::to_vec(structured).expect("serializable");
+        assert!(
+            serialized.len() <= crate::verdict::MAX_PRESENTATION_BYTES,
+            "structured cloaking output must be bounded, got {} bytes",
+            serialized.len()
         );
     }
 
