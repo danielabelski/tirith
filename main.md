@@ -24,7 +24,7 @@ Exact duplicate source rows inherit the lifecycle of their canonical root; sourc
 | `source-index.schema.json` | `11cfcf409c6fb54615871d11b3cae24e4bf437ed52689baa444e3ebe4d3ea521` |
 | `findings.schema.json` | `46a6639c8b7e7f51d2567f47e14124bb83dc4cc5aba76f728182a7da9de53991` |
 | `evidence-bundle.schema.json` | `803938b38dee2dfdfb2988b7a3a54c37783089c08bc20ad566fdf0ff0af8dada` |
-| `render_main.py` | `2009b692ec95748e5e279c7e3e415e1a539a5903557860e9f9ce0679b36dbff7` |
+| `render_main.py` | `f40102784598b01e4d2269ad5875f7422cda1db0fb1544f27b6919b9f857e8c0` |
 
 ### Source accounting
 

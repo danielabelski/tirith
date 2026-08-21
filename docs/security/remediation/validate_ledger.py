@@ -776,12 +776,13 @@ def git_show_json(base_ref: str, relative_path: str) -> Any | None:
         fail(f"{relative_path} at {base_ref} is not JSON: {error}")
 
 
-def validate_append_only(base_ref: str, ledger: dict[str, Any]) -> None:
-    relative = str(FINDINGS_PATH.relative_to(ROOT))
-    base = git_show_json(base_ref, relative)
-    if base is None:
-        return
-    current_by_id = {item["finding_id"]: item for item in ledger["findings"]}
+def compare_against_base(base: Any, current_by_id: dict[str, Any]) -> None:
+    """Every canonical finding in `base` must still be present and extended.
+
+    Split out of `validate_append_only` so the caller can convert a base whose
+    SHAPE it cannot interpret into a refusal with a readable message, without
+    also swallowing shape problems in the current ledger.
+    """
     for old in base["findings"]:
         finding_id = old["finding_id"]
         require(finding_id in current_by_id, f"{finding_id}: canonical finding deleted")
@@ -810,6 +811,33 @@ def validate_append_only(base_ref: str, ledger: dict[str, Any]) -> None:
             for x in new["source_links"]
         }
         require(old_sources <= new_sources, f"{finding_id}: source claim mapping removed")
+
+
+def validate_append_only(base_ref: str, ledger: dict[str, Any]) -> None:
+    relative = str(FINDINGS_PATH.relative_to(ROOT))
+    base = git_show_json(base_ref, relative)
+    if base is None:
+        return
+    current_by_id = {item["finding_id"]: item for item in ledger["findings"]}
+    try:
+        compare_against_base(base, current_by_id)
+    except (AttributeError, IndexError, KeyError, TypeError) as exc:
+        # The base carries a shape this validator cannot read: an older schema
+        # that predates a field, or simply malformed content. Only
+        # ValidationError, OSError and SubprocessError are caught in main(), so
+        # this used to escape as a bare traceback -- which reads as a broken
+        # tool rather than as a verdict, on the one check whose job is rejecting
+        # rewritten history.
+        #
+        # It fails CLOSED. An unreadable base means append-only was never
+        # proven, and "could not check" must never be reported as "checked and
+        # fine". Rewriting the base into a shape this validator chokes on would
+        # otherwise be a way to skip the check entirely.
+        fail(
+            f"cannot verify append-only against {base_ref}: base {relative} has an "
+            f"unreadable or unsupported shape ({type(exc).__name__}: {exc}). "
+            f"Append-only is therefore unproven, which is a refusal, not a pass."
+        )
     base_source = git_show_json(base_ref, str(SOURCE_INDEX_PATH.relative_to(ROOT)))
     if base_source is not None:
         require(base_source == load_canonical(SOURCE_INDEX_PATH), "source-index.json is immutable after bootstrap")

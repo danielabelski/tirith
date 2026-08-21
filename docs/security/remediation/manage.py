@@ -410,9 +410,16 @@ def build_initial_findings(source_index: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_if_changed(path: Path, text: str) -> None:
-    if path.exists() and path.read_text(encoding="utf-8") == text:
+    # Bytes, not text. These artifacts are digest-pinned, and `write_text` opens
+    # in text mode, so on a Windows checkout every "\n" is written as "\r\n" and
+    # the file stops hashing to its recorded value. `read_text` performs the
+    # reverse translation on the way in, so the comparison below would also read
+    # a CRLF file as identical to the LF text and skip the rewrite -- hiding the
+    # drift instead of correcting it.
+    data = text.encode("utf-8")
+    if path.exists() and path.read_bytes() == data:
         return
-    path.write_text(text, encoding="utf-8")
+    path.write_bytes(data)
 
 
 def command_bootstrap(args: argparse.Namespace) -> int:

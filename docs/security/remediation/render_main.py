@@ -162,13 +162,19 @@ def main() -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     rendered = render(load(SOURCE_INDEX), load(FINDINGS))
+    # Compare and write BYTES. main.md is a digest-pinned generated artifact, and
+    # text mode translates newlines in both directions on Windows: the write
+    # would emit CRLF, and `read_text` would then report that CRLF file as equal
+    # to the LF rendering. The staleness gate would keep saying "current" while
+    # the bytes no longer matched the recorded hash.
+    expected = rendered.encode("utf-8")
     if args.check:
-        if not OUTPUT.exists() or OUTPUT.read_text(encoding="utf-8") != rendered:
+        if not OUTPUT.exists() or OUTPUT.read_bytes() != expected:
             print("main.md is stale; run render_main.py", file=sys.stderr)
             return 1
         print("main.md is current")
         return 0
-    OUTPUT.write_text(rendered, encoding="utf-8")
+    OUTPUT.write_bytes(expected)
     print("rendered main.md")
     return 0
 
