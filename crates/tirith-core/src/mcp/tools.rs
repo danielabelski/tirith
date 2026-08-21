@@ -758,6 +758,19 @@ fn build_cloaking_response_with_compiled(
         }
     }
 
+    // repo-0299: the comparison only ran when every agent returned a
+    // non-empty body at the baseline status. If any agent's response was
+    // empty/blocked, "no cloaking" was never established — say so.
+    // `all` is vacuously true on an empty list, which would report a clean
+    // "no cloaking" for a check that compared nothing at all.
+    let all_comparable = !result.agent_responses.is_empty()
+        && result.agent_responses.iter().all(|r| r.content_length > 0);
+    // A detected result is a completed analysis that found something; only the
+    // inconclusive branch is an *incomplete* analysis. Every other tool in this
+    // module reports incompleteness through `is_error`, so leaving it false here
+    // let a consumer branching on `isError` read INCONCLUSIVE as a clean pass.
+    let analysis_incomplete = !result.cloaking_detected && !all_comparable;
+
     let text = if result.cloaking_detected {
         let differing: Vec<&str> = result
             .diff_pairs
@@ -769,26 +782,22 @@ fn build_cloaking_response_with_compiled(
             result.url,
             differing.join(", ")
         )
+    } else if all_comparable {
+        format!("No cloaking detected for {}", result.url)
     } else {
-        // repo-0299: the comparison only ran when every agent returned a
-        // non-empty body at the baseline status. If any agent's response was
-        // empty/blocked, "no cloaking" was never established — say so.
-        // `all` is vacuously true on an empty list, which would report a clean
-        // "no cloaking" for a check that compared nothing at all.
-        let all_comparable = !result.agent_responses.is_empty()
-            && result.agent_responses.iter().all(|r| r.content_length > 0);
-        if all_comparable {
-            format!("No cloaking detected for {}", result.url)
-        } else {
-            format!(
-                "Cloaking check INCONCLUSIVE for {}: at least one agent received an empty/blocked response, so no clean baseline comparison exists",
-                result.url
-            )
-        }
+        format!(
+            "Cloaking check INCONCLUSIVE for {}: at least one agent received an empty/blocked response, so no clean baseline comparison exists",
+            result.url
+        )
     };
 
     let text = bounded_safe_mcp_text(text, compiled);
     let mut structured = result.to_json(true);
+    // Mirror the text-level caveat into the structured payload so a machine
+    // consumer does not have to parse prose to learn the check was inconclusive.
+    if let Some(object) = structured.as_object_mut() {
+        object.insert("analysis_incomplete".into(), json!(analysis_incomplete));
+    }
     crate::redact::redact_json_strings(&mut structured, compiled);
 
     ToolCallResult {
@@ -796,7 +805,7 @@ fn build_cloaking_response_with_compiled(
             content_type: "text".into(),
             text,
         }],
-        is_error: false,
+        is_error: analysis_incomplete,
         structured_content: Some(structured),
     }
 }
@@ -939,6 +948,15 @@ fn format_dir_scan_text(
         "{} files scanned, {} finding(s) in {} file(s):\n",
         result.scanned_count, total, files_with
     ));
+    // These notes are why the reader should distrust the list that follows, so
+    // they go in before it. `BoundedTextBuilder` drops the tail once the budget
+    // is spent, and appending them last meant a scan with enough findings to
+    // exhaust the budget silently lost the very caveat saying it was truncated,
+    // had coverage gaps, or panicked. Cutting detail is recoverable; cutting the
+    // caveat turns an incomplete scan into an apparently complete one.
+    out.push_str(&truncation_note);
+    out.push_str(&coverage_note);
+    out.push_str(&panic_note);
     for fr in &result.file_results {
         if fr.findings.is_empty() {
             continue;
@@ -953,9 +971,6 @@ fn format_dir_scan_text(
             out.push_str(&format!("    [{}] {} — {}\n", f.severity, f.rule_id, title));
         }
     }
-    out.push_str(&truncation_note);
-    out.push_str(&coverage_note);
-    out.push_str(&panic_note);
     out.finish()
 }
 
@@ -1184,6 +1199,67 @@ mod tests {
             .is_some_and(|items| items > 0));
     }
 
+    /// The notes that say the scan was truncated, had coverage gaps, or hit a
+    /// rule panic are exactly the ones a reader needs when the output is too big
+    /// to show in full. They used to be appended AFTER the per-file detail, and
+    /// `BoundedTextBuilder` silently drops everything once the budget is spent,
+    /// so a scan with enough findings to overflow lost its own caveats and read
+    /// as a complete result. Cutting detail is fine; cutting the caveat is not.
+    #[test]
+    fn incompleteness_warnings_survive_a_truncated_directory_scan_summary() {
+        let file_results = (0..600)
+            .map(|index| scan::FileScanResult {
+                path: PathBuf::from(format!("/project/{index}/{}", "a-long-path".repeat(100))),
+                findings: vec![crate::verdict::Finding {
+                    rule_id: crate::verdict::RuleId::ConfigInjection,
+                    severity: crate::verdict::Severity::High,
+                    title: "malicious instruction".repeat(20),
+                    description: "d".repeat(2_000),
+                    evidence: Vec::new(),
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                }],
+                is_config_file: true,
+                coverage_gaps: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let result = scan::ScanResult {
+            scanned_count: file_results.len(),
+            skipped_count: 1,
+            file_results,
+            truncated: true,
+            truncation_reason: Some("Scan file budget exhausted; 40 file(s) omitted.".into()),
+            panic_files: vec![PathBuf::from("/project/panicking-rule.rs")],
+            coverage_gaps: Vec::new(),
+        };
+
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let text = format_dir_scan_text(&result, result.total_findings(), &compiled);
+
+        // Precondition: this input really does overflow the presentation budget,
+        // otherwise the assertions below would pass for the wrong reason.
+        assert!(
+            text.contains("[presentation truncated:"),
+            "fixture must exhaust the budget for this test to mean anything"
+        );
+        assert!(text.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
+
+        assert!(
+            text.contains("rule panic"),
+            "the rule-panic warning must survive truncation"
+        );
+        assert!(
+            text.contains("Scan file budget exhausted"),
+            "the truncation reason must survive truncation"
+        );
+        assert!(
+            text.contains("analysis incomplete"),
+            "the coverage-gap warning must survive truncation"
+        );
+    }
+
     #[test]
     fn file_scan_findings_count_preserves_raw_count_before_synthetic_bounding() {
         let finding = crate::verdict::Finding {
@@ -1347,6 +1423,71 @@ mod tests {
         assert!(
             structured["diffs"][0].get("diff_text").is_some(),
             "diff_text should be present in structured output"
+        );
+    }
+
+    /// An inconclusive cloaking check is an INCOMPLETE analysis, and every other
+    /// tool in this module signals incompleteness through `is_error`. Leaving it
+    /// false let a consumer that branches on `isError` (rather than reading the
+    /// prose) treat "at least one agent was blocked" as a clean no-cloaking pass.
+    #[test]
+    fn an_inconclusive_cloaking_check_is_reported_as_an_error() {
+        use crate::rules::cloaking::{AgentResponse, CloakingResult};
+
+        let agent = |name: &str, len: usize| AgentResponse {
+            agent_name: name.into(),
+            status_code: 200,
+            content_length: len,
+        };
+        let build = |detected: bool, agents: Vec<AgentResponse>| CloakingResult {
+            url: "https://example.com".into(),
+            cloaking_detected: detected,
+            findings: vec![],
+            agent_responses: agents,
+            diff_pairs: vec![],
+        };
+
+        // A blocked agent means no clean baseline was ever established.
+        let blocked = build_cloaking_response(
+            build(false, vec![agent("Chrome", 100), agent("ClaudeBot", 0)]),
+            &[],
+        );
+        assert!(
+            blocked.is_error,
+            "a blocked agent leaves the check inconclusive: {blocked:?}"
+        );
+        assert_eq!(
+            blocked.structured_content.as_ref().unwrap()["analysis_incomplete"],
+            serde_json::json!(true),
+            "the caveat must also be machine-readable, not only prose"
+        );
+
+        // `all` is vacuously true on an empty list: nothing was compared at all.
+        let nothing = build_cloaking_response(build(false, vec![]), &[]);
+        assert!(
+            nothing.is_error,
+            "comparing zero agents is not a clean pass: {nothing:?}"
+        );
+
+        // Both conclusive outcomes stay non-error. A detected result is a
+        // COMPLETED analysis that found something, not a failed one.
+        let clean = build_cloaking_response(
+            build(false, vec![agent("Chrome", 100), agent("ClaudeBot", 98)]),
+            &[],
+        );
+        assert!(!clean.is_error, "a fully comparable clean check: {clean:?}");
+        assert_eq!(
+            clean.structured_content.as_ref().unwrap()["analysis_incomplete"],
+            serde_json::json!(false)
+        );
+
+        let detected = build_cloaking_response(
+            build(true, vec![agent("Chrome", 100), agent("ClaudeBot", 0)]),
+            &[],
+        );
+        assert!(
+            !detected.is_error,
+            "detected cloaking is a finding, not an incomplete analysis: {detected:?}"
         );
     }
 

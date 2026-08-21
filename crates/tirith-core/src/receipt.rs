@@ -187,9 +187,17 @@ impl Receipt {
                 .iter()
                 .map(|value| text(value))
                 .collect(),
+            // `analysis_method` keeps the DLP pass: it embeds an incomplete-reason
+            // string from the runner, so it is not a closed vocabulary.
             analysis_method: text(&self.analysis_method),
-            privilege: text(&self.privilege),
-            timestamp: text(&self.timestamp),
+            // `privilege` and `timestamp` are program-generated, never derived
+            // from analysed input: privilege is one of "normal"/"elevated"/"user"
+            // and timestamp is `Utc::now().to_rfc3339()`. Running operator DLP
+            // over them could only ever corrupt them -- a custom pattern as
+            // ordinary as `\d{4}` rewrites the year and breaks the receipt for
+            // the downstream verifier that parses it. There is nothing to redact.
+            privilege: self.privilege.clone(),
+            timestamp: self.timestamp.clone(),
             cwd: None,
             git_repo: self.git_repo.as_deref().map(url),
             git_branch: self.git_branch.as_deref().map(text),
@@ -1206,6 +1214,49 @@ mod tests {
         assert!(
             receipt.cwd.is_some(),
             "stored receipt must retain local cwd"
+        );
+    }
+
+    /// `privilege` and `timestamp` are produced by tirith itself, never derived
+    /// from the analysed subject, so there is nothing in them to redact. Running
+    /// the operator's custom DLP patterns over them could only ever corrupt them,
+    /// and an operator pattern broad enough to hit a bare 4-digit run is entirely
+    /// ordinary. A mangled timestamp breaks the downstream verifier that parses
+    /// the receipt, so this is a data-integrity bug, not a cosmetic one.
+    #[test]
+    fn a_broad_operator_dlp_pattern_cannot_corrupt_program_generated_receipt_fields() {
+        // Matches the year in any RFC 3339 timestamp, and "user"/"normal".
+        let patterns = vec![r"\d{4}".to_string(), r"user|normal".to_string()];
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&patterns);
+
+        let mut receipt = script_receipt("b".repeat(64));
+        receipt.timestamp = "2026-01-01T00:00:00Z".to_string();
+        receipt.privilege = "user".to_string();
+
+        let projected = receipt.presentation_clone_with_compiled(&compiled);
+
+        assert_eq!(
+            projected.timestamp, "2026-01-01T00:00:00Z",
+            "a program-generated timestamp must survive operator DLP verbatim"
+        );
+        assert_eq!(
+            projected.privilege, "user",
+            "a closed-vocabulary privilege must survive operator DLP verbatim"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&projected.timestamp).is_ok(),
+            "the projected timestamp must still parse as RFC 3339"
+        );
+
+        // The same pattern set must still redact genuinely attacker-influenced
+        // free text, so this is a scoping fix and not a hole in the DLP pass.
+        let mut tainted = script_receipt("c".repeat(64));
+        tainted.analysis_method = "static-incomplete:normal".to_string();
+        let tainted = tainted.presentation_clone_with_compiled(&compiled);
+        assert!(
+            tainted.analysis_method.contains("[REDACTED:custom]"),
+            "analysis_method still carries subject-derived text: {}",
+            tainted.analysis_method
         );
     }
 

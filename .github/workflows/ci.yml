@@ -131,6 +131,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
+      # `fuzz/` declares its own `[workspace]`, so the root check above never
+      # resolves libfuzzer-sys or anything under it -- the NCSA entry in
+      # deny.toml's allow-list was allowing a license for a tree nothing audited.
+      # The fuzz targets are built and run by CI, so a fuzz-only advisory is a
+      # real exposure. Reuses the root deny.toml deliberately: one allow-list.
+      # (tools/rustsec-probe is also detached but is a one-off research probe
+      # that never enters the product build, so it stays uncovered.)
+      - run: cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml
 
   install-script:
     name: Install script (${{ matrix.name }})
