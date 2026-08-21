@@ -138,7 +138,12 @@ jobs:
       # real exposure. Reuses the root deny.toml deliberately: one allow-list.
       # (tools/rustsec-probe is also detached but is a one-off research probe
       # that never enters the product build, so it stays uncovered.)
-      - run: cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml
+      # No `--config`: it defaults to <cwd>/deny.toml, which is the root config
+      # this deliberately reuses. Do NOT pass the flag explicitly -- it moved
+      # from the `check` subcommand (0.19) to global scope (0.20), so either
+      # spelling breaks on the other version, and the step above installs
+      # whatever cargo-deny is newest.
+      - run: cargo deny --manifest-path fuzz/Cargo.toml check
 
   install-script:
     name: Install script (${{ matrix.name }})
