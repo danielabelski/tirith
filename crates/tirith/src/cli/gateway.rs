@@ -9118,6 +9118,14 @@ mod tests {
         );
     }
 
+    // `InterpretedCodeSnapshot::capture` goes through
+    // `ContainedAtomicFile::prepare`, which has no implementation outside Unix
+    // and Windows: the `cfg(all(not(unix), not(windows)))` platform module in
+    // contained_fs.rs returns `Unsupported`, so the `unwrap()` below would
+    // panic. The sibling limits test never reaches `prepare`, and
+    // `interpreted_snapshot_refuses_symlinked_dependencies` right after this is
+    // already gated the same way.
+    #[cfg(any(unix, windows))]
     #[test]
     fn interpreted_snapshot_excludes_self_referential_descriptor_lock() {
         let repo = tempfile::tempdir().unwrap();
