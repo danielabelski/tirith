@@ -62,9 +62,14 @@ jobs:
   test:
     name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    # The full workspace test suite completes well under this locally; fail
-    # runner wedges instead of leaving CI stuck in-progress for an hour.
-    timeout-minutes: 20
+    # A wedge detector, not a capacity budget. The suite has grown past what
+    # this comment used to assume: `Test (Linux)` measures 10min on the base of
+    # this stack and 19min at its head, so a 20min cap left about a minute of
+    # headroom and tipped over on any cold `rust-cache` restore or slow runner.
+    # GitHub records a timed-out job as CANCELLED, so it read as an unexplained
+    # red check rather than a timeout. A genuine wedge runs indefinitely and is
+    # still caught well inside this.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -102,7 +107,7 @@ jobs:
     name: MSRV (1.83)
     runs-on: ubuntu-latest
     # Match the main test job: treat prolonged runner hangs as failures.
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
