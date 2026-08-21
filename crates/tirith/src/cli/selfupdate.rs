@@ -1443,7 +1443,7 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
         let preserved = if Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file() {
             let staged = transaction_dir.join("live-before");
             if let Err(error) = run_as_root(
-                authorization,
+                &authorization,
                 "/usr/bin/install",
                 &[
                     OsStr::new("-m"),
