@@ -2093,14 +2093,12 @@ fn preflight_grok_pretool_hook(
         crate::assets::TIRITH_CHECK_PY,
         opts.force,
     )?;
-    if !opts.update_configs {
-        preflight_owned_file(
-            &hooks_dir.join("tirith.json"),
-            scope_root,
-            &content,
-            opts.force,
-        )?;
-    }
+    preflight_owned_file(
+        &hooks_dir.join("tirith.json"),
+        scope_root,
+        &content,
+        opts.force,
+    )?;
     Ok(())
 }
 
@@ -2120,10 +2118,12 @@ fn setup_grok_pretool_hook(
         opts.force,
         opts.dry_run,
     )?;
-    if opts.update_configs {
-        return Ok(());
-    }
 
+    // `tirith.json` is hook configuration, not an MCP registration, so
+    // `--update-configs` covers it. It is also the only Grok file that carries
+    // the absolute hook path and `TIRITH_BIN`, which is exactly what goes stale
+    // when the binary moves — refreshing the script alone would leave the hook
+    // pointing at the old location, and Grok fails open on hook errors.
     let config_path = hooks_dir.join("tirith.json");
     if private {
         write_owned_private_config(&config_path, scope_root, &content, opts.force, opts.dry_run)
@@ -2235,22 +2235,30 @@ pub fn setup_grok_build(opts: &SetupOpts) -> Result<(), String> {
         setup_grok_pretool_hook(&hooks_dir, &hooks_scope_root, tirith_bin, private, opts)?;
         eprintln!();
         #[cfg(unix)]
-        eprintln!("tirith: Grok Build hook script refreshed");
+        eprintln!("tirith: Grok Build hook script and hook config refreshed");
         #[cfg(not(unix))]
         eprintln!("tirith: Grok Build has no Tirith-owned hook asset on this platform");
         return Ok(());
     }
 
+    // Enforcement first, advertisement second. Both writes are individually
+    // transactional but the command spans two files, so if the second one fails
+    // the setup that survives should be the one that blocks: a hook with no MCP
+    // entry still checks commands, while an MCP entry with no hook only offers
+    // tools the model may decline to call.
+    #[cfg(unix)]
+    setup_grok_pretool_hook(&hooks_dir, &hooks_scope_root, tirith_bin, private, opts)?;
     merge_grok_mcp_toml(
         &config_path,
         &config_scope_root,
         tirith_bin,
         private,
-        opts.scope == Scope::User,
+        // Clear our own name from `disabled_mcp_servers` in whichever config
+        // this scope owns. Registering the server while the same file still
+        // disables it reports a success that Grok will not honour.
+        true,
         opts,
     )?;
-    #[cfg(unix)]
-    setup_grok_pretool_hook(&hooks_dir, &hooks_scope_root, tirith_bin, private, opts)?;
 
     eprintln!();
     eprintln!("tirith: Grok Build setup complete");
@@ -5053,6 +5061,130 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn grok_build_update_configs_repoints_the_hook_at_a_moved_binary() {
+        // `tirith.json` is the only Grok file carrying the absolute hook path
+        // and `TIRITH_BIN`, so it is the one that goes stale when the binary
+        // moves — which is the whole reason `--update-configs` exists. Grok
+        // fails open on hook errors, so a stale path is silent loss of cover.
+        with_fake_env(false, |_home, _cwd| {
+            let root = tempfile::tempdir().unwrap();
+            let custom = root.path().join("profile");
+            let _grok = EnvGuard::set("GROK_HOME", &custom);
+
+            let mut opts = mcp_opts(Scope::User);
+            opts.tirith_bin = "/old/prefix/bin/tirith".to_string();
+            setup_grok_build(&opts).unwrap();
+
+            let hook_config_path = custom.join("hooks/tirith.json");
+            let before: Value =
+                serde_json::from_str(&std::fs::read_to_string(&hook_config_path).unwrap()).unwrap();
+            assert_eq!(
+                before["hooks"]["PreToolUse"][0]["hooks"][0]["env"]["TIRITH_BIN"],
+                "/old/prefix/bin/tirith"
+            );
+
+            let mut refreshed = mcp_opts(Scope::User);
+            refreshed.tirith_bin = "/new/prefix/bin/tirith".to_string();
+            refreshed.update_configs = true;
+            // `setup::run` derives `force || update_configs`; these tests build
+            // SetupOpts directly, so mirror that here.
+            refreshed.force = true;
+            setup_grok_build(&refreshed).unwrap();
+
+            let after: Value =
+                serde_json::from_str(&std::fs::read_to_string(&hook_config_path).unwrap()).unwrap();
+            assert_eq!(
+                after["hooks"]["PreToolUse"][0]["hooks"][0]["env"]["TIRITH_BIN"],
+                "/new/prefix/bin/tirith",
+                "--update-configs must repoint the hook config at the current binary"
+            );
+        });
+    }
+
+    #[test]
+    fn grok_build_project_scope_clears_its_own_config_denylist() {
+        // Registering the server while the same file still names it in
+        // `disabled_mcp_servers` reports a success Grok will not honour.
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            let user_home = home.join("custom-grok");
+            std::fs::create_dir_all(&user_home).unwrap();
+            let _grok = EnvGuard::set("GROK_HOME", &user_home);
+
+            let project_grok = cwd.join(".grok");
+            std::fs::create_dir_all(&project_grok).unwrap();
+            std::fs::write(
+                project_grok.join("config.toml"),
+                "disabled_mcp_servers = [\"tirith\", \"other\"]\n",
+            )
+            .unwrap();
+
+            setup_grok_build(&mcp_opts(Scope::Project)).unwrap();
+
+            let parsed: toml::Value =
+                toml::from_str(&std::fs::read_to_string(project_grok.join("config.toml")).unwrap())
+                    .unwrap();
+            let disabled = parsed["disabled_mcp_servers"].as_array().unwrap();
+            assert!(
+                !disabled.iter().any(|e| e.as_str() == Some("tirith")),
+                "project setup must clear its own name from the project denylist"
+            );
+            assert!(
+                disabled.iter().any(|e| e.as_str() == Some("other")),
+                "other entries must be preserved, got {disabled:?}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_build_writes_the_enforcing_hook_before_the_cooperative_registration() {
+        // Preflight already rejects the predictable conflicts before anything is
+        // written, so the ordering only shows up for a failure it cannot see
+        // coming: here a read-only parent that blocks the config's atomic
+        // rename at write time. What must survive that is the hook, because a
+        // hook with no MCP entry still checks commands while an MCP entry with
+        // no hook only offers tools the model may decline to call.
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and does not mutate state.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root ignores the directory write bit, so the fault never fires.
+            return;
+        }
+        with_fake_env(false, |_home, _cwd| {
+            let root = tempfile::tempdir().unwrap();
+            let custom = root.path().join("profile");
+            std::fs::create_dir_all(custom.join("hooks")).unwrap();
+            let _grok = EnvGuard::set("GROK_HOME", &custom);
+
+            std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let opts = mcp_opts(Scope::User);
+            let result = setup_grok_build(&opts);
+
+            // Restore before asserting so a failed assertion cannot leave an
+            // undeletable tempdir behind.
+            std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            assert!(
+                result.is_err(),
+                "an unwritable Grok config directory must surface as an error"
+            );
+            assert!(
+                custom.join("hooks/tirith-check.py").is_file()
+                    && custom.join("hooks/tirith.json").is_file(),
+                "the blocking PreToolUse hook must already be installed when MCP registration fails"
+            );
+            assert!(
+                !custom.join("config.toml").exists(),
+                "the failed MCP write must not have left a config behind"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn grok_build_hook_adapts_native_pretool_payload_to_block_decision() {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -5090,6 +5222,62 @@ mod tests {
         let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(decision["decision"], "deny");
         assert!(decision["reason"].as_str().unwrap().contains("blocked"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_build_hook_still_surfaces_a_warn_allow_finding() {
+        // Grok's decision envelope carries a reason only for deny, so a
+        // warn-allow verdict had nowhere to put its finding and vanished: the
+        // user saw a bare `allow` and never learned the command was flagged.
+        // Grok surfaces hook stderr, so the finding goes there while stdout
+        // keeps the clean envelope Grok parses.
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let root = tempfile::tempdir().unwrap();
+        let hook = root.path().join("tirith-check.py");
+        let tirith = root.path().join("tirith");
+        std::fs::write(&hook, crate::assets::TIRITH_CHECK_PY).unwrap();
+        std::fs::write(
+            &tirith,
+            "#!/bin/sh\nprintf '%s\\n' '{\"findings\":[{\"title\":\"Shortened URL\",\"severity\":\"medium\"}]}'\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tirith, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child = Command::new("python3")
+            .arg(&hook)
+            .env("TIRITH_BIN", &tirith)
+            .env("TIRITH_HOOK_PROTOCOL", "grok-build")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                br#"{"hookEventName":"pre_tool_use","toolName":"run_terminal_command","toolInput":{"command":"curl https://exam.pl/x"}}"#,
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+
+        let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(decision["decision"], "allow");
+        assert!(
+            decision.get("reason").is_none(),
+            "Grok's allow envelope takes no reason field, got {decision}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Shortened URL"),
+            "a warn-allow finding must still reach the user on stderr, got: {stderr}"
+        );
     }
 
     #[test]

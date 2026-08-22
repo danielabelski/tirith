@@ -51,6 +51,12 @@ def decision(action, reason=None):
         output = {"decision": action}
         if action == "deny" and reason:
             output["reason"] = reason
+        elif reason:
+            # Grok's decision envelope carries a reason only for deny, so a
+            # warn-allow would otherwise be discarded and the user would never
+            # learn why the command was flagged. Grok surfaces hook stderr, so
+            # send the finding there rather than dropping it.
+            print(reason, file=sys.stderr)
     else:
         specific = {
             "hookEventName": "PreToolUse",
