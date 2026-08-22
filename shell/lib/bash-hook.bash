@@ -5,6 +5,39 @@
 #     Startup health gate + pending-not-consumed detection auto-degrade to preexec.
 #   preexec: DEBUG trap warn-only. Cannot block. No paste interception.
 
+# Establish trusted builtin lookup before reading or clearing any security
+# state. Bash normally resolves functions before builtins, so an exported
+# `BASH_FUNC_unset%%`, `BASH_FUNC_builtin%%`, or `BASH_FUNC_shopt%%` can shadow
+# even an explicit `builtin ...` invocation. Assigning POSIXLY_CORRECT enters
+# POSIX mode without a command lookup; in that mode the special `unset`
+# builtin has precedence over functions. Use that one grammar-level foothold
+# to remove every builtin name this hook relies on, then restore the caller's
+# POSIX mode and POSIXLY_CORRECT value exactly. Backslashes suppress aliases
+# while this bootstrap is in progress.
+_TIRITH_BOOTSTRAP_WAS_POSIX=0
+[[ -o posix ]] && _TIRITH_BOOTSTRAP_WAS_POSIX=1
+_TIRITH_BOOTSTRAP_POSIXLY_SET="${POSIXLY_CORRECT+x}"
+_TIRITH_BOOTSTRAP_POSIXLY_VALUE="${POSIXLY_CORRECT-}"
+POSIXLY_CORRECT=y
+if [[ -o posix ]]; then
+\unset -f \
+  alias bind builtin cd command declare disown enable eval exec exit export \
+  false getopts hash history jobs kill local printf read readonly return set shift \
+  shopt source test trap true type typeset ulimit umask unalias unset wait 2>/dev/null
+\unalias \
+  alias bind builtin cd command declare disown enable eval exec exit export \
+  false getopts hash history jobs kill local printf read readonly return set shift \
+  shopt source test trap true type typeset ulimit umask unalias unset wait 2>/dev/null
+if [[ "$_TIRITH_BOOTSTRAP_POSIXLY_SET" == "x" ]]; then
+  POSIXLY_CORRECT="$_TIRITH_BOOTSTRAP_POSIXLY_VALUE"
+else
+  \unset POSIXLY_CORRECT
+fi
+if [[ "$_TIRITH_BOOTSTRAP_WAS_POSIX" == "0" ]]; then
+  \set +o posix
+fi
+unset _TIRITH_BOOTSTRAP_WAS_POSIX _TIRITH_BOOTSTRAP_POSIXLY_SET _TIRITH_BOOTSTRAP_POSIXLY_VALUE
+
 # Guard against double-loading (session-local only).
 # If inherited from environment (exported by attacker/parent), ignore it.
 if [[ -n "$_TIRITH_BASH_LOADED" ]]; then
@@ -38,8 +71,9 @@ unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
 # slot the trampoline evals, and the one-shot latches that would swallow the
 # downgrade banners a user needs to see.
 #
-# Values set WITHOUT export are left alone, so the session-local test overrides
-# above and any in-shell state keep working exactly as before.
+# These values are private implementation state, not configuration. Reset them
+# unconditionally on a fresh load: testing whether they were exported before
+# clearing them creates a second attacker-controlled read and is unnecessary.
 for _tirith_inherited_state in \
   _TIRITH_BASH_INTERNAL \
   _tirith_last_key _tirith_last_rc _tirith_last_cmd \
@@ -47,8 +81,7 @@ for _tirith_inherited_state in \
   _TIRITH_DEGRADE_WARNED _TIRITH_OFF_WARNED _TIRITH_PREEXEC_WARNED _TIRITH_RECEIPT_DEGRADE_WARNED \
   _TIRITH_BINDS_INSTALLED _TIRITH_PREEXEC_PROMPT_STATUS
 do
-  [[ "$(declare -p "$_tirith_inherited_state" 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] \
-    && unset "$_tirith_inherited_state"
+  unset "$_tirith_inherited_state"
 done
 unset _tirith_inherited_state
 
@@ -582,9 +615,16 @@ _tirith_read_history_entry() {
 # Used to bridge cosmetic spacing differences (`>/dev/null` vs `> /dev/null`)
 # between BASH_COMMAND and the history line in enforcement mode.
 _tirith_normalize_spacing() {
-  local input="$1" s="" pending_space=0 i char op restore_patsub=0
+  local input="$1" s="" pending_space=0 i char next op restore_patsub=0
+  local default_stdout_fd=' 1>' default_stdin_fd=' 0<'
   for ((i=0; i<${#input}; i++)); do
     char="${input:i:1}"
+    next="${input:i+1:1}"
+    if [[ "$char" == "\\" && "$next" == $'\n' ]]; then
+      [[ -n "$s" ]] && pending_space=1
+      i=$((i + 1))
+      continue
+    fi
     case "$char" in
       [[:space:]])
         [[ -n "$s" ]] && pending_space=1
@@ -609,64 +649,112 @@ _tirith_normalize_spacing() {
     while [[ "$s" == *" $op"* ]]; do s="${s//" $op"/$op}"; done
     while [[ "$s" == *"$op "* ]]; do s="${s//"$op "/$op}"; done
   done
+  # Bash makes the default file descriptor explicit in BASH_COMMAND. Limit
+  # this normalization to token boundaries so an argument ending in a digit is
+  # not rewritten (`version1>file` is a word plus a redirect, not fd syntax).
+  while [[ "$s" == *"$default_stdout_fd"* ]]; do s="${s//$default_stdout_fd/>}"; done
+  while [[ "$s" == *"$default_stdin_fd"* ]]; do s="${s//$default_stdin_fd/<}"; done
+  [[ "$s" == 1\>* ]] && s="${s#1}"
+  [[ "$s" == 0\<* ]] && s="${s#0}"
   [[ $restore_patsub -eq 1 ]] && shopt -s patsub_replacement
   printf '%s' "$s"
 }
 
-# Escape POSIX-ERE metacharacters so the result can be embedded literally into
-# a bash =~ regex pattern.
-_tirith_regex_escape() {
-  local s="$1" out="" i c
-  for ((i=0; i<${#s}; i++)); do
-    c="${s:i:1}"
-    case "$c" in
-      '\'|'.'|'*'|'+'|'?'|'|'|'('|')'|'['|']'|'{'|'}'|'^'|'$')
-        out+='\'"$c" ;;
-      *)
-        out+="$c" ;;
-    esac
-  done
-  printf '%s' "$out"
-}
-
-# Return 0 when $1 (BASH_COMMAND) corresponds to one of the simple commands
-# in $2 (history_line). Uses three steps:
-#
-#   1. Literal word-boundary match of BASH_COMMAND in history_line.
-#   2. Whitespace-normalised retry (bridges `ls -l >/dev/null` vs
-#      `ls -l > /dev/null`).
-#   3. Command-name fallback: the first token of BASH_COMMAND (the program
-#      name) must appear as a bounded token somewhere in history_line. This
-#      bridges bash's internal rewriting of redirection FDs (`>&2` typed,
-#      `1>&2` in BASH_COMMAND) while still catching alias expansion (the
-#      alias's output command name won't appear in the typed line).
+# Return 0 when $1 (BASH_COMMAND) is an actual top-level command segment in $2
+# (history_line). Quotes and comments are data, never evidence that a command
+# name appeared in executable syntax. This deliberately rejects ambiguous
+# compound syntax instead of authenticating an alias expansion from a token in
+# a comment, string, heredoc body, or unused argument.
 _tirith_cmd_is_in_line() {
   local needle="$1" haystack="$2"
   [[ -z "$needle" || -z "$haystack" ]] && return 1
-  [[ "$haystack" == "$needle" ]] && return 0
-
-  local esc boundary
-  boundary='(^|[[:space:]|&;<>()])'
-  esc="$(_tirith_regex_escape "$needle")"
-  if [[ "$haystack" =~ ${boundary}${esc}([[:space:]|&\;<>()]|$) ]]; then
-    return 0
-  fi
-
-  local n_needle n_haystack
+  local n_needle n_haystack n_segment segment="" quote="" escaped=0 at_word_start=1
+  local i char next previous
   n_needle="$(_tirith_normalize_spacing "$needle")"
+  [[ -n "$n_needle" ]] || return 1
   n_haystack="$(_tirith_normalize_spacing "$haystack")"
   [[ "$n_haystack" == "$n_needle" ]] && return 0
-  esc="$(_tirith_regex_escape "$n_needle")"
-  if [[ "$n_haystack" =~ ${boundary}${esc}([[:space:]|&\;<>()]|$) ]]; then
-    return 0
-  fi
+  # Heredoc bodies are data, but locating their delimiter safely requires the
+  # full Bash grammar. Refuse segment authentication for any such line; exact
+  # whole-line equality above still permits an ordinary standalone heredoc.
+  [[ "$haystack" == *'<<'* ]] && return 1
 
-  local first_token="${needle%%[[:space:]]*}"
-  [[ -z "$first_token" ]] && return 1
-  esc="$(_tirith_regex_escape "$first_token")"
-  if [[ "$haystack" =~ ${boundary}${esc}([[:space:]|&\;<>()]|$) ]]; then
-    return 0
-  fi
+  for ((i=0; i<=${#haystack}; i++)); do
+    char="${haystack:i:1}"
+    next="${haystack:i+1:1}"
+    previous="${haystack:i-1:1}"
+    if [[ $i -eq ${#haystack} ]]; then
+      char=$'\n'
+    fi
+
+    if [[ $escaped -eq 1 ]]; then
+      segment+="$char"
+      escaped=0
+      at_word_start=0
+      continue
+    fi
+    if [[ "$quote" == "'" ]]; then
+      segment+="$char"
+      [[ "$char" == "'" ]] && quote=""
+      at_word_start=0
+      continue
+    fi
+    if [[ "$quote" == '"' ]]; then
+      segment+="$char"
+      if [[ "$char" == "\\" ]]; then
+        escaped=1
+      elif [[ "$char" == '"' ]]; then
+        quote=""
+      fi
+      at_word_start=0
+      continue
+    fi
+
+    case "$char" in
+      "\\") segment+="$char"; escaped=1; at_word_start=0; continue ;;
+      "'"|'"') segment+="$char"; quote="$char"; at_word_start=0; continue ;;
+      '#')
+        if [[ $at_word_start -eq 1 ]]; then
+          char=$'\n'
+        else
+          segment+="$char"
+          at_word_start=0
+          continue
+        fi
+        ;;
+    esac
+
+    case "$char" in
+      ' '|$'\t'|$'\r') segment+="$char"; at_word_start=1; continue ;;
+      '&')
+        if [[ "$next" == '>' || "$previous" == '>' || "$previous" == '<' ]]; then
+          segment+="$char"
+          at_word_start=0
+          continue
+        fi
+        ;;
+      '>'|'<') segment+="$char"; at_word_start=1; continue ;;
+      ';'|'|'|'('|')'|$'\n') ;;
+      *) segment+="$char"; at_word_start=0; continue ;;
+    esac
+
+    n_segment="$(_tirith_normalize_spacing "$segment")"
+    if [[ -n "$n_segment" ]]; then
+      [[ "$n_segment" == "$n_needle" ]] && return 0
+      # Control-flow keywords belong to the surrounding grammar rather than
+      # BASH_COMMAND. Remove only a leading reserved word from the already
+      # isolated executable segment, never from comments or quoted data.
+      case "$n_segment" in
+        if\ *|then\ *|elif\ *|while\ *|until\ *|do\ *|else\ *)
+          n_segment="${n_segment#* }"
+          [[ "$n_segment" == "$n_needle" ]] && return 0
+          ;;
+      esac
+    fi
+    segment=""
+    at_word_start=1
+    [[ "$char" == $'\n' ]] && break
+  done
   return 1
 }
 
@@ -744,9 +832,6 @@ _tirith_debug_trampoline() {
   # fires have at least one caller frame. `_tirith_preexec` only skips a nested
   # fire after the containing typed line has crossed the top-level decision.
   local _user_call_depth="${#FUNCNAME[@]}"
-  # Tirith's trap fired, whatever the chained handler goes on to do. The
-  # prompt-boundary ownership check reads this; see `_tirith_preexec_prompt_end`.
-  _TIRITH_DEBUG_TRAP_HEARTBEAT=1
   if [[ -n "${_TIRITH_PREV_DEBUG_TRAP:-}" ]]; then
     # Status is discarded on purpose: under a Tirith-owned extdebug block a
     # non-zero DEBUG result skips the command, and that decision belongs to
@@ -795,10 +880,14 @@ _tirith_read_debug_trap_capture() {
 _tirith_install_debug_trap() {
   [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "1" ]] || return 1
   local current="${_TIRITH_CAPTURED_DEBUG_TRAP_SPEC:-}"
-  if [[ "$current" == *"_tirith_debug_trampoline"* ]]; then
+  if [[ "$current" == "trap -- '_tirith_debug_trampoline' DEBUG" ]]; then
     _TIRITH_DEBUG_TRAP_INSTALLED=1
     return 0
   fi
+  # A wrapper, comment, or string that merely mentions the private function is
+  # not proof of ownership. Chaining it could recurse into Tirith or let an
+  # unrelated handler impersonate an already-installed hook.
+  [[ "$current" == *"_tirith_debug_trampoline"* ]] && return 1
 
   _TIRITH_PREV_DEBUG_TRAP=""
   if [[ -n "$current" ]]; then
@@ -808,6 +897,19 @@ _tirith_install_debug_trap() {
   builtin trap '_tirith_debug_trampoline' DEBUG || return 1
   _TIRITH_DEBUG_TRAP_INSTALLED=1
   return 0
+}
+
+_tirith_verify_debug_trap_ownership() {
+  _TIRITH_DEBUG_TRAP_OWNERSHIP_OK=0
+  local file="${_TIRITH_DEBUG_OWNERSHIP_FILE:-}"
+  if [[ -n "$file" ]] \
+     && _tirith_read_debug_trap_capture "$file" \
+     && [[ "${_TIRITH_CAPTURED_DEBUG_TRAP_SPEC:-}" == "trap -- '_tirith_debug_trampoline' DEBUG" ]]; then
+    _TIRITH_DEBUG_TRAP_OWNERSHIP_OK=1
+    return 0
+  fi
+  _tirith_session_lost_debug_trap
+  return 1
 }
 
 _tirith_prepare_debug_trap_capture() {
@@ -841,7 +943,21 @@ _tirith_finalize_debug_trap_capture() {
   fi
 
   _TIRITH_DEBUG_TRAP_CAPTURE_READY=1
+  _TIRITH_DEBUG_OWNERSHIP_FILE="$(_tirith_new_capture_file 2>/dev/null)" \
+    || _TIRITH_DEBUG_OWNERSHIP_FILE=""
+  if [[ -z "$_TIRITH_DEBUG_OWNERSHIP_FILE" ]]; then
+    _TIRITH_DEBUG_TRAP_CAPTURE_READY=2
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_ENFORCE=0
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: bash preexec hook was not installed because DEBUG-trap ownership could not be checked safely"
+    return 1
+  fi
   if ! _tirith_install_debug_trap; then
+    _tirith_remove_capture_file "$_TIRITH_DEBUG_OWNERSHIP_FILE" >/dev/null 2>&1 || true
+    _TIRITH_DEBUG_OWNERSHIP_FILE=""
     _TIRITH_DEBUG_TRAP_CAPTURE_READY=2
     _TIRITH_PREEXEC_PHASE="off"
     _TIRITH_PREEXEC_ENFORCE=0
@@ -887,11 +1003,37 @@ _tirith_preexec_prompt_begin() {
   [[ "${_TIRITH_PREEXEC_PHASE:-}" == "off" ]] && return "$previous_status"
   _TIRITH_PREEXEC_PHASE="prompt"
   _TIRITH_PREEXEC_AWAITING_USER=0
+  _TIRITH_DEBUG_TRAP_OWNERSHIP_OK=0
+  _TIRITH_PREEXEC_PROMPT_MUTATED=0
   return "$previous_status"
 }
 
 _tirith_restore_prompt_status() {
   return "${_TIRITH_PREEXEC_PROMPT_STATUS:-0}"
+}
+
+# Run a scalar PROMPT_COMMAND as data inside its own frame. Never splice user
+# text between Tirith's sentinels: an incomplete operator such as `false &&`
+# would otherwise consume the end guard, and `return` could leave Tirith's
+# wrapper before it publishes the next input boundary.
+_tirith_eval_user_prompt_command() {
+  builtin eval -- "$_TIRITH_PREEXEC_USER_PROMPT_COMMAND"
+}
+
+_tirith_run_user_prompt_command() {
+  local previous_status=$?
+  local expected_user_prompt="${_TIRITH_PREEXEC_USER_PROMPT_COMMAND:-}"
+  [[ -n "${_TIRITH_PREEXEC_USER_PROMPT_COMMAND:-}" ]] \
+    || return "$previous_status"
+  _tirith_restore_prompt_status
+  _tirith_eval_user_prompt_command
+  local prompt_rc=$?
+  if [[ "${PROMPT_COMMAND:-}" != "${_TIRITH_PREEXEC_SCALAR_WRAPPER:-}" ]] \
+     || [[ "${_TIRITH_PREEXEC_USER_PROMPT_COMMAND:-}" != "$expected_user_prompt" ]]; then
+    _TIRITH_PREEXEC_PROMPT_MUTATED=1
+    _TIRITH_PREEXEC_USER_PROMPT_COMMAND="$expected_user_prompt"
+  fi
+  return "$prompt_rc"
 }
 
 _tirith_preexec_prompt_end() {
@@ -904,23 +1046,26 @@ _tirith_preexec_prompt_end() {
     _tirith_session_degrade_to_warn_only \
       "tirith: extdebug became enabled by prompt code outside Tirith; enforcement is disabled because user debugger state cannot be safely restored"
   fi
-  # Ownership check. Every prompt cycle fires DEBUG for the sentinels
-  # themselves, so a live Tirith trap has always set the heartbeat by the time
-  # this runs. A cycle with no heartbeat means the trap is no longer ours.
+  # The top-level bootstrap serializes the live DEBUG handler every cycle.
+  # Refuse the next input boundary unless that exact record named Tirith's
+  # canonical trampoline; a writable scalar heartbeat is not ownership proof.
   if [[ "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" == "1" ]]; then
-    if [[ "${_TIRITH_DEBUG_TRAP_WATCH:-0}" == "1" ]] \
-       && [[ "${_TIRITH_DEBUG_TRAP_HEARTBEAT:-0}" != "1" ]]; then
+    if [[ "${_TIRITH_DEBUG_TRAP_OWNERSHIP_OK:-0}" != "1" ]]; then
       _tirith_session_lost_debug_trap
       return "$previous_status"
     fi
-    _TIRITH_DEBUG_TRAP_WATCH=1
+  fi
+  if [[ "${_TIRITH_PREEXEC_PROMPT_GUARDS:-0}" == "1" ]] \
+     && { [[ "${_TIRITH_PREEXEC_PROMPT_MUTATED:-0}" == "1" ]] \
+          || ! _tirith_preexec_prompt_guards_attached; }; then
+    _TIRITH_PREEXEC_PROMPT_GUARDS=0
+    _TIRITH_PREEXEC_PHASE="unbracketed"
+    _tirith_session_degrade_to_warn_only \
+      "tirith: PROMPT_COMMAND changed while the prompt was running; enforcement is disabled before the next input boundary"
+    return "$previous_status"
   fi
   _TIRITH_PREEXEC_PHASE="user"
   _TIRITH_PREEXEC_AWAITING_USER=1
-  # Last write before the next cycle: under `set -T` the trampoline fires for
-  # commands inside this function too, and re-arming earlier would let one of
-  # those fires forge the next cycle's heartbeat.
-  _TIRITH_DEBUG_TRAP_HEARTBEAT=0
   return "$previous_status"
 }
 
@@ -956,9 +1101,7 @@ _tirith_preexec_prompt_guards_attached() {
     [[ "${PROMPT_COMMAND[$((count - 1))]}" == "_tirith_preexec_prompt_end" ]]
     return
   fi
-  [[ "${PROMPT_COMMAND:-}" == "_tirith_preexec_prompt_begin"$'\n'* ]] || return 1
-  [[ "${PROMPT_COMMAND:-}" == "_tirith_preexec_prompt_begin"$'\n'"$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND"$'\n'* ]] || return 1
-  [[ "${PROMPT_COMMAND:-}" == *$'\n'"_tirith_preexec_prompt_end" ]]
+  [[ "${PROMPT_COMMAND:-}" == "${_TIRITH_PREEXEC_SCALAR_WRAPPER:-}" ]]
 }
 
 _tirith_install_preexec_prompt_guards() {
@@ -985,10 +1128,19 @@ _tirith_install_preexec_prompt_guards() {
   else
     local existing="${PROMPT_COMMAND:-}"
     if [[ -n "$existing" ]]; then
-      PROMPT_COMMAND="_tirith_preexec_prompt_begin"$'\n'"$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND"$'\n'"${existing}"$'\n'"_tirith_preexec_prompt_end" 2>/dev/null || return 1
-    else
-      PROMPT_COMMAND="_tirith_preexec_prompt_begin"$'\n'"$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND"$'\n'"_tirith_preexec_prompt_end" 2>/dev/null || return 1
+      _tirith_check_command_syntax "$existing"
+      if [[ "${_TIRITH_SYNTAX_RC:-1}" -ne 0 ]] \
+         || [[ "${_TIRITH_SYNTAX_ERROR:-}" == *"here-document at line"*"delimited by end-of-file"* ]] \
+         || [[ "$existing" == *\\ ]] \
+         || [[ "$existing" == *'<<'* ]]; then
+        unset _TIRITH_SYNTAX_ERROR _TIRITH_SYNTAX_RC
+        return 1
+      fi
+      unset _TIRITH_SYNTAX_ERROR _TIRITH_SYNTAX_RC
     fi
+    _TIRITH_PREEXEC_USER_PROMPT_COMMAND="$existing"
+    _TIRITH_PREEXEC_SCALAR_WRAPPER="_tirith_preexec_prompt_begin"$'\n'"$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND"$'\n'"_tirith_run_user_prompt_command"$'\n'"_tirith_preexec_prompt_end"
+    PROMPT_COMMAND="$_TIRITH_PREEXEC_SCALAR_WRAPPER" 2>/dev/null || return 1
   fi
   _tirith_preexec_prompt_guards_attached || return 1
   _TIRITH_PREEXEC_PROMPT_GUARDS=1
@@ -1586,15 +1738,10 @@ _TIRITH_DEBUG_TRAP_CAPTURE_READY=0
 _TIRITH_CAPTURED_DEBUG_TRAP_SPEC=""
 _TIRITH_DEBUG_TRAP_INSTALLED=0
 _TIRITH_DEBUG_CAPTURE_FILE=""
-# Prompt-boundary proof that Tirith's DEBUG trap is still the installed one.
-# `trap -p DEBUG` reports an empty handler inside a function, so ownership
-# cannot be re-read from `_tirith_preexec_prompt_end`; the trampoline reports
-# itself instead. HEARTBEAT is set on every fire, WATCH arms the check one full
-# prompt cycle after installation so the install cycle is not mistaken for a loss.
-_TIRITH_DEBUG_TRAP_HEARTBEAT=0
-_TIRITH_DEBUG_TRAP_WATCH=0
+_TIRITH_DEBUG_OWNERSHIP_FILE=""
+_TIRITH_DEBUG_TRAP_OWNERSHIP_OK=0
 _TIRITH_PREEXEC_ENFORCE_PENDING=0
-_TIRITH_PREEXEC_BOOTSTRAP_COMMAND='if [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_CAPTURE_FILE" 2>/dev/null; _tirith_finalize_debug_trap_capture; fi; _tirith_restore_prompt_status'
+_TIRITH_PREEXEC_BOOTSTRAP_COMMAND='if [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_CAPTURE_FILE" 2>/dev/null; _tirith_finalize_debug_trap_capture; fi; if [[ "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" == "1" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_OWNERSHIP_FILE" 2>/dev/null; _tirith_verify_debug_trap_ownership; fi; _tirith_restore_prompt_status'
 
 
 if [[ -n "${TIRITH_BASH_MODE:-}" ]]; then
@@ -2197,6 +2344,10 @@ fi
 # Exit summary: show session warnings on shell exit
 _tirith_exit_summary() {
   _tirith_discard_pending_debug_trap_capture
+  if _tirith_capture_file_is_private "${_TIRITH_DEBUG_OWNERSHIP_FILE:-}"; then
+    _tirith_remove_capture_file "$_TIRITH_DEBUG_OWNERSHIP_FILE" >/dev/null 2>&1 || true
+  fi
+  _TIRITH_DEBUG_OWNERSHIP_FILE=""
   local pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
   unset _TIRITH_PENDING_EVAL
   unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
@@ -2247,3 +2398,19 @@ unset _tirith_prev_exit_spec _TIRITH_EXTRACTED_TRAP
 #   "$@" 2>&1 | command tirith view --max-bytes 16777216 -
 # }
 # alias tirith-out='tirith-output-guard-wrap'
+else
+  # A readonly or otherwise hostile POSIXLY_CORRECT can deny the only
+  # grammar-level path to trusted builtin lookup. Skip the entire hook body and
+  # publish no protection claim; an absolute executable is immune to function
+  # and alias shadowing, so the interactive failure remains visible.
+  TIRITH_STATUS=off
+  TIRITH_BASH_EFFECTIVE_MODE=off
+  TIRITH_BASH_EFFECTIVE_PROTECTION=off
+  if [[ $- == *i* ]]; then
+    if [[ -x /usr/bin/printf ]]; then
+      /usr/bin/printf '%s\n' 'tirith: bash hooks disabled because trusted builtin lookup could not be established' >&2
+    elif [[ -x /bin/printf ]]; then
+      /bin/printf '%s\n' 'tirith: bash hooks disabled because trusted builtin lookup could not be established' >&2
+    fi
+  fi
+fi

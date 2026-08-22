@@ -804,6 +804,47 @@ sh -c 'touch {sentinels}/poisoned_leak' BLOCK_TOKEN-internal
 }
 
 #[test]
+fn imported_builtin_functions_cannot_shadow_hook_initialization() {
+    let (_out, stderr, invocations, sentinel_dir) = run_with_sentinels(
+        r#"
+printf 'BUILTIN_TYPES=%s,%s,%s,%s,%s\n' \
+  "$(type -t unset)" "$(type -t builtin)" "$(type -t command)" \
+  "$(type -t shopt)" "$(type -t type)" >&2
+sh -c 'touch {sentinels}/function_shadow_leak' BLOCK_TOKEN-function-shadow
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            (
+                "BASH_FUNC_unset%%",
+                "() { _TIRITH_BASH_INTERNAL=1; return 0; }",
+            ),
+            ("BASH_FUNC_declare%%", "() { return 0; }"),
+            ("BASH_FUNC_builtin%%", "() { return 0; }"),
+            ("BASH_FUNC_command%%", "() { return 0; }"),
+            ("BASH_FUNC_shopt%%", "() { return 0; }"),
+            ("BASH_FUNC_type%%", "() { return 0; }"),
+        ],
+    );
+
+    assert!(
+        stderr.contains("BUILTIN_TYPES=builtin,builtin,builtin,builtin,builtin"),
+        "the grammar-level bootstrap must purge every critical function override: {stderr}"
+    );
+    assert!(
+        !sentinel_path(&sentinel_dir, "function_shadow_leak").exists(),
+        "imported builtin shadows bypassed enforcement; invocations={invocations:#?}, stderr={stderr}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|line| line.contains("BLOCK_TOKEN-function-shadow")),
+        "the blocked command must still reach Tirith: {invocations:#?}"
+    );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
 fn exported_decision_cache_cannot_preseed_an_allow() {
     // The per-line decision cache is keyed on a small integer (`BASH_LINENO`),
     // so a guessable pre-seeded `allow` must not survive into the session. Try
@@ -829,10 +870,10 @@ sh -c 'touch {sentinels}/cache_leak' BLOCK_TOKEN-cache
 }
 
 #[test]
-fn exported_hook_state_is_cleared_but_session_local_state_is_kept() {
-    // Only the ENVIRONMENT copy is untrusted. A value assigned inside the
-    // session (no export) is the shell's own state and must survive, which is
-    // what keeps the `_TIRITH_TEST_*` overrides and in-shell latches working.
+fn private_hook_state_is_reset_even_when_preseeded_in_the_session() {
+    // Private decision/latch values are not configuration. A startup file can
+    // assign them without export, so a fresh hook load must reset both shell
+    // and environment copies before any security decision reads them.
     let hook = hook_path();
     let (_out, stderr, _inv) = run_bash_script(
         format!(
@@ -859,9 +900,9 @@ printf 'INTERNAL=[%s] LASTKEY=[%s] PREVTRAP=[%s] WARNED=[%s]\n' \
     // the scan path restores it to its captured previous value. What matters is
     // that the inherited `1` is gone and nothing re-exports it.
     assert!(
-        stderr.contains("INTERNAL=[0] LASTKEY=[] PREVTRAP=[] WARNED=[session_local]")
-            || stderr.contains("INTERNAL=[] LASTKEY=[] PREVTRAP=[] WARNED=[session_local]"),
-        "inherited hook state must be dropped while session-local state is preserved, got: {stderr}"
+        stderr.contains("INTERNAL=[0] LASTKEY=[] PREVTRAP=[] WARNED=[1]")
+            || stderr.contains("INTERNAL=[] LASTKEY=[] PREVTRAP=[] WARNED=[1]"),
+        "all preseeded private state must be replaced by this load's values, got: {stderr}"
     );
 }
 
@@ -999,6 +1040,173 @@ sh -c 'touch {{sentinels}}/after_trap_theft' BLOCK_TOKEN-trap-theft
             stderr.contains("protection is OFF for this shell")
                 && stderr.contains("replaced or removed Tirith's DEBUG trap"),
             "{tamper:?} must announce the loss of interception, got: {stderr}"
+        );
+        let _ = fs::remove_dir_all(&sentinel_dir);
+    }
+}
+
+#[test]
+fn trap_loss_is_published_before_the_next_user_line_is_accepted() {
+    for tamper in [
+        "trap ':' DEBUG",
+        "trap '_TIRITH_DEBUG_TRAP_HEARTBEAT=1' DEBUG",
+    ] {
+        let (_out, stderr, _inv, sentinel_dir) = run_with_sentinels(
+            &format!(
+                r#"
+{tamper}
+printf 'AT_NEXT_INPUT_PROT=%s STATUS=%s\n' "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" >&2; touch {{sentinels}}/after_loss
+"#
+            ),
+            &[
+                ("TIRITH_BASH_MODE", "preexec"),
+                ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            ],
+        );
+        assert!(
+            stderr.contains("protection is OFF for this shell")
+                && stderr.contains("AT_NEXT_INPUT_PROT=off STATUS=degraded"),
+            "{tamper:?} must be detected at the prompt boundary, before the next input runs: {stderr}"
+        );
+        let _ = fs::remove_dir_all(&sentinel_dir);
+    }
+}
+
+#[test]
+fn trampoline_name_in_existing_trap_is_not_ownership_proof() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+trap ': # _tirith_debug_trampoline' DEBUG
+source '{hook}'
+printf 'MENTION_PROT=%s STATUS=%s ENFORCE=%s\n' \
+  "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" "$_TIRITH_PREEXEC_ENFORCE" >&2
+trap -p DEBUG >&2
+"#
+    );
+    let (_stdout, stderr, _invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+    assert!(
+        stderr.contains("MENTION_PROT=off STATUS=degraded ENFORCE=0")
+            && stderr.contains("could not be chained safely")
+            && stderr.contains("trap -- ': # _tirith_debug_trampoline' DEBUG"),
+        "a substring match must neither claim nor replace DEBUG ownership: {stderr}"
+    );
+}
+
+#[test]
+fn malformed_scalar_prompt_commands_are_never_spliced_into_guards() {
+    for prompt_command in [
+        "false &&",
+        "true ||",
+        "|",
+        "printf continued \\",
+        "printf '",
+        "cat <<TIRITH_UNTERMINATED_HEREDOC",
+    ] {
+        let hook = hook_path();
+        let script = format!(
+            "PROMPT_COMMAND={}\nsource '{}'\nprintf 'MALFORMED_PROT=%s STATUS=%s ENFORCE=%s GUARDS=%s\\n' \"$TIRITH_BASH_EFFECTIVE_PROTECTION\" \"$TIRITH_STATUS\" \"$_TIRITH_PREEXEC_ENFORCE\" \"$_TIRITH_PREEXEC_PROMPT_GUARDS\" >&2\n",
+            shell_escape(prompt_command),
+            hook,
+        );
+        let (_stdout, stderr, _invocations) = run_bash_script(
+            &script,
+            &[
+                ("TIRITH_BASH_MODE", "preexec"),
+                ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            ],
+        );
+        assert!(
+            stderr.contains("MALFORMED_PROT=off STATUS=degraded ENFORCE=0 GUARDS=0")
+                && stderr.contains("safely bracketed"),
+            "malformed scalar {prompt_command:?} must be preserved but refused before guard publication: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn scalar_prompt_return_cannot_skip_the_end_guard() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+PROMPT_COMMAND='return 7'
+source '{hook}'
+printf 'RETURN_PROT=%s STATUS=%s ENFORCE=%s GUARDS=%s\n' \
+  "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" \
+  "$_TIRITH_PREEXEC_ENFORCE" "$_TIRITH_PREEXEC_PROMPT_GUARDS" >&2
+"#
+    );
+    let (_stdout, stderr, _invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+    assert!(
+        stderr.contains("RETURN_PROT=blocks STATUS=blocks ENFORCE=1 GUARDS=1"),
+        "return must end only the user prompt frame, not Tirith's wrapper: {stderr}"
+    );
+}
+
+#[test]
+fn scalar_prompt_mutation_degrades_before_next_input() {
+    let hook = hook_path();
+    let script = format!(
+        r#"
+PROMPT_COMMAND='PROMPT_COMMAND=:'; source '{hook}'
+:
+printf 'MUTATION_PROT=%s STATUS=%s ENFORCE=%s GUARDS=%s\n' \
+  "$TIRITH_BASH_EFFECTIVE_PROTECTION" "$TIRITH_STATUS" \
+  "$_TIRITH_PREEXEC_ENFORCE" "$_TIRITH_PREEXEC_PROMPT_GUARDS" >&2
+"#
+    );
+    let (_stdout, stderr, _invocations) = run_bash_script(
+        &script,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+    assert!(
+        stderr.contains("PROMPT_COMMAND changed while the prompt was running")
+            && stderr.contains("MUTATION_PROT=warn-only STATUS=degraded ENFORCE=0 GUARDS=0"),
+        "prompt mutation must be visible before the next line is accepted: {stderr}"
+    );
+}
+
+#[test]
+fn alias_expansion_cannot_authenticate_from_inert_text() {
+    for invocation in [
+        "go # sh bash",
+        "go \"unused sh bash\"",
+        "go unused sh bash",
+        "go <<'TIRITH_ALIAS_EOF'\nsh bash\nTIRITH_ALIAS_EOF",
+    ] {
+        let script = format!(
+            "\nshopt -s expand_aliases\nalias go=\"sh -c 'touch {{sentinels}}/alias_drift_leak' BLOCK_TOKEN-alias\"\neval {}\n",
+            shell_escape(invocation),
+        );
+        let (_out, stderr, _invocations, sentinel_dir) = run_with_sentinels(
+            &script,
+            &[
+                ("TIRITH_BASH_MODE", "preexec"),
+                ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            ],
+        );
+        assert!(
+            !sentinel_path(&sentinel_dir, "alias_drift_leak").exists(),
+            "inert text authenticated alias expansion {invocation:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("history no longer matches BASH_COMMAND"),
+            "alias drift {invocation:?} must fail closed instead of matching inert tokens: {stderr}"
         );
         let _ = fs::remove_dir_all(&sentinel_dir);
     }

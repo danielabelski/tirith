@@ -196,14 +196,21 @@ an already-enabled `extdebug`) is covered by the `capability_*` tests in
 
 Preexec enforcement keeps `extdebug` off for allowed lines and enables it
 lazily only after a complete typed-line block decision. Exact prompt-boundary
-guards bracket existing scalar entries and Bash 5.1+ arrays, preserving their
-order and the previous command status. Older Bash preserves arrays unchanged
-and leaves interception off because it cannot execute both guards. A sourced
+guards execute an existing scalar as data inside a dedicated function frame,
+and bracket Bash 5.1+ arrays, preserving their order and the previous command
+status. Incomplete scalar syntax and heredocs are refused rather than spliced
+into guard syntax; `return` cannot skip the end guard, and prompt mutation is
+published as a downgrade before the next input boundary. Older Bash preserves
+arrays unchanged and leaves interception off because it cannot execute both
+guards. A sourced
 hook truthfully reports protection `off` until the first prompt captures a
 caller-owned DEBUG trap at top level; that prompt publishes `warn-only` (or
 `blocks` for requested enforcement) before accepting more input. The
-conformance test covers both sides of that transition, noisy existing traps,
-and exact chaining.
+conformance test covers both sides of that transition, exact per-prompt trap
+ownership records, noisy existing traps, and exact chaining. Startup first
+purges security-critical imported Bash functions using POSIX special-builtin
+precedence, so exported `unset`, `builtin`, `command`, `declare`, `type`, or
+`shopt` functions cannot suppress initialization or fake a blocking state.
 The DEBUG trampoline uses
 structural call depth, not a function-name allowlist: prompt/startup execution
 is excluded by phase, while nested fires reuse the top-level decision and do
