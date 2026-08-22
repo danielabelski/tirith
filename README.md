@@ -726,16 +726,16 @@ tirith setup copilot-cli              # GitHub Copilot CLI (run from repo root)
 tirith setup cursor                   # Cursor
 tirith setup gemini-cli --with-mcp    # Gemini CLI + MCP server
 tirith setup kiro                     # Kiro CLI (formerly Amazon Q)
-tirith setup pi-cli                   # Pi CLI
+tirith setup pi-cli                   # Pi CLI: blocking tool_call guard
 tirith setup grok-build               # Grok Build MCP + POSIX PreToolUse hook
-tirith setup omp                      # OMP / Oh My Pi MCP tools
+tirith setup omp                      # OMP / Oh My Pi: blocking tool_call guard + MCP
 tirith setup opencode                 # OpenCode MCP tools
 tirith setup fx                       # Vercel Labs fx MCP tools (trusted user profile)
-tirith setup prime-agent              # Prime Agent generic MCP tools (user scope)
-tirith setup cline                    # Cline MCP tools (user scope)
+tirith setup prime-agent              # Prime Agent: blocking guard (bash + ipython) + MCP
+tirith setup cline                    # Cline: blocking PreToolUse hook + MCP (user scope)
 tirith setup roo-code                 # Roo Code MCP tools (project scope)
 tirith setup continue                 # Continue MCP tools (project scope)
-tirith setup openhands                # OpenHands CLI MCP tools (user scope)
+tirith setup openhands                # OpenHands: MCP (user) / blocking hook (--scope project)
 tirith setup vscode                   # VS Code
 tirith setup windsurf                 # Windsurf
 ```
