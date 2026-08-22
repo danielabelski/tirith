@@ -86,6 +86,8 @@ jobs:
           node-version: "22.17.0"
       - name: OpenClaw shell resolver contract
         run: node tests/openclaw-shell-resolver.mjs
+      - name: IPython execution-vector extraction contract
+        run: node tests/ipython-vector-extraction.mjs
       - name: Install interactive shell conformance dependencies
         if: matrix.name == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes fish zsh

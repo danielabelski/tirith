@@ -1,10 +1,23 @@
-# Agent MCP integrations
+# Agent integrations
 
-Tirith can register its stdio MCP server with several agents. MCP makes
-Tirith's check and scan tools available to the agent; it does **not** force the
-agent to call Tirith before a shell command or file operation. Grok Build is the
-one integration on this page that also receives a documented `PreToolUse` hook
-on POSIX systems.
+Tirith registers its stdio MCP server with several agents, and installs a
+blocking pre-execution hook wherever the host documents one.
+
+The distinction matters. MCP makes Tirith's check and scan tools *available* to
+the agent; it does **not** force the agent to call Tirith before running a
+shell command. A pre-execution hook does: the host asks Tirith first and
+honours a refusal. Where a host offers both, setup installs both, and it writes
+the hook **before** the MCP entry so that a partial failure leaves the half that
+can refuse a command.
+
+Hosts with a blocking hook (POSIX only): Grok Build, Pi CLI, Prime Agent, OMP,
+Cline, and OpenHands. The remaining clients on this page are MCP only, and say
+so in the table.
+
+Two of these hosts fail **open** on their own side: Grok Build and OpenHands
+both let the tool run when a hook errors or times out. Tirith's adapter is
+fail-closed (it denies on its own errors unless `TIRITH_FAIL_OPEN=1`), but it
+cannot compensate for a host that ignores a crashed hook.
 
 Every setup command stores the validated absolute path of the running `tirith`
 binary. Existing unrelated configuration is preserved, writes are contained
@@ -13,17 +26,17 @@ private, and `--dry-run`, `--force`, and repeat runs are supported.
 
 ## Supported clients
 
-| Client | Setup command | Supported scope and config | Verification |
-|---|---|---|---|
-| Grok Build | `tirith setup grok-build` | Project: `<invocation-cwd>/.grok/config.toml` plus trusted `<git-root>/.grok/hooks/tirith.json`; user: `$GROK_HOME`, otherwise `~/.grok` | `grok mcp doctor tirith`; `/hooks` |
-| OMP (Oh My Pi) | `tirith setup omp` | User only. Root: `~/${PI_CONFIG_DIR:-.omp}`; named profile: `<root>/profiles/<name>/agent/mcp.json`; default: `$PI_CODING_AGENT_DIR/mcp.json`, otherwise `<root>/agent/mcp.json` | `/mcp test tirith` |
-| OpenCode | `tirith setup opencode` | Project: the rootmost existing project `.opencode/opencode.json(c)`, otherwise the invocation directory's `opencode.json(c)`; user: `$OPENCODE_CONFIG_DIR/opencode.json(c)`, then `$OPENCODE_CONFIG`, otherwise `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json(c)` | `opencode mcp list` |
-| Vercel Labs fx | `tirith setup fx` | Trusted user profile only: `~/.fx/mcp.json` | `/mcp reload`, then `/mcp list` |
-| Prime Agent | `tirith setup prime-agent` | User only: non-empty `$PRIME_AGENT_CODING_AGENT_DIR/settings.json`, otherwise `~/.prime/agent/settings.json`; exact `~` and `~/...` values expand from HOME | `prime-agent mcp get tirith` |
-| Cline | `tirith setup cline` | User only: `$CLINE_MCP_SETTINGS_PATH`; then `$CLINE_DATA_DIR/settings/cline_mcp_settings.json`; then `$CLINE_DIR/data/settings/cline_mcp_settings.json`; otherwise `~/.cline/data/settings/cline_mcp_settings.json` | Restart Cline and open MCP Servers |
-| Roo Code | `tirith setup roo-code` | Project only: `<cwd>/.roo/mcp.json`; run setup from the intended workspace root | Confirm `tirith` is connected in MCP Servers |
-| Continue | `tirith setup continue` | Project-owned block only: `<cwd>/.continue/mcpServers/tirith.yaml`; run setup from the intended workspace root | Switch to Agent mode and confirm Tirith tools are present |
-| OpenHands CLI | `tirith setup openhands` | User only: non-empty absolute `$OPENHANDS_PERSISTENCE_DIR/mcp.json` without surrounding whitespace, otherwise `~/.openhands/mcp.json` when unset | `openhands mcp get tirith`; restart active conversations |
+| Client | Enforcement | Setup command | Supported scope and config | Verification |
+|---|---|---|---|---|
+| Grok Build | Hook + MCP | `tirith setup grok-build` | Project: `<invocation-cwd>/.grok/config.toml` plus trusted `<git-root>/.grok/hooks/tirith.json`; user: `$GROK_HOME`, otherwise `~/.grok` | `grok mcp doctor tirith`; `/hooks` |
+| OMP (Oh My Pi) | Hook + MCP | `tirith setup omp` | User only. Root: `~/${PI_CONFIG_DIR:-.omp}`; named profile: `<root>/profiles/<name>/agent/mcp.json`; default: `$PI_CODING_AGENT_DIR/mcp.json`, otherwise `<root>/agent/mcp.json`. Guard: `<root>/hooks/pre/tirith-guard.ts` | `/mcp test tirith` |
+| OpenCode | MCP only | `tirith setup opencode` | Project: the rootmost existing project `.opencode/opencode.json(c)`, otherwise the invocation directory's `opencode.json(c)`; user: `$OPENCODE_CONFIG_DIR/opencode.json(c)`, then `$OPENCODE_CONFIG`, otherwise `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json(c)` | `opencode mcp list` |
+| Vercel Labs fx | MCP only | `tirith setup fx` | Trusted user profile only: `~/.fx/mcp.json` | `/mcp reload`, then `/mcp list` |
+| Prime Agent | Hook + MCP | `tirith setup prime-agent` | User only: non-empty `$PRIME_AGENT_CODING_AGENT_DIR/settings.json`, otherwise `~/.prime/agent/settings.json`; exact `~` and `~/...` values expand from HOME. Guard: `<agent dir>/extensions/tirith-guard.ts` | `prime-agent mcp get tirith` |
+| Cline | Hook + MCP | `tirith setup cline` | User only: `$CLINE_MCP_SETTINGS_PATH`; then `$CLINE_DATA_DIR/settings/cline_mcp_settings.json`; then `$CLINE_DIR/data/settings/cline_mcp_settings.json`; otherwise `~/.cline/data/settings/cline_mcp_settings.json`. Hook: `~/Documents/Cline/Hooks/PreToolUse` | Restart Cline, enable hooks in settings, open MCP Servers |
+| Roo Code | MCP only | `tirith setup roo-code` | Project only: `<cwd>/.roo/mcp.json`; run setup from the intended workspace root | Confirm `tirith` is connected in MCP Servers |
+| Continue | MCP only | `tirith setup continue` | Project-owned block only: `<cwd>/.continue/mcpServers/tirith.yaml`; run setup from the intended workspace root | Switch to Agent mode and confirm Tirith tools are present |
+| OpenHands CLI | Hook (project) + MCP (user) | `tirith setup openhands` | User only: non-empty absolute `$OPENHANDS_PERSISTENCE_DIR/mcp.json` without surrounding whitespace, otherwise `~/.openhands/mcp.json` when unset. Project scope installs `<git-root>/.openhands/hooks.json` | `openhands mcp get tirith`; restart active conversations |
 
 Use `--scope user` for Grok Build or OpenCode when a user-wide
 registration is wanted. The other commands select their only safe documented
@@ -116,6 +129,45 @@ is therefore a useful blocking layer, not a standalone security boundary. On
 Windows, Tirith installs only the MCP registration until Grok exposes a
 shell-grammar signal that setup can verify.
 
+### The Pi-family guard
+
+Pi CLI, Prime Agent, and OMP expose the same blocking `tool_call` event and the
+same `{ block: true, reason }` veto, so they install one shared extension that
+differs only in the integration label it reports. Prime and OMP additionally
+block when the handler *throws*, which makes a guard crash fail closed on those
+two hosts.
+
+Prime Agent also exposes an `ipython` tool, and a notebook cell can reach a
+shell through several syntaxes at once. The guard extracts **every** vector in
+a cell rather than stopping at the first: `!cmd`, `!!cmd`, `x = !cmd`,
+`%system` / `%sx`, the `%%bash` / `%%sh` / `%%script <shell>` cell magics, and
+the Python-level `os.*`, `subprocess.*`, and `pty.spawn` calls, including the
+aliased forms `import subprocess as sp` and `from os import system`. Comments
+and string bodies are lexed rather than pattern-matched, so a commented-out
+call is not a vector and a `#` inside a string does not truncate a line.
+
+All recovered commands are joined into one newline-separated script and sent to
+`tirith check` in a single call, so the engine makes every security decision and
+the extension makes none. A vector whose command is computed at runtime
+(`os.system(user_input)`) cannot be shown to the engine; it is reported rather
+than dropped, and `TIRITH_HOOK_WARN_ACTION=deny` refuses the cell outright.
+
+`tests/ipython-vector-extraction.mjs` runs the exact shipped bytes of the guard
+against every syntax above.
+
+### Cline and OpenHands
+
+Neither host can pass environment to a hook: Cline runs a bare executable named
+exactly `PreToolUse`, and an OpenHands hook definition has no `env` field. Both
+therefore get a small generated `#!/bin/sh` wrapper that `exec`s the shared
+adapter with the right protocol baked in, installed alongside it and mode 0755.
+
+Cline hooks are inert until hooks are enabled in Cline's settings, and Cline's
+own hook runner is Unix-only. OpenHands reads `.openhands/hooks.json` from the
+repository it is working on, so its hook is installed by `--scope project` and
+should be committed; `--scope user` remains MCP only. An OpenHands denial exits
+2, which is the only exit code that host treats as a block.
+
 Repository-local MCP files also execute the configured command when the agent
 loads that project. Review project configuration before trusting a repository.
 Tirith setup never adds an automatic-approval list for its MCP tools.
@@ -134,13 +186,12 @@ or whitespace-literal registry; unset the variable to select `~/.openhands`.
 
 | Client or capability | Status | Reason |
 |---|---|---|
-| OMP project scope | Deferred; profile-aware user MCP is supported above | OMP deep-merges project settings from multiple built-in and provider-specific discovery roots. A later provider can set `mcp.enableProjectConfig: false`, so writing only `.omp/mcp.json` cannot guarantee an effective registration. |
+| OMP project scope | Deferred; profile-aware user MCP and the user-scope guard are supported above | OMP deep-merges project settings from multiple built-in and provider-specific discovery roots. A later provider can set `mcp.enableProjectConfig: false`, so writing only `.omp/mcp.json` cannot guarantee an effective registration. |
 | Goose | Deferred for automated setup | Goose documents stdio extensions in shared `~/.config/goose/config.yaml`, but safely editing arbitrary YAML while preserving comments, anchors, duplicate-key diagnostics, and unrelated extension state needs a dedicated contained YAML merger. Tirith does not reserialize that user file. |
 | Aider | Unsupported | Current Aider documentation exposes model/tool configuration but no native MCP client registry or blocking pre-tool hook suitable for Tirith setup. |
-| Cline `PreToolUse` hook | Deferred; Cline MCP is supported above | Cline has a blocking hook protocol, but current official pages disagree on legacy/current hook directories and enablement remains host-managed. Setup does not install a hook that might be present but disabled. |
 | Roo Code blocking hook | MCP only | Roo's stable project MCP file is documented; no equivalent stable blocking pre-tool setup contract was found. |
 | Continue user-global YAML mutation | Project block supported above | Continue supports a dedicated workspace MCP-block directory, which lets Tirith own one file. Its global `config.yaml` may contain anchors, comments, and secret references, so setup leaves it untouched. |
-| OpenHands project scope | User MCP supported above | OpenHands CLI 1.x documents `~/.openhands/mcp.json`; setup does not invent a repository-local path. |
+| OpenHands user-scope hooks | Project-scope hooks supported above | OpenHands reads hooks from `.openhands/hooks.json` in the repository it is working on. There is no documented user-level hooks file, so `--scope user` remains MCP only. |
 
 ## Primary contracts
 

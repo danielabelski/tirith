@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Claude Code / Grok Build PreToolUse hook for shell tool calls.
+"""Pre-tool-use hook for shell tool calls, for every host that runs a command.
 
 Reads JSON from stdin, extracts the command, and delegates to
 `tirith check --json` for security analysis. Claude Code is the default wire
-format; setup sets TIRITH_HOOK_PROTOCOL=grok-build for Grok's documented
-camelCase event and decision format.
+format; setup sets TIRITH_HOOK_PROTOCOL to select another host's event names,
+decision envelope, and exit-code contract:
+
+  claude-code (default) — PreToolUse/Bash, {"hookSpecificOutput": {...}}, exit 0
+  grok-build            — pre_tool_use/run_terminal_command, {"decision": ...}
+  cline                 — PreToolUse/execute_command, {"cancel": bool, ...}
+  openhands             — pre_tool_use/terminal, {"decision": ...} and exit 2
+                          on deny, because OpenHands treats any exit code other
+                          than 0 or 2 as an error and lets the tool proceed.
 
 Exit codes:
   0 — hook completed successfully (decision in stdout JSON)
@@ -21,7 +28,8 @@ Output (stdout):
 
 Environment:
   TIRITH_BIN              — path to tirith binary (default: "tirith")
-  TIRITH_HOOK_PROTOCOL    — "claude-code" (default) or "grok-build"
+  TIRITH_HOOK_PROTOCOL    — "claude-code" (default), "grok-build", "cline",
+                            or "openhands"
   TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny"
 """
 
@@ -46,8 +54,10 @@ def protocol():
 
 
 def decision(action, reason=None):
-    """Print one host-native PreToolUse decision and exit successfully."""
-    if protocol() == "grok-build":
+    """Print one host-native PreToolUse decision and exit with its own code."""
+    proto = protocol()
+    exit_code = 0
+    if proto == "grok-build":
         output = {"decision": action}
         if action == "deny" and reason:
             output["reason"] = reason
@@ -57,6 +67,29 @@ def decision(action, reason=None):
             # learn why the command was flagged. Grok surfaces hook stderr, so
             # send the finding there rather than dropping it.
             print(reason, file=sys.stderr)
+    elif proto == "cline":
+        # Cline reads `cancel`, and shows `errorMessage` when it is true.
+        output = {"cancel": action == "deny"}
+        if reason:
+            if action == "deny":
+                output["errorMessage"] = reason
+            else:
+                # A warn-allow has no error to show, but `contextModification`
+                # is delivered to the agent, so the finding is not lost.
+                output["contextModification"] = reason
+    elif proto == "openhands":
+        # OpenHands treats exit 2 as the block and lets the JSON `decision`
+        # override the exit code. Anything OTHER than 0 or 2 is an error, and
+        # an error lets the operation proceed, so a deny must exit exactly 2.
+        output = {"decision": "deny" if action == "deny" else "allow"}
+        if reason:
+            if action == "deny":
+                output["reason"] = reason
+                exit_code = 2
+            else:
+                output["additionalContext"] = reason
+        elif action == "deny":
+            exit_code = 2
     else:
         specific = {
             "hookEventName": "PreToolUse",
@@ -68,7 +101,7 @@ def decision(action, reason=None):
                 specific["additionalContext"] = reason
         output = {"hookSpecificOutput": specific}
     print(json.dumps(output))
-    sys.exit(0)
+    sys.exit(exit_code)
 
 
 def deny(reason):
@@ -150,14 +183,30 @@ def main():
         return
 
     # Dual-case field extraction (camelCase and snake_case)
+    proto = protocol()
     event = get(data, "hook_event_name", "hookEventName")
     tool = get(data, "tool_name", "toolName")
     tool_input = get(data, "tool_input", "toolInput") or {}
 
-    # Grok's native envelope uses pre_tool_use/run_terminal_command while its
-    # Claude-compatible matcher is named PreToolUse/Bash. Accept both only
-    # when setup explicitly selected the Grok protocol.
-    if protocol() == "grok-build":
+    if proto == "cline":
+        # Cline nests the tool under `preToolUse` and names the shell tool
+        # `execute_command`, with the command in `parameters`.
+        event = get(data, "hookName") or event
+        pre = get(data, "preToolUse") or {}
+        if isinstance(pre, dict):
+            tool = get(pre, "toolName") or tool
+            tool_input = get(pre, "parameters") or {}
+        is_shell_pretool = event == "PreToolUse" and tool == "execute_command"
+    elif proto == "openhands":
+        # OpenHands names the shell tool `terminal` and accepts both the
+        # snake_case event key and the Claude-compatible CamelCase one.
+        is_shell_pretool = event in ("pre_tool_use", "PreToolUse") and tool in (
+            "terminal",
+            "Bash",
+        )
+    elif proto == "grok-build":
+        # Grok's native envelope uses pre_tool_use/run_terminal_command while
+        # its Claude-compatible matcher is named PreToolUse/Bash.
         is_shell_pretool = event in ("pre_tool_use", "PreToolUse") and tool in (
             "run_terminal_command",
             "Bash",
@@ -180,7 +229,7 @@ def main():
     tirith_bin = os.environ.get("TIRITH_BIN") or shutil.which("tirith") or "tirith"
 
     env = os.environ.copy()
-    env["TIRITH_INTEGRATION"] = protocol()
+    env["TIRITH_INTEGRATION"] = proto
 
     try:
         result = subprocess.run(
