@@ -32,6 +32,8 @@ Environment:
   TIRITH_HOOK_PROTOCOL    — "claude-code" (default), "grok-build", "cline",
                             or "openhands"
   TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny"
+  TIRITH_HOOK_UNRESOLVED_ACTION — "deny" (default) or "warn" when OpenHands
+                            sends input to an unknown persistent process
 """
 
 import json
@@ -48,6 +50,7 @@ MAX_COMMANDS = 16
 MAX_COMMAND_BYTES = 1024 * 1024
 MAX_ANALYSES = 48
 CHECK_BUDGET_SECONDS = 10.0
+OPENHANDS_SAFE_PROCESS_CONTROLS = frozenset(("C-c", "C-d", "C-z"))
 
 
 def get(data, *keys):
@@ -131,6 +134,36 @@ def fail_closed(reason):
         deny(reason)
     else:
         sys.exit(0)
+
+
+def unresolved_action():
+    """Return the action for execution whose real interpreter is unavailable."""
+    if os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower() == "deny":
+        return "deny"
+    value = os.environ.get("TIRITH_HOOK_UNRESOLVED_ACTION", "deny").lower()
+    if value in ("deny", "warn"):
+        return value
+    print(
+        "tirith: warning: unrecognized TIRITH_HOOK_UNRESOLVED_ACTION="
+        f"{value!r}, defaulting to 'deny'",
+        file=sys.stderr,
+    )
+    return "deny"
+
+
+def unresolved(reason):
+    """Deny an uninspectable execution path, or visibly apply the opt-out."""
+    _hook_event("unresolved_vector", reason)
+    if unresolved_action() == "warn":
+        decision(
+            "allow",
+            reason
+            + " — allowed by TIRITH_HOOK_UNRESOLVED_ACTION=warn; the input was not inspected",
+        )
+    deny(
+        reason
+        + " — blocked; set TIRITH_HOOK_UNRESOLVED_ACTION=warn to opt out"
+    )
 
 
 def _hook_event(event, detail=None):
@@ -377,6 +410,24 @@ def main():
         command_specs = cline_commands
     else:
         command = tool_input.get("command")
+        if proto == "openhands":
+            is_input = tool_input.get("is_input", False)
+            if not isinstance(is_input, bool):
+                fail_closed("tirith: OpenHands is_input must be a boolean — blocked for safety")
+                return
+            if is_input:
+                if not isinstance(command, str):
+                    fail_closed("tirith: OpenHands process input must be a string — blocked for safety")
+                    return
+                if command == "" or command in OPENHANDS_SAFE_PROCESS_CONTROLS:
+                    # An empty input only polls for output. These exact control
+                    # tokens interrupt, suspend, or close the process; unlike a
+                    # newline, none can complete buffered executable text.
+                    decision("allow")
+                unresolved(
+                    "tirith: OpenHands process input targets a persistent process "
+                    "whose interpreter is not present in the hook event"
+                )
         if not isinstance(command, str) or not command.strip():
             fail_closed("tirith: no command found in hook input — blocked for safety")
             return

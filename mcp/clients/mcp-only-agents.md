@@ -207,6 +207,15 @@ repository already has survive. The hook command is shell-quoted, because
 OpenHands runs it through a shell. A denial exits 2, the only exit code that
 host treats as a block; any other non-zero exit is logged and the tool runs.
 
+OpenHands can also send `is_input=true` text directly to a process left running
+by an earlier terminal call. That event does not identify whether the process
+is a shell, Python, Node, a debugger, or something else, so treating the text
+as a new POSIX command would inspect the wrong language. Tirith blocks non-empty
+persistent-process input by default. Empty output polls and the exact `C-c`,
+`C-d`, and `C-z` control tokens remain available; a newline is blocked because
+it can execute already buffered input. `TIRITH_HOOK_UNRESOLVED_ACTION=warn`
+explicitly opts out and surfaces the limitation in `additionalContext`.
+
 Repository-local MCP files also execute the configured command when the agent
 loads that project. Review project configuration before trusting a repository.
 Tirith setup never adds an automatic-approval list for its MCP tools.
