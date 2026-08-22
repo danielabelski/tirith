@@ -90,13 +90,14 @@ const MAX_EXEC_ARGUMENTS = 4096;
  *
  * @typedef {object} KernelBindings
  * @property {Map<string, string>} moduleAlias local name -> os | subprocess | pty
- * @property {Set<string>} bareExec names bound by `from os import system` and friends
+ * @property {Map<string, {module: string, member: string}>} bareExec
+ *   local name -> canonical execution API bound by `from os import ...`
  * @property {Set<string>} ipythonAlias names bound by `ip = get_ipython()`
  */
 
 /** @returns {KernelBindings} */
 export function createBindings() {
-  return { moduleAlias: new Map(), bareExec: new Set(), ipythonAlias: new Set() };
+  return { moduleAlias: new Map(), bareExec: new Map(), ipythonAlias: new Set() };
 }
 
 const SHELL_CELL_MAGIC = /^\s*%%(bash|sh|script)\b(.*)$/;
@@ -113,16 +114,23 @@ const SCRIPT_FLAG_OPTIONS = new Set(["--bg", "--no-raise-error", "--raise-error"
  * transformer accepts `name`, `name.attr`, and `name[index]` on the left, so
  * the same shapes are accepted here. `!(?!=)` keeps `a != b` a comparison.
  */
-const BANG_LINE = /^\s*(?:[A-Za-z_]\w*(?:\.\w+|\[[^\]]*\])*\s*=\s*)?!{1,2}(?!=)(.*)$/;
+const PY_IDENTIFIER_SOURCE = String.raw`[_\p{ID_Start}][_\p{ID_Continue}]*`;
+const BANG_LINE = new RegExp(
+  String.raw`^\s*(?:${PY_IDENTIFIER_SOURCE}(?:\.${PY_IDENTIFIER_SOURCE}|\[[^\]]*\])*\s*=\s*)?!{1,2}(?!=)(.*)$`,
+  "u",
+);
 /** `%system cmd`, `%sx cmd`, and their assignment forms. */
-const SYSTEM_MAGIC = /^\s*(?:[A-Za-z_]\w*(?:\.\w+|\[[^\]]*\])*\s*=\s*)?%(?:system|sx)\s+(.*)$/;
-/** Any other line magic: not Python, and not a shell vector either. */
-const OTHER_MAGIC = /^\s*%{1,2}\w/;
+const SYSTEM_MAGIC = new RegExp(
+  String.raw`^\s*(?:${PY_IDENTIFIER_SOURCE}(?:\.${PY_IDENTIFIER_SOURCE}|\[[^\]]*\])*\s*=\s*)?%(?:system|sx)\s+(.*)$`,
+  "u",
+);
+/** Any other magic can run a built-in or user-defined executor. */
+const OTHER_MAGIC = /^\s*%{1,2}[_\p{ID_Start}]/u;
 /**
  * IPython expands `{expr}` and `$name` / `${name}` inside a shell escape before
  * running it. Either makes the command a runtime value.
  */
-const IPYTHON_EXPANSION = /\{[^{}]*\}|\$\{?[A-Za-z_]/;
+const IPYTHON_EXPANSION = /\{[^{}]*\}|\$\{?[_\p{ID_Start}]/u;
 
 /** `os` members that take ONE command string. */
 const OS_COMMAND = new Set(["system", "popen"]);
@@ -165,9 +173,10 @@ function execNamesFor(module) {
  * @param {number} start
  * @param {boolean} raw
  * @param {boolean} formatted true for an f-string
+ * @param {boolean} bytes true for a bytes literal
  * @returns {{ value: string, end: number, dynamic: boolean }}
  */
-function readString(src, start, raw, formatted) {
+function readString(src, start, raw, formatted, bytes = false) {
   const quote = src[start];
   const triple = src.slice(start, start + 3) === quote.repeat(3);
   const delim = triple ? quote.repeat(3) : quote;
@@ -182,6 +191,10 @@ function readString(src, start, raw, formatted) {
       if (esc === "n") { out += "\n"; i += 2; continue; }
       if (esc === "t") { out += "\t"; i += 2; continue; }
       if (esc === "r") { out += "\r"; i += 2; continue; }
+      if (esc === "a") { out += "\x07"; i += 2; continue; }
+      if (esc === "b") { out += "\x08"; i += 2; continue; }
+      if (esc === "f") { out += "\x0c"; i += 2; continue; }
+      if (esc === "v") { out += "\x0b"; i += 2; continue; }
       if (esc === "\\") { out += "\\"; i += 2; continue; }
       if (esc === "'") { out += "'"; i += 2; continue; }
       if (esc === '"') { out += '"'; i += 2; continue; }
@@ -205,16 +218,50 @@ function readString(src, start, raw, formatted) {
           i += 4;
           continue;
         }
+        dynamic = true;
+        out += src.slice(i, Math.min(i + 4, n));
+        i = Math.min(i + 4, n);
+        continue;
       }
-      if (esc === "u") {
+      if (esc === "u" && !bytes) {
         const hex = src.slice(i + 2, i + 6);
         if (/^[0-9a-fA-F]{4}$/.test(hex)) {
           out += String.fromCharCode(parseInt(hex, 16));
           i += 6;
           continue;
         }
+        dynamic = true;
+        out += src.slice(i, Math.min(i + 6, n));
+        i = Math.min(i + 6, n);
+        continue;
       }
-      out += esc;
+      if (esc === "U" && !bytes) {
+        const hex = src.slice(i + 2, i + 10);
+        const point = /^[0-9a-fA-F]{8}$/.test(hex) ? parseInt(hex, 16) : -1;
+        if (point >= 0 && point <= 0x10ffff) {
+          out += String.fromCodePoint(point);
+          i += 10;
+          continue;
+        }
+        dynamic = true;
+        out += src.slice(i, Math.min(i + 10, n));
+        i = Math.min(i + 10, n);
+        continue;
+      }
+      if (esc === "N" && !bytes) {
+        // JavaScript has no Unicode-name database. Preserve the source and
+        // mark the literal unresolved rather than changing Python's value.
+        const close = src.indexOf("}", i + 3);
+        dynamic = true;
+        const end = close >= 0 ? close + 1 : Math.min(i + 2, n);
+        out += src.slice(i, end);
+        i = end;
+        continue;
+      }
+      // Python currently preserves an unknown escape's backslash (with a
+      // warning). Dropping it can turn an executable string into harmless
+      // text, so retain both characters exactly.
+      out += "\\" + esc;
       i += 2;
       continue;
     }
@@ -285,14 +332,29 @@ function lexPython(src) {
       i++;
       continue;
     }
-    if (/[A-Za-z_]/.test(c)) {
-      let j = i;
-      while (j < n && /[A-Za-z0-9_]/.test(src[j])) j++;
-      const word = src.slice(i, j);
+    const firstPoint = String.fromCodePoint(src.codePointAt(i));
+    if (/^[_\p{ID_Start}]$/u.test(firstPoint)) {
+      let j = i + firstPoint.length;
+      while (j < n) {
+        const point = String.fromCodePoint(src.codePointAt(j));
+        if (!/^[_\p{ID_Continue}]$/u.test(point)) break;
+        j += point.length;
+      }
+      const sourceWord = src.slice(i, j);
+      // Python compares identifiers after NFKC normalization. Recording the
+      // normalized spelling makes `import os as 𝐨` and `o.system(...)`
+      // resolve to the same binding where Python does.
+      const word = sourceWord.normalize("NFKC");
       // A string prefix binds to the quote immediately following it.
-      if ((src[j] === '"' || src[j] === "'") && STRING_PREFIXES.has(word.toLowerCase())) {
-        const lower = word.toLowerCase();
-        const lit = readString(src, j, lower.indexOf("r") >= 0, lower.indexOf("f") >= 0);
+      if ((src[j] === '"' || src[j] === "'") && STRING_PREFIXES.has(sourceWord.toLowerCase())) {
+        const lower = sourceWord.toLowerCase();
+        const lit = readString(
+          src,
+          j,
+          lower.indexOf("r") >= 0,
+          lower.indexOf("f") >= 0,
+          lower.indexOf("b") >= 0,
+        );
         tokens.push({ t: "str", v: lit.value, dynamic: lit.dynamic });
         i = lit.end;
         continue;
@@ -302,8 +364,8 @@ function lexPython(src) {
       continue;
     }
     if (c === '"' || c === "'") {
-      const lit = readString(src, i, false, false);
-      tokens.push({ t: "str", v: lit.value, dynamic: false });
+      const lit = readString(src, i, false, false, false);
+      tokens.push({ t: "str", v: lit.value, dynamic: lit.dynamic });
       i = lit.end;
       continue;
     }
@@ -376,7 +438,7 @@ function collectBindings(tokens, bindings) {
           local = tokenName(tokens[k + 1]);
           k += 2;
         }
-        if (allowed.has(imported)) bareExec.add(local);
+        if (allowed.has(imported)) bareExec.set(local, { module, member: imported });
         if (isOp(tokens[k], ",")) {
           j = k + 1;
           continue;
@@ -425,11 +487,18 @@ function posixQuote(word) {
  *
  * @returns {{ kind: "str", value: string, end: number }
  *         | { kind: "list", values: string[], end: number }
+ *         | { kind: "bool", value: boolean, end: number }
  *         | { kind: "dynamic", end: number }
  *         | null} null at the end of the argument list
  */
 function readArgument(tokens, i) {
   if (tokens[i] === undefined || isOp(tokens[i], ")")) return null;
+
+  const boolName = tokenName(tokens[i]);
+  if ((boolName === "True" || boolName === "False")
+    && (isOp(tokens[i + 1], ",") || isOp(tokens[i + 1], ")"))) {
+    return { kind: "bool", value: boolName === "True", end: i + 1 };
+  }
 
   // A list or tuple of literals.
   if (isOp(tokens[i], "[") || isOp(tokens[i], "(")) {
@@ -499,24 +568,42 @@ function skipToArgumentEnd(tokens, i) {
   return j;
 }
 
-/** Read every positional argument of a call whose `(` is at `openParen`. */
+/** Read every positional and keyword argument of a call. */
 function readArguments(tokens, openParen) {
-  const args = [];
+  const positional = [];
+  const keywords = new Map();
+  let unknownPositional = false;
+  let unknownKeywords = false;
   let i = openParen + 1;
   while (true) {
-    const arg = readArgument(tokens, i);
+    if (tokens[i] === undefined || isOp(tokens[i], ")")) break;
+    if (isOp(tokens[i], "*")) {
+      const isDouble = isOp(tokens[i + 1], "*");
+      const arg = readArgument(tokens, i + (isDouble ? 2 : 1));
+      if (arg === null) break;
+      if (isDouble) unknownKeywords = true;
+      else unknownPositional = true;
+      i = arg.end;
+      if (isOp(tokens[i], ",")) {
+        i++;
+        continue;
+      }
+      break;
+    }
+    const keyword = tokenName(tokens[i]);
+    const isKeyword = keyword !== null && isOp(tokens[i + 1], "=");
+    const arg = readArgument(tokens, isKeyword ? i + 2 : i);
     if (arg === null) break;
-    args.push(arg);
+    if (isKeyword) keywords.set(keyword, arg);
+    else positional.push(arg);
     i = arg.end;
     if (isOp(tokens[i], ",")) {
       i++;
-      // A keyword argument (`shell=True`) ends the positional list.
-      if (tokenName(tokens[i]) !== null && isOp(tokens[i + 1], "=")) break;
       continue;
     }
     break;
   }
-  return args;
+  return { positional, keywords, unknownPositional, unknownKeywords };
 }
 
 /**
@@ -526,7 +613,9 @@ function readArguments(tokens, openParen) {
  * @param {"command" | "argv" | "command_or_argv"} shape
  * @returns {string | null} null when any part is computed at runtime
  */
-function renderCall(shape, args) {
+function renderCall(shape, call) {
+  if (call.unknownPositional || call.unknownKeywords) return null;
+  const args = call.positional;
   if (args.length === 0) return null;
   if (shape === "command" || shape === "command_or_argv") {
     const first = args[0];
@@ -546,6 +635,90 @@ function renderCall(shape, args) {
   return words.length > 0 ? words.map(posixQuote).join(" ") : null;
 }
 
+function renderProgramAndArgs(program, values) {
+  if (program === null || program.length === 0) return null;
+  return [program, ...values].map(posixQuote).join(" ");
+}
+
+/** Render the real argv rules for Python's os.exec*, spawn*, and posix_spawn*. */
+function renderOsArgvCall(member, call) {
+  if (call.unknownPositional || call.unknownKeywords) return null;
+  const args = call.positional;
+  const isSpawn = member.startsWith("spawn") && !member.startsWith("posix_spawn");
+  const isVector = member.includes("v") || member.startsWith("posix_spawn");
+  const programIndex = isSpawn ? 1 : 0;
+  const argvIndex = programIndex + 1;
+  const programArg = args[programIndex];
+  if (programArg === undefined || programArg.kind !== "str") return null;
+
+  if (isVector) {
+    const argv = args[argvIndex];
+    if (argv === undefined || argv.kind !== "list" || argv.values.length === 0) return null;
+    // Python's argv[0] is the target process name, not a CLI argument. Keeping
+    // it would turn `/bin/sh`, `sh`, `-c`, `payload` into `/bin/sh sh -c ...`
+    // and hide what the shell actually executes.
+    return renderProgramAndArgs(programArg.value, argv.values.slice(1));
+  }
+
+  // l-forms spread argv after the program. `*e` variants end with an env map,
+  // which readArgument deliberately marks dynamic and which is not an argv
+  // element. spawn* also begins with the wait mode, omitted above.
+  let end = args.length;
+  if (member.endsWith("e")) end--;
+  const argv0 = args[argvIndex];
+  if (argv0 === undefined || argv0.kind !== "str") return null;
+  const values = [];
+  for (const arg of args.slice(argvIndex + 1, end)) {
+    if (arg.kind !== "str") return null;
+    values.push(arg.value);
+  }
+  return renderProgramAndArgs(programArg.value, values);
+}
+
+/** Render subprocess APIs, including the semantic switch made by shell=True. */
+function renderSubprocessCall(member, call) {
+  if (call.unknownPositional || call.unknownKeywords) return null;
+  if (call.positional.length > 1) return null;
+  for (const keyword of ["executable", "env", "preexec_fn"]) {
+    if (call.keywords.has(keyword)) return null;
+  }
+  const first = call.positional[0];
+  if (first === undefined) return null;
+  const alwaysShell = member === "getoutput" || member === "getstatusoutput";
+  const shellArg = call.keywords.get("shell");
+  let usesShell = alwaysShell;
+  if (shellArg !== undefined) {
+    if (shellArg.kind !== "bool") return null;
+    usesShell = shellArg.value;
+  }
+
+  if (usesShell) {
+    if (first.kind === "str") return first.value.trim().length > 0 ? first.value : null;
+    // On POSIX, subprocess passes a list with shell=True as
+    // `/bin/sh -c args[0] args[1]...`; only args[0] is the command string.
+    if (first.kind === "list" && first.values.length > 0) return first.values[0];
+    return null;
+  }
+  if (first.kind === "list") {
+    return first.values.length > 0 ? first.values.map(posixQuote).join(" ") : null;
+  }
+  if (first.kind === "str") {
+    // With shell=False a string is one executable pathname; Python does not
+    // split its spaces into arguments.
+    return first.value.length > 0 ? posixQuote(first.value) : null;
+  }
+  return null;
+}
+
+function renderExecutionCall(module, member, call) {
+  if (module === "os") {
+    if (OS_ARGV.has(member)) return renderOsArgvCall(member, call);
+    return renderCall("command", call);
+  }
+  if (module === "subprocess") return renderSubprocessCall(member, call);
+  return renderCall("command_or_argv", call);
+}
+
 /**
  * Interpret a `%%script` line: options parsed the way IPython's argparse does,
  * then the first remaining word is the interpreter. `%%script bash --out x`
@@ -563,9 +736,53 @@ function scriptMagicIsShell(rest) {
     if (word.startsWith("--") && word.indexOf("=") > 0) { i++; continue; }
     break;
   }
-  const interpreter = i < words.length ? words[i] : "";
-  const base = interpreter.split("/").pop() || "";
+  let interpreter = i < words.length ? words[i] : "";
+  let base = interpreter.split("/").pop() || "";
+  if (base === "env") {
+    i++;
+    while (i < words.length) {
+      const word = words[i];
+      if (word === "-i" || word === "--ignore-environment" || word === "-0"
+        || word === "--null" || word === "--debug") {
+        i++;
+        continue;
+      }
+      if (word === "-u" || word === "--unset" || word === "-C" || word === "--chdir") {
+        i += 2;
+        continue;
+      }
+      if (word.startsWith("--unset=") || word.startsWith("--chdir=")
+        || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+        i++;
+        continue;
+      }
+      // -S/--split-string needs another shell-like parse. Returning false is
+      // safe: the caller marks an unclassified script interpreter unresolved.
+      if (word === "-S" || word === "--split-string" || word.startsWith("--split-string=")) {
+        return false;
+      }
+      interpreter = word;
+      base = interpreter.split("/").pop() || "";
+      break;
+    }
+  }
   return SHELL_INTERPRETERS.has(base);
+}
+
+/** Join continuations only for IPython shell escapes, never inside comments. */
+function joinShellEscapeContinuations(source) {
+  const input = source.split(/\r?\n/);
+  const output = [];
+  for (let i = 0; i < input.length; i++) {
+    let line = input[i];
+    if (BANG_LINE.test(line) || SYSTEM_MAGIC.test(line)) {
+      while (/[ \t]*\\$/.test(line) && i + 1 < input.length) {
+        line = line.replace(/[ \t]*\\$/, " ") + input[++i].trimStart();
+      }
+    }
+    output.push(line);
+  }
+  return output;
 }
 
 /**
@@ -583,11 +800,10 @@ export function extractIpythonVectors(source, bindings) {
   }
   const state = bindings !== undefined ? bindings : createBindings();
 
-  // IPython joins a line ending in a backslash with the next one before any
-  // transformation, so a shell escape continued onto a second line is one
-  // system call. Do the same first, or the line pass sees only the first half.
-  const joined = source.replace(/[ \t]*\\\r?\n[ \t]*/g, " ");
-  const lines = joined.split("\n");
+  // Shell escapes use IPython's continuation transform. Python continuations
+  // are instead handled by the lexer, which knows that a backslash inside a
+  // comment does not join the following executable line.
+  const lines = joinShellEscapeContinuations(source);
 
   // A shell cell magic makes the whole remaining cell one shell script, so it
   // is decided first and the Python lexer never runs.
@@ -601,7 +817,10 @@ export function extractIpythonVectors(source, bindings) {
       if (body.length > 0) commands.push(body);
       return { commands, unresolved };
     }
-    // A non-shell `%%script python` cell still runs Python, so fall through.
+    // Every other %%script interpreter still launches arbitrary code. The
+    // event does not carry a runtime command that the shell engine can prove.
+    unresolved.push(`%%script ${rest || "unknown interpreter"}`);
+    return { commands, unresolved };
   }
 
   const pythonLines = [];
@@ -620,6 +839,9 @@ export function extractIpythonVectors(source, bindings) {
       continue;
     }
     if (OTHER_MAGIC.test(line)) {
+      // Built-in and user-defined magics can execute their argument or cell.
+      // Erasing an unknown magic would turn execution into an apparent no-op.
+      unresolved.push(line.trim().split(/\s+/, 1)[0]);
       pythonLines.push("");
       continue;
     }
@@ -634,7 +856,8 @@ export function extractIpythonVectors(source, bindings) {
     if (word === null) continue;
 
     let label = null;
-    let shape = null;
+    let callModule = null;
+    let callMember = null;
     let openParen = -1;
 
     // get_ipython().system(...) and friends, directly or through an alias.
@@ -661,27 +884,32 @@ export function extractIpythonVectors(source, bindings) {
       }
       if (member === "run_line_magic") {
         label = "get_ipython().run_line_magic";
-        const name = args[0] !== undefined && args[0].kind === "str" ? args[0].value : null;
+        const name = args.positional[0] !== undefined && args.positional[0].kind === "str"
+          ? args.positional[0].value : null;
         if (name === "system" || name === "sx") {
-          const rendered = args[1] !== undefined && args[1].kind === "str" ? args[1].value : null;
+          const rendered = args.positional[1] !== undefined && args.positional[1].kind === "str"
+            ? args.positional[1].value : null;
           if (rendered !== null && rendered.trim().length > 0 && !IPYTHON_EXPANSION.test(rendered)) commands.push(rendered);
           else unresolved.push(label);
-        } else if (name === null) {
-          unresolved.push(label);
+        } else {
+          unresolved.push(name === null ? label : `${label}(${name})`);
         }
         continue;
       }
       if (member === "run_cell_magic") {
         label = "get_ipython().run_cell_magic";
-        const name = args[0] !== undefined && args[0].kind === "str" ? args[0].value : null;
-        const line = args[1] !== undefined && args[1].kind === "str" ? args[1].value : null;
-        const cell = args[2] !== undefined && args[2].kind === "str" ? args[2].value : null;
+        const name = args.positional[0] !== undefined && args.positional[0].kind === "str"
+          ? args.positional[0].value : null;
+        const line = args.positional[1] !== undefined && args.positional[1].kind === "str"
+          ? args.positional[1].value : null;
+        const cell = args.positional[2] !== undefined && args.positional[2].kind === "str"
+          ? args.positional[2].value : null;
         const isShell = name === "bash" || name === "sh" || (name === "script" && line !== null && scriptMagicIsShell(line));
         if (isShell) {
           if (cell !== null && cell.trim().length > 0) commands.push(cell.trim());
           else unresolved.push(label);
-        } else if (name === null) {
-          unresolved.push(label);
+        } else {
+          unresolved.push(name === null ? label : `${label}(${name})`);
         }
         continue;
       }
@@ -698,22 +926,28 @@ export function extractIpythonVectors(source, bindings) {
       if (known || UNAMBIGUOUS_EXEC_MEMBERS.has(member)) {
         label = word + "." + member;
         openParen = i + 3;
-        const module = canonical !== null ? canonical : OS_ARGV.has(member) ? "os" : "subprocess";
-        shape = module === "os" ? (OS_ARGV.has(member) ? "argv" : "command")
-          : module === "pty" ? "command_or_argv" : "command_or_argv";
+        callModule = canonical !== null ? canonical : OS_ARGV.has(member) ? "os" : "subprocess";
+        callMember = member;
       }
     }
 
-    // A bare name bound by `from subprocess import run`.
-    if (label === null && state.bareExec.has(word) && isOp(tokens[i + 1], "(")) {
+    // A bare name bound by `from subprocess import run`. The canonical member
+    // is retained so an alias of os.execl still gets execl's argv semantics.
+    const bare = state.bareExec.get(word);
+    if (label === null && bare !== undefined && isOp(tokens[i + 1], "(")) {
       label = word;
       openParen = i + 1;
-      shape = OS_ARGV.has(word) ? "argv" : "command_or_argv";
+      callModule = bare.module;
+      callMember = bare.member;
     }
 
     if (label === null) continue;
 
-    const rendered = renderCall(shape, readArguments(tokens, openParen));
+    const rendered = renderExecutionCall(
+      callModule,
+      callMember,
+      readArguments(tokens, openParen),
+    );
     if (rendered !== null && rendered.trim().length > 0) commands.push(rendered);
     else unresolved.push(label);
   }

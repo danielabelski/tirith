@@ -153,6 +153,17 @@ cells, because the kernel is persistent. Comments and string bodies are lexed
 rather than pattern-matched, so a commented-out call is not a vector and a `#`
 inside a string does not truncate a line.
 
+The reconstruction follows execution semantics rather than source appearance:
+`exec*`/`spawn*` omit Python's synthetic `argv[0]`; canonical API identity
+survives a `from ... import ... as ...` alias; and `subprocess shell=True`
+treats its command as shell syntax while `shell=False` preserves a string as
+one executable pathname. Unicode identifiers are tokenized and NFKC-normalized
+like Python, eight-digit Unicode escapes are decoded, and named or malformed
+escapes are unresolved instead of silently changed. A backslash inside a
+Python comment never joins the next line. Unknown line/cell magics and
+non-shell `%%script` interpreters are also unresolved, while
+`%%script /usr/bin/env bash` is recognized as a shell cell.
+
 Recovered commands are sent to `tirith check` over stdin as one script, so the
 engine makes every security decision and the extension makes none. An argv
 list is rendered with POSIX quoting, so `["printf", "%s", "a | b"]` reaches

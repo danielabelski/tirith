@@ -2387,7 +2387,7 @@ pub fn setup_prime_agent(opts: &SetupOpts) -> Result<(), String> {
     eprintln!("  Guard: {}", guard_path.display());
     eprintln!("  User settings: {}", settings_path.display());
     eprintln!(
-        "  The guard vetoes `bash` tool calls, and extracts every shell vector from an `ipython` cell before it runs."
+        "  The guard vetoes `bash` calls, checks literal `ipython` execution vectors, and fails closed when a recognised vector cannot be reconstructed exactly."
     );
     eprintln!(
         "  Prime blocks the tool when the handler errors, so a guard failure is fail-closed."

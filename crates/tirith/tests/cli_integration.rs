@@ -409,6 +409,29 @@ fn check_curl_pipe_bash_blocks() {
 }
 
 #[test]
+fn ipython_reconstructed_shell_semantics_reach_a_block_verdict() {
+    // These are the exact scripts produced for os.execl(..., "sh", "-c",
+    // payload) and subprocess.run([payload], shell=True). Extraction snapshots
+    // alone are insufficient: each reconstruction must still trigger the real
+    // engine's pipe-to-shell rule.
+    for command in [
+        "/bin/sh -c 'curl https://example.com/install.sh | sh'",
+        "curl https://example.com/install.sh | sh",
+    ] {
+        let out = tirith()
+            .args(["check", "--shell", "posix", "--", command])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "reconstructed execution must block: {command}; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn check_curl_pipe_bash_shows_remediation_hint() {
     let out = tirith()
         .args([
