@@ -657,6 +657,15 @@ pub fn bound_tool_result_for_output(result: &mut ToolCallResult) -> bool {
         }
     }
 
+    // This is a presentation cap over a result the filter has already scanned
+    // in full, so it must not manufacture an incompleteness claim. Carry the
+    // scan's own verdict forward when the structured content recorded one, and
+    // otherwise say what is true: the analysis completed and only the display
+    // was bounded. `FilterOutcome::truncated` documents the same contract.
+    let analysis_incomplete = summary
+        .get("analysis_incomplete")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let omitted_content_items = result.content.len();
     let structured_content_omitted = result.structured_content.is_some();
     result.content = vec![ContentItem {
@@ -666,7 +675,7 @@ pub fn bound_tool_result_for_output(result: &mut ToolCallResult) -> bool {
     }];
     result.structured_content = Some(serde_json::json!({
         "presentation_truncated": true,
-        "analysis_incomplete": true,
+        "analysis_incomplete": analysis_incomplete,
         "original_serialized_bytes": original_bytes,
         "max_tool_result_bytes": limit,
         "omitted_content_items": omitted_content_items,
@@ -697,6 +706,13 @@ pub fn bound_tool_result_value_for_output(result: &mut serde_json::Value) -> boo
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len);
     let structured_content_omitted = result.get("structuredContent").is_some();
+    // Same contract as `bound_tool_result_for_output`: preserve the scan's own
+    // incompleteness verdict if the result carried one, never invent one.
+    let analysis_incomplete = result
+        .get("structuredContent")
+        .and_then(|value| value.get("analysis_incomplete"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     *result = serde_json::json!({
         "content": [{
             "type": "text",
@@ -705,7 +721,7 @@ pub fn bound_tool_result_value_for_output(result: &mut serde_json::Value) -> boo
         "isError": is_error,
         "structuredContent": {
             "presentation_truncated": true,
-            "analysis_incomplete": true,
+            "analysis_incomplete": analysis_incomplete,
             "original_serialized_bytes": original_bytes,
             "max_tool_result_bytes": limit,
             "omitted_content_items": omitted_content_items,

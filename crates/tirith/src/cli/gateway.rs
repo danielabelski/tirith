@@ -6795,6 +6795,33 @@ fn write_schema_audit(direction: &str, decision: &str, tool_name: &str, reason: 
 /// sanitization guarantee, independent of the gateway's general failure posture;
 /// a `result`-less JSON-RPC error envelope is scanned and recursively sanitized
 /// across every key/value before forwarding.
+/// Serialize a response the output filter has finished with. Reserializing a
+/// `Value` that was parsed moments ago does not fail in practice, but if it
+/// ever did the caller's fallback would be to forward the ORIGINAL upstream
+/// bytes, which is exactly the content the filter just decided to change.
+/// Fail closed with a block envelope instead, so a serialization error can
+/// never become a forwarding of unsanitized output.
+fn serialize_filtered_response_or_block(parsed: &Value) -> Vec<u8> {
+    match serde_json::to_vec(parsed) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_gateway_audit_json(serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "kind": "gateway_output_filter",
+                "decision": "block",
+                "error": format!("filtered response could not be serialized: {error}"),
+                "fail_mode_triggered": false,
+                "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
+            }));
+            build_error_envelope_block_with_rule_ids(
+                parsed.get("id").cloned().unwrap_or(Value::Null),
+                "filtered response could not be serialized; blocked rather than forwarding the unsanitized original",
+                &[],
+            )
+        }
+    }
+}
+
 fn apply_output_filter_to_response(
     mut parsed: Value,
     fail_mode_closed: bool,
@@ -6817,7 +6844,7 @@ fn apply_output_filter_to_response(
                         &rule_ids,
                         "inspected",
                     );
-                    return serde_json::to_vec(&parsed).ok();
+                    return Some(serialize_filtered_response_or_block(&parsed));
                 }
                 Err(failure) => {
                     write_server_message_audit("block", "error", &failure.rule_ids, failure.reason);
@@ -6866,7 +6893,7 @@ fn apply_output_filter_to_response(
             });
             let obj = parsed.as_object_mut()?;
             obj.insert("result".to_string(), new_result);
-            return serde_json::to_vec(&parsed).ok();
+            return Some(serialize_filtered_response_or_block(&parsed));
         }
     };
 
@@ -6876,7 +6903,7 @@ fn apply_output_filter_to_response(
     // Splice the re-emitted (lossless) result back into the response.
     let result_slot = parsed.as_object_mut()?.get_mut("result")?;
     *result_slot = new_result;
-    serde_json::to_vec(&parsed).ok()
+    Some(serialize_filtered_response_or_block(&parsed))
 }
 
 /// C4 — inspect a Live listing/reading response (`tools/list`, `resources/list`,
