@@ -34,7 +34,7 @@ private, and `--dry-run`, `--force`, and repeat runs are supported.
 | OpenCode | MCP only | `tirith setup opencode` | Project: the rootmost existing project `.opencode/opencode.json(c)`, otherwise the invocation directory's `opencode.json(c)`; user: `$OPENCODE_CONFIG_DIR/opencode.json(c)`, then `$OPENCODE_CONFIG`, otherwise `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json(c)` | `opencode mcp list` |
 | Vercel Labs fx | MCP only | `tirith setup fx` | Trusted user profile only: `~/.fx/mcp.json` | `/mcp reload`, then `/mcp list` |
 | Prime Agent | Hook + MCP | `tirith setup prime-agent` | User only: non-empty `$PRIME_AGENT_CODING_AGENT_DIR/settings.json`, otherwise `~/.prime/agent/settings.json`; exact `~` and `~/...` values expand from HOME. Guard: `<agent dir>/extensions/tirith-guard.ts` | `prime-agent mcp get tirith` |
-| Cline | Hook + MCP | `tirith setup cline` | User only: `$CLINE_MCP_SETTINGS_PATH`; then `$CLINE_DATA_DIR/settings/cline_mcp_settings.json`; then `$CLINE_DIR/data/settings/cline_mcp_settings.json`; otherwise `~/.cline/data/settings/cline_mcp_settings.json`. Hook: `<Documents>/Cline/Hooks/PreToolUse`, with Documents resolved the way Cline resolves it (`xdg-user-dir DOCUMENTS` on Linux, `~/Documents` otherwise) | Restart Cline, enable hooks in settings, open MCP Servers |
+| Cline | Hook + MCP | `tirith setup cline` | User only: `$CLINE_MCP_SETTINGS_PATH`; then `$CLINE_DATA_DIR/settings/cline_mcp_settings.json`; then `$CLINE_DIR/data/settings/cline_mcp_settings.json`; otherwise `~/.cline/data/settings/cline_mcp_settings.json`. Hook: `<Documents>/Cline/Hooks/PreToolUse` (POSIX) or `PreToolUse.ps1` (Windows), with Documents resolved the way Cline resolves it (`xdg-user-dir DOCUMENTS` on Linux, the MyDocuments special folder on Windows, `~/Documents` otherwise) | Restart Cline, enable hooks in settings, open MCP Servers |
 | Roo Code | MCP only | `tirith setup roo-code` | Project only: `<cwd>/.roo/mcp.json`; run setup from the intended workspace root | Confirm `tirith` is connected in MCP Servers |
 | Continue | MCP only | `tirith setup continue` | Project-owned block only: `<cwd>/.continue/mcpServers/tirith.yaml`; run setup from the intended workspace root | Switch to Agent mode and confirm Tirith tools are present |
 | OpenHands CLI | Hook + MCP | `tirith setup openhands` | MCP is user only: non-empty absolute `$OPENHANDS_PERSISTENCE_DIR/mcp.json` without surrounding whitespace, otherwise `~/.openhands/mcp.json` when unset. Hooks follow the two locations the SDK searches: `--scope user` writes `~/.openhands/hooks.json`, `--scope project` writes `<work dir>/.openhands/hooks.json` where the work dir is `$OPENHANDS_WORK_DIR`, otherwise the current directory | `openhands mcp get tirith`; restart active conversations |
@@ -183,8 +183,11 @@ adapter with the right protocol baked in, installed alongside it and mode 0755.
 
 Cline hooks are inert until hooks are enabled in Cline's settings, and Cline
 runs the tool when a hook fails, so a hook that cannot start is not a block.
-Cline's own runner supports PowerShell hooks on Windows; Tirith's Cline hook is
-POSIX-only for now, which is a Tirith limitation rather than a host one.
+Cline runs a `PreToolUse` executable on POSIX and a `PreToolUse.ps1` through
+PowerShell on Windows; setup installs the right one for the platform. The
+Windows script is the counterpart of the POSIX wrapper: it forwards Cline's
+stdin and stdout through the same Python adapter and needs `python3` (or
+`python`) on PATH.
 
 OpenHands searches exactly two places for `hooks.json`: the working directory
 it was started in (`OPENHANDS_WORK_DIR`, otherwise the current directory, with

@@ -402,11 +402,7 @@ fn detect_ai_tools_with(
             Some(home.join(".omp/agent/hooks/pre/tirith-guard.ts")),
             None,
         ),
-        (
-            "cline",
-            Some(crate::cli::setup::cline_hooks_dir(home).join("PreToolUse")),
-            None,
-        ),
+        ("cline", Some(cline_hook_artifact(home)), None),
         (
             "grok-build",
             Some(home.join(".grok/hooks/tirith.json")),
@@ -474,8 +470,56 @@ fn detect_ai_tools_with(
     tools
 }
 
+/// The Cline hook artifact for the current platform: `PreToolUse` (an executable
+/// wrapper) on POSIX, `PreToolUse.ps1` on Windows.
+fn cline_hook_artifact(home: &std::path::Path) -> std::path::PathBuf {
+    let dir = crate::cli::setup::cline_hooks_dir(home);
+    #[cfg(windows)]
+    {
+        dir.join("PreToolUse.ps1")
+    }
+    #[cfg(not(windows))]
+    {
+        dir.join("PreToolUse")
+    }
+}
+
 /// Whether a Tirith-owned hook artifact is installed in a form the host can
 /// load and that actually reaches Tirith. Presence alone proves neither.
+/// The Windows variant: no executable bit, and the Cline hook is a `.ps1` that
+/// must carry the protocol and the adapter reference.
+#[cfg(windows)]
+fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match name {
+        "pi-cli" | "prime-agent" | "omp" => {
+            content.contains("tool_call")
+                && content.contains("TIRITH_BIN")
+                && !content.contains("\"__TIRITH_BIN__\"")
+                && !content.contains("\"__TIRITH_INTEGRATION__\"")
+        }
+        "cline" => {
+            content.contains("TIRITH_HOOK_PROTOCOL = 'cline'")
+                && content.contains("tirith-check.py")
+                && !content.contains("__TIRITH_BIN__")
+                && !content.contains("__ADAPTER_PATH__")
+        }
+        "grok-build" => serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/hooks/PreToolUse/0/hooks/0/env/TIRITH_HOOK_PROTOCOL")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|protocol| protocol == "grok-build")
+            })
+            .unwrap_or(false),
+        // OpenHands hooks are POSIX-only (the wrapper is a #!/bin/sh script).
+        _ => false,
+    }
+}
+
 #[cfg(unix)]
 fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -2889,7 +2933,7 @@ mod tests {
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(&path, rendered_guard()).unwrap();
             }
-            let cline_wrapper = crate::cli::setup::cline_hooks_dir(home).join("PreToolUse");
+            let cline_wrapper = cline_hook_artifact(home);
             write_executable(
                 &cline_wrapper,
                 "#!/bin/sh\nTIRITH_HOOK_PROTOCOL=cline exec python3 /x/tirith-check.py\n",
@@ -2920,7 +2964,7 @@ mod tests {
             )
             .unwrap();
             // A Cline wrapper with the right content and no executable bit.
-            let cline_wrapper = crate::cli::setup::cline_hooks_dir(home).join("PreToolUse");
+            let cline_wrapper = cline_hook_artifact(home);
             std::fs::create_dir_all(cline_wrapper.parent().unwrap()).unwrap();
             std::fs::write(
                 &cline_wrapper,

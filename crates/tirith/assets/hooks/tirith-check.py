@@ -274,9 +274,13 @@ def main():
         fail_closed("tirith: check returned non-zero with no output — blocked for safety")
         return
 
-    # Exit 0 = clean, allow
+    # Exit 0 = clean, allow. Cline reads a decision object from stdout and logs
+    # an error on empty output, so it gets an explicit allow; every other host
+    # treats a silent exit 0 as allow.
     if result.returncode == 0:
         _hook_event("check_ok")
+        if proto == "cline":
+            print(json.dumps({"cancel": False}))
         sys.exit(0)
 
     # Exit 2 = warn — check TIRITH_HOOK_WARN_ACTION

@@ -732,7 +732,7 @@ tirith setup omp                      # OMP / Oh My Pi: blocking tool_call guard
 tirith setup opencode                 # OpenCode MCP tools
 tirith setup fx                       # Vercel Labs fx MCP tools (trusted user profile)
 tirith setup prime-agent              # Prime Agent: blocking guard (bash + ipython) + MCP
-tirith setup cline                    # Cline: blocking PreToolUse hook + MCP (user scope)
+tirith setup cline                    # Cline: blocking PreToolUse hook (POSIX + Windows) + MCP
 tirith setup roo-code                 # Roo Code MCP tools (project scope)
 tirith setup continue                 # Continue MCP tools (project scope)
 tirith setup openhands                # OpenHands: MCP (user) / blocking hook (--scope project)
