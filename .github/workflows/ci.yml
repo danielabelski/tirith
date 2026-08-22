@@ -126,9 +126,26 @@ jobs:
           set -euo pipefail
           work="$(mktemp -d)"
           cd "$work"
-          curl -fsSLO "https://ftp.gnu.org/gnu/bash/bash-${BASH_VERSION_UNDER_TEST}.tar.gz"
-          echo "${BASH_TARBALL_SHA256}  bash-${BASH_VERSION_UNDER_TEST}.tar.gz" | sha256sum -c -
-          tar xzf "bash-${BASH_VERSION_UNDER_TEST}.tar.gz"
+          tarball="bash-${BASH_VERSION_UNDER_TEST}.tar.gz"
+          # Two GNU sources, tried in order. The sha256 below is the integrity
+          # check either way; the mirror only stops an upstream outage from
+          # turning into a red PR check. Both were verified byte-identical when
+          # this pin was taken.
+          fetched=0
+          for host in "https://ftp.gnu.org/gnu/bash" "https://mirrors.kernel.org/gnu/bash"; do
+            if curl -fsSL --retry 3 --retry-delay 5 -o "$tarball" "${host}/${tarball}"; then
+              echo "fetched ${tarball} from ${host}"
+              fetched=1
+              break
+            fi
+            echo "could not fetch ${tarball} from ${host}, trying the next source" >&2
+          done
+          if [[ $fetched -ne 1 ]]; then
+            echo "ERROR: could not fetch ${tarball} from any known GNU source" >&2
+            exit 1
+          fi
+          echo "${BASH_TARBALL_SHA256}  ${tarball}" | sha256sum -c -
+          tar xzf "$tarball"
           cd "bash-${BASH_VERSION_UNDER_TEST}"
           ./configure --prefix="$HOME/bash53" >/dev/null
           make -j"$(nproc)" >/dev/null
