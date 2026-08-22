@@ -249,11 +249,38 @@ assert.deepEqual(unresolved("import subprocess\nsubprocess.run(['curl', url])"),
 // ---------------------------------------------------------------------------
 assert.deepEqual(buildCheckScript("bash", { command: "id" }), { script: "id", unresolved: [] });
 assert.deepEqual(buildCheckScript("terminal", { command: "id" }), { script: "id", unresolved: [] });
-assert.equal(buildCheckScript("bash", { command: "   " }), null);
-assert.equal(buildCheckScript("bash", undefined), null);
+assert.deepEqual(buildCheckScript("bash", { command: "   " }), {
+  script: "",
+  unresolved: ["bash command is missing or empty"],
+});
+assert.deepEqual(buildCheckScript("bash", undefined), {
+  script: "",
+  unresolved: ["bash command is missing or empty"],
+});
 assert.equal(buildCheckScript("edit", { path: "x" }), null, "a non-executing tool is skipped");
 assert.deepEqual(buildCheckScript("ipython", { code: "!a\n!b" }), { script: "a\nb", unresolved: [] });
 assert.equal(buildCheckScript("ipython", { code: "x = 1 + 1" }), null, "no vector, nothing sent");
+
+// OMP exposes three process paths outside `bash`. Concrete `hub start` argv is
+// inspectable; dynamic language runtimes and process/debugger control are not.
+assert.deepEqual(buildCheckScript("hub", { op: "start", application: "npm", args: ["run", "dev server"] }), {
+  script: "'npm' 'run' 'dev server'",
+  unresolved: [],
+});
+assert.ok(
+  buildCheckScript("hub", { op: "start", application: "node", args: ["app.js"], env: { NODE_OPTIONS: "--require ./boot.js" } })
+    .unresolved.some((u) => /environment/.test(u)),
+  "an environment preload must not hide behind a clean argv",
+);
+assert.match(buildCheckScript("hub", { op: "restart", name: "web" }).unresolved[0], /omits the persisted/);
+assert.match(buildCheckScript("hub", { op: "send", name: "repl", text: "system('id')" }).unresolved[0], /unknown persistent/);
+assert.match(buildCheckScript("hub", { op: "send", name: "repl", to: "", text: "id" }).unresolved[0], /unknown persistent/);
+assert.match(buildCheckScript("hub", { op: "future_exec" }).unresolved[0], /unknown hub operation/);
+assert.equal(buildCheckScript("hub", { op: "logs", name: "web" }), null, "hub inspection remains available");
+assert.match(buildCheckScript("eval", { language: "js", code: "console.log(1)" }).unresolved[0], /outside the shell guard/);
+assert.match(buildCheckScript("debug", { action: "launch", program: "./app" }).unresolved[0], /debugger-adapter/);
+assert.match(buildCheckScript("debug", { action: "evaluate", expression: "system('id')" }).unresolved[0], /unknown target/);
+assert.equal(buildCheckScript("debug", { action: "threads" }), null, "debug inspection remains available");
 
 // A cell past the inspection limit is reported whole, never partially inspected.
 {
@@ -348,6 +375,26 @@ try {
       assert.match(dynamic.reason, /could not be inspected/);
       const expanded = await call("ipython", { code: "!rm {f}" });
       assert.equal(expanded.block, true, "an IPython expansion is uninspectable");
+
+      // OMP's non-bash process paths use the same blocking handler. A concrete
+      // hub launch is checked; every path whose real command is absent denies.
+      assert.equal(
+        await call("hub", { op: "start", application: "printf", args: ["clean"] }),
+        undefined,
+      );
+      const hubBlocked = await call("hub", { op: "start", application: "printf", args: ["BLOCK_TOKEN"] });
+      assert.equal(hubBlocked.block, true, "hub start argv must reach the engine");
+      assert.equal(
+        (await call("hub", { op: "start", application: "node", env: { NODE_OPTIONS: "--require ./boot.js" } })).block,
+        true,
+        "hub environment preloads are uninspectable and fail closed",
+      );
+      assert.equal((await call("hub", { op: "restart", name: "web" })).block, true);
+      assert.equal((await call("hub", { op: "send", name: "repl", text: "id" })).block, true);
+      assert.equal((await call("eval", { language: "rb", code: "puts 1" })).block, true);
+      assert.equal((await call("debug", { action: "launch", program: "./app" })).block, true);
+      assert.equal((await call("debug", { action: "evaluate", expression: "1 + 1" })).block, true);
+      assert.equal(await call("debug", { action: "threads" }), undefined);
 
       // A non-executing tool is ignored.
       assert.equal(await call("edit", { path: "x" }), undefined);

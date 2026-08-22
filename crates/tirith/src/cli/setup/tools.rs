@@ -1562,7 +1562,7 @@ pub fn setup_omp(opts: &SetupOpts) -> Result<(), String> {
     eprintln!("  Guard: {}", guard_path.display());
     eprintln!("  Config: {}", location.path.display());
     eprintln!(
-        "  The guard vetoes `bash` tool calls before execution; OMP also blocks when the handler errors."
+        "  The guard checks `bash` and concrete process launches, and fails closed on uninspectable `eval`, `hub`, and `debug` execution; OMP also blocks when the handler errors."
     );
     eprintln!("  Run `/mcp test tirith` in OMP to verify the stdio connection.");
     Ok(())
@@ -5816,6 +5816,12 @@ mod tests {
             );
             let body = std::fs::read_to_string(&guard).expect("omp guard must be installed");
             assert!(body.contains("\"omp\""), "guard must report its host");
+            assert!(
+                body.contains("buildOmpEvalCheck")
+                    && body.contains("buildOmpHubCheck")
+                    && body.contains("buildOmpDebugCheck"),
+                "OMP's non-bash execution tools must be guarded"
+            );
         });
     }
 

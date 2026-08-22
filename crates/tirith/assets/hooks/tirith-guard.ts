@@ -20,8 +20,8 @@
 //
 // Environment:
 //   TIRITH_HOOK_WARN_ACTION       — "allow" (default) or "deny" for engine warnings
-//   TIRITH_HOOK_UNRESOLVED_ACTION — "deny" (default) or "warn" for a cell that
-//                                   reaches a shell in a way this cannot read
+//   TIRITH_HOOK_UNRESOLVED_ACTION — "deny" (default) or "warn" for an execution
+//                                   path whose real command this cannot read
 //   TIRITH_FAIL_OPEN              — "1" to allow on error (default: deny)
 
 import { execFile, execFileSync } from "node:child_process";
@@ -33,6 +33,16 @@ const TIRITH_INTEGRATION = "__TIRITH_INTEGRATION__";
 const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_command", "terminal"]);
 /** Tool names whose `input.code` is an IPython cell. */
 const NOTEBOOK_TOOLS = new Set(["ipython", "python", "jupyter"]);
+/** OMP tools that can execute without going through its `bash` tool. */
+const OMP_EVAL_TOOL = "eval";
+const OMP_PROCESS_TOOL = "hub";
+const OMP_DEBUG_TOOL = "debug";
+
+/** OMP debug actions whose effects are inspection-only. */
+const OMP_DEBUG_READONLY_ACTIONS = new Set([
+  "output", "threads", "stack_trace", "scopes", "variables", "disassemble",
+  "read_memory", "loaded_sources", "modules", "sessions",
+]);
 
 /**
  * `tirith check` reads the command from stdin when it is given no argument and
@@ -41,6 +51,8 @@ const NOTEBOOK_TOOLS = new Set(["ipython", "python", "jupyter"]);
  * limit instead of by the platform's argument-length ceiling.
  */
 const MAX_CHECK_SCRIPT_BYTES = 1024 * 1024;
+/** Prevent adversarial tool payloads from making argv rendering itself unbounded. */
+const MAX_EXEC_ARGUMENTS = 4096;
 
 // ---------------------------------------------------------------------------
 // IPython cell execution-vector extraction.
@@ -709,6 +721,130 @@ export function extractIpythonVectors(source, bindings) {
   return { commands, unresolved };
 }
 
+/** Quote one argv element for the POSIX parser used by `tirith check`. */
+function quotePosixArgument(value) {
+  return "'" + value.replaceAll("'", "'\\''") + "'";
+}
+
+/**
+ * Render an application plus an argv array without turning argv data into
+ * shell syntax. OMP passes both `hub start` and debug launch arguments directly
+ * to their subprocess APIs, so quoting every element preserves that boundary.
+ */
+function renderArgv(application, args, label) {
+  if (typeof application !== "string" || application.length === 0) {
+    return { script: "", unresolved: [`${label} has no literal application`] };
+  }
+  if (args !== undefined && !Array.isArray(args)) {
+    return { script: "", unresolved: [`${label} args are not an array`] };
+  }
+  const argv = args === undefined ? [] : args;
+  if (argv.length > MAX_EXEC_ARGUMENTS) {
+    return { script: "", unresolved: [`${label} has more than ${MAX_EXEC_ARGUMENTS} arguments`] };
+  }
+  if (argv.some((arg) => typeof arg !== "string")) {
+    return { script: "", unresolved: [`${label} has a non-string argument`] };
+  }
+  const script = [application, ...argv].map(quotePosixArgument).join(" ");
+  if (Buffer.byteLength(script, "utf8") > MAX_CHECK_SCRIPT_BYTES) {
+    return { script: "", unresolved: [`${label} argv is larger than the ${MAX_CHECK_SCRIPT_BYTES}-byte inspection limit`] };
+  }
+  return { script, unresolved: [] };
+}
+
+/** Build the check for OMP's persistent multi-language evaluator. */
+function buildOmpEvalCheck(bag, bindings) {
+  const language = bag.language;
+  const code = bag.code;
+  if (typeof language !== "string" || typeof code !== "string" || code.trim().length === 0) {
+    return { script: "", unresolved: ["eval payload is malformed"] };
+  }
+
+  // Python literals are still useful evidence for the engine, but no supported
+  // eval language can be proved process-free from source text. For example,
+  // JavaScript can import child_process, Ruby can call Kernel.system, and a
+  // Python helper imported earlier can spawn without a visible call here.
+  const vectors = language === "py" ? extractIpythonVectors(code, bindings) : { commands: [], unresolved: [] };
+  const script = vectors.commands.join("\n");
+  const unresolved = [
+    ...vectors.unresolved,
+    `eval ${language} code can execute processes outside the shell guard`,
+  ];
+  if (Buffer.byteLength(script, "utf8") > MAX_CHECK_SCRIPT_BYTES) {
+    return {
+      script: "",
+      unresolved: [...unresolved, `eval vectors are larger than the ${MAX_CHECK_SCRIPT_BYTES}-byte inspection limit`],
+    };
+  }
+  return { script, unresolved };
+}
+
+/** Build the check for OMP's long-running process supervisor. */
+function buildOmpHubCheck(bag) {
+  const op = bag.op;
+  if (typeof op !== "string") return { script: "", unresolved: ["hub operation is malformed"] };
+  if (op === "start") {
+    const built = renderArgv(bag.application, bag.args, "hub start");
+    if (bag.env !== undefined) {
+      if (typeof bag.env !== "object" || bag.env === null || Array.isArray(bag.env)) {
+        built.unresolved.push("hub start env is malformed");
+      } else if (Object.keys(bag.env).length > 0) {
+        // Environment variables such as NODE_OPTIONS, RUBYOPT, BASH_ENV, and
+        // dynamic-loader variables can execute code before the visible argv.
+        built.unresolved.push("hub start environment can change what the application executes");
+      }
+    }
+    return built;
+  }
+  if (op === "restart") {
+    return { script: "", unresolved: ["hub restart omits the persisted application and argv"] };
+  }
+  const processName = typeof bag.name === "string" ? bag.name.trim() : "";
+  const peerName = typeof bag.to === "string" ? bag.to.trim() : "";
+  if (op === "send" && processName.length > 0 && peerName.length === 0) {
+    const script = typeof bag.text === "string" ? bag.text : "";
+    if (Buffer.byteLength(script, "utf8") > MAX_CHECK_SCRIPT_BYTES) {
+      return { script: "", unresolved: [`hub process input is larger than the ${MAX_CHECK_SCRIPT_BYTES}-byte inspection limit`] };
+    }
+    return {
+      script,
+      unresolved: ["hub process input targets an unknown persistent interpreter or terminal"],
+    };
+  }
+  // `stop` terminates a process; the remaining hub operations are messaging,
+  // job control, waits, or inspection.
+  if (["send", "wait", "inbox", "list", "jobs", "cancel", "ps", "logs", "stop", "describe"].includes(op)) {
+    return null;
+  }
+  return { script: "", unresolved: [`unknown hub operation ${op}`] };
+}
+
+/** Build the check for OMP's Debug Adapter Protocol controller. */
+function buildOmpDebugCheck(bag) {
+  const action = bag.action;
+  if (typeof action !== "string") return { script: "", unresolved: ["debug action is malformed"] };
+  if (OMP_DEBUG_READONLY_ACTIONS.has(action) || action === "terminate") return null;
+  if (action === "launch") {
+    const built = renderArgv(bag.program, bag.args, "debug launch");
+    // OMP starts a configured debugger adapter as well as the visible target.
+    // The adapter command is absent from the event and workspace dap.json can
+    // redefine it, so the event is not a complete process description.
+    built.unresolved.push("debug launch omits the configured debugger-adapter command");
+    return built;
+  }
+  if (action === "evaluate") {
+    const script = typeof bag.expression === "string" ? bag.expression : "";
+    return {
+      script: Buffer.byteLength(script, "utf8") <= MAX_CHECK_SCRIPT_BYTES ? script : "",
+      unresolved: ["debug evaluate runs in an unknown target language or REPL"],
+    };
+  }
+  // Attach, resume/step/pause, conditional breakpoints, writes, and custom DAP
+  // requests can execute or mutate a live process without exposing a command
+  // that Tirith can inspect.
+  return { script: "", unresolved: [`debug ${action} can control execution without a visible command`] };
+}
+
 /**
  * Build the script handed to `tirith check` for one tool call.
  *
@@ -725,9 +861,18 @@ export function extractIpythonVectors(source, bindings) {
  */
 export function buildCheckScript(toolName, input, bindings) {
   const bag = input === undefined || input === null ? {} : input;
+  if (typeof bag !== "object" || Array.isArray(bag)) {
+    if (SHELL_TOOLS.has(toolName) || NOTEBOOK_TOOLS.has(toolName)
+      || toolName === OMP_EVAL_TOOL || toolName === OMP_PROCESS_TOOL || toolName === OMP_DEBUG_TOOL) {
+      return { script: "", unresolved: [`${toolName || "execution"} payload is not an object`] };
+    }
+    return null;
+  }
   if (SHELL_TOOLS.has(toolName)) {
     const command = bag.command;
-    if (typeof command !== "string" || command.trim().length === 0) return null;
+    if (typeof command !== "string" || command.trim().length === 0) {
+      return { script: "", unresolved: [`${toolName} command is missing or empty`] };
+    }
     if (Buffer.byteLength(command, "utf8") > MAX_CHECK_SCRIPT_BYTES) {
       return { script: "", unresolved: [`command larger than the ${MAX_CHECK_SCRIPT_BYTES}-byte inspection limit`] };
     }
@@ -737,7 +882,9 @@ export function buildCheckScript(toolName, input, bindings) {
     let code = bag.code;
     if (code === undefined) code = bag.cell;
     if (code === undefined) code = bag.source;
-    if (typeof code !== "string" || code.trim().length === 0) return null;
+    if (typeof code !== "string" || code.trim().length === 0) {
+      return { script: "", unresolved: [`${toolName} code is missing or empty`] };
+    }
     const vectors = extractIpythonVectors(code, bindings);
     if (vectors.commands.length === 0 && vectors.unresolved.length === 0) return null;
     const script = vectors.commands.join("\n");
@@ -749,6 +896,9 @@ export function buildCheckScript(toolName, input, bindings) {
     }
     return { script, unresolved: vectors.unresolved };
   }
+  if (toolName === OMP_EVAL_TOOL) return buildOmpEvalCheck(bag, bindings);
+  if (toolName === OMP_PROCESS_TOOL) return buildOmpHubCheck(bag);
+  if (toolName === OMP_DEBUG_TOOL) return buildOmpDebugCheck(bag);
   return null;
 }
 
@@ -830,13 +980,13 @@ export default function (pi) {
     const unresolved = built.unresolved;
     const unresolvedNote = unresolved.length > 0
       ? `tirith: ${unresolved.length} execution vector(s) in this call (${unresolved.join(", ")}) `
-        + "are built at runtime or exceed the inspection limit and could not be inspected"
+        + "are hidden, built at runtime, malformed, or exceed the inspection limit and could not be inspected"
       : "";
 
     if (unresolvedNote) {
       hookEvent("unresolved_vector", unresolved.join(","));
       if (unresolvedAction() === "deny") {
-        return { block: true, reason: unresolvedNote + " — blocked; set TIRITH_HOOK_UNRESOLVED_ACTION=warn to allow uninspectable cells" };
+        return { block: true, reason: unresolvedNote + " — blocked; set TIRITH_HOOK_UNRESOLVED_ACTION=warn to allow uninspectable execution calls" };
       }
       process.stderr.write(unresolvedNote + "\n");
     }

@@ -158,6 +158,16 @@ engine makes every security decision and the extension makes none. An argv
 list is rendered with POSIX quoting, so `["printf", "%s", "a | b"]` reaches
 the engine as the single argument it is rather than as a pipeline.
 
+OMP also exposes process execution outside `bash`. The guard checks the exact
+application and argv supplied to `hub(op: "start")`. It blocks by default when
+the event does not contain the full command: arbitrary `eval` code; `hub`
+restart or process input; non-empty `hub` launch environments (which can carry
+runtime or loader preloads); and mutating `debug` actions. Debug launches are
+also uninspectable because OMP starts a configured debugger adapter whose
+command is absent from the event. Read-only `hub` and `debug` operations remain
+available. `TIRITH_HOOK_UNRESOLVED_ACTION=warn` is an explicit opt-out from
+this fail-closed boundary.
+
 A vector whose command is computed at runtime cannot be shown to the engine:
 an IPython `{expr}` or `$var` expansion, an f-string, a concatenation with a
 variable, a non-literal argv element. These are **blocked by default** rather
