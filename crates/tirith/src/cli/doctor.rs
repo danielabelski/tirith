@@ -2621,8 +2621,18 @@ fn run_simulate_enter() -> i32 {
         println!("        be written — new shells will fall back to preexec until it can be.");
     } else {
         println!("tirith: bash will use preexec mode (warn-only). For blocking, set");
-        println!("        TIRITH_BASH_PREEXEC_ENFORCE=1 in a clean-history shell, or run");
-        println!("        tirith on a shell where enter-mode delivery works.");
+        println!("        TIRITH_BASH_PREEXEC_ENFORCE=1, or run tirith on a shell where");
+        println!("        enter-mode delivery works.");
+        println!();
+        println!("        Preexec enforcement needs to own the whole typed line, so it");
+        println!("        refuses at startup and says so when any of these hold:");
+        println!("          - HISTCONTROL/HISTIGNORE filter history (ignorespace,");
+        println!("            ignoredups, ignoreboth), or history is off");
+        println!("          - extdebug is already enabled outside tirith");
+        println!("          - PROMPT_COMMAND is readonly, associative, or otherwise");
+        println!("            cannot be bracketed");
+        println!("        It also drops to off mid-session if another tool takes over the");
+        println!("        DEBUG trap. Enter mode has none of these constraints.");
     }
     0
 }
