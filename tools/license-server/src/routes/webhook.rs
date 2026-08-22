@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use base64::Engine;
 use rand_core::{OsRng, RngCore};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
@@ -18,6 +19,33 @@ use crate::state::AppState;
 use crate::webhook_verify;
 
 const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// Polar's signed webhook body.  The event ordering instant is part of the
+/// envelope (`timestamp`); object creation timestamps, when present inside
+/// `data`, describe the resource and are not lifecycle ordering metadata.
+#[derive(Debug, Deserialize)]
+struct PolarWebhookEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    timestamp: String,
+    data: serde_json::Value,
+}
+
+fn parse_envelope(body: &[u8]) -> Result<PolarWebhookEnvelope, AppError> {
+    let event: PolarWebhookEnvelope = serde_json::from_slice(body)
+        .map_err(|e| AppError::BadWebhook(format!("invalid Polar envelope: {e}")))?;
+    if event.event_type.is_empty() {
+        return Err(AppError::BadWebhook("empty event type".into()));
+    }
+    if !event.data.is_object() {
+        return Err(AppError::BadWebhook("data must be an object".into()));
+    }
+    // Validate this once at the signed-envelope boundary. Handlers normalize
+    // it again when constructing their DB command so the type does not permit
+    // an unchecked timestamp to cross the persistence boundary.
+    let _ = required_event_timestamp(&event)?;
+    Ok(event)
+}
 
 /// Record a dead-letter row, logging at error level if the insert itself fails.
 ///
@@ -60,17 +88,8 @@ pub async fn webhook(
     )
     .map_err(|e| AppError::Unauthorized(format!("webhook verification: {e}")))?;
 
-    let event: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| AppError::BadWebhook(format!("invalid JSON: {e}")))?;
-
-    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-    // Enforce the ordering prerequisite at the dispatcher as well as inside
-    // each state-changing handler. That keeps a newly added subscription event
-    // from accidentally bypassing the fail-closed timestamp contract.
-    if event_type.starts_with("subscription.") {
-        let _ = required_event_created_at(&event)?;
-    }
+    let event = parse_envelope(&body)?;
+    let event_type = event.event_type.as_str();
 
     // Polar does not include event_id in the body; the webhook-id header
     // is the authoritative identifier.
@@ -97,12 +116,10 @@ pub async fn webhook(
 /// Handles `order.paid` — the one-time lifetime Pro purchase path.
 async fn handle_order_paid(
     state: &AppState,
-    event: &serde_json::Value,
+    event: &PolarWebhookEnvelope,
     event_id: &str,
 ) -> Result<StatusCode, AppError> {
-    let data = event
-        .get("data")
-        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+    let data = &event.data;
 
     // Skip subscription renewals; those are handled by subscription.* events.
     if data
@@ -141,7 +158,7 @@ async fn handle_order_paid(
     let checkout_id = json_str(data, "checkout_id")
         .ok_or_else(|| AppError::BadWebhook("missing checkout_id".into()))?;
 
-    let created_at = required_event_created_at(event)?;
+    let created_at = required_event_timestamp(event)?;
 
     let product_id = json_str(data, "product_id")
         .ok_or_else(|| AppError::BadWebhook("missing product_id".into()))?;
@@ -193,12 +210,10 @@ async fn handle_order_paid(
 /// or reconciliation for an existing subscription.
 async fn handle_sub_active(
     state: &AppState,
-    event: &serde_json::Value,
+    event: &PolarWebhookEnvelope,
     event_id: &str,
 ) -> Result<StatusCode, AppError> {
-    let data = event
-        .get("data")
-        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+    let data = &event.data;
 
     let sub_id = json_str(data, "id")
         .ok_or_else(|| AppError::BadWebhook("missing subscription id".into()))?;
@@ -212,7 +227,7 @@ async fn handle_sub_active(
     let product_id = json_str(data, "product_id");
     let checkout_id = json_str(data, "checkout_id");
 
-    let created_at = required_event_created_at(event)?;
+    let created_at = required_event_timestamp(event)?;
 
     let (tier, tier_unknown) = resolve_tier(
         state,
@@ -328,12 +343,10 @@ async fn handle_sub_active(
 /// so the API key is NOT revoked here.
 async fn handle_sub_canceled(
     state: &AppState,
-    event: &serde_json::Value,
+    event: &PolarWebhookEnvelope,
     event_id: &str,
 ) -> Result<StatusCode, AppError> {
-    let data = event
-        .get("data")
-        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+    let data = &event.data;
 
     let sub_id = match json_str(data, "id") {
         Some(id) => id,
@@ -345,10 +358,7 @@ async fn handle_sub_canceled(
                     subscription_id: None,
                     event_type: "subscription.canceled".to_string(),
                     reason: "missing_subscription_id".to_string(),
-                    occurred_at: event
-                        .get("created_at")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                    occurred_at: Some(required_event_timestamp(event)?),
                     payload: redact_event(event),
                 },
             )
@@ -358,7 +368,7 @@ async fn handle_sub_canceled(
         }
     };
 
-    let created_at = required_event_created_at(event)?;
+    let created_at = required_event_timestamp(event)?;
 
     let customer_id = json_str(data, "customer_id");
     let email = data
@@ -396,12 +406,10 @@ async fn handle_sub_canceled(
 /// Handles `subscription.revoked` — terminal state, revokes the API key.
 async fn handle_sub_revoked(
     state: &AppState,
-    event: &serde_json::Value,
+    event: &PolarWebhookEnvelope,
     event_id: &str,
 ) -> Result<StatusCode, AppError> {
-    let data = event
-        .get("data")
-        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+    let data = &event.data;
 
     let sub_id = match json_str(data, "id") {
         Some(id) => id,
@@ -413,10 +421,7 @@ async fn handle_sub_revoked(
                     subscription_id: None,
                     event_type: "subscription.revoked".to_string(),
                     reason: "missing_subscription_id".to_string(),
-                    occurred_at: event
-                        .get("created_at")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                    occurred_at: Some(required_event_timestamp(event)?),
                     payload: redact_event(event),
                 },
             )
@@ -426,7 +431,7 @@ async fn handle_sub_revoked(
         }
     };
 
-    let created_at = required_event_created_at(event)?;
+    let created_at = required_event_timestamp(event)?;
 
     let customer_id = json_str(data, "customer_id");
     let email = data
@@ -461,12 +466,10 @@ async fn handle_sub_revoked(
 /// Handles `subscription.past_due` — payment failed, revokes the API key.
 async fn handle_sub_past_due(
     state: &AppState,
-    event: &serde_json::Value,
+    event: &PolarWebhookEnvelope,
     event_id: &str,
 ) -> Result<StatusCode, AppError> {
-    let data = event
-        .get("data")
-        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+    let data = &event.data;
 
     let sub_id = match json_str(data, "id") {
         Some(id) => id,
@@ -476,7 +479,7 @@ async fn handle_sub_past_due(
         }
     };
 
-    let created_at = required_event_created_at(event)?;
+    let created_at = required_event_timestamp(event)?;
 
     let product_id = json_str(data, "product_id");
     let (tier, tier_unknown) = resolve_tier(
@@ -533,12 +536,10 @@ async fn handle_sub_past_due(
 /// subscription is back to active.
 async fn handle_sub_uncanceled(
     state: &AppState,
-    event: &serde_json::Value,
+    event: &PolarWebhookEnvelope,
     event_id: &str,
 ) -> Result<StatusCode, AppError> {
-    let data = event
-        .get("data")
-        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+    let data = &event.data;
 
     let sub_id = match json_str(data, "id") {
         Some(id) => id,
@@ -548,7 +549,7 @@ async fn handle_sub_uncanceled(
         }
     };
 
-    let created_at = required_event_created_at(event)?;
+    let created_at = required_event_timestamp(event)?;
 
     let product_id = json_str(data, "product_id");
     let (tier, tier_unknown) = resolve_tier(
@@ -615,23 +616,20 @@ fn json_str(val: &serde_json::Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Lifecycle ordering is only safe when Polar supplies a parseable event
-/// creation instant. The signed delivery timestamp proves freshness of the
-/// HTTP message, not ordering of the underlying subscription event, so it
-/// cannot substitute for this payload field.
-fn required_event_created_at(event: &serde_json::Value) -> Result<String, AppError> {
-    let raw = event
-        .get("created_at")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::BadWebhook("missing created_at".into()))?;
-    chrono::DateTime::parse_from_rfc3339(raw)
+/// Lifecycle ordering is only safe when Polar supplies a parseable envelope
+/// timestamp. The Standard Webhooks header timestamp proves delivery
+/// freshness; this signed payload timestamp orders the underlying event.
+fn required_event_timestamp(event: &PolarWebhookEnvelope) -> Result<String, AppError> {
+    if event.timestamp.is_empty() {
+        return Err(AppError::BadWebhook("missing timestamp".into()));
+    }
+    chrono::DateTime::parse_from_rfc3339(&event.timestamp)
         .map(|timestamp| {
             timestamp
                 .to_utc()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
         })
-        .map_err(|_| AppError::BadWebhook("invalid created_at".into()))
+        .map_err(|_| AppError::BadWebhook("invalid timestamp".into()))
 }
 
 /// Resolve product_id → tier. On unknown product, insert dead-letter and return None.
@@ -642,7 +640,7 @@ async fn resolve_tier(
     event_id: &str,
     event_type: &str,
     created_at: &Option<String>,
-    event: &serde_json::Value,
+    event: &PolarWebhookEnvelope,
 ) -> (Option<String>, bool) {
     match product_id {
         Some(pid) => match state.config.tier_for_product(pid) {
@@ -757,16 +755,14 @@ fn log_created_outcome(outcome: &CreatedOutcome, id: &str, event_id: &str) {
 }
 
 /// Redact event payload — keep only safe fields for dead-letter storage.
-fn redact_event(event: &serde_json::Value) -> String {
-    let mut redacted = serde_json::json!({});
+fn redact_event(event: &PolarWebhookEnvelope) -> String {
+    let mut redacted = serde_json::json!({
+        "type": event.event_type,
+        "timestamp": event.timestamp,
+    });
 
-    if let Some(t) = event.get("type") {
-        redacted["type"] = t.clone();
-    }
-    if let Some(ca) = event.get("created_at") {
-        redacted["created_at"] = ca.clone();
-    }
-    if let Some(data) = event.get("data") {
+    let data = &event.data;
+    {
         let mut rd = serde_json::json!({});
         if let Some(id) = data.get("id") {
             rd["id"] = id.clone();
@@ -792,6 +788,11 @@ fn redact_event(event: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hmac::Mac;
+
+    fn envelope(value: serde_json::Value) -> PolarWebhookEnvelope {
+        serde_json::from_value(value).unwrap()
+    }
 
     #[test]
     fn redact_event_keeps_only_the_allowlisted_fields() {
@@ -801,7 +802,7 @@ mod tests {
         // dropped event and a plaintext PII leak into the dead-letter table.
         let event = serde_json::json!({
             "type": "subscription.past_due",
-            "created_at": "2024-01-01T00:00:00Z",
+            "timestamp": "2024-01-01T00:00:00Z",
             "secret_top_level": "must-not-appear",
             "data": {
                 "id": "sub_1",
@@ -814,11 +815,11 @@ mod tests {
                 "raw_note": "free text that could hold anything"
             }
         });
-        let redacted = redact_event(&event);
+        let redacted = redact_event(&envelope(event));
         let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
 
         assert_eq!(parsed["type"], "subscription.past_due");
-        assert_eq!(parsed["created_at"], "2024-01-01T00:00:00Z");
+        assert_eq!(parsed["timestamp"], "2024-01-01T00:00:00Z");
         assert_eq!(parsed["data"]["id"], "sub_1");
         assert_eq!(parsed["data"]["status"], "past_due");
         assert_eq!(parsed["data"]["product_id"], "prod_1");
@@ -846,15 +847,15 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_timestamp_is_required_and_must_be_rfc3339() {
-        for event in [
-            serde_json::json!({"type": "subscription.active"}),
-            serde_json::json!({"type": "subscription.active", "created_at": null}),
-            serde_json::json!({"type": "subscription.active", "created_at": ""}),
-            serde_json::json!({"type": "subscription.active", "created_at": "not-a-time"}),
+    fn envelope_timestamp_is_required_and_must_be_rfc3339() {
+        for body in [
+            serde_json::json!({"type": "subscription.active", "data": {}}),
+            serde_json::json!({"type": "subscription.active", "timestamp": null, "data": {}}),
+            serde_json::json!({"type": "subscription.active", "timestamp": "", "data": {}}),
+            serde_json::json!({"type": "subscription.active", "timestamp": "not-a-time", "data": {}}),
         ] {
             assert!(matches!(
-                required_event_created_at(&event),
+                parse_envelope(&serde_json::to_vec(&body).unwrap()),
                 Err(AppError::BadWebhook(_))
             ));
         }
@@ -862,13 +863,54 @@ mod tests {
 
     #[test]
     fn lifecycle_timestamp_is_normalized_to_one_utc_encoding() {
-        let event = serde_json::json!({
+        let event = envelope(serde_json::json!({
             "type": "subscription.active",
-            "created_at": "2024-03-01T13:30:00+02:00"
-        });
+            "timestamp": "2024-03-01T13:30:00.123456+02:00",
+            "data": {}
+        }));
         assert_eq!(
-            required_event_created_at(&event).unwrap(),
-            "2024-03-01T11:30:00.000Z"
+            required_event_timestamp(&event).unwrap(),
+            "2024-03-01T11:30:00.123456Z"
         );
+    }
+
+    #[test]
+    fn signed_official_polar_envelope_verifies_and_parses() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let secret = format!(
+            "whsec_{}",
+            base64::engine::general_purpose::STANDARD.encode(key)
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "subscription.active",
+            "timestamp": "2024-03-01T11:30:00.123456Z",
+            "data": {"id": "sub_official_shape"}
+        }))
+        .unwrap();
+        let message_id = "msg_official_shape";
+        let delivery_timestamp = chrono::Utc::now().timestamp().to_string();
+        let mut mac = <hmac::Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
+        mac.update(message_id.as_bytes());
+        mac.update(b".");
+        mac.update(delivery_timestamp.as_bytes());
+        mac.update(b".");
+        mac.update(&body);
+        let signature = format!(
+            "v1,{}",
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+        );
+
+        webhook_verify::verify_webhook(
+            &secret,
+            message_id,
+            &delivery_timestamp,
+            &body,
+            &signature,
+            300,
+        )
+        .unwrap();
+        let parsed = parse_envelope(&body).unwrap();
+        assert_eq!(parsed.event_type, "subscription.active");
+        assert_eq!(parsed.data["id"], "sub_official_shape");
     }
 }
