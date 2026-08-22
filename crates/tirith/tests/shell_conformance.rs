@@ -126,6 +126,30 @@ fn strict_ledger_counts(env: &IsolatedEnv) -> (usize, usize) {
     (confirmed, unresolved)
 }
 
+/// Number of typed events persisted in the session record.
+///
+/// This is the store `MassFileDeletion` and the other correlation rules read,
+/// and it is NOT the strict execution ledger: a receipt and a typed event are
+/// written by different paths. Asserting only on the ledger would let a change
+/// that persists an observation without committing a receipt pass while the
+/// original bug (#188, a tab completion counted as an executed deletion) came
+/// straight back.
+fn session_typed_event_count(env: &IsolatedEnv) -> usize {
+    let path = env.session_record_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        // No session record yet is the strongest possible form of "nothing was
+        // observed", so it counts as zero rather than failing the read.
+        return 0;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        panic!("session record at {} must be valid JSON", path.display());
+    };
+    value["typed_events"]
+        .as_array()
+        .map(|events| events.len())
+        .unwrap_or(0)
+}
+
 // === bash — PREEXEC mode (DEBUG-trap, warn-only unless
 // TIRITH_BASH_PREEXEC_ENFORCE) ===
 // Delivery goes through bash's own command loop, so it's reliable in a PTY.
@@ -927,18 +951,27 @@ fn fish_rm_tab_completion_does_not_persist_execution() {
         }
     };
 
-    let before = strict_ledger_counts(&env);
+    let ledger_before = strict_ledger_counts(&env);
+    let events_before = session_typed_event_count(&env);
     sess.send_raw(b"rm fish-delete-\t\t");
     sess.wait_idle(QUIET, SETTLE_MAX);
-    let after = strict_ledger_counts(&env);
+    let ledger_after = strict_ledger_counts(&env);
+    let events_after = session_typed_event_count(&env);
 
     // Cancel the unexecuted editor buffer before closing the session.
     sess.send_raw(b"\x03");
     sess.close();
 
     assert_eq!(
-        after, before,
-        "Fish tab completion must not commit a receipt or persist deletion observations"
+        ledger_after, ledger_before,
+        "Fish tab completion must not commit an execution receipt"
+    );
+    // The second half of the same invariant, and the one the original report
+    // was actually about: the correlation ring must not gain a deletion
+    // observation for a command the user never ran.
+    assert_eq!(
+        events_after, events_before,
+        "Fish tab completion must not persist a typed deletion observation"
     );
 }
 
