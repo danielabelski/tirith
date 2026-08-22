@@ -297,19 +297,18 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
         );
     }
 
-    let dispatch = yaml_key(triggers, "workflow_dispatch")
-        .as_mapping()
-        .expect("manual dispatch mapping");
-    let inputs = yaml_key(dispatch, "inputs")
-        .as_mapping()
-        .expect("manual dispatch inputs");
-    let dry_run = yaml_key(inputs, "dry_run")
-        .as_mapping()
-        .expect("dry-run input mapping");
-    assert_eq!(
-        yaml_key(dry_run, "default").as_bool(),
-        Some(true),
-        "manual dispatch must default to a non-publishing dry run"
+    // Manual dispatch must offer no inputs. Publication is gated on
+    // `github.event_name == 'push'` below, so no dispatch option can turn it
+    // on; a knob that looks like it might is worse than no knob, because a
+    // release engineer reading it would believe the default is what protects
+    // them rather than the event gate.
+    let dispatch = yaml_key(triggers, "workflow_dispatch");
+    assert!(
+        dispatch.is_null()
+            || dispatch
+                .as_mapping()
+                .is_some_and(|mapping| mapping.is_empty()),
+        "manual dispatch must declare no inputs, got {dispatch:?}"
     );
 
     // These jobs only build or validate artifacts. Every other current or future
@@ -317,6 +316,9 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
     // must require a real push event as well as a v* ref. This catches a manual
     // dispatch that selects an existing tag: `github.ref` alone is not an
     // adequate publication gate.
+    const PUBLICATION_GATE: &str =
+        "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')";
+
     let dry_run_jobs: HashSet<&str> = [
         "enforcement-check",
         "completions",
@@ -342,10 +344,15 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
         let condition = yaml_key(job, "if")
             .as_str()
             .expect("publication job condition");
-        assert!(
-            condition.contains("github.event_name == 'push'")
-                && condition.contains("startsWith(github.ref, 'refs/tags/v')"),
-            "release job {job_name:?} must be gated to a pushed v* tag, got {condition:?}"
+        // Exact match, not `contains`. A substring test passes for
+        // `(push && tag) || workflow_dispatch`, which is precisely the shape
+        // that would hand publication to anyone who can press Run workflow —
+        // and it is already the shape the build-only jobs above use, so it is
+        // one copy-paste away at all times.
+        let normalized = condition.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            normalized, PUBLICATION_GATE,
+            "release job {job_name:?} must carry exactly the pushed-v*-tag gate, got {condition:?}"
         );
     }
 }

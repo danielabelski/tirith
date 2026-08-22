@@ -41,6 +41,28 @@ trap 'rm -f -- "$file_list"' EXIT
 # unreadable package subtree into a partial scan that appears successful.
 find "$scan_root" -type f -print0 > "$file_list"
 
+# `-type f` is false for a symlink, so the scan above walks straight past one.
+# A link whose target lives inside the tree is still covered (the target is
+# itself a regular file the scan reaches), but a link pointing outside it names
+# a binary this check never inspects while the package still ships the path.
+# Refuse rather than report a clean scan over an unverifiable entry.
+# Compare canonical paths on both sides: `readlink -f` always answers with an
+# absolute path, so matching it against a relative `$scan_root` would reject
+# every ordinary in-tree `libfoo.so -> libfoo.so.1` a real package ships.
+canonical_root=$(cd -- "$scan_root" && pwd -P)
+escaping_links=0
+while IFS= read -r -d '' link; do
+  target=$(readlink -f -- "$link" 2>/dev/null || true)
+  case "$target" in
+    "$canonical_root"/*) continue ;;
+  esac
+  echo "ERROR: $link resolves outside $canonical_root (to '${target:-unresolvable}') and cannot be verified" >&2
+  escaping_links=$((escaping_links + 1))
+done < <(find "$scan_root" -type l -print0)
+if [[ $escaping_links -gt 0 ]]; then
+  exit 1
+fi
+
 elf_count=0
 while IFS= read -r -d '' candidate; do
   magic=$(LC_ALL=C od -An -tx1 -N4 -- "$candidate" | tr -d '[:space:]')

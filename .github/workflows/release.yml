@@ -14,12 +14,10 @@ on:
       - "crates/tirith-core/**"
       - "packaging/**"
       - "shell/**"
+  # Manual dispatch builds and smoke-tests only. It takes no inputs on purpose:
+  # every publishing job requires `github.event_name == 'push'`, so no dispatch
+  # option could enable publication and offering one would only imply otherwise.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Build and smoke-test only (no publish)"
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -766,12 +764,31 @@ jobs:
           SHA_AL=$(sha256sum tirith-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           SHA_XL=$(sha256sum tirith-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           cd ..
+          # Each sed below replaces the FIRST remaining placeholder, so the
+          # order of the four sha256 lines in the template is load-bearing and
+          # a template edit that drops or reorders one would silently ship a
+          # formula whose bottle hashes belong to the wrong architecture, or a
+          # literal PLACEHOLDER. Assert the count going in and coming out.
+          placeholders=$(grep -c 'sha256 "PLACEHOLDER"' homebrew-tap/Formula/tirith.rb || true)
+          if [ "$placeholders" -ne 4 ]; then
+            echo "ERROR: expected 4 sha256 PLACEHOLDER lines in the formula template, found ${placeholders}" >&2
+            exit 1
+          fi
           sed -i "s/version \"[0-9.]*\"/version \"${VER}\"/" homebrew-tap/Formula/tirith.rb
           sed -i "s|releases/download/v[0-9.]*|releases/download/${VERSION}|g" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_AA}\"/}" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_XA}\"/}" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_AL}\"/}" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_XL}\"/}" homebrew-tap/Formula/tirith.rb
+          if grep -q 'PLACEHOLDER' homebrew-tap/Formula/tirith.rb; then
+            echo "ERROR: formula still contains a PLACEHOLDER after templating" >&2
+            grep -n 'PLACEHOLDER' homebrew-tap/Formula/tirith.rb >&2
+            exit 1
+          fi
+          if grep -q 'version "0.1.0"' homebrew-tap/Formula/tirith.rb; then
+            echo "ERROR: formula version was not substituted (still the template placeholder)" >&2
+            exit 1
+          fi
 
       - name: Push formula
         env:
@@ -937,6 +954,10 @@ jobs:
           # `v[0-9.]*` matched zero digits and produced `v0.3.2$version`).
           sed -i "s|releases/download/v[0-9][0-9.]*|releases/download/${VERSION}|" scoop-tirith/bucket/tirith.json
           sed -i "s/\"hash\": \"PLACEHOLDER\"/\"hash\": \"${HASH}\"/" scoop-tirith/bucket/tirith.json
+          if grep -q 'PLACEHOLDER' scoop-tirith/bucket/tirith.json; then
+            echo "ERROR: scoop manifest still contains a PLACEHOLDER after templating" >&2
+            exit 1
+          fi
 
       - name: Push manifest
         env:
@@ -1506,9 +1527,19 @@ jobs:
       - name: Push to Chocolatey
         shell: pwsh
         continue-on-error: true  # Chocolatey moderation can block pushes; don't fail the release
+        env:
+          # Reach the secret through the environment. Interpolating `${{ }}` into
+          # a run: body splices the value into the script before the shell sees
+          # it, so the expansion is a script-injection surface and the key also
+          # lands in the process command line.
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+            Write-Warning "CHOCOLATEY_API_KEY is not configured; skipping push"
+            exit 0
+          }
           $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
-          & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+          & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY
           if ($LASTEXITCODE -ne 0) {
             Write-Warning "Chocolatey push failed (exit $LASTEXITCODE) — previous version may still be in moderation"
           }
