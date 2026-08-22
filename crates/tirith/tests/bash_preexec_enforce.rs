@@ -993,6 +993,70 @@ sh -c 'touch {{sentinels}}/after_trap_theft' BLOCK_TOKEN-trap-theft
 }
 
 #[test]
+fn losing_the_trap_is_announced_even_after_an_earlier_warn_only_downgrade() {
+    // Two degrade tiers, two banners. A session that already dropped to
+    // warn-only (and consumed that latch) and THEN loses its DEBUG trap goes
+    // from "warns" to "nothing", which is the transition a user most needs to
+    // hear about. A shared latch made it the one that stayed silent.
+    let (_out, stderr, _inv, sentinel_dir) = run_with_sentinels(
+        r#"
+echo BADRC_TOKEN-first
+trap 'true' DEBUG
+echo BLOCK_TOKEN-after-theft
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+    assert!(
+        stderr.contains("protection downgraded to warn-only"),
+        "the first degrade must still print its banner: {stderr}"
+    );
+    assert!(
+        stderr.contains("protection is OFF for this shell"),
+        "the later loss of the trap must print ITS banner too: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
+fn warn_only_scan_falls_back_to_a_plain_check_when_the_receipt_path_fails() {
+    // In warn-only mode the receipt-enabled check writes its stdout to a
+    // capture file, so when that path fails the user has seen nothing and the
+    // command runs anyway. The plain scan is the only thing the mode offers;
+    // it must still happen, and the receipt loss must be said once.
+    let (_out, stderr, invocations, sentinel_dir) = run_with_sentinels(
+        r#"
+# Pretend the startup probe negotiated protocol 3 with a valid parent context,
+# then hand the receipt path a fake tirith that returns no receipt frame.
+_TIRITH_RECEIPT_PROTOCOL=3
+_TIRITH_PREEXEC_RECEIPTS_TRUSTED=1
+_TIRITH_RECEIPT_SHELL_PID=$$
+echo WARN_TOKEN-fallback
+"#,
+        &[("TIRITH_BASH_MODE", "preexec")],
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|i| i.contains("--execution-receipt") && i.contains("WARN_TOKEN-fallback")),
+        "the receipt-enabled check must have been attempted first: {invocations:#?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|i| i.contains("--warn-only") && i.contains("WARN_TOKEN-fallback")),
+        "a failed receipt path must fall back to a plain warn-only scan: {invocations:#?}"
+    );
+    assert!(
+        stderr.contains("execution receipts unavailable"),
+        "the receipt loss must be announced: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
 fn reinstalling_the_tirith_trampoline_is_not_treated_as_a_loss() {
     // Idempotent re-installation, and any wrapper that chains through
     // `_tirith_debug_trampoline`, keep the heartbeat alive. Neither is tampering.

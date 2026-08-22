@@ -44,7 +44,7 @@ for _tirith_inherited_state in \
   _TIRITH_BASH_INTERNAL \
   _tirith_last_key _tirith_last_rc _tirith_last_cmd \
   _TIRITH_PREV_DEBUG_TRAP \
-  _TIRITH_DEGRADE_WARNED _TIRITH_PREEXEC_WARNED _TIRITH_RECEIPT_DEGRADE_WARNED \
+  _TIRITH_DEGRADE_WARNED _TIRITH_OFF_WARNED _TIRITH_PREEXEC_WARNED _TIRITH_RECEIPT_DEGRADE_WARNED \
   _TIRITH_BINDS_INSTALLED _TIRITH_PREEXEC_PROMPT_STATUS
 do
   [[ "$(declare -p "$_tirith_inherited_state" 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] \
@@ -1067,8 +1067,12 @@ _tirith_session_lost_debug_trap() {
   _TIRITH_PREEXEC_WARNED=1
   export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
   _tirith_set_status "degraded"
-  [[ -n "${_TIRITH_DEGRADE_WARNED:-}" ]] && return 0
-  _TIRITH_DEGRADE_WARNED=1
+  # Its own latch, deliberately not `_TIRITH_DEGRADE_WARNED`. That one belongs
+  # to the warn-only downgrade, and a session that already paid that banner must
+  # still hear about this one: warn-only to off is the transition that matters
+  # most, and sharing the latch made it the one transition that stayed silent.
+  [[ -n "${_TIRITH_OFF_WARNED:-}" ]] && return 0
+  _TIRITH_OFF_WARNED=1
   [[ $- == *i* ]] || return 0
   _tirith_output "tirith: protection is OFF for this shell — run 'tirith doctor' for details"
   _tirith_output "  another tool replaced or removed Tirith's DEBUG trap; commands are no longer being checked. Tirith did not take the trap back. Restart your shell, or load tirith after that tool."
@@ -1397,7 +1401,19 @@ _tirith_preexec() {
   if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 \
         && "${_TIRITH_PREEXEC_RECEIPTS_TRUSTED:-0}" == "1" ]]; then
     if _tirith_receipt_parent_context_is_valid; then
-      _tirith_preexec_receipt_check "$scan_target" yes || true
+      if ! _tirith_preexec_receipt_check "$scan_target" yes; then
+        # The receipt path failed before the user saw anything: its stdout goes
+        # to a capture file, so a capture, parse, or consume failure swallows
+        # the scan output along with the receipt. The command runs regardless
+        # in warn-only mode, which makes the scan the only thing this mode
+        # offers. Run it plainly, and say once that execution evidence for this
+        # shell is no longer strict.
+        _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
+        if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
+          _TIRITH_RECEIPT_DEGRADE_WARNED=1
+          _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
+        fi
+      fi
     else
       # A functrace-inherited DEBUG trap may run in a Bash subshell where `$$`
       # still names the registered top-level shell. Do not make a false strict
