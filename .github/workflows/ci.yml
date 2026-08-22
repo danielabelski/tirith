@@ -103,6 +103,66 @@ jobs:
           hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link
           --locked -- --exact --nocapture
 
+  bash-53:
+    # The hosted images ship bash 5.2, and the interactive-shell tests accept
+    # any bash >= 5, so every enter-mode and preexec assertion in CI has only
+    # ever run against 5.2. Issue #158 is reported against 5.3.15 and the
+    # extdebug/PROMPT_COMMAND ownership work in #176 exists because of it, so
+    # the version those bugs live on is the one version CI never exercised.
+    # Build it from the GNU release (sha256 pinned, same discipline as the
+    # action pins) and re-run the bash suites against it.
+    name: Bash 5.3 shell hooks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASH_VERSION_UNDER_TEST: "5.3"
+      BASH_TARBALL_SHA256: "0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build bash ${{ env.BASH_VERSION_UNDER_TEST }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cd "$work"
+          curl -fsSLO "https://ftp.gnu.org/gnu/bash/bash-${BASH_VERSION_UNDER_TEST}.tar.gz"
+          echo "${BASH_TARBALL_SHA256}  bash-${BASH_VERSION_UNDER_TEST}.tar.gz" | sha256sum -c -
+          tar xzf "bash-${BASH_VERSION_UNDER_TEST}.tar.gz"
+          cd "bash-${BASH_VERSION_UNDER_TEST}"
+          ./configure --prefix="$HOME/bash53" >/dev/null
+          make -j"$(nproc)" >/dev/null
+          make install >/dev/null
+          "$HOME/bash53/bin/bash" --version | head -1
+      - name: Put bash ${{ env.BASH_VERSION_UNDER_TEST }} first on PATH
+        run: |
+          set -euo pipefail
+          echo "$HOME/bash53/bin" >> "$GITHUB_PATH"
+      - name: Confirm the suites will see it
+        run: |
+          set -euo pipefail
+          resolved="$(command -v bash)"
+          echo "bash resolves to ${resolved}"
+          case "$("$resolved" --version | head -1)" in
+            *"version ${BASH_VERSION_UNDER_TEST}"*) ;;
+            *)
+              echo "ERROR: expected bash ${BASH_VERSION_UNDER_TEST} first on PATH" >&2
+              exit 1
+              ;;
+          esac
+      - name: Install interactive shell conformance dependencies
+        run: sudo apt-get update && sudo apt-get install --yes fish zsh
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Bash hook suites on ${{ env.BASH_VERSION_UNDER_TEST }}
+        run: >-
+          cargo test -p tirith --locked
+          --test bash_preexec_enforce
+          --test bash_hook_exports
+          --test shell_conformance
+
   msrv:
     name: MSRV (1.83)
     runs-on: ubuntu-latest
