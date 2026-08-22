@@ -40,9 +40,10 @@ Shipped and available in the current release line (see [CHANGELOG.md](../CHANGEL
   semantic-predicate clause, with `tirith rule test / validate / explain` as the
   authoring and testing surface.
 - **Offline mode for the hot path**: `tirith check --offline` and the
-  `TIRITH_OFFLINE` environment variable, an opt-in switch that suppresses the
-  periodic background threat-DB refresh so `check` runs purely locally. This is
-  a mechanism only; the online default is unchanged.
+  `TIRITH_OFFLINE` environment variable form a hard no-network boundary for the
+  periodic threat-DB refresh and runtime HTTP/DNS enrichment. Existing caches
+  may be read; cache misses are surfaced as incomplete verification. The online
+  default is unchanged.
 - **Android / Termux support**: Termux runs on Bionic libc, so the
   `aarch64-unknown-linux-musl` static build is the supported artifact; the
   release workflow builds it and smoke-tests it (static-linkage check plus

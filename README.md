@@ -868,12 +868,12 @@ That is the daily-driver set. tirith ships 78 top-level commands in all, in 8 gr
 
 ## Design principles
 
-- **Detection runs locally**: `paste`, `score`, `diff`, and `why` make zero
-  network calls. `tirith check` (including the `--approval-check` path shell
-  hooks use) also analyzes locally, but first triggers a *periodic background
-  threat-DB refresh* (see below), so it is not strictly offline. `tirith check
-  --offline` (or `TIRITH_OFFLINE=1`) suppresses the refresh and keeps it fully
-  local.
+- **Offline is a hard boundary**: `paste`, `score`, `diff`, and `why` make zero
+  network calls. `tirith check` can query configured OSV/deps.dev/ecosyste.ms,
+  CISA KEV, and Safe Browsing sources and can trigger the periodic threat-DB
+  refresh below. `tirith check --offline` (or `TIRITH_OFFLINE=1`) suppresses all
+  of those HTTP and DNS paths, reads only existing runtime caches, and reports
+  cache misses as incomplete verification rather than a clean result.
 - **Periodic background threat-DB refresh**: `tirith check` and the shell hooks
   trigger a cheap, detached background check at most once every 24 hours by
   default (`threat_intel.auto_update_hours`), to keep the signed database fresh.
@@ -886,11 +886,13 @@ That is the daily-driver set. tirith ships 78 top-level commands in all, in 8 gr
   per-command and exits immediately. The threat-DB refresh above is a
   short-lived detached update, not a resident process. Optional `tirith daemon
   start` is the only resident process, and it is opt-in.
-- **Network only when you ask, configure, or for the threat-DB refresh**:
+- **Network only on documented surfaces**:
   `run`, `fetch`, and `audit report --upload` reach the network only on explicit
-  invocation; the threat-DB refresh follows the schedule above. Daemon mode adds
-  network-aware URL resolution, and optional webhook / policy-server integrations
-  can make outbound requests when configured. Core detection never phones home.
+  invocation; `check` uses the configured runtime threat sources and the
+  threat-DB refresh follows the schedule above. Daemon mode adds network-aware
+  URL resolution, and optional webhook / policy-server integrations can make
+  outbound requests when configured. `--offline` / `TIRITH_OFFLINE=1` disables
+  every `check` hot-path network producer in both daemon and inline modes.
 - **Egress guard on fetches.** `tirith run`, `fetch --save`, and `command-card
   fetch` refuse private, loopback, and cloud-metadata hosts by default, and an
   SSRF guard re-checks DNS at connect time and on every redirect hop. To reach a

@@ -133,11 +133,28 @@ pub fn suggest_verified_for_cli_inline_with_policy_and_session(
     policy: &Policy,
     session_id: &str,
 ) -> Vec<SafeSuggestion> {
+    suggest_verified_for_cli_inline_with_policy_session_and_network(
+        ctx,
+        policy,
+        session_id,
+        crate::threatdb_api::RuntimeThreatNetwork::Online,
+    )
+}
+
+/// Network-policy-aware form used by CLI surfaces that own an explicit
+/// `--offline` decision. The compatibility entry point above remains online.
+pub fn suggest_verified_for_cli_inline_with_policy_session_and_network(
+    ctx: &AnalysisContext,
+    policy: &Policy,
+    session_id: &str,
+    network: crate::threatdb_api::RuntimeThreatNetwork,
+) -> Vec<SafeSuggestion> {
     let trusted_runner = trusted_current_tirith_path();
     suggest_verified_for_cli_inline_with_policy_session_and_runner(
         ctx,
         policy,
         session_id,
+        network,
         trusted_runner.as_deref(),
     )
 }
@@ -149,30 +166,55 @@ fn suggest_verified_for_cli_inline_with_policy_session_and_runner(
     ctx: &AnalysisContext,
     policy: &Policy,
     session_id: &str,
+    network: crate::threatdb_api::RuntimeThreatNetwork,
     trusted_runner: Option<&Path>,
 ) -> Vec<SafeSuggestion> {
     let origin = crate::agent_origin::resolve_cli_origin(ctx.interactive);
-    let verdict = analyze_cli_inline_candidate(ctx, &origin, policy, session_id);
-    verify_cli_inline_suggestions_with_runner(ctx, &verdict, policy, trusted_runner, session_id)
+    let verdict =
+        analyze_cli_inline_candidate_with_network(ctx, &origin, policy, session_id, network);
+    verify_cli_inline_suggestions_with_runner_and_network(
+        ctx,
+        &verdict,
+        policy,
+        network,
+        trusted_runner,
+        session_id,
+    )
 }
 
+#[cfg(test)]
+#[allow(dead_code)] // Linux-only exact-runner tests call this wrapper.
 fn analyze_cli_inline_candidate(
     ctx: &AnalysisContext,
     origin: &crate::agent_origin::AgentOrigin,
     policy: &Policy,
     session_id: &str,
 ) -> Verdict {
+    analyze_cli_inline_candidate_with_network(
+        ctx,
+        origin,
+        policy,
+        session_id,
+        crate::threatdb_api::RuntimeThreatNetwork::Online,
+    )
+}
+
+fn analyze_cli_inline_candidate_with_network(
+    ctx: &AnalysisContext,
+    origin: &crate::agent_origin::AgentOrigin,
+    policy: &Policy,
+    session_id: &str,
+    network: crate::threatdb_api::RuntimeThreatNetwork,
+) -> Verdict {
     let mut raw = engine::analyze_with_policy_without_bypass(ctx, policy);
-    let runtime_findings = crate::threatdb_api::enrich_command(
+    let runtime_findings = crate::threatdb_api::enrich_command_with_network(
         &ctx.input,
         ctx.shell,
         &policy.threat_intel,
         crate::threatdb_api::RuntimeThreatMode::Inline,
+        network,
     );
-    if !runtime_findings.is_empty() {
-        raw.findings.extend(runtime_findings);
-        raw.action = crate::verdict::upgraded_action_from_findings(&raw.findings, raw.action);
-    }
+    crate::escalation::merge_late_findings(&mut raw, runtime_findings, policy);
     raw.agent_origin = Some(origin.clone());
     crate::escalation::post_process_verdict_for_verification(
         &raw,
@@ -204,10 +246,29 @@ fn strip_executable_candidates(suggestions: &mut [SafeSuggestion], reason: &str)
     }
 }
 
+#[cfg(test)]
 fn verify_cli_inline_suggestions_with_runner(
     ctx: &AnalysisContext,
     verdict: &Verdict,
     policy: &Policy,
+    trusted_runner: Option<&Path>,
+    session_id: &str,
+) -> Vec<SafeSuggestion> {
+    verify_cli_inline_suggestions_with_runner_and_network(
+        ctx,
+        verdict,
+        policy,
+        crate::threatdb_api::RuntimeThreatNetwork::Online,
+        trusted_runner,
+        session_id,
+    )
+}
+
+fn verify_cli_inline_suggestions_with_runner_and_network(
+    ctx: &AnalysisContext,
+    verdict: &Verdict,
+    policy: &Policy,
+    network: crate::threatdb_api::RuntimeThreatNetwork,
     trusted_runner: Option<&Path>,
     session_id: &str,
 ) -> Vec<SafeSuggestion> {
@@ -282,8 +343,13 @@ fn verify_cli_inline_suggestions_with_runner(
         // Repeat the same producer-owned CLI-inline pipeline used to analyze the
         // original command. No caller-supplied verdict or generic daemon mode can
         // cross this executable-output boundary.
-        let candidate_verdict =
-            analyze_cli_inline_candidate(&candidate_ctx, &candidate_origin, policy, session_id);
+        let candidate_verdict = analyze_cli_inline_candidate_with_network(
+            &candidate_ctx,
+            &candidate_origin,
+            policy,
+            session_id,
+            network,
+        );
         if candidate_verdict.action == Action::Allow
             && candidate_verdict.requires_approval != Some(true)
         {
@@ -1237,6 +1303,7 @@ mod tests {
             &ctx,
             &policy,
             "safe-command-exact-positive",
+            crate::threatdb_api::RuntimeThreatNetwork::Online,
             Some(Path::new("/usr/local/bin/tirith")),
         );
         assert!(suggestions

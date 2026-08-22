@@ -12,6 +12,28 @@ use crate::session_warnings::SessionWarnings;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
 
+/// Merge findings produced after the engine pass under the same policy as the
+/// original verdict.
+///
+/// Runtime threat and network enrichment happen after the engine has already
+/// applied per-rule severity overrides. Every late producer must use this seam
+/// so those findings cannot bypass policy or diverge between daemon and inline
+/// execution.
+pub fn merge_late_findings(
+    verdict: &mut Verdict,
+    mut findings: Vec<Finding>,
+    policy: &crate::policy::Policy,
+) {
+    for finding in &mut findings {
+        if let Some(override_severity) = policy.severity_override(&finding.rule_id) {
+            finding.severity = override_severity;
+        }
+    }
+    verdict.findings.extend(findings);
+    verdict.action =
+        crate::verdict::upgraded_action_from_findings(&verdict.findings, verdict.action);
+}
+
 fn default_window_60() -> u64 {
     60
 }
@@ -2307,6 +2329,24 @@ mod tests {
             .insert("threat_malicious_package".to_string(), Severity::Info);
         let verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
         assert_eq!(verdict.action, Action::Allow);
+    }
+
+    #[test]
+    fn late_findings_receive_severity_policy_before_action_upgrade() {
+        let mut verdict = Verdict::from_findings(Vec::new(), 2, Timings::default());
+        let mut policy = crate::policy::Policy::default();
+        policy
+            .severity_overrides
+            .insert("analysis_incomplete".to_string(), Severity::Critical);
+
+        merge_late_findings(
+            &mut verdict,
+            vec![make_finding(RuleId::AnalysisIncomplete, Severity::Medium)],
+            &policy,
+        );
+
+        assert_eq!(verdict.findings[0].severity, Severity::Critical);
+        assert_eq!(verdict.action, Action::Block);
     }
 
     #[test]

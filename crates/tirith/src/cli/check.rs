@@ -20,9 +20,9 @@ use tirith_core::execution_state::{
 };
 use tirith_core::extract::ScanContext;
 use tirith_core::output;
-use tirith_core::threatdb_api::RuntimeThreatMode;
+use tirith_core::threatdb_api::{RuntimeThreatMode, RuntimeThreatNetwork};
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{action_from_findings, upgraded_action_from_findings, Action, Verdict};
+use tirith_core::verdict::{action_from_findings, Action, Verdict};
 
 /// W6: build a DISPLAY-ONLY clone of `effective` whose repeated Warn / WarnAck
 /// findings (already surfaced earlier this session) are collapsed, and return how
@@ -138,6 +138,7 @@ pub fn run(
     card: Option<String>,
 ) -> i32 {
     let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+    let offline = offline || crate::cli::offline_env_active();
     let shell_name = match shell_type {
         ShellType::Posix => "posix",
         ShellType::Fish => "fish",
@@ -364,17 +365,18 @@ pub fn run(
     crate::cli::warn_repo_policy_neutralized(&policy);
 
     if ran_locally {
-        let runtime_findings = tirith_core::threatdb_api::enrich_command(
+        let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
             cmd,
             shell_type,
             &policy.threat_intel,
             RuntimeThreatMode::Inline,
+            if offline {
+                RuntimeThreatNetwork::CacheOnly
+            } else {
+                RuntimeThreatNetwork::Online
+            },
         );
-        if !runtime_findings.is_empty() {
-            raw_verdict.findings.extend(runtime_findings);
-            raw_verdict.action =
-                upgraded_action_from_findings(&raw_verdict.findings, raw_verdict.action);
-        }
+        tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
     }
 
     // Snapshot raw action + rule ids before post-processing so the audit log
@@ -652,41 +654,47 @@ pub fn run(
 
     // Safe-command suggestions are advisory only: computed when opted-in AND the
     // verdict flagged something; they never influence the action or exit code.
-    let safe_suggestions: Vec<tirith_core::safe_command::SafeSuggestion> =
-        if suggest_safe_command && effective.action != Action::Allow {
-            let suggestion_ctx = AnalysisContext {
-                input: cmd.to_string(),
-                shell: shell_type,
-                scan_context: ScanContext::Exec,
-                raw_bytes: None,
-                interactive,
-                cwd: cwd.clone(),
-                file_path: None,
-                repo_root: None,
-                is_config_override: false,
-                clipboard_html: None,
-                card_ref: card.clone(),
-                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
-            };
-            if ran_locally {
-                tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_and_session(
+    let safe_suggestions: Vec<tirith_core::safe_command::SafeSuggestion> = if suggest_safe_command
+        && effective.action != Action::Allow
+    {
+        let suggestion_ctx = AnalysisContext {
+            input: cmd.to_string(),
+            shell: shell_type,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive,
+            cwd: cwd.clone(),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: card.clone(),
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        };
+        if ran_locally {
+            tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_session_and_network(
                     &suggestion_ctx,
                     &policy,
                     &session_id,
+                    if offline {
+                        RuntimeThreatNetwork::CacheOnly
+                    } else {
+                        RuntimeThreatNetwork::Online
+                    },
                 )
-            } else {
-                // A daemon verdict may include its longer-budget/private-network
-                // enrichment. Never replace that producer profile with a local
-                // Inline re-analysis at an executable-output boundary.
-                tirith_core::safe_command::suggest_verified_with_policy(
-                    &suggestion_ctx,
-                    &effective,
-                    &policy,
-                )
-            }
         } else {
-            Vec::new()
-        };
+            // A daemon verdict may include its longer-budget/private-network
+            // enrichment. Never replace that producer profile with a local
+            // Inline re-analysis at an executable-output boundary.
+            tirith_core::safe_command::suggest_verified_with_policy(
+                &suggestion_ctx,
+                &effective,
+                &policy,
+            )
+        }
+    } else {
+        Vec::new()
+    };
 
     if json {
         let suggestions_opt = if suggest_safe_command {
@@ -2447,17 +2455,18 @@ fn prepare_receipt_consumption(
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));
-    let runtime_findings = tirith_core::threatdb_api::enrich_command(
+    let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
         command,
         context.shell(),
         &policy.threat_intel,
         RuntimeThreatMode::Inline,
+        if crate::cli::offline_env_active() {
+            RuntimeThreatNetwork::CacheOnly
+        } else {
+            RuntimeThreatNetwork::Online
+        },
     );
-    if !runtime_findings.is_empty() {
-        raw_verdict.findings.extend(runtime_findings);
-        raw_verdict.action =
-            upgraded_action_from_findings(&raw_verdict.findings, raw_verdict.action);
-    }
+    tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
     if context.strict_warn_override() {
         policy.strict_warn = true;
     }

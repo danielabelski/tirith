@@ -139,19 +139,18 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     let (mut raw_verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
-    let runtime_findings = tirith_core::threatdb_api::enrich_command(
+    let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
         &cmd,
         shell_type,
         &policy.threat_intel,
         tirith_core::threatdb_api::RuntimeThreatMode::Inline,
+        if crate::cli::offline_env_active() {
+            tirith_core::threatdb_api::RuntimeThreatNetwork::CacheOnly
+        } else {
+            tirith_core::threatdb_api::RuntimeThreatNetwork::Online
+        },
     );
-    if !runtime_findings.is_empty() {
-        raw_verdict.findings.extend(runtime_findings);
-        raw_verdict.action = tirith_core::verdict::upgraded_action_from_findings(
-            &raw_verdict.findings,
-            raw_verdict.action,
-        );
-    }
+    tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
     let session_id = tirith_core::session::resolve_session_id();
     let verdict = tirith_core::escalation::post_process_verdict_for_verification(
@@ -183,10 +182,15 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     // exact final command that re-analyzes to an approval-free Allow under this
     // same context can populate `safe_command` and cross stdout/JSON execution
     // contracts.
-    let suggestions = safe_command::suggest_verified_for_cli_inline_with_policy_and_session(
+    let suggestions = safe_command::suggest_verified_for_cli_inline_with_policy_session_and_network(
         &ctx,
         &policy,
         &session_id,
+        if crate::cli::offline_env_active() {
+            tirith_core::threatdb_api::RuntimeThreatNetwork::CacheOnly
+        } else {
+            tirith_core::threatdb_api::RuntimeThreatNetwork::Online
+        },
     );
 
     // JSON / non-interactive path: emit a plain JSON array, never prompt. Exit

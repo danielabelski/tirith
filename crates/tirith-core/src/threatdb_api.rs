@@ -84,12 +84,31 @@ impl RuntimeThreatMode {
     }
 }
 
+/// Whether runtime threat intelligence may perform network I/O.
+///
+/// `CacheOnly` is an enforcement boundary, not a timeout hint: every live
+/// backend reads its persistent cache first and reports an incomplete lookup
+/// on a miss without constructing an HTTP client, resolving DNS, or sending a
+/// request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeThreatNetwork {
+    Online,
+    CacheOnly,
+}
+
+impl RuntimeThreatNetwork {
+    fn allows_network(self) -> bool {
+        self == Self::Online
+    }
+}
+
 /// A remote lookup must distinguish a complete negative answer from work that
 /// never completed. Collapsing both to `None` made a timed-out OSV request look
 /// exactly like "no advisory" and let later packages inherit a false clean
 /// result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LookupFailure {
+    Offline,
     Deadline,
     Client,
     Transport,
@@ -100,6 +119,7 @@ enum LookupFailure {
 impl LookupFailure {
     fn label(self) -> &'static str {
         match self {
+            Self::Offline => "was skipped by offline mode",
             Self::Deadline => "deadline exhausted",
             Self::Client => "HTTP client setup failed",
             Self::Transport => "transport failed",
@@ -153,7 +173,9 @@ trait PackageThreatBackend {
     ) -> MetadataLookup;
 }
 
-struct LivePackageThreatBackend;
+struct LivePackageThreatBackend {
+    network: RuntimeThreatNetwork,
+}
 
 impl PackageThreatBackend for LivePackageThreatBackend {
     fn resolve_default_version(
@@ -162,7 +184,7 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         name: &str,
         deadline: Instant,
     ) -> LookupOutcome<Option<String>> {
-        resolve_default_version(ecosystem, name, deadline)
+        resolve_default_version(ecosystem, name, deadline, self.network)
     }
 
     fn query_osv(
@@ -172,7 +194,7 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         version: &str,
         deadline: Instant,
     ) -> LookupOutcome<Vec<OsvVuln>> {
-        query_osv(ecosystem, name, version, deadline)
+        query_osv(ecosystem, name, version, deadline, self.network)
     }
 
     fn find_kev_alias(
@@ -180,7 +202,7 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         advisories: &[OsvVuln],
         deadline: Instant,
     ) -> LookupOutcome<Option<String>> {
-        find_kev_alias(advisories, deadline)
+        find_kev_alias(advisories, deadline, self.network)
     }
 
     fn collect_package_metadata(
@@ -190,7 +212,7 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         version: Option<&str>,
         deadline: Instant,
     ) -> MetadataLookup {
-        collect_package_metadata(ecosystem, name, version, deadline)
+        collect_package_metadata(ecosystem, name, version, deadline, self.network)
     }
 }
 
@@ -435,6 +457,18 @@ pub fn enrich_command(
     config: &ThreatIntelConfig,
     mode: RuntimeThreatMode,
 ) -> Vec<Finding> {
+    enrich_command_with_network(input, shell, config, mode, RuntimeThreatNetwork::Online)
+}
+
+/// Runtime enrichment with an explicit network policy. CLI entry points must
+/// use this form after resolving `--offline` and `TIRITH_OFFLINE`.
+pub fn enrich_command_with_network(
+    input: &str,
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    mode: RuntimeThreatMode,
+    network: RuntimeThreatNetwork,
+) -> Vec<Finding> {
     if !config.osv_enabled && !config.deps_dev_enabled && config.google_safe_browsing_key.is_none()
     {
         return Vec::new();
@@ -449,73 +483,79 @@ pub fn enrich_command(
     let extraction_truncated = extracted.truncated;
     let packages = extracted.packages;
     let urls = extract::extract_urls(input, shell);
+    let backend = LivePackageThreatBackend { network };
     let (mut findings, package_budget_truncated) =
-        enrich_packages_with_backend(packages, config, mode.timeout(), &LivePackageThreatBackend);
+        enrich_packages_with_backend(packages, config, mode.timeout(), &backend);
     let mut seen = HashSet::new();
     // URL enrichment receives its own phase budget. Package lookups cannot
     // silently consume the entire Safe Browsing deadline.
     let deadline = Instant::now() + mode.timeout();
 
     let mut url_budget_truncated = false;
-    if let Some(api_key) = config.google_safe_browsing_key.as_deref() {
-        // Privacy scrub BEFORE anything is transmitted or cached: userinfo,
-        // query (presigned tokens, reset links, bearer params), and fragments
-        // never leave the process, and private/credential-bearing URLs are not
-        // sent to a third party at all (repo-0346). Scrubbed URLs are also
-        // deduplicated, capped, and batched into as few requests as possible
-        // (repo-0348).
-        let mut candidates: Vec<String> = Vec::new();
-        let mut candidate_set: HashSet<String> = HashSet::new();
-        let dns_resolver = crate::network::SystemDnsResolver::new().ok();
-        // DNS classification shares the enrichment deadline and one lookup per
-        // candidate at most. If system DNS is unavailable or time is exhausted,
-        // dotted hostnames fail closed and are not disclosed to Google.
-        let mut dns_budget =
-            crate::network::DnsRequestBudget::new(deadline, MAX_ENRICH_URLS, MAX_ENRICH_URLS);
-        // Same ordering as the package budget: the cap counts candidates that
-        // will actually be looked up, so repeats cannot displace a distinct URL.
-        for url_info in urls {
-            if candidates.len() >= MAX_ENRICH_URLS {
-                // Third silent cut, same class as the two package caps.
-                url_budget_truncated = true;
-                break;
-            }
-            if let Some(url) = safe_browsing_candidate_url(
-                &url_info.parsed,
-                &url_info.raw,
-                dns_resolver
-                    .as_ref()
-                    .map(|resolver| resolver as &dyn crate::network::DnsResolver),
-                &mut dns_budget,
-            ) {
-                if candidate_set.insert(url.clone()) {
-                    candidates.push(url);
+    let safe_browsing_offline = network == RuntimeThreatNetwork::CacheOnly
+        && config.google_safe_browsing_key.is_some()
+        && !urls.is_empty();
+    if network.allows_network() {
+        if let Some(api_key) = config.google_safe_browsing_key.as_deref() {
+            // Privacy scrub BEFORE anything is transmitted or cached: userinfo,
+            // query (presigned tokens, reset links, bearer params), and fragments
+            // never leave the process, and private/credential-bearing URLs are not
+            // sent to a third party at all (repo-0346). Scrubbed URLs are also
+            // deduplicated, capped, and batched into as few requests as possible
+            // (repo-0348).
+            let mut candidates: Vec<String> = Vec::new();
+            let mut candidate_set: HashSet<String> = HashSet::new();
+            let dns_resolver = crate::network::SystemDnsResolver::new().ok();
+            // DNS classification shares the enrichment deadline and one lookup per
+            // candidate at most. If system DNS is unavailable or time is exhausted,
+            // dotted hostnames fail closed and are not disclosed to Google.
+            let mut dns_budget =
+                crate::network::DnsRequestBudget::new(deadline, MAX_ENRICH_URLS, MAX_ENRICH_URLS);
+            // Same ordering as the package budget: the cap counts candidates that
+            // will actually be looked up, so repeats cannot displace a distinct URL.
+            for url_info in urls {
+                if candidates.len() >= MAX_ENRICH_URLS {
+                    // Third silent cut, same class as the two package caps.
+                    url_budget_truncated = true;
+                    break;
+                }
+                if let Some(url) = safe_browsing_candidate_url(
+                    &url_info.parsed,
+                    &url_info.raw,
+                    dns_resolver
+                        .as_ref()
+                        .map(|resolver| resolver as &dyn crate::network::DnsResolver),
+                    &mut dns_budget,
+                ) {
+                    if candidate_set.insert(url.clone()) {
+                        candidates.push(url);
+                    }
                 }
             }
-        }
-        for batch in candidates.chunks(GSB_BATCH_SIZE) {
-            for (url, match_type) in query_safe_browsing_batch(batch, api_key, deadline) {
-                let key = format!("safe-browsing:{url}");
-                if seen.insert(key) {
-                    findings.push(Finding {
-                        rule_id: RuleId::ThreatSafeBrowsing,
-                        severity: Severity::High,
-                        title: "Google Safe Browsing match".to_string(),
-                        description: format!(
-                            "URL '{}' matched Google Safe Browsing threat type '{}'.",
-                            url, match_type
-                        ),
-                        evidence: vec![Evidence::ThreatIntel {
-                            source: "Google Safe Browsing".to_string(),
-                            threat_type: "safe_browsing".to_string(),
-                            confidence: Confidence::Confirmed,
-                            reference: Some(url.to_string()),
-                        }],
-                        human_view: None,
-                        agent_view: None,
-                        mitre_id: None,
-                        custom_rule_id: None,
-                    });
+            for batch in candidates.chunks(GSB_BATCH_SIZE) {
+                for (url, match_type) in query_safe_browsing_batch(batch, api_key, deadline) {
+                    let key = format!("safe-browsing:{url}");
+                    if seen.insert(key) {
+                        findings.push(Finding {
+                            rule_id: RuleId::ThreatSafeBrowsing,
+                            severity: Severity::High,
+                            title: "Google Safe Browsing match".to_string(),
+                            description: format!(
+                                "URL '{}' matched Google Safe Browsing threat type '{}'.",
+                                url, match_type
+                            ),
+                            evidence: vec![Evidence::ThreatIntel {
+                                source: "Google Safe Browsing".to_string(),
+                                threat_type: "safe_browsing".to_string(),
+                                confidence: Confidence::Confirmed,
+                                reference: Some(url.to_string()),
+                            }],
+                            human_view: None,
+                            agent_view: None,
+                            mitre_id: None,
+                            custom_rule_id: None,
+                        });
+                    }
                 }
             }
         }
@@ -533,6 +573,7 @@ pub fn enrich_command(
         extraction_truncated,
         package_budget_truncated,
         url_budget_truncated,
+        safe_browsing_offline,
     ) {
         findings.insert(0, finding);
     }
@@ -702,21 +743,25 @@ fn query_osv(
     name: &str,
     version: &str,
     deadline: Instant,
+    network: RuntimeThreatNetwork,
 ) -> LookupOutcome<Vec<OsvVuln>> {
     let Some(label) = ecosystem_label(ecosystem) else {
+        return LookupOutcome::Unsupported;
+    };
+    let Some(ecosystem_name) = osv_ecosystem_name(ecosystem) else {
         return LookupOutcome::Unsupported;
     };
     let cache_key = format!("{label}:{name}:{version}");
     if let Some(response) = load_cache::<OsvQueryResponse>("osv", &cache_key, CACHE_TTL_SECS) {
         return LookupOutcome::Complete(response.vulns);
     }
+    if !network.allows_network() {
+        return LookupOutcome::Incomplete(LookupFailure::Offline);
+    }
 
     let client = match build_client_result(deadline) {
         Ok(client) => client,
         Err(error) => return LookupOutcome::Incomplete(error),
-    };
-    let Some(ecosystem_name) = osv_ecosystem_name(ecosystem) else {
-        return LookupOutcome::Unsupported;
     };
     let body = serde_json::json!({
         "package": {
@@ -774,6 +819,7 @@ fn deps_package(
     ecosystem: Ecosystem,
     name: &str,
     deadline: Instant,
+    network: RuntimeThreatNetwork,
 ) -> LookupOutcome<DepsPackageResponse> {
     let Some(system) = deps_system_name(ecosystem) else {
         return LookupOutcome::Unsupported;
@@ -784,6 +830,9 @@ fn deps_package(
         load_cache::<DepsPackageResponse>("deps-package", &cache_key, CACHE_TTL_SECS)
     {
         return LookupOutcome::Complete(response);
+    }
+    if !network.allows_network() {
+        return LookupOutcome::Incomplete(LookupFailure::Offline);
     }
 
     let client = match build_client_result(deadline) {
@@ -817,8 +866,9 @@ fn resolve_default_version(
     ecosystem: Ecosystem,
     name: &str,
     deadline: Instant,
+    network: RuntimeThreatNetwork,
 ) -> LookupOutcome<Option<String>> {
-    match deps_package(ecosystem, name, deadline) {
+    match deps_package(ecosystem, name, deadline, network) {
         LookupOutcome::Complete(package) => LookupOutcome::Complete(
             package
                 .versions
@@ -846,6 +896,7 @@ fn ecosystems_package(
     ecosystem: Ecosystem,
     name: &str,
     deadline: Instant,
+    network: RuntimeThreatNetwork,
 ) -> LookupOutcome<EcosystemsPackageResponse> {
     let Some(registry) = ecosystems_registry_name(ecosystem) else {
         return LookupOutcome::Unsupported;
@@ -856,6 +907,9 @@ fn ecosystems_package(
         load_cache::<EcosystemsPackageResponse>("ecosystems-package", &cache_key, CACHE_TTL_SECS)
     {
         return LookupOutcome::Complete(response);
+    }
+    if !network.allows_network() {
+        return LookupOutcome::Incomplete(LookupFailure::Offline);
     }
 
     let client = match build_client_result(deadline) {
@@ -903,9 +957,10 @@ fn collect_package_metadata(
     name: &str,
     _version: Option<&str>,
     deadline: Instant,
+    network: RuntimeThreatNetwork,
 ) -> MetadataLookup {
     let mut incomplete = Vec::new();
-    let first_release_days = match deps_package(ecosystem, name, deadline) {
+    let first_release_days = match deps_package(ecosystem, name, deadline, network) {
         LookupOutcome::Complete(response) => response
             .versions
             .iter()
@@ -923,7 +978,7 @@ fn collect_package_metadata(
         }
     };
 
-    let maintainers = match ecosystems_package(ecosystem, name, deadline) {
+    let maintainers = match ecosystems_package(ecosystem, name, deadline, network) {
         LookupOutcome::Complete(package) => Some(package.maintainers.len()),
         LookupOutcome::Unsupported => None,
         LookupOutcome::Incomplete(error) => {
@@ -953,9 +1008,12 @@ struct KevVulnerability {
     cve_id: String,
 }
 
-fn kev_aliases(deadline: Instant) -> LookupOutcome<HashSet<String>> {
+fn kev_aliases(deadline: Instant, network: RuntimeThreatNetwork) -> LookupOutcome<HashSet<String>> {
     if let Some(cached) = load_cache::<Vec<String>>("kev", "active", KEV_CACHE_TTL_SECS) {
         return LookupOutcome::Complete(cached.into_iter().collect());
+    }
+    if !network.allows_network() {
+        return LookupOutcome::Incomplete(LookupFailure::Offline);
     }
     let client = match build_client_result(deadline) {
         Ok(client) => client,
@@ -983,11 +1041,15 @@ fn kev_aliases(deadline: Instant) -> LookupOutcome<HashSet<String>> {
     LookupOutcome::Complete(aliases.into_iter().collect())
 }
 
-fn find_kev_alias(advisories: &[OsvVuln], deadline: Instant) -> LookupOutcome<Option<String>> {
+fn find_kev_alias(
+    advisories: &[OsvVuln],
+    deadline: Instant,
+    network: RuntimeThreatNetwork,
+) -> LookupOutcome<Option<String>> {
     if advisories.is_empty() {
         return LookupOutcome::Complete(None);
     }
-    match kev_aliases(deadline) {
+    match kev_aliases(deadline, network) {
         LookupOutcome::Complete(kev) => LookupOutcome::Complete(
             advisories
                 .iter()
@@ -1179,12 +1241,14 @@ fn build_osv_finding(
 /// Three independent caps can cut what gets assessed, and each one used to be
 /// silent: the extraction grammar's `MAX_PACKAGES_PER_INVOCATION`, the package
 /// lookup budget `MAX_ENRICH_PACKAGES`, and the URL lookup budget
-/// `MAX_ENRICH_URLS`. Returns `None` when nothing was cut, so a complete
-/// analysis carries no extra finding.
+/// `MAX_ENRICH_URLS`. Offline Safe Browsing is also reported because its DNS
+/// classification and API request are intentionally forbidden. Returns `None`
+/// when nothing was cut, so a complete analysis carries no extra finding.
 fn incomplete_enrichment_finding(
     extraction_truncated: bool,
     package_budget_truncated: bool,
     url_budget_truncated: bool,
+    safe_browsing_offline: bool,
 ) -> Option<Finding> {
     let mut reasons: Vec<String> = Vec::new();
     if extraction_truncated {
@@ -1205,6 +1269,12 @@ fn incomplete_enrichment_finding(
             "more than {MAX_ENRICH_URLS} distinct URLs were named, so only the first \
              {MAX_ENRICH_URLS} were checked against Safe Browsing"
         ));
+    }
+    if safe_browsing_offline {
+        reasons.push(
+            "Safe Browsing URL checks were skipped because offline mode forbids DNS and HTTP"
+                .to_string(),
+        );
     }
     if reasons.is_empty() {
         return None;
@@ -2019,6 +2089,78 @@ mod tests {
         assert!(!backend.calls().iter().any(|call| call.starts_with("osv:")));
     }
 
+    #[test]
+    fn cache_only_backend_reads_hits_and_never_falls_through_to_http() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let cached_name = "tirith-offline-cached-fixture";
+        let cached_key = format!("pypi:{cached_name}:1.0.0");
+        store_cache(
+            "osv",
+            &cached_key,
+            &OsvQueryResponse {
+                vulns: vec![OsvVuln {
+                    id: "OSV-OFFLINE-CACHED".to_string(),
+                    aliases: Vec::new(),
+                    summary: None,
+                    references: Vec::new(),
+                }],
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let cached = query_osv(
+            Ecosystem::PyPI,
+            cached_name,
+            "1.0.0",
+            deadline,
+            RuntimeThreatNetwork::CacheOnly,
+        );
+        assert!(matches!(cached, LookupOutcome::Complete(vulns) if vulns.len() == 1));
+
+        let missing = query_osv(
+            Ecosystem::PyPI,
+            "tirith-offline-never-cached-fixture",
+            "9.9.9",
+            deadline,
+            RuntimeThreatNetwork::CacheOnly,
+        );
+        assert!(
+            matches!(missing, LookupOutcome::Incomplete(LookupFailure::Offline)),
+            "a cache miss must stop before HTTP client construction"
+        );
+    }
+
+    #[test]
+    fn cache_only_enrichment_discloses_skipped_package_and_url_checks() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: false,
+            google_safe_browsing_key: Some("unused-offline-key".to_string()),
+            ..ThreatIntelConfig::default()
+        };
+        let findings = enrich_command_with_network(
+            "pip install tirith-offline-command-fixture==9.9.9; curl https://public.example/test",
+            crate::tokenize::ShellType::Posix,
+            &config,
+            RuntimeThreatMode::Inline,
+            RuntimeThreatNetwork::CacheOnly,
+        );
+
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete
+                && finding
+                    .description
+                    .contains("OSV lookup was skipped by offline mode")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete
+                && finding
+                    .description
+                    .contains("offline mode forbids DNS and HTTP")
+        }));
+    }
+
     /// Runtime enrichment has three independent caps and every one of them used
     /// to be silent, so a verdict could report a clean assessment of a command
     /// it had only partly looked at. The static rule path already discloses its
@@ -2029,7 +2171,7 @@ mod tests {
     #[test]
     fn every_enrichment_cap_is_disclosed_and_a_complete_run_is_not() {
         assert!(
-            incomplete_enrichment_finding(false, false, false).is_none(),
+            incomplete_enrichment_finding(false, false, false, false).is_none(),
             "nothing was cut, so nothing may be disclosed"
         );
 
@@ -2043,7 +2185,7 @@ mod tests {
             ),
             (false, false, true, "were checked against Safe Browsing"),
         ] {
-            let finding = incomplete_enrichment_finding(extraction, package, url)
+            let finding = incomplete_enrichment_finding(extraction, package, url, false)
                 .expect("a cut must be disclosed");
             assert_eq!(finding.rule_id, RuleId::AnalysisIncomplete);
             assert_eq!(finding.severity, Severity::High);
@@ -2055,11 +2197,12 @@ mod tests {
         }
 
         // Several at once are reported together, not collapsed to the first.
-        let all = incomplete_enrichment_finding(true, true, true).expect("disclosed");
+        let all = incomplete_enrichment_finding(true, true, true, true).expect("disclosed");
         for expected in [
             "package extraction stopped at that cap",
             "were looked up against live threat intelligence",
             "were checked against Safe Browsing",
+            "offline mode forbids DNS and HTTP",
         ] {
             assert!(all.description.contains(expected), "{}", all.description);
         }

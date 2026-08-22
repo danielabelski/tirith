@@ -227,10 +227,7 @@ and a modern Bash PTY.
   model). Tracked as M0.1 follow-up; placeholder `#[ignore]`d tests mark the
   gap. PowerShell PTY coverage can validate preflight delivery, but cannot turn
   the intentionally unsupported strict receipt into an execution-proof claim.
-- **Offline isolation.** The bash enter-mode hook shells out to `tirith
-  check`, which may attempt a background threat-DB refresh. The conformance
-  tests do not currently assert on network behaviour. The `--offline` switch
-  (and the `TIRITH_OFFLINE` environment variable) now exists: setting
-  `TIRITH_OFFLINE=1` in a harness session makes that background refresh a
-  guaranteed no-op, so a future conformance test can pin network behaviour
-  deterministically.
+- **Offline isolation.** The bash enter-mode hook shells out to `tirith check`.
+  Setting `TIRITH_OFFLINE=1` in a harness session disables its background
+  refresh and every runtime HTTP/DNS enrichment path; cached results remain
+  usable and cache misses become explicit incomplete-verification findings.

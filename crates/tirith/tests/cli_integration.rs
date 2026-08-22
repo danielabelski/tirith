@@ -6157,6 +6157,62 @@ severity_overrides:
     );
 }
 
+#[test]
+fn offline_runtime_findings_honor_operator_severity_overrides() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmpdir.path().join("state");
+    let org_dir = tmpdir.path().join("org/.tirith");
+    let project_dir = tmpdir.path().join("project");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&org_dir).unwrap();
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(
+        org_dir.join("policy.yaml"),
+        "severity_overrides:\n  analysis_incomplete: CRITICAL\n",
+    )
+    .unwrap();
+
+    let out = tirith_isolated(
+        "test-offline-runtime-severity-override",
+        &state_dir,
+        &project_dir,
+    )
+    .env("TIRITH_POLICY_ROOT", tmpdir.path().join("org"))
+    .args([
+        "check",
+        "--offline",
+        "--non-interactive",
+        "--no-daemon",
+        "--json",
+        "--shell",
+        "posix",
+        "--",
+        "pip install tirith-offline-override-fixture==9.9.9",
+    ])
+    .output()
+    .expect("run offline check");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON verdict");
+    let runtime = json["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|finding| {
+            finding["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("skipped by offline mode"))
+        })
+        .expect("offline runtime finding");
+    assert_eq!(runtime["severity"], "CRITICAL");
+    assert_eq!(json["action"], "block");
+}
+
 /// F9 SECURITY notice: when a repo-scoped `.tirith/policy.yaml` carries a WEAKENING field
 /// (here `allowlist`), it is neutralized and the operator is told once per session via an
 /// UNCONDITIONAL `eprintln!` in `warn_repo_policy_neutralized` — it must NOT route through
