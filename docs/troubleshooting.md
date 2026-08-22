@@ -361,7 +361,7 @@ export TIRITH_BASH_MODE=enter
 
 ### DEBUG trap ownership
 
-In preexec mode (including after auto-degrade from enter mode), tirith sets the `DEBUG` trap. This is the same behavior used by default in SSH sessions. If you have custom `DEBUG` traps in your shell configuration, they will be overridden when tirith is in preexec mode.
+In preexec mode (including after auto-degrade from enter mode), tirith installs a `DEBUG` trap. This is the same behavior used by default in SSH sessions. A `DEBUG` trap you installed BEFORE sourcing the hook is not overridden: it is captured at the first prompt and chained, as described under "Chained DEBUG traps" above. A trap installed AFTER the hook replaces tirith's, and tirith does not take it back; it reports protection `off` at the next prompt and says which tool to load first. Run `tirith doctor` to see the live state.
 
 ## Bash: no visible input after `ssh` / `gcloud compute ssh`
 

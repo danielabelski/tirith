@@ -740,11 +740,13 @@ tirith setup vscode                   # VS Code
 tirith setup windsurf                 # Windsurf
 ```
 
-The Pi CLI integration is a blocking pre-tool extension. The additional MCP
-registrations expose Tirith tools to their agents but do not themselves
-intercept commands. On POSIX systems, Grok Build setup also installs its
-documented blocking `PreToolUse` hook, with the fail-open limits described in
-the [agent integration and trust matrix](mcp/clients/mcp-only-agents.md).
+Pi CLI, Prime Agent, OMP, Cline, OpenHands, and Grok Build (POSIX) get a
+blocking pre-execution hook: the host asks Tirith before running a command and
+honours a refusal. OpenCode, fx, Roo Code, and Continue are MCP only: their
+registrations expose Tirith's tools to the agent but do not intercept
+commands. Which hosts fail open when a hook itself errors, and what each hook
+can and cannot see, is in the
+[agent integration and trust matrix](mcp/clients/mcp-only-agents.md).
 See `mcp/clients/` for per-tool guides.
 
 ### CI/CD Integration

@@ -97,8 +97,10 @@ and:
 - Hook telemetry events are logged via `tirith hook-event` (fire-and-forget
   via `execFile`).
 - No `python3` dependency -- the extension is pure TypeScript.
-- The repo has no TS test runner. Automated testing of this extension is not
-  currently supported; use manual host E2E verification.
+- `tests/ipython-vector-extraction.mjs` runs in CI against the exact shipped
+  bytes of this extension: the cell extractor, and the `tool_call` handler
+  driven with a fake `tirith` binary. Live verification inside a real Pi CLI
+  session remains a manual E2E step.
 
 The Pi CLI 0.84.2 contract was rechecked on **2026-08-21** at source head
 `f4585b8bec581d005cbb1edfc07edfcce723d0ae`: see its documented

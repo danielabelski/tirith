@@ -14,10 +14,11 @@ Hosts with a blocking hook (POSIX only): Grok Build, Pi CLI, Prime Agent, OMP,
 Cline, and OpenHands. The remaining clients on this page are MCP only, and say
 so in the table.
 
-Two of these hosts fail **open** on their own side: Grok Build and OpenHands
-both let the tool run when a hook errors or times out. Tirith's adapter is
-fail-closed (it denies on its own errors unless `TIRITH_FAIL_OPEN=1`), but it
-cannot compensate for a host that ignores a crashed hook.
+Three of these hosts fail **open** on their own side: Grok Build, Cline, and
+OpenHands all let the tool run when a hook errors or times out. Tirith's adapter
+is fail-closed (it denies on its own errors unless `TIRITH_FAIL_OPEN=1`), but it
+cannot compensate for a host that ignores a crashed hook. Prime Agent and OMP
+block when a handler throws, so a guard crash fails closed there.
 
 Every setup command stores the validated absolute path of the running `tirith`
 binary. Existing unrelated configuration is preserved, writes are contained
@@ -29,14 +30,14 @@ private, and `--dry-run`, `--force`, and repeat runs are supported.
 | Client | Enforcement | Setup command | Supported scope and config | Verification |
 |---|---|---|---|---|
 | Grok Build | Hook + MCP | `tirith setup grok-build` | Project: `<invocation-cwd>/.grok/config.toml` plus trusted `<git-root>/.grok/hooks/tirith.json`; user: `$GROK_HOME`, otherwise `~/.grok` | `grok mcp doctor tirith`; `/hooks` |
-| OMP (Oh My Pi) | Hook + MCP | `tirith setup omp` | User only. Root: `~/${PI_CONFIG_DIR:-.omp}`; named profile: `<root>/profiles/<name>/agent/mcp.json`; default: `$PI_CODING_AGENT_DIR/mcp.json`, otherwise `<root>/agent/mcp.json`. Guard: `<root>/hooks/pre/tirith-guard.ts` | `/mcp test tirith` |
+| OMP (Oh My Pi) | Hook + MCP | `tirith setup omp` | User only. Root: `~/${PI_CONFIG_DIR:-.omp}`; named profile: `<root>/profiles/<name>/agent/mcp.json`; default: `$PI_CODING_AGENT_DIR/mcp.json`, otherwise `<root>/agent/mcp.json`. Guard: `hooks/pre/tirith-guard.ts` beside that `mcp.json`, which is where OMP discovers hooks (its agent directory, profile-aware) | `/mcp test tirith` |
 | OpenCode | MCP only | `tirith setup opencode` | Project: the rootmost existing project `.opencode/opencode.json(c)`, otherwise the invocation directory's `opencode.json(c)`; user: `$OPENCODE_CONFIG_DIR/opencode.json(c)`, then `$OPENCODE_CONFIG`, otherwise `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json(c)` | `opencode mcp list` |
 | Vercel Labs fx | MCP only | `tirith setup fx` | Trusted user profile only: `~/.fx/mcp.json` | `/mcp reload`, then `/mcp list` |
 | Prime Agent | Hook + MCP | `tirith setup prime-agent` | User only: non-empty `$PRIME_AGENT_CODING_AGENT_DIR/settings.json`, otherwise `~/.prime/agent/settings.json`; exact `~` and `~/...` values expand from HOME. Guard: `<agent dir>/extensions/tirith-guard.ts` | `prime-agent mcp get tirith` |
-| Cline | Hook + MCP | `tirith setup cline` | User only: `$CLINE_MCP_SETTINGS_PATH`; then `$CLINE_DATA_DIR/settings/cline_mcp_settings.json`; then `$CLINE_DIR/data/settings/cline_mcp_settings.json`; otherwise `~/.cline/data/settings/cline_mcp_settings.json`. Hook: `~/Documents/Cline/Hooks/PreToolUse` | Restart Cline, enable hooks in settings, open MCP Servers |
+| Cline | Hook + MCP | `tirith setup cline` | User only: `$CLINE_MCP_SETTINGS_PATH`; then `$CLINE_DATA_DIR/settings/cline_mcp_settings.json`; then `$CLINE_DIR/data/settings/cline_mcp_settings.json`; otherwise `~/.cline/data/settings/cline_mcp_settings.json`. Hook: `<Documents>/Cline/Hooks/PreToolUse`, with Documents resolved the way Cline resolves it (`xdg-user-dir DOCUMENTS` on Linux, `~/Documents` otherwise) | Restart Cline, enable hooks in settings, open MCP Servers |
 | Roo Code | MCP only | `tirith setup roo-code` | Project only: `<cwd>/.roo/mcp.json`; run setup from the intended workspace root | Confirm `tirith` is connected in MCP Servers |
 | Continue | MCP only | `tirith setup continue` | Project-owned block only: `<cwd>/.continue/mcpServers/tirith.yaml`; run setup from the intended workspace root | Switch to Agent mode and confirm Tirith tools are present |
-| OpenHands CLI | Hook (project) + MCP (user) | `tirith setup openhands` | User only: non-empty absolute `$OPENHANDS_PERSISTENCE_DIR/mcp.json` without surrounding whitespace, otherwise `~/.openhands/mcp.json` when unset. Project scope installs `<git-root>/.openhands/hooks.json` | `openhands mcp get tirith`; restart active conversations |
+| OpenHands CLI | Hook + MCP | `tirith setup openhands` | MCP is user only: non-empty absolute `$OPENHANDS_PERSISTENCE_DIR/mcp.json` without surrounding whitespace, otherwise `~/.openhands/mcp.json` when unset. Hooks follow the two locations the SDK searches: `--scope user` writes `~/.openhands/hooks.json`, `--scope project` writes `<work dir>/.openhands/hooks.json` where the work dir is `$OPENHANDS_WORK_DIR`, otherwise the current directory | `openhands mcp get tirith`; restart active conversations |
 
 Use `--scope user` for Grok Build or OpenCode when a user-wide
 registration is wanted. The other commands select their only safe documented
@@ -138,19 +139,37 @@ block when the handler *throws*, which makes a guard crash fail closed on those
 two hosts.
 
 Prime Agent also exposes an `ipython` tool, and a notebook cell can reach a
-shell through several syntaxes at once. The guard extracts **every** vector in
-a cell rather than stopping at the first: `!cmd`, `!!cmd`, `x = !cmd`,
-`%system` / `%sx`, the `%%bash` / `%%sh` / `%%script <shell>` cell magics, and
-the Python-level `os.*`, `subprocess.*`, and `pty.spawn` calls, including the
-aliased forms `import subprocess as sp` and `from os import system`. Comments
-and string bodies are lexed rather than pattern-matched, so a commented-out
-call is not a vector and a `#` inside a string does not truncate a line.
+shell through several syntaxes at once. The guard collects every vector it can
+recognise rather than stopping at the first: `!cmd`, `!!cmd`, assignment from
+`!cmd` (including `obj.attr = !cmd`), `%system` / `%sx`, the `%%bash` / `%%sh`
+/ `%%script <shell>` cell magics (with `%%script` options parsed, so
+`--out captured` is not mistaken for the interpreter), backslash-continued
+lines joined first, `get_ipython().system(...)` and its `run_line_magic` /
+`run_cell_magic` forms, and the Python-level `os.*`, `subprocess.*`, and
+`pty.spawn` calls with each API's real argument shape (`execl` and `spawn*`
+take an argv, `subprocess.run` takes a string or a list). Aliases such as
+`import subprocess as sp` and `from os import system` are remembered across
+cells, because the kernel is persistent. Comments and string bodies are lexed
+rather than pattern-matched, so a commented-out call is not a vector and a `#`
+inside a string does not truncate a line.
 
-All recovered commands are joined into one newline-separated script and sent to
-`tirith check` in a single call, so the engine makes every security decision and
-the extension makes none. A vector whose command is computed at runtime
-(`os.system(user_input)`) cannot be shown to the engine; it is reported rather
-than dropped, and `TIRITH_HOOK_WARN_ACTION=deny` refuses the cell outright.
+Recovered commands are sent to `tirith check` over stdin as one script, so the
+engine makes every security decision and the extension makes none. An argv
+list is rendered with POSIX quoting, so `["printf", "%s", "a | b"]` reaches
+the engine as the single argument it is rather than as a pipeline.
+
+A vector whose command is computed at runtime cannot be shown to the engine:
+an IPython `{expr}` or `$var` expansion, an f-string, a concatenation with a
+variable, a non-literal argv element. These are **blocked by default** rather
+than approximated, because half a command line means something other than the
+command that will run; `TIRITH_HOOK_UNRESOLVED_ACTION=warn` opts out and turns
+them into a stderr warning. The same applies to a cell too large to inspect.
+
+What this cannot do, stated plainly: source-level extraction cannot prove
+arbitrary Python safe. A wrapper function defined in an earlier cell, a
+`getattr` or `__import__` indirection, or a third-party package that spawns a
+process will not be recognised as a vector. The guard raises the cost of the
+obvious routes and refuses the unreadable ones; it is not a sandbox.
 
 `tests/ipython-vector-extraction.mjs` runs the exact shipped bytes of the guard
 against every syntax above.
@@ -162,11 +181,18 @@ exactly `PreToolUse`, and an OpenHands hook definition has no `env` field. Both
 therefore get a small generated `#!/bin/sh` wrapper that `exec`s the shared
 adapter with the right protocol baked in, installed alongside it and mode 0755.
 
-Cline hooks are inert until hooks are enabled in Cline's settings, and Cline's
-own hook runner is Unix-only. OpenHands reads `.openhands/hooks.json` from the
-repository it is working on, so its hook is installed by `--scope project` and
-should be committed; `--scope user` remains MCP only. An OpenHands denial exits
-2, which is the only exit code that host treats as a block.
+Cline hooks are inert until hooks are enabled in Cline's settings, and Cline
+runs the tool when a hook fails, so a hook that cannot start is not a block.
+Cline's own runner supports PowerShell hooks on Windows; Tirith's Cline hook is
+POSIX-only for now, which is a Tirith limitation rather than a host one.
+
+OpenHands searches exactly two places for `hooks.json`: the working directory
+it was started in (`OPENHANDS_WORK_DIR`, otherwise the current directory, with
+no parent walk) and `~/.openhands`. Setup writes to whichever the scope names,
+and merges into an existing file rather than replacing it, so hooks the
+repository already has survive. The hook command is shell-quoted, because
+OpenHands runs it through a shell. A denial exits 2, the only exit code that
+host treats as a block; any other non-zero exit is logged and the tool runs.
 
 Repository-local MCP files also execute the configured command when the agent
 loads that project. Review project configuration before trusting a repository.
@@ -191,7 +217,6 @@ or whitespace-literal registry; unset the variable to select `~/.openhands`.
 | Aider | Unsupported | Current Aider documentation exposes model/tool configuration but no native MCP client registry or blocking pre-tool hook suitable for Tirith setup. |
 | Roo Code blocking hook | MCP only | Roo's stable project MCP file is documented; no equivalent stable blocking pre-tool setup contract was found. |
 | Continue user-global YAML mutation | Project block supported above | Continue supports a dedicated workspace MCP-block directory, which lets Tirith own one file. Its global `config.yaml` may contain anchors, comments, and secret references, so setup leaves it untouched. |
-| OpenHands user-scope hooks | Project-scope hooks supported above | OpenHands reads hooks from `.openhands/hooks.json` in the repository it is working on. There is no documented user-level hooks file, so `--scope user` remains MCP only. |
 
 ## Primary contracts
 
