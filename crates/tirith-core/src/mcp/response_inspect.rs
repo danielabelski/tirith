@@ -60,15 +60,10 @@ use std::time::{Duration, Instant};
 use crate::mcp::output_filter::OutputFilterContext;
 use crate::verdict::{Action, Finding};
 
-/// Structural depth cap for the URI and blob walkers.
-///
-/// The leaf scan is already bounded, but these two walkers recurse the same
-/// value afterwards and carried no structural budget of their own. A
-/// wire-parsed message is capped by serde_json's own recursion limit before we
-/// ever see it; the public direct-call path is not, so a caller can hand us a
-/// `Value` built in memory at arbitrary depth. Match the leaf scanner's own
-/// ceiling so anything it already refused as too deep is not then walked.
-const MAX_INSPECT_WALK_DEPTH: usize = 128;
+/// Structural depth cap for the URI and blob walkers: the same ceiling the leaf
+/// scanner uses, so anything it refused as too deep is not then walked. See
+/// [`crate::mcp::MAX_STRUCTURED_DEPTH`].
+use crate::mcp::MAX_STRUCTURED_DEPTH as MAX_INSPECT_WALK_DEPTH;
 
 /// Maximum decoded size of an inline `blob` we will buffer to MIME-sniff. A blob
 /// larger than this is refused (the gateway's `max_message_bytes` already caps the

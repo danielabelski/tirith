@@ -65,10 +65,8 @@ const MAX_ANALYZER_WORK_BYTES: usize = 32 * 1024 * 1024;
 /// calls fit, while repeated candidate-heavy tails fail closed before becoming
 /// an attacker-controlled CPU loop.
 const MAX_ANALYZER_DECODE_CANDIDATES: usize = 512;
-/// Recursive sanitizers run only after this iterative shape check. The gateway's
-/// JSON parser already rejects excessive nesting; these limits also protect
-/// public callers that construct a `serde_json::Value` directly.
-const MAX_STRUCTURED_DEPTH: usize = 128;
+/// Recursive sanitizers run only after this iterative shape check.
+use crate::mcp::MAX_STRUCTURED_DEPTH;
 const MAX_STRUCTURED_NODES: usize = 1_000_000;
 /// Bound each class of structural secret work independently. Combining all
 /// work in one counter made an object layout fail at the transport limit while
