@@ -904,8 +904,23 @@ _tirith_preexec_prompt_end() {
     _tirith_session_degrade_to_warn_only \
       "tirith: extdebug became enabled by prompt code outside Tirith; enforcement is disabled because user debugger state cannot be safely restored"
   fi
+  # Ownership check. Every prompt cycle fires DEBUG for the sentinels
+  # themselves, so a live Tirith trap has always set the heartbeat by the time
+  # this runs. A cycle with no heartbeat means the trap is no longer ours.
+  if [[ "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" == "1" ]]; then
+    if [[ "${_TIRITH_DEBUG_TRAP_WATCH:-0}" == "1" ]] \
+       && [[ "${_TIRITH_DEBUG_TRAP_HEARTBEAT:-0}" != "1" ]]; then
+      _tirith_session_lost_debug_trap
+      return "$previous_status"
+    fi
+    _TIRITH_DEBUG_TRAP_WATCH=1
+  fi
   _TIRITH_PREEXEC_PHASE="user"
   _TIRITH_PREEXEC_AWAITING_USER=1
+  # Last write before the next cycle: under `set -T` the trampoline fires for
+  # commands inside this function too, and re-arming earlier would let one of
+  # those fires forge the next cycle's heartbeat.
+  _TIRITH_DEBUG_TRAP_HEARTBEAT=0
   return "$previous_status"
 }
 
@@ -1037,6 +1052,27 @@ _tirith_session_degrade_to_warn_only() {
   _tirith_set_status "degraded"
   # One consolidated headline, then the path-specific reason as the detail line.
   _tirith_warn_degraded_once "$reason"
+}
+
+# A replaced or removed DEBUG trap is not a downgrade to warn-only — it is the
+# total loss of interception, because nothing calls into Tirith any more. Say
+# so, and deliberately do NOT reinstall: whichever tool took the trap owns it
+# now, and clobbering it back would start the same fight from the other side.
+_tirith_session_lost_debug_trap() {
+  _TIRITH_PREEXEC_PHASE="off"
+  _TIRITH_PREEXEC_ENFORCE=0
+  _TIRITH_PREEXEC_ENFORCE_PENDING=0
+  _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+  _TIRITH_DEBUG_TRAP_WATCH=0
+  _TIRITH_PREEXEC_WARNED=1
+  export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+  _tirith_set_status "degraded"
+  [[ -n "${_TIRITH_DEGRADE_WARNED:-}" ]] && return 0
+  _TIRITH_DEGRADE_WARNED=1
+  [[ $- == *i* ]] || return 0
+  _tirith_output "tirith: protection is OFF for this shell — run 'tirith doctor' for details"
+  _tirith_output "  another tool replaced or removed Tirith's DEBUG trap; commands are no longer being checked. Tirith did not take the trap back. Restart your shell, or load tirith after that tool."
+  return 0
 }
 
 _tirith_preexec_receipt_check() {
@@ -1534,6 +1570,13 @@ _TIRITH_DEBUG_TRAP_CAPTURE_READY=0
 _TIRITH_CAPTURED_DEBUG_TRAP_SPEC=""
 _TIRITH_DEBUG_TRAP_INSTALLED=0
 _TIRITH_DEBUG_CAPTURE_FILE=""
+# Prompt-boundary proof that Tirith's DEBUG trap is still the installed one.
+# `trap -p DEBUG` reports an empty handler inside a function, so ownership
+# cannot be re-read from `_tirith_preexec_prompt_end`; the trampoline reports
+# itself instead. HEARTBEAT is set on every fire, WATCH arms the check one full
+# prompt cycle after installation so the install cycle is not mistaken for a loss.
+_TIRITH_DEBUG_TRAP_HEARTBEAT=0
+_TIRITH_DEBUG_TRAP_WATCH=0
 _TIRITH_PREEXEC_ENFORCE_PENDING=0
 _TIRITH_PREEXEC_BOOTSTRAP_COMMAND='if [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_CAPTURE_FILE" 2>/dev/null; _tirith_finalize_debug_trap_capture; fi; _tirith_restore_prompt_status'
 

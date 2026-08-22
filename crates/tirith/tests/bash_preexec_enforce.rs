@@ -963,6 +963,61 @@ trap -p DEBUG | grep -c '_tirith_debug_trampoline' >&2
 }
 
 #[test]
+fn replacing_tirith_debug_trap_mid_session_turns_protection_off_visibly() {
+    // Once another tool owns the DEBUG trap, bash calls that tool and not
+    // Tirith, so the command genuinely cannot be blocked any more. What must
+    // never happen is the silent version: a shell that keeps reporting
+    // protection while scanning nothing. `trap -p DEBUG` reads back empty
+    // inside a function, so ownership is proven by the trampoline's own
+    // per-prompt heartbeat rather than by re-reading the trap.
+    for tamper in ["trap 'true' DEBUG", "trap - DEBUG"] {
+        let (_out, stderr, _inv, sentinel_dir) = run_with_sentinels(
+            &format!(
+                r#"
+{tamper}
+sh -c 'touch {{sentinels}}/after_trap_theft' BLOCK_TOKEN-trap-theft
+"#
+            ),
+            &[
+                ("TIRITH_BASH_MODE", "preexec"),
+                ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            ],
+        );
+        assert!(
+            stderr.contains("protection is OFF for this shell")
+                && stderr.contains("replaced or removed Tirith's DEBUG trap"),
+            "{tamper:?} must announce the loss of interception, got: {stderr}"
+        );
+        let _ = fs::remove_dir_all(&sentinel_dir);
+    }
+}
+
+#[test]
+fn reinstalling_the_tirith_trampoline_is_not_treated_as_a_loss() {
+    // Idempotent re-installation, and any wrapper that chains through
+    // `_tirith_debug_trampoline`, keep the heartbeat alive. Neither is tampering.
+    let (_out, stderr, invocations, sentinel_dir) = run_with_sentinels(
+        r#"
+trap '_tirith_debug_trampoline' DEBUG
+sh -c 'touch {sentinels}/reinstall_leak' BLOCK_TOKEN-reinstall
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+    assert!(
+        !stderr.contains("protection is OFF for this shell"),
+        "re-installing Tirith's own trampoline must not report a lost trap, got: {stderr}"
+    );
+    assert!(
+        !sentinel_path(&sentinel_dir, "reinstall_leak").exists(),
+        "enforcement must survive an idempotent re-install; invocations: {invocations:#?}"
+    );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
 fn extdebug_left_alone_when_user_enabled_it_first() {
     let hook = hook_path();
     let (_out, stderr, _inv) = run_bash_script(
