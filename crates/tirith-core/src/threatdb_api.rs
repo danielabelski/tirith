@@ -46,18 +46,27 @@ fn read_json_bounded<T: DeserializeOwned>(
     resp: reqwest::blocking::Response,
     max_bytes: u64,
 ) -> Option<T> {
+    read_json_bounded_result(resp, max_bytes).ok()
+}
+
+fn read_json_bounded_result<T: DeserializeOwned>(
+    resp: reqwest::blocking::Response,
+    max_bytes: u64,
+) -> Result<T, LookupFailure> {
     if let Some(len) = resp.content_length() {
         if len > max_bytes {
-            return None;
+            return Err(LookupFailure::Response);
         }
     }
     use std::io::Read as _;
     let mut buf = Vec::new();
-    resp.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    resp.take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| LookupFailure::Response)?;
     if buf.len() as u64 > max_bytes {
-        return None;
+        return Err(LookupFailure::Response);
     }
-    serde_json::from_slice(&buf).ok()
+    serde_json::from_slice(&buf).map_err(|_| LookupFailure::Response)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,200 +84,328 @@ impl RuntimeThreatMode {
     }
 }
 
-pub fn enrich_command(
-    input: &str,
-    shell: ShellType,
-    config: &ThreatIntelConfig,
-    mode: RuntimeThreatMode,
-) -> Vec<Finding> {
-    if !config.osv_enabled && !config.deps_dev_enabled && config.google_safe_browsing_key.is_none()
-    {
-        return Vec::new();
+/// A remote lookup must distinguish a complete negative answer from work that
+/// never completed. Collapsing both to `None` made a timed-out OSV request look
+/// exactly like "no advisory" and let later packages inherit a false clean
+/// result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookupFailure {
+    Deadline,
+    Client,
+    Transport,
+    HttpStatus,
+    Response,
+}
+
+impl LookupFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline exhausted",
+            Self::Client => "HTTP client setup failed",
+            Self::Transport => "transport failed",
+            Self::HttpStatus => "upstream returned an error status",
+            Self::Response => "upstream response was invalid or exceeded its bound",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LookupOutcome<T> {
+    Complete(T),
+    Unsupported,
+    Incomplete(LookupFailure),
+}
+
+#[derive(Debug, Clone)]
+struct MetadataLookup {
+    signal: Option<SuspiciousPackageSignal>,
+    incomplete: Vec<(&'static str, LookupFailure)>,
+}
+
+trait PackageThreatBackend {
+    fn resolve_default_version(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        deadline: Instant,
+    ) -> LookupOutcome<Option<String>>;
+
+    fn query_osv(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+        deadline: Instant,
+    ) -> LookupOutcome<Vec<OsvVuln>>;
+
+    fn find_kev_alias(
+        &self,
+        advisories: &[OsvVuln],
+        deadline: Instant,
+    ) -> LookupOutcome<Option<String>>;
+
+    fn collect_package_metadata(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: Option<&str>,
+        deadline: Instant,
+    ) -> MetadataLookup;
+}
+
+struct LivePackageThreatBackend;
+
+impl PackageThreatBackend for LivePackageThreatBackend {
+    fn resolve_default_version(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        deadline: Instant,
+    ) -> LookupOutcome<Option<String>> {
+        resolve_default_version(ecosystem, name, deadline)
     }
 
-    let deadline = Instant::now() + mode.timeout();
+    fn query_osv(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+        deadline: Instant,
+    ) -> LookupOutcome<Vec<OsvVuln>> {
+        query_osv(ecosystem, name, version, deadline)
+    }
+
+    fn find_kev_alias(
+        &self,
+        advisories: &[OsvVuln],
+        deadline: Instant,
+    ) -> LookupOutcome<Option<String>> {
+        find_kev_alias(advisories, deadline)
+    }
+
+    fn collect_package_metadata(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: Option<&str>,
+        deadline: Instant,
+    ) -> MetadataLookup {
+        collect_package_metadata(ecosystem, name, version, deadline)
+    }
+}
+
+fn version_intent_identity(intent: &crate::version_intent::VersionIntent) -> String {
+    match intent {
+        crate::version_intent::VersionIntent::Unspecified => "unspecified".to_string(),
+        crate::version_intent::VersionIntent::Exact(version) => format!("exact:{version}"),
+        crate::version_intent::VersionIntent::Resolved(version) => {
+            format!("resolved:{version}")
+        }
+        crate::version_intent::VersionIntent::Constraint { raw, parsed } => {
+            format!("constraint:{}:{raw}", parsed.is_some())
+        }
+    }
+}
+
+fn deduplicate_packages(packages: Vec<threatintel::PackageRef>) -> Vec<threatintel::PackageRef> {
+    let mut seen: HashSet<(u8, String, String)> = HashSet::new();
+    packages
+        .into_iter()
+        .filter(|package| {
+            seen.insert((
+                package.ecosystem as u8,
+                crate::threatdb::canonical_package_name(package.ecosystem, &package.name),
+                version_intent_identity(&package.version),
+            ))
+        })
+        .collect()
+}
+
+fn package_incomplete_finding(
+    package: &threatintel::PackageRef,
+    mut reasons: Vec<String>,
+) -> Option<Finding> {
+    reasons.sort();
+    reasons.dedup();
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::Medium,
+        title: "Package threat intelligence could not be completed".to_string(),
+        description: format!(
+            "Tirith could not complete every configured runtime threat-intelligence check for package '{}' ({}). This is incomplete verification, not evidence that the package is malicious.",
+            package.name,
+            reasons.join("; ")
+        ),
+        evidence: vec![Evidence::ThreatIntel {
+            source: "runtime-package-enrichment".to_string(),
+            threat_type: "lookup_incomplete".to_string(),
+            confidence: Confidence::Low,
+            reference: None,
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    })
+}
+
+fn enrich_packages_with_backend(
+    packages: Vec<threatintel::PackageRef>,
+    config: &ThreatIntelConfig,
+    timeout: Duration,
+    backend: &dyn PackageThreatBackend,
+) -> (Vec<Finding>, bool) {
+    let deduplicated = deduplicate_packages(packages);
+    let budget_truncated = deduplicated.len() > MAX_ENRICH_PACKAGES;
+    let packages: Vec<_> = deduplicated.into_iter().take(MAX_ENRICH_PACKAGES).collect();
+    if packages.is_empty() {
+        return (Vec::new(), budget_truncated);
+    }
+
+    // Give every distinct package an equal wall-clock slice. A slow first
+    // registry request can consume only its own slice; it cannot starve every
+    // later package of the one shared deadline as it did in #211.
+    let divisor = u32::try_from(packages.len()).unwrap_or(u32::MAX);
+    let per_package = (timeout / divisor).max(Duration::from_millis(1));
     let mut findings = Vec::new();
     let mut seen = HashSet::new();
 
-    let segments = crate::tokenize::tokenize(input, shell);
-    // `extract_packages_detail_for_shell`, not the bare variant: the detail form
-    // exists precisely so a consumer whose output is a security decision can see
-    // that the package list was cut. Discarding it made a runtime verdict read
-    // as a complete assessment of a command it had only partly looked at.
-    let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
-    let extraction_truncated = extracted.truncated;
-    let packages = extracted.packages;
-    let urls = extract::extract_urls(input, shell);
+    for package in packages {
+        let deadline = Instant::now()
+            .checked_add(per_package)
+            .unwrap_or_else(Instant::now);
+        let mut incomplete = Vec::new();
 
-    // Deduplicate BEFORE the cap. Capping the raw list first let repeats
-    // consume the budget, so a command padded with duplicates pushed a real
-    // candidate out of the window without ever being looked up.
-    let mut queried_packages: HashSet<(u8, String)> = HashSet::new();
-    let deduplicated_packages: Vec<_> = packages
-        .into_iter()
-        .filter(|package| queried_packages.insert((package.ecosystem as u8, package.name.clone())))
-        .collect();
-    // A second, independent cut. The extraction cap above is the grammar's; this
-    // one is the lookup budget, and it was equally silent.
-    let package_budget_truncated = deduplicated_packages.len() > MAX_ENRICH_PACKAGES;
-    let packages_by_first_use: Vec<_> = deduplicated_packages
-        .into_iter()
-        .take(MAX_ENRICH_PACKAGES)
-        .collect();
-    for package in packages_by_first_use {
-        // Only a CONCRETE version (Exact/Resolved) is a valid OSV `version`; a range
-        // or constraint must NOT be sent as one (OSV would treat the range text as a
-        // literal version, degrading matching and skipping deps.dev fallback). A
-        // non-concrete intent falls through to resolution instead.
+        // Only a concrete version is a valid OSV `version`. Constraints and
+        // unspecified requests first resolve through deps.dev, but every
+        // resolver outcome remains typed so failure cannot masquerade as a
+        // clean negative result.
         let effective_version = if let Some(version) = package.version.exact_version() {
             Some(version.to_string())
         } else if config.deps_dev_enabled {
-            match &package.version {
-                // A range/constraint: substituting the registry's default
-                // version is only sound when that version verifiably satisfies
-                // the requested constraint — otherwise `foo<2` would be
-                // checked as `foo@3` and a relevant advisory suppressed.
-                crate::version_intent::VersionIntent::Constraint { parsed, raw } => {
-                    let resolved =
-                        resolve_default_version(package.ecosystem, &package.name, deadline);
-                    let satisfies = match (parsed, resolved.as_deref()) {
-                        (Some(constraint), Some(candidate)) => {
-                            crate::version_intent::ReleaseVersion::parse(candidate)
-                                .map(|rv| constraint.matches(&rv))
-                                .unwrap_or(false)
+            match backend.resolve_default_version(package.ecosystem, &package.name, deadline) {
+                LookupOutcome::Complete(Some(resolved)) => match &package.version {
+                    crate::version_intent::VersionIntent::Constraint { parsed, raw } => {
+                        match parsed {
+                            Some(constraint) => {
+                                match crate::version_intent::ReleaseVersion::parse(&resolved) {
+                                    Some(version) if constraint.matches(&version) => Some(resolved),
+                                    Some(_) => {
+                                        incomplete.push(format!(
+                                            "the registry default does not satisfy constraint '{raw}'"
+                                        ));
+                                        None
+                                    }
+                                    None => {
+                                        incomplete.push(
+                                            "the registry default was not a supported concrete version"
+                                                .to_string(),
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            None => {
+                                incomplete.push(format!(
+                                    "constraint '{raw}' is outside the supported proof grammar"
+                                ));
+                                None
+                            }
                         }
-                        _ => false,
-                    };
-                    if satisfies {
-                        resolved
-                    } else if resolved.is_some() {
-                        // A concrete default WAS resolved and it does not satisfy
-                        // the requested range (the registry's current default is
-                        // older than the requested floor, say). Deterministic and
-                        // independent of order, so it stays a finding.
-                        if seen.insert(format!(
-                            "unresolved:{}:{}",
-                            package.ecosystem as u8, package.name
-                        )) {
-                            findings.push(Finding {
-                                rule_id: RuleId::ThreatUnresolvedMaliciousPackage,
-                                severity: Severity::Medium,
-                                title: "Version constraint could not be verified".to_string(),
-                                description: format!(
-                                    "Package '{}' is requested with version constraint '{}', and \
-                                     the registry's concrete default version does not satisfy it, \
-                                     so OSV/KEV correlation could not be performed against a \
-                                     constraint-satisfying version.",
-                                    package.name, raw
-                                ),
-                                evidence: vec![Evidence::ThreatIntel {
-                                    source: "version-resolution".to_string(),
-                                    threat_type: "unresolved_constraint".to_string(),
-                                    confidence: Confidence::Medium,
-                                    reference: None,
-                                }],
-                                human_view: None,
-                                agent_view: None,
-                                mitre_id: None,
-                                custom_rule_id: None,
-                            });
-                        }
-                        None
-                    } else {
-                        // Resolution did not complete (the shared deadline was
-                        // spent on earlier packages, the network was down, or the
-                        // registry stayed silent). This is not evidence of a
-                        // threat and must not be labelled as a malicious package
-                        // nor block the command; it is an honest "could not
-                        // verify this constraint within the budget". Kept at the
-                        // same Medium severity the old finding used, so the
-                        // action is unchanged, but the framing no longer implies
-                        // the package is malicious.
-                        if seen.insert(format!(
-                            "unverified:{}:{}",
-                            package.ecosystem as u8, package.name
-                        )) {
-                            findings.push(Finding {
-                                rule_id: RuleId::AnalysisIncomplete,
-                                severity: Severity::Medium,
-                                title: "Version constraint could not be verified within the budget"
-                                    .to_string(),
-                                description: format!(
-                                    "Package '{}' is requested with version constraint '{}', but \
-                                     tirith could not resolve it to a concrete version within the \
-                                     enrichment time budget, so OSV/KEV correlation was not \
-                                     performed for it. This is an incomplete check, not a threat \
-                                     signal; run the install for this package on its own to have \
-                                     it fully assessed.",
-                                    package.name, raw
-                                ),
-                                evidence: vec![Evidence::ThreatIntel {
-                                    source: "version-resolution".to_string(),
-                                    threat_type: "resolution_incomplete".to_string(),
-                                    confidence: Confidence::Low,
-                                    reference: None,
-                                }],
-                                human_view: None,
-                                agent_view: None,
-                                mitre_id: None,
-                                custom_rule_id: None,
-                            });
-                        }
-                        None
                     }
+                    crate::version_intent::VersionIntent::Unspecified => Some(resolved),
+                    crate::version_intent::VersionIntent::Exact(_)
+                    | crate::version_intent::VersionIntent::Resolved(_) => {
+                        unreachable!("concrete versions are handled before registry resolution")
+                    }
+                },
+                LookupOutcome::Complete(None) => {
+                    incomplete.push("the registry returned no default version".to_string());
+                    None
                 }
-                // No version requested at all: the resolver will install the
-                // registry's current default, so checking that version is sound.
-                _ => resolve_default_version(package.ecosystem, &package.name, deadline),
+                LookupOutcome::Unsupported => {
+                    incomplete.push(
+                        "default-version resolution is unsupported for this ecosystem".to_string(),
+                    );
+                    None
+                }
+                LookupOutcome::Incomplete(failure) => {
+                    incomplete.push(format!("default-version resolution {}", failure.label()));
+                    None
+                }
             }
         } else {
+            incomplete.push(
+                "no concrete version was available and deps.dev resolution is disabled".to_string(),
+            );
             None
         };
 
         if config.osv_enabled {
             if let Some(version) = effective_version.as_deref() {
-                if let Some(advisories) =
-                    query_osv(package.ecosystem, &package.name, version, deadline)
-                {
-                    if !advisories.is_empty()
-                        && seen.insert(format!(
-                            "osv:{}:{}:{version}",
-                            package.ecosystem as u8, package.name
-                        ))
-                    {
-                        findings.push(build_osv_finding(
-                            package.ecosystem,
-                            &package.name,
-                            version,
-                            &advisories,
-                        ));
-                    }
-
-                    if let Some(kev_hit) = find_kev_alias(&advisories, deadline) {
-                        if seen.insert(format!(
-                            "kev:{}:{}:{kev_hit}",
-                            package.ecosystem as u8, package.name
-                        )) {
-                            findings.push(build_kev_finding(
+                match backend.query_osv(package.ecosystem, &package.name, version, deadline) {
+                    LookupOutcome::Complete(advisories) => {
+                        if !advisories.is_empty()
+                            && seen.insert(format!(
+                                "osv:{}:{}:{version}",
+                                package.ecosystem as u8, package.name
+                            ))
+                        {
+                            findings.push(build_osv_finding(
                                 package.ecosystem,
                                 &package.name,
                                 version,
-                                &kev_hit,
+                                &advisories,
                             ));
                         }
+
+                        if !advisories.is_empty() {
+                            match backend.find_kev_alias(&advisories, deadline) {
+                                LookupOutcome::Complete(Some(kev_hit)) => {
+                                    if seen.insert(format!(
+                                        "kev:{}:{}:{kev_hit}",
+                                        package.ecosystem as u8, package.name
+                                    )) {
+                                        findings.push(build_kev_finding(
+                                            package.ecosystem,
+                                            &package.name,
+                                            version,
+                                            &kev_hit,
+                                        ));
+                                    }
+                                }
+                                LookupOutcome::Complete(None) => {}
+                                LookupOutcome::Unsupported => incomplete
+                                    .push("CISA KEV correlation is unsupported".to_string()),
+                                LookupOutcome::Incomplete(failure) => incomplete
+                                    .push(format!("CISA KEV correlation {}", failure.label())),
+                            }
+                        }
+                    }
+                    LookupOutcome::Unsupported => {
+                        incomplete.push("OSV lookup is unsupported for this ecosystem".to_string())
+                    }
+                    LookupOutcome::Incomplete(failure) => {
+                        incomplete.push(format!("OSV lookup {}", failure.label()));
                     }
                 }
             }
         }
 
         if config.deps_dev_enabled {
-            let metadata = collect_package_metadata(
+            let metadata = backend.collect_package_metadata(
                 package.ecosystem,
                 &package.name,
                 effective_version.as_deref(),
                 deadline,
             );
-            if let Some(signal) = metadata {
+            for (source, failure) in metadata.incomplete {
+                incomplete.push(format!("{source} metadata lookup {}", failure.label()));
+            }
+            if let Some(signal) = metadata.signal {
                 if signal.is_suspicious()
                     && seen.insert(format!(
                         "suspicious:{}:{}",
@@ -283,7 +420,41 @@ pub fn enrich_command(
                 }
             }
         }
+
+        if let Some(finding) = package_incomplete_finding(&package, incomplete) {
+            findings.push(finding);
+        }
     }
+
+    (findings, budget_truncated)
+}
+
+pub fn enrich_command(
+    input: &str,
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    mode: RuntimeThreatMode,
+) -> Vec<Finding> {
+    if !config.osv_enabled && !config.deps_dev_enabled && config.google_safe_browsing_key.is_none()
+    {
+        return Vec::new();
+    }
+
+    let segments = crate::tokenize::tokenize(input, shell);
+    // `extract_packages_detail_for_shell`, not the bare variant: the detail form
+    // exists precisely so a consumer whose output is a security decision can see
+    // that the package list was cut. Discarding it made a runtime verdict read
+    // as a complete assessment of a command it had only partly looked at.
+    let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
+    let extraction_truncated = extracted.truncated;
+    let packages = extracted.packages;
+    let urls = extract::extract_urls(input, shell);
+    let (mut findings, package_budget_truncated) =
+        enrich_packages_with_backend(packages, config, mode.timeout(), &LivePackageThreatBackend);
+    let mut seen = HashSet::new();
+    // URL enrichment receives its own phase budget. Package lookups cannot
+    // silently consume the entire Safe Browsing deadline.
+    let deadline = Instant::now() + mode.timeout();
 
     let mut url_budget_truncated = false;
     if let Some(api_key) = config.google_safe_browsing_key.as_deref() {
@@ -478,11 +649,23 @@ fn remaining_timeout(deadline: Instant) -> Option<Duration> {
 }
 
 fn build_client(deadline: Instant) -> Option<reqwest::blocking::Client> {
-    let timeout = remaining_timeout(deadline)?;
+    build_client_result(deadline).ok()
+}
+
+fn build_client_result(deadline: Instant) -> Result<reqwest::blocking::Client, LookupFailure> {
+    let timeout = remaining_timeout(deadline).ok_or(LookupFailure::Deadline)?;
     reqwest::blocking::Client::builder()
         .timeout(timeout)
         .build()
-        .ok()
+        .map_err(|_| LookupFailure::Client)
+}
+
+fn classify_request_error(error: &reqwest::Error) -> LookupFailure {
+    if error.is_timeout() {
+        LookupFailure::Deadline
+    } else {
+        LookupFailure::Transport
+    }
 }
 
 fn unix_now() -> u64 {
@@ -519,14 +702,22 @@ fn query_osv(
     name: &str,
     version: &str,
     deadline: Instant,
-) -> Option<Vec<OsvVuln>> {
-    let cache_key = format!("{}:{name}:{version}", ecosystem_label(ecosystem)?);
+) -> LookupOutcome<Vec<OsvVuln>> {
+    let Some(label) = ecosystem_label(ecosystem) else {
+        return LookupOutcome::Unsupported;
+    };
+    let cache_key = format!("{label}:{name}:{version}");
     if let Some(response) = load_cache::<OsvQueryResponse>("osv", &cache_key, CACHE_TTL_SECS) {
-        return Some(response.vulns);
+        return LookupOutcome::Complete(response.vulns);
     }
 
-    let client = build_client(deadline)?;
-    let ecosystem_name = osv_ecosystem_name(ecosystem)?;
+    let client = match build_client_result(deadline) {
+        Ok(client) => client,
+        Err(error) => return LookupOutcome::Incomplete(error),
+    };
+    let Some(ecosystem_name) = osv_ecosystem_name(ecosystem) else {
+        return LookupOutcome::Unsupported;
+    };
     let body = serde_json::json!({
         "package": {
             "name": name,
@@ -535,20 +726,27 @@ fn query_osv(
         "version": version,
     });
 
-    let mut response: OsvQueryResponse = read_json_bounded(
-        client
-            .post("https://api.osv.dev/v1/query")
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .ok()?
-            .error_for_status()
-            .ok()?,
-        MAX_RESPONSE_BYTES,
-    )?;
+    let response = match client
+        .post("https://api.osv.dev/v1/query")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => return LookupOutcome::Incomplete(classify_request_error(&error)),
+    };
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(_) => return LookupOutcome::Incomplete(LookupFailure::HttpStatus),
+    };
+    let mut response: OsvQueryResponse =
+        match read_json_bounded_result(response, MAX_RESPONSE_BYTES) {
+            Ok(response) => response,
+            Err(error) => return LookupOutcome::Incomplete(error),
+        };
     response.vulns.truncate(MAX_DECODED_ITEMS);
     store_cache("osv", &cache_key, &response);
-    Some(response.vulns)
+    LookupOutcome::Complete(response.vulns)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -576,39 +774,61 @@ fn deps_package(
     ecosystem: Ecosystem,
     name: &str,
     deadline: Instant,
-) -> Option<DepsPackageResponse> {
-    let system = deps_system_name(ecosystem)?;
+) -> LookupOutcome<DepsPackageResponse> {
+    let Some(system) = deps_system_name(ecosystem) else {
+        return LookupOutcome::Unsupported;
+    };
     let encoded = utf8_percent_encode(name, NON_ALPHANUMERIC).to_string();
     let cache_key = format!("{system}:{encoded}");
     if let Some(response) =
         load_cache::<DepsPackageResponse>("deps-package", &cache_key, CACHE_TTL_SECS)
     {
-        return Some(response);
+        return LookupOutcome::Complete(response);
     }
 
-    let client = build_client(deadline)?;
-    let mut response: DepsPackageResponse = read_json_bounded(
-        client
-            .get(format!(
-                "https://api.deps.dev/v3/systems/{system}/packages/{encoded}"
-            ))
-            .send()
-            .ok()?
-            .error_for_status()
-            .ok()?,
-        MAX_RESPONSE_BYTES,
-    )?;
+    let client = match build_client_result(deadline) {
+        Ok(client) => client,
+        Err(error) => return LookupOutcome::Incomplete(error),
+    };
+    let response = match client
+        .get(format!(
+            "https://api.deps.dev/v3/systems/{system}/packages/{encoded}"
+        ))
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => return LookupOutcome::Incomplete(classify_request_error(&error)),
+    };
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(_) => return LookupOutcome::Incomplete(LookupFailure::HttpStatus),
+    };
+    let mut response: DepsPackageResponse =
+        match read_json_bounded_result(response, MAX_RESPONSE_BYTES) {
+            Ok(response) => response,
+            Err(error) => return LookupOutcome::Incomplete(error),
+        };
     response.versions.truncate(MAX_DECODED_ITEMS);
     store_cache("deps-package", &cache_key, &response);
-    Some(response)
+    LookupOutcome::Complete(response)
 }
 
-fn resolve_default_version(ecosystem: Ecosystem, name: &str, deadline: Instant) -> Option<String> {
-    deps_package(ecosystem, name, deadline)?
-        .versions
-        .into_iter()
-        .find(|version| version.is_default)
-        .map(|version| version.version_key.version)
+fn resolve_default_version(
+    ecosystem: Ecosystem,
+    name: &str,
+    deadline: Instant,
+) -> LookupOutcome<Option<String>> {
+    match deps_package(ecosystem, name, deadline) {
+        LookupOutcome::Complete(package) => LookupOutcome::Complete(
+            package
+                .versions
+                .into_iter()
+                .find(|version| version.is_default)
+                .map(|version| version.version_key.version),
+        ),
+        LookupOutcome::Unsupported => LookupOutcome::Unsupported,
+        LookupOutcome::Incomplete(error) => LookupOutcome::Incomplete(error),
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -626,31 +846,43 @@ fn ecosystems_package(
     ecosystem: Ecosystem,
     name: &str,
     deadline: Instant,
-) -> Option<EcosystemsPackageResponse> {
-    let registry = ecosystems_registry_name(ecosystem)?;
+) -> LookupOutcome<EcosystemsPackageResponse> {
+    let Some(registry) = ecosystems_registry_name(ecosystem) else {
+        return LookupOutcome::Unsupported;
+    };
     let encoded = utf8_percent_encode(name, NON_ALPHANUMERIC).to_string();
     let cache_key = format!("{registry}:{encoded}");
     if let Some(response) =
         load_cache::<EcosystemsPackageResponse>("ecosystems-package", &cache_key, CACHE_TTL_SECS)
     {
-        return Some(response);
+        return LookupOutcome::Complete(response);
     }
 
-    let client = build_client(deadline)?;
-    let mut response: EcosystemsPackageResponse = read_json_bounded(
-        client
-            .get(format!(
-                "https://packages.ecosyste.ms/api/v1/registries/{registry}/packages/{encoded}"
-            ))
-            .send()
-            .ok()?
-            .error_for_status()
-            .ok()?,
-        MAX_RESPONSE_BYTES,
-    )?;
+    let client = match build_client_result(deadline) {
+        Ok(client) => client,
+        Err(error) => return LookupOutcome::Incomplete(error),
+    };
+    let response = match client
+        .get(format!(
+            "https://packages.ecosyste.ms/api/v1/registries/{registry}/packages/{encoded}"
+        ))
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => return LookupOutcome::Incomplete(classify_request_error(&error)),
+    };
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(_) => return LookupOutcome::Incomplete(LookupFailure::HttpStatus),
+    };
+    let mut response: EcosystemsPackageResponse =
+        match read_json_bounded_result(response, MAX_RESPONSE_BYTES) {
+            Ok(response) => response,
+            Err(error) => return LookupOutcome::Incomplete(error),
+        };
     response.maintainers.truncate(MAX_DECODED_ITEMS);
     store_cache("ecosystems-package", &cache_key, &response);
-    Some(response)
+    LookupOutcome::Complete(response)
 }
 
 #[derive(Debug, Clone)]
@@ -671,10 +903,10 @@ fn collect_package_metadata(
     name: &str,
     _version: Option<&str>,
     deadline: Instant,
-) -> Option<SuspiciousPackageSignal> {
-    let deps = deps_package(ecosystem, name, deadline);
-    let first_release_days = deps.as_ref().and_then(|response| {
-        response
+) -> MetadataLookup {
+    let mut incomplete = Vec::new();
+    let first_release_days = match deps_package(ecosystem, name, deadline) {
+        LookupOutcome::Complete(response) => response
             .versions
             .iter()
             .filter_map(|version| version.published_at.as_deref())
@@ -683,19 +915,30 @@ fn collect_package_metadata(
             .map(|first_seen| {
                 let now = unix_now() as i64;
                 ((now - first_seen).max(0)) / 86_400
-            })
-    });
+            }),
+        LookupOutcome::Unsupported => None,
+        LookupOutcome::Incomplete(error) => {
+            incomplete.push(("deps.dev", error));
+            None
+        }
+    };
 
-    let maintainers =
-        ecosystems_package(ecosystem, name, deadline).map(|package| package.maintainers.len());
-    if first_release_days.is_none() && maintainers.is_none() {
-        return None;
-    }
+    let maintainers = match ecosystems_package(ecosystem, name, deadline) {
+        LookupOutcome::Complete(package) => Some(package.maintainers.len()),
+        LookupOutcome::Unsupported => None,
+        LookupOutcome::Incomplete(error) => {
+            incomplete.push(("ecosyste.ms", error));
+            None
+        }
+    };
+    let signal = (first_release_days.is_some() || maintainers.is_some()).then_some(
+        SuspiciousPackageSignal {
+            first_release_days,
+            maintainers,
+        },
+    );
 
-    Some(SuspiciousPackageSignal {
-        first_release_days,
-        maintainers,
-    })
+    MetadataLookup { signal, incomplete }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -710,15 +953,26 @@ struct KevVulnerability {
     cve_id: String,
 }
 
-fn kev_aliases(deadline: Instant) -> Option<HashSet<String>> {
+fn kev_aliases(deadline: Instant) -> LookupOutcome<HashSet<String>> {
     if let Some(cached) = load_cache::<Vec<String>>("kev", "active", KEV_CACHE_TTL_SECS) {
-        return Some(cached.into_iter().collect());
+        return LookupOutcome::Complete(cached.into_iter().collect());
     }
-    let client = build_client(deadline)?;
-    let response: KevCatalog = read_json_bounded(
-        client.get(KEV_URL).send().ok()?.error_for_status().ok()?,
-        KEV_MAX_RESPONSE_BYTES,
-    )?;
+    let client = match build_client_result(deadline) {
+        Ok(client) => client,
+        Err(error) => return LookupOutcome::Incomplete(error),
+    };
+    let response = match client.get(KEV_URL).send() {
+        Ok(response) => response,
+        Err(error) => return LookupOutcome::Incomplete(classify_request_error(&error)),
+    };
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(_) => return LookupOutcome::Incomplete(LookupFailure::HttpStatus),
+    };
+    let response: KevCatalog = match read_json_bounded_result(response, KEV_MAX_RESPONSE_BYTES) {
+        Ok(response) => response,
+        Err(error) => return LookupOutcome::Incomplete(error),
+    };
     let aliases: Vec<String> = response
         .vulnerabilities
         .into_iter()
@@ -726,16 +980,24 @@ fn kev_aliases(deadline: Instant) -> Option<HashSet<String>> {
         .filter(|id| !id.is_empty())
         .collect();
     store_cache("kev", "active", &aliases);
-    Some(aliases.into_iter().collect())
+    LookupOutcome::Complete(aliases.into_iter().collect())
 }
 
-fn find_kev_alias(advisories: &[OsvVuln], deadline: Instant) -> Option<String> {
-    let kev = kev_aliases(deadline)?;
-    advisories
-        .iter()
-        .flat_map(|advisory| advisory.aliases.iter().chain(std::iter::once(&advisory.id)))
-        .find(|alias| kev.contains(*alias))
-        .cloned()
+fn find_kev_alias(advisories: &[OsvVuln], deadline: Instant) -> LookupOutcome<Option<String>> {
+    if advisories.is_empty() {
+        return LookupOutcome::Complete(None);
+    }
+    match kev_aliases(deadline) {
+        LookupOutcome::Complete(kev) => LookupOutcome::Complete(
+            advisories
+                .iter()
+                .flat_map(|advisory| advisory.aliases.iter().chain(std::iter::once(&advisory.id)))
+                .find(|alias| kev.contains(*alias))
+                .cloned(),
+        ),
+        LookupOutcome::Unsupported => LookupOutcome::Unsupported,
+        LookupOutcome::Incomplete(error) => LookupOutcome::Incomplete(error),
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -934,8 +1196,8 @@ fn incomplete_enrichment_finding(
     }
     if package_budget_truncated {
         reasons.push(format!(
-            "more than {MAX_ENRICH_PACKAGES} distinct packages were named, so only the first \
-             {MAX_ENRICH_PACKAGES} were looked up against live threat intelligence"
+            "more than {MAX_ENRICH_PACKAGES} distinct package/version requests were named, so \
+             only the first {MAX_ENRICH_PACKAGES} were looked up against live threat intelligence"
         ));
     }
     if url_budget_truncated {
@@ -1205,7 +1467,7 @@ fn ecosystems_registry_name(ecosystem: Ecosystem) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::net::IpAddr;
     use std::sync::Mutex;
     use url::Url;
@@ -1247,6 +1509,132 @@ mod tests {
                 .push(name.to_string());
             self.answers.get(name).cloned().flatten()
         }
+    }
+
+    #[derive(Default)]
+    struct FakePackageBackend {
+        calls: Mutex<Vec<String>>,
+        slow_osv: HashSet<String>,
+        failed_osv: HashSet<String>,
+        vulnerable: HashSet<(String, String)>,
+        resolutions: HashMap<String, LookupOutcome<Option<String>>>,
+    }
+
+    impl FakePackageBackend {
+        fn slow(mut self, name: &str) -> Self {
+            self.slow_osv.insert(name.to_string());
+            self
+        }
+
+        fn fail_osv(mut self, name: &str) -> Self {
+            self.failed_osv.insert(name.to_string());
+            self
+        }
+
+        fn vulnerable(mut self, name: &str, version: &str) -> Self {
+            self.vulnerable
+                .insert((name.to_string(), version.to_string()));
+            self
+        }
+
+        fn resolution(mut self, name: &str, outcome: LookupOutcome<Option<String>>) -> Self {
+            self.resolutions.insert(name.to_string(), outcome);
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl PackageThreatBackend for FakePackageBackend {
+        fn resolve_default_version(
+            &self,
+            _ecosystem: Ecosystem,
+            name: &str,
+            _deadline: Instant,
+        ) -> LookupOutcome<Option<String>> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(format!("resolve:{name}"));
+            self.resolutions
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| LookupOutcome::Complete(Some("1.0.0".to_string())))
+        }
+
+        fn query_osv(
+            &self,
+            _ecosystem: Ecosystem,
+            name: &str,
+            version: &str,
+            deadline: Instant,
+        ) -> LookupOutcome<Vec<OsvVuln>> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(format!("osv:{name}:{version}"));
+            if self.slow_osv.contains(name) {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                if !wait.is_zero() {
+                    std::thread::sleep(wait + Duration::from_millis(1));
+                }
+                return LookupOutcome::Incomplete(LookupFailure::Deadline);
+            }
+            if self.failed_osv.contains(name) {
+                return LookupOutcome::Incomplete(LookupFailure::Transport);
+            }
+            if self
+                .vulnerable
+                .contains(&(name.to_string(), version.to_string()))
+            {
+                LookupOutcome::Complete(vec![OsvVuln {
+                    id: "OSV-TEST-1".to_string(),
+                    aliases: Vec::new(),
+                    summary: Some("fixture advisory".to_string()),
+                    references: Vec::new(),
+                }])
+            } else {
+                LookupOutcome::Complete(Vec::new())
+            }
+        }
+
+        fn find_kev_alias(
+            &self,
+            _advisories: &[OsvVuln],
+            _deadline: Instant,
+        ) -> LookupOutcome<Option<String>> {
+            LookupOutcome::Complete(None)
+        }
+
+        fn collect_package_metadata(
+            &self,
+            _ecosystem: Ecosystem,
+            _name: &str,
+            _version: Option<&str>,
+            _deadline: Instant,
+        ) -> MetadataLookup {
+            MetadataLookup {
+                signal: None,
+                incomplete: Vec::new(),
+            }
+        }
+    }
+
+    fn package_config(osv_enabled: bool, deps_dev_enabled: bool) -> ThreatIntelConfig {
+        ThreatIntelConfig {
+            osv_enabled,
+            deps_dev_enabled,
+            google_safe_browsing_key: None,
+            ..ThreatIntelConfig::default()
+        }
+    }
+
+    fn extracted_packages(command: &str) -> Vec<threatintel::PackageRef> {
+        let shell = crate::tokenize::ShellType::Posix;
+        let segments = crate::tokenize::tokenize(command, shell);
+        threatintel::extract_packages_detail_for_shell(&segments, shell).packages
     }
 
     fn dns_budget() -> crate::network::DnsRequestBudget {
@@ -1492,6 +1880,143 @@ mod tests {
             findings.is_empty(),
             "should return empty when all APIs are disabled"
         );
+    }
+
+    #[test]
+    fn distinct_versions_of_one_package_are_both_queried_in_both_orders() {
+        for command in [
+            "pip install demo-pkg==1.0.0 && pip install demo_pkg==2.0.0",
+            "pip install demo_pkg==2.0.0 && pip install demo-pkg==1.0.0",
+        ] {
+            let backend = FakePackageBackend::default().vulnerable("demo-pkg", "2");
+            let (findings, truncated) = enrich_packages_with_backend(
+                extracted_packages(command),
+                &package_config(true, false),
+                Duration::from_millis(50),
+                &backend,
+            );
+            assert!(!truncated);
+            let calls = backend.calls();
+            assert!(calls.contains(&"osv:demo-pkg:1".to_string()), "{calls:?}");
+            assert!(calls.contains(&"osv:demo-pkg:2".to_string()), "{calls:?}");
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == RuleId::ThreatOsvVulnerable
+                    && finding.title.contains("demo-pkg@2")
+            }));
+        }
+    }
+
+    #[test]
+    fn identical_package_version_duplicates_share_one_lookup() {
+        let backend = FakePackageBackend::default();
+        let (findings, truncated) = enrich_packages_with_backend(
+            extracted_packages("pip install demo_pkg==1.0.0 && pip install demo-pkg==1.0.0"),
+            &package_config(true, false),
+            Duration::from_millis(50),
+            &backend,
+        );
+        assert!(!truncated);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|call| call.as_str() == "osv:demo-pkg:1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_slow_package_cannot_starve_a_later_package_in_either_order() {
+        for command in [
+            "pip install slow-pkg==1.0.0 && pip install danger-pkg==2.0.0",
+            "pip install danger-pkg==2.0.0 && pip install slow-pkg==1.0.0",
+        ] {
+            let backend = FakePackageBackend::default()
+                .slow("slow-pkg")
+                .vulnerable("danger-pkg", "2");
+            let (findings, _) = enrich_packages_with_backend(
+                extracted_packages(command),
+                &package_config(true, false),
+                Duration::from_millis(30),
+                &backend,
+            );
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::ThreatOsvVulnerable
+                        && finding.title.contains("danger-pkg@2")
+                }),
+                "later package was starved for {command}: {findings:?}"
+            );
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete
+                    && finding.description.contains("slow-pkg")
+                    && finding
+                        .description
+                        .contains("OSV lookup deadline exhausted")
+            }));
+        }
+    }
+
+    #[test]
+    fn lookup_failures_and_unsatisfied_constraints_are_incomplete_not_threats() {
+        let failed = FakePackageBackend::default().fail_osv("demo-pkg");
+        let (findings, _) = enrich_packages_with_backend(
+            extracted_packages("pip install demo-pkg==1.0.0"),
+            &package_config(true, false),
+            Duration::from_millis(50),
+            &failed,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete
+                && finding.description.contains("OSV lookup transport failed")
+                && finding.description.contains("not evidence")
+        }));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatUnresolvedMaliciousPackage));
+
+        let unsatisfied = FakePackageBackend::default().resolution(
+            "demo-pkg",
+            LookupOutcome::Complete(Some("1.0.0".to_string())),
+        );
+        let (findings, _) = enrich_packages_with_backend(
+            extracted_packages("pip install 'demo-pkg>=2.0.0'"),
+            &package_config(true, true),
+            Duration::from_millis(50),
+            &unsatisfied,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete
+                && finding
+                    .description
+                    .contains("registry default does not satisfy constraint")
+        }));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatUnresolvedMaliciousPackage));
+    }
+
+    #[test]
+    fn resolver_timeout_is_disclosed_without_an_osv_false_negative() {
+        let backend = FakePackageBackend::default().resolution(
+            "demo-pkg",
+            LookupOutcome::Incomplete(LookupFailure::Deadline),
+        );
+        let (findings, _) = enrich_packages_with_backend(
+            extracted_packages("pip install 'demo-pkg>=2.0.0'"),
+            &package_config(true, true),
+            Duration::from_millis(50),
+            &backend,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete
+                && finding
+                    .description
+                    .contains("default-version resolution deadline exhausted")
+        }));
+        assert!(!backend.calls().iter().any(|call| call.starts_with("osv:")));
     }
 
     /// Runtime enrichment has three independent caps and every one of them used
