@@ -198,8 +198,12 @@ def main():
             tool_input = get(pre, "parameters") or {}
         is_shell_pretool = event == "PreToolUse" and tool == "execute_command"
     elif proto == "openhands":
-        # OpenHands names the shell tool `terminal` and accepts both the
-        # snake_case event key and the Claude-compatible CamelCase one.
+        # OpenHands serializes its pydantic `HookEvent` to stdin, whose event
+        # field is `event_type` with the CamelCase value `PreToolUse`. The
+        # Claude-compatible spellings are accepted too, because its docs say
+        # hook scripts can be shared with Claude Code, but `event_type` is what
+        # the real executor sends and is the one that must work.
+        event = get(data, "event_type") or event
         is_shell_pretool = event in ("pre_tool_use", "PreToolUse") and tool in (
             "terminal",
             "Bash",
