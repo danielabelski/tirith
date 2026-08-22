@@ -130,6 +130,10 @@ is therefore a useful blocking layer, not a standalone security boundary. On
 Windows, Tirith installs only the MCP registration until Grok exposes a
 shell-grammar signal that setup can verify.
 
+Setup records the validated absolute Python interpreter in Grok's hook command.
+It does not leave a bare `python3` for the repository runtime to resolve; re-run
+setup if that interpreter moves.
+
 ### The Pi-family guard
 
 Pi CLI, Prime Agent, and OMP expose the same blocking `tool_call` event and the
@@ -207,8 +211,10 @@ runs the tool when a hook fails, so a hook that cannot start is not a block.
 Cline runs a `PreToolUse` executable on POSIX and a `PreToolUse.ps1` through
 PowerShell on Windows; setup installs the right one for the platform. The
 Windows script is the counterpart of the POSIX wrapper: it forwards Cline's
-stdin and stdout through the same Python adapter and needs `python3` (or
-`python`) on PATH.
+stdin and stdout through the same Python adapter. Setup validates `python3`
+(or `python` on Windows) and bakes that interpreter's absolute path into both
+wrappers; re-run setup if it moves. An untrusted repository or temporary PATH
+shadow makes setup fail closed and is never executed.
 
 OpenHands searches exactly two places for `hooks.json`: the working directory
 it was started in (`OPENHANDS_WORK_DIR`, otherwise the current directory, with

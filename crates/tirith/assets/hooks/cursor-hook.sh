@@ -4,6 +4,7 @@ set -uo pipefail  # No -e: we handle errors explicitly per command
 # __TIRITH_BIN__ is replaced at setup time by resolve_tirith_bin() —
 # either "tirith" (portable) or "/abs/path/to/tirith" (fallback)
 TIRITH_BIN="${TIRITH_BIN:-__TIRITH_BIN__}"
+TIRITH_PYTHON=__TIRITH_PYTHON__
 _tirith_hook_event() {
   if [ $# -ge 2 ]; then
     "$TIRITH_BIN" hook-event --integration cursor --hook-type before_shell_execution --event "$1" --detail "$2" 2>/dev/null &
@@ -17,15 +18,15 @@ if [ -z "$TIRITH_BIN" ]; then
   fi
   echo '{"permission":"deny","user_message":"tirith binary not found — install tirith or set TIRITH_FAIL_OPEN=1"}' ; exit 0
 fi
-if ! command -v python3 >/dev/null 2>&1; then
+if [ ! -x "$TIRITH_PYTHON" ]; then
   _tirith_hook_event python3_missing
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then
     echo '{"permission":"allow"}'; exit 0
   fi
-  echo '{"permission":"deny","user_message":"python3 not found — install python3 or set TIRITH_FAIL_OPEN=1"}'; exit 0
+  echo '{"permission":"deny","user_message":"configured Python interpreter is unavailable — re-run tirith setup or set TIRITH_FAIL_OPEN=1"}'; exit 0
 fi
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
-COMMAND=$(python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('command',''))" <<< "$INPUT" 2>/dev/null)
+COMMAND=$("$TIRITH_PYTHON" -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('command',''))" <<< "$INPUT" 2>/dev/null)
 PARSE_RC=$?
 if [ "$PARSE_RC" -ne 0 ] || [ -z "$COMMAND" ]; then
   _tirith_hook_event parse_error
@@ -39,7 +40,7 @@ RC=$?  # No || true here: we need the actual exit code. Without set -e, script c
 
 # Helper: extract finding titles from JSON result via python3
 _findings_summary() {
-  python3 -c "
+  "$TIRITH_PYTHON" -c "
 import sys, json
 try:
     v = json.loads(sys.stdin.read())
@@ -65,7 +66,7 @@ elif [ "$RC" -eq 1 ]; then
   # Block — always deny
   _tirith_hook_event check_block
   REASON=$(_findings_summary)
-  DENY_JSON=$(python3 -c "
+  DENY_JSON=$("$TIRITH_PYTHON" -c "
 import sys, json
 reason = sys.argv[1]
 print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message': 'Command blocked by Tirith: ' + reason}))
@@ -87,7 +88,7 @@ elif [ "$RC" -eq 2 ]; then
     # Treat warn as deny
     _tirith_hook_event warn_denied
     REASON=$(_findings_summary)
-    DENY_JSON=$(python3 -c "
+    DENY_JSON=$("$TIRITH_PYTHON" -c "
 import sys, json
 reason = sys.argv[1]
 print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message': 'Command blocked by Tirith: ' + reason}))
@@ -102,7 +103,7 @@ print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message':
     _tirith_hook_event warn_allowed
     REASON=$(_findings_summary)
     echo "$REASON" >&2
-    ALLOW_JSON=$(python3 -c "
+    ALLOW_JSON=$("$TIRITH_PYTHON" -c "
 import sys, json
 msg = sys.argv[1]
 print(json.dumps({'permission': 'allow', 'user_message': msg}))

@@ -435,11 +435,12 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
     }
 
     let settings_path = target.join("settings.json");
+    let python = quoted_python_bin(opts)?;
     let hook_command = match opts.scope {
         Scope::Project => {
-            r#"python3 "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/tirith-check.py""#.to_string()
+            format!(r#"{python} "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/tirith-check.py""#)
         }
-        Scope::User => r#"python3 "$HOME/.claude/hooks/tirith-check.py""#.to_string(),
+        Scope::User => format!(r#"{python} "$HOME/.claude/hooks/tirith-check.py""#),
     };
     merge::merge_claude_settings(
         &settings_path,
@@ -724,7 +725,7 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
     let hooks_dir = target.join("hooks");
 
     let hook_path = hooks_dir.join("tirith-hook.sh");
-    let hook_content = crate::assets::CURSOR_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
+    let hook_content = render_python_shell_hook(crate::assets::CURSOR_HOOK_SH, opts)?;
     fs_helpers::write_hook_script(
         &hook_path,
         &scope_root,
@@ -808,7 +809,7 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
     let hooks_dir = target.join("hooks");
 
     let hook_path = hooks_dir.join("tirith-hook.sh");
-    let hook_content = crate::assets::VSCODE_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
+    let hook_content = render_python_shell_hook(crate::assets::VSCODE_HOOK_SH, opts)?;
     fs_helpers::write_hook_script(&hook_path, &cwd, &hook_content, opts.force, opts.dry_run)?;
 
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
@@ -901,16 +902,18 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
     }
 
     let settings_path = target.join("settings.json");
+    let python = quoted_python_bin(opts)?;
     let hook_command = match opts.scope {
         Scope::Project => {
-            r#"python3 "$GEMINI_PROJECT_DIR/.gemini/hooks/tirith-security-guard-gemini.py""#
-                .to_string()
+            format!(
+                r#"{python} "$GEMINI_PROJECT_DIR/.gemini/hooks/tirith-security-guard-gemini.py""#
+            )
         }
         Scope::User => {
             let abs = hooks_dir.join("tirith-security-guard-gemini.py");
             let abs = path_to_utf8(&abs, "Gemini hook")?;
             format!(
-                "python3 {}",
+                "{python} {}",
                 super::shell_profile::shell_quote(&abs, "bash")
             )
         }
@@ -1049,6 +1052,27 @@ fn require_absolute_tirith_bin(opts: &SetupOpts) -> Result<&str, String> {
     } else {
         Err("setup requires a validated absolute tirith executable path".into())
     }
+}
+
+fn require_absolute_python_bin(opts: &SetupOpts) -> Result<&str, String> {
+    match opts.python_bin.as_deref() {
+        Some(path) if Path::new(path).is_absolute() => Ok(path),
+        None if opts.dry_run => Ok("/absolute/path/to/python3"),
+        _ => Err("setup requires a validated absolute Python executable path".into()),
+    }
+}
+
+fn quoted_python_bin(opts: &SetupOpts) -> Result<String, String> {
+    Ok(super::shell_profile::shell_quote(
+        require_absolute_python_bin(opts)?,
+        "bash",
+    ))
+}
+
+fn render_python_shell_hook(template: &str, opts: &SetupOpts) -> Result<String, String> {
+    Ok(template
+        .replace("__TIRITH_BIN__", &opts.tirith_bin)
+        .replace("__TIRITH_PYTHON__", &quoted_python_bin(opts)?))
 }
 
 fn absolute_config_path(path: PathBuf, role: &str) -> Result<PathBuf, String> {
@@ -2111,11 +2135,13 @@ fn merge_grok_mcp_toml(
 fn grok_pretool_hook_config(
     hooks_dir: &Path,
     tirith_bin: &str,
+    python_bin: &str,
 ) -> Result<(PathBuf, String), String> {
     let hook_path = hooks_dir.join("tirith-check.py");
     let hook_path_text = path_to_utf8(&hook_path, "Grok Build Tirith hook")?;
     let hook_command = format!(
-        "python3 {}",
+        "{} {}",
+        super::shell_profile::shell_quote(python_bin, "bash"),
         super::shell_profile::shell_quote(&hook_path_text, "bash")
     );
     let content = serde_json::to_string_pretty(&json!({
@@ -2146,7 +2172,8 @@ fn preflight_grok_pretool_hook(
     tirith_bin: &str,
     opts: &SetupOpts,
 ) -> Result<(), String> {
-    let (hook_path, content) = grok_pretool_hook_config(hooks_dir, tirith_bin)?;
+    let (hook_path, content) =
+        grok_pretool_hook_config(hooks_dir, tirith_bin, require_absolute_python_bin(opts)?)?;
     preflight_owned_file(
         &hook_path,
         scope_root,
@@ -2170,7 +2197,8 @@ fn setup_grok_pretool_hook(
     private: bool,
     opts: &SetupOpts,
 ) -> Result<(), String> {
-    let (hook_path, content) = grok_pretool_hook_config(hooks_dir, tirith_bin)?;
+    let (hook_path, content) =
+        grok_pretool_hook_config(hooks_dir, tirith_bin, require_absolute_python_bin(opts)?)?;
     fs_helpers::write_hook_script(
         &hook_path,
         scope_root,
@@ -2443,6 +2471,7 @@ pub fn setup_fx(opts: &SetupOpts) -> Result<(), String> {
 fn pre_tool_use_wrapper(
     protocol: &str,
     tirith_bin: &str,
+    python_bin: &str,
     hook_script: &Path,
 ) -> Result<String, String> {
     let script_text = path_to_utf8(hook_script, "Tirith hook script")?;
@@ -2452,9 +2481,10 @@ fn pre_tool_use_wrapper(
          # this host's wire protocol. Do not edit; re-run setup to refresh it.\n\
          TIRITH_BIN={bin} \\\n\
          TIRITH_HOOK_PROTOCOL={protocol} \\\n\
-         exec python3 {script}\n",
+         exec {python} {script}\n",
         bin = super::shell_profile::shell_quote(tirith_bin, "bash"),
         protocol = super::shell_profile::shell_quote(protocol, "bash"),
+        python = super::shell_profile::shell_quote(python_bin, "bash"),
         script = super::shell_profile::shell_quote(&script_text, "bash"),
     ))
 }
@@ -2471,7 +2501,12 @@ fn install_wrapped_pre_tool_use_hook(
 ) -> Result<(PathBuf, PathBuf), String> {
     let script_path = hooks_dir.join("tirith-check.py");
     let wrapper_path = hooks_dir.join(wrapper_name);
-    let wrapper = pre_tool_use_wrapper(protocol, tirith_bin, &script_path)?;
+    let wrapper = pre_tool_use_wrapper(
+        protocol,
+        tirith_bin,
+        require_absolute_python_bin(opts)?,
+        &script_path,
+    )?;
     // Adapter first: a wrapper that exists but points at a missing script would
     // make the host error, and both of these hosts let the tool run on error.
     fs_helpers::write_hook_script(
@@ -2492,13 +2527,14 @@ fn install_wrapped_pre_tool_use_hook(
 }
 
 #[cfg(any(windows, test))]
-fn render_cline_powershell_hook(tirith_bin: &str, adapter_path: &str) -> String {
+fn render_cline_powershell_hook(tirith_bin: &str, python_bin: &str, adapter_path: &str) -> String {
     // PowerShell single-quoted literals escape an apostrophe by doubling it.
     // Do not use an interpolated string here: both paths are setup-controlled
     // identities and must reach PowerShell byte-for-byte.
     let quote = |value: &str| value.replace('\'', "''");
     crate::assets::CLINE_PRETOOLUSE_PS1
         .replace("__TIRITH_BIN__", &quote(tirith_bin))
+        .replace("__PYTHON_BIN__", &quote(python_bin))
         .replace("__ADAPTER_PATH__", &quote(adapter_path))
 }
 
@@ -2516,7 +2552,11 @@ fn install_cline_powershell_hook(
     let adapter_path = hooks_dir.join("tirith-check.py");
     let hook_path = hooks_dir.join("PreToolUse.ps1");
     let adapter_text = path_to_utf8(&adapter_path, "Cline hook adapter")?;
-    let hook = render_cline_powershell_hook(tirith_bin, &adapter_text);
+    let hook = render_cline_powershell_hook(
+        tirith_bin,
+        require_absolute_python_bin(opts)?,
+        &adapter_text,
+    );
     fs_helpers::write_hook_script(
         &adapter_path,
         scope_root,
@@ -2545,33 +2585,132 @@ fn windows_documents_dir() -> Option<PathBuf> {
     documents.is_absolute().then_some(documents)
 }
 
-/// Resolve Cline's global hooks directory the way Cline itself does.
-///
-/// Cline asks `xdg-user-dir DOCUMENTS` on Linux, the `MyDocuments` special
-/// folder on Windows, and falls back to `~/Documents`. A hook written to a
-/// hard-coded `~/Documents` on a Linux desktop with a localized or relocated
-/// Documents directory would never be discovered, while setup reported success.
-pub(crate) fn cline_hooks_dir(home: &Path) -> PathBuf {
+fn cline_default_hooks_dir(home: &Path) -> PathBuf {
+    home.join("Documents").join("Cline").join("Hooks")
+}
+
+/// `xdg-user-dir` sources `user-dirs.dirs`, so an ambient config root is code
+/// input, not just a lookup location. Accept a custom root only when it is an
+/// absolute, non-symlinked descendant of the selected home and does not overlap
+/// the current repository. A test HOME may itself live under the system temp
+/// root; denied ancestors that also contain HOME therefore add no distinction
+/// and are ignored.
+#[cfg(any(target_os = "linux", test))]
+fn checked_xdg_config_home(home: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = std::env::var_os("XDG_CONFIG_HOME") else {
+        return Ok(None);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| "XDG_CONFIG_HOME must be valid UTF-8".to_string())?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let config_home = PathBuf::from(raw);
+    if !config_home.is_absolute() {
+        return Err("XDG_CONFIG_HOME must be an absolute path".into());
+    }
+    fs_helpers::validate_target_dir(&config_home, Some(home)).map_err(|error| {
+        format!(
+            "refusing XDG_CONFIG_HOME for xdg-user-dir because it is not a contained home configuration directory: {error}"
+        )
+    })?;
+
+    let config_ancestor = nearest_existing_ancestor(&config_home)?
+        .canonicalize()
+        .map_err(|error| format!("canonicalize XDG_CONFIG_HOME: {error}"))?;
+    for denied in tirith_core::trusted_child::ambient_denied_roots() {
+        // HOME is already the explicit setup authority for this user-scoped
+        // installation. A broad temp root containing both HOME and the config
+        // adds no repository-specific provenance signal.
+        if home.starts_with(&denied) {
+            continue;
+        }
+        let canonical_denied = denied.canonicalize().unwrap_or(denied);
+        if config_home.starts_with(&canonical_denied)
+            || config_ancestor.starts_with(&canonical_denied)
+        {
+            return Err(format!(
+                "refusing XDG_CONFIG_HOME for xdg-user-dir because it overlaps an untrusted repository or temporary root: {}",
+                config_home.display()
+            ));
+        }
+    }
+    Ok(Some(config_home))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn run_xdg_user_dir(
+    helper: &tirith_core::trusted_child::TrustedExecutable,
+    home: &Path,
+) -> Result<Option<PathBuf>, String> {
+    helper
+        .revalidate()
+        .map_err(|error| format!("xdg-user-dir changed during setup: {error}"))?;
+    let mut spec = tirith_core::trusted_child::ChildSpec::new(
+        ["DOCUMENTS"],
+        tirith_core::trusted_child::ChildLimits::new(
+            std::time::Duration::from_secs(3),
+            4096,
+            16 * 1024,
+        ),
+    )
+    .env("HOME", home)
+    // xdg-user-dir is commonly a shell script. Give it only root-managed
+    // utility directories, never the ambient PATH.
+    .env(
+        "PATH",
+        "/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin",
+    );
+    if let Some(config_home) = checked_xdg_config_home(home)? {
+        spec = spec.env("XDG_CONFIG_HOME", config_home);
+    }
+    match tirith_core::trusted_child::run(helper, &spec) {
+        tirith_core::trusted_child::ChildOutcome::Completed { status, stdout, .. } => {
+            if !status.success() {
+                return Ok(None);
+            }
+            let resolved = String::from_utf8_lossy(&stdout).trim().to_string();
+            let resolved = PathBuf::from(resolved);
+            Ok(resolved.is_absolute().then_some(resolved))
+        }
+        outcome => Err(format!(
+            "trusted xdg-user-dir did not complete within its bounded runner: {outcome:?}"
+        )),
+    }
+}
+
+/// Resolve Cline's global hooks directory without executing a repository PATH
+/// shadow. Setup uses the checked result; doctor falls back to the documented
+/// default when it cannot safely query the optional Linux helper.
+fn cline_hooks_dir_checked(home: &Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(output) = std::process::Command::new("xdg-user-dir")
-            .arg("DOCUMENTS")
-            .output()
-        {
-            if output.status.success() {
-                let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let resolved = PathBuf::from(resolved);
-                if resolved.is_absolute() {
-                    return resolved.join("Cline").join("Hooks");
-                }
+        let helper = match tirith_core::trusted_child::resolve_system_helper("xdg-user-dir") {
+            Ok(helper) => Some(helper),
+            Err(tirith_core::trusted_child::TrustedExecutableError::NotFound(_)) => None,
+            Err(error) => {
+                return Err(format!(
+                    "refusing untrusted xdg-user-dir selected from PATH: {error}"
+                ));
+            }
+        };
+        if let Some(helper) = helper {
+            if let Some(resolved) = run_xdg_user_dir(&helper, home)? {
+                return Ok(resolved.join("Cline").join("Hooks"));
             }
         }
     }
     #[cfg(all(windows, not(test)))]
     if let Some(documents) = windows_documents_dir() {
-        return documents.join("Cline").join("Hooks");
+        return Ok(documents.join("Cline").join("Hooks"));
     }
-    home.join("Documents").join("Cline").join("Hooks")
+    Ok(cline_default_hooks_dir(home))
+}
+
+pub(crate) fn cline_hooks_dir(home: &Path) -> PathBuf {
+    cline_hooks_dir_checked(home).unwrap_or_else(|_| cline_default_hooks_dir(home))
 }
 
 /// Cline stores its global MCP registry beneath `CLINE_DATA_DIR`, falling back
@@ -2593,7 +2732,7 @@ pub fn setup_cline(opts: &SetupOpts) -> Result<(), String> {
     // through PowerShell.
     #[cfg(unix)]
     let cline_hook_paths = {
-        let hooks_dir = cline_hooks_dir(&home);
+        let hooks_dir = cline_hooks_dir_checked(&home)?;
         let scope_root = nearest_existing_ancestor(&hooks_dir)?;
         install_wrapped_pre_tool_use_hook(
             &hooks_dir,
@@ -2606,7 +2745,7 @@ pub fn setup_cline(opts: &SetupOpts) -> Result<(), String> {
     };
     #[cfg(windows)]
     let cline_hook_paths = {
-        let hooks_dir = cline_hooks_dir(&home);
+        let hooks_dir = cline_hooks_dir_checked(&home)?;
         let scope_root = nearest_existing_ancestor(&hooks_dir)?;
         install_cline_powershell_hook(&hooks_dir, &scope_root, tirith_bin, opts)?
     };
@@ -2658,7 +2797,7 @@ pub fn setup_cline(opts: &SetupOpts) -> Result<(), String> {
     let (wrapper, _script) = &cline_hook_paths;
     eprintln!("  Hook: {}", wrapper.display());
     eprintln!(
-        "  Enable hooks in Cline's settings; the hook is inert until you do. Cline runs the tool if a hook fails to start, so keep Python on PATH."
+        "  Enable hooks in Cline's settings; the hook is inert until you do. Cline runs the tool if a hook fails to start, so re-run setup if the pinned Python interpreter moves."
     );
     eprintln!("  Config: {}", config_path.display());
     eprintln!("  Restart Cline and verify `tirith` in its MCP Servers view.");
@@ -3083,7 +3222,7 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
     let hooks_dir = target.join("hooks");
 
     let hook_path = hooks_dir.join("tirith-hook.sh");
-    let hook_content = crate::assets::WINDSURF_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
+    let hook_content = render_python_shell_hook(crate::assets::WINDSURF_HOOK_SH, opts)?;
     fs_helpers::write_hook_script(&hook_path, &home, &hook_content, opts.force, opts.dry_run)?;
 
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
@@ -3169,13 +3308,14 @@ pub fn setup_copilot_cli(opts: &SetupOpts) -> Result<(), String> {
 
     // Tirith owns this file entirely (no merge) — we rewrite on every setup.
     let config_path = hooks_dir.join("tirith-security.json");
+    let python = quoted_python_bin(opts)?;
     let config = serde_json::json!({
         "version": 1,
         "hooks": {
             "preToolUse": [
                 {
                     "type": "command",
-                    "bash": "python3 .github/hooks/copilot-cli-hook.py",
+                    "bash": format!("{python} .github/hooks/copilot-cli-hook.py"),
                     "timeoutSec": 30
                 }
             ]
@@ -3252,7 +3392,7 @@ pub fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
     let agent_path = agents_dir.join("tirith-security.json");
     let hook_path_text = path_to_utf8(&hook_path, "Kiro hook")?;
     let quoted = super::shell_profile::shell_quote(&hook_path_text, "bash");
-    let command = format!("python3 {quoted}");
+    let command = format!("{} {quoted}", quoted_python_bin(opts)?);
     let agent = serde_json::json!({
         "description": "Tirith security guard: intercepts execute_bash tool calls and blocks dangerous commands.",
         "tools": ["*"],
@@ -4637,6 +4777,7 @@ mod tests {
             dry_run: false,
             force: false,
             tirith_bin: "tirith".to_string(),
+            python_bin: Some("/usr/bin/python3".to_string()),
             update_configs: false,
         }
     }
@@ -4653,8 +4794,40 @@ mod tests {
             dry_run: false,
             force: false,
             tirith_bin,
+            python_bin: Some(if cfg!(windows) {
+                r"C:\Python\python.exe".to_string()
+            } else {
+                "/usr/bin/python3".to_string()
+            }),
             update_configs: false,
         }
+    }
+
+    #[test]
+    fn generated_shell_hooks_use_only_the_pinned_python_interpreter() {
+        let mut opts = mcp_opts(Scope::User);
+        opts.python_bin = Some("/opt/Python Runtime/python3".to_string());
+        for template in [
+            crate::assets::CURSOR_HOOK_SH,
+            crate::assets::VSCODE_HOOK_SH,
+            crate::assets::WINDSURF_HOOK_SH,
+        ] {
+            let rendered = render_python_shell_hook(template, &opts).unwrap();
+            assert!(
+                rendered.contains("TIRITH_PYTHON='/opt/Python Runtime/python3'"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("__TIRITH_PYTHON__"), "{rendered}");
+            assert!(!rendered.contains("command -v python3"), "{rendered}");
+            assert!(!rendered.contains("$(python3 "), "{rendered}");
+        }
+
+        opts.python_bin = Some("python3".to_string());
+        assert!(
+            render_python_shell_hook(crate::assets::CURSOR_HOOK_SH, &opts)
+                .unwrap_err()
+                .contains("validated absolute Python")
+        );
     }
 
     #[test]
@@ -5857,9 +6030,10 @@ mod tests {
                 "wrapper must exec the adapter it was installed beside: {body}"
             );
             assert!(
-                body.contains("exec python3"),
-                "wrapper must exec, not fork: {body}"
+                body.contains("exec /usr/bin/python3"),
+                "wrapper must exec the pinned absolute interpreter, not resolve PATH: {body}"
             );
+            assert!(!body.contains("exec python3"), "{body}");
             for path in [&wrapper, &script] {
                 assert_eq!(
                     std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -6484,11 +6658,14 @@ mod tests {
     fn cline_powershell_hook_renders_without_placeholders_and_quotes_paths() {
         let rendered = render_cline_powershell_hook(
             r"C:\Program Files\Tirith\tirith.exe",
+            r"C:\Python's Runtime\python.exe",
             r"C:\Users\Dev's Box\.cline\tirith-check.py",
         );
         assert!(!rendered.contains("__TIRITH_BIN__"));
+        assert!(!rendered.contains("__PYTHON_BIN__"));
         assert!(!rendered.contains("__ADAPTER_PATH__"));
         assert!(rendered.contains("$env:TIRITH_HOOK_PROTOCOL = 'cline'"));
+        assert!(rendered.contains("C:\\Python''s Runtime\\python.exe"));
         // The apostrophe in the path is doubled for a PowerShell literal.
         assert!(
             rendered.contains("C:\\Users\\Dev''s Box"),
@@ -6542,9 +6719,16 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let hook_path = dir.path().join("PreToolUse.ps1");
+        let python = Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .expect("python3 required for Cline hook test");
+        assert!(python.status.success());
+        let python = String::from_utf8(python.stdout).unwrap();
+        let python = python.trim();
         std::fs::write(
             &hook_path,
-            render_cline_powershell_hook(fake.to_str().unwrap(), adapter.to_str().unwrap()),
+            render_cline_powershell_hook(fake.to_str().unwrap(), python, adapter.to_str().unwrap()),
         )
         .unwrap();
         std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -6620,24 +6804,92 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cline_hooks_dir_follows_xdg_user_dir_on_linux() {
+    fn cline_hooks_dir_refuses_repository_or_temp_xdg_user_dir() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
-        let docs = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
+        let marker = bin.path().join("executed");
         let fake = bin.path().join("xdg-user-dir");
         std::fs::write(
             &fake,
-            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", docs.path().display()),
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf '%s\\n' '/attacker/documents'\n",
+                marker.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _path = EnvGuard::set("PATH", bin.path());
         assert_eq!(
             cline_hooks_dir(home.path()),
-            docs.path().join("Cline/Hooks"),
-            "a relocated Documents directory is where Cline will look"
+            home.path().join("Documents/Cline/Hooks"),
+            "doctor must fall back without running an untrusted helper"
         );
+        assert!(!marker.exists(), "the PATH shadow must never execute");
+        assert!(
+            cline_hooks_dir_checked(home.path())
+                .unwrap_err()
+                .contains("refusing untrusted xdg-user-dir"),
+            "setup must fail instead of claiming it installed a discoverable hook"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cline_xdg_config_home_is_contained_and_not_repository_selected() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("isolated cwd");
+            let home_config = home.join(".config");
+            std::fs::create_dir_all(&home_config).unwrap();
+            {
+                let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &home_config);
+                assert_eq!(
+                    checked_xdg_config_home(home).unwrap(),
+                    Some(home_config.clone())
+                );
+            }
+
+            let repository_config = cwd.join("xdg-config");
+            std::fs::create_dir_all(&repository_config).unwrap();
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &repository_config);
+            let error = checked_xdg_config_home(home)
+                .expect_err("repository-selected xdg config must fail closed");
+            assert!(error.contains("refusing XDG_CONFIG_HOME"), "{error}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cline_xdg_helper_runs_with_bounded_sanitized_environment() {
+        with_fake_env(true, |home, cwd| {
+            let _cwd = cwd.expect("isolated cwd");
+            let config_home = home.join(".config");
+            std::fs::create_dir_all(&config_home).unwrap();
+            let helper_path = home.join("trusted-xdg-user-dir");
+            std::fs::write(
+                &helper_path,
+                "#!/bin/sh\n\
+                 [ \"$1\" = DOCUMENTS ] || exit 20\n\
+                 [ \"$XDG_CONFIG_HOME\" = \"$HOME/.config\" ] || exit 21\n\
+                 case \":$PATH:\" in *\":$HOME/repository-bin:\"*) exit 22;; esac\n\
+                 printf '%s\\n' \"$HOME/Relocated Documents\"\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let helper =
+                tirith_core::trusted_child::TrustedExecutable::from_absolute(&helper_path, &[])
+                    .unwrap();
+            let repository_bin = home.join("repository-bin");
+            std::fs::create_dir_all(&repository_bin).unwrap();
+            let _path = EnvGuard::set("PATH", &repository_bin);
+            let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &config_home);
+
+            assert_eq!(
+                run_xdg_user_dir(&helper, home).unwrap(),
+                Some(home.join("Relocated Documents"))
+            );
+        });
     }
 
     #[test]
@@ -7140,8 +7392,8 @@ mod tests {
             let entry = &v["hooks"]["preToolUse"][0];
             assert_eq!(entry["type"], "command");
             assert_eq!(
-                entry["bash"], "python3 .github/hooks/copilot-cli-hook.py",
-                "relative bash path, not absolute"
+                entry["bash"], "/usr/bin/python3 .github/hooks/copilot-cli-hook.py",
+                "the interpreter is pinned while Copilot's hook path stays repo-relative"
             );
             assert_eq!(entry["timeoutSec"], 30);
             assert!(
@@ -7187,10 +7439,10 @@ mod tests {
             assert_eq!(entry["matcher"], "execute_bash");
 
             let cmd = entry["command"].as_str().expect("command is string");
-            let prefix = "python3 ";
+            let prefix = "/usr/bin/python3 ";
             assert!(
                 cmd.starts_with(prefix),
-                "command should start with `python3 `, got: {cmd}"
+                "command should start with the pinned interpreter, got: {cmd}"
             );
             let path_part = unquote_posix(&cmd[prefix.len()..]);
             let expected = hook.display().to_string();
@@ -7214,10 +7466,10 @@ mod tests {
             let cmd = v["hooks"]["preToolUse"][0]["command"]
                 .as_str()
                 .expect("command is string");
-            let prefix = "python3 ";
+            let prefix = "/usr/bin/python3 ";
             assert!(
                 cmd.starts_with(prefix),
-                "command starts with python3: {cmd}"
+                "command starts with the pinned interpreter: {cmd}"
             );
             let path_part = unquote_posix(&cmd[prefix.len()..]);
             let path = std::path::Path::new(&path_part);

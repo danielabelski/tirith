@@ -6,6 +6,7 @@ set -uo pipefail  # No -e: we handle errors explicitly per command
 # __TIRITH_BIN__ is replaced at setup time by resolve_tirith_bin() —
 # either "tirith" (portable) or "/abs/path/to/tirith" (fallback)
 TIRITH_BIN="${TIRITH_BIN:-__TIRITH_BIN__}"
+TIRITH_PYTHON=__TIRITH_PYTHON__
 _tirith_hook_event() {
   if [ $# -ge 2 ]; then
     "$TIRITH_BIN" hook-event --integration vscode --hook-type pre_tool_use --event "$1" --detail "$2" 2>/dev/null &
@@ -17,7 +18,7 @@ _tirith_hook_event() {
 SHELL_TOOL_PATTERN="^(Bash|bash|shell|sh|zsh|terminal|Terminal|terminal_exec|terminalExec)$"
 
 deny() {
-  python3 -c "
+  "$TIRITH_PYTHON" -c "
 import sys, json
 reason = sys.argv[1]
 print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': reason}}))
@@ -29,18 +30,18 @@ if [ -z "$TIRITH_BIN" ]; then
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi
   deny "tirith binary not found — install tirith or set TIRITH_FAIL_OPEN=1"
 fi
-if ! command -v python3 >/dev/null 2>&1; then
+if [ ! -x "$TIRITH_PYTHON" ]; then
   _tirith_hook_event python3_missing
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi
-  # Cannot use deny() without python3 — emit static JSON
-  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"python3 not found — install python3 or set TIRITH_FAIL_OPEN=1"}}'
+  # Cannot use deny() without the pinned interpreter — emit static JSON.
+  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"configured Python interpreter is unavailable — re-run tirith setup or set TIRITH_FAIL_OPEN=1"}}'
   exit 0
 fi
 
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
 
 # Extract event, tool name, and command from stdin JSON
-PARSED=$(python3 -c "
+PARSED=$("$TIRITH_PYTHON" -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
@@ -85,7 +86,7 @@ RC=$?  # No || true: we need the actual exit code. Without set -e, script contin
 
 # Helper: extract finding titles from JSON result via python3
 _findings_summary() {
-  python3 -c "
+  "$TIRITH_PYTHON" -c "
 import sys, json
 try:
     v = json.loads(sys.stdin.read())
@@ -129,7 +130,7 @@ elif [ "$RC" -eq 2 ]; then
     # Warn-allow: emit allow with additionalContext so findings reach the model
     _tirith_hook_event warn_allowed
     REASON=$(_findings_summary)
-    ALLOW_JSON=$(python3 -c "
+    ALLOW_JSON=$("$TIRITH_PYTHON" -c "
 import sys, json
 msg = sys.argv[1]
 print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow', 'permissionDecisionReason': msg, 'additionalContext': msg}}))

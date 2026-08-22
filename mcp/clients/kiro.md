@@ -48,8 +48,9 @@ Kiro workspace rooted at the current directory").
 
 **Tradeoff for project scope: machine-specific paths.** Kiro does not
 document hook-command path resolution relative to the agent JSON file, so
-tirith uses an absolute `python3 /abs/path/.kiro/hooks/kiro-hook.py` in
-both scopes. For project scope this means `.kiro/agents/tirith-security.json`
+tirith uses an absolute interpreter and hook path
+(`/abs/path/to/python3 /abs/path/.kiro/hooks/kiro-hook.py`) in both scopes.
+For project scope this means `.kiro/agents/tirith-security.json`
 is local-only state:
 
 - Add `.kiro/agents/tirith-security.json` and `.kiro/hooks/kiro-hook.py`
@@ -84,7 +85,7 @@ Kiro hooks are scoped to the agent that loads them. Tirith's
        "preToolUse": [
          {
            "matcher": "execute_bash",
-           "command": "python3 /absolute/path/to/kiro-hook.py"
+           "command": "/absolute/path/to/python3 /absolute/path/to/kiro-hook.py"
          }
        ]
      }
@@ -190,6 +191,8 @@ passes it to `tirith check --json`, and:
   `.kiro/agents/tirith-security.json` under whichever directory `doctor`
   was invoked from. For predictable user-scope setup, run
   `tirith setup kiro --scope user` directly.
-- The hook requires `python3` on PATH.
+- Setup validates Python once and records its absolute path. Re-run setup if
+  that interpreter moves; Kiro does not resolve `python3` from its runtime
+  PATH.
 - Telemetry events are logged via `tirith hook-event` (fire-and-forget,
   non-blocking).

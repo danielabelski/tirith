@@ -501,10 +501,20 @@ fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
                 && !content.contains("\"__TIRITH_INTEGRATION__\"")
         }
         "cline" => {
+            let pinned_python = content.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("$pythonPath = '")
+                    .and_then(|value| value.strip_suffix('\''))
+                    .map(|value| value.replace("''", "'"))
+            });
             content.contains("TIRITH_HOOK_PROTOCOL = 'cline'")
                 && content.contains("tirith-check.py")
                 && !content.contains("__TIRITH_BIN__")
+                && !content.contains("__PYTHON_BIN__")
                 && !content.contains("__ADAPTER_PATH__")
+                && pinned_python
+                    .as_deref()
+                    .is_some_and(|python| std::path::Path::new(python).is_absolute())
         }
         "grok-build" => serde_json::from_str::<serde_json::Value>(&content)
             .ok()
@@ -521,15 +531,32 @@ fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
 }
 
 #[cfg(unix)]
-fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
+fn posix_wrapper_execs_pinned_python(path: &std::path::Path, protocol: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
+    let executable = std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
-    let executable = || {
-        std::fs::metadata(path)
-            .map(|meta| meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+    let pinned_exec = content.lines().any(|line| {
+        let Some(command) = line.trim_start().strip_prefix("exec ") else {
+            return false;
+        };
+        (command.starts_with('/') || command.starts_with("'/"))
+            && command.contains("tirith-check.py")
+    });
+    executable
+        && pinned_exec
+        && content.contains("TIRITH_HOOK_PROTOCOL=")
+        && content.contains(protocol)
+        && !content.contains("__TIRITH_PYTHON__")
+}
+
+#[cfg(unix)]
+fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
     };
     match name {
         // The shared Pi-family guard: a rendered copy names its host and its
@@ -542,7 +569,7 @@ fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
         }
         // Cline runs the file directly, so it must be executable and must exec
         // the adapter it was installed beside.
-        "cline" => executable() && content.contains("tirith-check.py") && content.contains("cline"),
+        "cline" => posix_wrapper_execs_pinned_python(path, "cline"),
         // Grok's hook config must select the Grok wire protocol.
         "grok-build" => serde_json::from_str::<serde_json::Value>(&content)
             .ok()
@@ -579,11 +606,10 @@ fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
                                     // The command is a single-quoted path; unquote it.
                                     let unquoted =
                                         cmd.trim().trim_matches('\'').replace("'\\''", "'");
-                                    std::fs::metadata(&unquoted)
-                                        .map(|meta| {
-                                            meta.is_file() && meta.permissions().mode() & 0o111 != 0
-                                        })
-                                        .unwrap_or(false)
+                                    posix_wrapper_execs_pinned_python(
+                                        std::path::Path::new(&unquoted),
+                                        "openhands",
+                                    )
                                 })
                                 .unwrap_or(false)
                         })
@@ -2936,7 +2962,7 @@ mod tests {
             let cline_wrapper = cline_hook_artifact(home);
             write_executable(
                 &cline_wrapper,
-                "#!/bin/sh\nTIRITH_HOOK_PROTOCOL=cline exec python3 /x/tirith-check.py\n",
+                "#!/bin/sh\nTIRITH_HOOK_PROTOCOL=cline\nexec /usr/bin/python3 /x/tirith-check.py\n",
             );
 
             let tools = detect_ai_tools_with(home, Some(cwd));
@@ -2992,7 +3018,10 @@ mod tests {
             let _work_dir = EnvGuard::remove("OPENHANDS_WORK_DIR");
             let install = |root: &std::path::Path| {
                 let wrapper = root.join(".openhands/hooks/tirith-pre-tool-use");
-                write_executable(&wrapper, "#!/bin/sh\nexec python3 tirith-check.py\n");
+                write_executable(
+                    &wrapper,
+                    "#!/bin/sh\nTIRITH_HOOK_PROTOCOL=openhands\nexec /usr/bin/python3 /x/tirith-check.py\n",
+                );
                 let quoted = format!("'{}'", wrapper.display());
                 std::fs::write(
                     root.join(".openhands/hooks.json"),

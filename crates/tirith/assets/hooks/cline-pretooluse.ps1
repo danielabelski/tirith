@@ -16,17 +16,16 @@ $env:TIRITH_HOOK_PROTOCOL = 'cline'
 # Read the whole event before spawning, so a closed stdin cannot deadlock.
 $raw = [Console]::In.ReadToEnd()
 
-$python = Get-Command python3 -ErrorAction SilentlyContinue
-if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
-if (-not $python) {
+$pythonPath = '__PYTHON_BIN__'
+if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
     # No interpreter to run the adapter. Cline runs the tool when a hook fails,
     # so a fail-open opt-out is honoured; otherwise cancel, matching the adapter.
     if ($env:TIRITH_FAIL_OPEN -eq '1') { Write-Output '{"cancel":false}'; exit 0 }
-    Write-Output '{"cancel":true,"errorMessage":"tirith: python3 not found on PATH; install Python or set TIRITH_FAIL_OPEN=1"}'
+    Write-Output '{"cancel":true,"errorMessage":"tirith: configured Python interpreter is unavailable; re-run setup or set TIRITH_FAIL_OPEN=1"}'
     exit 0
 }
 
-$decision = $raw | & $python.Source '__ADAPTER_PATH__'
+$decision = $raw | & $pythonPath '__ADAPTER_PATH__'
 $code = $LASTEXITCODE
 
 if (($code -ne 0) -and (-not $decision)) {

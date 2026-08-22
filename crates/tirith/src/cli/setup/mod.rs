@@ -144,6 +144,9 @@ mod run_impl {
         /// preferably its stable package-manager alias, otherwise its canonical
         /// target. Setup never persists a bare command name.
         pub tirith_bin: String,
+        /// Validated absolute Python invocation persisted by Python-backed
+        /// hooks. A repository-prepended PATH must never choose this value.
+        pub python_bin: Option<String>,
         /// When true, only refresh embedded hook scripts and gateway config.
         /// Skips MCP registration, shell profile installation, and zshenv setup.
         pub update_configs: bool,
@@ -206,16 +209,18 @@ mod run_impl {
 
         let tirith_bin = resolve_tirith_bin(dry_run)?;
 
-        // Hosts whose hook is a Python script (directly, or through a generated
-        // wrapper that execs it) need python3 on PATH. MCP-only and native
-        // TypeScript integrations do not.
-        if spec.needs_python {
-            if cfg!(windows) && tool == "cline" {
-                check_any_binary_on_path(&["python3", "python"], "Python", dry_run)?;
+        // Persist the exact validated interpreter, never a bare `python3` that
+        // the agent would resolve later from a repository-controlled PATH.
+        let python_bin = if spec.needs_python {
+            let names: &[&str] = if cfg!(windows) && tool == "cline" {
+                &["python3", "python"]
             } else {
-                check_binary_on_path("python3", dry_run)?;
-            }
-        }
+                &["python3"]
+            };
+            resolve_hook_dependency(names, "Python", dry_run)?
+        } else {
+            None
+        };
 
         if install_zshenv && !spec.shell_guard {
             return Err(format!(
@@ -241,6 +246,7 @@ mod run_impl {
             dry_run,
             force: effective_force,
             tirith_bin,
+            python_bin,
             update_configs,
         };
 
@@ -453,13 +459,33 @@ mod run_impl {
         }
     }
 
-    fn check_any_binary_on_path(names: &[&str], label: &str, dry_run: bool) -> Result<(), String> {
-        if names.iter().any(|name| is_on_path(name)) {
-            return Ok(());
+    /// Resolve a dependency that generated security configuration will execute
+    /// later. The first PATH hit is authoritative: a project/temp shadow is an
+    /// error, not a reason to skip ahead to a more convenient interpreter.
+    fn resolve_hook_dependency(
+        names: &[&str],
+        label: &str,
+        dry_run: bool,
+    ) -> Result<Option<String>, String> {
+        for name in names {
+            match tirith_core::trusted_child::resolve_ambient(name) {
+                Ok(executable) => {
+                    executable.revalidate().map_err(|error| {
+                        format!("validated {label} executable changed during setup: {error}")
+                    })?;
+                    return path_to_utf8(executable.invocation_path(), label).map(Some);
+                }
+                Err(tirith_core::trusted_child::TrustedExecutableError::NotFound(_)) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "refusing untrusted {label} executable selected from PATH: {error}"
+                    ));
+                }
+            }
         }
         if dry_run {
             eprintln!("tirith: WARNING: {label} not found on PATH");
-            Ok(())
+            Ok(None)
         } else {
             Err(format!("{label} is required — install {label} and retry"))
         }
@@ -848,6 +874,32 @@ mod run_impl {
             let mut perms = std::fs::metadata(path).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn hook_dependency_refuses_the_first_repository_or_temp_path_hit() {
+            use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+            with_fake_env(true, |_home, cwd| {
+                let cwd = cwd.expect("isolated cwd");
+                let bin = cwd.join("bin");
+                let marker = cwd.join("python-was-executed");
+                let fake = bin.join("python3");
+                write_executable(&fake, &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
+                let _path = EnvGuard::set("PATH", &bin);
+
+                let error = resolve_hook_dependency(&["python3"], "Python", false)
+                    .expect_err("a repository-selected interpreter must fail closed");
+                assert!(
+                    error.contains("refusing untrusted Python executable"),
+                    "{error}"
+                );
+                assert!(
+                    !marker.exists(),
+                    "dependency validation must never execute a PATH shadow"
+                );
+            });
         }
 
         #[cfg(unix)]

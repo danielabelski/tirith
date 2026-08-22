@@ -100,5 +100,7 @@ Expected: blocked by Tirith (exit code 2, reason on stderr).
 
 - Windsurf `pre_run_command` hooks use exit codes: 0 = allow, 2 = block.
 - The hook reads `tool_info.command_line` from stdin JSON.
+- Setup pins the validated absolute Python interpreter used by the generated
+  command hook. Re-run setup if that interpreter moves.
 - The gateway forwards all non-matched tool calls transparently.
 - Batch JSON-RPC arrays are denied in Phase 1 (fail-closed).

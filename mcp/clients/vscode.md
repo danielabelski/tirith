@@ -145,6 +145,8 @@ Expected: blocked by Tirith.
 - Tool names depend on the specific MCP extension in use. Update
   `guarded_tools` patterns in `gateway.yaml` to match your setup.
 - The gateway forwards all non-matched tool calls transparently.
+- Setup pins the validated absolute Python interpreter used by the generated
+  command hook. Re-run setup if that interpreter moves.
 - The zshenv guard applies to all non-interactive `zsh -lc` runs.
   `TIRITH_ZSHENV_SKIP=1` disables it; `VSCODE_RESOLVING_ENVIRONMENT`
   (set by VS Code during shell env probing) skips the scan so the IDE
