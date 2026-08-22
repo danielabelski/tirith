@@ -266,6 +266,15 @@ assert.equal(buildCheckScript("ipython", { code: "x = 1 + 1" }), null, "no vecto
 // ---------------------------------------------------------------------------
 // The handler itself, driven against a fake `tirith` that reads its stdin.
 // ---------------------------------------------------------------------------
+// The fake `tirith` below is a `#!/bin/sh` script, which Windows cannot
+// execute directly, and Node refuses to spawn a `.cmd` without a shell. The
+// handler's plumbing is platform-neutral JavaScript and is exercised on the
+// POSIX runners; here the extractor contract above is the whole test.
+if (process.platform === "win32") {
+  console.log("IPython vector extraction: extractor contract passed (handler run skipped on Windows)");
+  process.exit(0);
+}
+
 const scratch = await mkdtemp(join(tmpdir(), "tirith-guard-"));
 try {
   const fake = join(scratch, "tirith");

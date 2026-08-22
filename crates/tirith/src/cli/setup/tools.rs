@@ -5775,7 +5775,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             setup_cline(&mcp_opts(Scope::User)).unwrap();
 
-            let hooks = home.join("Documents/Cline/Hooks");
+            // Resolved the way Cline resolves it: on a Linux box with no
+            // user-dirs config, `xdg-user-dir DOCUMENTS` answers $HOME itself.
+            let hooks = cline_hooks_dir(home);
             let wrapper = hooks.join("PreToolUse");
             let script = hooks.join("tirith-check.py");
             let body = std::fs::read_to_string(&wrapper).expect("PreToolUse must be installed");
@@ -5833,7 +5835,7 @@ mod tests {
             opts.tirith_bin = fake.to_str().unwrap().to_string();
             setup_cline(&opts).unwrap();
 
-            let wrapper = home.join("Documents/Cline/Hooks/PreToolUse");
+            let wrapper = cline_hooks_dir(home).join("PreToolUse");
             let mut child = Command::new(&wrapper)
                 // The adapter is fail-closed by default; an ambient opt-out in
                 // the developer's shell must not decide this test.
