@@ -713,14 +713,6 @@ _tirith_disable_owned_extdebug() {
   return 0
 }
 
-# Idempotent DEBUG-trap installer. Chains through any pre-existing user DEBUG
-# trap via a trampoline so warn-only + enforcement do not clobber the user's
-# own instrumentation. Second and later calls are no-ops.
-#
-# We capture the caller's line number (BASH_LINENO[0] here, since the
-# trampoline IS the topmost function called from the trap) and pass it
-# explicitly to _tirith_preexec — otherwise preexec would see only its own
-# call frame's line, not the user-typed line.
 # Run the captured user DEBUG handler in its own frame. A DEBUG trap body is
 # ordinarily evaluated at the top level, where `return` is a no-op, so real
 # handlers use it freely as an early exit — `bash-preexec.sh` (oh-my-bash,
@@ -733,6 +725,14 @@ _tirith_run_chained_debug_trap() {
   builtin eval -- "$_TIRITH_PREV_DEBUG_TRAP"
 }
 
+# Idempotent DEBUG-trap installer. Chains through any pre-existing user DEBUG
+# trap via a trampoline so warn-only + enforcement do not clobber the user's
+# own instrumentation. Second and later calls are no-ops.
+#
+# We capture the caller's line number (BASH_LINENO[0] here, since the
+# trampoline IS the topmost function called from the trap) and pass it
+# explicitly to _tirith_preexec — otherwise preexec would see only its own
+# call frame's line, not the user-typed line.
 _tirith_debug_trampoline() {
   # Pin the command before chaining a user DEBUG trap: that trap may run
   # arbitrary shell code and change the live BASH_COMMAND value before Tirith
