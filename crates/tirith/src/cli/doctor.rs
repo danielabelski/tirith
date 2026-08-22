@@ -368,6 +368,52 @@ fn detect_ai_tools_with(
         });
     }
 
+    // Hosts where setup installs a Tirith-owned BLOCKING hook. Detect the hook
+    // artifact rather than the host directory, so `configured_scope` means what
+    // it means for copilot-cli and kiro above: Tirith is actually wired in, not
+    // merely that the tool is present. Default paths only, matching the rest of
+    // this function; a host relocated with an environment override is reported
+    // by its own setup command instead of guessed at here.
+    let hook_repo_root = tirith_core::policy::find_repo_root(None);
+    // (name, path under HOME, path under the repository root). A host that can
+    // be configured at either scope reports ONE row, project first, the same
+    // precedence kiro uses below.
+    for (name, user_relative, project_relative) in [
+        ("pi-cli", Some(".pi/agent/extensions/tirith-guard.ts"), None),
+        (
+            "prime-agent",
+            Some(".prime/agent/extensions/tirith-guard.ts"),
+            None,
+        ),
+        ("omp", Some(".omp/hooks/pre/tirith-guard.ts"), None),
+        ("cline", Some("Documents/Cline/Hooks/PreToolUse"), None),
+        (
+            "grok-build",
+            Some(".grok/hooks/tirith.json"),
+            Some(".grok/hooks/tirith.json"),
+        ),
+        ("openhands", None, Some(".openhands/hooks.json")),
+    ] {
+        let in_project = project_relative.is_some_and(|relative| {
+            hook_repo_root
+                .as_ref()
+                .is_some_and(|root| root.join(relative).exists())
+        });
+        if in_project {
+            tools.push(DetectedTool {
+                name,
+                configured_scope: Some("project"),
+            });
+            continue;
+        }
+        if user_relative.is_some_and(|relative| home.join(relative).exists()) {
+            tools.push(DetectedTool {
+                name,
+                configured_scope: Some("user"),
+            });
+        }
+    }
+
     // Kiro: precedence-ordered, single winner.
     //   1. project configured
     //   2. user configured
@@ -2676,7 +2722,7 @@ fn reset_safe_mode() -> i32 {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::cli::test_harness::{with_fake_env, EnvGuard, ENV_LOCK};
+    use crate::cli::test_harness::{with_fake_env, CwdGuard, EnvGuard, ENV_LOCK};
 
     fn first_kiro(tools: &[DetectedTool]) -> Option<&DetectedTool> {
         tools.iter().find(|t| t.name == "kiro")
@@ -2712,6 +2758,82 @@ mod tests {
             "helper must not emit a hard-coded 'doctor:' prefix, got: {onboard_msg}"
         );
         assert!(onboard_msg.contains("cannot read profile /tmp/.zshrc: denied"));
+    }
+
+    #[test]
+    fn detect_ai_tools_reports_installed_blocking_hooks() {
+        // `configured_scope: Some(..)` means Tirith is actually wired in, not
+        // merely that the host is present, so these detect the Tirith-owned
+        // hook artifact rather than the host's config directory.
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            for relative in [
+                ".pi/agent/extensions/tirith-guard.ts",
+                ".prime/agent/extensions/tirith-guard.ts",
+                ".omp/hooks/pre/tirith-guard.ts",
+                "Documents/Cline/Hooks/PreToolUse",
+            ] {
+                let path = home.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "x").unwrap();
+            }
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            for name in ["pi-cli", "prime-agent", "omp", "cline"] {
+                let found = tools
+                    .iter()
+                    .find(|t| t.name == name)
+                    .unwrap_or_else(|| panic!("{name} hook not detected"));
+                assert_eq!(found.configured_scope, Some("user"), "{name}");
+                assert_eq!(count_named(&tools, name), 1, "{name} must appear once");
+            }
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_reports_openhands_project_hook() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            std::fs::create_dir_all(cwd.join(".openhands")).unwrap();
+            std::fs::write(cwd.join(".openhands/hooks.json"), "{}").unwrap();
+            let _cwd = CwdGuard::set(cwd);
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let found = tools
+                .iter()
+                .find(|t| t.name == "openhands")
+                .expect("openhands hook not detected");
+            assert_eq!(found.configured_scope, Some("project"));
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_prefers_the_project_grok_hook_and_never_doubles_it() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            for base in [home.to_path_buf(), cwd.to_path_buf()] {
+                std::fs::create_dir_all(base.join(".grok/hooks")).unwrap();
+                std::fs::write(base.join(".grok/hooks/tirith.json"), "{}").unwrap();
+            }
+            let _cwd = CwdGuard::set(cwd);
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            assert_eq!(
+                count_named(&tools, "grok-build"),
+                1,
+                "a host configured at both scopes must still report one row"
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .find(|t| t.name == "grok-build")
+                    .unwrap()
+                    .configured_scope,
+                Some("project")
+            );
+        });
     }
 
     #[test]
