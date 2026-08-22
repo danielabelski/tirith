@@ -8,7 +8,8 @@ decision envelope, and exit-code contract:
 
   claude-code (default) — PreToolUse/Bash, {"hookSpecificOutput": {...}}, exit 0
   grok-build            — pre_tool_use/run_terminal_command, {"decision": ...}
-  cline                 — PreToolUse/execute_command, {"cancel": bool, ...}
+  cline                 — PreToolUse/execute_command or run_commands,
+                          {"cancel": bool, ...}
   openhands             — pre_tool_use/terminal, {"decision": ...} and exit 2
                           on deny, because OpenHands treats any exit code other
                           than 0 or 2 as an error and lets the tool proceed.
@@ -35,9 +36,18 @@ Environment:
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import time
+
+
+MAX_HOOK_INPUT_BYTES = 2 * 1024 * 1024
+MAX_COMMANDS = 16
+MAX_COMMAND_BYTES = 1024 * 1024
+MAX_ANALYSES = 48
+CHECK_BUDGET_SECONDS = 10.0
 
 
 def get(data, *keys):
@@ -165,9 +175,138 @@ def _build_warning_text(stdout):
     return text
 
 
+def _json_object(value, label):
+    """Accept a native object or the JSON-stringified object Cline emits."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{label} is not valid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def _shells_for_hint(hint):
+    """Map a host shell hint, or conservatively cover plausible Cline shells."""
+    if hint is None or hint == "":
+        # Cline does not consistently include the terminal profile in hook
+        # payloads. Scan more than one grammar so PowerShell syntax cannot be
+        # treated as a clean POSIX command (or vice versa).
+        if os.name == "nt":
+            return ["powershell", "cmd", "posix"]
+        return ["posix", "powershell"]
+    if not isinstance(hint, str):
+        raise ValueError("shell hint must be a string")
+    normalized = hint.strip().lower()
+    aliases = {
+        "sh": "posix",
+        "bash": "posix",
+        "zsh": "posix",
+        "posix": "posix",
+        "fish": "fish",
+        "powershell": "powershell",
+        "pwsh": "powershell",
+        "cmd": "cmd",
+        "cmd.exe": "cmd",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"unsupported shell hint: {hint}")
+    return [aliases[normalized]]
+
+
+def _command_for_shell(command, args, shell):
+    if args is None:
+        return command
+    argv = [command] + args
+    if shell in ("posix", "fish"):
+        return shlex.join(argv)
+    if shell == "powershell":
+        return " ".join("'" + value.replace("'", "''") + "'" for value in argv)
+    return subprocess.list2cmdline(argv)
+
+
+def _cline_commands(pre):
+    """Return (command, argv, shell-list) entries for both Cline generations."""
+    tool = get(pre, "toolName", "tool")
+    parameters = _json_object(get(pre, "parameters") or {}, "Cline parameters")
+    parameter_hint = get(parameters, "shell", "shellType", "shell_type")
+
+    if tool == "execute_command":
+        command = parameters.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("execute_command.command must be a non-empty string")
+        entries = [(command, None, _shells_for_hint(parameter_hint))]
+    elif tool == "run_commands":
+        commands = parameters.get("commands")
+        if isinstance(commands, str):
+            try:
+                commands = json.loads(commands)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"run_commands.commands is not valid JSON: {error}") from error
+        if not isinstance(commands, list) or not commands:
+            raise ValueError("run_commands.commands must be a non-empty array")
+        if len(commands) > MAX_COMMANDS:
+            raise ValueError(f"run_commands.commands exceeds the {MAX_COMMANDS}-command limit")
+        entries = []
+        for index, item in enumerate(commands):
+            item_hint = parameter_hint
+            args = None
+            if isinstance(item, str):
+                command = item
+            elif isinstance(item, dict):
+                command = item.get("command")
+                item_hint = get(item, "shell", "shellType", "shell_type") or parameter_hint
+                args = item.get("args")
+                if args is not None and (
+                    not isinstance(args, list)
+                    or not all(isinstance(arg, str) for arg in args)
+                ):
+                    raise ValueError(f"run_commands.commands[{index}].args must be strings")
+            else:
+                raise ValueError(f"run_commands.commands[{index}] has an invalid shape")
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError(f"run_commands.commands[{index}].command is empty")
+            entries.append((command, args, _shells_for_hint(item_hint)))
+    else:
+        return tool, []
+
+    analyses = sum(len(shells) for _, _, shells in entries)
+    if analyses > MAX_ANALYSES:
+        raise ValueError(f"Cline command batch exceeds the {MAX_ANALYSES}-analysis limit")
+    for command, args, shells in entries:
+        for shell in shells:
+            rendered = _command_for_shell(command, args, shell)
+            if len(rendered.encode("utf-8")) > MAX_COMMAND_BYTES:
+                raise ValueError("Cline command exceeds the analysis size limit")
+    return tool, entries
+
+
+def _run_check(tirith_bin, command, shell, env, timeout):
+    return subprocess.run(
+        [
+            tirith_bin,
+            "check",
+            "--json",
+            "--non-interactive",
+            "--shell",
+            shell,
+            "--",
+            command,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
 def main():
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.read(MAX_HOOK_INPUT_BYTES + 1)
+        if len(raw.encode("utf-8")) > MAX_HOOK_INPUT_BYTES:
+            fail_closed("tirith: hook input exceeds the safety limit")
+            return
         if not raw.strip():
             # Empty input — cannot determine command, fail-closed
             fail_closed("tirith: empty hook input — blocked for safety")
@@ -189,14 +328,20 @@ def main():
     tool_input = get(data, "tool_input", "toolInput") or {}
 
     if proto == "cline":
-        # Cline nests the tool under `preToolUse` and names the shell tool
-        # `execute_command`, with the command in `parameters`.
+        # Cline nests the tool under `preToolUse`. Older releases used
+        # execute_command; current releases batch shell work in run_commands.
         event = get(data, "hookName") or event
         pre = get(data, "preToolUse") or {}
-        if isinstance(pre, dict):
-            tool = get(pre, "toolName") or tool
-            tool_input = get(pre, "parameters") or {}
-        is_shell_pretool = event == "PreToolUse" and tool == "execute_command"
+        try:
+            pre = _json_object(pre, "Cline preToolUse")
+            tool, cline_commands = _cline_commands(pre)
+        except ValueError as error:
+            fail_closed(f"tirith: malformed Cline command payload — {error}")
+            return
+        is_shell_pretool = event == "PreToolUse" and tool in (
+            "execute_command",
+            "run_commands",
+        )
     elif proto == "openhands":
         # OpenHands serializes its pydantic `HookEvent` to stdin, whose event
         # field is `event_type` with the CamelCase value `PreToolUse`. The
@@ -218,16 +363,24 @@ def main():
     else:
         is_shell_pretool = event == "PreToolUse" and tool == "Bash"
     if not is_shell_pretool:
+        if proto == "cline":
+            # Cline parses stdout for every hook invocation; a silent success
+            # is reported as a hook error even for tools Tirith does not guard.
+            decision("allow")
         sys.exit(0)
 
     if not isinstance(tool_input, dict):
         fail_closed("tirith: invalid tool_input format — blocked for safety")
         return
 
-    command = tool_input.get("command")
-    if not isinstance(command, str) or not command.strip():
-        fail_closed("tirith: no command found in hook input — blocked for safety")
-        return
+    if proto == "cline":
+        command_specs = cline_commands
+    else:
+        command = tool_input.get("command")
+        if not isinstance(command, str) or not command.strip():
+            fail_closed("tirith: no command found in hook input — blocked for safety")
+            return
+        command_specs = [(command, None, ["posix"])]
 
     # Locate tirith binary
     tirith_bin = os.environ.get("TIRITH_BIN") or shutil.which("tirith") or "tirith"
@@ -235,75 +388,70 @@ def main():
     env = os.environ.copy()
     env["TIRITH_INTEGRATION"] = proto
 
-    try:
-        result = subprocess.run(
-            [
-                tirith_bin,
-                "check",
-                "--json",
-                "--non-interactive",
-                "--shell",
-                "posix",
-                "--",
-                command,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=env,
-        )
-    except FileNotFoundError:
-        fail_closed(f"tirith: {tirith_bin} not found — install tirith or set TIRITH_FAIL_OPEN=1")
-        return
-    except subprocess.TimeoutExpired:
-        _hook_event("timeout")
-        fail_closed("tirith: check timed out — blocked for safety")
-        return
-    except OSError as e:
-        _hook_event("unexpected_exit", str(e))
-        fail_closed(f"tirith: OS error running check — {e}")
-        return
+    deadline = time.monotonic() + CHECK_BUDGET_SECONDS
+    warning_texts = []
+    for command, args, shells in command_specs:
+        for shell in shells:
+            rendered = _command_for_shell(command, args, shell)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _hook_event("timeout")
+                fail_closed("tirith: command batch exceeded the check budget")
+                return
+            try:
+                result = _run_check(tirith_bin, rendered, shell, env, remaining)
+            except FileNotFoundError:
+                fail_closed(
+                    f"tirith: {tirith_bin} not found — install tirith or set TIRITH_FAIL_OPEN=1"
+                )
+                return
+            except subprocess.TimeoutExpired:
+                _hook_event("timeout")
+                fail_closed("tirith: check timed out — blocked for safety")
+                return
+            except OSError as error:
+                _hook_event("unexpected_exit", str(error))
+                fail_closed(f"tirith: OS error running check — {error}")
+                return
 
-    # Unexpected exit code — fail-closed
-    if result.returncode not in (0, 1, 2):
-        _hook_event("unexpected_exit", f"exit code {result.returncode}")
-        fail_closed(f"tirith: unexpected exit code {result.returncode} — blocked for safety")
-        return
-    if result.returncode != 0 and not result.stdout.strip():
-        _hook_event("unexpected_exit", f"exit code {result.returncode} with no output")
-        fail_closed("tirith: check returned non-zero with no output — blocked for safety")
-        return
+            if result.returncode not in (0, 1, 2):
+                _hook_event("unexpected_exit", f"exit code {result.returncode}")
+                fail_closed(
+                    f"tirith: unexpected exit code {result.returncode} — blocked for safety"
+                )
+                return
+            if result.returncode != 0 and not result.stdout.strip():
+                _hook_event(
+                    "unexpected_exit", f"exit code {result.returncode} with no output"
+                )
+                fail_closed("tirith: check returned non-zero with no output — blocked for safety")
+                return
+            if result.returncode == 1:
+                _hook_event("check_block")
+                deny(_build_warning_text(result.stdout))
+            if result.returncode == 2:
+                warning_texts.append(_build_warning_text(result.stdout))
 
-    # Exit 0 = clean, allow. Cline reads a decision object from stdout and logs
-    # an error on empty output, so it gets an explicit allow; every other host
-    # treats a silent exit 0 as allow.
-    if result.returncode == 0:
+    if not warning_texts:
         _hook_event("check_ok")
         if proto == "cline":
             print(json.dumps({"cancel": False}))
         sys.exit(0)
 
     # Exit 2 = warn — check TIRITH_HOOK_WARN_ACTION
-    if result.returncode == 2:
-        warn_action = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
-        if warn_action not in ("allow", "deny"):
-            print(
-                f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{warn_action}', defaulting to 'allow'",
-                file=sys.stderr,
-            )
-            warn_action = "allow"
-        if warn_action != "deny":
-            _hook_event("warn_allowed")
-            warning_text = _build_warning_text(result.stdout)
-            decision("allow", warning_text)
-
-    # Exit 1 = block, Exit 2 + deny = block
-    if result.returncode == 1:
-        _hook_event("check_block")
-    else:
-        _hook_event("warn_denied")
-    reason = _build_warning_text(result.stdout)
-    deny(reason)
+    warn_action = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
+    if warn_action not in ("allow", "deny"):
+        print(
+            f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{warn_action}', defaulting to 'allow'",
+            file=sys.stderr,
+        )
+        warn_action = "allow"
+    warning_text = "; ".join(dict.fromkeys(warning_texts))[:2000]
+    if warn_action != "deny":
+        _hook_event("warn_allowed")
+        decision("allow", warning_text)
+    _hook_event("warn_denied")
+    deny(warning_text)
 
 
 if __name__ == "__main__":

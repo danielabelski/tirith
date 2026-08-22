@@ -6274,6 +6274,130 @@ mod tests {
             .contains("Shortened URL"));
     }
 
+    #[cfg(unix)]
+    fn run_cline_adapter(root: &Path, fake: &Path, payload: &Value) -> Value {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let adapter = root.join("tirith-check.py");
+        std::fs::write(&adapter, crate::assets::TIRITH_CHECK_PY).unwrap();
+        let mut child = Command::new("python3")
+            .arg(&adapter)
+            .env("TIRITH_BIN", fake)
+            .env("TIRITH_HOOK_PROTOCOL", "cline")
+            .env_remove("TIRITH_FAIL_OPEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "Cline consumes stdout at exit 0");
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "Cline adapter returned invalid JSON ({error}): stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cline_run_commands_checks_every_stringified_command_and_shell_dialect() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let fake = root.path().join("fake-tirith");
+        let log = root.path().join("calls.log");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *BLOCK_SECOND*) printf '%s\\n' '{{\"findings\":[{{\"title\":\"blocked second command\",\"severity\":\"High\"}}]}}'; exit 1 ;; esac\ncase \"$*\" in *--shell\\ powershell*POWERSHELL_ONLY*) printf '%s\\n' '{{\"findings\":[{{\"title\":\"blocked PowerShell\",\"severity\":\"High\"}}]}}'; exit 1 ;; esac\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let commands = serde_json::to_string(&vec!["echo safe", "echo BLOCK_SECOND"]).unwrap();
+        let blocked = run_cline_adapter(
+            root.path(),
+            &fake,
+            &json!({
+                "hookName": "PreToolUse",
+                "preToolUse": {"tool": "run_commands", "parameters": {"commands": commands}}
+            }),
+        );
+        assert_eq!(blocked["cancel"], true);
+        assert!(blocked["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("blocked second command"));
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("echo safe"),
+            "first command was skipped: {calls}"
+        );
+        assert!(
+            calls.contains("BLOCK_SECOND"),
+            "later command was skipped: {calls}"
+        );
+
+        std::fs::write(&log, "").unwrap();
+        let powershell = run_cline_adapter(
+            root.path(),
+            &fake,
+            &json!({
+                "hookName": "PreToolUse",
+                "preToolUse": {
+                    "toolName": "run_commands",
+                    "parameters": {"commands": ["$env:TOKEN='x'; echo POWERSHELL_ONLY"]}
+                }
+            }),
+        );
+        assert_eq!(
+            powershell["cancel"], true,
+            "a command dangerous only under PowerShell must still be blocked"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("--shell powershell"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cline_malformed_batches_fail_closed_and_non_shell_tools_explicitly_allow() {
+        let root = tempfile::tempdir().unwrap();
+        let nonexistent = root.path().join("must-not-run");
+        let malformed = run_cline_adapter(
+            root.path(),
+            &nonexistent,
+            &json!({
+                "hookName": "PreToolUse",
+                "preToolUse": {"tool": "run_commands", "parameters": {"commands": "not json"}}
+            }),
+        );
+        assert_eq!(malformed["cancel"], true);
+        assert!(malformed["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("malformed Cline command payload"));
+
+        let unrelated = run_cline_adapter(
+            root.path(),
+            &nonexistent,
+            &json!({
+                "hookName": "PreToolUse",
+                "preToolUse": {"tool": "read_file", "parameters": {"path": "README.md"}}
+            }),
+        );
+        assert_eq!(unrelated, json!({"cancel": false}));
+    }
+
     #[test]
     fn cline_powershell_hook_renders_without_placeholders_and_quotes_paths() {
         let rendered = render_cline_powershell_hook(
