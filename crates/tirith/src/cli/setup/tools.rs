@@ -2491,6 +2491,60 @@ fn install_wrapped_pre_tool_use_hook(
     Ok((wrapper_path, script_path))
 }
 
+#[cfg(any(windows, test))]
+fn render_cline_powershell_hook(tirith_bin: &str, adapter_path: &str) -> String {
+    // PowerShell single-quoted literals escape an apostrophe by doubling it.
+    // Do not use an interpolated string here: both paths are setup-controlled
+    // identities and must reach PowerShell byte-for-byte.
+    let quote = |value: &str| value.replace('\'', "''");
+    crate::assets::CLINE_PRETOOLUSE_PS1
+        .replace("__TIRITH_BIN__", &quote(tirith_bin))
+        .replace("__ADAPTER_PATH__", &quote(adapter_path))
+}
+
+/// Install the Windows counterpart to the POSIX Cline wrapper. Cline itself
+/// invokes `PreToolUse.ps1` through PowerShell, so no executable bit or shim is
+/// required; the shared adapter is installed first because Cline proceeds when
+/// a hook process fails to start.
+#[cfg(windows)]
+fn install_cline_powershell_hook(
+    hooks_dir: &Path,
+    scope_root: &Path,
+    tirith_bin: &str,
+    opts: &SetupOpts,
+) -> Result<(PathBuf, PathBuf), String> {
+    let adapter_path = hooks_dir.join("tirith-check.py");
+    let hook_path = hooks_dir.join("PreToolUse.ps1");
+    let adapter_text = path_to_utf8(&adapter_path, "Cline hook adapter")?;
+    let hook = render_cline_powershell_hook(tirith_bin, &adapter_text);
+    fs_helpers::write_hook_script(
+        &adapter_path,
+        scope_root,
+        crate::assets::TIRITH_CHECK_PY,
+        opts.force,
+        opts.dry_run,
+    )?;
+    fs_helpers::write_hook_script(&hook_path, scope_root, &hook, opts.force, opts.dry_run)?;
+    Ok((hook_path, adapter_path))
+}
+
+#[cfg(all(windows, not(test)))]
+fn windows_documents_dir() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+
+    // SAFETY: FOLDERID_Documents is a valid known-folder GUID and None selects
+    // the current user's token. Windows returns one COM-allocated wide string.
+    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_Documents, KF_FLAG_DEFAULT, None) }.ok()?;
+    // SAFETY: a successful call returns a valid NUL-terminated allocation.
+    let documents = std::ffi::OsString::from_wide(unsafe { raw.as_wide() });
+    // SAFETY: ownership of exactly this allocation was transferred to us.
+    unsafe { CoTaskMemFree(Some(raw.as_ptr().cast())) };
+    let documents = PathBuf::from(documents);
+    documents.is_absolute().then_some(documents)
+}
+
 /// Resolve Cline's global hooks directory the way Cline itself does.
 ///
 /// Cline asks `xdg-user-dir DOCUMENTS` on Linux, the `MyDocuments` special
@@ -2513,6 +2567,10 @@ pub(crate) fn cline_hooks_dir(home: &Path) -> PathBuf {
             }
         }
     }
+    #[cfg(all(windows, not(test)))]
+    if let Some(documents) = windows_documents_dir() {
+        return documents.join("Cline").join("Hooks");
+    }
     home.join("Documents").join("Cline").join("Hooks")
 }
 
@@ -2530,32 +2588,32 @@ pub fn setup_cline(opts: &SetupOpts) -> Result<(), String> {
 
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
 
-    // Cline's global hooks directory, resolved as Cline resolves it. The file
-    // must be named exactly `PreToolUse` with no extension, and be executable.
-    // Cline runs PowerShell hooks on Windows; Tirith does not generate one yet,
-    // so only POSIX hosts receive a hook here. That is a Tirith limitation.
+    // Cline's global hooks directory, resolved as Cline resolves it. POSIX
+    // loads an executable named `PreToolUse`; Windows loads `PreToolUse.ps1`
+    // through PowerShell.
     #[cfg(unix)]
     let cline_hook_paths = {
         let hooks_dir = cline_hooks_dir(&home);
         let scope_root = nearest_existing_ancestor(&hooks_dir)?;
-        Some(install_wrapped_pre_tool_use_hook(
+        install_wrapped_pre_tool_use_hook(
             &hooks_dir,
             &scope_root,
             "PreToolUse",
             "cline",
             tirith_bin,
             opts,
-        )?)
+        )?
     };
-    #[cfg(not(unix))]
-    let cline_hook_paths: Option<(PathBuf, PathBuf)> = None;
+    #[cfg(windows)]
+    let cline_hook_paths = {
+        let hooks_dir = cline_hooks_dir(&home);
+        let scope_root = nearest_existing_ancestor(&hooks_dir)?;
+        install_cline_powershell_hook(&hooks_dir, &scope_root, tirith_bin, opts)?
+    };
 
     if opts.update_configs {
         eprintln!();
-        #[cfg(unix)]
         eprintln!("tirith: Cline hook script and PreToolUse wrapper refreshed");
-        #[cfg(not(unix))]
-        eprintln!("tirith: Cline hooks are not supported on this platform; nothing to refresh");
         return Ok(());
     }
 
@@ -2597,14 +2655,11 @@ pub fn setup_cline(opts: &SetupOpts) -> Result<(), String> {
 
     eprintln!();
     eprintln!("tirith: Cline setup complete");
-    if let Some((wrapper, _script)) = cline_hook_paths.as_ref() {
-        eprintln!("  Hook: {}", wrapper.display());
-        eprintln!(
-            "  Enable hooks in Cline's settings; the hook is inert until you do. Cline runs the tool if a hook fails to start, so keep python3 on PATH."
-        );
-    } else {
-        eprintln!("  This platform received MCP registration only; Cline runs hooks on POSIX and Windows.");
-    }
+    let (wrapper, _script) = &cline_hook_paths;
+    eprintln!("  Hook: {}", wrapper.display());
+    eprintln!(
+        "  Enable hooks in Cline's settings; the hook is inert until you do. Cline runs the tool if a hook fails to start, so keep Python on PATH."
+    );
     eprintln!("  Config: {}", config_path.display());
     eprintln!("  Restart Cline and verify `tirith` in its MCP Servers view.");
     Ok(())
@@ -5810,6 +5865,25 @@ mod tests {
         });
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn cline_installs_the_powershell_hook_and_shared_adapter() {
+        with_fake_env(false, |home, _cwd| {
+            setup_cline(&mcp_opts(Scope::User)).unwrap();
+
+            let hooks = cline_hooks_dir(home);
+            let hook = hooks.join("PreToolUse.ps1");
+            let adapter = hooks.join("tirith-check.py");
+            let body = std::fs::read_to_string(&hook).expect("PowerShell hook must be installed");
+            assert!(adapter.is_file(), "shared adapter must be installed first");
+            assert!(body.contains("$env:TIRITH_HOOK_PROTOCOL = 'cline'"));
+            assert!(body.contains(r"C:\Program Files\Tirith\tirith.exe"));
+            assert!(body.contains(adapter.to_str().unwrap()));
+            assert!(!body.contains("__TIRITH_BIN__"));
+            assert!(!body.contains("__ADAPTER_PATH__"));
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_installed_cline_wrapper_denies_a_blocked_command_end_to_end() {
@@ -6198,17 +6272,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Shortened URL"));
-    }
-
-    /// Render the shipped Cline PowerShell hook with concrete paths, the way
-    /// `install_cline_powershell_hook` does. Kept as a plain helper so the
-    /// rendering is tested on every platform even though the installer that
-    /// writes it is `#[cfg(windows)]`.
-    fn render_cline_powershell_hook(tirith_bin: &str, adapter_path: &str) -> String {
-        let quote = |value: &str| value.replace('\'', "''");
-        crate::assets::CLINE_PRETOOLUSE_PS1
-            .replace("__TIRITH_BIN__", &quote(tirith_bin))
-            .replace("__ADAPTER_PATH__", &quote(adapter_path))
     }
 
     #[test]

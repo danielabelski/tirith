@@ -63,7 +63,7 @@ mod run_impl {
 
     const HOSTS: &[HostSpec] = &[
         HostSpec { name: "claude-code", scopes: ScopeSupport::Both(Scope::Project), needs_python: true, shell_guard: true, setup: setup_claude_code },
-        HostSpec { name: "cline", scopes: ScopeSupport::UserOnly("Cline's documented MCP registry and global hooks directory are user-global — omit --scope or use --scope user"), needs_python: cfg!(unix), shell_guard: false, setup: setup_cline },
+        HostSpec { name: "cline", scopes: ScopeSupport::UserOnly("Cline's documented MCP registry and global hooks directory are user-global — omit --scope or use --scope user"), needs_python: true, shell_guard: false, setup: setup_cline },
         HostSpec { name: "codex", scopes: ScopeSupport::UserOnly("Codex is always user-global — omit --scope or use --scope user"), needs_python: false, shell_guard: true, setup: setup_codex },
         HostSpec { name: "copilot-cli", scopes: ScopeSupport::ProjectOnly("Copilot CLI loads hooks from the repo root — project-only. Omit --scope or use --scope project"), needs_python: true, shell_guard: true, setup: setup_copilot_cli },
         HostSpec { name: "continue", scopes: ScopeSupport::ProjectOnly("Continue user config is shared YAML; Tirith safely owns only a workspace .continue/mcpServers block — omit --scope or use --scope project"), needs_python: false, shell_guard: false, setup: setup_continue },
@@ -210,7 +210,11 @@ mod run_impl {
         // wrapper that execs it) need python3 on PATH. MCP-only and native
         // TypeScript integrations do not.
         if spec.needs_python {
-            check_binary_on_path("python3", dry_run)?;
+            if cfg!(windows) && tool == "cline" {
+                check_any_binary_on_path(&["python3", "python"], "Python", dry_run)?;
+            } else {
+                check_binary_on_path("python3", dry_run)?;
+            }
         }
 
         if install_zshenv && !spec.shell_guard {
@@ -446,6 +450,18 @@ mod run_impl {
             }
         } else {
             Ok(())
+        }
+    }
+
+    fn check_any_binary_on_path(names: &[&str], label: &str, dry_run: bool) -> Result<(), String> {
+        if names.iter().any(|name| is_on_path(name)) {
+            return Ok(());
+        }
+        if dry_run {
+            eprintln!("tirith: WARNING: {label} not found on PATH");
+            Ok(())
+        } else {
+            Err(format!("{label} is required — install {label} and retry"))
         }
     }
 
@@ -790,7 +806,8 @@ mod run_impl {
         fn wrapper_hosts_require_python() {
             // Cline and OpenHands exec the Python adapter through a wrapper.
             for name in ["cline", "openhands"] {
-                assert_eq!(host_spec(name).unwrap().needs_python, cfg!(unix), "{name}");
+                let expected = name == "cline" || cfg!(unix);
+                assert_eq!(host_spec(name).unwrap().needs_python, expected, "{name}");
             }
         }
 
