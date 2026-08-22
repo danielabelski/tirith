@@ -1534,15 +1534,35 @@ jobs:
           # lands in the process command line.
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
+          # `continue-on-error` keeps a moderation hold from failing a release,
+          # but it also let the v0.3.3 push fail with a 403 that nobody saw: the
+          # step went red inside a green job and the version never reached
+          # Chocolatey. Every outcome here is therefore written to the run
+          # summary and raised as an annotation, so the job page says what
+          # happened without anyone opening a log.
+          $summary = $env:GITHUB_STEP_SUMMARY
           if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
-            Write-Warning "CHOCOLATEY_API_KEY is not configured; skipping push"
+            Write-Output "::warning title=Chocolatey push skipped::CHOCOLATEY_API_KEY is not configured; the release was not pushed to Chocolatey"
+            Add-Content -Path $summary -Value "## Chocolatey`n`n**Skipped**: CHOCOLATEY_API_KEY is not configured."
             exit 0
           }
           $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
-          & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Chocolatey push failed (exit $LASTEXITCODE) — previous version may still be in moderation"
+          if (-not $nupkg) {
+            Write-Output "::error title=Chocolatey push failed::no tirith.*.nupkg was produced by the pack step"
+            Add-Content -Path $summary -Value "## Chocolatey`n`n**Failed**: no package was produced to push."
+            exit 1
           }
+          $output = & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Output $output
+          if ($code -ne 0) {
+            $detail = ($output -split "`n" | Where-Object { $_ -match "status code|forbidden|unauthorized|conflict|moderation|exists" } | Select-Object -First 3) -join "; "
+            if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "exit $code" }
+            Write-Output "::error title=Chocolatey push failed::$($nupkg.Name): $detail. A 403 means the API key is invalid or not authorized for this package; a 409 means the version already exists; a moderation hold on the previous version can also refuse a push. The release itself is unaffected."
+            Add-Content -Path $summary -Value "## Chocolatey`n`n**Failed** to push ``$($nupkg.Name)``: $detail`n`nThe package must be pushed by hand, or the key rotated, before the next tag. See the step log for the full response."
+            exit $code
+          }
+          Add-Content -Path $summary -Value "## Chocolatey`n`nPushed ``$($nupkg.Name)`` to push.chocolatey.org; it now waits for moderation."
 
   publish-aur:
     name: Update AUR Package

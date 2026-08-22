@@ -50,6 +50,12 @@ find "$scan_root" -type f -print0 > "$file_list"
 # absolute path, so matching it against a relative `$scan_root` would reject
 # every ordinary in-tree `libfoo.so -> libfoo.so.1` a real package ships.
 canonical_root=$(cd -- "$scan_root" && pwd -P)
+# Same discipline as the file list above: a process substitution's exit status
+# is invisible to `set -e`, so a `find` that failed part-way would leave this
+# loop short and the scan looking clean. Materialize the list first.
+link_list=$(mktemp)
+trap 'rm -f -- "$file_list" "$link_list"' EXIT
+find "$scan_root" -type l -print0 > "$link_list"
 escaping_links=0
 while IFS= read -r -d '' link; do
   target=$(readlink -f -- "$link" 2>/dev/null || true)
@@ -58,7 +64,7 @@ while IFS= read -r -d '' link; do
   esac
   echo "ERROR: $link resolves outside $canonical_root (to '${target:-unresolvable}') and cannot be verified" >&2
   escaping_links=$((escaping_links + 1))
-done < <(find "$scan_root" -type l -print0)
+done < "$link_list"
 if [[ $escaping_links -gt 0 ]]; then
   exit 1
 fi
