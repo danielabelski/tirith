@@ -25,6 +25,33 @@ unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
 [[ "$(declare -p _TIRITH_TEST_SKIP_HEALTH 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] && unset _TIRITH_TEST_SKIP_HEALTH
 [[ "$(declare -p _TIRITH_TEST_FAIL_HEALTH 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] && unset _TIRITH_TEST_FAIL_HEALTH
 
+# Hook state that is READ before this session ever writes it. Everything below
+# is session-local by contract: Tirith only ever hands these to a child as a
+# command prefix on its own `tirith` invocations, so an interactive shell that
+# starts with one already in its environment received it from somewhere else.
+#
+# `_TIRITH_BASH_INTERNAL=1` is the load-bearing one — it is the first line of
+# `_tirith_preexec`, so a parent process that exports it turns off command
+# interception for the whole session without touching a config file, a policy,
+# or the hook itself. The rest are the same shape: a pre-seeded per-line
+# decision cache (an allow verdict Tirith never issued), the DEBUG-chaining
+# slot the trampoline evals, and the one-shot latches that would swallow the
+# downgrade banners a user needs to see.
+#
+# Values set WITHOUT export are left alone, so the session-local test overrides
+# above and any in-shell state keep working exactly as before.
+for _tirith_inherited_state in \
+  _TIRITH_BASH_INTERNAL \
+  _tirith_last_key _tirith_last_rc _tirith_last_cmd \
+  _TIRITH_PREV_DEBUG_TRAP \
+  _TIRITH_DEGRADE_WARNED _TIRITH_PREEXEC_WARNED _TIRITH_RECEIPT_DEGRADE_WARNED \
+  _TIRITH_BINDS_INSTALLED _TIRITH_PREEXEC_PROMPT_STATUS
+do
+  [[ "$(declare -p "$_tirith_inherited_state" 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] \
+    && unset "$_tirith_inherited_state"
+done
+unset _tirith_inherited_state
+
 # Session tracking: generate ID per shell session if not inherited
 if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
   builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \

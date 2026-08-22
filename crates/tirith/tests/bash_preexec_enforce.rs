@@ -772,6 +772,100 @@ printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
 }
 
 #[test]
+fn exported_internal_marker_does_not_disable_interception() {
+    // `_TIRITH_BASH_INTERNAL` is the first line of `_tirith_preexec`. Tirith
+    // only ever passes it as a command prefix on its own child invocations, so
+    // an interactive shell that STARTS with it exported was handed it by
+    // something else — a wrapper script, an `ssh SendEnv`, a direnv file, a
+    // compromised parent. Honouring it there would silently switch off command
+    // interception for the entire session.
+    let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
+        r#"
+sh -c 'touch {sentinels}/poisoned_leak' BLOCK_TOKEN-internal
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            ("_TIRITH_BASH_INTERNAL", "1"),
+        ],
+    );
+
+    assert!(
+        !sentinel_path(&sentinel_dir, "poisoned_leak").exists(),
+        "an inherited _TIRITH_BASH_INTERNAL must not disable the preexec scan; invocations: {invocations:#?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|i| i.contains("BLOCK_TOKEN-internal")),
+        "tirith must still be consulted for the blocked line: {invocations:#?}"
+    );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
+fn exported_decision_cache_cannot_preseed_an_allow() {
+    // The per-line decision cache is keyed on a small integer (`BASH_LINENO`),
+    // so a guessable pre-seeded `allow` must not survive into the session. Try
+    // the low line ids a fresh interactive shell actually uses.
+    for guessed_line_id in ["0", "1", "2", "3"] {
+        let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
+            r#"
+sh -c 'touch {sentinels}/cache_leak' BLOCK_TOKEN-cache
+"#,
+            &[
+                ("TIRITH_BASH_MODE", "preexec"),
+                ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+                ("_tirith_last_key", guessed_line_id),
+                ("_tirith_last_rc", "0"),
+            ],
+        );
+        assert!(
+            !sentinel_path(&sentinel_dir, "cache_leak").exists(),
+            "pre-seeded allow for line id {guessed_line_id} bypassed the scan; invocations: {invocations:#?}"
+        );
+        let _ = fs::remove_dir_all(&sentinel_dir);
+    }
+}
+
+#[test]
+fn exported_hook_state_is_cleared_but_session_local_state_is_kept() {
+    // Only the ENVIRONMENT copy is untrusted. A value assigned inside the
+    // session (no export) is the shell's own state and must survive, which is
+    // what keeps the `_TIRITH_TEST_*` overrides and in-shell latches working.
+    let hook = hook_path();
+    let (_out, stderr, _inv) = run_bash_script(
+        format!(
+            r#"
+_TIRITH_PREEXEC_WARNED=session_local
+source '{hook}'
+printf 'INTERNAL=[%s] LASTKEY=[%s] PREVTRAP=[%s] WARNED=[%s]\n' \
+  "${{_TIRITH_BASH_INTERNAL:-}}" "${{_tirith_last_key:-}}" \
+  "${{_TIRITH_PREV_DEBUG_TRAP:-}}" "$_TIRITH_PREEXEC_WARNED" >&2
+            "#
+        )
+        .as_str(),
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("_TIRITH_BASH_INTERNAL", "1"),
+            ("_tirith_last_key", "7"),
+            (
+                "_TIRITH_PREV_DEBUG_TRAP",
+                "touch /tmp/tirith-should-never-run",
+            ),
+        ],
+    );
+    // The internal marker reads back as a session-local `0` rather than unset:
+    // the scan path restores it to its captured previous value. What matters is
+    // that the inherited `1` is gone and nothing re-exports it.
+    assert!(
+        stderr.contains("INTERNAL=[0] LASTKEY=[] PREVTRAP=[] WARNED=[session_local]")
+            || stderr.contains("INTERNAL=[] LASTKEY=[] PREVTRAP=[] WARNED=[session_local]"),
+        "inherited hook state must be dropped while session-local state is preserved, got: {stderr}"
+    );
+}
+
+#[test]
 fn debug_trap_chains_user_trap() {
     // A DEBUG trap installed BEFORE sourcing the hook must be wrapped, not clobbered.
     let (_out, stderr, _inv, _tmp) = run_with_sentinels(
