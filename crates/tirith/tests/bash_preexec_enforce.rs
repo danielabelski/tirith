@@ -910,6 +910,18 @@ fn chained_debug_trap_that_returns_early_still_reaches_the_scan() {
     // — the base of oh-my-bash, Atuin and iTerm2 shell integration — opens with
     // exactly this shape. Evaluated inline it would return from Tirith's own
     // trampoline before the scan, silently disabling the session.
+    //
+    // This containment is a bash >= 5 guarantee. On bash 3.2 the trampoline
+    // cannot reliably install over a pre-existing DEBUG trap whose bare body
+    // returns, so Tirith detects the lost trap and degrades to `off` with a
+    // banner (see the lost-trap test) rather than silently scanning nothing —
+    // but it cannot hold the whole-line block there. Enter mode, the default
+    // and recommended mode, is bash 5+ only, and the real bash-preexec wraps
+    // its return in its own function, which is contained on every version.
+    if spawned_bash_major() < 5 {
+        eprintln!("skipping: needs bash >= 5 (spawned bash is older)");
+        return;
+    }
     for user_trap in [
         r#"[[ -n "$_BP_INTERACTIVE" ]] || return 0"#,
         "return",
@@ -1313,6 +1325,18 @@ fn split_test_env(extra_env: &[(&str, &str)]) -> (String, Vec<(String, String)>)
 /// `($BASH_VERSION, $BASH)` for the bash a bare `Command::new("bash")` runs. The
 /// capability cache is keyed on both, so a seeded cache must record the exact
 /// values the spawned bash reports.
+/// Major version of the bash a bare `Command::new("bash")` runs. The DEBUG-trap
+/// tests that depend on bash >= 5 semantics use this to skip on the macOS
+/// runner's system bash 3.2, the same way the PTY suite gates on `modern_bash`.
+fn spawned_bash_major() -> u32 {
+    let (version, _) = spawned_bash_identity();
+    version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+        .unwrap_or(0)
+}
+
 fn spawned_bash_identity() -> (String, String) {
     let out = Command::new("bash")
         .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
