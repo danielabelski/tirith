@@ -904,6 +904,48 @@ printf 'USER_TRAP_COUNT=%s\n' "$USER_TRAP_COUNT" >&2
 }
 
 #[test]
+fn chained_debug_trap_that_returns_early_still_reaches_the_scan() {
+    // A DEBUG trap body is normally evaluated at the top level, where `return`
+    // is a no-op, so real handlers use it as an early exit. `bash-preexec.sh`
+    // — the base of oh-my-bash, Atuin and iTerm2 shell integration — opens with
+    // exactly this shape. Evaluated inline it would return from Tirith's own
+    // trampoline before the scan, silently disabling the session.
+    for user_trap in [
+        r#"[[ -n "$_BP_INTERACTIVE" ]] || return 0"#,
+        "return",
+        "if true; then return 1; fi",
+    ] {
+        let script = format!(
+            r#"
+trap '{user_trap}' DEBUG
+unset _TIRITH_BASH_LOADED
+source '{hook}'
+sh -c 'touch {{sentinels}}/early_return_leak' BLOCK_TOKEN-early-return
+"#,
+            hook = hook_path(),
+        );
+        let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
+            &script,
+            &[
+                ("TIRITH_BASH_MODE", "preexec"),
+                ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            ],
+        );
+        assert!(
+            !sentinel_path(&sentinel_dir, "early_return_leak").exists(),
+            "chained DEBUG trap {user_trap:?} bypassed the scan; invocations: {invocations:#?}"
+        );
+        assert!(
+            invocations
+                .iter()
+                .any(|i| i.contains("BLOCK_TOKEN-early-return")),
+            "tirith was never consulted behind {user_trap:?}: {invocations:#?}"
+        );
+        let _ = fs::remove_dir_all(&sentinel_dir);
+    }
+}
+
+#[test]
 fn install_debug_trap_is_idempotent() {
     let (_out, stderr, _inv, _tmp) = run_with_sentinels(
         r#"

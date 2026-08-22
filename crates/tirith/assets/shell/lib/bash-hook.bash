@@ -721,6 +721,18 @@ _tirith_disable_owned_extdebug() {
 # trampoline IS the topmost function called from the trap) and pass it
 # explicitly to _tirith_preexec — otherwise preexec would see only its own
 # call frame's line, not the user-typed line.
+# Run the captured user DEBUG handler in its own frame. A DEBUG trap body is
+# ordinarily evaluated at the top level, where `return` is a no-op, so real
+# handlers use it freely as an early exit — `bash-preexec.sh` (oh-my-bash,
+# Atuin, iTerm2 shell integration) opens with exactly that shape. Evaluating
+# such a body inline would make its `return` leave the TRAMPOLINE before
+# Tirith ever scans, silently disabling interception for the whole session.
+# Giving it a frame of its own means the early exit ends the chained handler
+# and nothing else.
+_tirith_run_chained_debug_trap() {
+  builtin eval -- "$_TIRITH_PREV_DEBUG_TRAP"
+}
+
 _tirith_debug_trampoline() {
   # Pin the command before chaining a user DEBUG trap: that trap may run
   # arbitrary shell code and change the live BASH_COMMAND value before Tirith
@@ -732,8 +744,14 @@ _tirith_debug_trampoline() {
   # fires have at least one caller frame. `_tirith_preexec` only skips a nested
   # fire after the containing typed line has crossed the top-level decision.
   local _user_call_depth="${#FUNCNAME[@]}"
+  # Tirith's trap fired, whatever the chained handler goes on to do. The
+  # prompt-boundary ownership check reads this; see `_tirith_preexec_prompt_end`.
+  _TIRITH_DEBUG_TRAP_HEARTBEAT=1
   if [[ -n "${_TIRITH_PREV_DEBUG_TRAP:-}" ]]; then
-    builtin eval -- "$_TIRITH_PREV_DEBUG_TRAP" || true
+    # Status is discarded on purpose: under a Tirith-owned extdebug block a
+    # non-zero DEBUG result skips the command, and that decision belongs to
+    # Tirith alone, not to a chained handler.
+    _tirith_run_chained_debug_trap || true
   fi
   _tirith_preexec "$_user_line_id" "$_user_call_depth" "$_user_bash_command"
 }
