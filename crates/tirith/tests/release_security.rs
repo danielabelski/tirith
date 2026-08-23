@@ -355,6 +355,63 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
             "release job {job_name:?} must carry exactly the pushed-v*-tag gate, got {condition:?}"
         );
     }
+
+    // Every job that can mint attestations, mutate a registry/repository, or
+    // consume a publication secret must cross the protected release
+    // environment. Repository administrators still configure that
+    // environment's reviewers and deployment-tag rule in GitHub settings.
+    for job_name in [
+        "release-authority",
+        "attest-packages",
+        "release",
+        "publish-crates",
+        "publish-homebrew",
+        "publish-npm",
+        "publish-scoop",
+        "publish-docker",
+        "publish-chocolatey",
+        "publish-aur",
+    ] {
+        let environment = yaml_key(workflow_job(jobs, job_name), "environment")
+            .as_str()
+            .unwrap_or_else(|| panic!("release job {job_name:?} must name an environment"));
+        assert_eq!(environment, "release");
+    }
+
+    let authority_runs = joined_run_scripts(workflow_job(jobs, "release-authority"));
+    assert!(
+        authority_runs.contains("refs/remotes/origin/${DEFAULT_BRANCH}"),
+        "release authority must bind a tag to the fetched default branch"
+    );
+    assert!(
+        authority_runs.contains("[[ \"$RELEASE_SHA\" != \"$default_sha\" ]]"),
+        "release authority must require the tag and current default branch to name the same commit"
+    );
+
+    let release_runs = joined_run_scripts(workflow_job(jobs, "release"));
+    assert!(
+        release_runs.contains("--certificate-identity \"$EXPECTED_CERT_IDENTITY\""),
+        "release verification must use the exact workflow-and-tag certificate identity"
+    );
+    assert!(
+        !release_runs.contains("--certificate-identity-regexp"),
+        "release verification must not broaden signer authority with an identity regexp"
+    );
+}
+
+#[test]
+fn installer_pins_cosign_to_the_exact_release_workflow_and_resolved_tag() {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let installer = std::fs::read_to_string(repository_root.join("scripts/install.sh"))
+        .expect("read installer");
+    assert!(installer.contains(
+        "--certificate-identity \"https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${VERSION}\""
+    ));
+    assert!(!installer.contains("--certificate-identity-regexp"));
+    assert!(
+        installer.contains("https://api.github.com/repos/${REPO}/releases/latest"),
+        "the latest installer path must resolve an exact release tag before signature verification"
+    );
 }
 
 #[test]

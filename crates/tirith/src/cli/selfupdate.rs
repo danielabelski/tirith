@@ -23,8 +23,11 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 const MAX_ARCHIVE_SIZE: u64 = 64 * 1024 * 1024;
 /// Hard cap on `checksums.txt` / signature / certificate files.
 const MAX_METADATA_SIZE: u64 = 256 * 1024;
-/// cosign keyless verification identity regexp — must match the workflow.
-const COSIGN_IDENTITY_REGEXP: &str = "github.com/sheeki03/tirith";
+/// Exact keyless signer workflow. The requested release tag is appended at
+/// verification time so a signature made by another workflow or for another
+/// tag cannot authorize these bytes.
+const COSIGN_WORKFLOW_IDENTITY: &str =
+    "https://github.com/sheeki03/tirith/.github/workflows/release.yml@refs/tags/";
 /// cosign OIDC issuer — the GitHub Actions OIDC provider.
 const COSIGN_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
@@ -1640,6 +1643,9 @@ fn emit_update_error(json: bool, msg: &str) {
 
 /// A downloaded release artifact set, all in a working directory.
 struct ReleaseSet {
+    /// Exact release tag used to fetch every member of this set. Cosign
+    /// verification binds the signer identity to this same tag.
+    tag: String,
     archive_path: PathBuf,
     /// Raw `checksums.txt` content (the signed-over payload).
     checksums_txt: String,
@@ -1720,6 +1726,7 @@ fn download_release_set(
     );
 
     Ok(ReleaseSet {
+        tag: tag.to_string(),
         archive_path,
         checksums_txt,
         sig_path,
@@ -2006,8 +2013,8 @@ fn verify_cosign_signature_with_program(
         .arg(sig)
         .arg("--certificate")
         .arg(cert)
-        .arg("--certificate-identity-regexp")
-        .arg(COSIGN_IDENTITY_REGEXP)
+        .arg("--certificate-identity")
+        .arg(format!("{COSIGN_WORKFLOW_IDENTITY}{}", release.tag))
         .arg("--certificate-oidc-issuer")
         .arg(COSIGN_OIDC_ISSUER)
         .arg(&release.checksums_path)
@@ -3470,6 +3477,7 @@ mod tests {
         std::fs::write(&checksums, &txt).unwrap();
 
         let release = ReleaseSet {
+            tag: "v0.3.3".to_string(),
             archive_path: archive,
             checksums_txt: txt,
             sig_path: None,
@@ -3494,6 +3502,7 @@ mod tests {
         std::fs::write(&checksums, &txt).unwrap();
 
         let release = ReleaseSet {
+            tag: "v0.3.3".to_string(),
             archive_path: archive,
             checksums_txt: txt,
             sig_path: None, // release shipped no cosign signature
@@ -3532,6 +3541,7 @@ mod tests {
         std::fs::write(&checksums, txt).unwrap();
 
         let release = ReleaseSet {
+            tag: "v0.3.3".to_string(),
             archive_path: archive,
             checksums_txt: txt.to_string(),
             sig_path: None,
@@ -3838,6 +3848,7 @@ mod tests {
         std::fs::write(&cert, b"dummy-certificate").unwrap();
 
         let release = ReleaseSet {
+            tag: "v0.3.3".to_string(),
             archive_path: archive,
             checksums_txt: txt,
             sig_path: Some(sig),
@@ -3867,6 +3878,54 @@ mod tests {
                 }
             ),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cosign_identity_is_bound_to_the_exact_release_workflow_and_tag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_cosign = dir.path().join("cosign");
+        std::fs::write(
+            &fake_cosign,
+            "#!/bin/sh\nexpected='https://github.com/sheeki03/tirith/.github/workflows/release.yml@refs/tags/v9.8.7'\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--certificate-identity' ]; then\n    shift\n    [ \"${1-}\" = \"$expected\" ] || exit 41\n    found=1\n  fi\n  shift\ndone\n[ \"${found-}\" = 1 ]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_cosign, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
+        let body = b"TAG-BOUND RELEASE";
+        std::fs::write(&archive, body).unwrap();
+        let digest = hex_sha256(body);
+        let checksums_txt = format!("{digest}  tirith-x86_64-unknown-linux-gnu.tar.gz\n");
+        let checksums_path = dir.path().join("checksums.txt");
+        std::fs::write(&checksums_path, &checksums_txt).unwrap();
+        let sig_path = dir.path().join("checksums.txt.sig");
+        let cert_path = dir.path().join("checksums.txt.pem");
+        std::fs::write(&sig_path, b"signature").unwrap();
+        std::fs::write(&cert_path, b"certificate").unwrap();
+        let release = ReleaseSet {
+            tag: "v9.8.7".to_string(),
+            archive_path: archive,
+            checksums_txt,
+            sig_path: Some(sig_path),
+            cert_path: Some(cert_path),
+            checksums_path,
+        };
+
+        let verdict = verify_archive_against_checksums_with_program(
+            &release,
+            "tirith-x86_64-unknown-linux-gnu.tar.gz",
+            Some(&fake_cosign),
+        );
+        assert!(matches!(
+            verdict,
+            ArchiveVerdict::Ok {
+                signed: ChecksumStrength::Signed,
+                ..
+            }
+        ));
     }
 
     #[test]

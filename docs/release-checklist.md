@@ -41,6 +41,24 @@ cargo package -p tirith-core --allow-dirty
 cargo package -p tirith --allow-dirty   # may fail until tirith-core is published
 ```
 
+## Release authority prerequisites
+
+Repository settings are part of the release security boundary. Before a tag
+can publish, GitHub must have an environment named `release` with required
+reviewers and a deployment-branch/tag rule that admits only protected `v*`
+tags. The repository must also have a ruleset that restricts creation, update,
+and deletion of `v*` tags to release maintainers. Workflow YAML cannot protect
+its own tag trigger from an account that is allowed to replace that YAML at an
+arbitrary tagged commit, so these settings are mandatory rather than optional
+hardening.
+
+The workflow independently requires a complete semantic-version tag, requires
+that tag to point at the current default-branch commit, and routes every
+attestation/publication job through the `release` environment. The installer
+and self-updater accept the checksum signature only from the exact
+`release.yml@refs/tags/<requested-tag>` OIDC identity; a valid signature from
+another repository workflow or another release tag is not interchangeable.
+
 ## Linux release compatibility contract
 
 The two GNU tarballs are cross-linked with Zig against a GLIBC 2.28 ceiling.
@@ -77,8 +95,10 @@ every packaged ELF, installs the packages, and repeats the runtime smoke.
 
 Pull requests that affect release inputs and manual `workflow_dispatch` runs
 execute these build/package/runtime gates without publishing. Only a pushed
-`v*` tag may run signing, attestations, release upload, registry publication,
-or package-manager update jobs.
+protected `v*` tag on the current default-branch commit may run signing,
+attestations, release upload, registry publication, or package-manager update
+jobs, and each publishing job requires approval through the `release`
+environment.
 
 ## Release pipeline (full sequence)
 

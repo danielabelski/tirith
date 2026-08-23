@@ -63,10 +63,14 @@ Release artifacts are built via GitHub Actions with:
 
 Verify a release:
 ```bash
-cosign verify-blob --certificate-identity-regexp 'github.com/sheeki03/tirith' \
+TAG=v0.3.3
+cosign verify-blob \
+  --signature checksums.txt.sig \
+  --certificate checksums.txt.pem \
+  --certificate-identity "https://github.com/sheeki03/tirith/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  --bundle tirith-*.cosign.bundle \
-  tirith-*.tar.gz
+  checksums.txt
+sha256sum --check --strict checksums.txt
 ```
 
 ## Supported versions

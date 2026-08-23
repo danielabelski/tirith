@@ -168,17 +168,39 @@ resolve_version() {
     TIRITH_VERSION="${TIRITH_VERSION#v}"
     VERSION="v${TIRITH_VERSION}"
   else
-    VERSION="latest"
+    VERSION=""
   fi
+}
+
+validate_release_tag() {
+  printf '%s\n' "$1" \
+    | LC_ALL=C grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'
+}
+
+resolve_latest_version() {
+  workdir="$1"
+  if [ -n "$VERSION" ]; then
+    validate_release_tag "$VERSION" \
+      || err "TIRITH_VERSION must be a complete semantic version (for example 0.3.3)"
+    return 0
+  fi
+
+  latest_json="${workdir}/latest-release.json"
+  fetch "https://api.github.com/repos/${REPO}/releases/latest" "$latest_json"
+  latest_tags=$(/usr/bin/sed -n \
+    's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)"[,]*[[:space:]]*$/\1/p' \
+    "$latest_json")
+  latest_count=$(printf '%s\n' "$latest_tags" | grep -c . || true)
+  if [ "$latest_count" -ne 1 ] || ! validate_release_tag "$latest_tags"; then
+    err "latest release metadata did not contain exactly one valid semantic-version tag"
+  fi
+  VERSION="$latest_tags"
 }
 
 download_url() {
   local file="$1"
-  if [ "$VERSION" = "latest" ]; then
-    printf 'https://github.com/%s/releases/latest/download/%s' "$REPO" "$file"
-  else
-    printf 'https://github.com/%s/releases/download/%s/%s' "$REPO" "$VERSION" "$file"
-  fi
+  [ -n "$VERSION" ] || err "release tag must be resolved before constructing download URLs"
+  printf 'https://github.com/%s/releases/download/%s/%s' "$REPO" "$VERSION" "$file"
 }
 
 fetch() {
@@ -277,7 +299,7 @@ verify_cosign() {
   if ! "$COSIGN_BIN" verify-blob \
     --signature "${workdir}/checksums.txt.sig" \
     --certificate "${workdir}/checksums.txt.pem" \
-    --certificate-identity-regexp '^https://github\.com/sheeki03/tirith/\.github/workflows/' \
+    --certificate-identity "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${VERSION}" \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     "${workdir}/checksums.txt"; then
     # A FAILED verification is always fatal: even under TIRITH_ALLOW_UNSIGNED,
@@ -405,12 +427,13 @@ main() {
   detect_platform
   resolve_version
 
-  info "Installing tirith (${VERSION}) for ${TARGET}..."
-
   local tmpdir
   tmpdir="$(mktemp -d)"
   PAIRED_TMPDIR="$tmpdir"
   install_paired_traps
+
+  resolve_latest_version "$tmpdir"
+  info "Installing tirith (${VERSION}) for ${TARGET}..."
 
   # Download archive and checksums
   info "Downloading ${ARCHIVE}..."
