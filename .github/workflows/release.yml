@@ -10,9 +10,14 @@ on:
       - ".github/scripts/verify-glibc-compat.sh"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "Dockerfile"
       - "crates/tirith/**"
       - "crates/tirith-core/**"
+      - "npm/**"
       - "packaging/**"
+      - "scripts/install.sh"
+      - "scripts/prepare-npm-packages.sh"
+      - "scripts/validate-npm-packages.mjs"
       - "shell/**"
   # Manual dispatch builds and smoke-tests only. It takes no inputs on purpose:
   # every publishing job requires `github.event_name == 'push'`, so no dispatch
@@ -43,8 +48,8 @@ jobs:
           RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::release tag is not a complete semantic version: $RELEASE_TAG"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::stable publication requires an exact vMAJOR.MINOR.PATCH tag: $RELEASE_TAG"
             exit 1
           fi
           default_ref="refs/remotes/origin/${DEFAULT_BRANCH}"
@@ -597,9 +602,50 @@ jobs:
               --predicate-type https://slsa.dev/provenance/v1
           done
 
+  npm-package-validation:
+    name: Validate npm package assembly
+    needs: build
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.17.0"
+
+      - name: Download platform archives into producer-isolated directories
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: tirith-*-*-*
+          path: artifacts
+
+      - name: Resolve package version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble and validate exact npm packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          scripts/prepare-npm-packages.sh "$VERSION" artifacts
+          node scripts/validate-npm-packages.mjs "$VERSION" artifacts
+
   release:
     name: Create Release
-    needs: [fuzz-gate, release-validation, attest-packages]
+    needs: [fuzz-gate, release-validation, attest-packages, npm-package-validation]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     environment: release
@@ -611,11 +657,49 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download all artifacts
+      - name: Download release artifacts into producer-isolated directories
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: artifacts
-          merge-multiple: true
+          pattern: tirith-*
+          path: downloaded
+
+      - name: Assemble release payload from exact producers
+        run: |
+          set -euo pipefail
+          expected_producers=(
+            tirith-aarch64-apple-darwin
+            tirith-aarch64-unknown-linux-gnu
+            tirith-aarch64-unknown-linux-musl
+            tirith-deb
+            tirith-rpm
+            tirith-x86_64-apple-darwin
+            tirith-x86_64-pc-windows-msvc
+            tirith-x86_64-unknown-linux-gnu
+          )
+          mapfile -t actual_producers < <(find downloaded -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+          if ! diff -u \
+              <(printf '%s\n' "${expected_producers[@]}" | sort) \
+              <(printf '%s\n' "${actual_producers[@]}"); then
+            echo "ERROR: release artifact producer set changed" >&2
+            exit 1
+          fi
+          for producer in "${expected_producers[@]}"; do
+            file_count=$(find "downloaded/${producer}" -mindepth 1 -maxdepth 1 -type f | wc -l)
+            if [[ "$file_count" -ne 1 ]]; then
+              echo "ERROR: ${producer} produced ${file_count} root files; expected exactly one" >&2
+              exit 1
+            fi
+          done
+
+          mkdir artifacts
+          cp downloaded/tirith-aarch64-apple-darwin/tirith-aarch64-apple-darwin.tar.gz artifacts/
+          cp downloaded/tirith-aarch64-unknown-linux-gnu/tirith-aarch64-unknown-linux-gnu.tar.gz artifacts/
+          cp downloaded/tirith-aarch64-unknown-linux-musl/tirith-aarch64-unknown-linux-musl.tar.gz artifacts/
+          cp downloaded/tirith-x86_64-apple-darwin/tirith-x86_64-apple-darwin.tar.gz artifacts/
+          cp downloaded/tirith-x86_64-pc-windows-msvc/tirith-x86_64-pc-windows-msvc.zip artifacts/
+          cp downloaded/tirith-x86_64-unknown-linux-gnu/tirith-x86_64-unknown-linux-gnu.tar.gz artifacts/
+          cp downloaded/tirith-deb/tirith_*.deb artifacts/
+          cp downloaded/tirith-rpm/tirith-*.rpm artifacts/
 
       - name: Refuse an existing release for this tag
         env:
@@ -633,9 +717,6 @@ jobs:
             cat "$error_file" >&2
             exit 1
           fi
-
-      - name: Remove completions-man directories (not for release)
-        run: rm -rf artifacts/completions artifacts/man
 
       - name: Stage installer and verify complete release payload
         env:
@@ -814,11 +895,11 @@ jobs:
           path: source
           persist-credentials: false
 
-      - name: Download all artifacts
+      - name: Download versioned archives into producer-isolated directories
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: tirith-*-*-*
           path: artifacts
-          merge-multiple: true
 
       - name: Checkout tap repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -834,12 +915,10 @@ jobs:
           VER="${VERSION#v}"
           mkdir -p homebrew-tap/Formula
           cp source/packaging/homebrew/tirith.rb homebrew-tap/Formula/tirith.rb
-          cd artifacts
-          SHA_AA=$(sha256sum tirith-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
-          SHA_XA=$(sha256sum tirith-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
-          SHA_AL=$(sha256sum tirith-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
-          SHA_XL=$(sha256sum tirith-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
-          cd ..
+          SHA_AA=$(sha256sum artifacts/tirith-aarch64-apple-darwin/tirith-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_XA=$(sha256sum artifacts/tirith-x86_64-apple-darwin/tirith-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_AL=$(sha256sum artifacts/tirith-aarch64-unknown-linux-gnu/tirith-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+          SHA_XL=$(sha256sum artifacts/tirith-x86_64-unknown-linux-gnu/tirith-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           # Each sed below replaces the FIRST remaining placeholder, so the
           # order of the four sha256 lines in the template is load-bearing and
           # a template edit that drops or reorders one would silently ship a
@@ -896,68 +975,16 @@ jobs:
           node-version: "22.17.0"
           registry-url: https://registry.npmjs.org
 
-      - name: Download all artifacts
+      - name: Download platform archives into producer-isolated directories
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: tirith-*-*-*
           path: artifacts
-          merge-multiple: true
 
-      - name: Prepare platform packages
+      - name: Prepare and validate platform packages
         run: |
-          set -euo pipefail
-
-          VERSION="${GITHUB_REF_NAME#v}"
-
-          # Map: npm-dir archive-name binary-name
-          declare -A NPM_MAP=(
-            ["darwin-arm64"]="tirith-aarch64-apple-darwin.tar.gz:tirith"
-            ["darwin-x64"]="tirith-x86_64-apple-darwin.tar.gz:tirith"
-            ["linux-x64"]="tirith-x86_64-unknown-linux-gnu.tar.gz:tirith"
-            ["linux-arm64"]="tirith-aarch64-unknown-linux-gnu.tar.gz:tirith"
-            ["win32-x64"]="tirith-x86_64-pc-windows-msvc.zip:tirith.exe"
-          )
-
-          for platform in "${!NPM_MAP[@]}"; do
-            IFS=':' read -r archive binary <<< "${NPM_MAP[$platform]}"
-            pkg_dir="npm/${platform}"
-
-            # Extract binary into package bin/
-            tmpdir=$(mktemp -d)
-            if [[ "$archive" == *.zip ]]; then
-              unzip -o "artifacts/${archive}" -d "$tmpdir"
-            else
-              tar xzf "artifacts/${archive}" -C "$tmpdir"
-            fi
-
-            mkdir -p "${pkg_dir}/bin"
-            cp "${tmpdir}/${binary}" "${pkg_dir}/bin/${binary}"
-            chmod +x "${pkg_dir}/bin/${binary}" 2>/dev/null || true
-            rm -rf "$tmpdir"
-
-            # Update version in package.json
-            cd "$pkg_dir"
-            node -e "
-              const pkg = require('./package.json');
-              pkg.version = '${VERSION}';
-              require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-            "
-            cd -
-          done
-
-          # Update root package version
-          cd npm/tirith
-          node -e "
-            const pkg = require('./package.json');
-            pkg.version = '${VERSION}';
-            for (const dep of Object.keys(pkg.optionalDependencies || {})) {
-              pkg.optionalDependencies[dep] = '${VERSION}';
-            }
-            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
-          cd -
-
-          # Ensure launcher has correct permissions and line endings
-          chmod +x npm/tirith/bin/tirith
+          scripts/prepare-npm-packages.sh "$GITHUB_REF_NAME" artifacts
+          node scripts/validate-npm-packages.mjs "$GITHUB_REF_NAME" artifacts
 
       - name: Publish platform packages
         env:
@@ -1008,11 +1035,11 @@ jobs:
           path: source
           persist-credentials: false
 
-      - name: Download all artifacts
+      - name: Download exact Windows artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: tirith-x86_64-pc-windows-msvc
           path: artifacts
-          merge-multiple: true
 
       - name: Checkout scoop bucket
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1065,24 +1092,24 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download all artifacts
+      - name: Download Linux archives into producer-isolated directories
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: tirith-*-unknown-linux-gnu
           path: artifacts
-          merge-multiple: true
 
       - name: Prepare per-platform build contexts
         run: |
           set -euo pipefail
           # amd64
           mkdir -p docker-amd64/bin docker-amd64/shell
-          tar xzf artifacts/tirith-x86_64-unknown-linux-gnu.tar.gz -C docker-amd64/bin tirith
+          tar xzf artifacts/tirith-x86_64-unknown-linux-gnu/tirith-x86_64-unknown-linux-gnu.tar.gz -C docker-amd64/bin tirith
           cp -r shell/* docker-amd64/shell/
           cp Dockerfile docker-amd64/
 
           # arm64
           mkdir -p docker-arm64/bin docker-arm64/shell
-          tar xzf artifacts/tirith-aarch64-unknown-linux-gnu.tar.gz -C docker-arm64/bin tirith
+          tar xzf artifacts/tirith-aarch64-unknown-linux-gnu/tirith-aarch64-unknown-linux-gnu.tar.gz -C docker-arm64/bin tirith
           cp -r shell/* docker-arm64/shell/
           cp Dockerfile docker-arm64/
 
@@ -1603,7 +1630,6 @@ jobs:
         with:
           name: tirith-x86_64-pc-windows-msvc
           path: artifacts
-          merge-multiple: true
 
       - name: Template and pack
         shell: pwsh
@@ -1673,7 +1699,6 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     environment: release
-    continue-on-error: true  # AUR SSH can be transiently unavailable; don't fail the release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

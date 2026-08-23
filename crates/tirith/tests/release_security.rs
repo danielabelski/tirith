@@ -311,6 +311,11 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
         ".github/workflows/release.yml",
         ".github/scripts/smoke-linux-release.sh",
         ".github/scripts/verify-glibc-compat.sh",
+        "Dockerfile",
+        "npm/**",
+        "scripts/install.sh",
+        "scripts/prepare-npm-packages.sh",
+        "scripts/validate-npm-packages.mjs",
     ] {
         assert!(
             pull_request_paths
@@ -352,6 +357,7 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
         "build-rpm",
         "rpm-runtime-compat",
         "release-validation",
+        "npm-package-validation",
     ]
     .into_iter()
     .collect();
@@ -403,6 +409,10 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
 
     let authority_runs = joined_run_scripts(workflow_job(jobs, "release-authority"));
     assert!(
+        authority_runs.contains(r#"^v[0-9]+\.[0-9]+\.[0-9]+$"#),
+        "stable channels must reject prerelease and build-metadata tags"
+    );
+    assert!(
         authority_runs.contains("refs/remotes/origin/${DEFAULT_BRANCH}"),
         "release authority must bind a tag to the fetched default branch"
     );
@@ -420,6 +430,139 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
         !release_runs.contains("--certificate-identity-regexp"),
         "release verification must not broaden signer authority with an identity regexp"
     );
+}
+
+#[test]
+fn release_downloads_retain_artifact_producer_identity() {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow_path = repository_root.join(".github/workflows/release.yml");
+    let workflow = std::fs::read_to_string(&workflow_path).expect("read release workflow");
+    assert!(
+        !workflow.contains("merge-multiple: true"),
+        "release artifacts must never be concurrently flattened into one directory"
+    );
+    for producer_path in [
+        "downloaded/tirith-aarch64-apple-darwin/tirith-aarch64-apple-darwin.tar.gz",
+        "downloaded/tirith-aarch64-unknown-linux-gnu/tirith-aarch64-unknown-linux-gnu.tar.gz",
+        "downloaded/tirith-aarch64-unknown-linux-musl/tirith-aarch64-unknown-linux-musl.tar.gz",
+        "downloaded/tirith-x86_64-apple-darwin/tirith-x86_64-apple-darwin.tar.gz",
+        "downloaded/tirith-x86_64-pc-windows-msvc/tirith-x86_64-pc-windows-msvc.zip",
+        "downloaded/tirith-x86_64-unknown-linux-gnu/tirith-x86_64-unknown-linux-gnu.tar.gz",
+        "downloaded/tirith-deb/tirith_*.deb",
+        "downloaded/tirith-rpm/tirith-*.rpm",
+    ] {
+        assert!(
+            workflow.contains(producer_path),
+            "release assembly must map exact producer path {producer_path:?}"
+        );
+    }
+    assert!(workflow.contains("release artifact producer set changed"));
+    assert!(workflow.contains("expected exactly one"));
+    assert_eq!(
+        workflow
+            .matches("node scripts/validate-npm-packages.mjs")
+            .count(),
+        2,
+        "credential-free validation and publication must share exact npm package checks"
+    );
+
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(&workflow).expect("release workflow must be valid YAML");
+    let jobs = yaml_key(
+        document.as_mapping().expect("release workflow root"),
+        "jobs",
+    )
+    .as_mapping()
+    .expect("release jobs");
+    assert!(
+        workflow_job(jobs, "publish-aur")
+            .get(serde_yaml::Value::String("continue-on-error".to_string()))
+            .is_none(),
+        "AUR publication must not turn a failed push into a green release"
+    );
+}
+
+#[test]
+fn pull_request_benchmarks_have_no_write_token() {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow_path = repository_root.join(".github/workflows/bench.yml");
+    let workflow = std::fs::read_to_string(&workflow_path).expect("read benchmark workflow");
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(&workflow).expect("benchmark workflow must be valid YAML");
+    let root = document.as_mapping().expect("benchmark workflow root");
+    let permissions = yaml_key(root, "permissions")
+        .as_mapping()
+        .expect("benchmark workflow permissions");
+    assert_eq!(yaml_key(permissions, "contents").as_str(), Some("read"));
+    assert!(
+        permissions
+            .get(serde_yaml::Value::String("pull-requests".to_string()))
+            .is_none(),
+        "PR benchmark workflow must not request pull-request write authority"
+    );
+
+    let jobs = yaml_key(root, "jobs").as_mapping().expect("benchmark jobs");
+    let benchmark = workflow_job(jobs, "benchmark");
+    assert!(
+        benchmark
+            .get(serde_yaml::Value::String("permissions".to_string()))
+            .is_none(),
+        "untrusted benchmark code must inherit read-only workflow permissions"
+    );
+    let publisher = workflow_job(jobs, "publish-baseline");
+    assert_eq!(
+        yaml_key(
+            yaml_key(publisher, "permissions")
+                .as_mapping()
+                .expect("publisher permissions"),
+            "contents",
+        )
+        .as_str(),
+        Some("write")
+    );
+    assert_eq!(
+        yaml_key(publisher, "if").as_str(),
+        Some("github.event_name == 'push' && github.ref == 'refs/heads/main'")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn glibc_scanner_rejects_nonnumeric_namespaces() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let temp = tempfile::tempdir().expect("temporary GLIBC scanner fixture");
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).expect("create fixture root");
+    std::fs::write(root.join("binary"), b"\x7fELFfixture").expect("write fake ELF");
+    let readelf = temp.path().join("readelf-fixture");
+    std::fs::write(
+        &readelf,
+        r#"#!/bin/sh
+case "$1" in
+  --file-header) printf '  Machine: Advanced Micro Devices X86-64\n' ;;
+  --version-info) printf 'Name: GLIBC_2.28\nName: GLIBC_PRIVATE\n' ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("write fake readelf");
+    let mut permissions = std::fs::metadata(&readelf).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&readelf, permissions).unwrap();
+
+    let output = std::process::Command::new("bash")
+        .arg(repository_root.join(".github/scripts/verify-glibc-compat.sh"))
+        .args(["x86_64", "2.28"])
+        .arg(&root)
+        .env("READELF", &readelf)
+        .output()
+        .expect("run GLIBC scanner");
+    assert!(!output.status.success(), "scanner accepted GLIBC_PRIVATE");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported GLIBC namespace"), "{stderr}");
+    assert!(stderr.contains("GLIBC_PRIVATE"), "{stderr}");
 }
 
 #[test]

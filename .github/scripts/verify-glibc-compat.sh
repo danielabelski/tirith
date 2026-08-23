@@ -83,6 +83,13 @@ while IFS= read -r -d '' candidate; do
   fi
 
   version_info=$(LC_ALL=C "$readelf_bin" --version-info --wide -- "$candidate")
+  namespaces=$(grep -oE 'GLIBC_[A-Za-z0-9_.]+' <<<"$version_info" | sort -u || true)
+  invalid_namespaces=$(grep -vE '^GLIBC_[0-9]+(\.[0-9]+)+$' <<<"$namespaces" || true)
+  if [[ -n "$invalid_namespaces" ]]; then
+    echo "ERROR: $candidate references unsupported GLIBC namespace(s):" >&2
+    printf '%s\n' "$invalid_namespaces" >&2
+    exit 1
+  fi
   versions=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' <<<"$version_info" || true)
   if [[ -z "$versions" ]]; then
     echo "ERROR: GNU release ELF has no versioned GLIBC requirements: $candidate" >&2

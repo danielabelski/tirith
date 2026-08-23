@@ -59,6 +59,22 @@ def _finding(closed_date: str | None = None) -> dict:
 
 
 class BlockerClosureAccountingTests(unittest.TestCase):
+    def test_invalid_calendar_dates_are_rejected(self) -> None:
+        for invalid in ["2026-02-29", "2026-13-01", "2026-99-99", "2026-8-01"]:
+            finding = _finding()
+            finding["blockers"][0]["opened_date"] = invalid
+            finding["history"][1]["date"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                validator.ValidationError, "date invalid"
+            ):
+                validator.validate_history(finding, finding["finding_id"])
+
+    def test_leap_day_is_a_valid_calendar_date(self) -> None:
+        finding = _finding()
+        finding["blockers"][0]["opened_date"] = "2028-02-29"
+        finding["history"][1]["date"] = "2028-02-29"
+        validator.validate_history(finding, finding["finding_id"])
+
     def test_active_blocker_remains_release_active(self) -> None:
         finding = _finding()
         validator.validate_history(finding, finding["finding_id"])

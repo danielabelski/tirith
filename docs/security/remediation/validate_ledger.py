@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import re
@@ -207,6 +208,16 @@ FINDING_KEYS = {
 
 class ValidationError(Exception):
     pass
+
+
+def is_iso_calendar_date(value: Any) -> bool:
+    if not isinstance(value, str) or DATE_RE.fullmatch(value) is None:
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def fail(message: str) -> None:
@@ -492,7 +503,7 @@ def validate_attempt(value: Any, label: str, closure_bundle_path: str) -> None:
     for field in ("os", "os_version", "arch", "toolchain", "command", "log_or_attestation_id"):
         require(isinstance(value[field], str) and value[field].strip(), f"{label}: {field} required")
     require(value["result"] in {"passed", "failed", "blocked_native"}, f"{label}: invalid result")
-    require(DATE_RE.fullmatch(value["date"]) is not None, f"{label}: ISO date required")
+    require(is_iso_calendar_date(value["date"]), f"{label}: ISO calendar date required")
     require(
         synthetic_merge_tree(value["base_sha"], value["head_sha"]) == value["merge_tree_sha"],
         f"{label}: merge_tree_sha does not bind synthetic base+head merge",
@@ -537,9 +548,9 @@ def validate_blocker_accounting(finding: dict[str, Any], label: str) -> None:
         blocker_ids.add(blocker_id)
         by_id[blocker_id] = blocker
         require(isinstance(blocker["reason"], str) and blocker["reason"].strip(), f"{label}: blocker reason required")
-        require(isinstance(blocker["opened_date"], str) and DATE_RE.fullmatch(blocker["opened_date"]) is not None, f"{label}: blocker open date invalid")
+        require(is_iso_calendar_date(blocker["opened_date"]), f"{label}: blocker open date invalid")
         closed_date = blocker["closed_date"]
-        require(closed_date is None or (isinstance(closed_date, str) and DATE_RE.fullmatch(closed_date) is not None), f"{label}: blocker close date invalid")
+        require(closed_date is None or is_iso_calendar_date(closed_date), f"{label}: blocker close date invalid")
         require(closed_date is None or closed_date >= blocker["opened_date"], f"{label}: blocker closes before it opens")
 
     blocker_events: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
@@ -578,7 +589,7 @@ def validate_history(finding: dict[str, Any], label: str) -> None:
         if event["event"] in BLOCKER_EVENTS:
             require(isinstance(event["blocker_id"], str) and BLOCKER_RE.fullmatch(event["blocker_id"]) is not None, f"{label}: history blocker ID must start blocked_")
         require(event["lifecycle"] in LIFECYCLES, f"{label}: history lifecycle invalid")
-        require(DATE_RE.fullmatch(event["date"]) is not None, f"{label}: history date invalid")
+        require(is_iso_calendar_date(event["date"]), f"{label}: history date invalid")
         require(isinstance(event["reason"], str) and event["reason"].strip(), f"{label}: history reason required")
         if index == 0:
             require(event["event"] == "imported" and event["lifecycle"] == "confirmed_open", f"{label}: history must start with confirmed_open import")
