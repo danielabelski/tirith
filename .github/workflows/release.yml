@@ -644,11 +644,16 @@ jobs:
             version="${GITHUB_REF_NAME#v}"
           else
             version=$(awk '
-              /^\[workspace\.package\]$/ { in_workspace_package=1; next }
-              in_workspace_package && /^\[/ { exit }
-              in_workspace_package && /^version[[:space:]]*=/ {
-                gsub(/^[^=]*=[[:space:]]*"|"[[:space:]]*$/, "")
-                print
+              /^[[:space:]]*\[[[:space:]]*workspace[[:space:]]*\.[[:space:]]*package[[:space:]]*\][[:space:]]*(#.*)?$/ {
+                in_workspace_package=1
+                next
+              }
+              in_workspace_package && /^[[:space:]]*\[/ { exit }
+              in_workspace_package && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*(#.*)?$/ {
+                value=$0
+                sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/, "", value)
+                sub(/"[[:space:]]*(#.*)?$/, "", value)
+                print value
                 exit
               }
             ' Cargo.toml)
@@ -1394,11 +1399,16 @@ jobs:
         run: |
           set -euo pipefail
           package_version=$(awk '
-            /^\[workspace\.package\]$/ { in_workspace_package=1; next }
-            in_workspace_package && /^\[/ { exit }
-            in_workspace_package && /^version[[:space:]]*=/ {
-              gsub(/^[^=]*=[[:space:]]*"|"[[:space:]]*$/, "")
-              print
+            /^[[:space:]]*\[[[:space:]]*workspace[[:space:]]*\.[[:space:]]*package[[:space:]]*\][[:space:]]*(#.*)?$/ {
+              in_workspace_package=1
+              next
+            }
+            in_workspace_package && /^[[:space:]]*\[/ { exit }
+            in_workspace_package && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*(#.*)?$/ {
+              value=$0
+              sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/, "", value)
+              sub(/"[[:space:]]*(#.*)?$/, "", value)
+              print value
               exit
             }
           ' Cargo.toml)

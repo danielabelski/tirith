@@ -75,6 +75,23 @@ fn joined_run_scripts(job: &serde_yaml::Mapping) -> String {
         .join("\n")
 }
 
+fn named_step_run<'a>(job: &'a serde_yaml::Mapping, name: &str) -> &'a str {
+    yaml_key(job, "steps")
+        .as_sequence()
+        .expect("workflow job steps sequence")
+        .iter()
+        .filter_map(serde_yaml::Value::as_mapping)
+        .find(|step| {
+            step.get(serde_yaml::Value::String("name".to_string()))
+                .and_then(serde_yaml::Value::as_str)
+                == Some(name)
+        })
+        .unwrap_or_else(|| panic!("workflow job is missing step {name:?}"))
+        .get(serde_yaml::Value::String("run".to_string()))
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or_else(|| panic!("workflow step {name:?} must have a run script"))
+}
+
 fn uses_is_immutably_pinned(uses: &str) -> bool {
     if uses.starts_with("./") {
         return true;
@@ -430,6 +447,56 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
         !release_runs.contains("--certificate-identity-regexp"),
         "release verification must not broaden signer authority with an identity regexp"
     );
+}
+
+#[test]
+fn portable_release_version_resolvers_accept_toml_inline_comments() {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow_path = repository_root.join(".github/workflows/release.yml");
+    let workflow = std::fs::read_to_string(&workflow_path).expect("read release workflow");
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(&workflow).expect("release workflow must be valid YAML");
+    let jobs = yaml_key(
+        document.as_mapping().expect("release workflow root"),
+        "jobs",
+    )
+    .as_mapping()
+    .expect("release workflow jobs");
+
+    let fixture = tempfile::tempdir().expect("temporary Cargo manifest fixture");
+    std::fs::write(
+        fixture.path().join("Cargo.toml"),
+        "[ workspace . package ] # shared metadata\n  version = \"1.2.3-beta.1\"  # release version\n",
+    )
+    .expect("write Cargo manifest fixture");
+
+    for (job_name, output_env, expected_line) in [
+        (
+            "npm-package-validation",
+            "GITHUB_OUTPUT",
+            "version=1.2.3-beta.1",
+        ),
+        ("build-rpm", "GITHUB_ENV", "PACKAGE_VERSION=1.2.3-beta.1"),
+    ] {
+        let output_path = fixture.path().join(format!("{job_name}.output"));
+        let script = named_step_run(workflow_job(jobs, job_name), "Resolve package version");
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", script])
+            .current_dir(fixture.path())
+            .env("GITHUB_REF", "refs/heads/version-parser-test")
+            .env("GITHUB_REF_NAME", "version-parser-test")
+            .env(output_env, &output_path)
+            .output()
+            .unwrap_or_else(|error| panic!("run {job_name} version resolver: {error}"));
+        assert!(
+            output.status.success(),
+            "{job_name} version resolver rejected valid TOML: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let resolved = std::fs::read_to_string(&output_path)
+            .unwrap_or_else(|error| panic!("read {job_name} output: {error}"));
+        assert_eq!(resolved.trim(), expected_line);
+    }
 }
 
 #[test]
