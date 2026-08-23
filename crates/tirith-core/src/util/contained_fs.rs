@@ -32,6 +32,25 @@ pub(crate) enum ContainedFilePreimage {
     },
 }
 
+/// Bytes and identity sampled from one retained file handle. Platform readers
+/// also verify the handle's generation metadata before and after streaming, so
+/// this value can never combine one file's bytes with another file's identity.
+#[derive(Debug)]
+struct ContainedReadSnapshot {
+    bytes: Vec<u8>,
+    identity: String,
+}
+
+impl ContainedReadSnapshot {
+    fn preimage(&self) -> ContainedFilePreimage {
+        ContainedFilePreimage::Present {
+            identity: self.identity.clone(),
+            len: u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
+            sha256: crate::command_card::sha256_hex(&self.bytes),
+        }
+    }
+}
+
 impl ContainedFilePreimage {
     pub(crate) fn projection_sha256(&self) -> String {
         let projection = match self {
@@ -116,19 +135,13 @@ impl ContainedAtomicFile {
     /// capability, refusing a final symlink and bounding the complete read.
     pub fn read_capped(&self, cap: u64) -> Result<Vec<u8>, OpenRegularError> {
         match self.inner.read_capped(cap) {
-            Ok(bytes) => {
-                let identity = self.inner.named_identity().map_err(OpenRegularError::Io)?;
-                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                let preimage = ContainedFilePreimage::Present {
-                    identity,
-                    len,
-                    sha256: crate::command_card::sha256_hex(&bytes),
-                };
+            Ok(snapshot) => {
+                let preimage = snapshot.preimage();
                 *self
                     .observed_preimage
                     .lock()
                     .map_err(|error| OpenRegularError::Io(poisoned_lock(error)))? = Some(preimage);
-                Ok(bytes)
+                Ok(snapshot.bytes)
             }
             Err(OpenRegularError::NotFound) => {
                 *self
@@ -249,11 +262,7 @@ impl ContainedAtomicFile {
             Some(ContainedFilePreimage::Absent) => 0,
             None => return Ok(()),
         }) {
-            Ok(bytes) => ContainedFilePreimage::Present {
-                identity: self.inner.named_identity()?,
-                len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                sha256: crate::command_card::sha256_hex(&bytes),
-            },
+            Ok(snapshot) => snapshot.preimage(),
             Err(OpenRegularError::NotFound) => ContainedFilePreimage::Absent,
             Err(_) => return Err(stale_preimage()),
         };
@@ -363,7 +372,7 @@ mod platform {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::{Component, Path, PathBuf};
 
-    use super::OpenRegularError;
+    use super::{ContainedReadSnapshot, OpenRegularError};
 
     const MAX_TRUSTED_SYMLINKS: usize = 40;
     const MAX_SYMLINK_BYTES: usize = 64 * 1024;
@@ -378,6 +387,23 @@ mod platform {
         /// and proves the retained fd remains the only authority.
         static DIRECTORY_OPEN_TEST_HOOK: std::cell::RefCell<DirectoryOpenTestHook> =
             std::cell::RefCell::new(None);
+        /// Runs after a contained file's bytes are read but before its retained
+        /// handle is revalidated. Tests replace the visible name here to prove
+        /// bytes and identity still come from the one held descriptor.
+        static READ_SNAPSHOT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    fn stable_read_generation(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.len() == after.len()
+            && before.mode() == after.mode()
+            && before.nlink() == after.nlink()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
     }
 
     fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -867,7 +893,10 @@ mod platform {
             })
         }
 
-        pub(super) fn read_capped(&self, cap: u64) -> Result<Vec<u8>, OpenRegularError> {
+        pub(super) fn read_capped(
+            &self,
+            cap: u64,
+        ) -> Result<ContainedReadSnapshot, OpenRegularError> {
             // SAFETY: fd/name are live and the returned descriptor is uniquely
             // transferred to `File` on success.
             let fd = unsafe {
@@ -904,26 +933,20 @@ mod platform {
             if bytes.len() as u64 > cap {
                 return Err(OpenRegularError::TooLarge);
             }
-            Ok(bytes)
-        }
-
-        pub(super) fn named_identity(&self) -> io::Result<String> {
-            let fd = unsafe {
-                libc::openat(
-                    self.parent.as_raw_fd(),
-                    self.name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
+            #[cfg(test)]
+            READ_SNAPSHOT_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
+            let after = file.metadata().map_err(OpenRegularError::Io)?;
+            if !stable_read_generation(&metadata, &after) {
+                return Err(OpenRegularError::Io(super::stale_preimage()));
             }
-            let file = unsafe { File::from_raw_fd(fd) };
-            let metadata = file.metadata()?;
-            if !metadata.is_file() {
-                return Err(invalid_input("contained destination is not a regular file"));
-            }
-            Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+            Ok(ContainedReadSnapshot {
+                bytes,
+                identity: format!("unix:{}:{}", metadata.dev(), metadata.ino()),
+            })
         }
 
         pub(super) fn binding_identity(&self) -> io::Result<(String, String)> {
@@ -1279,11 +1302,74 @@ mod platform {
             DIRECTORY_OPEN_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
         }
 
+        fn clear_read_snapshot_hook() {
+            READ_SNAPSHOT_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+
         fn make_fifo(path: &Path) {
             let encoded = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
             // SAFETY: `encoded` is a live NUL-terminated path and mkfifo does
             // not retain the pointer.
             assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        }
+
+        #[test]
+        fn contained_read_rejects_visible_rename_at_post_read_seam() {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("state.json");
+            let replacement = root.path().join("replacement.json");
+            let displaced = root.path().join("displaced.json");
+            std::fs::write(&destination, b"first identity").unwrap();
+            std::fs::write(&replacement, b"second identity").unwrap();
+            let reader = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
+
+            let swapped = Rc::new(Cell::new(false));
+            let swapped_for_hook = Rc::clone(&swapped);
+            let destination_for_hook = destination.clone();
+            let replacement_for_hook = replacement.clone();
+            let displaced_for_hook = displaced.clone();
+            READ_SNAPSHOT_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    if swapped_for_hook.replace(true) {
+                        return;
+                    }
+                    std::fs::rename(&destination_for_hook, &displaced_for_hook).unwrap();
+                    std::fs::rename(&replacement_for_hook, &destination_for_hook).unwrap();
+                }));
+            });
+
+            let error = reader
+                .read_capped(1024)
+                .expect_err("a rename during the read must invalidate the snapshot");
+            clear_read_snapshot_hook();
+            assert!(matches!(error, OpenRegularError::Io(_)));
+            assert_eq!(std::fs::read(displaced).unwrap(), b"first identity");
+            assert_eq!(std::fs::read(destination).unwrap(), b"second identity");
+        }
+
+        #[test]
+        fn contained_read_rejects_same_size_mutation_during_streaming() {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("state.json");
+            std::fs::write(&destination, b"first generation").unwrap();
+            let reader = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
+
+            let mutated = Rc::new(Cell::new(false));
+            let mutated_for_hook = Rc::clone(&mutated);
+            let destination_for_hook = destination.clone();
+            READ_SNAPSHOT_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    if !mutated_for_hook.replace(true) {
+                        std::fs::write(&destination_for_hook, b"later generation").unwrap();
+                    }
+                }));
+            });
+
+            let error = reader
+                .read_capped(1024)
+                .expect_err("one read must not span a same-size mutation");
+            clear_read_snapshot_hook();
+            assert!(matches!(error, OpenRegularError::Io(_)));
         }
 
         #[test]
@@ -1550,7 +1636,7 @@ mod platform {
     use std::path::{Component, Path, PathBuf};
     use std::ptr::{null, null_mut};
 
-    use super::OpenRegularError;
+    use super::{ContainedReadSnapshot, OpenRegularError};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
@@ -1563,9 +1649,10 @@ mod platform {
         HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
-        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        CreateFileW, FileBasicInfo, FileDispositionInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
         FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE,
@@ -2097,6 +2184,65 @@ mod platform {
         ))
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct WindowsReadGeneration {
+        volume: u32,
+        index: u64,
+        size: u64,
+        links: u32,
+        attributes: u32,
+        creation_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+    }
+
+    fn read_generation(handle: HANDLE, display: &Path) -> io::Result<WindowsReadGeneration> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: handle is live and `info` is writable.
+        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return Err(with_context(
+                "inspect contained read generation",
+                display.display(),
+                io::Error::last_os_error(),
+            ));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+        {
+            return Err(invalid_input(format!(
+                "refusing reparse or non-regular contained destination {}",
+                display.display()
+            )));
+        }
+        let mut basic = FILE_BASIC_INFO::default();
+        // SAFETY: handle is live and the typed output buffer has the advertised size.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(with_context(
+                "inspect contained file change time",
+                display.display(),
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(WindowsReadGeneration {
+            volume: info.dwVolumeSerialNumber,
+            index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+            links: info.nNumberOfLinks,
+            attributes: basic.FileAttributes,
+            creation_time: basic.CreationTime,
+            last_write_time: basic.LastWriteTime,
+            change_time: basic.ChangeTime,
+        })
+    }
+
     fn inspect_destination(
         parent: &HeldDirectory,
         name: &OsStr,
@@ -2251,7 +2397,10 @@ mod platform {
             })
         }
 
-        pub(super) fn read_capped(&self, cap: u64) -> Result<Vec<u8>, OpenRegularError> {
+        pub(super) fn read_capped(
+            &self,
+            cap: u64,
+        ) -> Result<ContainedReadSnapshot, OpenRegularError> {
             let handle = match open_named_file(
                 &self.parent,
                 &self.name,
@@ -2273,14 +2422,14 @@ mod platform {
                     return Err(OpenRegularError::Io(error));
                 }
             };
-            let size = inspect_regular(handle.0, &self.display).map_err(|error| {
+            let before = read_generation(handle.0, &self.display).map_err(|error| {
                 if error.kind() == io::ErrorKind::InvalidInput {
                     OpenRegularError::NotRegularFile
                 } else {
                     OpenRegularError::Io(error)
                 }
             })?;
-            if size > cap {
+            if before.size > cap {
                 return Err(OpenRegularError::TooLarge);
             }
             let mut file = handle.into_file();
@@ -2292,19 +2441,15 @@ mod platform {
             if bytes.len() as u64 > cap {
                 return Err(OpenRegularError::TooLarge);
             }
-            Ok(bytes)
-        }
-
-        pub(super) fn named_identity(&self) -> io::Result<String> {
-            let handle = open_named_file(
-                &self.parent,
-                &self.name,
-                FILE_GENERIC_READ | FILE_READ_ATTRIBUTES,
-                RelativeFileDisposition::OpenExisting,
-            )?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "contained file is absent"))?;
-            inspect_regular(handle.0, &self.display)?;
-            handle_identity(handle.0, &self.display)
+            let after = read_generation(file.as_raw_handle(), &self.display)
+                .map_err(OpenRegularError::Io)?;
+            if before != after {
+                return Err(OpenRegularError::Io(super::stale_preimage()));
+            }
+            Ok(ContainedReadSnapshot {
+                bytes,
+                identity: format!("windows:{}:{}", before.volume, before.index),
+            })
         }
 
         pub(super) fn binding_identity(&self) -> io::Result<(String, String)> {
@@ -2843,7 +2988,7 @@ mod platform {
     use std::io;
     use std::path::Path;
 
-    use super::OpenRegularError;
+    use super::{ContainedReadSnapshot, OpenRegularError};
 
     fn unsupported() -> io::Error {
         io::Error::new(
@@ -2875,12 +3020,11 @@ mod platform {
             Err(unsupported())
         }
 
-        pub(super) fn read_capped(&self, _cap: u64) -> Result<Vec<u8>, OpenRegularError> {
+        pub(super) fn read_capped(
+            &self,
+            _cap: u64,
+        ) -> Result<ContainedReadSnapshot, OpenRegularError> {
             Err(OpenRegularError::Io(unsupported()))
-        }
-
-        pub(super) fn named_identity(&self) -> io::Result<String> {
-            Err(unsupported())
         }
 
         pub(super) fn binding_identity(&self) -> io::Result<(String, String)> {

@@ -853,6 +853,53 @@ struct CleanupFrame {
 /// attack. Directory streams themselves are never retained across descent.
 #[cfg(target_os = "linux")]
 const CLEANUP_MAX_DEPTH: usize = 16_384;
+/// Bound total destructive work independently of directory depth. A hostile
+/// capsule can cheaply create enormous zero-byte fanout, so cleanup must return
+/// an honest residue error instead of extending the capsule indefinitely.
+#[cfg(target_os = "linux")]
+const CLEANUP_MAX_ENTRIES: usize = 100_000;
+#[cfg(target_os = "linux")]
+const CLEANUP_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(target_os = "linux")]
+struct CleanupBudget {
+    entries_seen: usize,
+    max_entries: usize,
+    deadline: std::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl CleanupBudget {
+    fn new(max_entries: usize, duration: std::time::Duration) -> Self {
+        Self {
+            entries_seen: 0,
+            max_entries,
+            deadline: std::time::Instant::now() + duration,
+        }
+    }
+
+    fn check_deadline(&self) -> std::io::Result<()> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "cleanup exceeded its time budget; preserving unremoved residue",
+            ));
+        }
+        Ok(())
+    }
+
+    fn observe_entry(&mut self) -> std::io::Result<()> {
+        self.check_deadline()?;
+        if self.entries_seen >= self.max_entries {
+            return Err(std::io::Error::other(format!(
+                "cleanup exceeds the {0}-entry resource limit; preserving unremoved residue",
+                self.max_entries
+            )));
+        }
+        self.entries_seen += 1;
+        Ok(())
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn push_cleanup_frame(
@@ -885,6 +932,19 @@ fn remove_owned_directory_contents_with_hook<F>(
 where
     F: FnMut(i32, &std::ffi::CStr, bool),
 {
+    let mut budget = CleanupBudget::new(CLEANUP_MAX_ENTRIES, CLEANUP_MAX_DURATION);
+    remove_owned_directory_contents_with_hook_and_budget(directory_fd, hook, &mut budget)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owned_directory_contents_with_hook_and_budget<F>(
+    directory_fd: i32,
+    hook: &mut F,
+    budget: &mut CleanupBudget,
+) -> std::io::Result<()>
+where
+    F: FnMut(i32, &std::ffi::CStr, bool),
+{
     use std::os::fd::AsRawFd as _;
 
     if unsafe { libc::fchmod(directory_fd, 0o700) } != 0 {
@@ -899,6 +959,7 @@ where
     let mut frames = Vec::<CleanupFrame>::new();
 
     loop {
+        budget.check_deadline()?;
         let observed_current = cleanup_fd_identity(current.as_raw_fd())?;
         if observed_current != current_identity
             || observed_current.file_type != libc::S_IFDIR
@@ -1002,6 +1063,8 @@ where
                 }
             }
         };
+
+        budget.observe_entry()?;
 
         let handle = open_cleanup_entry(current.as_raw_fd(), observed.name.as_c_str())?;
         let identity = cleanup_fd_identity(handle.as_raw_fd())?;
@@ -7460,6 +7523,66 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_cleanup_preserves_residue_after_entry_budget() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().expect("cleanup root");
+        for index in 0..4 {
+            std::fs::write(root.path().join(format!("entry-{index}")), b"payload")
+                .expect("create cleanup entry");
+        }
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root.path())
+            .expect("open cleanup root");
+        let mut budget = CleanupBudget::new(2, std::time::Duration::from_secs(1));
+        let error = remove_owned_directory_contents_with_hook_and_budget(
+            handle.as_raw_fd(),
+            &mut |_, _, _| {},
+            &mut budget,
+        )
+        .expect_err("cleanup must stop at its entry budget");
+
+        assert!(
+            error.to_string().contains("2-entry resource limit"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().next().is_some(),
+            "budget exhaustion must leave residue instead of claiming complete cleanup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_cleanup_preserves_residue_after_time_budget() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().expect("cleanup root");
+        let marker = root.path().join("marker");
+        std::fs::write(&marker, b"payload").expect("create cleanup entry");
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root.path())
+            .expect("open cleanup root");
+        let mut budget = CleanupBudget::new(100, std::time::Duration::ZERO);
+        let error = remove_owned_directory_contents_with_hook_and_budget(
+            handle.as_raw_fd(),
+            &mut |_, _, _| {},
+            &mut budget,
+        )
+        .expect_err("cleanup must stop at its deadline");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(marker.exists(), "deadline exhaustion must preserve residue");
     }
 
     #[cfg(target_os = "linux")]
