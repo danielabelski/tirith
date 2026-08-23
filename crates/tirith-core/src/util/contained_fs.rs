@@ -377,6 +377,18 @@ mod platform {
     const MAX_TRUSTED_SYMLINKS: usize = 40;
     const MAX_SYMLINK_BYTES: usize = 64 * 1024;
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const PUBLICATION_HOLD_ACCESS: libc::c_int = libc::O_PATH;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const PUBLICATION_HOLD_ACCESS: libc::c_int = libc::O_EVTONLY;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    const PUBLICATION_HOLD_ACCESS: libc::c_int = libc::O_RDONLY | libc::O_NONBLOCK;
+
     #[cfg(test)]
     type DirectoryOpenTestHook = Option<Box<dyn FnMut(&OsStr)>>;
 
@@ -687,6 +699,17 @@ mod platform {
         },
     }
 
+    /// Namespace identity plus a retained handle for an existing destination.
+    ///
+    /// Keeping the handle live until publication prevents the filesystem from
+    /// recycling the observed inode after an unlink/recreate race. A bare
+    /// `(device, inode)` comparison is otherwise insufficient on filesystems
+    /// that immediately reuse the just-freed inode number.
+    struct PublicationSnapshot {
+        preimage: PublicationPreimage,
+        _held: Option<File>,
+    }
+
     fn inspect_final(parent: &File, name: &CString) -> io::Result<Option<FinalEntry>> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: fd/name are live, `stat` points to writable storage, and
@@ -734,6 +757,68 @@ mod platform {
         display: &Path,
     ) -> io::Result<PublicationPreimage> {
         classify_publication_preimage(inspect_final(parent, name)?, display)
+    }
+
+    fn publication_snapshot(
+        parent: &File,
+        name: &CString,
+        display: &Path,
+    ) -> io::Result<PublicationSnapshot> {
+        let preimage = publication_preimage(parent, name, display)?;
+        if preimage == PublicationPreimage::Absent {
+            return Ok(PublicationSnapshot {
+                preimage,
+                _held: None,
+            });
+        }
+
+        // The namespace probe above rejects every stable non-regular shape
+        // without opening it. Use a metadata-only handle where the platform
+        // provides one (and nonblocking read access elsewhere), then prove the
+        // held object is still the same regular inode the probe observed.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                PUBLICATION_HOLD_ACCESS | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(permission_denied(format!(
+                "contained publication destination {} changed while its identity was retained: {}",
+                display.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: `fd` is a newly owned descriptor.
+        let held = unsafe { File::from_raw_fd(fd) };
+        let metadata = held.metadata()?;
+        if !metadata.is_file() {
+            return Err(permission_denied(format!(
+                "contained publication destination {} changed to a non-regular object",
+                display.display()
+            )));
+        }
+        let held_device = libc::dev_t::try_from(metadata.dev()).map_err(|_| {
+            permission_denied(format!(
+                "contained publication destination {} has an unrepresentable device identity",
+                display.display()
+            ))
+        })?;
+        let held_preimage = PublicationPreimage::Regular {
+            device: held_device,
+            inode: metadata.ino(),
+        };
+        if held_preimage != preimage {
+            return Err(permission_denied(format!(
+                "contained publication destination {} changed while its identity was retained",
+                display.display()
+            )));
+        }
+        Ok(PublicationSnapshot {
+            preimage,
+            _held: Some(held),
+        })
     }
 
     fn classify_publication_preimage(
@@ -1117,8 +1202,8 @@ mod platform {
             // sensitive callers retain their stronger digest
             // preimage check in `before_publish`.
             let expected_destination =
-                publication_preimage(&self.parent, &self.name, &self.display)?;
-            if !overwrite && expected_destination != PublicationPreimage::Absent {
+                publication_snapshot(&self.parent, &self.name, &self.display)?;
+            if !overwrite && expected_destination.preimage != PublicationPreimage::Absent {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("{} already exists", self.display.display()),
@@ -1178,7 +1263,7 @@ mod platform {
             // leaves every sibling link and the shared old inode untouched.
             let current_destination =
                 publication_preimage(&self.parent, &self.name, &self.display)?;
-            if current_destination != expected_destination {
+            if current_destination != expected_destination.preimage {
                 return Err(permission_denied(format!(
                     "contained publication destination {} changed before atomic publication",
                     self.display.display()
@@ -2267,11 +2352,18 @@ mod platform {
         Regular { volume: u32, index: u64 },
     }
 
-    fn publication_preimage(
+    /// Namespace identity plus the live handle that keeps an existing file ID
+    /// from being recycled before the final publication comparison.
+    struct PublicationSnapshot {
+        preimage: PublicationPreimage,
+        _held: Option<OwnedHandle>,
+    }
+
+    fn publication_snapshot(
         parent: &HeldDirectory,
         name: &OsStr,
         display: &Path,
-    ) -> io::Result<PublicationPreimage> {
+    ) -> io::Result<PublicationSnapshot> {
         let Some(handle) = open_named_file(
             parent,
             name,
@@ -2279,7 +2371,10 @@ mod platform {
             RelativeFileDisposition::OpenExisting,
         )?
         else {
-            return Ok(PublicationPreimage::Absent);
+            return Ok(PublicationSnapshot {
+                preimage: PublicationPreimage::Absent,
+                _held: None,
+            });
         };
         inspect_regular(handle.0, display)?;
 
@@ -2292,10 +2387,21 @@ mod platform {
                 io::Error::last_os_error(),
             ));
         }
-        Ok(PublicationPreimage::Regular {
-            volume: info.dwVolumeSerialNumber,
-            index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        Ok(PublicationSnapshot {
+            preimage: PublicationPreimage::Regular {
+                volume: info.dwVolumeSerialNumber,
+                index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            },
+            _held: Some(handle),
         })
+    }
+
+    fn publication_preimage(
+        parent: &HeldDirectory,
+        name: &OsStr,
+        display: &Path,
+    ) -> io::Result<PublicationPreimage> {
+        Ok(publication_snapshot(parent, name, display)?.preimage)
     }
 
     pub(super) struct ContainedAtomicFile {
@@ -2616,8 +2722,8 @@ mod platform {
             F: FnOnce() -> io::Result<()>,
         {
             let expected_destination =
-                publication_preimage(&self.parent, &self.name, &self.display)?;
-            if expected_destination != PublicationPreimage::Absent && !overwrite {
+                publication_snapshot(&self.parent, &self.name, &self.display)?;
+            if expected_destination.preimage != PublicationPreimage::Absent && !overwrite {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("{} already exists", self.display.display()),
@@ -2651,7 +2757,7 @@ mod platform {
             // RootDirectory remains the retained parent handle.
             let current_destination =
                 publication_preimage(&self.parent, &self.name, &self.display)?;
-            if current_destination != expected_destination {
+            if current_destination != expected_destination.preimage {
                 return Err(permission_denied(format!(
                     "contained publication destination {} changed before atomic publication",
                     self.display.display()
