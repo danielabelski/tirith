@@ -176,6 +176,57 @@ impl Db {
                 .map_err(|e| AppError::Internal(format!("migration price_id→product_id: {e}")))?;
         }
 
+        // Older releases persisted the complete provider event in dead_letter,
+        // including customer email and arbitrary metadata. The newtype below
+        // prevents new unsafe writes, but that compile-time invariant cannot
+        // clean rows already on disk. Rewrite every retained row through the
+        // same allowlist on startup; malformed legacy JSON is reduced to the
+        // trusted relational columns rather than preserved verbatim.
+        let legacy_dead_letters = match conn.prepare(
+            "SELECT id, event_type, occurred_at, subscription_id, payload FROM dead_letter",
+        ) {
+            Ok(mut statement) => statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|e| AppError::Internal(format!("migration read dead-letter: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Internal(format!("migration collect dead-letter: {e}")))?,
+            // The direct legacy-schema migration test constructs only the
+            // subscriptions table. Production `Db::open` creates dead_letter
+            // before migrations, so absence is a test/partial-schema no-op.
+            Err(_) => Vec::new(),
+        };
+        for (id, event_type, occurred_at, subscription_id, payload) in legacy_dead_letters {
+            let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
+            let data = parsed.as_ref().and_then(|value| value.get("data"));
+            let safe_text = |field: &str| {
+                data.and_then(|value| value.get(field))
+                    .and_then(serde_json::Value::as_str)
+            };
+            let redacted = RedactedDeadLetterPayload::lifecycle(
+                &event_type,
+                occurred_at.as_deref(),
+                subscription_id.as_deref(),
+                safe_text("status"),
+                safe_text("product_id"),
+                safe_text("checkout_id"),
+                safe_text("customer_id"),
+                safe_text("tier"),
+            );
+            conn.execute(
+                "UPDATE dead_letter SET payload=?1 WHERE id=?2",
+                params![redacted.into_inner(), id],
+            )
+            .map_err(|e| AppError::Internal(format!("migration redact dead-letter: {e}")))?;
+        }
+
         Ok(())
     }
 
@@ -2327,5 +2378,113 @@ mod tests {
         assert!(conn
             .prepare("SELECT price_id FROM subscriptions LIMIT 0")
             .is_err());
+    }
+
+    #[test]
+    fn migration_redacts_retained_legacy_dead_letter_payloads() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dead_letter (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL UNIQUE,
+                 subscription_id TEXT,
+                 event_type TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 occurred_at TEXT,
+                 payload TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        let legacy = serde_json::json!({
+            "type": "subscription.past_due",
+            "timestamp": "2024-01-02T03:04:05.123456Z",
+            "data": {
+                "id": "payload-substitution-must-not-win",
+                "status": "past_due",
+                "product_id": "prod_team",
+                "checkout_id": "checkout_1",
+                "customer_id": "customer_1",
+                "tier": "team",
+                "customer": {"email": "legacy-private@example.com"},
+                "metadata": {"api_key": "legacy-secret-canary"}
+            }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO dead_letter
+             (event_id, subscription_id, event_type, reason, occurred_at, payload)
+             VALUES ('evt_legacy', 'sub_trusted', 'subscription.past_due',
+                     'unresolvable_product', '2024-01-02T03:04:05.123456Z', ?1)",
+            params![legacy],
+        )
+        .unwrap();
+
+        Db::migrate(&conn).unwrap();
+
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM dead_letter WHERE event_id='evt_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!payload.contains("legacy-private@example.com"));
+        assert!(!payload.contains("legacy-secret-canary"));
+        assert!(!payload.contains("payload-substitution-must-not-win"));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["type"], "subscription.past_due");
+        assert_eq!(parsed["timestamp"], "2024-01-02T03:04:05.123456Z");
+        assert_eq!(parsed["data"]["id"], "sub_trusted");
+        assert_eq!(parsed["data"]["status"], "past_due");
+        assert_eq!(parsed["data"]["product_id"], "prod_team");
+        assert_eq!(parsed["data"]["tier"], "team");
+
+        // Idempotency matters because this migration runs at every startup.
+        Db::migrate(&conn).unwrap();
+        let after_second_run: String = conn
+            .query_row(
+                "SELECT payload FROM dead_letter WHERE event_id='evt_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_second_run, payload);
+    }
+
+    #[test]
+    fn migration_reduces_malformed_dead_letters_to_relational_identity() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dead_letter (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL UNIQUE,
+                 subscription_id TEXT,
+                 event_type TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 occurred_at TEXT,
+                 payload TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO dead_letter
+             (event_id, subscription_id, event_type, reason, occurred_at, payload)
+             VALUES ('evt_bad', 'sub_safe', 'subscription.revoked',
+                     'unorderable_revocation:InvalidStored', NULL,
+                     'not-json legacy-secret-canary');",
+        )
+        .unwrap();
+
+        Db::migrate(&conn).unwrap();
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM dead_letter WHERE event_id='evt_bad'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!payload.contains("legacy-secret-canary"));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["type"], "subscription.revoked");
+        assert_eq!(parsed["data"]["id"], "sub_safe");
     }
 }
