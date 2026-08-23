@@ -292,16 +292,15 @@ fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let shadow_marker = tmpdir.path().join("shadowed-export-ran");
     let hook = hook_path();
-    let script = format!(
-        "export() {{ touch '{}'; }}; \
-         readonly POSIXLY_CORRECT; source '{hook}' 2>/dev/null; \
-         /bin/sh -c 'printf \"CHILD_MODE=%s\\nCHILD_PROT=%s\\n\" \
-           \"$TIRITH_BASH_EFFECTIVE_MODE\" \"$TIRITH_BASH_EFFECTIVE_PROTECTION\"'",
-        shadow_marker.display()
-    );
+    let script = r#"export() { touch "$TIRITH_TEST_SHADOW_MARKER"; };
+         readonly POSIXLY_CORRECT; source "$TIRITH_TEST_HOOK" 2>/dev/null;
+         /bin/sh -c 'printf "CHILD_MODE=%s\nCHILD_PROT=%s\n" \
+           "$TIRITH_BASH_EFFECTIVE_MODE" "$TIRITH_BASH_EFFECTIVE_PROTECTION"'"#;
     let output = Command::new("bash")
-        .args(["--norc", "--noprofile", "-c", &script])
+        .args(["--norc", "--noprofile", "-c", script])
         .env_clear()
+        .env("TIRITH_TEST_HOOK", &hook)
+        .env("TIRITH_TEST_SHADOW_MARKER", &shadow_marker)
         .env("PATH", path_with_tirith_under_test())
         .env("TIRITH_BASH_EFFECTIVE_MODE", "preexec")
         .env("TIRITH_BASH_EFFECTIVE_PROTECTION", "blocks")
