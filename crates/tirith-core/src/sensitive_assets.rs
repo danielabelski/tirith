@@ -961,6 +961,10 @@ pub(crate) const MAX_BIP39_SCAN_INPUT_BYTES: usize = 16 * 1024 * 1024;
 // many isolated BIP-39 words as incomplete even when punctuation prevented a
 // candidate phrase from forming.
 pub(crate) const MAX_BIP39_TIER1_WORD_TOKENS: usize = 32_768;
+/// Bound regex tokenization plus dictionary lookups in the authoritative pass.
+/// The byte ceiling alone still permits millions of short words and therefore
+/// does not bound CPU work.
+pub(crate) const MAX_BIP39_WORD_OPERATIONS: usize = 131_072;
 pub(crate) const MAX_BIP39_CHECKSUM_CANDIDATES: usize = 16_384;
 pub(crate) const MAX_BIP39_MATCHES: usize = 1_024;
 const MAX_BIP39_WORDS_PER_PHRASE: usize = 24;
@@ -974,6 +978,7 @@ struct Bip39WordRecord {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Bip39ScanStats {
+    word_operations: usize,
     bip39_word_tokens: usize,
     checksum_candidates: usize,
     confirmed_matches: usize,
@@ -1057,7 +1062,13 @@ fn has_bip39_word_run_candidate(input: &str) -> bool {
     let mut run = 0usize;
     let mut word_tokens = 0usize;
     let mut cursor = 0usize;
-    for matched in WORD_RE.find_iter(input) {
+    for (word_operations, matched) in WORD_RE.find_iter(input).enumerate() {
+        if word_operations == MAX_BIP39_WORD_OPERATIONS {
+            // The cheap gate is inconclusive at its work ceiling. Route to the
+            // authoritative pass, which applies the same deterministic ceiling
+            // and reports AnalysisIncomplete rather than allowing partial work.
+            return true;
+        }
         if !input[cursor..matched.start()]
             .chars()
             .all(char::is_whitespace)
@@ -2122,6 +2133,15 @@ fn record_bip39_word(result: &mut Bip39ScanResult) {
     result.stats.bip39_word_tokens += 1;
 }
 
+fn record_bip39_word_operation(result: &mut Bip39ScanResult) -> bool {
+    if result.stats.word_operations == MAX_BIP39_WORD_OPERATIONS {
+        result.incomplete = true;
+        return false;
+    }
+    result.stats.word_operations += 1;
+    true
+}
+
 fn check_bip39_candidate(result: &mut Bip39ScanResult, words: &[Bip39WordRecord]) -> Option<bool> {
     if result.stats.checksum_candidates == MAX_BIP39_CHECKSUM_CANDIDATES {
         result.incomplete = true;
@@ -2178,6 +2198,9 @@ fn explicit_mnemonic_spans(input: &str, result: &mut Bip39ScanResult) {
             .find_iter(&input[context.end()..])
             .take(MAX_BIP39_WORDS_PER_PHRASE)
         {
+            if !record_bip39_word_operation(result) {
+                return;
+            }
             let range = (context.end() + matched.start())..(context.end() + matched.end());
             let gap = &input[cursor..range.start];
             if !gap
@@ -2268,6 +2291,9 @@ fn global_mnemonic_spans(input: &str, result: &mut Bip39ScanResult) {
     let mut window = VecDeque::with_capacity(MAX_BIP39_WORDS_PER_PHRASE);
     let mut cursor = 0usize;
     for matched in WORD_RE.find_iter(input) {
+        if !record_bip39_word_operation(result) {
+            return;
+        }
         if !input[cursor..matched.start()]
             .chars()
             .all(char::is_whitespace)
@@ -3996,18 +4022,35 @@ mod tests {
     }
 
     #[test]
-    fn ten_mib_non_bip39_file_scan_is_complete_without_owned_word_records() {
+    fn ten_mib_short_word_stream_stops_at_the_operation_budget() {
         let input = "a ".repeat(5 * 1024 * 1024);
         assert_eq!(input.len(), 10 * 1024 * 1024);
 
         let mut scan = Bip39ScanResult::default();
         global_mnemonic_spans(&input, &mut scan);
-        assert!(!scan.incomplete);
+        assert!(scan.incomplete);
         assert!(scan.spans.is_empty());
+        assert_eq!(scan.stats.word_operations, MAX_BIP39_WORD_OPERATIONS);
         assert_eq!(scan.stats.bip39_word_tokens, 0);
         assert_eq!(scan.stats.checksum_candidates, 0);
         assert_eq!(scan.stats.max_rolling_words, 0);
-        assert!(!tier1_sensitive_asset_candidate_deep(&input));
+        assert!(tier1_sensitive_asset_candidate_deep(&input));
+    }
+
+    #[test]
+    fn near_transport_ceiling_adversarial_runs_have_deterministic_work() {
+        let pattern = format!("{}qzxq ", "abandon ".repeat(11));
+        let repeats = (MAX_BIP39_SCAN_INPUT_BYTES - 1) / pattern.len();
+        let input = pattern.repeat(repeats);
+        assert!(input.len() > 15 * 1024 * 1024);
+        assert!(input.len() <= MAX_BIP39_SCAN_INPUT_BYTES);
+
+        let mut scan = Bip39ScanResult::default();
+        global_mnemonic_spans(&input, &mut scan);
+        assert!(scan.incomplete);
+        assert!(scan.spans.is_empty());
+        assert_eq!(scan.stats.word_operations, MAX_BIP39_WORD_OPERATIONS);
+        assert_eq!(scan.stats.checksum_candidates, 0);
     }
 
     #[test]

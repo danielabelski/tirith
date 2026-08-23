@@ -3212,11 +3212,10 @@ mod tests {
         // C2: a benign response above the former 1 MiB scan cap is now scanned in
         // full and allowed under BOTH fail modes. The independent presentation
         // cap compacts the already-scanned response before forwarding it.
-        // `ordinary` and `safe` are BIP-39 dictionary words, but punctuation and
-        // the non-dictionary word `prose` keep every run below 12 words. A global
-        // dictionary-hit budget must not turn this ordinary prose into a secret.
-        let huge = "ordinary safe prose.\n".repeat(50_000);
-        assert_eq!(huge.len(), 1_050_000);
+        // Large byte volume remains supported when token work is bounded too.
+        // The punctuation padding crosses the former byte ceiling without
+        // creating an attacker-controlled millions-of-short-words workload.
+        let huge = "safe prose. ################\n".repeat(50_000);
         assert!(huge.len() > FORMER_SCAN_CAP);
         for fail_mode_closed in [true, false] {
             let mut result = ToolCallResult {
