@@ -84,7 +84,10 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
                 "id": rule_str,
                 "shortDescription": {
                     "text": if custom {
-                        format!("Custom rule: {}", rule_str.trim_start_matches("custom/"))
+                        format!(
+                            "Custom rule: {}",
+                            rule_str.strip_prefix("custom/").unwrap_or(&rule_str)
+                        )
                     } else {
                         project_sarif_text(&f.finding.title)
                     }

@@ -75,7 +75,7 @@ pub fn scan(path: &Path, json: bool) -> i32 {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
-    let mut verdict = engine::analyze(&ctx);
+    let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
 
     // Two layers the general `tirith scan` skips, opted back in for logs:
     //   * Credentials — FileScan skips them (source-file secrets are an
@@ -83,15 +83,15 @@ pub fn scan(path: &Path, json: bool) -> i32 {
     //   * Prompt-injection seeds — FileScan skips them so a repo-wide scan
     //     doesn't false-flag security docs quoting injection phrases; agent
     //     output / build logs are exactly where the rule fits.
-    let cred_findings =
+    let mut late_findings =
         tirith_core::rules::credential::check(&content, ShellType::Posix, ScanContext::Paste);
-    verdict.findings.extend(cred_findings);
-
     let prompt_findings = tirith_core::rules::prompt_injection::check(&content);
-    verdict.findings.extend(prompt_findings);
+    late_findings.extend(prompt_findings);
 
-    // Recompute the action now that the extra rule layers are folded in.
-    verdict.action = tirith_core::verdict::action_from_findings(&verdict.findings);
+    // These two log-specific rule layers run after the engine pass, so merge
+    // them through the same policy seam as every other late producer. This
+    // applies per-rule severity overrides before deriving the final action.
+    tirith_core::escalation::merge_late_findings(&mut verdict, late_findings, &policy);
 
     if json {
         return emit_scan_json(path, &verdict);

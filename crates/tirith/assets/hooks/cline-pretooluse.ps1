@@ -13,6 +13,14 @@ $ErrorActionPreference = 'Stop'
 $env:TIRITH_BIN = '__TIRITH_BIN__'
 $env:TIRITH_HOOK_PROTOCOL = 'cline'
 
+function Write-TirithFallback([string]$message) {
+    if ($env:TIRITH_FAIL_OPEN -eq '1') {
+        Write-Output '{"cancel":false}'
+    } else {
+        [ordered]@{ cancel = $true; errorMessage = $message } | ConvertTo-Json -Compress
+    }
+}
+
 # Read the whole event before spawning, so a closed stdin cannot deadlock.
 $raw = [Console]::In.ReadToEnd()
 
@@ -20,17 +28,32 @@ $pythonPath = '__PYTHON_BIN__'
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
     # No interpreter to run the adapter. Cline runs the tool when a hook fails,
     # so a fail-open opt-out is honoured; otherwise cancel, matching the adapter.
-    if ($env:TIRITH_FAIL_OPEN -eq '1') { Write-Output '{"cancel":false}'; exit 0 }
-    Write-Output '{"cancel":true,"errorMessage":"tirith: configured Python interpreter is unavailable; re-run setup or set TIRITH_FAIL_OPEN=1"}'
+    Write-TirithFallback 'tirith: configured Python interpreter is unavailable; re-run setup or set TIRITH_FAIL_OPEN=1'
     exit 0
 }
 
-$decision = $raw | & $pythonPath '__ADAPTER_PATH__'
-$code = $LASTEXITCODE
+try {
+    $decision = ($raw | & $pythonPath '__ADAPTER_PATH__' | Out-String).Trim()
+    $code = $LASTEXITCODE
+} catch {
+    Write-TirithFallback 'tirith: hook adapter could not be started; re-run setup or set TIRITH_FAIL_OPEN=1'
+    exit 0
+}
 
-if (($code -ne 0) -and (-not $decision)) {
-    if ($env:TIRITH_FAIL_OPEN -eq '1') { Write-Output '{"cancel":false}'; exit 0 }
-    Write-Output '{"cancel":true,"errorMessage":"tirith: hook adapter exited without a decision"}'
+if (-not $decision) {
+    Write-TirithFallback "tirith: hook adapter exited without a decision (exit code $code)"
+    exit 0
+}
+
+# A malformed stdout value is equivalent to no decision: Cline otherwise
+# treats a hook parse failure as permission to continue.
+try {
+    $parsedDecision = $decision | ConvertFrom-Json -ErrorAction Stop
+    if (($null -eq $parsedDecision.cancel) -or ($parsedDecision.cancel -isnot [bool])) {
+        throw 'decision is missing a boolean cancel field'
+    }
+} catch {
+    Write-TirithFallback 'tirith: hook adapter returned an invalid decision'
     exit 0
 }
 

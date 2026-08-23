@@ -291,7 +291,9 @@ fn builtin_redaction_candidate(index: usize, input: &str) -> bool {
         3 => input.contains("ghs_"),
         5 => input.contains("xox"),
         6 => input.contains('@'),
-        _ => false,
+        // A future pattern without a paired fast-path check must still reach
+        // the authoritative regex pass instead of failing open.
+        _ => true,
     }
 }
 

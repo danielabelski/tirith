@@ -2432,6 +2432,10 @@ else
   # publish no protection claim; an absolute executable is immune to function
   # and alias shadowing, so the interactive failure remains visible.
   TIRITH_STATUS=off
+  # Do not invoke `export` here: this branch exists because builtin identity is
+  # untrusted, and an imported `export` function could run attacker code. An
+  # inherited exported effective-state variable retains its export attribute
+  # when assigned, so child processes cannot keep a stale active value.
   TIRITH_BASH_EFFECTIVE_MODE=off
   TIRITH_BASH_EFFECTIVE_PROTECTION=off
   if [[ $- == *i* ]]; then

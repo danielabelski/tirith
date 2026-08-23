@@ -266,6 +266,36 @@ fn hook_does_not_export_in_noninteractive_shell() {
     );
 }
 
+#[test]
+fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export() {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let shadow_marker = tmpdir.path().join("shadowed-export-ran");
+    let hook = hook_path();
+    let script = format!(
+        "readonly POSIXLY_CORRECT; source '{hook}' 2>/dev/null; \
+         /bin/sh -c 'printf \"CHILD_MODE=%s\\nCHILD_PROT=%s\\n\" \
+           \"$TIRITH_BASH_EFFECTIVE_MODE\" \"$TIRITH_BASH_EFFECTIVE_PROTECTION\"'"
+    );
+    let shadow = format!("() {{ touch '{}'; }}", shadow_marker.display());
+    let output = Command::new("bash")
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env_clear()
+        .env("PATH", path_with_tirith_under_test())
+        .env("TIRITH_BASH_EFFECTIVE_MODE", "preexec")
+        .env("TIRITH_BASH_EFFECTIVE_PROTECTION", "blocks")
+        .env("BASH_FUNC_export%%", shadow)
+        .output()
+        .expect("run bootstrap failure fixture");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("CHILD_MODE=off"), "{stdout}");
+    assert!(stdout.contains("CHILD_PROT=off"), "{stdout}");
+    assert!(
+        !shadow_marker.exists(),
+        "the untrusted export function must never run in the failed-bootstrap branch"
+    );
+}
+
 // --- TIRITH_STATUS: the opt-in prompt indicator (non-exported) ---
 
 #[test]

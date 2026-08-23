@@ -495,8 +495,12 @@ mod tests {
                 ),
             ]);
             let source_address = source.address();
-            let resolver = crate::ssrf_guard::fixture_resolver_with_lookup_for_test(move |_host| {
-                Ok(vec![source_address])
+            let resolver = crate::ssrf_guard::fixture_resolver_with_lookup_for_test(move |host| {
+                if host.starts_with("redirect-target") {
+                    Ok(vec![target_address])
+                } else {
+                    Ok(vec![source_address])
+                }
             });
             let client = crate::ssrf_guard::server_client_builder_with_resolver_for_test(resolver)
                 .redirect(reqwest::redirect::Policy::none())

@@ -18,7 +18,8 @@ pub const TIRITH_HOOK_MARKER: &str = "tirith init";
 /// Reserved lifecycle-command key owned by Tirith.
 pub const TIRITH_HOOK_KEY: &str = "tirith-init";
 
-const TIRITH_HOOK_ARGV: [&str; 4] = ["tirith", "init", "--shell", "auto"];
+/// Canonical argv for Tirith's owned devcontainer lifecycle entry.
+pub const TIRITH_HOOK_ARGV: [&str; 4] = ["tirith", "init", "--shell", "auto"];
 
 /// devcontainer.json and .gitignore are small configuration files; cap reads
 /// so a hostile or broken file cannot force an unbounded allocation.
@@ -216,8 +217,13 @@ pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-fn tirith_hook_value() -> Value {
+/// Return the canonical Tirith lifecycle entry as a JSON value.
+pub fn tirith_hook_value() -> Value {
     json!(TIRITH_HOOK_ARGV)
+}
+
+fn tirith_hook_literal() -> String {
+    serde_json::to_string(&TIRITH_HOOK_ARGV).expect("static Tirith hook argv must serialize")
 }
 
 #[derive(Debug, Clone)]
@@ -388,7 +394,7 @@ fn render_post_create_command(input: &str) -> Result<Option<String>, String> {
                 input,
                 &commands,
                 TIRITH_HOOK_KEY,
-                r#"["tirith", "init", "--shell", "auto"]"#,
+                &tirith_hook_literal(),
             )))
         }
         Value::String(_) | Value::Array(_) => {
@@ -396,8 +402,9 @@ fn render_post_create_command(input: &str) -> Result<Option<String>, String> {
             let property_indent = line_indent(input, member.key_start);
             let child_indent = format!("{property_indent}  ");
             let newline = preferred_newline(input);
+            let hook_literal = tirith_hook_literal();
             let replacement = format!(
-                "{{{newline}{child_indent}\"existing\": {raw_existing},{newline}{child_indent}\"{TIRITH_HOOK_KEY}\": [\"tirith\", \"init\", \"--shell\", \"auto\"]{newline}{property_indent}}}"
+                "{{{newline}{child_indent}\"existing\": {raw_existing},{newline}{child_indent}\"{TIRITH_HOOK_KEY}\": {hook_literal}{newline}{property_indent}}}"
             );
             let mut output = input.to_string();
             output.replace_range(member.value_start..member.value_end, &replacement);
@@ -462,7 +469,7 @@ fn render_container_env(input: &str) -> Result<Option<String>, String> {
 }
 
 fn managed_post_create_object() -> String {
-    format!(r#"{{"{TIRITH_HOOK_KEY}": ["tirith", "init", "--shell", "auto"]}}"#)
+    format!(r#"{{"{TIRITH_HOOK_KEY}": {}}}"#, tirith_hook_literal())
 }
 
 fn insert_jsonc_object_member(input: &str, object: &JsoncObject, key: &str, value: &str) -> String {

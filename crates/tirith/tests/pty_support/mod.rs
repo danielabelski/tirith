@@ -646,10 +646,21 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
 /// marker is read while empty (macOS wins this race, slow CI doesn't — #116).
 /// Polling the filesystem side effect is correct at any machine speed.
 pub fn wait_for_marker(marker: &Path, needle: &str, timeout: Duration) -> String {
+    wait_for_marker_count(marker, needle, 1, timeout)
+}
+
+/// Poll `marker` until it contains `needle` at least `minimum` times (or the
+/// timeout), returning the file's final contents.
+pub fn wait_for_marker_count(
+    marker: &Path,
+    needle: &str,
+    minimum: usize,
+    timeout: Duration,
+) -> String {
     let deadline = Instant::now() + timeout;
     loop {
         let body = std::fs::read_to_string(marker).unwrap_or_default();
-        if count_occurrences(&body, needle) >= 1 {
+        if count_occurrences(&body, needle) >= minimum {
             return body;
         }
         if Instant::now() >= deadline {

@@ -31,7 +31,7 @@ mod pty_support;
 
 use pty_support::{
     bash_major_version, count_occurrences, embedded_hook, fish_bin, modern_bash, wait_for_marker,
-    zsh_bin, IsolatedEnv, PtySession,
+    wait_for_marker_count, zsh_bin, IsolatedEnv, PtySession,
 };
 
 // Shared timings: generous for a loaded CI box yet bounded so a hung shell
@@ -556,9 +556,9 @@ fn bash_preexec_enforce_functions_prompt_array_and_receipt_cardinality() {
     sess.clear_buffer();
 
     sess.send_line("benign_fn");
+    let post_degrade_body = wait_for_marker_count(&allowed, "RAN", 2, MARKER_MAX);
     let post_degrade_output = sess.expect("TIRITH_PTY> ");
     sess.wait_idle(QUIET, SETTLE_MAX);
-    let post_degrade_body = std::fs::read_to_string(&allowed).expect("read function marker");
     assert_eq!(
         count_occurrences(&post_degrade_body, "RAN"),
         2,

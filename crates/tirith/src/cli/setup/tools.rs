@@ -4803,7 +4803,7 @@ mod tests {
             dry_run: false,
             force: false,
             tirith_bin: "tirith".to_string(),
-            python_bin: Some("/usr/bin/python3".to_string()),
+            python_bin: Some(test_python_bin().to_string()),
             update_configs: false,
         }
     }
@@ -4820,29 +4820,41 @@ mod tests {
             dry_run: false,
             force: false,
             tirith_bin,
-            python_bin: Some(if cfg!(windows) {
-                r"C:\Python\python.exe".to_string()
-            } else {
-                "/usr/bin/python3".to_string()
-            }),
+            python_bin: Some(test_python_bin().to_string()),
             update_configs: false,
+        }
+    }
+
+    fn test_python_bin() -> &'static str {
+        #[cfg(windows)]
+        {
+            r"C:\Python\python.exe"
+        }
+        #[cfg(not(windows))]
+        {
+            "/usr/bin/python3"
         }
     }
 
     #[test]
     fn generated_shell_hooks_use_only_the_pinned_python_interpreter() {
         let mut opts = mcp_opts(Scope::User);
-        opts.python_bin = Some("/opt/Python Runtime/python3".to_string());
+        #[cfg(windows)]
+        let pinned_python = r"C:\Program Files\Python Runtime\python.exe";
+        #[cfg(not(windows))]
+        let pinned_python = "/opt/Python Runtime/python3";
+        opts.python_bin = Some(pinned_python.to_string());
+        let expected_assignment = format!(
+            "TIRITH_PYTHON={}",
+            super::super::shell_profile::shell_quote(pinned_python, "bash")
+        );
         for template in [
             crate::assets::CURSOR_HOOK_SH,
             crate::assets::VSCODE_HOOK_SH,
             crate::assets::WINDSURF_HOOK_SH,
         ] {
             let rendered = render_python_shell_hook(template, &opts).unwrap();
-            assert!(
-                rendered.contains("TIRITH_PYTHON='/opt/Python Runtime/python3'"),
-                "{rendered}"
-            );
+            assert!(rendered.contains(&expected_assignment), "{rendered}");
             assert!(!rendered.contains("__TIRITH_PYTHON__"), "{rendered}");
             assert!(!rendered.contains("command -v python3"), "{rendered}");
             assert!(!rendered.contains("$(python3 "), "{rendered}");
@@ -6808,6 +6820,86 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cline_powershell_hook_fails_closed_when_the_adapter_cannot_decide() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let Some(pwsh) = powershell_interpreter() else {
+            eprintln!("skipping: no PowerShell interpreter (pwsh) available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let run = |hook: &Path, fail_open: bool| -> Value {
+            let mut command = Command::new(&pwsh);
+            command
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(hook)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if fail_open {
+                command.env("TIRITH_FAIL_OPEN", "1");
+            } else {
+                command.env_remove("TIRITH_FAIL_OPEN");
+            }
+            let mut child = command.spawn().expect("run the Cline PowerShell hook");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"hookName":"PreToolUse"}"#)
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|error| panic!("hook stdout was not JSON ({error}): {stdout}"))
+        };
+
+        // A regular file passes Test-Path -PathType Leaf but cannot be launched
+        // as the configured interpreter. PowerShell raises a terminating error.
+        let unlaunchable = dir.path().join("not-an-interpreter");
+        std::fs::write(&unlaunchable, "not executable").unwrap();
+        std::fs::set_permissions(&unlaunchable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let launch_failure_hook = dir.path().join("launch-failure.ps1");
+        std::fs::write(
+            &launch_failure_hook,
+            render_cline_powershell_hook(
+                "/fake/tirith",
+                unlaunchable.to_str().unwrap(),
+                "/fake/adapter.py",
+            ),
+        )
+        .unwrap();
+        assert_eq!(run(&launch_failure_hook, false)["cancel"], true);
+        assert_eq!(run(&launch_failure_hook, true)["cancel"], false);
+
+        // A process that exits successfully with malformed stdout is also not
+        // an allow decision and must not become a host-level fail-open.
+        let malformed = dir.path().join("malformed-adapter-runner");
+        std::fs::write(&malformed, "#!/bin/sh\nprintf '%s\\n' not-json\n").unwrap();
+        std::fs::set_permissions(&malformed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let malformed_hook = dir.path().join("malformed.ps1");
+        std::fs::write(
+            &malformed_hook,
+            render_cline_powershell_hook(
+                "/fake/tirith",
+                malformed.to_str().unwrap(),
+                "/fake/adapter.py",
+            ),
+        )
+        .unwrap();
+        assert_eq!(run(&malformed_hook, false)["cancel"], true);
+    }
+
     #[test]
     fn cline_hooks_dir_falls_back_to_home_documents() {
         // Without a Linux `xdg-user-dir` answer there is exactly one place
@@ -7401,7 +7493,8 @@ mod tests {
             std::fs::create_dir_all(&subdir).unwrap();
             let _cwd = CwdGuard::set(&subdir);
 
-            setup_copilot_cli(&opts_for(Scope::Project)).unwrap();
+            let opts = opts_for(Scope::Project);
+            setup_copilot_cli(&opts).unwrap();
 
             let hook = cwd.join(".github/hooks/copilot-cli-hook.py");
             let cfg = cwd.join(".github/hooks/tirith-security.json");
@@ -7418,7 +7511,11 @@ mod tests {
             let entry = &v["hooks"]["preToolUse"][0];
             assert_eq!(entry["type"], "command");
             assert_eq!(
-                entry["bash"], "/usr/bin/python3 .github/hooks/copilot-cli-hook.py",
+                entry["bash"],
+                format!(
+                    "{} .github/hooks/copilot-cli-hook.py",
+                    quoted_python_bin(&opts).unwrap()
+                ),
                 "the interpreter is pinned while Copilot's hook path stays repo-relative"
             );
             assert_eq!(entry["timeoutSec"], 30);
@@ -7445,7 +7542,8 @@ mod tests {
     #[test]
     fn setup_kiro_user_scope_writes_hook_and_agent() {
         with_fake_env(false, |home, _cwd| {
-            setup_kiro(&opts_for(Scope::User)).unwrap();
+            let opts = opts_for(Scope::User);
+            setup_kiro(&opts).unwrap();
 
             // Chained single-component `.join`s so Windows separators match
             // production; an embedded-slash path would mix `\` and `/`.
@@ -7465,9 +7563,9 @@ mod tests {
             assert_eq!(entry["matcher"], "execute_bash");
 
             let cmd = entry["command"].as_str().expect("command is string");
-            let prefix = "/usr/bin/python3 ";
+            let prefix = format!("{} ", quoted_python_bin(&opts).unwrap());
             assert!(
-                cmd.starts_with(prefix),
+                cmd.starts_with(&prefix),
                 "command should start with the pinned interpreter, got: {cmd}"
             );
             let path_part = unquote_posix(&cmd[prefix.len()..]);
@@ -7483,7 +7581,8 @@ mod tests {
     fn setup_kiro_project_scope_uses_absolute_command() {
         with_fake_env(true, |_home, cwd| {
             let cwd = cwd.expect("cwd set");
-            setup_kiro(&opts_for(Scope::Project)).unwrap();
+            let opts = opts_for(Scope::Project);
+            setup_kiro(&opts).unwrap();
 
             let agent = cwd.join(".kiro/agents/tirith-security.json");
             assert!(agent.exists());
@@ -7492,9 +7591,9 @@ mod tests {
             let cmd = v["hooks"]["preToolUse"][0]["command"]
                 .as_str()
                 .expect("command is string");
-            let prefix = "/usr/bin/python3 ";
+            let prefix = format!("{} ", quoted_python_bin(&opts).unwrap());
             assert!(
-                cmd.starts_with(prefix),
+                cmd.starts_with(&prefix),
                 "command starts with the pinned interpreter: {cmd}"
             );
             let path_part = unquote_posix(&cmd[prefix.len()..]);

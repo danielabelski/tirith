@@ -880,6 +880,7 @@ fn generate_tier1_regex(out_dir: &str) {
         let mut known_frags: Vec<String> = Vec::new();
         if let Some(ref patterns) = cred_file.pattern {
             for p in patterns {
+                validate_credential_tier1_fragment(&p.id, &p.tier1_fragment);
                 known_frags.push(p.tier1_fragment.clone());
             }
         }
@@ -905,6 +906,7 @@ fn generate_tier1_regex(out_dir: &str) {
         );
         ids.push("credential_private_key".to_string());
         for pk in pk_patterns {
+            validate_credential_tier1_fragment(&pk.id, &pk.tier1_fragment);
             exec_fragments.push(pk.tier1_fragment.clone());
             paste_fragments.push(pk.tier1_fragment.clone());
         }
@@ -921,6 +923,10 @@ fn generate_tier1_regex(out_dir: &str) {
 
     let exec_regex = format!("(?:{})", exec_fragments.join("|"));
     let paste_regex = format!("(?:{})", paste_fragments.join("|"));
+    regex::Regex::new(&exec_regex)
+        .unwrap_or_else(|error| panic!("generated Tier-1 exec regex is invalid: {error}"));
+    regex::Regex::new(&paste_regex)
+        .unwrap_or_else(|error| panic!("generated Tier-1 paste regex is invalid: {error}"));
 
     let mut code = String::new();
     code.push_str("// Auto-generated Tier 1 regex patterns from declarative pattern table.\n");
@@ -948,6 +954,12 @@ fn generate_tier1_regex(out_dir: &str) {
 
     let out_path = Path::new(out_dir).join("tier1_gen.rs");
     fs::write(&out_path, code).unwrap();
+}
+
+fn validate_credential_tier1_fragment(id: &str, fragment: &str) {
+    regex::Regex::new(fragment).unwrap_or_else(|error| {
+        panic!("credential_patterns.toml entry '{id}' has an invalid tier1_fragment: {error}")
+    });
 }
 
 /// (snake_case id, PascalCase variant) for every RuleId — snake for TOML

@@ -151,6 +151,23 @@ fn privacy_project_bounded_text(value: &str, max_bytes: usize) -> String {
     crate::util::truncate_bytes(&privacy_project_unbounded_text(value), max_bytes)
 }
 
+fn metadata_keys_are_recoverable(metadata: &BTreeMap<String, String>) -> bool {
+    metadata.keys().all(|key| {
+        let (projected_key, _) = crate::redact::privacy_project_durable_pair(key, "");
+        let projected_key = privacy_project_unbounded_text(&projected_key);
+        !key.is_empty() && !projected_key.is_empty()
+    })
+}
+
+fn metadata_is_within_projected_bounds(metadata: &BTreeMap<String, String>) -> bool {
+    metadata.len() <= MAX_TYPED_EVENT_METADATA_ENTRIES
+        && metadata.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= MAX_TYPED_EVENT_METADATA_KEY_BYTES
+                && value.len() <= MAX_TYPED_EVENT_METADATA_VALUE_BYTES
+        })
+}
+
 pub(crate) fn privacy_project_endpoint(value: &str) -> String {
     let projected = privacy_project_bounded_text(value, MAX_TYPED_EVENT_METADATA_VALUE_BYTES);
     if projected.starts_with("[REDACTED:") {
@@ -255,12 +272,10 @@ impl<'de> Deserialize<'de> for TypedEvent {
     {
         let wire = TypedEventWire::deserialize(deserializer)?;
         let projected_rule_id = privacy_project_unbounded_text(&wire.rule_id);
-        let metadata_is_recoverable = wire.metadata.keys().all(|key| {
-            let (projected_key, _) = crate::redact::privacy_project_durable_pair(key, "");
-            let projected_key = privacy_project_unbounded_text(&projected_key);
-            !key.is_empty() && !projected_key.is_empty()
-        });
-        if wire.rule_id.is_empty() || projected_rule_id.is_empty() || !metadata_is_recoverable {
+        if wire.rule_id.is_empty()
+            || projected_rule_id.is_empty()
+            || !metadata_keys_are_recoverable(&wire.metadata)
+        {
             return Err(D::Error::custom(
                 "typed event exceeds its public semantic bounds",
             ));
@@ -281,12 +296,7 @@ impl<'de> Deserialize<'de> for TypedEvent {
             || event.timestamp.len() > MAX_TYPED_EVENT_TIMESTAMP_BYTES
             || event.rule_id.is_empty()
             || event.rule_id.len() > MAX_TYPED_EVENT_RULE_ID_BYTES
-            || event.metadata.len() > MAX_TYPED_EVENT_METADATA_ENTRIES
-            || event.metadata.iter().any(|(key, value)| {
-                key.is_empty()
-                    || key.len() > MAX_TYPED_EVENT_METADATA_KEY_BYTES
-                    || value.len() > MAX_TYPED_EVENT_METADATA_VALUE_BYTES
-            })
+            || !metadata_is_within_projected_bounds(&event.metadata)
         {
             return Err(D::Error::custom(
                 "typed event exceeds its projected semantic bounds",
@@ -481,12 +491,10 @@ impl<'de> Deserialize<'de> for EventPrototype {
     {
         let wire = EventPrototypeWire::deserialize(deserializer)?;
         let projected_rule_id = privacy_project_unbounded_text(&wire.rule_id);
-        let metadata_is_recoverable = wire.metadata.keys().all(|key| {
-            let (projected_key, _) = crate::redact::privacy_project_durable_pair(key, "");
-            let projected_key = privacy_project_unbounded_text(&projected_key);
-            !key.is_empty() && !projected_key.is_empty()
-        });
-        if wire.rule_id.is_empty() || projected_rule_id.is_empty() || !metadata_is_recoverable {
+        if wire.rule_id.is_empty()
+            || projected_rule_id.is_empty()
+            || !metadata_keys_are_recoverable(&wire.metadata)
+        {
             return Err(D::Error::custom(
                 "event prototype exceeds its public semantic bounds",
             ));
@@ -495,12 +503,7 @@ impl<'de> Deserialize<'de> for EventPrototype {
         privacy_project_event_prototype(&mut prototype);
         if prototype.rule_id.is_empty()
             || prototype.rule_id.len() > MAX_TYPED_EVENT_RULE_ID_BYTES
-            || prototype.metadata.len() > MAX_TYPED_EVENT_METADATA_ENTRIES
-            || prototype.metadata.iter().any(|(key, value)| {
-                key.is_empty()
-                    || key.len() > MAX_TYPED_EVENT_METADATA_KEY_BYTES
-                    || value.len() > MAX_TYPED_EVENT_METADATA_VALUE_BYTES
-            })
+            || !metadata_is_within_projected_bounds(&prototype.metadata)
         {
             return Err(D::Error::custom(
                 "event prototype exceeds its projected semantic bounds",

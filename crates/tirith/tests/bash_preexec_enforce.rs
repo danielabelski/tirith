@@ -469,13 +469,13 @@ fn prompt_array_is_wrapped_only_when_bash_executes_every_element() {
         r#"
 prompt_first() {{ :; }}
 prompt_second() {{ :; }}
-PROMPT_COMMAND=(prompt_first prompt_second)
-source '{hook}'
 if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
   array_supported=1
 else
   array_supported=0
 fi
+PROMPT_COMMAND=(prompt_first prompt_second)
+source '{hook}'
 if [[ "${{PROMPT_COMMAND[1]:-}}" == "$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND" ]]; then bootstrap_ok=1; else bootstrap_ok=0; fi
 printf 'ARRAY_SUPPORTED=%s LEN=%s PC0=%s PC2=%s PC3=%s PC4=%s BOOTSTRAP=%s ENFORCE=%s GUARDS=%s\n' \
   "$array_supported" "${{#PROMPT_COMMAND[@]}}" \
@@ -896,6 +896,12 @@ sh -c 'touch {sentinels}/cache_leak' BLOCK_TOKEN-cache
         assert!(
             !sentinel_path(&sentinel_dir, "cache_leak").exists(),
             "pre-seeded allow for line id {guessed_line_id} bypassed the scan; invocations: {invocations:#?}"
+        );
+        assert!(
+            invocations
+                .iter()
+                .any(|invocation| invocation.contains("BLOCK_TOKEN-cache")),
+            "the scan never ran for line id {guessed_line_id}, so the absent sentinel proves nothing: {invocations:#?}"
         );
         let _ = fs::remove_dir_all(&sentinel_dir);
     }

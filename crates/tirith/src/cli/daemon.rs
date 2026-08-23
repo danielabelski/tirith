@@ -550,7 +550,11 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     // so the decision arrives on the request. This mirrors the inline path's
     // explicit cache-only runtime-enrichment mode.
     if !req.offline {
-        enrich_with_network_checks(&mut late_findings);
+        // Engine findings carry the shortened-URL rule that drives redirect
+        // resolution. Runtime threat findings are a second input to the same
+        // bounded DNS pass so their URL evidence retains the old coverage.
+        let network_findings = enrich_with_network_checks(&mut verdict.findings, &late_findings);
+        late_findings.extend(network_findings);
     }
 
     // All post-engine producers meet policy at one final merge point. In
@@ -597,7 +601,10 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
 /// Run network checks on URL-referencing findings (daemon path only, where
 /// latency is acceptable).
 #[cfg(unix)]
-fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
+fn enrich_with_network_checks(
+    engine_findings: &mut [Finding],
+    late_findings: &[Finding],
+) -> Vec<Finding> {
     let mut new_findings = Vec::new();
     // One cancellable resolver and one absolute budget cover every host in this
     // daemon request. Distinct attacker-controlled findings cannot each reset
@@ -607,7 +614,7 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
         .map(|resolver| (resolver, network::DnsRequestBudget::dnsbl()));
 
     // Resolve shortened URLs and surface blocklist hits on destinations.
-    for finding in findings.iter_mut() {
+    for finding in engine_findings.iter_mut() {
         if finding.rule_id != RuleId::ShortenedUrl {
             continue;
         }
@@ -654,7 +661,7 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
 
     // DNS blocklist on every URL host in any finding.
     let mut checked_hosts = std::collections::HashSet::new();
-    for finding in findings.iter() {
+    for finding in engine_findings.iter().chain(late_findings.iter()) {
         for evidence in &finding.evidence {
             if let Evidence::Url { raw } = evidence {
                 if let Some(host) = extract_host_from_url(raw) {
@@ -688,7 +695,7 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
         }
     }
 
-    findings.extend(new_findings);
+    new_findings
 }
 
 /// Extract the host portion from a URL string.

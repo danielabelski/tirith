@@ -164,11 +164,14 @@ pub(crate) fn inject_tirith_hook_permitted(
             return InjectOutcome::NotFound(path.to_path_buf());
         }
         Err(tirith_core::util::OpenRegularError::NotFound) => {
+            let mut post_create = serde_json::Map::new();
+            post_create.insert(
+                devcontainer_writer::TIRITH_HOOK_KEY.to_string(),
+                devcontainer_writer::tirith_hook_value(),
+            );
             let seed = serde_json::json!({
                 "name": "tirith-protected devcontainer",
-                "postCreateCommand": {
-                    "tirith-init": ["tirith", "init", "--shell", "auto"],
-                },
+                "postCreateCommand": post_create,
                 "containerEnv": { "TIRITH_DEVCONTAINER": "1" },
             });
             let mut contents = match serde_json::to_string_pretty(&seed) {
