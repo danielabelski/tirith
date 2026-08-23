@@ -1,6 +1,9 @@
 # Tirith + Cursor Setup (Automatic Coverage)
 
-> **Phase 1b** — Gateway integration documented but not yet integration-tested.
+> **Verification boundary:** setup/config behavior is covered by repository
+> tests, but only a live Cursor session can prove that the installed host
+> version loaded and honored both the hook and gateway. Run the verification
+> steps after setup and every Cursor/Tirith upgrade.
 
 ## Why two paths are required
 
@@ -135,6 +138,8 @@ Expected: blocked by Tirith.
 - Cursor tool names vary by extension — check which names your MCP server
   exposes and add `guarded_tools` patterns to `gateway.yaml` accordingly.
 - The gateway forwards all non-matched tool calls transparently.
+- Setup pins the validated absolute Python interpreter used by the generated
+  command hook. Re-run setup if that interpreter moves.
 - The zshenv guard applies to all non-interactive `zsh -lc` runs.
   `TIRITH_ZSHENV_SKIP=1` disables it; `VSCODE_RESOLVING_ENVIRONMENT`
   (set by VS Code/Cursor during shell env probing) skips the scan so

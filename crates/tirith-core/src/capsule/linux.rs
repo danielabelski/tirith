@@ -1161,7 +1161,21 @@ fn apply_env(policy: &EnvironmentPolicy, temp_home: Option<&Path>) {
     // UTF-8 allow-list entry, so `env_name_survives` is false for it and it is
     // dropped (the fail-closed direction: deny-by-default with no UTF-8 leak hole).
     for name in &present {
-        if !env_name_survives(name, &survivors) {
+        let value_sensitive = policy.deny_sensitive
+            && name
+                .to_str()
+                .and_then(|name| {
+                    std::env::var_os(name).map(|value| {
+                        value
+                            .to_str()
+                            .map(|value| !policy.assignment_survives(name, value))
+                            .unwrap_or_else(|| {
+                                crate::sensitive_assets::is_registered_env_name(name)
+                            })
+                    })
+                })
+                .unwrap_or(false);
+        if !env_name_survives(name, &survivors) || value_sensitive {
             std::env::remove_var(name);
         }
     }
@@ -1881,9 +1895,12 @@ mod tests {
     fn production_seccomp_parent_death_signal_kills_and_reaps_target() {
         const MODE: &str = "TIRITH_SECCOMP_GUARD_DEATH_MODE";
         const MARKER: &str = "TIRITH_SECCOMP_GUARD_DEATH_MARKER";
-        let marker_dir = tempfile::tempdir().expect("guard-death marker directory");
-        let marker = marker_dir.path().join("target-survived");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate seccomp subprocess test state");
+        let marker = global.roots().temp.join("target-survived");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        global.apply_to_command(&mut command);
+        let output = command
             .args(["seccomp_guard_death_subprocess", "--nocapture"])
             .env(MODE, "controller")
             .env(MARKER, &marker)

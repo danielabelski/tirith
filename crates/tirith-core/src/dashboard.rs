@@ -393,7 +393,7 @@ fn policy_summary_error(path: String, error: String) -> PolicySummary {
 fn build_threatdb_summary() -> ThreatDbSummary {
     use crate::threatdb::ThreatDb;
 
-    let db_path = ThreatDb::default_path();
+    let db_path = ThreatDb::resolve_primary_path();
     let path_str = db_path.as_ref().map(|p| p.display().to_string());
 
     let exists = db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -833,61 +833,36 @@ fn render_hook(h: &HookSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_test_support::GlobalStateGuard;
 
     /// Every env var that influences where `build_policy_summary` resolves
     /// config from (XDG / %APPDATA% / %LOCALAPPDATA% / HOME / USERPROFILE /
     /// TIRITH_*). A hermetic test must pin and restore EVERY one across OSes.
-    const ENV_KEYS: [&str; 8] = [
+    const ENV_KEYS: [&str; 9] = [
         "XDG_CONFIG_HOME",
         "APPDATA",
         "LOCALAPPDATA",
         "HOME",
         "USERPROFILE",
         "TIRITH_POLICY_ROOT",
+        "TIRITH_THREATDB_PATH",
         "TIRITH_SERVER_URL",
         "TIRITH_API_KEY",
     ];
 
-    /// RAII guard: on construction saves + overrides every [`ENV_KEYS`] var, on
-    /// `Drop` restores them. Serialized by the caller's `TEST_ENV_LOCK`; bind to
-    /// `let _env = …` so it lives for the whole test.
-    struct DashboardEnvGuard {
-        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl DashboardEnvGuard {
-        /// Snapshot all [`ENV_KEYS`], then apply `overrides` (`Some` sets,
-        /// `None`/unnamed removes) so the resolved env is fully caller-determined.
-        fn apply(overrides: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
-            let prev = ENV_KEYS.iter().map(|&k| (k, std::env::var_os(k))).collect();
-            // SAFETY: env mutation is serialized by `TEST_ENV_LOCK`, which the
-            // caller holds for the lifetime of this guard.
-            unsafe {
-                for &key in ENV_KEYS.iter() {
-                    let ovr = overrides.iter().find(|(k, _)| *k == key);
-                    match ovr {
-                        Some((_, Some(value))) => std::env::set_var(key, value),
-                        // None or unnamed → unset, so the host env can't bleed in.
-                        _ => std::env::remove_var(key),
-                    }
-                }
-            }
-            Self { prev }
-        }
-    }
-
-    impl Drop for DashboardEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: still serialized by `TEST_ENV_LOCK` held by the caller.
-            unsafe {
-                for (key, prev) in &self.prev {
-                    match prev {
-                        Some(v) => std::env::set_var(key, v),
-                        None => std::env::remove_var(key),
-                    }
-                }
+    /// Install a fully caller-determined dashboard environment. Unnamed keys
+    /// are removed, and the shared guard restores their exact prior values.
+    fn dashboard_environment(
+        overrides: &[(&'static str, Option<&std::ffi::OsStr>)],
+    ) -> GlobalStateGuard {
+        let mut environment = GlobalStateGuard::new().expect("isolate dashboard environment");
+        for &key in &ENV_KEYS {
+            match overrides.iter().find(|(present, _)| *present == key) {
+                Some((_, Some(value))) => environment.set_env(key, value),
+                _ => environment.remove_env(key),
             }
         }
+        environment
     }
 
     fn empty_snapshot() -> DashboardSnapshot {
@@ -1223,12 +1198,9 @@ mod tests {
         // the developer's real config (CodeRabbit M13 PR #132 R17-3): pin the
         // config-resolving env at a temp dir and use a temp cwd with a `.git`
         // dir but no `.tirith/policy.yaml` (genuine built-in defaults).
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
         let cfg = isolated_config.path().as_os_str();
-        let _env = DashboardEnvGuard::apply(&[
+        let _env = dashboard_environment(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
             ("APPDATA", Some(cfg)),
             ("LOCALAPPDATA", Some(cfg)),
@@ -1261,6 +1233,27 @@ mod tests {
     }
 
     #[test]
+    fn threatdb_summary_reports_the_effective_v2_sibling() {
+        let state = tempfile::tempdir().unwrap();
+        let v1_path = state.path().join("primary.dat");
+        let v2_path = state.path().join("primary-v2.dat");
+        std::fs::write(
+            &v2_path,
+            include_bytes!("../../../tests/fixtures/test-threatdb.dat"),
+        )
+        .unwrap();
+        assert!(!v1_path.exists(), "the legacy path must remain absent");
+
+        let _env = dashboard_environment(&[("TIRITH_THREATDB_PATH", Some(v1_path.as_os_str()))]);
+        let summary = build_threatdb_summary();
+
+        assert!(summary.installed);
+        assert_eq!(summary.path.as_deref(), v2_path.to_str());
+        assert_eq!(summary.signature_valid, Some(true));
+        assert_eq!(summary.build_sequence, Some(42));
+    }
+
+    #[test]
     fn generate_serve_token_is_64_hex_chars_and_varies() {
         let t1 = generate_serve_token().expect("rng");
         let t2 = generate_serve_token().expect("rng");
@@ -1277,13 +1270,10 @@ mod tests {
         // CodeRabbit M13 PR #132 R5-1: a malformed file must NOT read as benign
         // defaults. The 3-variant enum makes the state unambiguous (broken →
         // ParseError, no file → NoFile, valid → Valid) and the "error + numbers"
-        // state unrepresentable. Env isolated + restored via TEST_ENV_LOCK.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // state unrepresentable. The environment is isolated and restored.
         let isolated_config = tempfile::tempdir().unwrap();
         let cfg = isolated_config.path().as_os_str();
-        let _env = DashboardEnvGuard::apply(&[
+        let _env = dashboard_environment(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
             ("APPDATA", Some(cfg)),
             ("LOCALAPPDATA", Some(cfg)),
@@ -1366,12 +1356,9 @@ mod tests {
         // must surface the fail-closed error state via `read_regular_capped`'s
         // `NotRegularFile` rejection — not panic, not benign defaults. Env
         // isolated as the sibling broken-policy test.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
         let cfg = isolated_config.path().as_os_str();
-        let _env = DashboardEnvGuard::apply(&[
+        let _env = dashboard_environment(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
             ("APPDATA", Some(cfg)),
             ("LOCALAPPDATA", Some(cfg)),
@@ -1418,12 +1405,9 @@ mod tests {
         // CodeRabbit M13 PR #132 R23: an oversized policy file (> POLICY_READ_CAP)
         // is refused before buffering, surfacing the fail-closed error state. One
         // byte past the cap.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
         let cfg = isolated_config.path().as_os_str();
-        let _env = DashboardEnvGuard::apply(&[
+        let _env = dashboard_environment(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
             ("APPDATA", Some(cfg)),
             ("LOCALAPPDATA", Some(cfg)),
@@ -1462,12 +1446,9 @@ mod tests {
     #[test]
     fn build_policy_summary_fifo_policy_does_not_hang() {
         use std::ffi::CString;
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
         let cfg = isolated_config.path().as_os_str();
-        let _env = DashboardEnvGuard::apply(&[
+        let _env = dashboard_environment(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
             ("APPDATA", Some(cfg)),
             ("LOCALAPPDATA", Some(cfg)),
@@ -1655,15 +1636,12 @@ mod tests {
         // an org blocklist line, and two trust entries (flat → allowlist,
         // rule-scoped → allowlist_rules). A broken local file is still the
         // hard-error state (asserted at the end).
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
         // Point every config-resolving var at the isolated dir (XDG on
         // Linux/macOS, %APPDATA% on Windows) so the overlay files are seen on
         // every platform and the real config is never read.
         let cfg = isolated_config.path().as_os_str();
-        let _env = DashboardEnvGuard::apply(&[
+        let _env = dashboard_environment(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
             ("APPDATA", Some(cfg)),
             ("LOCALAPPDATA", Some(cfg)),
@@ -1767,15 +1745,12 @@ mod tests {
         // closed` and the env names an UNREACHABLE server, so `Policy::discover`
         // would fail closed (paranoia None); observing local `paranoia: 3`
         // instead proves the offline path ran.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
         let cfg = isolated_config.path().as_os_str();
         // Pin config resolution at the isolated dir and name a bogus, unreachable
         // policy server. A stray `fetch_remote_policy` would flip the summary to
         // the error state or hang.
-        let _env = DashboardEnvGuard::apply(&[
+        let _env = dashboard_environment(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
             ("APPDATA", Some(cfg)),
             ("LOCALAPPDATA", Some(cfg)),

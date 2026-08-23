@@ -291,7 +291,7 @@ fn emit_check_plan_human(plan_path: &Path, sha: &str, summary: &PlanSummary, pur
         super::sanitize_for_human_output(&plan_path.display().to_string(), false)
     );
     eprintln!("  tool:        {}", summary.tool.as_str());
-    eprintln!("  sha256:      {sha}");
+    eprintln!("  sha256:      {}", sha);
     eprintln!(
         "  changes:     create={} update={} destroy={} (total={})",
         summary.create, summary.update, summary.destroy, summary.total_changes,
@@ -332,7 +332,7 @@ fn emit_check_plan_human(plan_path: &Path, sha: &str, summary: &PlanSummary, pur
         }
     }
     if purged > 0 {
-        eprintln!("  purged {purged} old plan(s) from the cache");
+        eprintln!("  purged {} old plan(s) from the cache", purged);
     }
     eprintln!("  recorded in: {}", iac_plan::iac_plans_dir_display(),);
 }
@@ -383,7 +383,7 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// symlinks, then used for both the bounded read and atomic 0600 publication.
 /// Any read error other than genuine absence aborts rather than becoming an
 /// empty baseline.
-fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+pub(super) fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/policy.yaml →
     // <repo>, <config>/tirith/policy.yaml → <config>. A policy path is always
     // at least three components deep; refuse a malformed shallower path rather
@@ -395,7 +395,15 @@ fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()>
         )
     })?;
 
-    let contained = tirith_core::util::ContainedAtomicFile::prepare(containment_root, path, true)?;
+    let policy = Policy::discover_local_only(containment_root.to_str());
+    let contained = super::prepare_config_destination_permitted(
+        containment_root,
+        path,
+        true,
+        &policy,
+        true,
+        true,
+    )?;
 
     // Read the current contents WITHOUT following a symlinked final component.
     // An absent file is an empty baseline (the key is then appended); any other
@@ -436,7 +444,15 @@ fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()>
         out.push('\n');
     }
 
-    contained.write_atomic(out.as_bytes(), true)
+    super::write_prepared_config_file_permitted(
+        containment_root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 /// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`

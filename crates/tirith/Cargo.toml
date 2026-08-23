@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "tirith-threatdb-compile"
 path = "src/bin/tirith_threatdb_compile.rs"
 
+[[bin]]
+name = "tirith-package-approval-authority"
+path = "src/bin/tirith_package_approval_authority.rs"
+
 [features]
 # Compatibility-only pass-through retained for downstream build invocations.
 # The core lookup is unconditional so ordinary, no-default-feature, Nix, and
@@ -86,6 +90,7 @@ fs2 = { workspace = true }
 portable-pty = "0.9"
 # Parses the embedded `tirith lab` corpus (assets/lab_corpus.toml).
 toml = "0.8"
+toml_edit = { workspace = true }
 # Builds the synthetic, inert `tirith lab` artifact fixtures (wheels) at lab time
 # (`cli::lab_artifacts`, plan unit G2). Same line tirith-core already depends on
 # (2.x, deflate only); already in the lockfile, no new transitive resolution.
@@ -112,6 +117,7 @@ http-body-util = "0.1"
 
 [dev-dependencies]
 tirith-core = { workspace = true, features = ["test-network-seams"] }
+tirith-test-support = { workspace = true }
 mockito = "1"
 ed25519-dalek = { workspace = true }
 # Build synthetic wheels (ZIP archives) in the `package inspect` / `scan`
@@ -147,10 +153,11 @@ windows = { version = "0.62", default-features = false, features = [
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
 section = "utils"
-depends = "ca-certificates"
+depends = "ca-certificates, sudo"
 # Paths relative to crates/tirith/ (NOT repo root)
 assets = [
     ["target/release/tirith", "usr/bin/", "755"],
+    ["target/release/tirith-package-approval-authority", "usr/libexec/", "755"],
     # Shell hooks
     ["assets/shell/tirith.sh", "usr/share/tirith/shell/", "644"],
     ["assets/shell/lib/zsh-hook.zsh", "usr/share/tirith/shell/lib/", "644"],

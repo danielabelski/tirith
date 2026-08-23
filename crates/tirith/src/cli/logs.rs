@@ -43,7 +43,6 @@ const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_SECRET_BLOCK_BYTES: usize = 1024 * 1024;
 const REDACTED_BLOCK_MARKER: &str = "[REDACTED]";
 const INCOMPLETE_REDACTION_MARKER: &str = "[REDACTED:incomplete]";
-const OVERSIZED_LOG_LINE_MARKER: &str = "[... oversized line omitted ...]";
 
 // ─── scan ───────────────────────────────────────────────────────────────────
 
@@ -76,7 +75,7 @@ pub fn scan(path: &Path, json: bool) -> i32 {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
-    let mut verdict = engine::analyze(&ctx);
+    let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
 
     // Two layers the general `tirith scan` skips, opted back in for logs:
     //   * Credentials — FileScan skips them (source-file secrets are an
@@ -84,15 +83,15 @@ pub fn scan(path: &Path, json: bool) -> i32 {
     //   * Prompt-injection seeds — FileScan skips them so a repo-wide scan
     //     doesn't false-flag security docs quoting injection phrases; agent
     //     output / build logs are exactly where the rule fits.
-    let cred_findings =
+    let mut late_findings =
         tirith_core::rules::credential::check(&content, ShellType::Posix, ScanContext::Paste);
-    verdict.findings.extend(cred_findings);
-
     let prompt_findings = tirith_core::rules::prompt_injection::check(&content);
-    verdict.findings.extend(prompt_findings);
+    late_findings.extend(prompt_findings);
 
-    // Recompute the action now that the extra rule layers are folded in.
-    verdict.action = tirith_core::verdict::action_from_findings(&verdict.findings);
+    // These two log-specific rule layers run after the engine pass, so merge
+    // them through the same policy seam as every other late producer. This
+    // applies per-rule severity overrides before deriving the final action.
+    tirith_core::escalation::merge_late_findings(&mut verdict, late_findings, &policy);
 
     if json {
         return emit_scan_json(path, &verdict);
@@ -552,70 +551,6 @@ where
     Ok(())
 }
 
-/// Stream plain logical lines without allowing one newline-free record to make
-/// `BufRead::read_line` allocate the entire remainder of an attacker-controlled
-/// file. Oversized records are discarded through the next newline and replaced
-/// by one categorical marker.
-fn read_plain_records_bounded<R, F>(
-    reader: &mut R,
-    line_limit: usize,
-    mut consume: F,
-) -> std::io::Result<()>
-where
-    R: BufRead,
-    F: FnMut(String),
-{
-    let mut line = Vec::with_capacity(STREAM_CHUNK_BYTES.min(line_limit));
-    let mut oversized = false;
-    let mut pending = false;
-
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            if pending || oversized {
-                if oversized {
-                    consume(OVERSIZED_LOG_LINE_MARKER.to_string());
-                } else {
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
-                    }
-                    consume(String::from_utf8_lossy(&line).into_owned());
-                }
-            }
-            return Ok(());
-        }
-
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let payload_len = newline.unwrap_or(available.len());
-        if !oversized {
-            let remaining = line_limit.saturating_sub(line.len());
-            if payload_len > remaining {
-                oversized = true;
-                line.clear();
-            } else {
-                line.extend_from_slice(&available[..payload_len]);
-            }
-        }
-        pending |= payload_len > 0;
-
-        let consumed = payload_len + usize::from(newline.is_some());
-        reader.consume(consumed);
-        if newline.is_some() {
-            if oversized {
-                consume(OVERSIZED_LOG_LINE_MARKER.to_string());
-            } else {
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                consume(String::from_utf8_lossy(&line).into_owned());
-            }
-            line.clear();
-            oversized = false;
-            pending = false;
-        }
-    }
-}
-
 // ─── summarize ──────────────────────────────────────────────────────────────
 
 /// `tirith logs summarize` — a compressed, optionally-sanitized view of a log.
@@ -650,10 +585,7 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
     // tail window, so memory is O(max_lines) regardless of input size.
     let mut lines_head: Vec<String> = Vec::new();
     let mut lines_tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    // Reserve one line for the elision marker. With max_lines == 1 the
-    // bounded buffers intentionally retain no content lines, so the marker is
-    // the sole output instead of exceeding the caller's requested limit.
-    let budget = max_lines.saturating_sub(1);
+    let budget = max_lines.saturating_sub(1).max(1);
     let head_cap = budget.div_ceil(2);
     let tail_cap = budget - head_cap;
     let mut total_lines: usize = 0;
@@ -723,11 +655,25 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
     } else {
         // Preserve the unredacted command's historical behavior. The protected
         // path above uses fixed-size reads and a bounded logical-record cap.
-        if let Err(e) =
-            read_plain_records_bounded(&mut reader, MAX_STREAM_LINE_BYTES, accept_processed)
-        {
-            eprintln!("tirith logs summarize: read error: {e}");
-            return 1;
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        loop {
+            buf.clear();
+            let n = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("tirith logs summarize: read error: {e}");
+                    return 1;
+                }
+            };
+            let mut end = n;
+            if end > 0 && buf[end - 1] == b'\n' {
+                end -= 1;
+            }
+            if end > 0 && buf[end - 1] == b'\r' {
+                end -= 1;
+            }
+            accept_processed(String::from_utf8_lossy(&buf[..end]).into_owned());
         }
     }
     if let Some(prev) = last_line.take() {
@@ -1327,21 +1273,6 @@ mod tests {
         }
         let code = summarize(f.path(), false, 30, false);
         assert_eq!(code, 0);
-    }
-
-    #[test]
-    fn plain_record_reader_bounds_a_newline_free_record_and_resumes() {
-        let input = format!("{}\nnext\r\n", "x".repeat(33));
-        let mut reader = std::io::BufReader::new(input.as_bytes());
-        let mut records = Vec::new();
-
-        read_plain_records_bounded(&mut reader, 32, |line| records.push(line))
-            .expect("bounded read");
-
-        assert_eq!(
-            records,
-            vec![OVERSIZED_LOG_LINE_MARKER.to_string(), "next".to_string()]
-        );
     }
 
     #[test]

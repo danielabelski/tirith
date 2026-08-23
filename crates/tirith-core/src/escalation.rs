@@ -12,6 +12,28 @@ use crate::session_warnings::SessionWarnings;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
 
+/// Merge findings produced after the engine pass under the same policy as the
+/// original verdict.
+///
+/// Runtime threat and network enrichment happen after the engine has already
+/// applied per-rule severity overrides. Every late producer must use this seam
+/// so those findings cannot bypass policy or diverge between daemon and inline
+/// execution.
+pub fn merge_late_findings(
+    verdict: &mut Verdict,
+    mut findings: Vec<Finding>,
+    policy: &crate::policy::Policy,
+) {
+    for finding in &mut findings {
+        if let Some(override_severity) = policy.severity_override(&finding.rule_id) {
+            finding.severity = override_severity;
+        }
+    }
+    verdict.findings.extend(findings);
+    verdict.action =
+        crate::verdict::upgraded_action_from_findings(&verdict.findings, verdict.action);
+}
+
 fn default_window_60() -> u64 {
     60
 }
@@ -485,9 +507,6 @@ pub(crate) fn apply_stateless_policy_effects(
         if let Some(meta) = crate::approval::check_approval(&effective, policy) {
             crate::approval::apply_approval(&mut effective, &meta);
             causal_rule_ids.insert(meta.rule_id.clone());
-            if caller != CallerContext::Cli && effective.requires_approval == Some(true) {
-                effective.action = Action::Block;
-            }
         }
     }
 
@@ -543,7 +562,36 @@ pub(crate) fn apply_stateless_policy_effects(
         }
     }
 
+    normalize_approval_contract(&mut effective, caller);
     effective
+}
+
+fn clear_approval_metadata(verdict: &mut Verdict) {
+    verdict.requires_approval = None;
+    verdict.approval_timeout_secs = None;
+    verdict.approval_fallback = None;
+    verdict.approval_rule = None;
+    verdict.approval_description = None;
+}
+
+/// Keep the action and approval channel as one invariant at every return seam:
+/// a Block is never approvable, and a caller without a prompt channel must turn
+/// a live approval requirement into an unambiguous Block.
+fn normalize_approval_contract(verdict: &mut Verdict, caller: CallerContext) {
+    if verdict.action == Action::Block {
+        clear_approval_metadata(verdict);
+        return;
+    }
+    if verdict.requires_approval == Some(true) {
+        if caller != CallerContext::Cli {
+            verdict.action = Action::Block;
+            clear_approval_metadata(verdict);
+        } else if verdict.action == Action::Allow {
+            // Filtering may hide the causal finding, but it cannot turn a live
+            // approval gate into an executable Allow.
+            verdict.action = Action::Warn;
+        }
+    }
 }
 
 pub(crate) fn apply_correlation_findings(
@@ -615,6 +663,7 @@ pub fn post_process_verdict_for_verification(
         reapply_monotonic_policy_effects(&mut effective, policy, caller);
     }
 
+    normalize_approval_contract(&mut effective, caller);
     effective
 }
 
@@ -664,9 +713,6 @@ fn reapply_monotonic_policy_effects(
         if let Some(meta) = crate::approval::check_approval(effective, policy) {
             crate::approval::apply_approval(effective, &meta);
             causal_rule_ids.insert(meta.rule_id.clone());
-            if caller != CallerContext::Cli && effective.requires_approval == Some(true) {
-                effective.action = Action::Block;
-            }
         }
     }
 
@@ -693,6 +739,7 @@ fn reapply_monotonic_policy_effects(
             effective.findings.push(causal.clone());
         }
     }
+    normalize_approval_contract(effective, caller);
 }
 
 /// Post-processing pipeline applied after the engine produces a raw verdict:
@@ -803,6 +850,7 @@ pub fn post_process_verdict(
         reapply_monotonic_policy_effects(&mut effective, policy, caller);
     }
 
+    normalize_approval_contract(&mut effective, caller);
     effective
 }
 
@@ -1174,33 +1222,236 @@ fn delete_value_flags_for(tool: &str) -> &'static [&'static str] {
 ///
 /// `shred -n 3 secret.txt` -> `[secret.txt]` (the `3` is `-n`'s value, not a path);
 /// `shred --iterations=3 a b` -> `[a, b]`; `rm a b c` -> `[a, b, c]`.
-fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<&'a String> {
+fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<std::borrow::Cow<'a, str>> {
     let value_flags = delete_value_flags_for(tool);
     let mut paths = Vec::new();
     let mut end_of_options = false;
     let mut skip_next = false;
+    let mut skip_redirection_target = false;
     for a in args {
+        if skip_redirection_target {
+            // A separated shell redirect (`2> /tmp/stderr`) consumes this
+            // shell word; it never reaches rm/unlink/shred as an operand.
+            skip_redirection_target = false;
+            continue;
+        }
+        if let Some(target_is_separate) = shell_redirection_token(a) {
+            // Redirections are removed by the shell before argv construction,
+            // so they cannot satisfy a preceding value-taking option. Keep
+            // `skip_next` armed across both attached and separated forms.
+            skip_redirection_target = target_is_separate;
+            continue;
+        }
+
+        // The lossless word splitter intentionally preserves shell spelling,
+        // so a redirect appended to an argv word remains one token here:
+        // `target>/dev/null`. Model the shell's actual argv by retaining only
+        // the prefix and discarding the operator/target suffix. Quoted or
+        // escaped angle brackets are not operators and remain in the operand.
+        let (logical_arg, suffix_target_is_separate) =
+            if let Some((prefix, target_is_separate)) = shell_redirection_suffix(a) {
+                (prefix, Some(target_is_separate))
+            } else {
+                (a.as_str(), None)
+            };
         if skip_next {
             // This token is the value of a preceding value-taking option (e.g. the
             // `3` after `shred -n`); it is not a path.
             skip_next = false;
-            continue;
-        }
-        if !end_of_options && a.as_str() == "--" {
-            end_of_options = true;
-            continue;
-        }
-        if !end_of_options && a.starts_with('-') {
-            // A bare value-taking option consumes the NEXT token as its value; the
-            // joined `--iterations=3` form is self-contained (consumes nothing).
-            if value_flags.contains(&a.as_str()) {
-                skip_next = true;
+            if let Some(target_is_separate) = suffix_target_is_separate {
+                skip_redirection_target = target_is_separate;
             }
             continue;
         }
-        paths.push(a);
+        if !end_of_options && logical_arg == "--" {
+            end_of_options = true;
+            if let Some(target_is_separate) = suffix_target_is_separate {
+                skip_redirection_target = target_is_separate;
+            }
+            continue;
+        }
+        if !end_of_options && logical_arg.starts_with('-') {
+            // A bare value-taking option consumes the NEXT token as its value; the
+            // joined `--iterations=3` form is self-contained (consumes nothing).
+            if value_flags.contains(&logical_arg) {
+                skip_next = true;
+            }
+            if let Some(target_is_separate) = suffix_target_is_separate {
+                skip_redirection_target = target_is_separate;
+            }
+            continue;
+        }
+        paths.push(std::borrow::Cow::Borrowed(logical_arg));
+        if let Some(target_is_separate) = suffix_target_is_separate {
+            skip_redirection_target = target_is_separate;
+        }
     }
     paths
+}
+
+/// Split the first unquoted, unescaped redirection suffix from a preceding argv
+/// word. Returns the argv prefix plus whether the operator consumes the next
+/// shell word. Process substitutions stay part of the word.
+fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+        Backtick,
+    }
+
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut substitution_depth = 0usize;
+    let mut parameter_depth = 0usize;
+    let mut chars = word.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                }
+                continue;
+            }
+            Quote::Double => {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = Quote::None;
+                }
+                continue;
+            }
+            Quote::Backtick => {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == '`' {
+                    quote = Quote::None;
+                }
+                continue;
+            }
+            Quote::None => match ch {
+                '\\' => {
+                    escaped = true;
+                    continue;
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    continue;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    continue;
+                }
+                '`' => {
+                    quote = Quote::Backtick;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+
+        if substitution_depth > 0 {
+            match ch {
+                '(' => substitution_depth = substitution_depth.saturating_add(1),
+                ')' => substitution_depth = substitution_depth.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        }
+
+        if parameter_depth > 0 {
+            match ch {
+                '{' => parameter_depth = parameter_depth.saturating_add(1),
+                '}' => parameter_depth = parameter_depth.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        }
+
+        // Operators inside command/process substitutions belong to that
+        // nested command, not the outer delete command. Consume the opening
+        // parenthesis here so it is counted exactly once.
+        if matches!(ch, '$' | '<' | '>') && chars.peek().is_some_and(|(_, next)| *next == '(') {
+            let _ = chars.next();
+            substitution_depth = 1;
+            continue;
+        }
+
+        // A `>` or `<` inside `${parameter expansion}` is word content (for
+        // example `${x:-a>b}`), not an outer redirection operator.
+        if ch == '$' && chars.peek().is_some_and(|(_, next)| *next == '{') {
+            let _ = chars.next();
+            parameter_depth = 1;
+            continue;
+        }
+
+        let candidate_index = ((ch == '&' && chars.peek().is_some_and(|(_, next)| *next == '>'))
+            || matches!(ch, '<' | '>'))
+        .then_some(index);
+        let Some(candidate_index) = candidate_index else {
+            continue;
+        };
+        if candidate_index == 0 {
+            return None;
+        }
+        let candidate = &word[candidate_index..];
+        if let Some(target_is_separate) = shell_redirection_token(candidate) {
+            return Some((&word[..candidate_index], target_is_separate));
+        }
+    }
+    None
+}
+
+/// Classify an unquoted POSIX/Fish redirection word retained by Tirith's
+/// lossless tokenizer. Returns whether the operator consumes the following
+/// token (`2> /tmp/log`) rather than carrying an attached target
+/// (`2>/tmp/log`, `2>&1`). Quoted or escaped lookalikes remain ordinary delete
+/// operands.
+fn shell_redirection_token(word: &str) -> Option<bool> {
+    let mut rest = word;
+    rest = rest.trim_start_matches(|ch: char| ch.is_ascii_digit());
+
+    // Bash also permits a variable-backed descriptor (`{fd}>file`). Only peel
+    // an actual shell identifier so a path that merely starts with braces is
+    // not mistaken for redirection syntax.
+    if let Some(after_open) = rest.strip_prefix('{') {
+        if let Some(close) = after_open.find('}') {
+            let name = &after_open[..close];
+            let mut bytes = name.bytes();
+            let valid_name = bytes
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            if valid_name {
+                rest = &after_open[close + 1..];
+            }
+        }
+    }
+
+    // Quoting or escaping the operator makes it an argv word. Escapes in an
+    // attached target are unrelated (`2>/tmp/a\\>b` is still a redirect).
+    if rest.starts_with(['\'', '"']) || rest.starts_with("\\>") || rest.starts_with("\\<") {
+        return None;
+    }
+
+    // Process substitutions are argv operands which expand to `/dev/fd/...`,
+    // not redirections. Check them before the generic `<`/`>` prefix match.
+    if rest.starts_with("<(") || rest.starts_with(">(") {
+        return None;
+    }
+
+    const OPERATORS: &[&str] = &[
+        "&>>", "&>", ">>", "<<<", "<<-", "<<", "><", "<>", ">|", ">&", "<&", ">", "<",
+    ];
+    let operator = OPERATORS
+        .iter()
+        .find(|operator| rest.starts_with(**operator))?;
+    Some(rest.len() == operator.len())
 }
 
 /// The first PATH operand of a delete command (the representative metadata path).
@@ -1208,7 +1459,9 @@ fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<&'a String> {
 /// a path: `shred -n 3 secret.txt` yields `secret.txt`, not `3`. `rm`/`unlink`
 /// have no value-taking options, so this is the first non-flag token as before.
 fn first_path_arg(tool: &str, args: &[String]) -> Option<String> {
-    delete_path_args(tool, args).first().map(|s| (*s).clone())
+    delete_path_args(tool, args)
+        .first()
+        .map(|path| path.as_ref().to_string())
 }
 
 /// The number of PATH operands a delete command targets, sharing [`delete_path_args`]
@@ -1220,16 +1473,16 @@ fn count_path_args(tool: &str, args: &[String]) -> usize {
     delete_path_args(tool, args).len()
 }
 
-/// The number of PATH operands that are NOT build artifacts, using the same path
-/// rule as [`count_path_args`] plus `crate::util_build_dirs::is_build_artifact_path`
-/// on each path. `rm app.rs dist/x dist/y` -> 1; `rm dist/a dist/b` -> 0;
-/// `rm -rf src x` -> 2. This is what the mass-deletion correlation sums, so a mixed
-/// delete contributes exactly its real non-build paths instead of all-or-nothing on
-/// one sampled path.
+/// Count PATH operands that are not concrete build artifacts. Dynamic operands
+/// remain counted: a shell variable cannot be exempted from text alone because
+/// `mktemp`, `mv`, and `rm` may all resolve to user-defined shell functions.
 fn count_non_build_path_args(tool: &str, args: &[String]) -> usize {
     delete_path_args(tool, args)
         .into_iter()
-        .filter(|a| !crate::util_build_dirs::is_build_artifact_path(a))
+        .filter(|path| {
+            let path = shell_dequote(path.as_ref());
+            !crate::util_build_dirs::is_build_artifact_path(&path)
+        })
         .count()
 }
 
@@ -2076,6 +2329,24 @@ mod tests {
             .insert("threat_malicious_package".to_string(), Severity::Info);
         let verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
         assert_eq!(verdict.action, Action::Allow);
+    }
+
+    #[test]
+    fn late_findings_receive_severity_policy_before_action_upgrade() {
+        let mut verdict = Verdict::from_findings(Vec::new(), 2, Timings::default());
+        let mut policy = crate::policy::Policy::default();
+        policy
+            .severity_overrides
+            .insert("analysis_incomplete".to_string(), Severity::Critical);
+
+        merge_late_findings(
+            &mut verdict,
+            vec![make_finding(RuleId::AnalysisIncomplete, Severity::Medium)],
+            &policy,
+        );
+
+        assert_eq!(verdict.findings[0].severity, Severity::Critical);
+        assert_eq!(verdict.action, Action::Block);
     }
 
     #[test]
@@ -2974,6 +3245,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn engine_native_approval_is_preserved_for_cli_and_refused_for_mcp() {
+        let mut raw = raw_verdict_with(Action::Warn, vec![], None);
+        raw.requires_approval = Some(true);
+        raw.approval_timeout_secs = Some(0);
+        raw.approval_fallback = Some("block".into());
+        raw.approval_rule = Some("web3_network_policy_violation".into());
+        raw.approval_description = Some("Web3 endpoint requires approval".into());
+        let policy = crate::policy::Policy::default();
+
+        let cli = apply_stateless_policy_effects(&raw, &policy, CallerContext::Cli);
+        assert_eq!(cli.action, Action::Warn);
+        assert_eq!(cli.requires_approval, Some(true));
+
+        let mcp = apply_stateless_policy_effects(&raw, &policy, CallerContext::McpServer);
+        assert_eq!(mcp.action, Action::Block);
+        assert_eq!(mcp.requires_approval, None);
+        assert_eq!(mcp.approval_rule, None);
+
+        let mut later_block = cli;
+        later_block.action = Action::Block;
+        normalize_approval_contract(&mut later_block, CallerContext::Cli);
+        assert_eq!(later_block.requires_approval, None);
+        assert_eq!(later_block.approval_timeout_secs, None);
+        assert_eq!(later_block.approval_fallback, None);
+        assert_eq!(later_block.approval_rule, None);
+        assert_eq!(later_block.approval_description, None);
+    }
+
+    #[test]
+    fn pending_approval_cannot_remain_an_executable_allow() {
+        // The CLI prompt channel may keep a live approval contract, but it
+        // must not report Action::Allow: that would look executable before
+        // the operator answers. MCP has no prompt, so the same contract is
+        // a Block with the approval metadata cleared.
+        let mut raw = raw_verdict_with(Action::Allow, vec![], None);
+        raw.requires_approval = Some(true);
+        raw.approval_timeout_secs = Some(30);
+        raw.approval_fallback = Some("block".into());
+        raw.approval_rule = Some("curl_pipe_shell".into());
+        raw.approval_description = Some("pending review".into());
+        let policy = crate::policy::Policy::default();
+
+        let cli = apply_stateless_policy_effects(&raw, &policy, CallerContext::Cli);
+        assert_eq!(cli.action, Action::Warn);
+        assert_eq!(cli.requires_approval, Some(true));
+
+        let mcp = apply_stateless_policy_effects(&raw, &policy, CallerContext::McpServer);
+        assert_eq!(mcp.action, Action::Block);
+        assert_eq!(mcp.requires_approval, None);
+    }
+
     // --- W7: derive_typed_events -------------------------------------------
 
     fn kinds(events: &[TypedEvent]) -> Vec<EventKind> {
@@ -3692,6 +4015,11 @@ mod tests {
         // silently ignored and the Medium correlation stayed at Warn.
         let correlation = make_finding(RuleId::DependencyChangeThenNetwork, Severity::Medium);
         let mut effective = raw_verdict_with(Action::Warn, vec![correlation], None);
+        effective.requires_approval = Some(true);
+        effective.approval_timeout_secs = Some(0);
+        effective.approval_fallback = Some("block".into());
+        effective.approval_rule = Some("web3_network_policy_violation".into());
+        effective.approval_description = Some("Web3 approval".into());
         let mut policy = crate::policy::Policy::default();
         policy.action_overrides.insert(
             RuleId::DependencyChangeThenNetwork.to_string(),
@@ -3709,6 +4037,11 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.rule_id == RuleId::DependencyChangeThenNetwork));
+        assert_eq!(effective.requires_approval, None);
+        assert_eq!(effective.approval_timeout_secs, None);
+        assert_eq!(effective.approval_fallback, None);
+        assert_eq!(effective.approval_rule, None);
+        assert_eq!(effective.approval_description, None);
     }
 
     #[test]
@@ -3730,6 +4063,11 @@ mod tests {
         let mut effective = raw_verdict_with(Action::Warn, vec![correlation], None);
         reapply_monotonic_policy_effects(&mut effective, &policy, CallerContext::Gateway);
         assert_eq!(effective.action, Action::Block);
+        assert_eq!(effective.requires_approval, None);
+        assert_eq!(effective.approval_timeout_secs, None);
+        assert_eq!(effective.approval_fallback, None);
+        assert_eq!(effective.approval_rule, None);
+        assert_eq!(effective.approval_description, None);
     }
 
     #[test]
@@ -3923,6 +4261,405 @@ mod tests {
     }
 
     #[test]
+    fn delete_operand_count_ignores_attached_and_separated_shell_redirections() {
+        let verdict = raw_verdict_with(Action::Allow, vec![], None);
+        for command in [
+            "rm -f authored.txt 2>/dev/null",
+            "rm -f authored.txt 2> /tmp/stderr",
+            "rm -f authored.txt >/tmp/stdout 2>&1",
+            "rm -- authored.txt < /tmp/stdin",
+        ] {
+            let event = derive_typed_events(command, &verdict)
+                .into_iter()
+                .find(|event| event.kind == EventKind::FileDelete)
+                .expect("delete event");
+            assert_eq!(
+                event
+                    .metadata
+                    .get(crate::event_buffer::DELETE_COUNT_KEY)
+                    .map(String::as_str),
+                Some("1"),
+                "redirection syntax became a delete operand: {command}"
+            );
+            assert_eq!(
+                event
+                    .metadata
+                    .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                    .map(String::as_str),
+                Some("1"),
+                "redirection syntax inflated mass-delete correlation: {command}"
+            );
+        }
+    }
+
+    fn delete_counts_for_shell(command: &str, shell: ShellType) -> (usize, usize) {
+        let verdict = raw_verdict_with(Action::Allow, vec![], None);
+        let event = derive_event_prototypes_for_shell(command, &verdict, shell)
+            .into_iter()
+            .find(|event| event.kind == EventKind::FileDelete)
+            .expect("delete event");
+        let total = event.metadata[crate::event_buffer::DELETE_COUNT_KEY]
+            .parse()
+            .expect("numeric total delete count");
+        let non_build = event.metadata[crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY]
+            .parse()
+            .expect("numeric non-build delete count");
+        (total, non_build)
+    }
+
+    const HERMES_SNAPSHOT_TEMP_VARIABLE: &str = "__hermes_snap_tmp";
+    const HERMES_SNAPSHOT_TEMP_REFERENCE: &str = "$__hermes_snap_tmp";
+
+    fn hermes_snapshot_wrapper(template: &str, destination: &str) -> String {
+        let producer = format!(
+            "{{ ( unset ${{!HERMES_SESSION_*}} ${{!HERMES_CRON_AUTO_DELIVER_*}} \
+             ${{!HERMES_BROWSER_CONTROL_*}} AI_AGENT HERMES_AGENT \
+             HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; }} \
+             > \"{HERMES_SNAPSHOT_TEMP_REFERENCE}\""
+        );
+        hermes_snapshot_wrapper_with_producer(template, destination, &producer)
+    }
+
+    fn hermes_legacy_snapshot_wrapper(template: &str, destination: &str) -> String {
+        let producer =
+            format!("{{ ( export -p; ) || true; }} > \"{HERMES_SNAPSHOT_TEMP_REFERENCE}\"");
+        hermes_snapshot_wrapper_with_producer(template, destination, &producer)
+    }
+
+    fn hermes_snapshot_wrapper_with_producer(
+        template: &str,
+        destination: &str,
+        producer: &str,
+    ) -> String {
+        format!(
+            "{HERMES_SNAPSHOT_TEMP_VARIABLE}=$(mktemp {template}) && \
+             {{ {producer} && \
+             mv -f \"{HERMES_SNAPSHOT_TEMP_REFERENCE}\" {destination}; }} \
+             2>/dev/null || rm -f \"{HERMES_SNAPSHOT_TEMP_REFERENCE}\" 2>/dev/null || true"
+        )
+    }
+
+    #[test]
+    fn hermes_snapshot_fallback_remains_counted_when_commands_can_be_shadowed() {
+        let command = hermes_snapshot_wrapper(
+            "/data/data/com.termux/files/usr/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
+            "/data/data/com.termux/files/usr/tmp/hermes-snap-session.sh",
+        );
+        assert_eq!(delete_counts_for_shell(&command, ShellType::Posix), (1, 1));
+
+        let legacy = hermes_legacy_snapshot_wrapper(
+            "/run/user/1000/hermes/hermes-snap-legacy.sh.tmp.XXXXXXXXXX",
+            "/run/user/1000/hermes/hermes-snap-legacy.sh",
+        );
+        assert_eq!(
+            delete_counts_for_shell(&legacy, ShellType::Posix),
+            (1, 1),
+            "plain legacy commands can resolve to user-defined shell functions"
+        );
+
+        for command in [
+            hermes_snapshot_wrapper(
+                "/c/Users/Alice/.hermes/cache/terminal/hermes-snap-msys.sh.tmp.XXXXXXXXXX",
+                "/c/Users/Alice/.hermes/cache/terminal/hermes-snap-msys.sh",
+            ),
+            hermes_legacy_snapshot_wrapper(
+                r"'C:\Users\Alice\.hermes\cache\terminal\hermes-snap-native.sh.tmp.XXXXXXXXXX'",
+                r"'C:\Users\Alice\.hermes\cache\terminal\hermes-snap-native.sh'",
+            ),
+        ] {
+            assert_eq!(
+                delete_counts_for_shell(&command, ShellType::Posix),
+                (1, 1),
+                "custom MSYS/native-Windows roots cannot override shadowability"
+            );
+        }
+
+        let with_sorted_passthroughs = command.replace(
+            "HERMES_UI_SESSION_ID 2>/dev/null",
+            "HERMES_UI_SESSION_ID AWS_PROFILE ZED_TOKEN 2>/dev/null",
+        );
+        assert_eq!(
+            delete_counts_for_shell(&with_sorted_passthroughs, ShellType::Posix),
+            (1, 1),
+            "the current producer's plain commands remain shadowable"
+        );
+
+        // The generated command is commonly rendered with physical continued
+        // lines. Proving it must not depend on collapsing those into one line.
+        let continued = command
+            .replace(" && {", " && \\\n{")
+            .replace(" } 2>/dev/null", " } \\\n2>/dev/null");
+        assert_eq!(
+            delete_counts_for_shell(&continued, ShellType::Posix),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn hermes_snapshot_cleanup_keeps_other_delete_segments_counted() {
+        let wrapper = hermes_snapshot_wrapper(
+            "/var/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
+            "/var/tmp/hermes-snap-session.sh",
+        );
+        let command = format!("rm authored.txt; {wrapper}; shred -n 3 another.txt");
+        assert_eq!(
+            delete_counts_for_shell(&command, ShellType::Posix),
+            (3, 3),
+            "dynamic fallback and authored deletes must all remain counted"
+        );
+    }
+
+    #[test]
+    fn hermes_wrapper_whitespace_and_newline_mutations_never_gain_an_exemption() {
+        let command = hermes_snapshot_wrapper(
+            "/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
+            "/tmp/hermes-snap-session.sh",
+        );
+        let mutations = [
+            command.replace(
+                "HERMES_UI_SESSION_ID 2>/dev/null",
+                "HERMES_UI_SESSION_ID\nrm secret source 2>/dev/null",
+            ),
+            command.replace(" && {", " && \\\r\n{"),
+            command.replace(
+                "HERMES_UI_SESSION_ID 2>/dev/null",
+                "HERMES_UI_SESSION_ID\u{000b}EXTRA 2>/dev/null",
+            ),
+            command.replace(
+                "HERMES_UI_SESSION_ID 2>/dev/null",
+                "HERMES_UI_SESSION_ID\u{00a0}EXTRA 2>/dev/null",
+            ),
+        ];
+        for mutation in mutations {
+            assert_eq!(
+                delete_counts_for_shell(&mutation, ShellType::Posix),
+                (1, 1),
+                "control/Unicode whitespace mutation must leave the fallback fully counted: {mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hermes_cleanup_interacts_safely_with_redirections_and_shell_types() {
+        let command = hermes_snapshot_wrapper(
+            "/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
+            "/tmp/hermes-snap-session.sh",
+        );
+        let segments = tokenize::tokenize(&command, ShellType::Posix);
+        let cleanup = segments
+            .iter()
+            .find(|segment| segment.command.as_deref() == Some("rm"))
+            .expect("fallback rm segment");
+        assert_eq!(
+            delete_path_args("rm", &cleanup.args)
+                .into_iter()
+                .map(|path| shell_dequote(path.as_ref()))
+                .collect::<Vec<_>>(),
+            [HERMES_SNAPSHOT_TEMP_REFERENCE]
+        );
+        assert_eq!(
+            delete_counts_for_shell(&command, ShellType::PowerShell),
+            (1, 1),
+            "the POSIX-only shape must not suppress another shell's deletion"
+        );
+    }
+
+    #[test]
+    fn concrete_hermes_artifacts_are_excluded_but_authored_lookalikes_are_not() {
+        assert_eq!(
+            delete_counts_for_shell(
+                "rm -rf '/tmp/hermes_sandbox_job' \
+                 /tmp/hermes-snap-session.sh.tmp.123",
+                ShellType::Posix,
+            ),
+            (2, 0),
+            "quoted and unquoted generated paths are both concrete artifacts"
+        );
+        assert_eq!(
+            delete_counts_for_shell(
+                "rm -rf project/hermes_sandbox_job \
+                 /workspace/hermes-snap-session.sh.tmp.123",
+                ShellType::Posix,
+            ),
+            (2, 2),
+            "similarly named authored paths must remain counted"
+        );
+        assert_eq!(
+            delete_counts_for_shell(
+                "rm -rf /tmp/hermes_sandbox_job/symlink/important.txt",
+                ShellType::Posix,
+            ),
+            (1, 1),
+            "a sandbox descendant may resolve through a symlink and is never globally exempt"
+        );
+    }
+
+    #[test]
+    fn quoted_and_escaped_redirection_lookalikes_remain_delete_operands() {
+        for args in [
+            vec!["'2>/dev/null'".to_string()],
+            vec!["2\\>/dev/null".to_string()],
+            vec!["2\">\"/dev/null".to_string()],
+            vec!["--".to_string(), "'2>/dev/null'".to_string()],
+        ] {
+            assert_eq!(delete_path_args("rm", &args).len(), 1, "args={args:?}");
+        }
+    }
+
+    #[test]
+    fn attached_redirect_target_may_contain_an_escaped_angle() {
+        let args = vec!["authored.txt".to_string(), "2>/tmp/a\\>b".to_string()];
+        assert_eq!(
+            delete_path_args("rm", &args)
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec!["authored.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn process_substitutions_remain_delete_operands() {
+        for token in ["<(printf data)", ">(printf data)", "2>(printf data)"] {
+            let args = vec![token.to_string()];
+            assert_eq!(
+                delete_path_args("rm", &args)
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>(),
+                vec![token.to_string()],
+                "process substitution was discarded as a redirect: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_fd_redirections_do_not_count_as_delete_operands() {
+        for args in [
+            vec!["authored.txt", "{log}>/tmp/log"],
+            vec!["authored.txt", "{log}>", "/tmp/log"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                delete_path_args("rm", &args)
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>(),
+                vec!["authored.txt".to_string()],
+                "dynamic-fd redirect became a delete operand: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_stripping_heredoc_delimiter_is_not_a_delete_operand() {
+        let args = ["authored.txt", "<<-", "EOF"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delete_path_args("rm", &args)
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec!["authored.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn redirections_do_not_consume_a_delete_option_value_slot() {
+        for args in [
+            vec!["-n", "2>/dev/null", "3", "secret.txt"],
+            vec!["-n", "2>", "/tmp/stderr", "3", "secret.txt"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                delete_path_args("shred", &args)
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>(),
+                vec!["secret.txt".to_string()],
+                "redirection changed effective argv option binding: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_redirection_suffix_preserves_only_the_real_delete_operand() {
+        let args = ["target>/dev/null"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delete_path_args("rm", &args)
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec!["target".to_string()]
+        );
+
+        let verdict = raw_verdict_with(Action::Allow, vec![], None);
+        let event = derive_typed_events("rm -rf target>/dev/null", &verdict)
+            .into_iter()
+            .find(|event| event.kind == EventKind::FileDelete)
+            .expect("delete event");
+        assert_eq!(
+            event.metadata.get("path").map(String::as_str),
+            Some("target")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("0"),
+            "the real `target` build directory must retain its build-artifact classification"
+        );
+    }
+
+    #[test]
+    fn quoted_escaped_and_process_substitution_suffixes_are_not_redirects() {
+        for token in [
+            "target\\>/dev/null",
+            "'target>/dev/null'",
+            "target\">\"/dev/null",
+            "target<(printf data)",
+            "target<(printf data>/dev/null)",
+            "target$(printf data>/dev/null)",
+            "target`printf data>/dev/null`",
+            "target${x:-a>b}",
+            "target${x:-${y:-a>b}}",
+        ] {
+            let args = vec![token.to_string()];
+            assert_eq!(
+                delete_path_args("rm", &args)
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>(),
+                vec![token.to_string()],
+                "quoted, escaped, or process-substitution text was split: {token}"
+            );
+        }
+
+        let args = vec!["target${x:-a>b}>/dev/null".to_string()];
+        assert_eq!(
+            delete_path_args("rm", &args)
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec!["target${x:-a>b}".to_string()],
+            "an outer redirect after parameter expansion must still be removed"
+        );
+    }
+
+    #[test]
     fn derive_file_delete_mixed_paths_counts_only_non_build() {
         // A7: a MIXED delete records total `count` for every path but a
         // `non_build_count` that excludes build artifacts. `rm app.rs dist/x dist/y`
@@ -4029,36 +4766,6 @@ mod tests {
         );
     }
 
-    /// RAII guard that snapshots an env var on construction and restores it (to its
-    /// prior value, or absent) on Drop, so a unix E2E test that sets
-    /// `XDG_STATE_HOME`/`TIRITH_LOG` does not leak that mutation into later tests.
-    /// Mirrors the `EnvVarGuard` used in `policy.rs`/`url_validate.rs`. Restoration
-    /// runs on unwind too, so the previous `catch_unwind` + unconditional
-    /// `remove_var` dance is no longer needed. Serialized by `TEST_ENV_LOCK`.
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized by TEST_ENV_LOCK; restore the prior value or remove.
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     /// W7 end-to-end: a SINGLE `rm a b c d` (four non-artifact paths) trips the
     /// MassFileDeletion correlation through the real `post_process_verdict` path,
     /// while `rm dist/x dist/y dist/z` (build artifacts) does not. This is the
@@ -4067,13 +4774,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn correlation_single_multipath_rm_trips_mass_deletion() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global escalation state");
         let dir = tempfile::tempdir().unwrap();
-        // Snapshot-and-restore the prior env so later tests are not mutated.
-        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
-        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
+        global.set_env("XDG_STATE_HOME", dir.path());
+        global.set_env("TIRITH_LOG", "0");
 
         let policy = crate::policy::Policy::default();
 
@@ -4154,13 +4859,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn correlation_secret_write_then_network_reaches_verdict() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global escalation state");
         let dir = tempfile::tempdir().unwrap();
-        // Snapshot-and-restore the prior env so later tests are not mutated.
-        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
-        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
+        global.set_env("XDG_STATE_HOME", dir.path());
+        global.set_env("TIRITH_LOG", "0");
 
         let policy = crate::policy::Policy::default();
         let session_id = "w7-secret-then-network";
@@ -4273,12 +4976,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn correlation_presentation_dedup_does_not_suppress_block() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global escalation state");
         let dir = tempfile::tempdir().unwrap();
-        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
-        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
+        global.set_env("XDG_STATE_HOME", dir.path());
+        global.set_env("TIRITH_LOG", "0");
 
         let policy = crate::policy::Policy::default();
         let session_id = "w7-dedup-enforcement";

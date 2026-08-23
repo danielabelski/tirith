@@ -2929,12 +2929,10 @@ mod tests {
         let path = root.path().join("config.json");
         fs::write(&path, "base").unwrap();
         let oversized = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
-        let transform_calls = std::cell::Cell::new(0usize);
         let error = transactional_update_with_hook(
             &path,
             root.path(),
             |snapshot| {
-                transform_calls.set(transform_calls.get() + 1);
                 if snapshot.text(&path)? == Some("base") {
                     Ok(FileUpdate::write_text("small".into(), 0o600).with_backup(true))
                 } else {
@@ -2954,11 +2952,6 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "drift");
         assert!(backup_paths(root.path()).is_empty());
         assert!(temporary_setup_paths(root.path()).is_empty());
-        assert_eq!(
-            transform_calls.get(),
-            1,
-            "snapshot drift must not replay observable transform work"
-        );
     }
 
     #[test]

@@ -4,11 +4,13 @@ description: >
   Terminal security analysis for shell environments. This skill should be used
   when checking commands for supply-chain attacks before execution, scanning
   repositories for hidden content or config poisoning, scoring URLs for
-  homograph attacks, setting up AI tool protection for Claude Code / Cursor /
-  Codex / Windsurf, downloading and executing scripts safely, investigating
-  why tirith blocked a command, managing trusted patterns, running security
-  audits, configuring MCP gateway proxies, or working with threat intelligence
-  databases. Also use when the user mentions "tirith", "pipe-to-shell",
+  homograph attacks, setting up AI tool protection, inspecting Python package
+  artifacts, governing untrusted tasks or Web3 commands, auditing browser
+  extensions, creating provenance receipts, downloading and executing scripts
+  safely, investigating why tirith blocked a command, managing trusted
+  patterns, running security audits, configuring MCP gateway proxies, or
+  working with threat intelligence databases. Also use when the user mentions
+  "tirith", "pipe-to-shell",
   "homograph", "ANSI injection", "zero-width", "punycode", "terminal security",
   "shell hook", "cloaking detection", "supply chain attack", "bidi override",
   "invisible unicode", or "config poisoning". Even if the user does not
@@ -72,7 +74,9 @@ Explain a specific rule: `tirith explain --rule pipe_to_interpreter`
 
 ### Intercept dangerous commands
 
-tirith hooks into the shell and checks every command before execution.
+tirith checks commands accepted by a supported interactive shell while its
+hook is loaded and healthy. Blocking behavior is shell/mode-specific; use
+`tirith doctor` to verify effective protection.
 Manual check:
 
 ```bash
@@ -138,20 +142,34 @@ Configure tirith to guard AI coding agents against prompt injection
 and malicious tool calls:
 
 ```bash
-tirith setup claude-code --with-mcp    # Claude Code + MCP server
-tirith setup cursor                     # Cursor
-tirith setup codex                      # OpenAI Codex
-tirith setup copilot-cli                # GitHub Copilot CLI (run from repo root)
-tirith setup gemini-cli --with-mcp     # Gemini CLI + MCP
-tirith setup kiro                       # Kiro CLI (formerly Amazon Q)
-tirith setup vscode                     # VS Code
-tirith setup windsurf                   # Windsurf
-tirith setup pi-cli                     # Pi CLI
-tirith setup openclaw                   # OpenClaw
+tirith setup claude-code --with-mcp   # blocking PreToolUse; project/user
+tirith setup cline                    # POSIX/Windows PreToolUse + MCP; user
+tirith setup codex                    # MCP gateway; optional --install-zshenv
+tirith setup copilot-cli              # blocking hook; project/repo root
+tirith setup continue                 # MCP only; project
+tirith setup cursor                   # hook + gateway; project/user
+tirith setup fx                       # MCP only; trusted user profile
+tirith setup gemini-cli --with-mcp    # blocking hook; optional MCP
+tirith setup grok-build               # POSIX hook + MCP; project/user
+tirith setup kiro                     # agent-scoped hook; project/user
+tirith setup omp                      # blocking guard + MCP; user/profile
+tirith setup openclaw                 # blocking plugin; project/user
+tirith setup opencode                 # MCP only; project/user
+tirith setup openhands                # POSIX hook + user MCP
+tirith setup pi-cli                   # blocking extension; project/user
+tirith setup prime-agent              # bash/IPython guard + MCP; user
+tirith setup roo-code                 # MCP only; project
+tirith setup vscode                   # workspace hook + gateway; project
+tirith setup windsurf                 # hook + gateway; user
 ```
 
 Preview changes: `tirith setup claude-code --dry-run`
 Update hook scripts: `tirith setup claude-code --update-configs`
+
+MCP-only registration is cooperative and does not force a command check.
+Host-native hooks are automatic only after the host loads and honors them.
+Restart the host and run its documented allow/block verification after setup or
+an upgrade. See `mcp/clients/mcp-only-agents.md` for the complete trust matrix.
 
 ### MCP gateway proxy
 
@@ -226,6 +244,45 @@ tirith threat-db update --force  # force re-download
 tirith threat-db status          # show DB age and entry counts
 ```
 
+### Inspect and enforce Python packages
+
+Inspect exact local artifacts without downloading them:
+
+```bash
+tirith package inspect --artifact dist/example-1.0-py3-none-any.whl
+tirith package inspect --artifact-set ./downloaded-wheels
+tirith package inspect --installed ./.venv
+```
+
+On x86_64 Linux, approve and install a hash-pinned pip plan through the native
+authority and containment capsule:
+
+```bash
+tirith pkg trust-tool /absolute/path/to/static-uv
+tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
+tirith pkg install pip requests==2.31.0 --target .tirith-pkg
+tirith pkg verify-env --target .tirith-pkg requests
+tirith pkg receipt last
+```
+
+Unsupported platforms refuse before pip starts. npm and Cargo are evidence
+surfaces, not enforcing package-firewall backends.
+
+### Explicit task, capsule, browser, and attestation workflows
+
+```bash
+tirith task check --file task-envelope.json       # diagnostic; executes nothing
+tirith capsule run --preset untrusted-project \
+  --project ./untrusted -- /bin/sh -c 'make test' # x86_64 Linux only
+tirith browser audit --browser chrome
+tirith pkg attest-npm --project .
+tirith attest build --help
+tirith attest deployment --help
+```
+
+These commands have command-specific evidence exit codes; do not assume the
+`tirith check` 0/1/2/3 ladder. See `docs/compatibility.md`.
+
 ### Policy management
 
 Configure detection behavior with YAML policies:
@@ -265,6 +322,10 @@ tirith daemon status    # check status and measure latency
 ## Output Behavior
 
 ### Exit codes
+
+This is the `tirith check` and shell-hook verdict ladder. Evidence-oriented
+commands such as `task check`, `capsule run`, `browser audit`, `pkg attest-npm`,
+and `attest` define command-specific codes in `docs/compatibility.md`.
 
 | Code | Action | Meaning |
 |------|--------|---------|
@@ -318,6 +379,10 @@ available to AI agents:
 | `tirith_verify_mcp_config` | Validate MCP configs for insecure servers, shell injection in args |
 | `tirith_fetch_cloaking` | Detect server-side cloaking (different content for bots vs browsers) |
 
+The preview `tirith_check_task` tool is absent and refused by name unless the
+server starts with `TIRITH_MCP_PREVIEW=1`. The default tool list is a frozen
+compatibility contract.
+
 Register: `tirith setup claude-code --with-mcp`
 Run manually: `tirith mcp-server` (JSON-RPC over stdio)
 
@@ -331,6 +396,9 @@ Run manually: `tirith mcp-server` (JSON-RPC over stdio)
 | `score` | Risk-score a URL |
 | `diff` | Compare a URL against known-good patterns |
 | `scan` | Scan files for hidden content and config poisoning |
+| `package` | Package risk, installed-tree scan, and exact artifact/environment inspection |
+| `pkg` | Python package approval/install/verification plus provenance and receipt evidence |
+| `ecosystem` | Scan a project's declared or installed dependencies |
 | `fetch` | Detect server-side cloaking (Unix) |
 | `why` | Explain the last triggered rule |
 | `explain` | Show documentation for a detection rule |
@@ -345,7 +413,12 @@ Run manually: `tirith mcp-server` (JSON-RPC over stdio)
 | `warnings` | Show accumulated session warnings |
 | `threat-db` | Manage threat intelligence database |
 | `gateway` | MCP gateway proxy for AI agent security |
+| `mcp` | Lock, verify, diff, and explain repository MCP configuration |
 | `mcp-server` | Run as MCP server (JSON-RPC over stdio) |
+| `task` | Diagnostic untrusted-task assessment (preview) |
+| `capsule` | Fail-closed untrusted-project containment on supported x86_64 Linux |
+| `browser` | Native-messaging setup and Chromium-family extension audit |
+| `attest` | Point-in-time build and deployment receipts |
 | `daemon` | Background daemon for faster checks |
 | `license` | Show or manage license status |
 | `activate` | Activate a license key |

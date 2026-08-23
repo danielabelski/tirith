@@ -247,17 +247,24 @@ pub(crate) mod test_support {
 
     const FIXTURE_DEADLINE: Duration = Duration::from_secs(3);
 
-    pub(crate) struct EnvironmentRestore(Vec<(&'static str, Option<OsString>)>);
+    pub(crate) struct EnvironmentRestore {
+        previous: Vec<(&'static str, Option<OsString>)>,
+        _global: tirith_test_support::GlobalStateGuard,
+    }
 
     impl EnvironmentRestore {
         pub(crate) fn new() -> Self {
-            Self(Vec::new())
+            Self {
+                previous: Vec::new(),
+                _global: tirith_test_support::GlobalStateGuard::new()
+                    .expect("isolate process-global test state"),
+            }
         }
 
         pub(crate) fn set(&mut self, name: &'static str, value: Option<&str>) {
-            self.0.push((name, std::env::var_os(name)));
-            // SAFETY: callers hold crate::TEST_ENV_LOCK for this guard's full
-            // lifetime, serializing process-environment mutation.
+            self.previous.push((name, std::env::var_os(name)));
+            // SAFETY: `_global` owns the shared process-global lock for this
+            // wrapper's full lifetime.
             unsafe {
                 match value {
                     Some(value) => std::env::set_var(name, value),
@@ -284,9 +291,9 @@ pub(crate) mod test_support {
 
     impl Drop for EnvironmentRestore {
         fn drop(&mut self) {
-            for (name, value) in self.0.drain(..).rev() {
-                // SAFETY: the environment lock remains held until this guard
-                // has restored every value.
+            for (name, value) in self.previous.drain(..).rev() {
+                // SAFETY: `_global` is still alive while this Drop
+                // implementation restores every wrapper-specific value.
                 unsafe {
                     match value {
                         Some(value) => std::env::set_var(name, value),
@@ -372,14 +379,17 @@ pub(crate) mod test_support {
                             "HTTP fixture received fewer than {expected} requests before deadline"
                         ));
                     };
-                    // On Darwin an accepted socket can inherit the listener's
-                    // nonblocking mode. The fixture needs a bounded BLOCKING
-                    // read: otherwise the first immediate `WouldBlock` records
-                    // an empty request and still publishes a success response,
-                    // making direct-route assertions flaky and misleading.
-                    stream
-                        .set_nonblocking(false)
-                        .map_err(|error| format!("make fixture stream blocking: {error}"))?;
+                    // `accept(2)` on BSD/Darwin creates the connected socket
+                    // with the listener's properties. The listener must be
+                    // nonblocking so the worker can observe `stop`, but request
+                    // reads must block until bytes arrive. Otherwise an inherited
+                    // `O_NONBLOCK` can yield an immediate `WouldBlock`; the old
+                    // fixture then recorded an empty request and sent a success
+                    // response, producing false wire-contract failures (and
+                    // occasionally malformed redirect exchanges).
+                    stream.set_nonblocking(false).map_err(|error| {
+                        format!("make accepted HTTP fixture stream blocking: {error}")
+                    })?;
                     stream
                         .set_read_timeout(Some(Duration::from_millis(500)))
                         .map_err(|error| format!("set fixture read timeout: {error}"))?;
@@ -388,16 +398,13 @@ pub(crate) mod test_support {
                         let mut chunk = [0u8; 4096];
                         match stream.read(&mut chunk) {
                             Ok(0) => {
-                                return Err("HTTP fixture peer closed before a complete request"
-                                    .to_string());
+                                return Err(format!(
+                                    "HTTP fixture peer closed before a complete request (received {} bytes)",
+                                    request.len()
+                                ))
                             }
                             Ok(read) => {
                                 request.extend_from_slice(&chunk[..read]);
-                                if request.len() > 1024 * 1024 {
-                                    return Err(
-                                        "HTTP fixture request exceeded the 1 MiB cap".to_string()
-                                    );
-                                }
                                 if request_is_complete(&request) {
                                     break;
                                 }
@@ -408,9 +415,10 @@ pub(crate) mod test_support {
                                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                                 ) =>
                             {
-                                return Err(
-                                    "HTTP fixture timed out before a complete request".to_string()
-                                );
+                                return Err(format!(
+                                    "HTTP fixture timed out before a complete request (received {} bytes)",
+                                    request.len()
+                                ));
                             }
                             Err(error) => return Err(format!("read HTTP fixture: {error}")),
                         }
@@ -545,6 +553,23 @@ mod tests {
         values.iter().map(|value| value.parse().unwrap()).collect()
     }
 
+    #[test]
+    fn environment_restore_wrapper_restores_custom_keys_with_shared_guard() {
+        const KEY: &str = "TIRITH_SSRF_GUARD_RESTORE_TEST";
+        let previous = std::env::var_os(KEY);
+        {
+            let mut restore = super::test_support::EnvironmentRestore::new();
+            restore.set(KEY, Some("temporary-value"));
+            assert_eq!(std::env::var(KEY).as_deref(), Ok("temporary-value"));
+        }
+
+        // Reacquire the same global lock before observing process state. The
+        // shared guard does not manage this wrapper-specific key itself.
+        let _verification = tirith_test_support::GlobalStateGuard::new()
+            .expect("reacquire process-global test state");
+        assert_eq!(std::env::var_os(KEY), previous);
+    }
+
     #[cfg(unix)]
     #[test]
     fn guarded_client_builders_ignore_ambient_proxies_and_keep_direct_routes_working() {
@@ -553,15 +578,16 @@ mod tests {
         };
         use std::time::Duration;
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Acquire process-global environment ownership before starting either
+        // deadline-bound listener. Under a parallel full-suite run, waiting for
+        // this lock after binding could let the fixture's accept deadline expire
+        // and turn the intended direct connection into a spurious refusal.
+        let mut restore = EnvironmentRestore::new();
         let fixture = ScriptedHttpServer::start(vec![
             http_response("200 OK", &[], b"server-direct"),
             http_response("200 OK", &[], b"fetch-direct"),
         ]);
         let proxy = ProxyTrap::start();
-        let mut restore = EnvironmentRestore::new();
         restore.install_ambient_proxy(&proxy.url());
 
         let address = fixture.address();

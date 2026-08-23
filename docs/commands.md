@@ -1,9 +1,9 @@
 # Command reference
 
-tirith ships 74 commands. `tirith --help` prints this same list grouped by
-category, and `tirith <command> --help` documents any one in detail. The groups
-below mirror that built-in grouping. The [README](../README.md) covers the
-everyday subset; this is the complete reference.
+tirith ships 78 top-level commands. `tirith --help` prints this same list
+grouped by category, and `tirith <command> --help` documents any one in detail.
+The groups below mirror that built-in grouping. The [README](../README.md)
+covers the everyday subset; this is the complete reference.
 
 ## Scan & analyze
 
@@ -21,8 +21,10 @@ everyday subset; this is the complete reference.
 | `tirith preview -- <cmd>` | Simulate the filesystem blast radius of `rm` / `mv` / `chmod -R` / `rsync --delete` without running it |
 | `tirith watch -- <cmd>` | Run a command, then diff its filesystem, `$PATH`, and shell-rc impact |
 | `tirith temp-run -- <cmd>` | Run a command in a throwaway temp directory and diff its file impact (file isolation, not a sandbox) |
+| `tirith capsule run --preset untrusted-project --project <dir> -- <cmd>` | Copy an untrusted project into a held ephemeral directory and run an exact argv inside a fail-closed OS capsule, emitting a signed receipt. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, and there is no degraded fallback |
 | `tirith taint {list,explain,clear}` | Track files downloaded from risky sources; executing or sourcing a tainted file fires a finding |
 | `tirith intend "<intent>" -- <cmd>` | Flag high-impact behavior the stated intent does not justify (advisory) |
+| `tirith task check` | Preview. Diagnostically assess an untrusted task envelope (issue body, PDF, web page) and report which effects it would be allowed. Executes nothing, fetches nothing, resolves no package, writes nothing, and declares `enforceability: observe_only` (`--file`, `--adapter`, `--format json`) |
 | `tirith lab` | Run the detection engine against a curated adversarial corpus to see what it catches (`--filter`, `--score`) |
 | `tirith explain --rule <id>` | Rule docs, examples, remediation, and MITRE mapping (`--fix`, `--list --category`) |
 | `tirith why` | Explain the last rule that triggered |
@@ -47,10 +49,11 @@ everyday subset; this is the complete reference.
 |---------|-------------|
 | `tirith init` | Print the shell hook for your profile (`--prompt-status` adds the prompt snippet) |
 | `tirith onboard` | Guided first-run wizard: detect the environment and recommend a policy template (`--apply`) |
-| `tirith setup <tool>` | One-command AI-tool setup (claude-code, codex, cursor, and more; `--with-mcp`) |
+| `tirith setup <tool>` | One-command setup for 19 named hosts: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, and windsurf (`--scope`, `--with-mcp`, `--dry-run`, `--update-configs`) |
 | `tirith install <backend> <args>` | Recorded, risk-analyzed install across npm / pip / cargo / apt / brew / dnf / yum / pacman / scoop / docker / go / url (`--online`, `--no-exec`, `--yes`, `--sha256`) |
 | `tirith verify-self` / `update` / `version --provenance` | Verify the running binary, signature-verified self-update, and build / install provenance |
 | `tirith browser {host,install-extension}` | Install the Chrome native-messaging host that records clipboard provenance |
+| `tirith browser audit` | Read-only integrity audit of installed Chromium-family extensions: tree digests, permissions, execution surfaces, install class, provenance, and drift against a baseline receipt (`--browser`, `--profile`, `--baseline`, `--write-baseline`) |
 | `tirith devcontainer {guard,inject}` / `codespaces {setup,inject}` | Guard container operations and inject tirith into `devcontainer.json` |
 | `tirith activate <key>` / `tirith license` | Activate a commercial license key, or show and manage license status |
 
@@ -84,6 +87,7 @@ everyday subset; this is the complete reference.
 | Command | What it does |
 |---------|-------------|
 | `tirith package {risk,explain,scan}` | Score a package's supply-chain risk (offline by default; `--online` adds registry provenance; `--installed` walks installed trees) |
+| `tirith package inspect` | Inspect local wheel artifacts, an artifact set, or an installed Python environment for structural violations, identity/RECORD/ownership failures, startup hooks, native execution chains, and cross-distribution loader/payload splits. Never downloads artifacts (`--artifact`, `--artifact-set`, `--installed`, `--format json`) |
 | `tirith ecosystem scan [path]` | Score every declared dependency in a project, slopsquat-aware (`--installed`, `--online`, `--format json`) |
 | `tirith threat-db {update,status,health,sources,explain,diff}` | Manage the signed local threat database (`threatdb` is an alias) |
 | `tirith iac {guard,check-plan,require-plan-before-apply}` | Terraform / Pulumi / OpenTofu apply gates (saved-plan hash, no-plan-apply) |
@@ -91,12 +95,27 @@ everyday subset; this is the complete reference.
 | `tirith secret {triage,rotate,revoke}` | Guidance-only secret-rotation assistant for 11 providers (no network) |
 | `tirith command-card {create,sign,verify,fetch}` | Ed25519-signed attestations that a known-good command is what it claims |
 | `tirith commands {init,list,run,check}` | Repo command manifest (`.tirith/commands.yaml`): a bounded allowlist plus an elevation-only `dangerous[]` list |
+| `tirith attest {build,verify-build,deployment,verify-deployment}` | Bind one source tree, one output tree, and one set of deployed routes into content-addressed point-in-time receipts, signed when this installation has an audit key. Not a reproducible-build claim and not continuous monitoring; `verify-deployment` re-checks the document and makes no network request |
+
+## Package firewall
+
+| Command | What it does |
+|---------|-------------|
+| `tirith pkg approve <backend> <spec>` | Resolve and inspect a requirement set and approve its install plan, printing the plan digest the approval binds to. Does not install |
+| `tirith pkg install <backend> <spec>` | Resolve, inspect, and install only the verified hash-pinned bytes inside the containment capsule, with a tamper-evident receipt. Enforcing execution is x86_64 Linux-only; every other platform fails closed before pip starts |
+| `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
+| `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |
+| `tirith pkg graph` | Compose a provenance graph (ownership / execution / payload) over a wheel set or an installed environment. Read model only |
+| `tirith pkg diff <old> <new>` | Release differential between two wheels of the same distribution, flagging execution-shape changes |
+| `tirith pkg attest <wheel>` | Fetch a wheel's PyPI publish attestation and bind the attested subject digest to the wheel's SHA-256. Evidence only, never an auto-allow |
+| `tirith pkg attest-npm` | Ask the project's own npm to verify its installed packages' registry signatures and provenance attestations, bound to the exact `package-lock.json` and `node_modules` inventory, and emit a signed receipt. Tirith does not download, inspect, or bind the tarball bytes npm installs (`--project`, `--require-provenance`, `--out`, `--format json`) |
+| `tirith pkg receipt {list,last,show}` | List or show the package-firewall tamper-evident receipts |
 
 ## AI-agent integrations
 
 | Command | What it does |
 |---------|-------------|
-| `tirith mcp-server` | Run tirith as an MCP server (7 tools) over JSON-RPC stdio (`--sanitize-tool-output`) |
+| `tirith mcp-server` | Run tirith as an MCP server (six cross-platform tools, plus `tirith_fetch_cloaking` on Unix) over JSON-RPC stdio; tool/resource output is sanitized by default (`--unsafe-unsanitized-tool-output` restores legacy pass-through) |
 | `tirith mcp {lock,verify,diff,explain,permissions,policy}` | Inventory and gate a repo's MCP servers into `.tirith/mcp.lock`, with per-server tool and per-capability views |
 | `tirith gateway run` | MCP gateway proxy that intercepts AI-agent shell tool calls (`--filter-output`) |
 | `tirith agent {sessions,explain,current,allow,block,policy}` | Caller-origin (human / agent / MCP / CI / IDE) governance; an `agent_rules.deny` match forces a block |
@@ -109,7 +128,7 @@ everyday subset; this is the complete reference.
 |---------|-------------|
 | `tirith audit {export,stats,report,verify}` | Audit-log management; `verify` checks the tamper-evident hash chain (`--expected-head`) |
 | `tirith incident {start,stop,status,report}` | Declare an "under attack" posture: fail-closed, bypass disabled, key rules elevated |
-| `tirith checkpoint {create,list,restore,diff,purge,watch}` | Snapshot files before risky operations in the private per-user state directory; `restore` sha256-verifies each blob and reports per-file outcomes. Releases before 0.3.4 may have left data under `/tmp/tirith/checkpoints`; inspect and remove that legacy directory manually. |
+| `tirith checkpoint {create,list,restore,diff,purge,watch}` | Snapshot files before risky operations in the private per-user state directory; `restore` sha256-verifies each blob and reports per-file outcomes. Releases before 0.4.0 may have left data under `/tmp/tirith/checkpoints`; inspect and remove that legacy directory manually. |
 | `tirith pending {list,resolve,export}` | Pending-decision registry for deferred blocks, suppressed-finding rollups, and restore prompts |
 | `tirith share --target <a>` / `tirith redact --audience <a>` | Audience-aware redaction before sharing (github-issue, slack, llm, public-paste) |
 | `tirith clipboard {copy,scan,guard,watch}` | Clipboard with secret-shape gating and browser source attribution |

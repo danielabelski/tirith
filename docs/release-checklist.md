@@ -1,5 +1,45 @@
 # Release Checklist
 
+## 0.4.0 preparation
+
+The current changelog and release guide describe **target** 0.4.0 behavior; the
+package version remains 0.3.3 until the final integration tree is known. Before
+creating the release commit:
+
+1. Rebase or merge the complete integration stack onto the final default-branch
+   tip and review the resulting tree, not only each stacked diff.
+2. Resolve or explicitly defer every item under `[Unreleased]` → `Known issues`.
+3. Run the required Linux, macOS, and Windows matrices on that exact tree,
+   including native x86_64-Linux containment and host-shaped hook tests.
+4. Complete the Web3/task and ThreatDB v2 rollout playbooks below.
+5. Change the workspace version to `0.4.0`, update Cargo lockfiles, regenerate
+   generated documentation/fixtures through their owning commands, and confirm
+   every package template is materialized from the tag as designed. Do not
+   hand-edit generated capability or evidence files.
+6. Move the changelog content from `[Unreleased]` to
+   `[0.4.0] - YYYY-MM-DD`, remove the draft banner from the release guide, and
+   ensure README installation text does not claim a registry has 0.4.0 before
+   that registry actually does.
+7. Run package assembly and the full release-validation workflow before pushing
+   the protected `v0.4.0` tag.
+
+Version 0.4.0 is intentional: it is the next minor after 0.3.3 and reflects the
+new commands, policy/document schemas, integrations, and enforcement surfaces.
+Skipping directly to 0.5.0 would create an unexplained empty 0.4 release line.
+
+## Feature-specific rollout playbooks
+
+Some releases carry their own staged-enablement and back-out procedure. Work
+through the playbook BEFORE the generic steps below, because a stage-0 item can
+block the merge window itself.
+
+- [Web3 and untrusted-task boundary](web3-task-rollout.md): pause and verify the
+  scheduled ThreatDB workflow, run the shadow build and the `@solana/web3.js`
+  boundary regression, confirm the frozen MCP tool list and the inert policy
+  defaults, then re-enable the workflow and monitor one deliberate run.
+- [ThreatDB v2 rollout](threatdb-v2-rollout.md): the separate database-format
+  playbook.
+
 ## crates.io publish order
 
 Publish `tirith-core` to crates.io **first**, then `tirith`. Run
@@ -28,12 +68,108 @@ cargo package -p tirith-core --allow-dirty
 cargo package -p tirith --allow-dirty   # may fail until tirith-core is published
 ```
 
+## Release authority prerequisites
+
+Repository settings are part of the release security boundary. Before a tag
+can publish, GitHub must have an environment named `release` with required
+reviewers and a deployment-branch/tag rule that admits only protected `v*`
+tags. The repository must also have a ruleset that restricts creation, update,
+and deletion of `v*` tags to release maintainers. Workflow YAML cannot protect
+its own tag trigger from an account that is allowed to replace that YAML at an
+arbitrary tagged commit, so these settings are mandatory rather than optional
+hardening.
+
+The workflow independently requires a complete semantic-version tag, requires
+that tag to point at the current default-branch commit, and routes every
+attestation/publication job through the `release` environment. The installer
+and self-updater accept the checksum signature only from the exact
+`release.yml@refs/tags/<requested-tag>` OIDC identity; a valid signature from
+another repository workflow or another release tag is not interchangeable.
+
+Release versions are single-use. Before publishing, the workflow requires the
+GitHub Release, both crates.io versions, all six npm versions, and all
+version-specific container tags to be absent. A pre-existing version is a hard
+conflict, not a successful rerun, and GitHub release assets are never replaced.
+Recover a partially published release manually after comparing the published
+bytes and provenance; do not delete or overwrite public artifacts to make a
+workflow rerun green. Release runner labels and the Node toolchain use explicit
+versions rather than moving `*-latest` or major-only selectors.
+
+## Linux release compatibility contract
+
+The two GNU tarballs are cross-linked with Zig against a GLIBC 2.28 ceiling.
+Both shipped executables (`tirith` and
+`tirith-package-approval-authority`) are scanned before packaging, and the
+release workflow executes the packaged bytes on AlmaLinux 8, Amazon Linux
+2023, and Rocky Linux 9. The x86_64 test runs natively; the aarch64 test runs
+under a pinned QEMU/binfmt environment. A release is not compatible merely
+because `tirith --version` starts: the runtime smoke also requires an exact
+allow exit code, an exact block exit code, and the helper's fail-closed exit
+code. GLIBC 2.28 is deliberate: Tirith and Rust's standard library reference
+`memfd_create` and `statx`, so a 2.17 sysroot cannot link without an additional
+raw-syscall shim. EL8 already ships GLIBC 2.28, and adding that shim would
+increase release risk without expanding the supported target set.
+
+The aarch64 release does not overclaim x86_64-only seccomp support: extrasafe is
+compiled only for linux-x86_64. On aarch64, Landlock and the remaining Linux
+containment layers stay available, but `network_raw_denied` is reported false;
+a locked-down capsule that requires it is degraded and fails closed. The
+aarch64 release build is itself a required CI gate, preventing an x86_64-only
+dependency from silently breaking the shipped artifact again. Each aarch64
+runtime smoke also invokes the locked-down capsule and requires an exit-1
+pre-launch refusal naming `network_raw_denied`; any child output fails the gate.
+The static musl build retains the cleanup walk's exact mount-ID proof through a
+size- and offset-asserted Linux `statx` UAPI buffer because libc hides those
+bindings for its default musl ABI. There is no `st_dev` fallback: an unavailable
+syscall or missing mount-ID result remains a fail-closed cleanup error.
+
+The `.deb` and `.rpm` packages must contain byte-identical copies of the
+canonical x86_64 GNU tarball executables. Do not restore a distro-native RPM
+rebuild: it raises the GLIBC floor and would invalidate `tirith verify-self`
+for DNF installs. CI extracts both packages, compares both executables, scans
+every packaged ELF, installs the packages, and repeats the runtime smoke.
+
+Pull requests that affect release inputs and manual `workflow_dispatch` runs
+execute these build/package/runtime gates without publishing. Only a pushed
+protected `v*` tag on the current default-branch commit may run signing,
+attestations, release upload, registry publication, or package-manager update
+jobs, and each publishing job requires approval through the `release`
+environment.
+
 ## Release pipeline (full sequence)
 
-Push a `v*` tag → GitHub Actions workflow builds, smoke-tests, then publishes to:
+Push a `v*` tag → GitHub Actions workflow builds, compatibility-tests, then publishes to:
 
 - GitHub Releases (signed checksums, install.sh, platform tarballs)
 - crates.io (`cargo publish tirith-core` then `cargo publish tirith`)
 - Homebrew (sheeki03/homebrew-tap — template sed'd from `packaging/homebrew/tirith.rb`)
 - npm (6 packages — root + 5 platform, version from tag)
 - Scoop (sheeki03/scoop-tirith — template sed'd from `packaging/scoop/tirith.json`)
+- GHCR (x86_64 and arm64 images plus immutable version manifest; moving
+  selectors advance only after version publication succeeds)
+- Chocolatey (package push; availability remains pending until community
+  moderation approves it)
+- AUR (`PKGBUILD` and `.SRCINFO` generated from the release tag)
+
+Homebrew core is separate from the tap publication. After the release exists,
+follow [the Homebrew core update guide](homebrew-core.md) and verify the core
+formula/bottles independently before describing `brew install tirith` as
+serving 0.4.0 everywhere.
+
+## Post-publication verification
+
+- Verify the GitHub Release contains every expected platform archive, Debian
+  and RPM package, installer, checksums, signature, certificate, SBOM, and
+  provenance artifact. Re-run verification against the downloaded public
+  bytes, not the runner workspace.
+- Verify `tirith` and `tirith-core` 0.4.0 on crates.io and all six exact 0.4.0
+  npm packages. Test one clean and one blocked command through an installed npm
+  platform wrapper.
+- Verify the Homebrew tap, Scoop bucket, GHCR architecture manifest, and AUR
+  package all resolve to the released checksums/digests.
+- Record Chocolatey's moderation state honestly. `choco info tirith` is the
+  source of truth for the approved community package; do not call 0.4.0
+  available there while it is still awaiting moderation.
+- Run `tirith version --provenance`, `tirith verify-self`, and `tirith doctor`
+  from representative package-manager installs and publish the final release
+  notes only after those checks match the tag.

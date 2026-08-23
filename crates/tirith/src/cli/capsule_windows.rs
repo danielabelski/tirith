@@ -6,12 +6,11 @@
 //! refused if it cannot be honestly enforced) and materializes it with the Win32
 //! AppContainer / ACL / Job Object / process-creation APIs:
 //!
-//! 1. **AppContainer profile + package SID** — `CreateAppContainerProfile` with a
-//!    per-launch name derived from the plan's stable base. Concurrent launches
-//!    therefore never share the package SID whose temporary ACL grants are later
-//!    revoked. The profile is deleted after the run. No networking capability is
-//!    ever passed (the plan grants none), so the container has no outbound socket
-//!    access.
+//! 1. **AppContainer profile + package SID** — `CreateAppContainerProfile`
+//!    (idempotent; an already-existing profile is reused) then
+//!    `DeriveAppContainerSidFromAppContainerName` for the package SID the child runs
+//!    under. No networking capability is ever passed (the plan grants none), so the
+//!    container has no outbound socket access.
 //! 2. **ACL grants (tracked + revoked)** — for each [`AclGrant`], add an
 //!    `EXPLICIT_ACCESS_W` ACE granting the container package SID the requested
 //!    access to the path's DACL via `SetEntriesInAclW` + `SetNamedSecurityInfoW`.
@@ -62,7 +61,6 @@
 
 use std::ffi::{c_void, OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -75,7 +73,9 @@ use windows::Win32::Security::Authorization::{
     GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
     TRUSTEE_W,
 };
-use windows::Win32::Security::Isolation::{CreateAppContainerProfile, DeleteAppContainerProfile};
+use windows::Win32::Security::Isolation::{
+    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+};
 use windows::Win32::Security::{
     CopySid, DeleteAce, EqualSid, FreeSid, GetAce, GetLengthSid, ACCESS_ALLOWED_ACE, ACE_FLAGS,
     ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
@@ -97,7 +97,7 @@ use windows::Win32::System::Threading::{
 };
 
 use tirith_core::capsule::windows::{
-    command_line_wide_for, AclAccess, AclGrant, WindowsLaunchPlan, APP_CONTAINER_NAME_MAX,
+    command_line_wide_for, AclAccess, AclGrant, WindowsLaunchPlan,
 };
 use tirith_core::capsule::{CapsuleSpec, EnvironmentPolicy};
 
@@ -106,7 +106,7 @@ use tirith_core::capsule::{CapsuleSpec, EnvironmentPolicy};
 /// fail-closed denial without leaking secrets.
 #[derive(Debug)]
 pub enum WindowsLaunchError {
-    /// Creating or deleting the AppContainer identity failed.
+    /// Creating or deriving the AppContainer identity failed.
     AppContainer(String, WinError),
     /// Applying or reverting an ACL grant failed.
     Acl(String, WIN32_ERROR),
@@ -123,11 +123,6 @@ pub enum WindowsLaunchError {
     /// Encoding a string for a Win32 wide-string argument failed (interior NUL).
     Encoding(String),
 }
-
-/// Monotonic per-process component for ephemeral AppContainer profile names.
-/// The process id supplies cross-process separation while this counter supplies
-/// thread-safe separation between overlapping launches in one process.
-static NEXT_PROFILE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl std::fmt::Display for WindowsLaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -160,17 +155,10 @@ pub struct ContainedChild {
     /// The ACL grants to revoke when the run is done. Held so the grants outlive
     /// the child but are reverted afterward.
     acl_guards: Vec<AclGuard>,
-    /// Removes this launch's unique HOME/TEMP tree after the process exits and
-    /// its AppContainer ACL grants are revoked.
-    temp_home: Option<TempHomeGuard>,
     /// The spec-requested wall-clock deadline (seconds), enforced by
     /// [`wait_for`] as a finite wait plus Job termination on expiry. `None`
     /// waits indefinitely (the spec requested no deadline).
     wall_clock_seconds: Option<u64>,
-    /// Deletes this launch's unique AppContainer profile after the ACL grants
-    /// and process lifetime end. Kept last so ordinary field drop closes the Job
-    /// and process handles before profile cleanup.
-    profile: ProfileGuard,
 }
 
 impl ContainedChild {
@@ -188,7 +176,9 @@ impl ContainedChild {
     /// or `INFINITE` when no deadline was requested. Saturates at just under
     /// `INFINITE` so a huge requested value cannot alias the infinite sentinel.
     fn wait_timeout_ms(&self) -> u32 {
-        wall_clock_timeout_ms(self.wall_clock_seconds)
+        self.wall_clock_seconds
+            .map(|s| s.saturating_mul(1000).min(u32::MAX as u64 - 1) as u32)
+            .unwrap_or(INFINITE)
     }
 
     /// Revert every ACL grant now (the child has exited). Idempotent: each guard
@@ -202,32 +192,11 @@ impl ContainedChild {
                 }
             }
         }
-        if let Some(temp_home) = &mut self.temp_home {
-            if let Err(e) = temp_home.remove_now() {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        if let Err(e) = self.profile.delete_now() {
-            if first_err.is_none() {
-                first_err = Some(e);
-            }
-        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
     }
-}
-
-/// Convert a policy wall-clock limit into the finite Win32 wait used by
-/// [`wait_for`]. Kept separate from the handle-owning child so the boundary and
-/// saturation behavior remain unit-testable without launching a process.
-fn wall_clock_timeout_ms(wall_clock_seconds: Option<u64>) -> u32 {
-    wall_clock_seconds
-        .map(|s| s.saturating_mul(1000).min(u32::MAX as u64 - 1) as u32)
-        .unwrap_or(INFINITE)
 }
 
 /// Launch `program` + `args` contained per `spec`, on the current Windows host.
@@ -331,18 +300,21 @@ fn apply_plan(
     cwd: Option<&std::path::Path>,
 ) -> Result<ContainedChild, WindowsLaunchError> {
     // 1. AppContainer profile (idempotent) + package SID.
-    let (container_sid, profile) = create_unique_appcontainer(plan)?;
+    let container_sid = create_or_open_appcontainer(plan)?;
     // `container_sid` owns the PSID and frees it on drop.
 
     // 2. ACL grants — tracked so they are reverted on any later failure or when the
     //    child finishes.
     // repo-0199: create the isolated HOME/TEMP directory BEFORE granting the
     // container SID access to it (the grant is in plan.acl_grants).
-    let temp_home = plan
-        .temp_home
-        .as_ref()
-        .map(|home| TempHomeGuard::create(home.clone()))
-        .transpose()?;
+    if let Some(home) = &plan.temp_home {
+        std::fs::create_dir_all(home).map_err(|e| {
+            WindowsLaunchError::Encoding(format!(
+                "cannot create capsule temporary home {}: {e}",
+                home.display()
+            ))
+        })?;
+    }
     let mut acl_guards = Vec::with_capacity(plan.acl_grants.len());
     for grant in &plan.acl_grants {
         match apply_acl_grant(grant, container_sid.psid()) {
@@ -414,60 +386,8 @@ fn apply_plan(
         process: launched.process,
         thread: launched.thread,
         acl_guards,
-        temp_home,
         wall_clock_seconds,
-        profile,
     })
-}
-
-/// Owns the isolated HOME/TEMP directory for one capsule launch. Creation uses
-/// `create_dir`, never `create_dir_all`, so an unexpected pre-existing name is
-/// rejected instead of reusing stale or attacker-planted contents. Cleanup is
-/// retried from `Drop` if explicit finish reports an error.
-struct TempHomeGuard {
-    path: std::path::PathBuf,
-    removed: bool,
-}
-
-impl TempHomeGuard {
-    fn create(path: std::path::PathBuf) -> Result<Self, WindowsLaunchError> {
-        std::fs::create_dir(&path).map_err(|e| {
-            WindowsLaunchError::Encoding(format!(
-                "cannot create unique capsule temporary home {}: {e}",
-                path.display()
-            ))
-        })?;
-        Ok(Self {
-            path,
-            removed: false,
-        })
-    }
-
-    fn remove_now(&mut self) -> Result<(), WindowsLaunchError> {
-        if self.removed {
-            return Ok(());
-        }
-        match std::fs::remove_dir_all(&self.path) {
-            Ok(()) => {
-                self.removed = true;
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.removed = true;
-                Ok(())
-            }
-            Err(error) => Err(WindowsLaunchError::Encoding(format!(
-                "cannot remove capsule temporary home {}: {error}",
-                self.path.display()
-            ))),
-        }
-    }
-}
-
-impl Drop for TempHomeGuard {
-    fn drop(&mut self) {
-        let _ = self.remove_now();
-    }
 }
 
 /// A PSID that owns its allocation and frees it on drop via `FreeSid`. Used for the
@@ -494,94 +414,44 @@ impl Drop for OwnedSid {
     }
 }
 
-/// Build a per-launch AppContainer profile name from the pure plan's stable base.
-/// Reusing the base SID would let one overlapping run's cleanup revoke the other
-/// run's ACL grants. The process id plus a checked atomic sequence keeps live
-/// launches distinct across and within processes while remaining under Windows'
-/// 64-code-unit profile-name limit.
-fn unique_profile_name(base: &str) -> Result<String, WindowsLaunchError> {
-    let sequence = NEXT_PROFILE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .map_err(|_| {
-            WindowsLaunchError::Encoding(
-                "appcontainer launch sequence exhausted; refusing SID reuse".to_string(),
-            )
-        })?;
-    let name = format!("{base}.{:08x}.{sequence:016x}", std::process::id());
-    if name.encode_utf16().count() > APP_CONTAINER_NAME_MAX {
-        return Err(WindowsLaunchError::Encoding(format!(
-            "per-launch appcontainer name exceeds {APP_CONTAINER_NAME_MAX} UTF-16 units"
-        )));
-    }
-    Ok(name)
-}
-
-/// Create a unique AppContainer profile for this launch and return both its package
-/// SID and a guard that deletes the profile after the contained run. No capabilities
-/// are ever passed (the plan grants none), so the container has no networking
-/// capability. Any unexpected name collision fails closed instead of sharing a SID.
-fn create_unique_appcontainer(
-    plan: &WindowsLaunchPlan,
-) -> Result<(OwnedSid, ProfileGuard), WindowsLaunchError> {
-    let profile_name = unique_profile_name(&plan.profile.name)?;
-    let name = wide_nul(&profile_name)
+/// Create the AppContainer profile (or reuse an existing one) and return its package
+/// SID. `CreateAppContainerProfile` returns the SID directly; if the profile already
+/// exists it fails with `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`, in which case we
+/// derive the SID from the name instead (idempotent reuse). No capabilities are ever
+/// passed (the plan grants none), so the container has no networking capability.
+fn create_or_open_appcontainer(plan: &WindowsLaunchPlan) -> Result<OwnedSid, WindowsLaunchError> {
+    let name = wide_nul(&plan.profile.name)
         .map_err(|_| WindowsLaunchError::Encoding("appcontainer name has NUL".to_string()))?;
     let display = wide_nul(&plan.profile.display_name)
         .map_err(|_| WindowsLaunchError::Encoding("display name has NUL".to_string()))?;
 
     // First try to create. `pcapabilities = None` -> no capabilities, so no network.
     // SAFETY: the wide strings are NUL-terminated and outlive the call.
-    let sid = unsafe {
+    let created = unsafe {
         CreateAppContainerProfile(
             PCWSTR(name.as_ptr()),
             PCWSTR(display.as_ptr()),
             PCWSTR(display.as_ptr()),
             None,
         )
-    }
-    .map_err(|e| {
-        WindowsLaunchError::AppContainer("create unique per-launch profile failed".to_string(), e)
-    })?;
-    Ok((
-        OwnedSid(sid),
-        ProfileGuard {
-            name_wide: name,
-            deleted: false,
-        },
-    ))
-}
-
-/// Owns one per-launch AppContainer profile and removes it once the contained
-/// process and its temporary ACL grants are finished. A failed explicit deletion
-/// remains retryable from `Drop`.
-struct ProfileGuard {
-    name_wide: Vec<u16>,
-    deleted: bool,
-}
-
-impl ProfileGuard {
-    fn delete_now(&mut self) -> Result<(), WindowsLaunchError> {
-        if self.deleted {
-            return Ok(());
+    };
+    match created {
+        Ok(psid) => Ok(OwnedSid(psid)),
+        Err(_) => {
+            // Most likely ERROR_ALREADY_EXISTS: derive the SID from the existing
+            // profile. (Any other error surfaces here too, with a derive failure.)
+            // SAFETY: `name` is NUL-terminated. The windows-crate binding returns the
+            // derived PSID directly (no out-param).
+            let derived =
+                unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) };
+            match derived {
+                Ok(psid) => Ok(OwnedSid(psid)),
+                Err(e) => Err(WindowsLaunchError::AppContainer(
+                    "create and derive both failed".to_string(),
+                    e,
+                )),
+            }
         }
-        // SAFETY: `name_wide` is a live NUL-terminated string naming the profile
-        // created for this guard; the API borrows it only for this call.
-        unsafe { DeleteAppContainerProfile(PCWSTR(self.name_wide.as_ptr())) }.map_err(|e| {
-            WindowsLaunchError::AppContainer(
-                "delete unique per-launch profile failed".to_string(),
-                e,
-            )
-        })?;
-        self.deleted = true;
-        Ok(())
-    }
-}
-
-impl Drop for ProfileGuard {
-    fn drop(&mut self) {
-        let _ = self.delete_now();
     }
 }
 
@@ -596,13 +466,13 @@ impl Drop for ProfileGuard {
 /// **Ownership:** `container_sid` is a `LocalAlloc`/`CopySid` duplicate of the
 /// AppContainer package SID (the original `OwnedSid` is freed when `apply_plan`
 /// returns, while the guard lives on inside [`ContainedChild`]); it is freed
-/// with `LocalFree` on drop, after the final revert.
+/// with `FreeSid` on drop, after the final revert.
 struct AclGuard {
     /// The path whose DACL we modified (NUL-terminated wide string).
     path_wide: Vec<u16>,
     /// Owned duplicate of the container package SID our ACE was granted to;
     /// matched against the live DACL at revert time.
-    container_sid: OwnedLocalSid,
+    container_sid: PSID,
     /// Whether this guard has already reverted.
     reverted: bool,
 }
@@ -654,18 +524,8 @@ impl AclGuard {
             for i in (0..ace_count).rev() {
                 let mut pace: *mut core::ffi::c_void = std::ptr::null_mut();
                 // SAFETY: `current_dacl` is a live DACL and `i < AceCount`.
-                if let Err(error) = unsafe { GetAce(current_dacl, i, &mut pace) } {
-                    return Err(WindowsLaunchError::Acl(
-                        "read ACE while reverting capsule grant".to_string(),
-                        WIN32_ERROR::from_error(&error).unwrap_or(ERROR_INVALID_PARAMETER),
-                    ));
-                }
-                if pace.is_null() {
-                    return Err(WindowsLaunchError::Acl(
-                        "read ACE while reverting capsule grant returned a null pointer"
-                            .to_string(),
-                        ERROR_INVALID_PARAMETER,
-                    ));
+                if unsafe { GetAce(current_dacl, i, &mut pace) }.is_err() || pace.is_null() {
+                    continue;
                 }
                 // SAFETY: `pace` names a live ACE inside the DACL for the
                 // duration of this iteration.
@@ -684,17 +544,12 @@ impl AclGuard {
                     PSID(unsafe { std::ptr::addr_of_mut!((*ace).SidStart) }
                         as *mut core::ffi::c_void);
                 // SAFETY: both SIDs are valid; EqualSid reads only.
-                let is_ours = unsafe { EqualSid(ace_sid, self.container_sid.psid()) }.is_ok();
+                let is_ours = unsafe { EqualSid(ace_sid, self.container_sid) }.is_ok();
                 if is_ours {
                     // SAFETY: `i` indexes a live ACE in `current_dacl`;
                     // DeleteAce shrinks the ACL in place, which is safe inside
                     // the owning descriptor buffer.
-                    if let Err(error) = unsafe { DeleteAce(current_dacl, i) } {
-                        return Err(WindowsLaunchError::Acl(
-                            "delete capsule ACE from DACL".to_string(),
-                            WIN32_ERROR::from_error(&error).unwrap_or(ERROR_INVALID_PARAMETER),
-                        ));
-                    }
+                    let _ = unsafe { DeleteAce(current_dacl, i) };
                 }
             }
             // SAFETY: `path_wide` is NUL-terminated; `current_dacl` is the
@@ -736,28 +591,13 @@ impl Drop for AclGuard {
         // FAILED earlier revert left `reverted` clear, so this retries the
         // revocation instead of leaking the ACE.
         let _ = self.revert_now();
-    }
-}
-
-/// A copied SID whose storage came from `LocalAlloc`. Unlike the SID returned by
-/// `CreateAppContainerProfile`, this allocation must be paired with `LocalFree`,
-/// not `FreeSid` (which is documented for `AllocateAndInitializeSid` results).
-struct OwnedLocalSid(HLOCAL);
-
-impl OwnedLocalSid {
-    fn psid(&self) -> PSID {
-        PSID(self.0 .0)
-    }
-}
-
-impl Drop for OwnedLocalSid {
-    fn drop(&mut self) {
-        if !self.0 .0.is_null() {
-            // SAFETY: this handle was returned by `LocalAlloc` and is freed once.
+        if !self.container_sid.0.is_null() {
+            // SAFETY: `container_sid` was allocated by LocalAlloc and is freed
+            // exactly once here via FreeSid's matching LocalFree.
             unsafe {
-                let _ = LocalFree(Some(self.0));
+                let _ = FreeSid(self.container_sid);
             }
-            self.0 = HLOCAL(std::ptr::null_mut());
+            self.container_sid = PSID(std::ptr::null_mut());
         }
     }
 }
@@ -797,28 +637,6 @@ fn apply_acl_grant(grant: &AclGrant, container_sid: PSID) -> Result<AclGuard, Wi
         .ok_or_else(|| WindowsLaunchError::Encoding(format!("non-UTF-8 path: {:?}", grant.path)))?;
     let path_wide =
         wide_nul(path_str).map_err(|_| WindowsLaunchError::Encoding("path has NUL".to_string()))?;
-
-    // Build the guard's independent SID copy BEFORE modifying the path. If
-    // allocation or copying fails, no ACE has been installed and therefore no
-    // cleanup state can be lost.
-    // SAFETY: `container_sid` came from CreateAppContainerProfile and is valid.
-    let sid_len = unsafe { GetLengthSid(container_sid) };
-    // SAFETY: allocate exactly the byte length reported for the source SID.
-    let sid_buf = unsafe { LocalAlloc(LPTR, sid_len as usize) }.map_err(|error| {
-        WindowsLaunchError::Acl(
-            "allocate container SID copy".to_string(),
-            WIN32_ERROR::from_error(&error).unwrap_or(ERROR_NOT_ENOUGH_MEMORY),
-        )
-    })?;
-    let sid_copy = OwnedLocalSid(sid_buf);
-    // SAFETY: `sid_copy` owns `sid_len` writable bytes and `container_sid` is a
-    // valid source SID. The RAII owner frees the buffer on failure.
-    if let Err(error) = unsafe { CopySid(sid_len, sid_copy.psid(), container_sid) } {
-        return Err(WindowsLaunchError::Acl(
-            "copy container SID for revert".to_string(),
-            WIN32_ERROR::from_error(&error).unwrap_or(ERROR_INVALID_PARAMETER),
-        ));
-    }
 
     // Read the existing DACL (so our grant is additive).
     let mut existing_dacl: *mut ACL = std::ptr::null_mut();
@@ -919,9 +737,39 @@ fn apply_acl_grant(grant: &AclGrant, container_sid: PSID) -> Result<AclGuard, Wi
         let _ = LocalFree(Some(HLOCAL(sd.0)));
     }
 
+    // Duplicate the container SID for the guard: the caller's `OwnedSid` is
+    // freed when `apply_plan` returns, but the guard lives on inside
+    // `ContainedChild` until the run finishes and the grant is reverted.
+    // SAFETY: `container_sid` is a valid SID for the duration of these calls.
+    let sid_len = unsafe { GetLengthSid(container_sid) };
+    // SAFETY: allocating `sid_len` zeroed bytes for the CopySid destination.
+    let sid_buf = unsafe { LocalAlloc(LPTR, sid_len as usize) }.map_err(|e| {
+        WindowsLaunchError::Acl(
+            "allocate container SID copy".to_string(),
+            WIN32_ERROR::from_error(&e).unwrap_or(ERROR_NOT_ENOUGH_MEMORY),
+        )
+    })?;
+    // SAFETY: `sid_buf` holds `sid_len` writable bytes; `container_sid` is a
+    // valid source SID. On failure the buffer is freed before returning.
+    if let Err(e) = unsafe {
+        CopySid(
+            sid_len,
+            PSID(sid_buf.0 as *mut core::ffi::c_void),
+            container_sid,
+        )
+    } {
+        unsafe {
+            let _ = LocalFree(Some(sid_buf));
+        }
+        return Err(WindowsLaunchError::Acl(
+            "copy container SID for revert".to_string(),
+            WIN32_ERROR::from_error(&e).unwrap_or(ERROR_INVALID_PARAMETER),
+        ));
+    }
+
     Ok(AclGuard {
         path_wide,
-        container_sid: sid_copy,
+        container_sid: PSID(sid_buf.0 as *mut core::ffi::c_void),
         reverted: false,
     })
 }
@@ -1029,14 +877,26 @@ fn build_environment_block(
     let present: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
         .collect();
-    let survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    let mut survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    if policy.deny_sensitive {
+        survivors.retain(|name| {
+            std::env::var_os(name).is_none_or(|value| {
+                value
+                    .to_str()
+                    .map(|value| policy.assignment_survives(name, value))
+                    .unwrap_or_else(|| !tirith_core::sensitive_assets::is_registered_env_name(name))
+            })
+        });
+    }
 
     // Isolated HOME/TEMP for the child when temporary_home is set — the SAME
     // path the launch plan granted to the container SID (repo-0199).
     let temp_home = if policy.temporary_home {
         temp_home_override
-            .expect("temporary_home launch plans must supply a unique HOME/TEMP path")
-            .to_path_buf()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("tirith-capsule-{}", std::process::id()))
+            })
     } else {
         std::path::PathBuf::new()
     };
@@ -1284,6 +1144,8 @@ const SUB_CONTAINERS_AND_OBJECTS_INHERIT: u32 = 0x3;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+    use std::path::Path;
     use tirith_core::capsule::windows::windows_launch_plan;
     use tirith_core::capsule::CapsuleSpec;
 
@@ -1296,26 +1158,6 @@ mod tests {
     #[test]
     fn wide_nul_rejects_interior_nul() {
         assert!(wide_nul("a\0b").is_err());
-    }
-
-    #[test]
-    fn wall_clock_timeout_is_finite_and_saturates_below_infinite() {
-        assert_eq!(wall_clock_timeout_ms(None), INFINITE);
-        assert_eq!(wall_clock_timeout_ms(Some(0)), 0);
-        assert_eq!(wall_clock_timeout_ms(Some(60)), 60_000);
-        assert_eq!(wall_clock_timeout_ms(Some(u64::MAX)), INFINITE - 1);
-    }
-
-    #[test]
-    fn appcontainer_profile_names_are_unique_and_bounded_per_launch() {
-        let base = "tirith.capsule.0123456789abcdef";
-        let first = unique_profile_name(base).expect("first name");
-        let second = unique_profile_name(base).expect("second name");
-        assert_ne!(first, second);
-        assert!(first.starts_with(base));
-        assert!(second.starts_with(base));
-        assert!(first.encode_utf16().count() <= APP_CONTAINER_NAME_MAX);
-        assert!(second.encode_utf16().count() <= APP_CONTAINER_NAME_MAX);
     }
 
     #[test]
@@ -1332,18 +1174,18 @@ mod tests {
 
     #[test]
     fn environment_block_strips_sensitive_and_double_nul_terminates() {
+        let _global = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _benign = EnvGuard::set("TIRITH_TEST_BENIGN", Path::new("ok"));
+        let _secret = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Path::new("shh"));
         // Build a block from a policy that inherits the parent env but strips
         // sensitive names; assert a sensitive var is absent and the block ends in NUL.
-        std::env::set_var("TIRITH_TEST_BENIGN", "ok");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "shh");
         let policy = EnvironmentPolicy {
             inherit: true,
             allow: Vec::new(),
             deny_sensitive: true,
             temporary_home: false,
         };
-        let isolated = std::path::Path::new("C:/Temp/tirith-capsule-test-unique");
-        let block = build_environment_block(&policy, Some(isolated));
+        let block = build_environment_block(&policy, None);
         // Decode to a string for substring checks (entries are KEY=VALUE\0...).
         let decoded = String::from_utf16_lossy(&block);
         assert!(decoded.contains("TIRITH_TEST_BENIGN=ok"));
@@ -1352,21 +1194,19 @@ mod tests {
             "sensitive var must be stripped from the child env block"
         );
         assert_eq!(*block.last().unwrap(), 0, "block must end with a NUL");
-        std::env::remove_var("TIRITH_TEST_BENIGN");
-        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
     }
 
     #[test]
     fn environment_block_overrides_home_under_temporary_home() {
-        std::env::set_var("USERPROFILE", "C:/Users/real");
+        let _global = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _profile = EnvGuard::set("USERPROFILE", Path::new("C:/Users/real"));
         let policy = EnvironmentPolicy {
             inherit: true,
             allow: Vec::new(),
             deny_sensitive: true,
             temporary_home: true,
         };
-        let isolated = std::path::Path::new("C:/Temp/tirith-capsule-test-unique");
-        let block = build_environment_block(&policy, Some(isolated));
+        let block = build_environment_block(&policy, None);
         let decoded = String::from_utf16_lossy(&block);
         // The real profile path must NOT survive; an isolated temp dir replaces it.
         assert!(
@@ -1374,8 +1214,6 @@ mod tests {
             "real USERPROFILE must be replaced under temporary_home"
         );
         assert!(decoded.contains("USERPROFILE="));
-        assert!(decoded.contains("C:/Temp/tirith-capsule-test-unique"));
-        std::env::remove_var("USERPROFILE");
     }
 
     #[test]

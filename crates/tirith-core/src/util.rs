@@ -7,9 +7,11 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 mod contained_fs;
+pub(crate) mod dirfd;
 
+pub(crate) use contained_fs::ContainedFilePreimage;
 #[doc(hidden)]
-pub use contained_fs::ContainedAtomicFile;
+pub use contained_fs::{ContainedAtomicFile, ContainedExclusiveLock};
 
 /// Why [`open_regular_capped`] refused to hand back a usable reader.
 #[derive(Debug)]
@@ -624,11 +626,19 @@ pub fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
 /// Structured like `checkpoint::write_checkpoint_file_atomic`.
 pub fn write_file_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match dir {
-        Some(d) => tempfile::NamedTempFile::new_in(d)?,
-        None => tempfile::NamedTempFile::new()?,
+    // Always create the tempfile in the destination directory. A relative
+    // filename (`build.receipt.json`) has no parent, and `NamedTempFile::new()`
+    // then lands in `%TEMP%` / `/tmp`, which on Windows is often a different
+    // volume (ERROR_NOT_SAME_DEVICE / os error 17 on persist/rename).
+    let cwd;
+    let dir = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(d) => d,
+        None => {
+            cwd = std::env::current_dir()?;
+            &cwd
+        }
     };
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -703,8 +713,31 @@ pub fn normalize_path_separators(path: Option<&Path>) -> Option<String> {
 
 #[cfg(test)]
 mod open_regular_tests {
-    use super::{open_regular_capped, read_regular_capped, read_store_lines, OpenRegularError};
+    use super::{
+        open_regular_capped, read_regular_capped, read_store_lines, write_file_atomic_0600,
+        OpenRegularError,
+    };
+    use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn atomic_write_of_a_relative_filename_stays_in_cwd() {
+        // The cwd is process-global. Changing it without the shared guard races
+        // every concurrent test that reads it: a guard built inside this window
+        // records this test's temp directory as the cwd to restore, and once
+        // that directory is removed every later `current_dir()` fails. Borrow
+        // the guard's already-isolated cwd instead, which it restores before
+        // removing its own root.
+        let _global =
+            tirith_test_support::GlobalStateGuard::new().expect("isolate process-global cwd state");
+        let cwd = std::env::current_dir().unwrap();
+        write_file_atomic_0600(Path::new("receipt.json"), b"{\"ok\":true}")
+            .expect("relative persist must not cross volumes");
+        assert_eq!(
+            std::fs::read(cwd.join("receipt.json")).unwrap(),
+            b"{\"ok\":true}"
+        );
+    }
 
     #[test]
     fn regular_file_within_cap_reads() {

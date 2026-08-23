@@ -47,22 +47,22 @@ fn label_origin(origin: &AgentOrigin) -> String {
             }
         }
         AgentOrigin::Agent { tool, version } => match version {
-            Some(v) => format!("agent ({tool:?} {v:?})"),
-            None => format!("agent ({tool:?})"),
+            Some(v) => format!("agent ({:?} {:?})", tool, v),
+            None => format!("agent ({:?})", tool),
         },
         AgentOrigin::Mcp {
             client_name,
             client_version,
         } => match client_version {
-            Some(v) => format!("mcp ({client_name:?} {v:?})"),
-            None => format!("mcp ({client_name:?})"),
+            Some(v) => format!("mcp ({:?} {:?})", client_name, v),
+            None => format!("mcp ({:?})", client_name),
         },
         AgentOrigin::Gateway => "gateway".to_string(),
         AgentOrigin::Ci { provider } => match provider {
-            Some(p) => format!("ci ({p:?})"),
+            Some(p) => format!("ci ({:?})", p),
             None => "ci (generic)".to_string(),
         },
-        AgentOrigin::Ide { name } => format!("ide ({name:?})"),
+        AgentOrigin::Ide { name } => format!("ide ({:?})", name),
     }
 }
 
@@ -131,8 +131,8 @@ impl OriginGroupKey {
             ("human", _, None) => "human".to_string(),
             ("gateway", _, _) => "gateway".to_string(),
             ("ci", None, _) => "ci (generic)".to_string(),
-            ("ci", Some(p), _) => format!("ci ({p:?})"),
-            (kind, Some(p), _) => format!("{kind} ({p:?})"),
+            ("ci", Some(p), _) => format!("ci ({:?})", p),
+            (kind, Some(p), _) => format!("{kind} ({:?})", p),
             (kind, None, _) => kind.to_string(),
         }
     }
@@ -420,7 +420,7 @@ pub fn explain(query: &str, log_override: Option<&str>, json: bool) -> i32 {
         report_error(
             json,
             "tirith agent explain",
-            &format!("no matching audit entries for {query:?}"),
+            &format!("no matching audit entries for {:?}", query),
         );
         return 1;
     }
@@ -642,36 +642,18 @@ pub(crate) fn policy_init_for_root(
 
     let yaml_body = render_agent_policy_scaffold_yaml(&scaffold);
 
-    // Bind the destination beneath the repo root through retained directory
-    // capabilities: `prepare` creates `.tirith` when missing WITHOUT following
-    // attacker-controlled symlinks and rejects any symlinked repo-controlled
-    // component (a symlinked `.tirith` escaping the repo, or a symlinked final
-    // component), closing the check/use gap the friendly pre-check above
-    // cannot.
-    let contained =
-        match tirith_core::util::ContainedAtomicFile::prepare(repo_root, &example_path, true) {
-            Ok(c) => c,
-            Err(e) => {
-                report_error(
-                    json,
-                    "tirith agent policy init",
-                    &format!(
-                        "refusing to write {} through a symlinked or escaping path: {e}",
-                        super::sanitize_for_human_output(
-                            &example_path.display().to_string(),
-                            false
-                        )
-                    ),
-                );
-                return 1;
-            }
-        };
-
-    // Atomic same-directory publish that never follows a final-component
-    // symlink; `overwrite = force` preserves no-clobber unless --force, and a
-    // file planted after the pre-check surfaces as AlreadyExists rather than
-    // being silently clobbered.
-    if let Err(e) = contained.write_atomic(yaml_body.as_bytes(), force) {
+    // Decide before parent creation, then retain one filesystem capability
+    // through exact-operation authorization and atomic publication.
+    let policy = policy::Policy::discover_local_only(repo_root.to_str());
+    if let Err(e) = super::write_config_file_permitted_with_parent_creation(
+        repo_root,
+        &example_path,
+        yaml_body.as_bytes(),
+        force,
+        &policy,
+        false,
+        true,
+    ) {
         let message = if e.kind() == std::io::ErrorKind::AlreadyExists {
             format!(
                 "{} already exists (use --force to overwrite)",
@@ -860,7 +842,10 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
         report_error(
             json,
             "tirith agent allow",
-            &format!("unknown kind {kind_str:?} (valid: human, agent, mcp, gateway, ci, ide)"),
+            &format!(
+                "unknown kind {:?} (valid: human, agent, mcp, gateway, ci, ide)",
+                kind_str
+            ),
         );
         return 1;
     };
@@ -954,7 +939,10 @@ pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json:
         report_error(
             json,
             "tirith agent block",
-            &format!("unknown kind {kind_str:?} (valid: human, agent, mcp, gateway, ci, ide)"),
+            &format!(
+                "unknown kind {:?} (valid: human, agent, mcp, gateway, ci, ide)",
+                kind_str
+            ),
         );
         return 1;
     };

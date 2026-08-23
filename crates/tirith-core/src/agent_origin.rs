@@ -22,7 +22,7 @@
 //! fabricated category through `TIRITH_INTEGRATION`; the free-form strings
 //! inside variants are caller-controlled, capped, and debug-escaped on render.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Cap on a free-form caller-supplied label (`tool`, `client_name`, `name`,
 /// `provider`), bounded so a hostile million-byte `TIRITH_INTEGRATION` cannot
@@ -44,8 +44,7 @@ pub const MAX_VERSION_LEN: usize = 64;
 /// Serialized as a tagged union (`tag = "kind"`, snake_case), e.g.
 /// `{"kind":"agent","tool":"claude-code"}`. An older log with no `agent_origin`
 /// still parses (the field serde-defaults to `None`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AgentOrigin {
     /// A human at a terminal — the default. `interactive` duplicates
     /// [`Verdict::interactive_detected`] so an audit consumer reading only
@@ -63,7 +62,6 @@ pub enum AgentOrigin {
         /// [`sanitize_caller_label`].
         tool: String,
         /// Sanitized integration version, when supplied.
-        #[serde(skip_serializing_if = "Option::is_none")]
         version: Option<String>,
     },
     /// An MCP client identifying itself via the JSON-RPC `initialize.clientInfo`
@@ -72,7 +70,6 @@ pub enum AgentOrigin {
         /// Sanitized `clientInfo.name`.
         client_name: String,
         /// Sanitized `clientInfo.version`.
-        #[serde(skip_serializing_if = "Option::is_none")]
         client_version: Option<String>,
     },
     /// `tirith gateway` acting as a policy enforcement point in front of another
@@ -82,7 +79,6 @@ pub enum AgentOrigin {
     /// (e.g. `"github-actions"`), `None` for a generic `CI` signal.
     Ci {
         /// Sanitized provider name; `None` when only generic `CI` was observed.
-        #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
     /// IDE-driven invocation. Unused today (IDEs set `TIRITH_INTEGRATION` and
@@ -91,6 +87,130 @@ pub enum AgentOrigin {
         /// Sanitized IDE name.
         name: String,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ProjectedAgentOrigin {
+    Human {
+        interactive: bool,
+    },
+    Agent {
+        tool: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
+    Mcp {
+        client_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_version: Option<String>,
+    },
+    Gateway,
+    Ci {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    Ide {
+        name: String,
+    },
+}
+
+impl From<&AgentOrigin> for ProjectedAgentOrigin {
+    fn from(origin: &AgentOrigin) -> Self {
+        match origin {
+            AgentOrigin::Human { interactive } => Self::Human {
+                interactive: *interactive,
+            },
+            AgentOrigin::Agent { tool, version } => Self::Agent {
+                tool: sanitize_caller_label(tool),
+                version: version.as_deref().and_then(non_empty_version),
+            },
+            AgentOrigin::Mcp {
+                client_name,
+                client_version,
+            } => Self::Mcp {
+                client_name: sanitize_caller_label(client_name),
+                client_version: client_version.as_deref().and_then(non_empty_version),
+            },
+            AgentOrigin::Gateway => Self::Gateway,
+            AgentOrigin::Ci { provider } => Self::Ci {
+                provider: provider.as_deref().and_then(non_empty_label),
+            },
+            AgentOrigin::Ide { name } => Self::Ide {
+                name: sanitize_caller_label(name),
+            },
+        }
+    }
+}
+
+impl Serialize for AgentOrigin {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ProjectedAgentOrigin::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProjectedAgentOrigin::deserialize(deserializer)?;
+        Ok(match wire {
+            ProjectedAgentOrigin::Human { interactive } => Self::Human { interactive },
+            ProjectedAgentOrigin::Agent { tool, version } => Self::Agent {
+                tool: sanitize_caller_label(&tool),
+                version: version.as_deref().and_then(non_empty_version),
+            },
+            ProjectedAgentOrigin::Mcp {
+                client_name,
+                client_version,
+            } => Self::Mcp {
+                client_name: sanitize_caller_label(&client_name),
+                client_version: client_version.as_deref().and_then(non_empty_version),
+            },
+            ProjectedAgentOrigin::Gateway => Self::Gateway,
+            ProjectedAgentOrigin::Ci { provider } => Self::Ci {
+                provider: provider.as_deref().and_then(non_empty_label),
+            },
+            ProjectedAgentOrigin::Ide { name } => Self::Ide {
+                name: sanitize_caller_label(&name),
+            },
+        })
+    }
+}
+
+impl std::fmt::Debug for AgentOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match ProjectedAgentOrigin::from(self) {
+            ProjectedAgentOrigin::Human { interactive } => f
+                .debug_struct("Human")
+                .field("interactive", &interactive)
+                .finish(),
+            ProjectedAgentOrigin::Agent { tool, version } => f
+                .debug_struct("Agent")
+                .field("tool", &tool)
+                .field("version", &version)
+                .finish(),
+            ProjectedAgentOrigin::Mcp {
+                client_name,
+                client_version,
+            } => f
+                .debug_struct("Mcp")
+                .field("client_name", &client_name)
+                .field("client_version", &client_version)
+                .finish(),
+            ProjectedAgentOrigin::Gateway => f.write_str("Gateway"),
+            ProjectedAgentOrigin::Ci { provider } => {
+                f.debug_struct("Ci").field("provider", &provider).finish()
+            }
+            ProjectedAgentOrigin::Ide { name } => {
+                f.debug_struct("Ide").field("name", &name).finish()
+            }
+        }
+    }
 }
 
 impl AgentOrigin {
@@ -233,7 +353,8 @@ fn env_is_truthy(var: &str) -> bool {
 /// into an audit line or JSON), and cap at [`MAX_LABEL_LEN`] bytes truncating on
 /// a char boundary. Empty result is preserved (caller decides the fallback).
 pub fn sanitize_caller_label(raw: &str) -> String {
-    let trimmed = raw.trim();
+    let projected = project_origin_text(raw);
+    let trimmed = projected.trim();
     let mut out = String::with_capacity(trimmed.len().min(MAX_LABEL_LEN));
     for ch in trimmed.chars() {
         // Keep printable ASCII + printable Unicode; drop C0 control, DEL, and
@@ -263,7 +384,8 @@ pub fn sanitize_caller_label(raw: &str) -> String {
 /// Sanitize a caller-supplied version string. Same rules as
 /// [`sanitize_caller_label`] but with a tighter cap ([`MAX_VERSION_LEN`]).
 pub fn sanitize_caller_version(raw: &str) -> String {
-    let trimmed = raw.trim();
+    let projected = project_origin_text(raw);
+    let trimmed = projected.trim();
     let mut out = String::with_capacity(trimmed.len().min(MAX_VERSION_LEN));
     for ch in trimmed.chars() {
         let keep = (ch as u32) >= 0x20 && ch != '\u{7f}' && !is_invisible_or_format(ch);
@@ -280,6 +402,13 @@ pub fn sanitize_caller_version(raw: &str) -> String {
         }
     }
     out
+}
+
+fn project_origin_text(raw: &str) -> String {
+    let share_safe =
+        crate::redact::redact_for_audience(raw, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    crate::redact::redact_blocked_output(&share_safe)
 }
 
 /// True for codepoints we never round-trip through the origin payload: bidi
@@ -347,6 +476,27 @@ fn non_empty_version(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestEnvironment {
+        global: tirith_test_support::GlobalStateGuard,
+    }
+
+    impl TestEnvironment {
+        fn new() -> Self {
+            Self {
+                global: tirith_test_support::GlobalStateGuard::new()
+                    .expect("isolate process-global agent-origin state"),
+            }
+        }
+
+        fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            self.global.set_env(name, value);
+        }
+
+        fn unset(&mut self, name: &'static str) {
+            self.global.remove_env(name);
+        }
+    }
 
     #[test]
     fn kind_tags_are_stable() {
@@ -462,21 +612,17 @@ mod tests {
         }
     }
 
-    // env-driven resolver tests; hold the global env lock (they mutate env).
+    // Env-driven resolver tests use the shared panic-safe global state guard.
 
     #[test]
     fn resolve_cli_origin_prefers_tirith_integration() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         // TIRITH_INTEGRATION wins over CI signals.
-        unsafe {
-            std::env::set_var("TIRITH_INTEGRATION", "claude-code");
-            std::env::set_var("TIRITH_INTEGRATION_VERSION", "1.2.3");
-            std::env::set_var("CI", "true");
-            std::env::set_var("GITHUB_ACTIONS", "true");
-        }
+        env.set("TIRITH_INTEGRATION", "claude-code");
+        env.set("TIRITH_INTEGRATION_VERSION", "1.2.3");
+        env.set("CI", "true");
+        env.set("GITHUB_ACTIONS", "true");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "agent");
@@ -486,29 +632,18 @@ mod tests {
         } else {
             panic!("expected Agent");
         }
-
-        unsafe {
-            std::env::remove_var("TIRITH_INTEGRATION");
-            std::env::remove_var("TIRITH_INTEGRATION_VERSION");
-            std::env::remove_var("CI");
-            std::env::remove_var("GITHUB_ACTIONS");
-        }
     }
 
     #[test]
     fn resolve_cli_origin_detects_named_ci_when_no_integration() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
-        unsafe {
-            std::env::remove_var("TIRITH_INTEGRATION");
-            std::env::remove_var("TIRITH_INTEGRATION_VERSION");
-            std::env::set_var("GITHUB_ACTIONS", "true");
-            std::env::remove_var("CI");
-            std::env::remove_var("GITLAB_CI");
-            std::env::remove_var("BUILDKITE");
-        }
+        env.unset("TIRITH_INTEGRATION");
+        env.unset("TIRITH_INTEGRATION_VERSION");
+        env.set("GITHUB_ACTIONS", "true");
+        env.unset("CI");
+        env.unset("GITLAB_CI");
+        env.unset("BUILDKITE");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "ci");
@@ -517,17 +652,11 @@ mod tests {
         } else {
             panic!("expected Ci");
         }
-
-        unsafe {
-            std::env::remove_var("GITHUB_ACTIONS");
-        }
     }
 
     #[test]
     fn resolve_cli_origin_detects_generic_ci_without_named_provider() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         // Clear every named-provider variable we know about, then set only CI=true.
         let named = [
@@ -543,13 +672,11 @@ mod tests {
             "DRONE",
             "CODEBUILD_BUILD_ID",
         ];
-        unsafe {
-            std::env::remove_var("TIRITH_INTEGRATION");
-            for v in named {
-                std::env::remove_var(v);
-            }
-            std::env::set_var("CI", "true");
+        env.unset("TIRITH_INTEGRATION");
+        for v in named {
+            env.unset(v);
         }
+        env.set("CI", "true");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "ci");
@@ -558,17 +685,11 @@ mod tests {
         } else {
             panic!("expected Ci");
         }
-
-        unsafe {
-            std::env::remove_var("CI");
-        }
     }
 
     #[test]
     fn resolve_cli_origin_falls_back_to_human() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         let to_clear = [
             "TIRITH_INTEGRATION",
@@ -586,10 +707,8 @@ mod tests {
             "DRONE",
             "CODEBUILD_BUILD_ID",
         ];
-        unsafe {
-            for v in to_clear {
-                std::env::remove_var(v);
-            }
+        for v in to_clear {
+            env.unset(v);
         }
 
         let origin = resolve_cli_origin(true);
@@ -603,9 +722,7 @@ mod tests {
 
     #[test]
     fn resolve_cli_origin_treats_ci_false_as_not_ci() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         // Some shells default `CI=false` — that should NOT trip the CI branch.
         let to_clear = [
@@ -622,26 +739,18 @@ mod tests {
             "DRONE",
             "CODEBUILD_BUILD_ID",
         ];
-        unsafe {
-            for v in to_clear {
-                std::env::remove_var(v);
-            }
-            std::env::set_var("CI", "false");
+        for v in to_clear {
+            env.unset(v);
         }
+        env.set("CI", "false");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "human");
-
-        unsafe {
-            std::env::remove_var("CI");
-        }
     }
 
     #[test]
     fn resolve_cli_origin_ignores_hostile_tirith_integration() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         // A million-byte hostile value with control bytes must not crash, not
         // produce a multi-line audit-poisoning label, and cap at MAX_LABEL_LEN.
@@ -650,10 +759,8 @@ mod tests {
             "x".repeat(1_000_000),
             "y".repeat(1_000_000)
         );
-        unsafe {
-            std::env::set_var("TIRITH_INTEGRATION", &hostile);
-            std::env::remove_var("CI");
-        }
+        env.set("TIRITH_INTEGRATION", &hostile);
+        env.unset("CI");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "agent");
@@ -663,10 +770,6 @@ mod tests {
             assert!(!tool.contains('\x1b'));
         } else {
             panic!("expected Agent");
-        }
-
-        unsafe {
-            std::env::remove_var("TIRITH_INTEGRATION");
         }
     }
 
@@ -742,5 +845,69 @@ mod tests {
         assert!(!v.contains('\n'));
         assert!(!v.contains('\x1b'));
         assert!(v.starts_with("1.2.3"));
+    }
+
+    #[test]
+    fn direct_public_variant_is_projected_by_debug_and_serialize() {
+        let secret = format!("ghp_{}", "A".repeat(36));
+        let origin = AgentOrigin::Agent {
+            tool: format!("/Users/alice/{secret}"),
+            version: Some(secret.clone()),
+        };
+
+        let debug = format!("{origin:?}");
+        let json = serde_json::to_string(&origin).unwrap();
+        for output in [&debug, &json] {
+            assert!(!output.contains(&secret), "{output}");
+            assert!(!output.contains("/Users/alice"), "{output}");
+            assert!(output.contains("REDACTED"), "{output}");
+        }
+    }
+
+    #[test]
+    fn constructors_redact_before_the_length_cap() {
+        let secret = format!("ghp_{}", "B".repeat(36));
+        // Start the credential four bytes before the label boundary. A
+        // truncate-then-project implementation would retain the recognizable
+        // `ghp_` prefix; projection-first construction removes it before the
+        // byte cap is applied.
+        let raw = format!("{}-{secret}", "x".repeat(MAX_LABEL_LEN - 5));
+        let origin = AgentOrigin::agent(&raw, Some(&secret)).unwrap();
+        let AgentOrigin::Agent { tool, version } = &origin else {
+            panic!("expected agent origin");
+        };
+        assert!(tool.len() <= MAX_LABEL_LEN, "{tool}");
+        assert!(version.as_deref().unwrap_or_default().len() <= MAX_VERSION_LEN);
+        assert!(!tool.contains("ghp_"), "{tool}");
+        assert!(!version.as_deref().unwrap_or_default().contains("ghp_"));
+
+        let json = serde_json::to_string(&origin).unwrap();
+        assert!(!json.contains(&secret), "{json}");
+        assert!(!json.contains("ghp_"), "{json}");
+    }
+
+    #[test]
+    fn deserialize_projects_wire_fields_before_public_construction() {
+        let secret = format!("ghp_{}", "C".repeat(36));
+        let wire = serde_json::json!({
+            "kind": "mcp",
+            "client_name": format!("/Users/alice/{secret}"),
+            "client_version": secret,
+        });
+        let origin: AgentOrigin = serde_json::from_value(wire).unwrap();
+        let AgentOrigin::Mcp {
+            client_name,
+            client_version,
+        } = &origin
+        else {
+            panic!("expected MCP origin");
+        };
+        assert!(!client_name.contains(&secret), "{client_name}");
+        assert!(!client_name.contains("/Users/alice"), "{client_name}");
+        assert!(!client_version.as_deref().unwrap_or("").contains(&secret));
+
+        let round_trip = serde_json::to_string(&origin).unwrap();
+        assert!(!round_trip.contains(&secret), "{round_trip}");
+        assert!(round_trip.contains("REDACTED"), "{round_trip}");
     }
 }

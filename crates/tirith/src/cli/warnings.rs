@@ -137,7 +137,8 @@ fn print_summary(w: &SessionWarnings, top_rules: &[(String, u32)]) {
         let next_level = next_paranoia_for_hidden(w.hidden_low, w.hidden_info);
         if let Some(next) = next_level {
             eprintln!(
-                "  \u{21b3} {hidden} findings hidden ({hidden_desc}). Set 'paranoia: {next}' in .tirith/policy.yaml to see them.",
+                "  \u{21b3} {} findings hidden ({hidden_desc}). Set 'paranoia: {next}' in .tirith/policy.yaml to see them.",
+                hidden,
             );
         }
     } else {

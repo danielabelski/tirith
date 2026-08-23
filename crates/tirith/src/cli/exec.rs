@@ -129,7 +129,7 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// parent (`.tirith`) instead is a tautology for a fixed `policy.yaml` filename and
 /// would NOT catch a symlinked `.tirith`. A malformed path with no grandparent is
 /// rejected rather than written.
-fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/policy.yaml → <repo>,
     // <config>/tirith/policy.yaml → <config>. A policy path is always at least
     // three components deep; refuse a malformed shallower path rather than guess.
@@ -140,7 +140,15 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         )
     })?;
 
-    let contained = tirith_core::util::ContainedAtomicFile::prepare(containment_root, path, true)?;
+    let policy = Policy::discover_local_only(containment_root.to_str());
+    let contained = super::prepare_config_destination_permitted(
+        containment_root,
+        path,
+        true,
+        &policy,
+        true,
+        true,
+    )?;
 
     // Read the current contents WITHOUT following a symlinked final component. An
     // absent file is an empty baseline (the key is then appended); any other read
@@ -180,7 +188,15 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     verify_guard_key_effective(&out, enable)?;
     // Atomic publish (temp + fsync + rename) through the retained parent
     // capability: interruption cannot truncate the previous policy.
-    contained.write_atomic(out.as_bytes(), true)
+    super::write_prepared_config_file_permitted(
+        containment_root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 fn verify_guard_key_effective(candidate: &str, expected: bool) -> std::io::Result<()> {
@@ -460,6 +476,9 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_appends_and_replaces() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // Real layout: <root>/.tirith/policy.yaml so the grandparent containment
         // root (<root>) exists and is not a symlink — the legit write must pass.
         let dir = tempfile::tempdir().unwrap();

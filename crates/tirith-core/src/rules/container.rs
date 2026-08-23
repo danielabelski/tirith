@@ -44,6 +44,18 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     for seg in &segments {
         let effective = match crate::rules::command::resolve_effective_segment(seg, shell) {
             Ok(effective) => effective,
+            Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
+                findings.push(make_finding(
+                    RuleId::AnalysisIncomplete,
+                    Severity::High,
+                    "Container command analysis exceeded its work budget".to_string(),
+                    "The container command exceeded Tirith's bounded token-normalization budget. The omitted token suffix is blocked instead of being treated as a non-container command."
+                        .to_string(),
+                    input,
+                    seg,
+                ));
+                continue;
+            }
             Err(_) => {
                 if seg.raw.split_whitespace().any(|word| {
                     matches!(command_basename(word, shell).as_str(), "docker" | "podman")
@@ -118,6 +130,10 @@ fn check_run_or_create(
         ));
     }
     if let Some(src) = sensitive_bind_mount(after_sub) {
+        // The title and description are public and are persisted to
+        // `last_trigger.json`, so the host path is redacted here rather than
+        // relying on evidence-only scrubbing.
+        let src = crate::redact::redact_command_text(&src, &[]);
         findings.push(make_finding(
             RuleId::DockerRunSensitiveBindMount,
             Severity::High,
@@ -513,10 +529,23 @@ fn make_finding(
         evidence: vec![
             Evidence::CommandPattern {
                 pattern: "docker <container-gate>".to_string(),
-                matched: seg.raw.chars().take(200).collect(),
+                // Redact BEFORE truncating. Cutting first can split a private
+                // path so the surviving prefix no longer matches a reviewed
+                // root, which would leak part of a wallet or credential path
+                // that the later redaction pass can no longer recognize.
+                matched: crate::redact::redact_command_text(&seg.raw, &[])
+                    .chars()
+                    .take(200)
+                    .collect(),
             },
             Evidence::Text {
-                detail: format!("input: {}", input.chars().take(200).collect::<String>()),
+                detail: format!(
+                    "input: {}",
+                    crate::redact::redact_command_text(input, &[])
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ),
             },
         ],
         human_view: Some(

@@ -77,15 +77,23 @@ fn windows_helper_parent_exits_with_a_live_grandchild() {
     // deliberately remains live with inherited stdout/stderr handles.
 }
 
-/// Hosted Windows runners build under a directory whose owner sits outside the
-/// trusted set, so the resolver legitimately refuses to bind the running test
-/// binary. The supervisor cases below need that binding to have anything to
-/// assert, so they skip there rather than restating the runner's ownership.
+/// Refusals that describe the hosted runner's own checkout, not the code under
+/// test. Both have been observed on GitHub Windows runners: the build directory
+/// is owned outside the trusted set, and on the `D:` work volume its ACLs also
+/// grant broad write access. Either way the resolver is right to refuse, and
+/// the supervisor cases below need a binding to have anything to assert.
+///
+/// Deliberately an exact list rather than "any InvalidPath": a refusal for any
+/// other reason is a real finding and must still fail loudly.
+const RUNNER_CHECKOUT_REFUSALS: &[&str] = &["untrusted owner", "grants broad write access"];
+
 fn trusted_current_exe() -> Option<TrustedExecutable> {
     match TrustedExecutable::current() {
         Ok(executable) => Some(executable),
         Err(error @ TrustedExecutableError::InvalidPath { .. })
-            if error.to_string().contains("untrusted owner") =>
+            if RUNNER_CHECKOUT_REFUSALS
+                .iter()
+                .any(|reason| error.to_string().contains(reason)) =>
         {
             eprintln!("skipping: {error}");
             None
@@ -321,4 +329,75 @@ fn windows_supervisor_timeout_kills_descendants_holding_pipes() {
         }
         assert_eq!(wait, WAIT_OBJECT_0, "descendant survived timeout cleanup");
     }
+}
+
+/// The pre-spawn deadline refusal runs before the executable is revalidated, so
+/// any bindable native image proves the guarantee. `cmd.exe` lives under a
+/// System32 owner inside the trusted set, so it binds on hosted runners where
+/// the checkout directory's owner does not.
+fn system_shell_executable() -> Option<TrustedExecutable> {
+    let interpreter = std::path::PathBuf::from(std::env::var_os("SystemRoot")?)
+        .join("System32")
+        .join("cmd.exe");
+    match TrustedExecutable::from_absolute(&interpreter, &[]) {
+        Ok(executable) => Some(executable),
+        Err(error) => {
+            eprintln!("skipping: {error}");
+            None
+        }
+    }
+}
+
+/// `cmd /c mkdir <path>` as the observable side effect, deliberately not a
+/// redirect. `cmd.exe` parses its own command line rather than following CRT
+/// argument rules, so an argument carrying `>` and embedded quotes gets escaped
+/// by Rust in a way `cmd` does not undo — that spelling ran but exited non-zero
+/// on the runner. Passing the path as its own argument leaves the quoting to
+/// Rust and the interpretation to `cmd`.
+fn marker_spec(marker: &std::path::Path, timeout: Duration) -> ChildSpec {
+    helper_spec(
+        &["/c", "mkdir", marker.to_str().expect("utf8 marker path")],
+        ChildLimits::new(timeout, 4096, 4096),
+    )
+}
+
+#[test]
+fn windows_supervisor_refuses_overflowing_deadline_before_child_code_executes() {
+    let Some(executable) = system_shell_executable() else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("overflow-child-ran");
+    match run(&executable, &marker_spec(&marker, Duration::MAX)) {
+        ChildOutcome::SpawnError(reason) => {
+            assert!(reason.contains("timeout deadline exceeds"), "{reason}");
+        }
+        other => panic!("overflowing deadline was not refused before spawn: {other:?}"),
+    }
+    assert!(
+        !marker.exists(),
+        "the child executed despite the pre-spawn deadline refusal"
+    );
+}
+
+#[test]
+fn windows_supervisor_runs_with_a_representable_deadline() {
+    let Some(executable) = system_shell_executable() else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("normal-child-ran");
+    // The control keeps the refusal test honest: the same spec under a
+    // representable deadline must actually create the marker, or the negative
+    // assertion would hold for a command that could never run at all.
+    match run(&executable, &marker_spec(&marker, Duration::from_secs(10))) {
+        ChildOutcome::Completed { status, .. } => {
+            assert!(status.success(), "control child failed: {status:?}");
+        }
+        other => panic!("representable deadline was not executed normally: {other:?}"),
+    }
+    assert!(
+        marker.exists(),
+        "the control child did not execute under a representable deadline"
+    );
 }

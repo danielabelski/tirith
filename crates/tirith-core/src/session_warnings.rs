@@ -4,13 +4,15 @@
 //! State is JSON at `state_dir()/sessions/{session_id}.json`. All I/O is
 //! best-effort: failures never alter the verdict or panic.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::verdict::{Evidence, Finding};
 
@@ -29,44 +31,51 @@ pub(crate) const MAX_TYPED_EVENTS: usize = 200;
 /// boundary. It is sized well above the number of distinct correlations a
 /// [`MAX_TYPED_EVENTS`]-event window can produce so it never evicts a marker whose
 /// source events are still in-window (which would let the same hit re-emit).
-const MAX_SURFACED_CORRELATIONS: usize = MAX_TYPED_EVENTS * 4;
+pub(crate) const MAX_SURFACED_CORRELATIONS: usize = MAX_TYPED_EVENTS * 4;
+const MAX_COOLDOWNS: usize = 512;
+const MAX_WARNING_DOMAINS: usize = 32;
+const MAX_TIMESTAMP_BYTES: usize = 64;
+const MAX_RULE_ID_BYTES: usize = 128;
+const MAX_SEVERITY_BYTES: usize = 32;
+const MAX_TITLE_BYTES: usize = 120;
+const MAX_COMMAND_PREVIEW_BYTES: usize = 120;
+const MAX_DOMAIN_BYTES: usize = 255;
+const MAX_COOLDOWN_KEY_BYTES: usize = 512;
+const MAX_COOLDOWN_VALUE_BYTES: usize = 64;
+const MAX_CORRELATION_SIGNATURE_BYTES: usize = 512;
+const MAX_CORRELATION_SOURCES: usize = 4;
+const PRIVACY_REDACTED_SESSION_ID: &str = "privacy-redacted";
+const PRIVACY_UNSAFE_SESSION_DIAGNOSTIC: &str =
+    "tirith: session: refusing privacy-unsafe session identity";
 
 /// Per-session warning accumulator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct SessionWarnings {
     pub session_id: String,
     pub session_start: String,
     pub total_warnings: u32,
     /// Aggregate hidden findings (for backward compat / quick total).
-    #[serde(default)]
     pub hidden_findings: u32,
     /// Hidden findings broken down by severity (recorded at detection time).
-    #[serde(default)]
     pub hidden_low: u32,
-    #[serde(default)]
     pub hidden_info: u32,
     pub events: VecDeque<WarningEvent>,
     /// Escalation events: records when an escalation rule fired, scoped per
     /// (rule_id, domain) key. Used for cooldown matching.
-    #[serde(default)]
     pub escalation_events: VecDeque<EscalationEvent>,
     /// Findings hidden by paranoia filtering, for `tirith warnings --hidden`.
-    #[serde(default)]
     pub hidden_events: VecDeque<HiddenEvent>,
     /// W6 — per-rule suppression cooldowns: `rule_key -> expires_at` (RFC3339).
     /// Session-backed so one-shot CLI / hook processes honor a cooldown that an
     /// earlier invocation started.
-    #[serde(default)]
     pub cooldowns: std::collections::BTreeMap<String, String>,
     /// W7: bounded ring of typed events for cross-event correlation. Recorded
     /// only after the caller confirms execution (and only for security-relevant
     /// signals); pre-execution checks use a provisional, non-persisted event view.
     /// Off the hot path; capped to [`MAX_TYPED_EVENTS`].
-    #[serde(default)]
     pub typed_events: VecDeque<crate::event_buffer::TypedEvent>,
     /// Next stable sequence for a confirmed typed event. Zero is accepted only
     /// while loading legacy state and is repaired before use.
-    #[serde(default)]
     pub next_typed_event_sequence: u64,
     /// W7: signatures of correlation hits already added to session warning
     /// presentation/accounting, so a hit whose A-then-B pair (or delete burst) is
@@ -77,12 +86,11 @@ pub struct SessionWarnings {
     /// the live [`typed_events`](Self::typed_events), and dropped once they have all
     /// aged out (see [`correlate_session`]). [`MAX_SURFACED_CORRELATIONS`] is only a
     /// pathological-growth backstop, not the dedup boundary.
-    #[serde(default)]
     pub surfaced_correlations: VecDeque<String>,
 }
 
 /// A single warning event within a session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WarningEvent {
     pub timestamp: String,
     pub rule_id: String,
@@ -95,16 +103,15 @@ pub struct WarningEvent {
 /// Records when an escalation rule fired, for cooldown scoping. `rule_id` is the
 /// crossing rule or `"*"` for aggregate; `domain` is set only for
 /// `domain_scoped` rules (one domain's escalation doesn't cool down others).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EscalationEvent {
     pub timestamp: String,
     pub rule_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
 }
 
 /// A finding that was hidden by paranoia filtering (recorded for `tirith warnings --hidden`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct HiddenEvent {
     pub timestamp: String,
     pub rule_id: String,
@@ -112,6 +119,586 @@ pub struct HiddenEvent {
     pub title: String,
     pub command_redacted: String,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "SessionWarnings")]
+struct SessionWarningsWire {
+    session_id: String,
+    session_start: String,
+    total_warnings: u32,
+    #[serde(default)]
+    hidden_findings: u32,
+    #[serde(default)]
+    hidden_low: u32,
+    #[serde(default)]
+    hidden_info: u32,
+    events: VecDeque<WarningEvent>,
+    #[serde(default)]
+    escalation_events: VecDeque<EscalationEvent>,
+    #[serde(default)]
+    hidden_events: VecDeque<HiddenEvent>,
+    #[serde(default)]
+    cooldowns: BTreeMap<String, String>,
+    #[serde(default)]
+    typed_events: VecDeque<crate::event_buffer::TypedEvent>,
+    #[serde(default)]
+    next_typed_event_sequence: u64,
+    #[serde(default)]
+    surfaced_correlations: VecDeque<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "WarningEvent")]
+struct WarningEventWire {
+    timestamp: String,
+    rule_id: String,
+    severity: String,
+    title: String,
+    command_redacted: String,
+    domains: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "EscalationEvent")]
+struct EscalationEventWire {
+    timestamp: String,
+    rule_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "HiddenEvent")]
+struct HiddenEventWire {
+    timestamp: String,
+    rule_id: String,
+    severity: String,
+    title: String,
+    command_redacted: String,
+}
+
+impl From<SessionWarningsWire> for SessionWarnings {
+    fn from(wire: SessionWarningsWire) -> Self {
+        Self {
+            session_id: wire.session_id,
+            session_start: wire.session_start,
+            total_warnings: wire.total_warnings,
+            hidden_findings: wire.hidden_findings,
+            hidden_low: wire.hidden_low,
+            hidden_info: wire.hidden_info,
+            events: wire.events,
+            escalation_events: wire.escalation_events,
+            hidden_events: wire.hidden_events,
+            cooldowns: wire.cooldowns,
+            typed_events: wire.typed_events,
+            next_typed_event_sequence: wire.next_typed_event_sequence,
+            surfaced_correlations: wire.surfaced_correlations,
+        }
+    }
+}
+
+impl From<SessionWarnings> for SessionWarningsWire {
+    fn from(session: SessionWarnings) -> Self {
+        Self {
+            session_id: session.session_id,
+            session_start: session.session_start,
+            total_warnings: session.total_warnings,
+            hidden_findings: session.hidden_findings,
+            hidden_low: session.hidden_low,
+            hidden_info: session.hidden_info,
+            events: session.events,
+            escalation_events: session.escalation_events,
+            hidden_events: session.hidden_events,
+            cooldowns: session.cooldowns,
+            typed_events: session.typed_events,
+            next_typed_event_sequence: session.next_typed_event_sequence,
+            surfaced_correlations: session.surfaced_correlations,
+        }
+    }
+}
+
+impl From<WarningEventWire> for WarningEvent {
+    fn from(wire: WarningEventWire) -> Self {
+        Self {
+            timestamp: wire.timestamp,
+            rule_id: wire.rule_id,
+            severity: wire.severity,
+            title: wire.title,
+            command_redacted: wire.command_redacted,
+            domains: wire.domains,
+        }
+    }
+}
+
+impl From<WarningEvent> for WarningEventWire {
+    fn from(event: WarningEvent) -> Self {
+        Self {
+            timestamp: event.timestamp,
+            rule_id: event.rule_id,
+            severity: event.severity,
+            title: event.title,
+            command_redacted: event.command_redacted,
+            domains: event.domains,
+        }
+    }
+}
+
+impl From<EscalationEventWire> for EscalationEvent {
+    fn from(wire: EscalationEventWire) -> Self {
+        Self {
+            timestamp: wire.timestamp,
+            rule_id: wire.rule_id,
+            domain: wire.domain,
+        }
+    }
+}
+
+impl From<EscalationEvent> for EscalationEventWire {
+    fn from(event: EscalationEvent) -> Self {
+        Self {
+            timestamp: event.timestamp,
+            rule_id: event.rule_id,
+            domain: event.domain,
+        }
+    }
+}
+
+impl From<HiddenEventWire> for HiddenEvent {
+    fn from(wire: HiddenEventWire) -> Self {
+        Self {
+            timestamp: wire.timestamp,
+            rule_id: wire.rule_id,
+            severity: wire.severity,
+            title: wire.title,
+            command_redacted: wire.command_redacted,
+        }
+    }
+}
+
+impl From<HiddenEvent> for HiddenEventWire {
+    fn from(event: HiddenEvent) -> Self {
+        Self {
+            timestamp: event.timestamp,
+            rule_id: event.rule_id,
+            severity: event.severity,
+            title: event.title,
+            command_redacted: event.command_redacted,
+        }
+    }
+}
+
+fn privacy_project_bounded_text(value: &str, max_bytes: usize) -> String {
+    let projected = crate::redact::privacy_project_durable_text(value);
+    let projected = crate::mcp::output_filter::sanitize_for_display(&projected);
+    crate::util::truncate_bytes(&projected, max_bytes)
+}
+
+fn privacy_project_domain(value: &str) -> String {
+    crate::util::truncate_bytes(
+        &crate::event_buffer::privacy_project_endpoint(value).to_lowercase(),
+        MAX_DOMAIN_BYTES,
+    )
+}
+
+fn privacy_project_session_id(value: &str) -> String {
+    if crate::session::is_valid_session_id(value) {
+        value.to_string()
+    } else {
+        PRIVACY_REDACTED_SESSION_ID.to_string()
+    }
+}
+
+fn privacy_project_warning_event(event: &mut WarningEvent) {
+    event.timestamp = privacy_project_bounded_text(&event.timestamp, MAX_TIMESTAMP_BYTES);
+    event.rule_id = privacy_project_bounded_text(&event.rule_id, MAX_RULE_ID_BYTES);
+    event.severity = privacy_project_bounded_text(&event.severity, MAX_SEVERITY_BYTES);
+    event.title = privacy_project_bounded_text(&event.title, MAX_TITLE_BYTES);
+    event.command_redacted =
+        privacy_project_bounded_text(&event.command_redacted, MAX_COMMAND_PREVIEW_BYTES);
+    event.domains = std::mem::take(&mut event.domains)
+        .into_iter()
+        .map(|domain| privacy_project_domain(&domain))
+        .filter(|domain| !domain.is_empty())
+        .collect();
+    event.domains.sort();
+    event.domains.dedup();
+    event.domains.truncate(MAX_WARNING_DOMAINS);
+}
+
+fn privacy_project_escalation_event(event: &mut EscalationEvent) {
+    event.timestamp = privacy_project_bounded_text(&event.timestamp, MAX_TIMESTAMP_BYTES);
+    event.rule_id = privacy_project_bounded_text(&event.rule_id, MAX_RULE_ID_BYTES);
+    event.domain = event
+        .domain
+        .take()
+        .map(|domain| privacy_project_domain(&domain));
+}
+
+fn privacy_project_hidden_event(event: &mut HiddenEvent) {
+    event.timestamp = privacy_project_bounded_text(&event.timestamp, MAX_TIMESTAMP_BYTES);
+    event.rule_id = privacy_project_bounded_text(&event.rule_id, MAX_RULE_ID_BYTES);
+    event.severity = privacy_project_bounded_text(&event.severity, MAX_SEVERITY_BYTES);
+    event.title = privacy_project_bounded_text(&event.title, MAX_TITLE_BYTES);
+    event.command_redacted =
+        privacy_project_bounded_text(&event.command_redacted, MAX_COMMAND_PREVIEW_BYTES);
+}
+
+fn validate_warning_event_input(event: &WarningEvent) -> Result<(), &'static str> {
+    let projected_rule = privacy_project_bounded_text(&event.rule_id, MAX_RULE_ID_BYTES);
+    if event.timestamp.len() > MAX_TIMESTAMP_BYTES
+        || event.rule_id.is_empty()
+        || projected_rule.is_empty()
+        || event.rule_id.len() > MAX_RULE_ID_BYTES
+        || event.severity.len() > MAX_SEVERITY_BYTES
+        || event.title.len() > MAX_TITLE_BYTES
+        || event.command_redacted.len() > MAX_COMMAND_PREVIEW_BYTES
+        || event.domains.len() > MAX_WARNING_DOMAINS
+        || event
+            .domains
+            .iter()
+            .any(|domain| domain.len() > MAX_DOMAIN_BYTES)
+    {
+        Err("warning event exceeds its public semantic bounds")
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_escalation_event_input(event: &EscalationEvent) -> Result<(), &'static str> {
+    let projected_rule = privacy_project_bounded_text(&event.rule_id, MAX_RULE_ID_BYTES);
+    if event.timestamp.len() > MAX_TIMESTAMP_BYTES
+        || event.rule_id.is_empty()
+        || projected_rule.is_empty()
+        || event.rule_id.len() > MAX_RULE_ID_BYTES
+        || event
+            .domain
+            .as_ref()
+            .is_some_and(|domain| domain.len() > MAX_DOMAIN_BYTES)
+    {
+        Err("escalation event exceeds its public semantic bounds")
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_hidden_event_input(event: &HiddenEvent) -> Result<(), &'static str> {
+    let projected_rule = privacy_project_bounded_text(&event.rule_id, MAX_RULE_ID_BYTES);
+    if event.timestamp.len() > MAX_TIMESTAMP_BYTES
+        || event.rule_id.is_empty()
+        || projected_rule.is_empty()
+        || event.rule_id.len() > MAX_RULE_ID_BYTES
+        || event.severity.len() > MAX_SEVERITY_BYTES
+        || event.title.len() > MAX_TITLE_BYTES
+        || event.command_redacted.len() > MAX_COMMAND_PREVIEW_BYTES
+    {
+        Err("hidden event exceeds its public semantic bounds")
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct EventIdentityProjection {
+    sequence: u64,
+    old_id: String,
+    new_id: String,
+    old_timestamp: String,
+    new_timestamp: String,
+}
+
+fn privacy_project_correlation_signature(
+    signature: &str,
+    events: &VecDeque<crate::event_buffer::TypedEvent>,
+    identities: &[EventIdentityProjection],
+) -> Option<String> {
+    if signature.is_empty() || signature.len() > MAX_CORRELATION_SIGNATURE_BYTES {
+        return None;
+    }
+    if privacy_project_bounded_text(signature, MAX_CORRELATION_SIGNATURE_BYTES) != signature {
+        return None;
+    }
+    let mut parts = signature.split('|');
+    let rule = parts.next()?;
+    if !matches!(
+        rule,
+        "SecretWriteThenNetwork"
+            | "DependencyChangeThenNetwork"
+            | "DeleteThenForcePush"
+            | "MassFileDeletion"
+    ) {
+        return None;
+    }
+
+    let mut rebuilt = rule.to_string();
+    let mut source_count = 0usize;
+    for part in parts {
+        source_count += 1;
+        if source_count > MAX_CORRELATION_SOURCES {
+            return None;
+        }
+        rebuilt.push('|');
+        if let Some(encoded) = part.strip_prefix("e:") {
+            let (event_id, sequence) = encoded.rsplit_once(':')?;
+            let sequence = sequence.parse::<u64>().ok()?;
+            let current = identities.iter().find(|identity| {
+                identity.sequence == sequence && identity.old_id.as_str() == event_id
+            });
+            let event_id = current.map_or(event_id, |identity| identity.new_id.as_str());
+            if event_id.is_empty()
+                || !events
+                    .iter()
+                    .any(|event| event.sequence == sequence && event.event_id == event_id)
+            {
+                return None;
+            }
+            rebuilt.push_str("e:");
+            rebuilt.push_str(event_id);
+            rebuilt.push(':');
+            rebuilt.push_str(&sequence.to_string());
+        } else {
+            let prefix = if part.starts_with("t:") { "t:" } else { "" };
+            let timestamp = part.strip_prefix("t:").unwrap_or(part);
+            let timestamp = identities
+                .iter()
+                .find(|identity| identity.old_timestamp == timestamp)
+                .map_or(timestamp, |identity| identity.new_timestamp.as_str());
+            if !events.iter().any(|event| event.timestamp == timestamp) {
+                return None;
+            }
+            rebuilt.push_str(prefix);
+            rebuilt.push_str(timestamp);
+        }
+    }
+    (source_count > 0 && rebuilt.len() <= MAX_CORRELATION_SIGNATURE_BYTES).then_some(rebuilt)
+}
+
+/// Project the complete public/persisted session graph. This is idempotent and
+/// runs at every direct serde/debug boundary as well as after a locked mutation,
+/// immediately before persistence.
+fn privacy_project_session_state(session: &mut SessionWarnings) {
+    session.session_id = privacy_project_session_id(&session.session_id);
+    session.session_start = privacy_project_bounded_text(&session.session_start, 64);
+
+    for event in &mut session.events {
+        privacy_project_warning_event(event);
+    }
+    while session.events.len() > MAX_EVENTS {
+        session.events.pop_front();
+    }
+    for event in &mut session.escalation_events {
+        privacy_project_escalation_event(event);
+    }
+    while session.escalation_events.len() > MAX_ESCALATION_EVENTS {
+        session.escalation_events.pop_front();
+    }
+    for event in &mut session.hidden_events {
+        privacy_project_hidden_event(event);
+    }
+    while session.hidden_events.len() > MAX_HIDDEN_EVENTS {
+        session.hidden_events.pop_front();
+    }
+
+    let mut cooldowns = BTreeMap::new();
+    for (key, value) in std::mem::take(&mut session.cooldowns) {
+        let (key, value) = crate::redact::privacy_project_durable_pair(&key, &value);
+        let key = privacy_project_bounded_text(&key, MAX_COOLDOWN_KEY_BYTES);
+        if key.is_empty() {
+            continue;
+        }
+        let value = privacy_project_bounded_text(&value, MAX_COOLDOWN_VALUE_BYTES);
+        cooldowns.insert(key, value);
+        if cooldowns.len() >= MAX_COOLDOWNS {
+            break;
+        }
+    }
+    session.cooldowns = cooldowns;
+
+    let mut identities = Vec::with_capacity(session.typed_events.len().min(MAX_TYPED_EVENTS));
+    for event in &mut session.typed_events {
+        let old_id = event.event_id.clone();
+        let old_timestamp = event.timestamp.clone();
+        crate::event_buffer::privacy_project_typed_event(event);
+        if event.sequence == 0 {
+            event.event_id.clear();
+        } else {
+            // Presentation state accepts an id only when it is reproducibly
+            // derived from the current projected source. This prevents an
+            // attacker-provided digest from becoming a durable oracle.
+            event.event_id.clear();
+            event.migrate_legacy_identity(&session.session_id, event.sequence);
+        }
+        identities.push(EventIdentityProjection {
+            sequence: event.sequence,
+            old_id,
+            new_id: event.event_id.clone(),
+            old_timestamp,
+            new_timestamp: event.timestamp.clone(),
+        });
+    }
+    while session.typed_events.len() > MAX_TYPED_EVENTS {
+        session.typed_events.pop_front();
+    }
+
+    let mut correlations: VecDeque<String> = std::mem::take(&mut session.surfaced_correlations)
+        .into_iter()
+        .filter_map(|signature| {
+            privacy_project_correlation_signature(&signature, &session.typed_events, &identities)
+        })
+        .collect();
+    while correlations.len() > MAX_SURFACED_CORRELATIONS {
+        correlations.pop_front();
+    }
+    session.surfaced_correlations = correlations;
+}
+
+impl Serialize for SessionWarnings {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut projected = self.clone();
+        privacy_project_session_state(&mut projected);
+        SessionWarningsWire::from(projected).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionWarnings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SessionWarningsWire::deserialize(deserializer)?;
+        let mut typed_sequences = std::collections::HashSet::new();
+        let mut typed_ids = std::collections::HashSet::new();
+        let duplicate_typed_identity = wire.typed_events.iter().any(|event| {
+            (event.sequence != 0 && !typed_sequences.insert(event.sequence))
+                || (!event.event_id.is_empty() && !typed_ids.insert(event.event_id.clone()))
+        });
+        if duplicate_typed_identity {
+            return Err(D::Error::custom("duplicate typed event identity"));
+        }
+        if wire.session_id.is_empty()
+            || wire.session_id.len() > 128
+            || wire.session_start.len() > MAX_TIMESTAMP_BYTES
+            || wire.events.len() > MAX_EVENTS
+            || wire.escalation_events.len() > MAX_ESCALATION_EVENTS
+            || wire.hidden_events.len() > MAX_HIDDEN_EVENTS
+            || wire.cooldowns.len() > MAX_COOLDOWNS
+            || wire.cooldowns.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > MAX_COOLDOWN_KEY_BYTES
+                    || value.len() > MAX_COOLDOWN_VALUE_BYTES
+            })
+            || wire.typed_events.len() > MAX_TYPED_EVENTS
+            || wire.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS
+            || wire.surfaced_correlations.iter().any(|signature| {
+                signature.is_empty() || signature.len() > MAX_CORRELATION_SIGNATURE_BYTES
+            })
+        {
+            return Err(D::Error::custom(
+                "session warnings exceed their public semantic bounds",
+            ));
+        }
+        let mut session = Self::from(wire);
+        privacy_project_session_state(&mut session);
+        Ok(session)
+    }
+}
+
+impl fmt::Debug for SessionWarnings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut projected = self.clone();
+        privacy_project_session_state(&mut projected);
+        formatter
+            .debug_struct("SessionWarnings")
+            .field("session_id", &projected.session_id)
+            .field("session_start", &projected.session_start)
+            .field("total_warnings", &projected.total_warnings)
+            .field("hidden_findings", &projected.hidden_findings)
+            .field("hidden_low", &projected.hidden_low)
+            .field("hidden_info", &projected.hidden_info)
+            .field("events", &projected.events)
+            .field("escalation_events", &projected.escalation_events)
+            .field("hidden_events", &projected.hidden_events)
+            .field("cooldowns", &projected.cooldowns)
+            .field("typed_events", &projected.typed_events)
+            .field(
+                "next_typed_event_sequence",
+                &projected.next_typed_event_sequence,
+            )
+            .field("surfaced_correlations", &projected.surfaced_correlations)
+            .finish()
+    }
+}
+
+macro_rules! privacy_projected_event_traits {
+    ($event:ty, $wire:ty, $project:path, $validate:path, $name:literal, {$($field:ident),+ $(,)?}) => {
+        impl Serialize for $event {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let mut projected = self.clone();
+                $project(&mut projected);
+                <$wire>::from(projected).serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $event {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let mut event = Self::from(<$wire>::deserialize(deserializer)?);
+                // Older Tirith versions could persist values beyond today's
+                // public bounds. Apply the same privacy/bounds projection used
+                // by every output boundary before validating, so one safely
+                // recoverable legacy field cannot discard the entire session.
+                // Irrecoverable semantics (for example a control-only rule id)
+                // still fail validation after projection.
+                $project(&mut event);
+                $validate(&event).map_err(D::Error::custom)?;
+                Ok(event)
+            }
+        }
+
+        impl fmt::Debug for $event {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut projected = self.clone();
+                $project(&mut projected);
+                formatter
+                    .debug_struct($name)
+                    $(.field(stringify!($field), &projected.$field))+
+                    .finish()
+            }
+        }
+    };
+}
+
+privacy_projected_event_traits!(
+    WarningEvent,
+    WarningEventWire,
+    privacy_project_warning_event,
+    validate_warning_event_input,
+    "WarningEvent",
+    {timestamp, rule_id, severity, title, command_redacted, domains}
+);
+privacy_projected_event_traits!(
+    EscalationEvent,
+    EscalationEventWire,
+    privacy_project_escalation_event,
+    validate_escalation_event_input,
+    "EscalationEvent",
+    {timestamp, rule_id, domain}
+);
+privacy_projected_event_traits!(
+    HiddenEvent,
+    HiddenEventWire,
+    privacy_project_hidden_event,
+    validate_hidden_event_input,
+    "HiddenEvent",
+    {timestamp, rule_id, severity, title, command_redacted}
+);
 
 impl SessionWarnings {
     /// Create a new empty accumulator.
@@ -191,11 +778,13 @@ fn cutoff_time(window_minutes: u64) -> String {
 
 /// Validate session_id and return the state file path.
 ///
-/// Session IDs must be non-empty, <=128 chars, and contain only
-/// `[a-zA-Z0-9_-]` to prevent path traversal.
+/// Session IDs must be non-empty, <=128 chars, contain only `[a-zA-Z0-9_-]`,
+/// and survive mandatory durable-secret projection unchanged. The shared
+/// resolver predicate therefore prevents both traversal and secret-bearing
+/// state/lock filenames.
 pub fn session_state_path(session_id: &str) -> Option<PathBuf> {
-    // repo-0339: one shared alphabet with the session resolver, so an ID the
-    // resolver accepted is always storable.
+    // repo-0339: one shared privacy-safe predicate with the session resolver, so
+    // an ID the resolver accepted is always storable.
     if !crate::session::is_valid_session_id(session_id) {
         return None;
     }
@@ -261,6 +850,10 @@ fn ensure_private_session_directory(directory: &Path) -> std::io::Result<()> {
 /// temp+rename, so a reader sees a complete old-or-new file and needs no shared lock
 /// to avoid a transient empty state.
 pub fn load(session_id: &str) -> SessionWarnings {
+    if privacy_project_session_id(session_id) != session_id {
+        crate::audit::audit_diagnostic(PRIVACY_UNSAFE_SESSION_DIAGNOSTIC);
+        return SessionWarnings::new(PRIVACY_REDACTED_SESSION_ID);
+    }
     let path = match session_state_path(session_id) {
         Some(p) => p,
         None => return SessionWarnings::new(session_id),
@@ -325,17 +918,13 @@ pub(crate) fn migrate_typed_event_identities(session: &mut SessionWarnings) {
             event.migrate_legacy_identity(&session.session_id, event.sequence);
         }
         if !event.event_id.is_empty() && used_ids.contains(&event.event_id) {
-            let base = event.event_id.clone();
             let mut replacement = None;
             for collision in 1..=used_ids.len().saturating_add(1) {
-                let seed = format!(
-                    "tirith-legacy-collision-v1\0{}\0{}\0{}\0{}",
-                    session.session_id, event.sequence, base, collision
-                );
-                let candidate = format!(
-                    "legacy-{}",
-                    crate::execution_state::sha256_hex(seed.as_bytes())
-                );
+                // Sequence and bounded ordinal are already unique, non-secret
+                // state. Do not hash the colliding attacker-controlled id: a
+                // digest would preserve an offline oracle after raw text was
+                // projected away.
+                let candidate = format!("legacy-event-{}-collision-{collision}", event.sequence);
                 if !used_ids.contains(&candidate) {
                     replacement = Some(candidate);
                     break;
@@ -817,6 +1406,10 @@ fn with_session_locked_result<R, F>(session_id: &str, persist: bool, access: F) 
 where
     F: FnOnce(&mut SessionWarnings) -> R,
 {
+    if privacy_project_session_id(session_id) != session_id {
+        crate::audit::audit_diagnostic(PRIVACY_UNSAFE_SESSION_DIAGNOSTIC);
+        return None;
+    }
     let path = session_state_path(session_id)?;
     let lock_path = session_lock_path(session_id)?;
 
@@ -958,6 +1551,17 @@ where
     }
 
     let result = access(&mut session);
+    // The loaded record was projected during deserialization/strict validation,
+    // but mutation closures can append fresh attacker-controlled titles,
+    // domains, paths, metadata keys/values, and stable ids. Reproject the entire
+    // graph after the mutation and before either serialization or debug-capable
+    // state can escape this boundary.
+    privacy_project_session_state(&mut session);
+    if session.session_id != session_id {
+        crate::audit::audit_diagnostic(PRIVACY_UNSAFE_SESSION_DIAGNOSTIC);
+        let _ = fs2::FileExt::unlock(&lock_file);
+        return Some(result);
+    }
 
     if !persist {
         let _ = fs2::FileExt::unlock(&lock_file);
@@ -1210,32 +1814,7 @@ pub fn clear_session(session_id: &str) {
 mod tests {
     use super::*;
     use crate::verdict::{Evidence, Finding, RuleId, Severity};
-
-    #[cfg(unix)]
-    struct TestStateHome(Option<std::ffi::OsString>);
-
-    #[cfg(unix)]
-    impl TestStateHome {
-        fn install(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("XDG_STATE_HOME");
-            // SAFETY: every caller holds the crate-wide environment lock.
-            unsafe { std::env::set_var("XDG_STATE_HOME", path) };
-            Self(previous)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for TestStateHome {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds the crate-wide environment lock.
-            unsafe {
-                match self.0.take() {
-                    Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-            }
-        }
-    }
+    use tirith_test_support::GlobalStateGuard;
 
     fn make_finding(rule_id: RuleId, severity: Severity) -> Finding {
         Finding {
@@ -1278,6 +1857,461 @@ mod tests {
         // Accept max length
         let max_id = "a".repeat(128);
         assert!(session_state_path(&max_id).is_some());
+
+        // A syntactically valid identifier that is itself sensitive must never
+        // become a JSON or lock filename.
+        let canary = format!("ghp_canary_{}", "Z".repeat(30));
+        assert!(canary
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')));
+        assert!(!crate::session::is_valid_session_id(&canary));
+        assert!(session_state_path(&canary).is_none());
+    }
+
+    #[test]
+    fn public_session_event_traits_project_direct_values_and_deserialization() {
+        let canary = format!("ghp_canary_{}", "C".repeat(30));
+        let warning = WarningEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            rule_id: format!("warning-{canary}"),
+            severity: "high".to_string(),
+            title: format!("wallet warning {canary}"),
+            command_redacted: format!("cat /wallets/{canary}/keypair.json"),
+            domains: vec![format!(
+                "https://operator:{canary}@rpc.example/private/{canary}"
+            )],
+        };
+        let escalation = EscalationEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            rule_id: format!("escalation-{canary}"),
+            domain: Some(format!(
+                "https://operator:{canary}@rpc.example/private/{canary}"
+            )),
+        };
+        let hidden = HiddenEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            rule_id: format!("hidden-{canary}"),
+            severity: "low".to_string(),
+            title: format!("hidden wallet finding {canary}"),
+            command_redacted: format!("cat /wallets/{canary}/wallet.dat"),
+        };
+
+        for output in [
+            serde_json::to_string(&warning).expect("serialize warning"),
+            format!("{warning:?}"),
+            serde_json::to_string(&escalation).expect("serialize escalation"),
+            format!("{escalation:?}"),
+            serde_json::to_string(&hidden).expect("serialize hidden"),
+            format!("{hidden:?}"),
+        ] {
+            assert!(!output.contains(&canary), "{output}");
+        }
+
+        let decoded_warning: WarningEvent = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "rule_id": format!("warning-{canary}"),
+            "severity": "high",
+            "title": format!("wallet warning {canary}"),
+            "command_redacted": format!("cat /wallets/{canary}/keypair.json"),
+            "domains": [format!("https://operator:{canary}@rpc.example/private/{canary}")],
+        }))
+        .expect("deserialize warning");
+        let decoded_escalation: EscalationEvent = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "rule_id": format!("escalation-{canary}"),
+            "domain": format!("https://operator:{canary}@rpc.example/private/{canary}"),
+        }))
+        .expect("deserialize escalation");
+        let decoded_hidden: HiddenEvent = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "rule_id": format!("hidden-{canary}"),
+            "severity": "low",
+            "title": format!("hidden wallet finding {canary}"),
+            "command_redacted": format!("cat /wallets/{canary}/wallet.dat"),
+        }))
+        .expect("deserialize hidden");
+        let decoded = format!("{decoded_warning:?}{decoded_escalation:?}{decoded_hidden:?}");
+        assert!(!decoded.contains(&canary), "{decoded}");
+        assert_eq!(decoded_warning.domains, vec!["https://rpc.example"]);
+        assert_eq!(
+            decoded_escalation.domain.as_deref(),
+            Some("https://rpc.example")
+        );
+
+        assert!(serde_json::from_value::<WarningEvent>(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "rule_id": "\u{1b}[31m",
+            "severity": "high",
+            "title": "control-only rule",
+            "command_redacted": "true",
+            "domains": [],
+        }))
+        .is_err());
+        assert!(
+            serde_json::from_value::<EscalationEvent>(serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "rule_id": "\u{1b}[31m",
+            }))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<HiddenEvent>(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "rule_id": "\u{1b}[31m",
+            "severity": "low",
+            "title": "control-only rule",
+            "command_redacted": "true",
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_overlong_event_fields_are_projected_without_losing_session_history() {
+        let overlong_domain = format!("{}.example", "a".repeat(MAX_DOMAIN_BYTES + 80));
+        let decoded: SessionWarnings = serde_json::from_value(serde_json::json!({
+            "session_id": "legacy-bounds",
+            "session_start": "2026-01-01T00:00:00Z",
+            "total_warnings": 2,
+            "events": [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "rule_id": "shortened_url",
+                    "severity": "medium",
+                    "title": "legacy title",
+                    "command_redacted": "curl example.invalid",
+                    "domains": [overlong_domain]
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "rule_id": "plain_http",
+                    "severity": "low",
+                    "title": "still present",
+                    "command_redacted": "curl http://example.invalid",
+                    "domains": ["example.invalid"]
+                }
+            ]
+        }))
+        .expect("recoverable legacy fields must be projected, not reject the session");
+
+        assert_eq!(decoded.total_warnings, 2);
+        assert_eq!(decoded.events.len(), 2, "valid history must survive");
+        assert!(decoded.events[0].domains[0].len() <= MAX_DOMAIN_BYTES);
+        assert_eq!(decoded.events[1].domains, vec!["example.invalid"]);
+    }
+
+    #[test]
+    fn session_public_traits_project_full_graph_and_preserve_categories() {
+        use crate::event_buffer::{EventKind, TypedEvent, MANIFEST_FLAG_KEY};
+
+        let canary = format!("ghp_canary_{}", "D".repeat(30));
+        let mut session = SessionWarnings::new("privacy-direct-session");
+        session.events.push_back(WarningEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            rule_id: format!("warning-{canary}"),
+            severity: "high".to_string(),
+            title: format!("wallet warning {canary}"),
+            command_redacted: format!("cat /wallets/{canary}/keypair.json"),
+            domains: vec![format!(
+                "https://operator:{canary}@rpc.example/private/{canary}"
+            )],
+        });
+        session.hidden_events.push_back(HiddenEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            rule_id: "hidden".to_string(),
+            severity: "low".to_string(),
+            title: format!("hidden {canary}"),
+            command_redacted: format!("echo {canary}"),
+        });
+        session.cooldowns.insert(
+            format!("rule|{canary}"),
+            format!("2026-01-01T00:00:00Z-{canary}"),
+        );
+        let mut typed = TypedEvent::new(
+            "2026-01-01T00:00:00Z",
+            EventKind::FileWrite,
+            &format!("typed-{canary}"),
+        )
+        .with_meta("path", &format!("/wallets/{canary}/wallet.dat"))
+        .with_meta(
+            "host",
+            &format!("https://operator:{canary}@rpc.example/private/{canary}"),
+        )
+        .with_meta(MANIFEST_FLAG_KEY, "true")
+        .with_meta(&format!("private-{canary}"), &format!("value-{canary}"));
+        typed.event_id = format!("event-{canary}");
+        typed.sequence = 1;
+        session.typed_events.push_back(typed);
+        session.next_typed_event_sequence = 2;
+        session
+            .surfaced_correlations
+            .push_back(format!("SecretWriteThenNetwork|e:{canary}:1"));
+
+        let serialized = serde_json::to_string(&session).expect("serialize projected session");
+        let debug = format!("{session:?}");
+        assert!(!serialized.contains(&canary), "{serialized}");
+        assert!(!debug.contains(&canary), "{debug}");
+
+        let mut unsafe_identity = SessionWarnings::new("temporary-safe-id");
+        unsafe_identity.session_id = canary.clone();
+        let unsafe_identity_json =
+            serde_json::to_string(&unsafe_identity).expect("serialize unsafe session id");
+        let unsafe_identity_debug = format!("{unsafe_identity:?}");
+        assert!(!unsafe_identity_json.contains(&canary));
+        assert!(!unsafe_identity_debug.contains(&canary));
+        assert!(unsafe_identity_json.contains(PRIVACY_REDACTED_SESSION_ID));
+        assert!(unsafe_identity_debug.contains(PRIVACY_REDACTED_SESSION_ID));
+
+        let decoded: SessionWarnings = serde_json::from_value(serde_json::json!({
+            "session_id": canary,
+            "session_start": "2026-01-01T00:00:00Z",
+            "total_warnings": 1,
+            "events": [{
+                "timestamp": "2026-01-01T00:00:00Z",
+                "rule_id": format!("warning-{canary}"),
+                "severity": "high",
+                "title": format!("wallet warning {canary}"),
+                "command_redacted": format!("cat /wallets/{canary}/keypair.json"),
+                "domains": [format!("https://operator:{canary}@rpc.example/private/{canary}")],
+            }],
+            "cooldowns": {(format!("rule|{canary}")): format!("2026-01-01T00:00:00Z-{canary}")},
+            "typed_events": [{
+                "event_id": format!("event-{canary}"),
+                "sequence": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "kind": "file_write",
+                "rule_id": format!("typed-{canary}"),
+                "metadata": {
+                    "path": format!("/wallets/{canary}/wallet.dat"),
+                    "host": format!("https://operator:{canary}@rpc.example/private/{canary}"),
+                    (MANIFEST_FLAG_KEY): "true",
+                    (format!("private-{canary}")): format!("value-{canary}"),
+                },
+            }],
+            "next_typed_event_sequence": 2,
+            "surfaced_correlations": [format!("SecretWriteThenNetwork|e:{canary}:1")],
+        }))
+        .expect("deserialize projected session");
+        let decoded_json = serde_json::to_string(&decoded).expect("reserialize session");
+        let decoded_debug = format!("{decoded:?}");
+        assert!(!decoded_json.contains(&canary), "{decoded_json}");
+        assert!(!decoded_debug.contains(&canary), "{decoded_debug}");
+        assert_eq!(decoded.session_id, PRIVACY_REDACTED_SESSION_ID);
+        assert_eq!(decoded.typed_events[0].event_id, "legacy-event-1");
+        assert_eq!(
+            decoded.typed_events[0]
+                .metadata
+                .get(MANIFEST_FLAG_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(decoded.surfaced_correlations.is_empty());
+    }
+
+    #[test]
+    fn multiple_privacy_projected_typed_events_migrate_before_duplicate_rejection() {
+        let canary_a = format!("ghp_canary_{}", "A".repeat(30));
+        let canary_b = format!("ghp_canary_{}", "B".repeat(30));
+        let decoded: SessionWarnings = serde_json::from_value(serde_json::json!({
+            "session_id": "legacy-two-projected-events",
+            "session_start": "2026-01-01T00:00:00Z",
+            "total_warnings": 0,
+            "events": [],
+            "typed_events": [
+                {
+                    "event_id": format!("first-{canary_a}"),
+                    "sequence": 1,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "kind": "file_write",
+                    "rule_id": format!("write-{canary_a}"),
+                    "metadata": {"path": format!("/wallets/{canary_a}/one")},
+                },
+                {
+                    "event_id": format!("second-{canary_b}"),
+                    "sequence": 2,
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "kind": "network",
+                    "rule_id": format!("network-{canary_b}"),
+                    "metadata": {"host": format!("https://user:{canary_b}@rpc.example/private")},
+                }
+            ],
+            "next_typed_event_sequence": 3,
+        }))
+        .expect("independently projected legacy events must migrate by sequence");
+
+        assert_eq!(decoded.typed_events.len(), 2);
+        assert_eq!(decoded.typed_events[0].event_id, "legacy-event-1");
+        assert_eq!(decoded.typed_events[1].event_id, "legacy-event-2");
+        assert_ne!(
+            decoded.typed_events[0].event_id,
+            decoded.typed_events[1].event_id
+        );
+        let reserialized = serde_json::to_string(&decoded).expect("reserialize migrated session");
+        assert!(!reserialized.contains(&canary_a));
+        assert!(!reserialized.contains(&canary_b));
+    }
+
+    #[test]
+    fn unchanged_duplicate_typed_event_ids_are_still_rejected() {
+        let duplicate = serde_json::json!({
+            "event_id": "same-public-id",
+            "sequence": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "kind": "network",
+            "rule_id": "network_egress",
+            "metadata": {},
+        });
+        let mut second = duplicate.clone();
+        second["sequence"] = serde_json::json!(2);
+        let error = serde_json::from_value::<SessionWarnings>(serde_json::json!({
+            "session_id": "duplicate-public-identities",
+            "session_start": "2026-01-01T00:00:00Z",
+            "total_warnings": 0,
+            "events": [],
+            "typed_events": [duplicate, second],
+            "next_typed_event_sequence": 3,
+        }))
+        .expect_err("unchanged duplicate event IDs must remain invalid");
+        assert!(
+            error.to_string().contains("duplicate typed event identity"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_writer_projects_fresh_mutation_before_persistence() {
+        use crate::event_buffer::{EventKind, TypedEvent, MANIFEST_FLAG_KEY};
+
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let temporary = tempfile::tempdir().expect("isolated session privacy state");
+        global_state.set_env("XDG_STATE_HOME", temporary.path());
+        global_state.set_env("TIRITH_LOG", "0");
+        let canary = format!("ghp_canary_{}", "E".repeat(30));
+        let session_id = "privacy-writer-session";
+
+        with_session_locked(session_id, |session| {
+            session.events.push_back(WarningEvent {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                rule_id: format!("warning-{canary}"),
+                severity: "high".to_string(),
+                title: format!("wallet warning {canary}"),
+                command_redacted: format!("cat /wallets/{canary}/keypair.json"),
+                domains: vec![format!(
+                    "https://operator:{canary}@rpc.example/private/{canary}"
+                )],
+            });
+            let mut typed = TypedEvent::new(
+                "2026-01-01T00:00:00Z",
+                EventKind::FileWrite,
+                &format!("typed-{canary}"),
+            )
+            .with_meta("path", &format!("/wallets/{canary}/wallet.dat"))
+            .with_meta(
+                "host",
+                &format!("https://operator:{canary}@rpc.example/private/{canary}"),
+            )
+            .with_meta(
+                "rpc_url",
+                &format!("https://operator:{canary}@rpc2.example/private/{canary}"),
+            )
+            .with_meta(MANIFEST_FLAG_KEY, "true")
+            .with_meta(&format!("private-{canary}"), &format!("value-{canary}"));
+            for index in 0..64 {
+                typed.metadata.insert(
+                    format!("extension-{index:02}-{canary}"),
+                    format!("value-{index}-{canary}"),
+                );
+            }
+            typed.event_id = format!("event-{canary}");
+            typed.sequence = 1;
+            session.typed_events.push_back(typed);
+            session.next_typed_event_sequence = 2;
+            session
+                .surfaced_correlations
+                .push_back(format!("SecretWriteThenNetwork|e:{canary}:1"));
+            session.cooldowns.insert(
+                format!("rule|{canary}"),
+                format!("2026-01-01T00:00:00Z-{canary}"),
+            );
+        });
+
+        let path = session_state_path(session_id).expect("session path");
+        let body = std::fs::read_to_string(path).expect("persisted session");
+        assert!(!body.contains(&canary), "{body}");
+        let persisted: SessionWarnings = serde_json::from_str(&body).expect("projected session");
+        assert_eq!(persisted.typed_events[0].event_id, "legacy-event-1");
+        assert!(persisted.typed_events[0].metadata.len() <= 32);
+        assert_eq!(
+            persisted.typed_events[0]
+                .metadata
+                .get(MANIFEST_FLAG_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            persisted.typed_events[0]
+                .metadata
+                .get("host")
+                .map(String::as_str),
+            Some("https://rpc.example")
+        );
+        assert_eq!(
+            persisted.typed_events[0]
+                .metadata
+                .get("rpc_url")
+                .map(String::as_str),
+            Some("https://rpc2.example")
+        );
+        assert!(persisted.surfaced_correlations.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_writer_refuses_privacy_changed_session_identity() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let temporary = tempfile::tempdir().expect("isolated session identity state");
+        global_state.set_env("XDG_STATE_HOME", temporary.path());
+        global_state.set_env("TIRITH_LOG", "0");
+        let session_id = "privacy-writer-identity";
+        let canary = format!("ghp_canary_{}", "F".repeat(30));
+
+        let sessions = crate::policy::state_dir()
+            .expect("isolated state root")
+            .join("sessions");
+        let raw_json = sessions.join(format!("{canary}.json"));
+        let raw_lock = sessions.join(format!("{canary}.json.lock"));
+        with_session_locked(&canary, |_| {
+            panic!("privacy-unsafe identity must be refused before its mutation closure")
+        });
+        assert!(!raw_json.exists());
+        assert!(!raw_lock.exists());
+        assert!(!PRIVACY_UNSAFE_SESSION_DIAGNOSTIC.contains(&canary));
+
+        // Even a pre-existing raw secret-named file is not read or mentioned in
+        // a path-derived diagnostic.
+        std::fs::create_dir_all(&sessions).expect("create raw fixture directory");
+        std::fs::write(&raw_json, b"corrupt secret-named fixture")
+            .expect("write raw secret-named fixture");
+        let loaded = load(&canary);
+        assert_eq!(loaded.session_id, PRIVACY_REDACTED_SESSION_ID);
+        assert_eq!(
+            std::fs::read(&raw_json).expect("raw fixture remains untouched"),
+            b"corrupt secret-named fixture"
+        );
+        assert!(!raw_lock.exists());
+
+        with_session_locked(session_id, |session| {
+            session.session_id = canary.clone();
+            session.cooldowns.insert(
+                "must-not-persist".to_string(),
+                "2026-01-01T00:00:00Z".to_string(),
+            );
+        });
+
+        let path = session_state_path(session_id).expect("session path");
+        assert!(
+            !path.exists(),
+            "a privacy-projected identity mismatch must not publish session JSON"
+        );
     }
 
     #[cfg(unix)]
@@ -1287,11 +2321,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::{Duration, SystemTime};
 
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let temporary = tempfile::tempdir().expect("isolated GC state");
-        let _state = TestStateHome::install(temporary.path());
+        global_state.set_env("XDG_STATE_HOME", temporary.path());
 
         let prepare = |session_id: &str,
                        verdict: &crate::verdict::Verdict,
@@ -1429,13 +2461,26 @@ mod tests {
         ));
         let mismatch_strict = strict_path(mismatch_id);
         let mismatch_lock = session_lock_path(mismatch_id).expect("mismatch lock path");
+        // Current strict state is anchored in the atomic
+        // `<session>.execution.anchor` sidecar. The stable `.json.lock` may
+        // still contain an obsolete pre-v2 marker, but it is deliberately not
+        // authoritative once the strong sidecar exists. Corrupt the CURRENT
+        // anchor boundary so this fixture actually exercises fail-closed GC.
+        let mismatch_anchor_path = mismatch_lock
+            .parent()
+            .expect("mismatch lock parent")
+            .join(format!("{mismatch_id}.execution.anchor"));
         let mut mismatch_anchor = OpenOptions::new()
             .write(true)
             .truncate(true)
-            .open(&mismatch_lock)
+            .open(&mismatch_anchor_path)
             .expect("open mismatch anchor");
+        let mismatched_anchor = format!(
+            "TIRITH-EXECUTION-ANCHOR-V2 3 0 ledger-mismatch {}\n",
+            "0".repeat(64)
+        );
         mismatch_anchor
-            .write_all(b"TIRITH-EXECUTION-ANCHOR-V1 ledger-mismatch\n")
+            .write_all(mismatched_anchor.as_bytes())
             .expect("write mismatched anchor");
         mismatch_anchor.sync_all().expect("sync mismatched anchor");
         drop(mismatch_anchor);
@@ -1480,13 +2525,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_record_and_load_cycle() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let state_home = dir.path().join("state");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        global_state.set_env("XDG_STATE_HOME", &state_home);
 
         let session_id = "test-session-rec-001";
 
@@ -1520,7 +2563,7 @@ mod tests {
         let session = load(session_id);
         assert_eq!(session.total_warnings, 0);
 
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        global_state.remove_env("XDG_STATE_HOME");
     }
 
     #[test]
@@ -1675,14 +2718,11 @@ mod tests {
 
     #[test]
     fn suppress_check_is_session_backed() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
+
         let sid = "test-suppress-1";
         // First sighting starts the cooldown and is NOT suppressed.
         assert!(!suppress_check(sid, "curl_pipe_shell", None, 3600));
@@ -1694,10 +2734,8 @@ mod tests {
         // The cooldown is persisted on the session record.
         let sw = load(sid);
         assert!(sw.cooldowns.contains_key("curl_pipe_shell"));
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("TIRITH_LOG");
     }
 
     #[test]
@@ -1706,14 +2744,11 @@ mod tests {
         // place the expiry in the past and instantly expire the cooldown). After
         // clamping, the first sighting starts a far-future cooldown and the second
         // sighting (same key) is suppressed.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
+
         let sid = "test-suppress-overflow";
         // u64::MAX would overflow i64; the clamp keeps the expiry in the future.
         assert!(!suppress_check(sid, "curl_pipe_shell", None, u64::MAX));
@@ -1732,10 +2767,8 @@ mod tests {
             parsed > chrono::Utc::now(),
             "clamped expiry must be in the future, got {expiry}"
         );
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("TIRITH_LOG");
     }
 
     /// W6 safety contract: a SUPPRESSED hit must emit a compact
@@ -1745,18 +2778,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn suppress_check_emits_finding_suppressed_rollup() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         // Isolate BOTH state (session record) and data (audit log) into the temp
         // dir, and ENABLE logging so the rollup is actually written.
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
-            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
-            std::env::set_var("TIRITH_LOG", "1");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path().join("state"));
+        global_state.set_env("XDG_DATA_HOME", dir.path().join("data"));
+        global_state.set_env("TIRITH_LOG", "1");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "test-suppress-rollup";
@@ -1783,12 +2812,11 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("XDG_DATA_HOME");
+        global_state.remove_env("TIRITH_LOG");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -1803,17 +2831,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn with_session_locked_write_is_atomic_and_leaves_no_temp() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "h12-atomic-session";
@@ -1860,15 +2884,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -1886,17 +2910,13 @@ mod tests {
     fn with_session_locked_refuses_symlinked_lock() {
         use crate::event_buffer::{EventKind, TypedEvent};
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "symlinked-lock-session";
@@ -1931,15 +2951,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -1953,17 +2973,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn suppress_check_prunes_expired_cooldowns_globally() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "prune-cooldowns-session";
@@ -1989,15 +3005,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -2013,17 +3029,13 @@ mod tests {
     fn with_session_locked_refuses_symlinked_session_file() {
         use crate::event_buffer::{EventKind, TypedEvent};
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "symlinked-session-file";
@@ -2060,15 +3072,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -2083,15 +3095,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn load_refuses_symlinked_session_file() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
 
         let result = std::panic::catch_unwind(|| {
             let sid = "symlink-read";
@@ -2116,11 +3124,11 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
         if let Err(e) = result {
@@ -2136,15 +3144,11 @@ mod tests {
     #[test]
     fn load_refuses_fifo_session_file() {
         use std::os::unix::ffi::OsStrExt;
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
 
         let result = std::panic::catch_unwind(|| {
             let sid = "fifo-read";
@@ -2167,11 +3171,11 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
         if let Err(e) = result {
@@ -2189,17 +3193,13 @@ mod tests {
         use crate::event_buffer::{EventKind, TypedEvent};
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::FileTypeExt;
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "fifo-write";
@@ -2232,15 +3232,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -2257,17 +3257,13 @@ mod tests {
     #[test]
     fn reader_degrades_but_writer_preserves_invalid_utf8_session() {
         use crate::event_buffer::{EventKind, TypedEvent};
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "invalid-utf8";
@@ -2313,15 +3309,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -2340,15 +3336,10 @@ mod tests {
     fn correlate_session_persists_marker_and_warning_atomically() {
         use crate::event_buffer::{EventKind, TypedEvent};
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let session_id = "w7-atomic-correlation";
@@ -2425,11 +3416,6 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -2448,23 +3434,25 @@ mod tests {
     fn surfaced_correlation_not_re_emitted_while_source_events_live() {
         use crate::event_buffer::{EventKind, TypedEvent};
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let session_id = "w7-surfaced-retention-e3";
             let policy = crate::policy::Policy::default();
-            // Capture a fixed base; every synthetic timestamp sits within the last
-            // ~3s so all stay inside both the 30s secret-then-network window and the
-            // 20s mass-deletion window for the whole (fast) duration of the test.
-            let base = chrono::Utc::now();
+            // Capture a fixed base safely in the future. Correlation deliberately
+            // treats a valid future timestamp as live during a local-clock rollback,
+            // so this exercises the production rule while remaining deterministic
+            // when a contended full-suite run makes 260 fsync-backed mutations take
+            // longer than the 20-second mass-deletion window.
+            // Keep the synthetic events well ahead of even a heavily contended
+            // full-suite run. This fixture performs hundreds of durable writes
+            // and can take several minutes under load; a five-minute margin made
+            // later events age out for wall-clock reasons unrelated to the
+            // de-duplication invariant under test.
+            let base = chrono::Utc::now() + chrono::Duration::days(1);
             let stamp =
                 |ms_before: i64| (base - chrono::Duration::milliseconds(ms_before)).to_rfc3339();
 
@@ -2544,11 +3532,6 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }

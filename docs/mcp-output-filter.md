@@ -1,16 +1,18 @@
 # MCP output filter (M7 ch4)
 
-Tirith ships two opt-in surfaces for routing MCP tool results through the
+Tirith ships two surfaces for routing MCP output through the
 output-direction analyzer before they reach the calling agent:
 
 - `tirith gateway run --filter-output` — filters every guarded-tool response
   returned by an upstream MCP server the gateway is proxying.
-- `tirith mcp-server --sanitize-tool-output` — filters every tool result the
-  tirith MCP server itself produces before sending it back to the client.
+- `tirith mcp-server` — filters every tool result and `resources/read` body the
+  tirith MCP server itself produces before sending it back to the client. This
+  is the secure default; `--unsafe-unsanitized-tool-output` is an explicit
+  legacy compatibility escape hatch.
 
-Both flags are **opt-in**. Default behavior (no flag) preserves the
-pre-M7-ch4 pass-through. The chunk-4 commit is `feat(gateway,mcp):
---filter-output + --sanitize-tool-output (M7 ch4)`.
+Gateway filtering remains an explicit flag outside the secure profile. The
+local MCP server filters by default because its calling agent is a privileged
+consumer and repository-derived resource text is untrusted output.
 
 ## Protocol contract
 
@@ -22,7 +24,7 @@ transforms based on the verdict's `Action`:
 | ------- | ------------------------------------------------------------ | --------- |
 | `Block` | `content` replaced with single placeholder text item         | `true`    |
 | `Warn`  | `[tirith: WARNING …]` text item prepended; existing items sanitized in place | preserved |
-| `Allow` | pass through unchanged                                       | preserved |
+| `Allow` | structure preserved; forwarded strings sanitized in place    | preserved |
 
 ### Block placeholder shape
 
@@ -85,28 +87,71 @@ The prepended notice has the shape:
 
 ## Fail-mode
 
-The two surfaces use different defaults:
+A Block decision is final once the filter is engaged: the gateway's
+`policy.fail_mode` governs separate response-lifecycle failures and never turns
+a detected injection or a malformed guarded tool result into an allow. Which
+findings block is a severity question, not a fail-mode one — Critical and High
+findings block and have their content replaced, Medium and Low findings warn
+and keep sanitized content, per the two sections above.
+`tirith mcp-server` engages the filter for tool and resource-read output by
+default. Only the explicitly named `--unsafe-unsanitized-tool-output`
+compatibility flag disables that local-server boundary.
 
-- `tirith gateway run --filter-output` — `fail_mode_closed = false`. An
-  analysis truncation past `MAX_SCAN_BYTES` (1 MiB) with no fired findings
-  passes through. Stricter behavior is the gateway's own `policy.fail_mode:
-  closed`; the output filter inherits its lane.
-- `tirith mcp-server --sanitize-tool-output` — `fail_mode_closed = true`.
-  Truncation degrades to Block. Stricter than the gateway default because the
-  calling agent is the highest-privilege consumer of these results.
+## Listing and resource-response inspection
+
+The gateway also inspects the untrusted results of `tools/list`,
+`resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`,
+and `prompts/get`. Every string leaf and object key reaches the same output
+analyzer. Resource links, descriptors, content URIs, URI templates, and URLs in
+extension metadata additionally cross the outbound destination policy.
+
+Concrete HTTP(S) destinations receive the full credential, metadata-host,
+private, loopback, link-local, DNS, redirect, and rebinding checks. Relative
+references and the explicit internal `tirith:` and `ui:` schemes are accepted.
+Every other absolute scheme is refused: an unfamiliar scheme is not assumed
+safe merely because Tirith itself does not dereference it, since an MCP client
+may have registered a network-capable handler for it. URI templates must have a
+fixed, inspectable scheme and authority; an expansion cannot select either.
+
+Inline resource blobs are decoded only under the decoded-size and blob-count
+limits. Tirith accepts canonical standard Base64, either fully padded or wholly
+unpadded, with optional ASCII wrapping whitespace. Data after padding, partial
+or excess padding, invalid placement, and non-zero unused trailing bits are
+rejected. Executable, script, and archive magic bytes are compared with the
+declared MIME category. This applies both to top-level `resources/read`
+contents and embedded resources in `prompts/get`.
+
+URI and blob passes share node, blob, and retained-violation budgets. Exact
+categorical violations are deduplicated while they are collected. Exhaustion
+adds `analysis_incomplete` and blocks the whole response; an already-final text
+Block short-circuits these secondary passes because no later inspection can
+make the response forwardable.
 
 ## Scan cap and large payloads
 
-`MAX_SCAN_BYTES = 1 MiB`. The filter concatenates text items (joined with a
-NUL separator so a multi-item OSC payload split across items is not joined
-back into a single sequence) and analyzes the first 1 MiB. The remainder is
-never dropped — it remains in the unfiltered `content` items (warn path) or
-is replaced wholesale by the placeholder (block path). The `truncated` flag
-on the audit line records that scanning was incomplete.
+The streaming analyzer scans all accepted content and structured string leaves;
+there is no per-call prefix that can leave a suffix uninspected. Transport limits
+bound bytes before filtering (the gateway uses its configured
+`max_message_bytes`, and the local dispatcher caps a JSON-RPC line). Independent
+depth, node, logical-leaf, total string-byte, cumulative analyzer-work,
+cumulative decode-candidate, and repeated structural-work budgets bound hostile
+JSON layouts and repeated endpoint rescans.
+Exceeding a budget produces a High `analysis_incomplete` block instead of
+truncating, partially scanning, or silently forwarding the result. Logical leaf
+endpoints receive their own prompt/exfil checkpoint so padded encodings, word
+boundaries, and anchored policy seeds retain end-of-leaf semantics. The
+continuous analyzer advances at those same boundaries, so terminal state and
+attacks split across leaves remain detectable without inventing longer context
+or losing a finding that exists only at an intermediate endpoint.
 
-Performance: sub-millisecond per call for payloads under the cap on typical
-agent output. The output ruleset is byte-stream-oriented and does not
-allocate per character.
+The final presentation is also bounded and replaced by compact safe metadata
+when necessary. The audit `truncated` field refers to presentation bounding,
+not an incomplete security scan; structural analysis refusal is represented by
+the `analysis_incomplete` rule.
+
+Performance is bounded by the transport and structural-work limits rather than
+by silently truncating input. The output ruleset is byte-stream-oriented and
+does not invoke network I/O.
 
 ## Rule set
 

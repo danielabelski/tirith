@@ -1,6 +1,32 @@
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # time RFC 2822 parsing DoS (stack exhaustion). Cargo.toml pins time to
+    # <0.3.38 (0.3.38+ needs time-core >=0.1.3 / Rust 1.85, above our MSRV 1.83),
+    # so the version we build predates the advisory's 0.3.47 fix and stays in the
+    # affected range. Ignored regardless: that fix requires Rust 1.88 (far above
+    # MSRV 1.83), and tirith never parses user-controlled RFC 2822 dates (the only
+    # trigger). Transitive dep via lopdf/rust-s3. See the time pin note in Cargo.toml.
+    "RUSTSEC-2026-0009",
+    # lopdf 0.34 stack-overflow DoS: a crafted PDF with deeply nested arrays/dicts
+    # aborts the process (uncatchable SIGABRT) during parse. The fix (lopdf >=0.42)
+    # requires Rust 1.85, above tirith's MSRV 1.83, so we cannot bump lopdf. The
+    # only untrusted entry point, check_pdf() in rules/rendered.rs, runs a
+    # nesting-depth preflight (PDF_NESTING_DEPTH_CAP) that rejects the bomb BEFORE
+    # load_mem is ever called, including a decompress-and-rescan of every
+    # compressed object stream (repo-0332/pr173-0027: the former raw-bytes-only
+    # preflight was bypassable via /ObjStm). Remove this ignore
+    # (and the .cargo/audit.toml twin) once MSRV/lopdf can move.
+    "RUSTSEC-2026-0187",
+    # hickory-proto 0.24.4 BinEncoder name-compression DoS (O(n²) on a
+    # malicious message with many labels). The fixed line is 0.26.1; that
+    # resolver series is a different API than the 0.24 pin in
+    # crates/tirith-core/Cargo.toml (MSRV 1.83). Tirith only encodes DNS
+    # queries it constructs for hostnames already extracted from policy or
+    # command text; it does not re-encode untrusted DNS messages. Remove
+    # this ignore when the resolver can move to >=0.26.1.
+    "RUSTSEC-2026-0119",
+]
 
 [licenses]
 version = 2
@@ -9,6 +35,9 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # NCSA is the permissive University of Illinois license used by the
+    # libfuzzer-sys/LLVM libFuzzer component in the standalone fuzz workspace.
+    "NCSA",
     "ISC",
     "Unicode-3.0",
     "MPL-2.0",

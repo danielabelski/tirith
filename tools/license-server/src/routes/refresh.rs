@@ -4,6 +4,7 @@ use axum::response::IntoResponse;
 use sha2::{Digest, Sha256};
 use tracing::error;
 
+use crate::db::RefreshPublishOutcome;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -64,12 +65,29 @@ pub async fn refresh(
     let exp_ts = chrono::Utc::now().timestamp() + (state.config.token_ttl_days * 86400);
     let token = state.signer.sign_token(&sub.tier, exp_ts);
 
-    if !state
+    // The throttle check and token publication are one atomic database
+    // operation. Signing can happen speculatively, but only the single winner
+    // is persisted and returned; every parallel loser is rate-limited.
+    match state
         .db
-        .insert_token_if_interval_elapsed(&sub.id, &token, exp_ts, MIN_REFRESH_INTERVAL_SECS)
+        .publish_refresh_token_if_authorized(
+            &key_hash,
+            &sub.id,
+            &sub.tier,
+            &token,
+            exp_ts,
+            MIN_REFRESH_INTERVAL_SECS,
+        )
         .await?
     {
-        return Err(AppError::RateLimited);
+        RefreshPublishOutcome::Inserted => {}
+        RefreshPublishOutcome::RateLimited => return Err(AppError::RateLimited),
+        RefreshPublishOutcome::NotAuthorized => {
+            return Err(AppError::Unauthorized(
+                "Authentication or subscription state changed. Retry with an active API key."
+                    .into(),
+            ));
+        }
     }
 
     Ok((

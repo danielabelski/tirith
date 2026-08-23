@@ -1,5 +1,14 @@
 # tirith
 
+> [!IMPORTANT]
+> This is the original product and architecture concept document. It is kept
+> for historical context and includes obsolete roadmap, implementation, and
+> commercial assumptions. It is **not** the current installation, security, or
+> capability contract. Use the [README](README.md),
+> [changelog](CHANGELOG.md), [capability matrix](docs/capability-matrix.md),
+> [enforcement coverage](docs/enforcement-coverage.md), and
+> [draft 0.4.0 release guide](docs/release-notes-0.4.0.md) for current behavior.
+
 > Browsers solved homograph attacks years ago. Terminals haven't. tirith is the browser-equivalent safety net for the terminal.
 
 ## The Problem

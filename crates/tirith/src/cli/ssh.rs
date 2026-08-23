@@ -173,7 +173,7 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// symlinks, then used for both the bounded read and atomic 0600 publication.
 /// Any read error other than genuine absence aborts rather than becoming an
 /// empty baseline.
-fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/policy.yaml →
     // <repo>, <config>/tirith/policy.yaml → <config>. A policy path is always
     // at least three components deep; refuse a malformed shallower path rather
@@ -185,7 +185,15 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         )
     })?;
 
-    let contained = tirith_core::util::ContainedAtomicFile::prepare(containment_root, path, true)?;
+    let policy = Policy::discover_local_only(containment_root.to_str());
+    let contained = super::prepare_config_destination_permitted(
+        containment_root,
+        path,
+        true,
+        &policy,
+        true,
+        true,
+    )?;
 
     // Read the current contents WITHOUT following a symlinked final component.
     // An absent file is an empty baseline (the key is then appended); any other
@@ -224,7 +232,15 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
-    contained.write_atomic(out.as_bytes(), true)
+    super::write_prepared_config_file_permitted(
+        containment_root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 /// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
@@ -293,24 +309,24 @@ pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i3
         },
     };
 
-    // Write the RAW host input first (the runtime rule looks up the literal
-    // typed string); add the resolved form below when it differs, so labeling an
-    // alias also matches the DNS name. Same flat-YAML format as context labels.
-    if let Err(e) = policy_mod::write_context_label(&target_path, host, criticality) {
+    // Commit the RAW input and resolved form together so an alias can never be
+    // left half-labeled if authorization or publication fails.
+    let mut labels = vec![(host, criticality)];
+    if resolved_host != host {
+        labels.push((resolved_host.as_str(), criticality));
+    }
+    let policy = Policy::discover_local_only(
+        target_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::to_str),
+    );
+    if let Err(e) = super::write_context_labels_permitted(&target_path, &labels, &policy) {
         eprintln!(
             "tirith ssh label: failed to write {}: {e}",
             target_path.display()
         );
         return 1;
-    }
-    if resolved_host != host {
-        if let Err(e) = policy_mod::write_context_label(&target_path, &resolved_host, criticality) {
-            eprintln!(
-                "tirith ssh label: failed to write resolved-host entry to {}: {e}",
-                target_path.display()
-            );
-            return 1;
-        }
     }
 
     if json {

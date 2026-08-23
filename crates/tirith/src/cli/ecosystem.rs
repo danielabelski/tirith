@@ -235,7 +235,7 @@ fn exit_code(action: Action) -> i32 {
 /// dependency.
 fn package_allowlisted(policy: &Policy, eco: Ecosystem, name: &str) -> bool {
     let bare = name.to_lowercase();
-    let qualified = format!("{eco}:{bare}");
+    let qualified = format!("{}:{}", eco, bare);
 
     let matches_entry = |entry: &str| {
         let e = entry.trim().to_lowercase();

@@ -79,7 +79,7 @@ fn resolve_finding_id(id: &str) -> Result<RuleId, String> {
         .find(|r| r.event_id.as_deref() == Some(event_id));
 
     let Some(entry) = entry else {
-        if read.truncated_records {
+        if read.records.len() > AUDIT_SCAN_LIMIT {
             return Err(format!(
                 "finding ID {id:?} not found in the {scanned} most-recent audit entries (cap is {AUDIT_SCAN_LIMIT}); \
                  narrow via `tirith audit export --since <duration>` and re-run"

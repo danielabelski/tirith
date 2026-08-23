@@ -3,7 +3,10 @@
 Applies to: **VS Code**, **Void**, and other VS Code forks that support MCP
 servers. For **Windsurf**, see [windsurf.md](windsurf.md).
 
-> **Phase 1b** — Gateway integration documented but not yet integration-tested.
+> **Verification boundary:** setup/config behavior is covered by repository
+> tests, but only the effective VS Code/fork host can prove that it loaded and
+> honored both the workspace hook and gateway. Run the verification steps after
+> setup and every host/Tirith upgrade.
 
 ## Why two paths are required
 
@@ -145,6 +148,8 @@ Expected: blocked by Tirith.
 - Tool names depend on the specific MCP extension in use. Update
   `guarded_tools` patterns in `gateway.yaml` to match your setup.
 - The gateway forwards all non-matched tool calls transparently.
+- Setup pins the validated absolute Python interpreter used by the generated
+  command hook. Re-run setup if that interpreter moves.
 - The zshenv guard applies to all non-interactive `zsh -lc` runs.
   `TIRITH_ZSHENV_SKIP=1` disables it; `VSCODE_RESOLVING_ENVIRONMENT`
   (set by VS Code during shell env probing) skips the scan so the IDE

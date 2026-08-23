@@ -28,8 +28,6 @@ struct CredPattern {
     #[allow(dead_code)]
     regex: String,
     #[allow(dead_code)]
-    redact_prefix_len: Option<usize>,
-    #[allow(dead_code)]
     severity: String,
 }
 
@@ -555,8 +553,26 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         id: "package_install",
         tier1_exec_fragments: &[
             r"(?i:\b(?:pip3?|uv)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+install\b)",
-            r"(?i:\b(?:npm|npx|yarn|pnpm|bun)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:install|i|add)\b)",
+            // `(?:[^\s;|&]+\s+){0,3}` mirrors `npm_command::MAX_SUBCOMMAND_PREFIX_WORDS`:
+            // the subcommand is not always the first word after the launcher
+            // (`yarn global add`, `yarn workspace <name> add`, `yarn
+            // --network-timeout 100000 add`), and a fragment that demands
+            // adjacency gates those forms out of exec context entirely.
+            r"(?i:\b(?:npm|npx|yarn|pnpm|bun)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:install|i|add|ci|clean-install)\b)",
+            // npm's historical install misspellings and the install-test
+            // family. They install exactly as `install` does, so without them
+            // one extra keystroke buys an unanalyzed install.
+            r"(?i:\bnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|ic|install-clean|isntall-clean|install-test|it|install-ci-test|cit|clean-install-test|sit)\b)",
             r"(?i:\bnpx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
+            // The fetch-and-run half of the npm family (`crate::npm_command`).
+            // Every form the shared grammar recognizes needs a fragment here or
+            // it is gated out of exec context and never reaches tier 3.
+            r"(?i:\bnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:exec|x)\b)",
+            r"(?i:\bpnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}dlx\b)",
+            r"(?i:\byarn(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}dlx\b)",
+            r"(?i:\bbun(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}x\b)",
+            r"(?i:\bbunx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
+            r"(?i:\bpnpx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
             r"(?i:\bgem(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+install\b)",
             r"(?i:\bgo(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:get|install)\b)",
             r"(?i:\bcomposer(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+require\b)",
@@ -620,7 +636,10 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     PatternEntry {
         id: "env_var_sensitive",
         tier1_exec_fragments: &[
-            r"(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN)\s*=",
+            // Coarse superset of the central sensitive-assets registry. Precise
+            // value-aware RPC and prefix-family classification stays in tier 3.
+            r"(?i:(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_SECURITY_TOKEN|AWS_WEB_IDENTITY_TOKEN_FILE|AWS_CONTAINER_AUTHORIZATION_TOKEN(?:_FILE)?|AZURE_CLIENT_SECRET|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_API_KEY|GOOGLE_OAUTH_ACCESS_TOKEN|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|NODE_AUTH_TOKEN|PYPI_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|STRIPE_API_KEY|DOCKER_PASSWORD|DOCKER_CONFIG|KUBECONFIG|SLACK_TOKEN|SSH_AUTH_SOCK|GPG_AGENT_INFO|PRIVATE_KEY|DEPLOYER_PRIVATE_KEY|WALLET_PRIVATE_KEY|ETH_PRIVATE_KEY|EVM_PRIVATE_KEY|FOUNDRY_PRIVATE_KEY|MNEMONIC|SEED_PHRASE|WALLET_MNEMONIC|SOLANA_KEYPAIR(?:_PATH)?|ANCHOR_WALLET|KEYSTORE_PASSWORD|WALLET_PASSWORD|UV_INDEX_URL|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|TWINE_PASSWORD|TWINE_TOKEN|RPC_API_KEY|JWT_SECRET|RPC_URL|ETH_RPC_URL|SOLANA_RPC_URL|AWS_SECRET_[A-Z0-9_]+|AWS_SESSION_TOKEN_[A-Z0-9_]+|AWS_SECURITY_TOKEN_[A-Z0-9_]+|AZURE_CLIENT_SECRET_[A-Z0-9_]+|GOOGLE_API_KEY_[A-Z0-9_]+|GOOGLE_OAUTH_ACCESS_TOKEN_[A-Z0-9_]+|TWINE_PASSWORD_[A-Z0-9_]+|TWINE_TOKEN_[A-Z0-9_]+))\s*=",
+            r"(?i:(?:--mnemonic\b|\b(?:mnemonic|seed[-_ ]?phrase)\s*[:=]))",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Sensitive API key environment variable exports",
@@ -659,21 +678,34 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Docker/Podman remote daemon with privilege escalation",
     },
     PatternEntry {
+        // C10 — one COARSE gate for the Web3 tool family. Tier-1 only has to
+        // decide whether the precise parser is worth running, so matching the
+        // bare tool token is correct and cheap; `rules::web3` then discards
+        // every benign `cast call` / `forge build` without emitting anything.
+        // Anchored on a word boundary so `forgets` and `castle` do not match.
+        id: "web3_cli",
+        tier1_exec_fragments: &[r"\b(?:cast|forge|hardhat|solana|anchor)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Web3 tool invocations (cast, forge, hardhat, solana, anchor); precise grammar in rules::web3 decides what is actually state-changing",
+    },
+    PatternEntry {
         id: "credential_file_sweep",
         tier1_exec_fragments: &[
-            r"\.ssh/id_",
-            r"\.ssh/authorized_keys",
-            r"\.aws/credentials",
-            r"\.aws/config",
-            r"\.docker/config\.json",
-            r"\.kube/config",
-            r"\.config/gcloud/",
+            r"(?:^|[\\/])\.ssh(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.aws(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.azure(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.docker(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.kube(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.config[\\/](?:gcloud|gh|solana)(?:[\\/]|\b)",
             r"\.npmrc",
             r"\.pypirc",
             r"\.netrc",
-            r"\.gnupg/",
-            r"\.config/gh/",
+            r"(?:^|[\\/])\.gnupg(?:[\\/]|\b)",
             r"\.git-credentials",
+            r"(?:^|[\\/])\.ethereum[\\/]keystore(?:[\\/]|\b)",
+            r"(?:^|[\\/])wallet\.dat(?:\b|[\s'\x22])",
+            r"(?:^|[\\/])(?:solana-keypair|-?[^\\/\s]+-keypair)\.json(?:\b|[\s'\x22])",
+            r"(?:^|[\\/])etc(?:[\\/]|\b)",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Credential file path sweep (multiple sensitive paths in one command)",
@@ -848,6 +880,7 @@ fn generate_tier1_regex(out_dir: &str) {
         let mut known_frags: Vec<String> = Vec::new();
         if let Some(ref patterns) = cred_file.pattern {
             for p in patterns {
+                validate_credential_tier1_fragment(&p.id, &p.tier1_fragment);
                 known_frags.push(p.tier1_fragment.clone());
             }
         }
@@ -873,6 +906,7 @@ fn generate_tier1_regex(out_dir: &str) {
         );
         ids.push("credential_private_key".to_string());
         for pk in pk_patterns {
+            validate_credential_tier1_fragment(&pk.id, &pk.tier1_fragment);
             exec_fragments.push(pk.tier1_fragment.clone());
             paste_fragments.push(pk.tier1_fragment.clone());
         }
@@ -889,6 +923,10 @@ fn generate_tier1_regex(out_dir: &str) {
 
     let exec_regex = format!("(?:{})", exec_fragments.join("|"));
     let paste_regex = format!("(?:{})", paste_fragments.join("|"));
+    regex::Regex::new(&exec_regex)
+        .unwrap_or_else(|error| panic!("generated Tier-1 exec regex is invalid: {error}"));
+    regex::Regex::new(&paste_regex)
+        .unwrap_or_else(|error| panic!("generated Tier-1 paste regex is invalid: {error}"));
 
     let mut code = String::new();
     code.push_str("// Auto-generated Tier 1 regex patterns from declarative pattern table.\n");
@@ -916,6 +954,12 @@ fn generate_tier1_regex(out_dir: &str) {
 
     let out_path = Path::new(out_dir).join("tier1_gen.rs");
     fs::write(&out_path, code).unwrap();
+}
+
+fn validate_credential_tier1_fragment(id: &str, fragment: &str) {
+    regex::Regex::new(fragment).unwrap_or_else(|error| {
+        panic!("credential_patterns.toml entry '{id}' has an invalid tier1_fragment: {error}")
+    });
 }
 
 /// (snake_case id, PascalCase variant) for every RuleId — snake for TOML
@@ -1037,6 +1081,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "WorkflowCheckoutUntrustedRef",
     ),
     ("workflow_cache_poisoning", "WorkflowCachePoisoning"),
+    ("workflow_artifact_poisoning", "WorkflowArtifactPoisoning"),
     ("dockerfile_unpinned_image", "DockerfileUnpinnedImage"),
     ("package_script_dangerous", "PackageScriptDangerous"),
     // AI-relevant file hidden-content scan rules
@@ -1141,6 +1186,14 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("prompt_injection_obfuscated", "PromptInjectionObfuscated"),
     // C7 — output-side data-exfiltration rule.
     ("output_data_exfiltration", "OutputDataExfiltration"),
+    // C10 — Web3 execution-boundary rules. Exactly three; parser and config
+    // gaps reuse `analysis_incomplete`.
+    ("web3_state_changing_command", "Web3StateChangingCommand"),
+    ("web3_signer_risk", "Web3SignerRisk"),
+    (
+        "web3_network_policy_violation",
+        "Web3NetworkPolicyViolation",
+    ),
     // Operational-context rules (M8 ch1).
     (
         "context_prod_destructive_command",

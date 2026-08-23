@@ -10,30 +10,147 @@ pub fn run(
     requested_pipe_invocation: Option<RequestedPipeInvocation>,
     expected_sha256: Option<String>,
 ) -> i32 {
-    // Structured stdout must contain exactly one trusted envelope. An executed
-    // remote script controls its own stdout, so permitting execution in JSON mode
-    // would let it prepend forged objects or make the stream unparsable. Refuse
-    // before runner setup (and therefore before DNS/download/confirmation).
+    // JSON mode owns stdout as one bounded protocol envelope. Capture policy
+    // diagnostics before even the early refusal path so a malformed policy can
+    // never write attacker-controlled text beside that envelope.
+    let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+
+    // Structured stdout cannot safely coexist with an executed child's stdout.
+    // This is a fixed protocol refusal with no caller-derived field, so reject
+    // before full policy discovery (which may contact a remote policy service),
+    // runner setup, DNS, download, or confirmation.
     if json && !no_exec {
-        let error = serde_json::json!({
-            "error": "tirith run JSON output is inspection-only; pass --no-exec or omit --json before executing a remote script"
-        });
-        if serde_json::to_writer(std::io::stdout().lock(), &error).is_err() {
-            eprintln!("tirith: failed to write JSON output");
-        }
-        println!();
+        let empty_dlp = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let error = build_run_error_json(
+            "tirith run JSON output is inspection-only; pass --no-exec or omit --json before executing a remote script",
+            &empty_dlp,
+        );
+        let _ = write_run_json(&error);
         return 1;
     }
 
+    // Freeze one authoritative full-policy projection for every CLI-owned
+    // output field. The runner may resolve its own exact analysis snapshot
+    // later; this additional plan protects errors and early refusals that do
+    // not carry a RunResult.
+    let cwd_for_policy = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let output_policy = tirith_core::policy::Policy::discover(cwd_for_policy.as_deref());
+    if json {
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(
+            &output_policy.dlp_custom_patterns,
+        );
+    }
+    let output_dlp =
+        tirith_core::redact::CompiledCustomPatterns::new_silent(&output_policy.dlp_custom_patterns);
+    if !json {
+        emit_run_policy_diagnostics_human(&output_dlp);
+    }
+
     let interactive = is_terminal::is_terminal(std::io::stderr());
+
+    // C12: prepare the owned download-and-launch transition here, then hand its
+    // non-cloneable authorization and exact operation to the core runner. The
+    // runner consumes it at the last safe point before `download_bounded`, so
+    // nothing below this preparation has yet resolved DNS, opened a socket,
+    // written a temporary file, or launched an interpreter.
+    //
+    // Stated honestly: this gate covers the `tirith run` COMMAND. A program that
+    // links tirith-core and calls `runner::run` directly is not routed through
+    // it, exactly as `docs/threat-model.md` says.
+    //
+    // The exact binding includes canonical URL, digest pin, inspect/execute
+    // purpose, forced interpreter argv, redirect policy, and all durable
+    // download effects. Construction is pure: domain DNS remains inside the
+    // runner after this pending authorization is consumed.
+    let run_binding = match runner::remote_run_boundary_binding(
+        url,
+        expected_sha256.as_deref(),
+        no_exec,
+        requested_pipe_invocation.as_ref(),
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            let message = format!("invalid remote-script request before authorization: {reason}");
+            if json {
+                let error = build_run_error_json(&message, &output_dlp);
+                let _ = write_run_json(&error);
+            } else {
+                eprintln!(
+                    "tirith run: {}",
+                    tirith_core::output::sanitize_human_field_with_compiled(&message, &output_dlp),
+                );
+            }
+            return 1;
+        }
+    };
+    let run_operation = run_binding.operation();
+    let pending_authorization =
+        match tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+            tirith_core::task_boundary::RemoteScriptRunBoundary,
+        >(
+            &run_operation,
+            &output_policy.task_gate,
+            &tirith_core::task_analysis::TaskAnalysisContext::default(),
+        ) {
+            Ok(pending) => {
+                if let Err(error) =
+                    tirith_core::audit::log_task_boundary_assessment(pending.assessment())
+                {
+                    tirith_core::audit::audit_diagnostic(format!(
+                        "task-boundary audit append failed: {error}"
+                    ));
+                }
+                pending
+            }
+            Err(error) => {
+                if let Some(assessment) = error.assessment() {
+                    if let Err(audit_error) =
+                        tirith_core::audit::log_task_boundary_assessment(assessment)
+                    {
+                        tirith_core::audit::audit_diagnostic(format!(
+                            "task-boundary audit append failed: {audit_error}"
+                        ));
+                    }
+                }
+                let reason = error
+                    .assessment()
+                    .and_then(|assessment| assessment.refusal(false))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| error.to_string());
+                let message = format!("task gate refused before any download: {reason}");
+                if json {
+                    let error = build_run_error_json(&message, &output_dlp);
+                    let _ = write_run_json(&error);
+                } else {
+                    eprintln!(
+                        "tirith run: {}",
+                        tirith_core::output::sanitize_human_field_with_compiled(
+                            &message,
+                            &output_dlp
+                        ),
+                    );
+                }
+                return 1;
+            }
+        };
+    // The effects the gate refused tighten the capsule the script would run in,
+    // so a decision that survives to launch still narrows what launch means.
+    // `enforced_denied_effects` is empty unless the gate is enforcing, so an
+    // operator who filled in the effect sets without choosing a mode does not
+    // get a silently narrower capsule.
+    let denied_effects = pending_authorization.assessment().enforced_denied_effects();
 
     // Every live path now uses the same stopped-target capsule controller. The
     // legacy `--capsule` spelling remains accepted, but omitting it no longer
     // falls back to an ordinary spawn that could run before durable execution
     // state is committed.
     let _capsule_requested = capsule;
-    let verified_executor: Option<tirith_core::runner::VerifiedScriptExecutor> =
-        Some(Box::new(capsuled_exec));
+    let verified_executor: tirith_core::runner::VerifiedScriptExecutor =
+        Box::new(move |invocation, reviewed, authorizer| {
+            capsuled_exec_tightened(invocation, reviewed, authorizer, &denied_effects)
+        });
 
     let opts = RunOptions {
         url: url.to_string(),
@@ -43,65 +160,178 @@ pub fn run(
         exec_fn: None,
     };
 
-    let result = match (verified_executor, requested_pipe_invocation) {
-        (Some(executor), Some(requested)) => {
-            runner::run_with_verified_pipe_executor(opts, requested, executor)
-        }
-        (Some(executor), None) => runner::run_with_verified_executor(opts, executor),
-        (None, Some(_)) => {
-            Err("forced stdin execution requires the fail-closed capsule executor".to_string())
-        }
-        (None, None) => runner::run(opts),
-    };
+    let result = runner::run_with_authorized_verified_executor(
+        opts,
+        requested_pipe_invocation,
+        pending_authorization,
+        &run_operation,
+        verified_executor,
+    );
     match result {
         Ok(result) => {
-            if json {
-                #[derive(serde::Serialize)]
-                struct RunOutput<'a> {
-                    receipt: tirith_core::receipt::PublicReceipt,
-                    verdict: Option<&'a tirith_core::verdict::Verdict>,
-                    analysis_complete: bool,
-                    refused: bool,
-                    executed: bool,
-                    exit_code: Option<i32>,
-                }
-                let out = RunOutput {
-                    // Public DTO: the stored receipt's URL userinfo is redacted
-                    // and local-machine metadata (cwd) omitted, so a
-                    // credential-bearing Git remote cannot reach logs or agent
-                    // context through this JSON (repo-0420).
-                    receipt: result.receipt.public_view(),
-                    verdict: result.verdict.as_ref(),
-                    analysis_complete: result.analysis_complete,
-                    refused: result.refused,
-                    executed: result.executed,
-                    exit_code: result.exit_code,
-                };
-                if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-                    eprintln!("tirith: failed to write JSON output");
-                }
-                println!();
+            let presentation_patterns = tirith_core::policy::captured_policy_dlp_patterns_or(
+                &output_policy.dlp_custom_patterns,
+            );
+            let presentation_dlp =
+                tirith_core::redact::CompiledCustomPatterns::new_silent(&presentation_patterns);
+            if !json {
+                emit_run_policy_diagnostics_human(&presentation_dlp);
             }
-
-            if result.executed || result.refused {
-                result.exit_code.unwrap_or(1)
+            let json_ok = !json || write_run_json(&build_run_json(&result, &presentation_dlp));
+            let outcome_code = run_process_outcome_code(&result, json);
+            if !json_ok && outcome_code == 0 {
+                1
             } else {
-                0
+                outcome_code
             }
         }
         Err(e) => {
+            let presentation_patterns = tirith_core::policy::captured_policy_dlp_patterns_or(
+                &output_policy.dlp_custom_patterns,
+            );
+            let presentation_dlp =
+                tirith_core::redact::CompiledCustomPatterns::new_silent(&presentation_patterns);
             if json {
-                let err = serde_json::json!({ "error": e });
-                if serde_json::to_writer_pretty(std::io::stdout().lock(), &err).is_err() {
-                    eprintln!("tirith: failed to write JSON output");
-                }
-                println!();
+                let err = build_run_error_json(&e, &presentation_dlp);
+                let _ = write_run_json(&err);
             } else {
-                eprintln!("tirith: {e}");
+                emit_run_policy_diagnostics_human(&presentation_dlp);
+                let error =
+                    tirith_core::output::sanitize_human_field_with_compiled(&e, &presentation_dlp);
+                eprintln!("tirith: {error}");
             }
             1
         }
     }
+}
+
+fn run_result_analysis_complete(result: &tirith_core::runner::RunResult) -> bool {
+    result.analysis_complete && result.verdict.is_some()
+}
+
+fn run_process_outcome_code(result: &tirith_core::runner::RunResult, json: bool) -> i32 {
+    if json && !run_result_analysis_complete(result) {
+        1
+    } else if result.executed || result.refused {
+        result.exit_code.unwrap_or(1)
+    } else {
+        0
+    }
+}
+
+fn build_run_json(
+    result: &tirith_core::runner::RunResult,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> serde_json::Value {
+    // `RunResult::verdict` is already DLP-redacted by the runner against the
+    // exact policy snapshot used by analysis. Clone and priority-bound it here,
+    // at the public DTO boundary, leaving the runner/audit state untouched.
+    let presentation = result
+        .verdict
+        .as_ref()
+        .map(|verdict| crate::cli::prepare_verdict_presentation(verdict, compiled));
+    let original_findings_count = presentation
+        .as_ref()
+        .map(|projection| projection.original_findings_count)
+        .unwrap_or(0);
+    let presented_findings_count = presentation
+        .as_ref()
+        .map(|projection| projection.presented_findings_count)
+        .unwrap_or(0);
+    let dropped_findings_count = presentation
+        .as_ref()
+        .map(|projection| projection.dropped_findings_count)
+        .unwrap_or(0);
+    let receipt = result
+        .presentation_receipt_with_compiled(compiled)
+        .public_view();
+    let analysis_complete = run_result_analysis_complete(result);
+    let effective_action = if analysis_complete {
+        presentation
+            .as_ref()
+            .expect("complete run result carries a verdict")
+            .verdict
+            .action
+    } else {
+        tirith_core::verdict::Action::Block
+    };
+    let exit_code = if analysis_complete {
+        result.exit_code
+    } else {
+        Some(tirith_core::verdict::Action::Block.exit_code())
+    };
+    let executed = analysis_complete && result.executed;
+    let mut value = serde_json::json!({
+        // Public DTO: URL userinfo is redacted and local-machine cwd omitted.
+        "receipt": receipt,
+        "verdict": presentation.as_ref().map(|projection| &projection.verdict),
+        "action": effective_action,
+        "original_findings_count": original_findings_count,
+        "presented_findings_count": presented_findings_count,
+        "dropped_findings_count": dropped_findings_count,
+        "analysis_complete": analysis_complete,
+        "analysis_incomplete": !analysis_complete,
+        "refused": result.refused,
+        "executed": executed,
+        "exit_code": exit_code,
+    });
+    append_run_policy_diagnostics(&mut value, compiled);
+    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    tirith_core::verdict::bound_json_value_for_output(value)
+}
+
+fn build_run_error_json(
+    error: &str,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> serde_json::Value {
+    let error = tirith_core::redact::redact_sanitize_redact_with_compiled(error, compiled);
+    let mut value = serde_json::json!({
+        "action": tirith_core::verdict::Action::Block,
+        "analysis_complete": false,
+        "analysis_incomplete": true,
+        "refused": true,
+        "executed": false,
+        "exit_code": 1,
+        "error": error,
+    });
+    append_run_policy_diagnostics(&mut value, compiled);
+    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    tirith_core::verdict::bound_json_value_for_output(value)
+}
+
+fn append_run_policy_diagnostics(
+    value: &mut serde_json::Value,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) {
+    let diagnostics = tirith_core::policy::drain_captured_policy_diagnostics_for_output(compiled);
+    if diagnostics.is_empty() {
+        return;
+    }
+    let count = diagnostics.len();
+    let diagnostics = diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.replace(['\r', '\n', '\t'], " "))
+        .map(serde_json::Value::String)
+        .collect();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("policy_diagnostics_count".to_string(), count.into());
+        object.insert(
+            "policy_diagnostics".to_string(),
+            serde_json::Value::Array(diagnostics),
+        );
+    }
+}
+
+fn emit_run_policy_diagnostics_human(compiled: &tirith_core::redact::CompiledCustomPatterns) {
+    for diagnostic in tirith_core::policy::drain_captured_policy_diagnostics_for_output(compiled) {
+        let diagnostic =
+            tirith_core::output::sanitize_human_field_with_compiled(&diagnostic, compiled);
+        eprintln!("tirith run: policy diagnostic: {diagnostic}");
+    }
+}
+
+fn write_run_json(value: &serde_json::Value) -> bool {
+    super::write_json_stdout(value, "tirith: failed to write JSON output")
 }
 
 fn reviewed_file_capsule_spec() -> tirith_core::capsule::CapsuleSpec {
@@ -154,16 +384,30 @@ fn apply_test_capsule_override(
     spec
 }
 
-/// The contained executor for every live `tirith run` (E5). `--capsule` is a
-/// legacy compatibility spelling, not an opt-in boundary. Runs the exact typed
-/// interpreter invocation through the locked-down OS capsule. File mode receives
-/// only the inherited sealed reviewed-script descriptor; no downloaded-script
-/// pathname enters argv. Enforcing surface: fail closed when the backend cannot
-/// provide the spec's required coverage.
-pub(crate) fn capsuled_exec(
+/// The contained executor for every live `tirith run` and `tirith install url`
+/// (E5). `--capsule` is a legacy compatibility spelling, not an opt-in boundary.
+/// Runs the exact typed interpreter invocation through the locked-down OS
+/// capsule. File mode receives only the inherited sealed reviewed-script
+/// descriptor; no downloaded-script pathname enters argv. Enforcing surface:
+/// fail closed when the backend cannot provide the spec's required coverage.
+///
+/// `task_denied_effects` carries the C12 decision into the spec: a denied effect
+/// becomes a removed capability
+/// ([`tirith_core::task_boundary::tighten_capsule_spec`]). Because
+/// `CapsuleSpec::required_coverage` is derived from the spec, tightening it
+/// raises what the backend must deliver, and the existing shortfall check
+/// refuses a backend that cannot deliver it. Nothing here loosens a spec.
+///
+/// There is deliberately no untightened sibling that takes three arguments. A
+/// convenience wrapper that passes an empty denial set is the easy wrong call
+/// for a new download-and-launch surface to make, and that is precisely the
+/// mistake `tirith install url` made before this slice was finished; a caller
+/// with no decision must now write the empty set out and mean it.
+pub(crate) fn capsuled_exec_tightened(
     invocation: &ScriptInvocation,
     reviewed_script: tirith_core::runner::ReviewedScript<'_>,
     authorizer: &mut tirith_core::runner::ExecutionAuthorizer,
+    task_denied_effects: &std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
 ) -> Result<i32, String> {
     let outcome = match invocation.input_mode {
         ScriptInputMode::File => {
@@ -172,6 +416,7 @@ pub(crate) fn capsuled_exec(
                     .to_string()
             })?;
             let mut spec = reviewed_file_capsule_spec();
+            tirith_core::task_boundary::tighten_capsule_spec(&mut spec, task_denied_effects);
             let (read_roots, runtime_path) = validated_stdin_runtime(program)?;
             spec.filesystem.read_roots = read_roots;
             spec.environment.allow = ["PATH", "LANG", "TERM"]
@@ -201,6 +446,7 @@ pub(crate) fn capsuled_exec(
                     format!("forced stdin execution lost its closed interpreter identity: {error}")
                 })?;
             let mut spec = forced_stdin_capsule_spec();
+            tirith_core::task_boundary::tighten_capsule_spec(&mut spec, task_denied_effects);
             let (read_roots, runtime_path) = validated_stdin_runtime(program)?;
             spec.filesystem.read_roots = read_roots;
             // PATH is supplied as explicit, validated child data. It is not
@@ -362,6 +608,381 @@ fn root_managed_metadata_is_secure(uid: u32, mode: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_json_is_bounded_and_retains_late_critical_without_mutating_result() {
+        use tirith_core::verdict::{Finding, RuleId, Severity, Timings, Verdict};
+
+        let mut findings = (0..400)
+            .map(|index| Finding {
+                rule_id: RuleId::ConfigInjection,
+                severity: Severity::Low,
+                title: format!("low {index}"),
+                description: "low detail ".repeat(2_000),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            })
+            .collect::<Vec<_>>();
+        findings.push(Finding {
+            rule_id: RuleId::PrivateKeyExposed,
+            severity: Severity::Critical,
+            title: "late runner critical".to_string(),
+            description: "must survive the DTO cap".to_string(),
+            evidence: Vec::new(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+        let verdict = Verdict::from_findings(findings, 3, Timings::default());
+        let raw_count = verdict.findings.len();
+        let result = tirith_core::runner::RunResult {
+            receipt: tirith_core::receipt::Receipt {
+                url: "https://example.test/install.sh".to_string(),
+                final_url: None,
+                redirects: Vec::new(),
+                sha256: "a".repeat(64),
+                size: 1,
+                domains_referenced: Vec::new(),
+                paths_referenced: (0..2_000)
+                    .map(|index| format!("/receipt-flood/{index}/{}", "x".repeat(200)))
+                    .collect(),
+                analysis_method: "policy-complete:sh".to_string(),
+                privilege: "normal".to_string(),
+                timestamp: "2026-08-09T00:00:00Z".to_string(),
+                cwd: Some("/private/raw/cwd".to_string()),
+                git_repo: None,
+                git_branch: None,
+            },
+            verdict: Some(verdict),
+            analysis_complete: true,
+            refused: true,
+            executed: false,
+            exit_code: Some(1),
+        };
+
+        let patterns = vec!["C02_RUN_OUTPUT_PATTERN".to_string()];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let value = super::build_run_json(&result, &compiled);
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+
+        assert!(pretty.len() < tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        assert!(pretty.contains("private_key_exposed"), "{pretty}");
+        assert!(pretty.contains("late runner critical"), "{pretty}");
+        assert_eq!(result.verdict.as_ref().unwrap().findings.len(), raw_count);
+        assert_eq!(
+            value["summary"]["original_findings_count"],
+            raw_count as u64
+        );
+        assert!(value["summary"]["dropped_findings_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert_eq!(value["summary"]["refused"], true);
+        assert_eq!(value["summary"]["executed"], false);
+        assert_eq!(value["summary"]["exit_code"], 1);
+        assert_eq!(value["summary"]["action"], "block");
+    }
+
+    #[test]
+    fn no_exec_block_json_keeps_action_without_claiming_live_refusal_and_scrubs_receipt() {
+        use tirith_core::verdict::{Finding, RuleId, Severity, Timings, Verdict};
+
+        let canary = "C02_RUN_RECEIPT_CANARY";
+        let provider_token = "provider-token-0123456789";
+        let patterns = vec![regex::escape(canary)];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let verdict = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::PrivateKeyExposed,
+                severity: Severity::Critical,
+                title: "blocked body".to_string(),
+                description: "no-exec still reports the body decision".to_string(),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings::default(),
+        );
+        let result = tirith_core::runner::RunResult {
+            receipt: tirith_core::receipt::Receipt {
+                url: format!(
+                    "https://user:password@mainnet.infura.io/v3/{provider_token}?token={canary}#fragment"
+                ),
+                final_url: Some(format!(
+                    "https://eth-mainnet.g.alchemy.com/v2/{provider_token}?key={canary}"
+                )),
+                redirects: vec![format!(
+                    "https://rpc.ankr.com/eth/{provider_token}?key={canary}"
+                )],
+                sha256: "c".repeat(64),
+                size: 1,
+                domains_referenced: vec!["example.test".to_string()],
+                paths_referenced: vec![format!("/private/{canary}/wallet.json")],
+                analysis_method: "policy-complete:sh".to_string(),
+                privilege: "normal".to_string(),
+                timestamp: "2026-08-09T00:00:00Z".to_string(),
+                cwd: Some(format!("/private/{canary}")),
+                git_repo: Some(format!(
+                    "https://user:password@github.com/org/repo?token={canary}#fragment"
+                )),
+                git_branch: Some(format!("branch-{canary}")),
+            },
+            verdict: Some(verdict),
+            analysis_complete: true,
+            refused: false,
+            executed: false,
+            exit_code: None,
+        };
+
+        let value = super::build_run_json(&result, &compiled);
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["refused"], false);
+        assert_eq!(value["executed"], false);
+        assert!(!serialized.contains(canary));
+        assert!(!serialized.contains(provider_token));
+        assert!(!serialized.contains("user:password"));
+        assert!(!serialized.contains("token="));
+        assert!(!serialized.contains("#fragment"));
+        assert!(serialized.contains("[REDACTED:custom]"));
+    }
+
+    #[test]
+    fn receipt_json_uses_the_monotonic_nested_policy_dlp_union() {
+        let canary = "C02_LATE_RUNNER_POLICY_CANARY";
+        let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(&[]);
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(&[regex::escape(canary)]);
+        let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(&[]);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let result = tirith_core::runner::RunResult {
+            receipt: tirith_core::receipt::Receipt {
+                url: "https://example.test/install.sh".to_string(),
+                final_url: None,
+                redirects: Vec::new(),
+                sha256: "b".repeat(64),
+                size: 1,
+                domains_referenced: Vec::new(),
+                paths_referenced: vec![format!("/private/{canary}/wallet.json")],
+                analysis_method: "policy-complete:sh".to_string(),
+                privilege: "normal".to_string(),
+                timestamp: "2026-08-11T00:00:00Z".to_string(),
+                cwd: None,
+                git_repo: None,
+                git_branch: None,
+            },
+            verdict: Some(tirith_core::verdict::Verdict::allow_fast(
+                3,
+                Default::default(),
+            )),
+            analysis_complete: true,
+            refused: false,
+            executed: false,
+            exit_code: None,
+        };
+
+        let serialized = serde_json::to_string(&super::build_run_json(&result, &compiled)).unwrap();
+        assert!(!serialized.contains(canary), "{serialized}");
+        assert!(serialized.contains("[REDACTED:custom]"), "{serialized}");
+    }
+
+    fn incomplete_no_exec_result(
+        reason: &str,
+        receipt_flood: bool,
+    ) -> tirith_core::runner::RunResult {
+        tirith_core::runner::RunResult {
+            receipt: tirith_core::receipt::Receipt {
+                url: "https://example.test/inspect.sh".to_string(),
+                final_url: None,
+                redirects: Vec::new(),
+                sha256: "f".repeat(64),
+                size: 1,
+                domains_referenced: Vec::new(),
+                paths_referenced: if receipt_flood {
+                    (0..2_000)
+                        .map(|index| format!("/incomplete/{index}/{}", "x".repeat(220)))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                analysis_method: format!("static-incomplete:{reason}"),
+                privilege: "normal".to_string(),
+                timestamp: "2026-08-10T00:00:00Z".to_string(),
+                cwd: Some("/private/raw/cwd".to_string()),
+                git_repo: None,
+                git_branch: None,
+            },
+            verdict: None,
+            analysis_complete: false,
+            refused: false,
+            executed: false,
+            exit_code: None,
+        }
+    }
+
+    fn assert_incomplete_no_exec_metadata(value: &serde_json::Value) {
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["analysis_complete"], false);
+        assert_eq!(value["analysis_incomplete"], true);
+        assert_eq!(value["refused"], false);
+        assert_eq!(value["executed"], false);
+        assert_eq!(value["exit_code"], 1);
+    }
+
+    #[test]
+    fn unsupported_interpreter_no_exec_json_is_block_incomplete_exit_one() {
+        let patterns = vec!["C02_UNSUPPORTED_INTERPRETER_OUTPUT".to_string()];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let result = incomplete_no_exec_result("unsupported-interpreter", false);
+
+        let value = super::build_run_json(&result, &compiled);
+
+        assert_eq!(
+            value["receipt"]["analysis_method"],
+            "static-incomplete:unsupported-interpreter"
+        );
+        assert_incomplete_no_exec_metadata(&value);
+        assert_eq!(super::run_process_outcome_code(&result, true), 1);
+        assert_eq!(
+            super::run_process_outcome_code(&result, false),
+            0,
+            "non-JSON inspection keeps its existing process-status contract"
+        );
+    }
+
+    #[test]
+    fn no_verdict_overrides_a_claimed_complete_flag_in_json_and_process_status() {
+        let patterns = vec!["C02_NO_VERDICT_OUTPUT".to_string()];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let mut result = incomplete_no_exec_result("unsupported-interpreter", false);
+        result.analysis_complete = true;
+
+        let value = super::build_run_json(&result, &compiled);
+
+        assert_incomplete_no_exec_metadata(&value);
+        assert_eq!(super::run_process_outcome_code(&result, true), 1);
+    }
+
+    #[test]
+    fn invalid_utf8_no_exec_json_and_compact_fallback_are_identically_fail_closed() {
+        let patterns = vec!["C02_INVALID_UTF8_OUTPUT".to_string()];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let ordinary_result = incomplete_no_exec_result("invalid-utf8", false);
+        let ordinary = super::build_run_json(&ordinary_result, &compiled);
+        assert_eq!(
+            ordinary["receipt"]["analysis_method"],
+            "static-incomplete:invalid-utf8"
+        );
+        assert_incomplete_no_exec_metadata(&ordinary);
+
+        let flooded_result = incomplete_no_exec_result("invalid-utf8", true);
+        let fallback = super::build_run_json(&flooded_result, &compiled);
+        let pretty = serde_json::to_string_pretty(&fallback).unwrap();
+
+        assert!(pretty.len() < tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        assert_eq!(fallback["presentation_truncated"], true);
+        for field in [
+            "action",
+            "analysis_complete",
+            "analysis_incomplete",
+            "refused",
+            "executed",
+            "exit_code",
+        ] {
+            assert_eq!(
+                fallback["summary"][field], ordinary[field],
+                "compact fallback changed incomplete-run field {field}"
+            );
+        }
+        assert_eq!(super::run_process_outcome_code(&flooded_result, true), 1);
+    }
+
+    #[test]
+    fn run_error_json_uses_frozen_dlp_before_full_envelope_cap() {
+        let canary = "C02_RUN_ERROR_CANARY";
+        let github = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let patterns = vec![regex::escape(canary)];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let error = format!(
+            "failure {}\u{200b}{} {}\u{1b}[31m{} {}",
+            &canary[..9],
+            &canary[9..],
+            &github[..18],
+            &github[18..],
+            "flood".repeat(100_000)
+        );
+
+        let value = super::build_run_error_json(&error, &compiled);
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+
+        assert!(pretty.len() < tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        assert!(!pretty.contains(canary));
+        assert!(!pretty.contains(&github));
+        assert!(pretty.contains("[REDACTED:custom]"));
+        assert!(pretty.contains("[REDACTED:GitHub PAT]"));
+        assert_eq!(value["summary"]["action"], "block");
+        assert_eq!(value["summary"]["analysis_complete"], false);
+        assert_eq!(value["summary"]["analysis_incomplete"], true);
+        assert_eq!(value["summary"]["refused"], true);
+        assert_eq!(value["summary"]["exit_code"], 1);
+    }
+
+    #[test]
+    fn run_json_captures_policy_diagnostics_inside_the_bounded_error_envelope() {
+        let custom = "C02_RUN_POLICY_CANARY";
+        let github = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let source = format!(
+            "policy-{}\u{1b}[31m{}-{}\u{200b}{}",
+            &github[..18],
+            &github[18..],
+            &custom[..10],
+            &custom[10..]
+        );
+        let patterns = vec![regex::escape(custom)];
+        let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(&patterns);
+        let _ = tirith_core::policy::Policy::load_from_yaml("[", Some(&source));
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+
+        let value = super::build_run_error_json(&"runner failure ".repeat(40_000), &compiled);
+        let serialized = serde_json::to_string_pretty(&value).unwrap();
+        let summary = value.get("summary").unwrap_or(&value);
+
+        assert!(serialized.len() < tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        assert!(!serialized.contains(&github), "{serialized}");
+        assert!(!serialized.contains(custom), "{serialized}");
+        assert!(!serialized.contains("\\u001b"), "{serialized}");
+        assert!(!serialized.contains("\\u200b"), "{serialized}");
+        assert_eq!(summary["action"], "block");
+        assert_eq!(summary["analysis_complete"], false);
+        assert_eq!(summary["analysis_incomplete"], true);
+        assert_eq!(summary["refused"], true);
+        assert!(summary["policy_diagnostics_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1));
+
+        let diagnostics = if let Some(diagnostics) = value["policy_diagnostics"].as_array() {
+            diagnostics
+        } else {
+            summary["policy_diagnostics"]
+                .as_array()
+                .expect("fallback retains captured diagnostics")
+        };
+        let diagnostic_text = diagnostics
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(diagnostic_text.contains("[REDACTED:GitHub PAT]"));
+        assert!(diagnostic_text.contains("[REDACTED:custom]"));
+    }
+
     #[cfg(target_os = "linux")]
     struct TestCapsuleOverrideGuard(Option<super::TestCapsuleOverride>);
 
@@ -492,7 +1113,14 @@ mod tests {
                 interpreter: tirith_core::runner::PipeInterpreter::Bash,
                 args: Vec::new(),
             },
-            Box::new(super::capsuled_exec),
+            Box::new(|invocation, reviewed, authorizer| {
+                super::capsuled_exec_tightened(
+                    invocation,
+                    reviewed,
+                    authorizer,
+                    &std::collections::BTreeSet::new(),
+                )
+            }),
         );
         drop(server);
         result.expect("live `tirith run` regression transaction")

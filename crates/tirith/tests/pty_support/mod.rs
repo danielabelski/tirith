@@ -237,6 +237,16 @@ impl IsolatedEnv {
             .join(format!("{}.execution", self.session_id()))
     }
 
+    /// Session record written by `session_warnings`. This is where a deletion
+    /// OBSERVATION lands (`typed_events`), which is a different store from the
+    /// execution ledger above: correlation rules such as `MassFileDeletion` read
+    /// this ring, not the receipt ledger.
+    pub fn session_record_path(&self) -> PathBuf {
+        self.state_home
+            .join("tirith/sessions")
+            .join(format!("{}.json", self.session_id()))
+    }
+
     /// Path to the persisted bash safe-mode flag (the hook writes it on enter-mode
     /// degrade, so a test can assert a visible degrade also persisted).
     pub fn bash_safe_mode_flag(&self) -> PathBuf {
@@ -337,8 +347,13 @@ pub struct PtySession {
     closed: bool,
 }
 
-/// How long any single `expect` may wait before failing the test.
+/// How long any single `expect` may wait WITHOUT NEW OUTPUT before failing.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// An absolute ceiling on any single `expect`, so a wedged session cannot hang
+/// the suite even though the idle deadline keeps resetting. Generous on
+/// purpose: it is a backstop, not the thing that decides a test's verdict.
+const MAX_TOTAL_WAIT: Duration = Duration::from_secs(180);
 
 impl PtySession {
     /// Spawn `program` with `args` in a fresh PTY under `env` (cwd = `workdir`).
@@ -460,17 +475,35 @@ impl PtySession {
     }
 
     /// Like [`PtySession::expect`] but with a caller-chosen deadline.
+    ///
+    /// The deadline is an IDLE one: it measures time since the shell last
+    /// produced a byte, not total elapsed time. These tests drive a real
+    /// interactive bash whose hook shells out to `tirith`, and the whole
+    /// workspace suite runs 35 test binaries at once, so a total deadline
+    /// measures how loaded the machine is rather than whether the shell is
+    /// making progress. That is what made
+    /// `bash_enter_degradation_is_visible_not_silent` fail under a parallel run
+    /// while passing every time on its own. An idle deadline still catches the
+    /// failure that matters, a shell that has genuinely stopped responding,
+    /// and `MAX_TOTAL_WAIT` keeps a wedged session from hanging the suite.
     pub fn expect_within(&mut self, needle: &str, timeout: Duration) -> String {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut seen = self.buf.len();
         loop {
             if self.buf.contains(needle) {
                 return self.buf.clone();
             }
-            if Instant::now() >= deadline {
+            if self.buf.len() != seen {
+                seen = self.buf.len();
+                last_progress = Instant::now();
+            }
+            if last_progress.elapsed() >= timeout || started.elapsed() >= MAX_TOTAL_WAIT {
                 panic!(
-                    "pty harness: timed out after {:?} waiting for {:?}\n\
+                    "pty harness: no output for {:?} (total {:?}) waiting for {:?}\n\
                      ---- captured output ----\n{}\n-------------------------",
                     timeout,
+                    started.elapsed(),
                     needle,
                     self.buf.trim_end()
                 );
@@ -613,10 +646,21 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
 /// marker is read while empty (macOS wins this race, slow CI doesn't — #116).
 /// Polling the filesystem side effect is correct at any machine speed.
 pub fn wait_for_marker(marker: &Path, needle: &str, timeout: Duration) -> String {
+    wait_for_marker_count(marker, needle, 1, timeout)
+}
+
+/// Poll `marker` until it contains `needle` at least `minimum` times (or the
+/// timeout), returning the file's final contents.
+pub fn wait_for_marker_count(
+    marker: &Path,
+    needle: &str,
+    minimum: usize,
+    timeout: Duration,
+) -> String {
     let deadline = Instant::now() + timeout;
     loop {
         let body = std::fs::read_to_string(marker).unwrap_or_default();
-        if count_occurrences(&body, needle) >= 1 {
+        if count_occurrences(&body, needle) >= minimum {
             return body;
         }
         if Instant::now() >= deadline {

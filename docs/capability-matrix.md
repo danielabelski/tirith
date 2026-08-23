@@ -26,8 +26,10 @@ Inspected:
 | `tirith preview` | Partial | Simulates the filesystem blast radius of destructive commands; models the impact rather than inspecting content. | Yes |
 | `tirith watch` | Partial | Runs a command, then diffs filesystem, PATH, and shell-rc impact; observes effects, not the command bytes. | Yes |
 | `tirith temp-run` | Partial | Runs a command in a throwaway directory and diffs file impact. File isolation, not full containment, unless --capsule is set. | Partial |
+| `tirith capsule run` | Full | Copies the project with symlink-safe same-inode traversal (refusing symlinks, escapes, and case/Unicode collisions), digests every copied file, runs the exact argv in a fail-closed capsule, and diffs the tree afterwards. Enforceable only on x86_64 Linux; every other host refuses before any copy or spawn. | Yes |
 | `tirith taint` | None | Tracks provenance of files downloaded from risky sources; flags execution of a tainted file. Bookkeeping, not content inspection. | Yes |
 | `tirith intend` | Full | Inspects the command and flags high-impact behavior the stated intent does not justify (advisory). | Yes |
+| `tirith task check` | Partial | Preview, diagnostic. Parses a bounded untrusted task envelope in full and assigns each source's effective provenance from the tirith-owned ingress adapter rather than the document's own claim, but effect inference models the Web3 shell grammar and nothing else, so a proposed shell action outside that grammar is reported INCOMPLETE rather than understood. Executes nothing, fetches nothing, resolves no package, and writes nothing; it declares enforceability observe_only, so it reports what an envelope would be allowed to do and stops nothing. | Yes |
 | `tirith lab` | Full | Runs the detection engine against a curated, inert adversarial corpus to show what it catches. Offline. | Yes |
 | `tirith explain` | None | Prints rule documentation, examples, remediation, and MITRE mapping. Documentation surface. | Yes |
 | `tirith why` | None | Explains the last rule that triggered. Reporting surface over an existing verdict. | Yes |
@@ -53,11 +55,11 @@ Inspected:
 | `tirith init` | None | Prints the shell hook for the active profile. Configuration surface. | Yes |
 | `tirith onboard` | None | Guided first-run wizard: detects the environment and recommends a policy template. Configuration surface. | Yes |
 | `tirith setup` | None | One-command AI-tool setup. Writes integration config; does not inspect content. | Yes |
-| `tirith install` | Partial | Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. | Partial |
+| `tirith install` | Partial | Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. For npm, --online also reports registry identity facts (origin, registry-bound tarball URL, parsed dist.integrity SRI, legacy shasum status, signature and provenance-attestation state) and, on an unpinned spec, a name-existence probe; those facts are parsed, never verified, and tirith does not download, inspect, or bind the tarball bytes npm installs. | Partial |
 | `tirith verify-self` | Full | Verifies the running binary and its build/install provenance against signed checksums. | Yes |
 | `tirith update` | Full | Signature-verified self-update: inspects the downloaded binary before replacing the running one. | Yes |
 | `tirith version` | None | Prints version and, with --provenance, build/install provenance. Reporting surface. | Yes |
-| `tirith browser` | None | Installs the Chrome native-messaging host that records clipboard provenance. Configuration surface. | Yes |
+| `tirith browser` | Partial | Installs the Chrome native-messaging host that records clipboard provenance (configuration surface). `browser audit` additionally reads bytes: it hashes every file under a profile's Extensions/<id>/<version> source tree, parses each manifest.json, and reads exactly three install-class fields (location, from_webstore, was_installed_by_default) from Preferences. It never reads cookies, history, saved passwords, Local Storage, IndexedDB, extension storage, wallet databases, or Local State, so it cannot see browsing data or the signed-in account, and profile identity is the profile directory name only. | Yes |
 | `tirith devcontainer` | Partial | Guards container operations and injects tirith into devcontainer.json. Inspects the guarded operation, not container contents. | Yes |
 | `tirith codespaces` | None | Sets up and injects tirith into Codespaces. Configuration surface. | Yes |
 | `tirith activate` | None | Activates a commercial license key. Licensing surface. | Yes |
@@ -92,7 +94,7 @@ Inspected:
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith package` | Partial | Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. | Partial |
+| `tirith package` | Partial | Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. For npm, --online reports dist identity facts and their verification state; no state can be verified here, and tirith does not download, inspect, or bind npm tarball bytes. | Partial |
 | `tirith ecosystem` | Partial | Scores every declared dependency in a project, slopsquat-aware. Inspects manifests and installed trees; registry depth needs --online. | Partial |
 | `tirith threat-db` | None | Manages the signed local threat database. Data management surface consumed by the inspecting commands. | Yes |
 | `tirith iac` | Full | Terraform / Pulumi / OpenTofu apply gates: inspects the saved-plan hash and blocks no-plan applies. | Yes |
@@ -100,12 +102,16 @@ Inspected:
 | `tirith secret` | None | Guidance-only secret-rotation assistant for 11 providers (no network). Advisory surface. | Yes |
 | `tirith command-card` | Full | Creates and verifies Ed25519-signed attestations that a known-good command is what it claims. | Yes |
 | `tirith commands` | Full | Repo command manifest: a bounded allowlist plus an elevation-only dangerous[] list, inspected against the invoked command. | Yes |
+| `tirith attest build` | Full | Hashes every regular file of a source tree and an output tree into one deterministic digest each, plus the commit and dirty state, lockfile digests, policy projection hash, a REDACTED argv digest, and the per-file output manifest. Every symlink, non-regular entry, non-UTF-8 path, case or Unicode collision, and mid-hash change is a REFUSAL, never a silently skipped entry. This is a point-in-time record, not a reproducible-build claim: tirith does not run the build, does not observe the compiler, and cannot say the output came from the source. | Yes |
+| `tirith attest verify-build` | Full | Checks the receipt's signature against this installation's audit key, then re-scans and re-hashes both trees under the caps, exclusion set, and permission model the receipt itself records. It proves the trees are unchanged since the receipt was taken; it proves nothing about where either tree came from. | Yes |
+| `tirith attest deployment` | Full | Verifies the build receipt first (a receipt that fails its own integrity rules makes ZERO requests), then fetches only the routes the build's output manifest names, from ONE https origin through the connect-time DNS guard, and hashes the exact returned bytes. A cross-origin redirect is a mismatch, not a follow. It proves only that those routes returned those bytes at that timestamp: not continuous monitoring, and nothing at all about routes it did not fetch. | Yes |
+| `tirith attest verify-deployment` | None | Re-checks the deployment receipt DOCUMENT: its content address, its signature, and its internal consistency. It makes no network request and re-measures no route, deliberately, because a second measurement presented as verification of the first would be the continuous-monitoring claim these receipts refuse to make. | Yes |
 
 ## AI-agent integrations
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith mcp-server` | Full | Runs tirith as an MCP server (7 tools) over JSON-RPC stdio; inspects tool inputs and, with --sanitize-tool-output, outputs. | Yes |
+| `tirith mcp-server` | Full | Runs tirith as an MCP server (six cross-platform tools, plus tirith_fetch_cloaking on Unix) over JSON-RPC stdio; inspects tool inputs and sanitizes tool/resource-read outputs by default. | Yes |
 | `tirith mcp` | Full | Inventories and gates a repo's MCP servers into .tirith/mcp.lock; inspects tool descriptors, schemas, and per-capability surfaces. | Yes |
 | `tirith gateway` | Full | MCP gateway proxy that intercepts AI-agent tool calls; inspects requests and filters responses for injection and exfil. | Yes |
 | `tirith agent` | Partial | Caller-origin governance (human / agent / MCP / CI / IDE); an agent_rules.deny match forces a block. Inspects origin and rules, not payloads. | Yes |
@@ -134,4 +140,5 @@ Inspected:
 | `tirith pkg graph` | Full | Renders the execution/ownership provenance graph from inspected artifact execution edges and the ownership map. | Yes |
 | `tirith pkg diff` | Full | Local release differential between two wheels; inspects members for execution-shape drift (pure to native, hooks added). | Yes |
 | `tirith pkg attest` | Full | Binds a PyPI provenance attestation subject digest to the quarantined sha256 and verifies it (optional sigstore feature). Missing or invalid attestation is evidence, never an auto-allow. | Yes |
+| `tirith pkg attest-npm` | Partial | Resolves npm through the trusted-executable mechanism, discovers its exact version, and runs one argv from a CLOSED fixture-backed contract table; an npm outside the table runs NO command. It reads the project's package-lock.json and node_modules inventory in full and binds npm's own answer to them, and it compares an attestation's in-toto subject digest against the lockfile integrity SRI. The signature verification is npm's, not tirith's: npm signs with ECDSA P-256 and this workspace has no P-256 backend, and the Sigstore closure is off on the workspace MSRV. Tirith does not download, inspect, or bind the tarball bytes npm installs. A non-public registry, an unsupported npm, Windows, or a project .npmrc that reconfigures the audit all return partial. | Yes |
 | `tirith pkg receipt` | None | Lists and shows tamper-evident artifact-scan receipts. Reporting surface over recorded receipts. | Yes |

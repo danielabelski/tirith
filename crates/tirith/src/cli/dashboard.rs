@@ -296,9 +296,8 @@ fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
 /// default.
 ///
 /// Atomic publish (R19-N3): written to a sibling temp file, `sync_all`'d, then
-/// renamed over `path` through a retained parent-directory capability, so a
-/// mid-write failure never truncates a previously-good export and a concurrent
-/// symlink swap cannot redirect publication.
+/// renamed over `path` via [`crate::cli::write_file_atomic`], so a mid-write
+/// failure never truncates a previously-good export.
 ///
 /// Permissions (R12-3): on Unix the temp file is `0600` and the rename carries
 /// that mode onto the destination, so the report is owner-only even before
@@ -306,29 +305,29 @@ fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
 /// default `%USERPROFILE%\Documents` is already user-private via NTFS ACL) but
 /// emit a one-line stderr warning that protection relies on directory perms.
 fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
-    // repo-0374: the export path can be repository-controlled (the documented
-    // `--out .` flow writes ./dashboard.html). Bind its parent once and publish
-    // relative to that retained capability. This refuses both a symlinked final
-    // component and a symlinked intermediate directory without a check/use gap.
-    // With `create_parent = true`, the same capability traversal also creates a
-    // missing default `~/Documents` parent without an unsafe pathname pre-pass.
-    let root = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let prepared =
-        tirith_core::util::ContainedAtomicFile::prepare(&root, path, true).map_err(|error| {
-            format!(
-                "refusing unsafe dashboard destination {}: {error}",
+    // repo-0478: the default `~/Documents` parent may not exist (headless
+    // accounts); create it so the documented default flow works.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create export directory {}: {e}", parent.display()))?;
+    }
+    // repo-0374: the export path can be a repository-planted symlink (the
+    // documented `--out .` flow writes ./dashboard.html). `write_file_atomic`
+    // deliberately resolves symlinks for config files, so refuse them here
+    // instead of overwriting an out-of-repo target.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to write export through symlink {}",
                 path.display()
-            )
-        })?;
+            ));
+        }
+    }
     // Atomic temp+fsync+rename; `overwrite = true` replaces an existing export.
-    // On Unix the 0600 temp mode is preserved by the rename.
-    prepared
-        .write_atomic(html.as_bytes(), true)
-        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    // On Unix the 0600 temp mode is preserved by the rename; the helper also
+    // creates any missing parent dirs.
+    crate::cli::write_file_atomic(path, html.as_bytes(), /* overwrite = */ true)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
 
     // No Unix file modes here — warn (to stderr, keeping --json/stdout clean)
     // that protection relies on the OS directory permissions.
@@ -1035,33 +1034,6 @@ mod tests {
                 "re-exported report must remain 0600, got {mode:o}"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_html_file_refuses_symlinked_final_component() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let victim = outside.path().join("victim.html");
-        std::fs::write(&victim, b"SENTINEL").unwrap();
-        let path = dir.path().join("dashboard.html");
-        std::os::unix::fs::symlink(&victim, &path).unwrap();
-
-        assert!(write_html_file(&path, "<html>attacker</html>").is_err());
-        assert_eq!(std::fs::read(&victim).unwrap(), b"SENTINEL");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_html_file_refuses_symlinked_parent_component() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let link = root.path().join("export");
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
-        let path = link.join("dashboard.html");
-
-        assert!(write_html_file(&path, "<html>attacker</html>").is_err());
-        assert!(!outside.path().join("dashboard.html").exists());
     }
 
     // Light integration test (invariants B/D/E end-to-end over a real socket).

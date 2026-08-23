@@ -8,6 +8,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{collections::BTreeSet, marker::PhantomData};
 
 use sha2::{Digest, Sha256};
 use tirith_core::selfupdate::{self, InstallMethod, Provenance, SemVer, VerificationStatus};
@@ -22,10 +23,141 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 const MAX_ARCHIVE_SIZE: u64 = 64 * 1024 * 1024;
 /// Hard cap on `checksums.txt` / signature / certificate files.
 const MAX_METADATA_SIZE: u64 = 256 * 1024;
-/// cosign keyless verification identity regexp — must match the workflow.
-const COSIGN_IDENTITY_REGEXP: &str = "github.com/sheeki03/tirith";
+/// Exact keyless signer workflow. The requested release tag is appended at
+/// verification time so a signature made by another workflow or for another
+/// tag cannot authorize these bytes.
+const COSIGN_WORKFLOW_IDENTITY: &str =
+    "https://github.com/sheeki03/tirith/.github/workflows/release.yml@refs/tags/";
 /// cosign OIDC issuer — the GitHub Actions OIDC provider.
 const COSIGN_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+/// Opaque, exact-operation authorization retained for every effect in one
+/// self-integrity transaction. The task permit is consumed once, before the
+/// first network/temp effect, and this lease rechecks the exact operation and
+/// receipt deadline immediately before each later effect.
+struct RetainedSelfAuthorization<B: tirith_core::task_boundary::BoundaryMarker> {
+    envelope: tirith_core::task::TaskEnvelopeInput,
+    effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
+    lease: tirith_core::task_boundary::TaskBoundaryEffectLease<B>,
+    marker: PhantomData<fn() -> B>,
+}
+
+impl<B: tirith_core::task_boundary::BoundaryMarker> RetainedSelfAuthorization<B> {
+    fn operation(&self) -> tirith_core::task_boundary::BoundaryOperation<'_> {
+        tirith_core::task_boundary::BoundaryOperation {
+            boundary: B::BOUNDARY,
+            envelope: &self.envelope,
+            adapter: tirith_core::task::IngressAdapter::OperatorIngest,
+            boundary_effects: self.effects.clone(),
+        }
+    }
+
+    fn authorize_effect(&self) -> Result<(), String> {
+        self.lease
+            .authorize_effect_at(&self.operation(), chrono::Utc::now())
+            .map_err(|error| format!("task authorization is no longer valid: {error}"))
+    }
+}
+
+trait SelfEffectAuthorization {
+    fn authorize_effect(&self) -> Result<(), String>;
+}
+
+impl<B: tirith_core::task_boundary::BoundaryMarker> SelfEffectAuthorization
+    for RetainedSelfAuthorization<B>
+{
+    fn authorize_effect(&self) -> Result<(), String> {
+        RetainedSelfAuthorization::authorize_effect(self)
+    }
+}
+
+fn self_boundary_envelope(
+    kind: &str,
+    projection: serde_json::Value,
+    destination: Option<&Path>,
+) -> Result<tirith_core::task::TaskEnvelopeInput, String> {
+    let projection = serde_json::json!({
+        "binding_version": 1,
+        "kind": kind,
+        "transaction": projection,
+    });
+    let digest = tirith_core::command_card::sha256_hex(
+        tirith_core::audit::canonical_json_for_hash(&projection).as_bytes(),
+    );
+    let source = tirith_core::task::TaskSourceInput {
+        claimed_source: tirith_core::task::SourceKind::Unknown,
+        content: format!("tirith-{kind}-operation:v1:sha256:{digest}"),
+        locator: None,
+        receipt: None,
+    };
+    let action = match destination {
+        Some(path) => tirith_core::task::ProposedAction::ConfigWrite {
+            path: path
+                .to_str()
+                .ok_or_else(|| "self-update destination must be valid UTF-8".to_string())?
+                .to_string(),
+        },
+        None => tirith_core::task::ProposedAction::Narrative {
+            text: kind.to_string(),
+        },
+    };
+    Ok(tirith_core::task::TaskEnvelopeInput {
+        task_id: None,
+        sources: vec![source],
+        actions: vec![action],
+        requested_effects: BTreeSet::new(),
+    })
+}
+
+fn prepare_self_authorization<B: tirith_core::task_boundary::BoundaryMarker>(
+    envelope: tirith_core::task::TaskEnvelopeInput,
+    effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
+) -> Result<RetainedSelfAuthorization<B>, String> {
+    let policy = tirith_core::policy::Policy::discover_local_only(None);
+    prepare_self_authorization_with_policy::<B>(envelope, effects, &policy.task_gate)
+}
+
+fn prepare_self_authorization_with_policy<B: tirith_core::task_boundary::BoundaryMarker>(
+    envelope: tirith_core::task::TaskEnvelopeInput,
+    effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
+    gate: &tirith_core::web3_policy::TaskGatePolicy,
+) -> Result<RetainedSelfAuthorization<B>, String> {
+    let operation = tirith_core::task_boundary::BoundaryOperation {
+        boundary: B::BOUNDARY,
+        envelope: &envelope,
+        adapter: tirith_core::task::IngressAdapter::OperatorIngest,
+        boundary_effects: effects.clone(),
+    };
+    let pending = tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<B>(
+        &operation,
+        gate,
+        &tirith_core::task_analysis::TaskAnalysisContext::default(),
+    );
+    let assessment = match &pending {
+        Ok(pending) => Some(pending.assessment()),
+        Err(error) => error.assessment(),
+    };
+    if let Some(assessment) = assessment {
+        if let Err(error) = tirith_core::audit::log_task_boundary_assessment(assessment) {
+            tirith_core::audit::audit_diagnostic(format!(
+                "self-integrity task-boundary audit append failed: {error}"
+            ));
+        }
+    }
+    let permit = pending
+        .map_err(|error| format!("task gate refused before any self-integrity effect: {error}"))?
+        .consume_default_for_operation(&operation, chrono::Utc::now())
+        .map_err(|error| format!("task authorization could not be consumed: {error}"))?;
+    let lease = permit
+        .into_effect_lease_at(&operation, chrono::Utc::now())
+        .map_err(|error| format!("task authorization is no longer valid: {error}"))?;
+    Ok(RetainedSelfAuthorization {
+        envelope,
+        effects,
+        lease,
+        marker: PhantomData,
+    })
+}
 
 /// Gather the running binary's provenance without any network access.
 pub fn gather_provenance() -> Provenance {
@@ -282,11 +414,12 @@ pub fn verify_self(json: bool) -> i32 {
 /// For installs whose binary is legitimately NOT byte-identical to the generic
 /// release artifact, the canonical-binary byte-compare in `verify-self` cannot
 /// apply, so return an honest `Unverified` reason instead of a false `Failed`:
-/// `cargo install` and the AUR compile from source, and the `.rpm` is rebuilt
-/// against the target distro's (older) glibc in a separate container. Returns
-/// `None` for installs that DO ship the canonical release binary (`.deb`/apt,
+/// `cargo install` and the AUR compile from source. Returns `None` for installs
+/// that DO ship the canonical release binary (`.deb`/apt, `.rpm`/dnf,
 /// self-managed, Homebrew, npm, Scoop) and must verify normally. Exhaustive (no
-/// `_`) so a new install method forces a deliberate decision here.
+/// `_`) so a new install method forces a deliberate decision here. The release
+/// workflow byte-compares both RPM executables against the canonical GNU
+/// tarball before publishing, so DNF must never be carved out here again.
 fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
     match method {
         InstallMethod::Cargo => Some(
@@ -299,16 +432,12 @@ fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
              canonical release binary to byte-compare against"
                 .to_string(),
         ),
-        InstallMethod::Dnf => Some(
-            "installed from the distribution .rpm, which is built against the target distro's \
-             glibc and is intentionally not byte-identical to the generic Linux release binary"
-                .to_string(),
-        ),
         InstallMethod::SelfManaged
         | InstallMethod::Homebrew
         | InstallMethod::Npm
         | InstallMethod::Scoop
         | InstallMethod::Apt
+        | InstallMethod::Dnf
         | InstallMethod::Unknown => None,
     }
 }
@@ -319,8 +448,8 @@ fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
 /// (distributed as a bottle), so its binary is not the prebuilt release artifact,
 /// while the `sheeki03/tap` formula pours the prebuilt binary and matches above
 /// (VERIFIED). Every other method that reaches here ships the canonical prebuilt
-/// binary (.deb/apt, npm, Scoop, self-managed), so for them a mismatch IS tampering
-/// and stays `Failed`; the always-source-built methods (cargo/aur/dnf) are
+/// binary (.deb/apt, .rpm/dnf, npm, Scoop, self-managed), so for them a mismatch
+/// IS tampering and stays `Failed`; the always-source-built methods (cargo/aur) are
 /// pre-empted before the network fetch by `source_built_unverified_reason` and
 /// never reach here. Exhaustive (no `_`) so a new method forces a decision.
 fn benign_mismatch_reason(method: &InstallMethod) -> Option<String> {
@@ -355,12 +484,12 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         });
     }
 
-    // 1b. Source-/distro-built installs are not byte-identical to the generic
-    //     release binary by design (cargo/AUR compile from source; the .rpm is
-    //     rebuilt against the distro's glibc). Byte-comparing them to the generic
-    //     tarball would falsely report "modified or replaced", so report an honest
-    //     Unverified rather than a false Failed. (.deb/apt ships the canonical
-    //     binary, so it is NOT carved out here and verifies normally.)
+    // 1b. Source-built installs are not byte-identical to the generic release
+    //     binary by design (cargo/AUR compile from source). Byte-comparing them
+    //     to the generic tarball would falsely report "modified or replaced",
+    //     so report an honest Unverified rather than a false Failed. Both
+    //     `.deb`/apt and `.rpm`/dnf ship the canonical binary and therefore are
+    //     NOT carved out here; they verify normally.
     if let Some(reason) = source_built_unverified_reason(&prov.install_method) {
         return VerifySelfOutcome::verdict(VerificationStatus::Unverified { reason });
     }
@@ -408,9 +537,47 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         }
     };
 
+    let binary_display = match binary_path.to_str() {
+        Some(path) => path,
+        None => {
+            return VerifySelfOutcome::operational(
+                "the running binary path is not valid UTF-8 and cannot be bound safely".to_string(),
+            )
+        }
+    };
+    let authorization =
+        match prepare_self_authorization::<tirith_core::task_boundary::VerifySelfBoundary>(
+            match self_boundary_envelope(
+                "verify-self",
+                serde_json::json!({
+                    "version": version.to_string(),
+                    "target": target.clone(),
+                    "binary_path": binary_display,
+                    "binary_sha256": binary_sha.clone(),
+                    "release_origin": REPO,
+                }),
+                None,
+            ) {
+                Ok(envelope) => envelope,
+                Err(error) => return VerifySelfOutcome::operational(error),
+            },
+            [
+                tirith_core::effects::CommandEffectKind::NetworkEgress,
+                tirith_core::effects::CommandEffectKind::FilesystemWrite,
+            ]
+            .into_iter()
+            .collect(),
+        ) {
+            Ok(authorization) => authorization,
+            Err(error) => return VerifySelfOutcome::operational(error),
+        };
+
     // 4. Download the release archive + checksums for this exact version.
     let tag = format!("v{version}");
     let archive_name = selfupdate::release_archive_name(&target);
+    if let Err(error) = authorization.authorize_effect() {
+        return VerifySelfOutcome::operational(error);
+    }
     let workdir = match tempfile::Builder::new().prefix("tirith-verify-").tempdir() {
         Ok(d) => d,
         Err(e) => {
@@ -422,7 +589,7 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         }
     };
 
-    let release = match download_release_set(&tag, &archive_name, workdir.path()) {
+    let release = match download_release_set(&tag, &archive_name, workdir.path(), &authorization) {
         Ok(r) => r,
         Err(DownloadError::Offline(msg)) => {
             return VerifySelfOutcome::verdict(VerificationStatus::Unverified {
@@ -450,6 +617,7 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         ArchiveVerdict::Ok {
             signed,
             cosign_note,
+            ..
         } => (signed, cosign_note),
         ArchiveVerdict::Failed(reason) => {
             return VerifySelfOutcome::verdict(VerificationStatus::Failed { reason })
@@ -462,7 +630,12 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     // 6. Extract the binary from the verified archive and compare it
     //    byte-for-byte to the running binary — ties the archive checksum to the
     //    actual file on disk.
-    let extracted = match extract_tirith_binary(&release.archive_path, &target, workdir.path()) {
+    let extracted = match extract_tirith_binary(
+        &release.archive_path,
+        &target,
+        workdir.path(),
+        &authorization,
+    ) {
         Ok(p) => p,
         Err(e) => {
             return VerifySelfOutcome::verdict(VerificationStatus::Failed {
@@ -502,17 +675,70 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
             ),
         });
     }
+    if let Err(reason) = verify_exact_regular_preimage(&binary_path, Some(&binary_sha)) {
+        return VerifySelfOutcome::verdict(VerificationStatus::Failed {
+            reason: format!(
+                "the running binary changed while verify-self was checking it: {reason}"
+            ),
+        });
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let mut helper_note = None;
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let helper_note: Option<String> = None;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Err(reason) = verify_installed_package_approval_helper(workdir.path(), &target) {
+        if install_method_requires_package_approval_helper(&prov.install_method) {
+            return VerifySelfOutcome::verdict(VerificationStatus::Failed { reason });
+        }
+        helper_note = Some(format!(
+            "binary integrity verified; optional native package-approval capability unavailable: {reason}"
+        ));
+    }
 
     // Running binary == official release binary. Verdict strength is whatever
     // the archive-vs-checksums step achieved; for a checksum-only result, carry
     // the cosign note (absent vs broken) into the detail.
-    match checksum_status {
+    let detail = [cosign_note, helper_note]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let outcome = match checksum_status {
         ChecksumStrength::Signed => VerifySelfOutcome::verdict(VerificationStatus::VerifiedSigned),
         ChecksumStrength::ChecksumOnly => {
             VerifySelfOutcome::verdict(VerificationStatus::VerifiedChecksumOnly)
-                .with_detail(cosign_note)
         }
+    };
+    outcome.with_detail((!detail.is_empty()).then_some(detail))
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn install_method_requires_package_approval_helper(method: &InstallMethod) -> bool {
+    matches!(
+        method,
+        InstallMethod::SelfManaged | InstallMethod::Apt | InstallMethod::Dnf
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn verify_installed_package_approval_helper(workdir: &Path, target: &str) -> Result<(), String> {
+    let extracted_helper = extracted_package_approval_helper(workdir, target)?;
+    let extracted_helper_sha = hash_file_opt(&extracted_helper)
+        .ok_or_else(|| "could not hash the verified release package-approval helper".to_string())?;
+    let installed_helper_path = installed_package_approval_helper_path().ok_or_else(|| {
+        "the matching root-owned package-approval helper is not installed".to_string()
+    })?;
+    let installed_helper_sha = hash_file_opt(&installed_helper_path).ok_or_else(|| {
+        "the matching root-owned package-approval helper is not installed".to_string()
+    })?;
+    if !selfupdate::digest_eq(&extracted_helper_sha, &installed_helper_sha) {
+        return Err(
+            "the installed package-approval helper does not match this release".to_string(),
+        );
     }
+    Ok(())
 }
 
 /// Print the `verify-self` result. Returns `1` only when JSON was requested but
@@ -676,8 +902,57 @@ fn run_update(
         }
     };
 
+    let expected_binary_sha = match prov.binary_sha256.as_deref() {
+        Some(sha) => sha.to_string(),
+        None => {
+            emit_update_error(json, "could not bind the running binary's exact preimage");
+            return 1;
+        }
+    };
+    let expected_rollback_sha = hash_file_opt(&previous_backup_path(&binary_path));
+    let mut effects = [tirith_core::effects::CommandEffectKind::NetworkEgress]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if !dry_run {
+        effects.insert(tirith_core::effects::CommandEffectKind::FilesystemWrite);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        effects.insert(tirith_core::effects::CommandEffectKind::ResourceEscalation);
+    }
+    let authorization =
+        match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
+            match self_boundary_envelope(
+                "self-update",
+                serde_json::json!({
+                    "mode": "update",
+                    "release_selector": "latest",
+                    "current_version": current.to_string(),
+                    "target": target.clone(),
+                    "binary_path": binary_path.to_str(),
+                    "binary_preimage_sha256": expected_binary_sha.clone(),
+                    "rollback_preimage_sha256": expected_rollback_sha.clone(),
+                    "allow_unsigned": allow_unsigned,
+                    "dry_run": dry_run,
+                    "release_origin": REPO,
+                }),
+                if dry_run { None } else { Some(&binary_path) },
+            ) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    emit_update_error(json, &error);
+                    return 1;
+                }
+            },
+            effects,
+        ) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                emit_update_error(json, &error);
+                return 1;
+            }
+        };
+
     // 1. Find the latest release version via the GitHub API.
-    let latest = match fetch_latest_version() {
+    let latest = match fetch_latest_version(&authorization) {
         Ok(v) => v,
         Err(DownloadError::Offline(msg)) => {
             emit_update_error(
@@ -754,6 +1029,10 @@ fn run_update(
     // 2. Download the latest release archive + checksums.
     let tag = format!("v{latest}");
     let archive_name = selfupdate::release_archive_name(&target);
+    if let Err(error) = authorization.authorize_effect() {
+        emit_update_error(json, &error);
+        return 1;
+    }
     let workdir = match tempfile::Builder::new().prefix("tirith-update-").tempdir() {
         Ok(d) => d,
         Err(e) => {
@@ -765,7 +1044,7 @@ fn run_update(
     // repo-0492: progress goes to stderr — in --json mode stdout must carry
     // exactly one JSON document.
     eprintln!("tirith: downloading {tag} for {target}...");
-    let release = match download_release_set(&tag, &archive_name, workdir.path()) {
+    let release = match download_release_set(&tag, &archive_name, workdir.path(), &authorization) {
         Ok(r) => r,
         Err(e) => {
             emit_update_error(json, &format!("download failed: {}", e.message()));
@@ -801,6 +1080,7 @@ fn run_update(
         ArchiveVerdict::Ok {
             signed,
             cosign_note,
+            ..
         } => {
             if !allow_unsigned && *signed == ChecksumStrength::ChecksumOnly {
                 // Signature is mandatory by default. The checksum DID verify,
@@ -825,7 +1105,12 @@ fn run_update(
     }
 
     // 4. Extract the new binary from the verified archive.
-    let new_binary = match extract_tirith_binary(&release.archive_path, &target, workdir.path()) {
+    let new_binary = match extract_tirith_binary(
+        &release.archive_path,
+        &target,
+        workdir.path(),
+        &authorization,
+    ) {
         Ok(p) => p,
         Err(e) => {
             emit_update_error(
@@ -835,15 +1120,62 @@ fn run_update(
             return 1;
         }
     };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let helper_install = {
+        let archive_sha256 = match &archive_verdict {
+            ArchiveVerdict::Ok { archive_sha256, .. } => archive_sha256,
+            _ => unreachable!("failed archive verdict returned above"),
+        };
+        match install_package_approval_helper_for_update(
+            &release.archive_path,
+            archive_sha256,
+            &authorization,
+        ) {
+            Ok(installed) => Some(installed),
+            Err(error) => {
+                emit_update_error(
+                    json,
+                    &format!("could not update the package-approval helper: {error}"),
+                );
+                return 1;
+            }
+        }
+    };
 
     // 5. Atomic swap, keeping the previous binary for rollback.
-    let swap = match atomic_self_replace(&binary_path, &new_binary) {
+    let swap = match atomic_self_replace(
+        &binary_path,
+        &new_binary,
+        &expected_binary_sha,
+        expected_rollback_sha.as_deref(),
+        &authorization,
+    ) {
         Ok(s) => s,
         Err(e) => {
-            emit_update_error(json, &format!("could not install the new binary: {e}"));
+            #[allow(unused_mut)]
+            let mut error = format!("could not install the new binary: {e}");
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if let Some(helper_install) = helper_install {
+                if let Err(rollback_error) =
+                    rollback_package_approval_helper_update(helper_install, &authorization)
+                {
+                    error.push_str(&format!(
+                        "; additionally failed to restore package-approval helper state: {rollback_error}"
+                    ));
+                }
+            }
+            emit_update_error(json, &error);
             return 1;
         }
     };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(helper_install) = helper_install {
+        if let Err(error) = commit_package_approval_helper_update(helper_install, &authorization) {
+            eprintln!(
+                "tirith: warning: update succeeded but privileged helper transaction cleanup failed: {error}"
+            );
+        }
+    }
 
     if json {
         let v = serde_json::json!({
@@ -993,7 +1325,6 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
         }
         return 1;
     }
-
     if dry_run {
         if json {
             let v = serde_json::json!({
@@ -1024,16 +1355,212 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
         return 0;
     }
 
+    let expected_binary_sha = match hash_file_opt(&binary_path) {
+        Some(sha) => sha,
+        None => {
+            emit_update_error(json, "could not bind the running binary's exact preimage");
+            return 1;
+        }
+    };
+    let expected_rollback_sha = match hash_file_opt(&backup) {
+        Some(sha) => sha,
+        None => {
+            emit_update_error(json, "could not bind the rollback binary's exact preimage");
+            return 1;
+        }
+    };
+    let effects = [
+        tirith_core::effects::CommandEffectKind::FilesystemWrite,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        tirith_core::effects::CommandEffectKind::ResourceEscalation,
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let authorization =
+        match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
+            match self_boundary_envelope(
+                "self-update",
+                serde_json::json!({
+                    "mode": "rollback",
+                    "binary_path": binary_path.to_str(),
+                    "binary_preimage_sha256": expected_binary_sha.clone(),
+                    "rollback_path": backup.to_str(),
+                    "rollback_preimage_sha256": expected_rollback_sha.clone(),
+                    "dry_run": false,
+                }),
+                Some(&binary_path),
+            ) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    emit_update_error(json, &error);
+                    return 1;
+                }
+            },
+            effects,
+        ) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                emit_update_error(json, &error);
+                return 1;
+            }
+        };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let helper_restore = if Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file()
+        || Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file()
+        || Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file()
+    {
+        use std::ffi::OsStr;
+        let had_previous = Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file();
+        let previously_absent = Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file();
+        if had_previous == previously_absent {
+            emit_update_error(
+                json,
+                "paired rollback is unavailable because the previous package-approval helper state is ambiguous",
+            );
+            return 1;
+        }
+        if let Err(error) = authorization.authorize_effect() {
+            emit_update_error(json, &error);
+            return 1;
+        }
+        // Stage inside a root-owned 0700 directory, not the system temp dir.
+        // The preserved path is handed to `run_as_root("/usr/bin/install", ...)`
+        // further down, so root re-opens it BY NAME. In a world-writable /tmp
+        // that name is one an unprivileged process can race, and the file being
+        // installed is the binary that authorises package installs, so the
+        // failure mode is as bad as it gets. `install_package_approval_helper_for_update`
+        // already solves this; this mirrors it rather than inventing a variant.
+        let transaction_dir = match stage_helper_rollback_dir(&authorization) {
+            Ok(dir) => dir,
+            Err(error) => {
+                emit_update_error(json, &format!("could not stage helper rollback: {error}"));
+                return 1;
+            }
+        };
+        // Only preserve a helper that is actually there. The guard above admits
+        // this block when merely the backup or the previously-absent marker
+        // exists, and copying an absent live helper made `fs::copy` return
+        // NotFound and aborted the entire binary rollback with "could not
+        // preserve the current helper" for a wholly unrelated reason.
+        let preserved = if Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file() {
+            let staged = transaction_dir.join("live-before");
+            if let Err(error) = run_as_root(
+                &authorization,
+                "/usr/bin/install",
+                &[
+                    OsStr::new("-m"),
+                    OsStr::new("700"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
+                    staged.as_os_str(),
+                ],
+            ) {
+                let _ = remove_helper_rollback_dir(&authorization, &transaction_dir);
+                emit_update_error(
+                    json,
+                    &format!("could not preserve the current helper: {error}"),
+                );
+                return 1;
+            }
+            Some(staged)
+        } else {
+            None
+        };
+        let helper_result = if had_previous {
+            run_as_root(
+                &authorization,
+                "/usr/bin/install",
+                &[
+                    OsStr::new("-m"),
+                    OsStr::new("755"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
+                ],
+            )
+        } else {
+            run_as_root(
+                &authorization,
+                "/bin/rm",
+                &[OsStr::new("-f"), OsStr::new(PACKAGE_APPROVAL_HELPER_PATH)],
+            )
+        };
+        if let Err(error) = helper_result {
+            let _ = remove_helper_rollback_dir(&authorization, &transaction_dir);
+            emit_update_error(json, &format!("helper rollback failed: {error}"));
+            return 1;
+        }
+        Some(HelperRollbackPreserve {
+            transaction_dir,
+            preserved,
+        })
+    } else {
+        None
+    };
+
     // Restore via `atomic_restore_from`, NOT `atomic_self_replace`: the latter
     // would first copy the live binary onto `previous_backup_path(dest)` (the
     // same path as `backup`), clobbering the rollback source before the swap.
     // `atomic_restore_from` reads the source up front and never writes to it.
-    match atomic_restore_from(&binary_path, &backup) {
+    match atomic_restore_from(
+        &binary_path,
+        &backup,
+        &expected_binary_sha,
+        &expected_rollback_sha,
+        &authorization,
+    ) {
         Ok(()) => {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                use std::ffi::OsStr;
+                if helper_restore.is_some() {
+                    // These two markers describe what the helper looked like
+                    // BEFORE this rollback. Leaving one behind silently makes the
+                    // next rollback reason from stale state -- a stray
+                    // "previously absent" marker in particular tells it to delete
+                    // a helper the user legitimately has. Cleanup is still
+                    // best-effort (the rollback itself already succeeded, so this
+                    // must not turn into a failure), but it no longer happens
+                    // invisibly.
+                    for (marker, description) in [
+                        (PACKAGE_APPROVAL_HELPER_BACKUP, "helper backup"),
+                        (
+                            PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT,
+                            "helper previously-absent marker",
+                        ),
+                    ] {
+                        if let Err(e) = run_as_root(
+                            &authorization,
+                            "/bin/rm",
+                            &[OsStr::new("-f"), OsStr::new(marker)],
+                        ) {
+                            eprintln!(
+                                "tirith: warning: rolled back successfully but could not remove \
+                                 the stale {description} at {marker} ({e}); delete it manually -- \
+                                 a future rollback would otherwise act on out-of-date state"
+                            );
+                        }
+                    }
+                }
+                if let Some(helper_restore) = helper_restore.as_ref() {
+                    if let Err(e) =
+                        remove_helper_rollback_dir(&authorization, &helper_restore.transaction_dir)
+                    {
+                        eprintln!(
+                            "tirith: warning: rolled back successfully but could not remove the \
+                             root-owned helper rollback directory {} ({e}); remove it manually",
+                            helper_restore.transaction_dir.display()
+                        );
+                    }
+                }
+            }
             // Remove the now-stale backup (no longer "the previous version").
             // A leftover `.tirith-previous` identical to the live binary would
             // make a later `--rollback` a confusing no-op — so warn if removal
             // fails.
+            if let Err(error) = authorization.authorize_effect() {
+                emit_update_error(json, &error);
+                return 1;
+            }
             if let Err(e) = std::fs::remove_file(&backup) {
                 eprintln!(
                     "tirith: warning: rolled back successfully but could not remove the now-stale \
@@ -1056,6 +1583,49 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
             0
         }
         Err(e) => {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                use std::ffi::OsStr;
+                if let Some(helper_restore) = helper_restore {
+                    // Same class as the marker cleanup above, and worse: this is
+                    // the compensating restore on the FAILED-rollback path. If it
+                    // also fails the system is left with neither the new helper
+                    // nor the old one, and the error we are about to report says
+                    // nothing about that. Still best-effort -- the rollback error
+                    // stays the primary result -- but it gets reported.
+                    //
+                    // Only reinstall what was actually captured. When the live
+                    // helper was absent there is nothing to put back, and trying
+                    // would install a path that was never written.
+                    if let Some(preserved) = helper_restore.preserved.as_deref() {
+                        if let Err(e) = run_as_root(
+                            &authorization,
+                            "/usr/bin/install",
+                            &[
+                                OsStr::new("-m"),
+                                OsStr::new("755"),
+                                preserved.as_os_str(),
+                                OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
+                            ],
+                        ) {
+                            eprintln!(
+                                "tirith: warning: rollback failed AND the package-approval helper \
+                                 could not be restored to {PACKAGE_APPROVAL_HELPER_PATH} ({e}); the \
+                                 helper may now be missing -- reinstall before relying on it"
+                            );
+                        }
+                    }
+                    if let Err(e) =
+                        remove_helper_rollback_dir(&authorization, &helper_restore.transaction_dir)
+                    {
+                        eprintln!(
+                            "tirith: warning: could not remove the root-owned helper rollback \
+                             directory {} ({e}); remove it manually",
+                            helper_restore.transaction_dir.display()
+                        );
+                    }
+                }
+            }
             emit_update_error(json, &format!("rollback failed: {e}"));
             1
         }
@@ -1073,6 +1643,9 @@ fn emit_update_error(json: bool, msg: &str) {
 
 /// A downloaded release artifact set, all in a working directory.
 struct ReleaseSet {
+    /// Exact release tag used to fetch every member of this set. Cosign
+    /// verification binds the signer identity to this same tag.
+    tag: String,
     archive_path: PathBuf,
     /// Raw `checksums.txt` content (the signed-over payload).
     checksums_txt: String,
@@ -1114,6 +1687,7 @@ fn download_release_set(
     tag: &str,
     archive_name: &str,
     workdir: &Path,
+    authorization: &impl SelfEffectAuthorization,
 ) -> Result<ReleaseSet, DownloadError> {
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
 
@@ -1123,17 +1697,17 @@ fn download_release_set(
     // The archive and checksums.txt are required; the cosign sig/cert are
     // optional (an older release may lack them — an honest "checksum-only").
     let archive_url = format!("{base}/{archive_name}");
-    let archive_bytes = fetch_bytes(&client, &archive_url, MAX_ARCHIVE_SIZE)?;
+    let archive_bytes = fetch_bytes(&client, &archive_url, MAX_ARCHIVE_SIZE, authorization)?;
     let archive_path = workdir.join(archive_name);
-    write_file(&archive_path, &archive_bytes)
+    write_file(&archive_path, &archive_bytes, authorization)
         .map_err(|e| DownloadError::Other(format!("write archive: {e}")))?;
 
     let checksums_url = format!("{base}/checksums.txt");
-    let checksums_bytes = fetch_bytes(&client, &checksums_url, MAX_METADATA_SIZE)?;
+    let checksums_bytes = fetch_bytes(&client, &checksums_url, MAX_METADATA_SIZE, authorization)?;
     let checksums_txt = String::from_utf8(checksums_bytes.clone())
         .map_err(|_| DownloadError::Other("checksums.txt is not valid UTF-8".to_string()))?;
     let checksums_path = workdir.join("checksums.txt");
-    write_file(&checksums_path, &checksums_bytes)
+    write_file(&checksums_path, &checksums_bytes, authorization)
         .map_err(|e| DownloadError::Other(format!("write checksums.txt: {e}")))?;
 
     let sig_path = fetch_optional(
@@ -1141,15 +1715,18 @@ fn download_release_set(
         &format!("{base}/checksums.txt.sig"),
         workdir,
         "checksums.txt.sig",
+        authorization,
     );
     let cert_path = fetch_optional(
         &client,
         &format!("{base}/checksums.txt.pem"),
         workdir,
         "checksums.txt.pem",
+        authorization,
     );
 
     Ok(ReleaseSet {
+        tag: tag.to_string(),
         archive_path,
         checksums_txt,
         sig_path,
@@ -1159,11 +1736,13 @@ fn download_release_set(
 }
 
 /// Resolve the latest published release version through the GitHub API.
-fn fetch_latest_version() -> Result<SemVer, DownloadError> {
+fn fetch_latest_version(
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<SemVer, DownloadError> {
     let client = http_client(API_TIMEOUT_SECS)
         .map_err(|e| DownloadError::Other(format!("HTTP client: {e}")))?;
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body = fetch_bytes(&client, &url, MAX_METADATA_SIZE)?;
+    let body = fetch_bytes(&client, &url, MAX_METADATA_SIZE, authorization)?;
     let json: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| DownloadError::Other(format!("GitHub API response was not JSON: {e}")))?;
     let tag = json
@@ -1194,8 +1773,12 @@ fn fetch_bytes(
     client: &reqwest::blocking::Client,
     url: &str,
     max: u64,
+    authorization: &impl SelfEffectAuthorization,
 ) -> Result<Vec<u8>, DownloadError> {
     validate_download_url(url)?;
+    authorization
+        .authorize_effect()
+        .map_err(DownloadError::Other)?;
     let resp = client
         .get(url)
         .header(
@@ -1256,10 +1839,11 @@ fn fetch_optional(
     url: &str,
     workdir: &Path,
     name: &str,
+    authorization: &impl SelfEffectAuthorization,
 ) -> Option<PathBuf> {
-    let bytes = fetch_bytes(client, url, MAX_METADATA_SIZE).ok()?;
+    let bytes = fetch_bytes(client, url, MAX_METADATA_SIZE, authorization).ok()?;
     let path = workdir.join(name);
-    write_file(&path, &bytes).ok()?;
+    write_file(&path, &bytes, authorization).ok()?;
     Some(path)
 }
 
@@ -1277,6 +1861,13 @@ enum ArchiveVerdict {
     /// The archive's SHA-256 matched the entry in `checksums.txt`.
     Ok {
         signed: ChecksumStrength,
+        /// Exact digest from the checksum entry. Privileged helper staging
+        /// re-checks the root-owned archive copy against this value.
+        #[cfg_attr(
+            not(all(target_os = "linux", target_arch = "x86_64")),
+            allow(dead_code)
+        )]
+        archive_sha256: String,
         /// Why the signature was NOT checked (`None` when fully signed). For
         /// `ChecksumOnly` this distinguishes "cosign not installed" from
         /// "cosign present but unrunnable" — lost by an `eprintln!` under JSON.
@@ -1292,6 +1883,19 @@ enum ArchiveVerdict {
 /// if `cosign` is available and the release shipped a signature — verify the
 /// cosign signature over `checksums.txt`.
 fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) -> ArchiveVerdict {
+    let cosign = cosign_program();
+    verify_archive_against_checksums_with_program(release, archive_name, cosign.as_deref())
+}
+
+/// Internal exact-executable seam for archive verification. Production reaches
+/// this only through [`cosign_program`], which preserves the trusted fixed-path
+/// policy on Linux. Tests pass a private fixture path directly so they can
+/// exercise a non-zero verifier result without weakening that resolver.
+fn verify_archive_against_checksums_with_program(
+    release: &ReleaseSet,
+    archive_name: &str,
+    cosign: Option<&Path>,
+) -> ArchiveVerdict {
     // 1. Archive bytes vs the digest in checksums.txt.
     let archive_bytes = match std::fs::read(&release.archive_path) {
         Ok(b) => b,
@@ -1320,13 +1924,15 @@ fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) ->
     }
 
     // 2. cosign signature over checksums.txt, if possible.
-    match verify_cosign_signature(release) {
+    match verify_cosign_signature_with_program(release, cosign) {
         CosignOutcomeInternal::Verified => ArchiveVerdict::Ok {
             signed: ChecksumStrength::Signed,
+            archive_sha256: expected,
             cosign_note: None,
         },
         CosignOutcomeInternal::Unavailable(reason) => ArchiveVerdict::Ok {
             signed: ChecksumStrength::ChecksumOnly,
+            archive_sha256: expected,
             cosign_note: Some(reason.detail()),
         },
         CosignOutcomeInternal::Failed(reason) => {
@@ -1388,24 +1994,27 @@ enum CosignOutcomeInternal {
 /// and OIDC issuer. Missing cosign / no signature → `Unavailable` (honest, never
 /// a false pass); the cases are reported distinctly so JSON consumers can tell
 /// "cosign absent" from "cosign broken".
-fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
+fn verify_cosign_signature_with_program(
+    release: &ReleaseSet,
+    cosign: Option<&Path>,
+) -> CosignOutcomeInternal {
     let (sig, cert) = match (&release.sig_path, &release.cert_path) {
         (Some(s), Some(c)) => (s, c),
         _ => return CosignOutcomeInternal::Unavailable(CosignUnavailable::NoSignaturePublished),
     };
 
-    if !cosign_available() {
+    let Some(cosign) = cosign else {
         return CosignOutcomeInternal::Unavailable(CosignUnavailable::NotInstalled);
-    }
+    };
 
-    let output = std::process::Command::new("cosign")
+    let output = std::process::Command::new(cosign)
         .arg("verify-blob")
         .arg("--signature")
         .arg(sig)
         .arg("--certificate")
         .arg(cert)
-        .arg("--certificate-identity-regexp")
-        .arg(COSIGN_IDENTITY_REGEXP)
+        .arg("--certificate-identity")
+        .arg(format!("{COSIGN_WORKFLOW_IDENTITY}{}", release.tag))
         .arg("--certificate-oidc-issuer")
         .arg(COSIGN_OIDC_ISSUER)
         .arg(&release.checksums_path)
@@ -1433,25 +2042,57 @@ fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
     }
 }
 
-/// True when a `cosign` binary is resolvable on `PATH`.
-fn cosign_available() -> bool {
-    let probe = {
-        #[cfg(unix)]
-        {
-            std::process::Command::new("sh")
-                .args(["-c", "command -v cosign >/dev/null 2>&1"])
-                .status()
-        }
-        #[cfg(not(unix))]
-        {
-            std::process::Command::new("where.exe")
-                .arg("cosign")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-        }
-    };
-    probe.map(|s| s.success()).unwrap_or(false)
+fn cosign_program() -> Option<PathBuf> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // This verifier authorizes bytes that later cross a sudo boundary.
+        // Never accept a caller-PATH executable for that decision.
+        ["/usr/bin/cosign", "/usr/local/bin/cosign"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| {
+                super::package_approval_authority_native::validate_root_owned_executable(path)
+                    .is_ok()
+            })
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|directory| {
+                directory.join(if cfg!(windows) {
+                    "cosign.exe"
+                } else {
+                    "cosign"
+                })
+            })
+            .find(|candidate| candidate.is_file())
+    }
+}
+
+/// Root-managed system binary directories searched for `tar`, mirroring
+/// `TRUSTED_ZSH_SEARCH_DIRS`. Global root-owned locations only: no per-user
+/// profile, because a same-UID writer must not be able to choose the archiver
+/// that unpacks a release during self-update.
+#[cfg(unix)]
+const TRUSTED_TAR_SEARCH_DIRS: [&str; 4] = [
+    "/bin",
+    "/usr/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
+/// Note the privileged installer below still calls `/usr/bin/tar` (alongside
+/// `/usr/bin/install` and `/usr/bin/sha256sum`) through `run_as_root`. That is a
+/// separate, fully hardcoded helper set executed as root, where provenance is
+/// resolved under a different UID than this check runs as; it is deliberately
+/// left alone rather than half-converted here.
+#[cfg(unix)]
+fn resolve_trusted_tar() -> Result<tirith_core::trusted_child::TrustedExecutable, String> {
+    let search_path = std::env::join_paths(TRUSTED_TAR_SEARCH_DIRS)
+        .map_err(|error| format!("could not construct trusted tar search path: {error}"))?;
+    tirith_core::trusted_child::resolve_system_helper_on_path("tar", &search_path)
+        .map_err(|error| format!("trusted system tar not found: {error}"))
 }
 
 /// Extract the `tirith` binary (`tirith.exe` on Windows) from a release archive
@@ -1463,8 +2104,14 @@ fn cosign_available() -> bool {
 /// `--no-same-owner`, and the produced path is canonicalized and asserted to lie
 /// INSIDE `extract_dir`, so an escaping symlink member is rejected here rather
 /// than hashed/installed.
-fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result<PathBuf, String> {
+fn extract_tirith_binary(
+    archive: &Path,
+    target: &str,
+    workdir: &Path,
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<PathBuf, String> {
     let extract_dir = workdir.join("extracted");
+    authorization.authorize_effect()?;
     std::fs::create_dir_all(&extract_dir).map_err(|e| format!("create extract dir: {e}"))?;
 
     let binary_name = if target.contains("windows") {
@@ -1475,6 +2122,7 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
 
     if target.contains("windows") {
         // `.zip` via PowerShell Expand-Archive.
+        authorization.authorize_effect()?;
         let status = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg(format!(
@@ -1490,7 +2138,25 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
     } else {
         // `.tar.gz` via `tar`. `--no-same-owner` keeps extracted files owned by
         // the current user regardless of the archived uid/gid (matters as root).
-        let status = std::process::Command::new("tar")
+        // Resolve `tar` from a FIXED list of root-managed system directories
+        // instead of the single hardcoded `/usr/bin/tar`. Pinning one absolute
+        // path kept ambient PATH out of the self-update flow, which is the
+        // property worth keeping, but it also made self-update fail outright on
+        // any layout that ships tar elsewhere (/bin/tar, NixOS) -- and the
+        // update mechanism is the one thing you cannot fix remotely once it is
+        // broken. Searching a fixed list still keeps PATH out of it, and
+        // `resolve_system_helper_on_path` additionally applies the shared
+        // system-helper provenance policy that a bare path string never did.
+        #[cfg(unix)]
+        let trusted_tar = resolve_trusted_tar()?;
+        #[cfg(unix)]
+        let tar = trusted_tar.path();
+        #[cfg(not(unix))]
+        // Both branches must yield `&Path`: the unix arm binds
+        // `trusted_tar.path()`.
+        let tar = std::path::Path::new("tar");
+        authorization.authorize_effect()?;
+        let status = std::process::Command::new(tar)
             .arg("--no-same-owner")
             .arg("-xzf")
             .arg(archive)
@@ -1531,7 +2197,466 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
     Ok(canonical_binary)
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PACKAGE_APPROVAL_HELPER_PATH: &str = "/usr/local/libexec/tirith-package-approval-authority";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PACKAGE_APPROVAL_HELPER_BACKUP: &str =
+    "/usr/local/libexec/tirith-package-approval-authority.tirith-previous";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT: &str =
+    "/usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent";
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn installed_package_approval_helper_path() -> Option<PathBuf> {
+    [
+        "/usr/libexec/tirith-package-approval-authority",
+        PACKAGE_APPROVAL_HELPER_PATH,
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn extracted_package_approval_helper(workdir: &Path, target: &str) -> Result<PathBuf, String> {
+    if target != "x86_64-unknown-linux-gnu" && target != "x86_64-unknown-linux-musl" {
+        return Err("x86_64 Linux update selected an incompatible release target".to_string());
+    }
+    let extract_dir = workdir.join("extracted").canonicalize().map_err(|error| {
+        format!("could not canonicalize the verified extraction directory: {error}")
+    })?;
+    let helper = extract_dir.join("tirith-package-approval-authority");
+    let canonical = helper.canonicalize().map_err(|error| {
+        format!("verified release is missing the package-approval helper: {error}")
+    })?;
+    if !canonical.starts_with(&extract_dir) || !canonical.is_file() {
+        return Err(
+            "release package-approval helper escaped the verified archive root".to_string(),
+        );
+    }
+    Ok(canonical)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct HelperInstallRollback {
+    transaction_dir: PathBuf,
+    had_live_helper: bool,
+    had_prior_backup: bool,
+    had_prior_absent_marker: bool,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn run_as_root(
+    authorization: &impl SelfEffectAuthorization,
+    program: &str,
+    args: &[&std::ffi::OsStr],
+) -> Result<(), String> {
+    authorization.authorize_effect()?;
+    let mut command = if unsafe { libc::geteuid() } == 0 {
+        std::process::Command::new(program)
+    } else {
+        let sudo = Path::new("/usr/bin/sudo");
+        super::package_approval_authority_native::validate_root_owned_executable(sudo)
+            .map_err(|error| error.to_string())?;
+        let mut command = std::process::Command::new(sudo);
+        command.arg("--").arg(program);
+        command
+    };
+    let status = command
+        .args(args)
+        .status()
+        .map_err(|error| format!("could not run privileged installer: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("privileged package-approval helper installer failed".to_string())
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn run_as_root_output(
+    authorization: &impl SelfEffectAuthorization,
+    program: &str,
+    args: &[&std::ffi::OsStr],
+) -> Result<std::process::Output, String> {
+    authorization.authorize_effect()?;
+    let mut command = if unsafe { libc::geteuid() } == 0 {
+        std::process::Command::new(program)
+    } else {
+        let sudo = Path::new("/usr/bin/sudo");
+        super::package_approval_authority_native::validate_root_owned_executable(sudo)
+            .map_err(|error| error.to_string())?;
+        let mut command = std::process::Command::new(sudo);
+        command.arg("--").arg(program);
+        command
+    };
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run privileged installer: {error}"))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err("privileged package-approval helper installer failed".to_string())
+    }
+}
+
+/// What the paired helper rollback preserved, and where.
+///
+/// The preserved copy lives in a root-owned `0700` directory rather than the
+/// system temp dir, because the path is later handed to a privileged
+/// `/usr/bin/install` that re-opens it by name.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct HelperRollbackPreserve {
+    transaction_dir: PathBuf,
+    /// `None` when there was no live helper to preserve. The caller enters the
+    /// preserve block when merely the backup or the previously-absent marker
+    /// exists, so "nothing captured" is a normal outcome, not a failure.
+    preserved: Option<PathBuf>,
+}
+
+/// Create the root-owned `0700` staging directory for a paired helper rollback.
+/// Same discipline as [`install_package_approval_helper_for_update`]: validate
+/// the admin hierarchy first, so root never creates anything beneath a path an
+/// unprivileged writer controls.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn stage_helper_rollback_dir(
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<PathBuf, String> {
+    use std::ffi::OsStr;
+
+    super::package_approval_authority_native::validate_admin_hierarchy(Path::new("/usr/local"), 0)
+        .map_err(|error| error.to_string())?;
+    run_as_root(
+        authorization,
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("755"),
+            OsStr::new("/usr/local/libexec"),
+        ],
+    )?;
+    super::package_approval_authority_native::validate_admin_hierarchy(
+        Path::new("/usr/local/libexec"),
+        0,
+    )
+    .map_err(|error| error.to_string())?;
+    let directory = PathBuf::from(format!(
+        "/usr/local/libexec/.tirith-helper-rollback-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    run_as_root(
+        authorization,
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("700"),
+            directory.as_os_str(),
+        ],
+    )?;
+    Ok(directory)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn remove_helper_rollback_dir(
+    authorization: &impl SelfEffectAuthorization,
+    directory: &Path,
+) -> Result<(), String> {
+    use std::ffi::OsStr;
+
+    run_as_root(
+        authorization,
+        "/bin/rm",
+        &[OsStr::new("-rf"), directory.as_os_str()],
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn install_package_approval_helper_for_update(
+    archive: &Path,
+    archive_sha256: &str,
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<HelperInstallRollback, String> {
+    use std::ffi::OsStr;
+
+    let destination = Path::new(PACKAGE_APPROVAL_HELPER_PATH);
+    let backup = Path::new(PACKAGE_APPROVAL_HELPER_BACKUP);
+    super::package_approval_authority_native::validate_admin_hierarchy(Path::new("/usr/local"), 0)
+        .map_err(|error| error.to_string())?;
+    run_as_root(
+        authorization,
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("755"),
+            OsStr::new("/usr/local/libexec"),
+        ],
+    )?;
+    super::package_approval_authority_native::validate_admin_hierarchy(
+        Path::new("/usr/local/libexec"),
+        0,
+    )
+    .map_err(|error| error.to_string())?;
+    if archive_sha256.len() != 64
+        || !archive_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("verified release archive has an invalid SHA-256".to_string());
+    }
+    let transaction_dir = PathBuf::from(format!(
+        "/usr/local/libexec/.tirith-helper-update-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    run_as_root(
+        authorization,
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("700"),
+            transaction_dir.as_os_str(),
+        ],
+    )?;
+    let had_live_helper = destination.exists();
+    let had_prior_backup = backup.exists();
+    let prior_absent = Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT);
+    let had_prior_absent_marker = prior_absent.exists();
+    let transaction = HelperInstallRollback {
+        transaction_dir: transaction_dir.clone(),
+        had_live_helper,
+        had_prior_backup,
+        had_prior_absent_marker,
+    };
+    let preserve = |source: &Path, name: &str, mode: &str| {
+        run_as_root(
+            authorization,
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new(mode),
+                source.as_os_str(),
+                transaction_dir.join(name).as_os_str(),
+            ],
+        )
+    };
+    let preserve_result = (|| {
+        if had_live_helper {
+            preserve(destination, "live-before", "755")?;
+        }
+        if had_prior_backup {
+            preserve(backup, "rollback-before", "755")?;
+        }
+        if had_prior_absent_marker {
+            preserve(prior_absent, "absent-before", "600")?;
+        }
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = preserve_result {
+        // Best-effort: `error` is the result the caller acts on. But this is a
+        // root-owned directory, so say something rather than leaving it to be
+        // discovered later.
+        if let Err(cleanup) = run_as_root(
+            authorization,
+            "/bin/rm",
+            &[OsStr::new("-rf"), transaction_dir.as_os_str()],
+        ) {
+            eprintln!(
+                "tirith: warning: could not remove the root-owned transaction directory {} \
+                 ({cleanup}); remove it manually",
+                transaction_dir.display()
+            );
+        }
+        return Err(error);
+    }
+
+    let result = (|| {
+        if had_live_helper {
+            run_as_root(
+                authorization,
+                "/bin/rm",
+                &[
+                    OsStr::new("-f"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+                ],
+            )?;
+            run_as_root(
+                authorization,
+                "/usr/bin/install",
+                &[
+                    OsStr::new("-m"),
+                    OsStr::new("755"),
+                    destination.as_os_str(),
+                    backup.as_os_str(),
+                ],
+            )?;
+        } else {
+            run_as_root(
+                authorization,
+                "/bin/rm",
+                &[OsStr::new("-f"), OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP)],
+            )?;
+            run_as_root(
+                authorization,
+                "/usr/bin/touch",
+                &[OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT)],
+            )?;
+            run_as_root(
+                authorization,
+                "/bin/chmod",
+                &[
+                    OsStr::new("600"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+                ],
+            )?;
+        }
+        let staged_archive = transaction_dir.join("release.tar.gz");
+        run_as_root(
+            authorization,
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("600"),
+                archive.as_os_str(),
+                staged_archive.as_os_str(),
+            ],
+        )?;
+        let output = run_as_root_output(
+            authorization,
+            "/usr/bin/sha256sum",
+            &[staged_archive.as_os_str()],
+        )?;
+        let observed = String::from_utf8(output.stdout)
+            .map_err(|_| "privileged archive digest output was invalid".to_string())?;
+        if observed.split_whitespace().next() != Some(archive_sha256) {
+            return Err("root-owned staged archive failed its signed digest check".to_string());
+        }
+        run_as_root(
+            authorization,
+            "/usr/bin/tar",
+            &[
+                OsStr::new("--no-same-owner"),
+                OsStr::new("-xzf"),
+                staged_archive.as_os_str(),
+                OsStr::new("-C"),
+                transaction_dir.as_os_str(),
+                OsStr::new("tirith-package-approval-authority"),
+            ],
+        )?;
+        run_as_root(
+            authorization,
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("755"),
+                transaction_dir
+                    .join("tirith-package-approval-authority")
+                    .as_os_str(),
+                destination.as_os_str(),
+            ],
+        )
+    })();
+    match result {
+        Ok(()) => Ok(transaction),
+        Err(error) => match rollback_package_approval_helper_update(transaction, authorization) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; additionally failed to restore package-approval helper state: {rollback_error}"
+            )),
+        },
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn rollback_package_approval_helper_update(
+    rollback: HelperInstallRollback,
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<(), String> {
+    use std::ffi::OsStr;
+
+    let destination = Path::new(PACKAGE_APPROVAL_HELPER_PATH);
+    if rollback.had_live_helper {
+        run_as_root(
+            authorization,
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("755"),
+                rollback.transaction_dir.join("live-before").as_os_str(),
+                destination.as_os_str(),
+            ],
+        )?;
+    } else {
+        run_as_root(
+            authorization,
+            "/bin/rm",
+            &[OsStr::new("-f"), destination.as_os_str()],
+        )?;
+    }
+    if rollback.had_prior_backup {
+        run_as_root(
+            authorization,
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("755"),
+                rollback.transaction_dir.join("rollback-before").as_os_str(),
+                OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP),
+            ],
+        )?;
+    } else {
+        run_as_root(
+            authorization,
+            "/bin/rm",
+            &[OsStr::new("-f"), OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP)],
+        )?;
+    }
+    if rollback.had_prior_absent_marker {
+        run_as_root(
+            authorization,
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("600"),
+                rollback.transaction_dir.join("absent-before").as_os_str(),
+                OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+            ],
+        )?;
+    } else {
+        run_as_root(
+            authorization,
+            "/bin/rm",
+            &[
+                OsStr::new("-f"),
+                OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+            ],
+        )?;
+    }
+    run_as_root(
+        authorization,
+        "/bin/rm",
+        &[OsStr::new("-rf"), rollback.transaction_dir.as_os_str()],
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn commit_package_approval_helper_update(
+    rollback: HelperInstallRollback,
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<(), String> {
+    use std::ffi::OsStr;
+    run_as_root(
+        authorization,
+        "/bin/rm",
+        &[OsStr::new("-rf"), rollback.transaction_dir.as_os_str()],
+    )
+}
+
 /// Result of an atomic self-replace.
+#[derive(Debug)]
 struct SwapResult {
     /// Where the previous binary was saved (for `--rollback`).
     previous_backup: PathBuf,
@@ -1555,13 +2680,23 @@ fn previous_backup_path(binary_path: &Path) -> PathBuf {
 /// same-filesystem, atomic rename) with the exec bit set before the rename; the
 /// current `dest` is backed up first; the swap is a single `rename(temp, dest)`
 /// so a reader always sees either the old or the new binary, never a partial.
-fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, String> {
+fn atomic_self_replace(
+    dest: &Path,
+    new_binary: &Path,
+    expected_dest_sha256: &str,
+    expected_backup_sha256: Option<&str>,
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<SwapResult, String> {
     let dir = dest
         .parent()
         .ok_or_else(|| "cannot determine the binary's directory".to_string())?;
 
     // Refuse early on a non-writable directory: a clean error beats a raw
     // rename failure, and no temp file is created.
+    verify_exact_regular_preimage(dest, Some(expected_dest_sha256))?;
+    let backup = previous_backup_path(dest);
+    verify_exact_regular_preimage(&backup, expected_backup_sha256)?;
+    authorization.authorize_effect()?;
     if !dir_is_writable(dir) {
         return Err(format!(
             "the directory {} is not writable — tirith cannot replace its own binary there \
@@ -1570,76 +2705,117 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
         ));
     }
 
-    // 1. Save the current binary as the rollback backup.
-    let backup = previous_backup_path(dest);
-    std::fs::copy(dest, &backup).map_err(|e| {
-        format!(
-            "could not save the current binary to {}: {e}",
-            backup.display()
-        )
-    })?;
-    // Durability: fsync the backup's CONTENTS so a crash after the swap can't
-    // leave the live binary replaced while the `--rollback` target is
-    // truncated. The handle MUST be opened for WRITE — Windows `sync_all` calls
-    // `FlushFileBuffers`, which rejects a read-only handle; `write(true)` opens
-    // the existing copy without truncating. Its dir entry is covered by the
-    // parent fsync at step 4.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&backup)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| {
+    // Preserve an older rollback point until the entire replacement commits.
+    // A failed second update must not destroy the only known-good backup.
+    let prior_backup = if backup.exists() {
+        authorization.authorize_effect()?;
+        let preserved = tempfile::Builder::new()
+            .prefix(".tirith-prior-backup-")
+            .tempfile_in(dir)
+            .map_err(|e| format!("could not preserve the prior rollback backup: {e}"))?;
+        std::fs::copy(&backup, preserved.path())
+            .and_then(|_| preserved.as_file().sync_all())
+            .map_err(|e| format!("could not preserve the prior rollback backup: {e}"))?;
+        Some(preserved)
+    } else {
+        None
+    };
+
+    let replacement = (|| {
+        // 1. Save the current binary as the rollback backup.
+        verify_exact_regular_preimage(dest, Some(expected_dest_sha256))?;
+        verify_exact_regular_preimage(&backup, expected_backup_sha256)?;
+        authorization.authorize_effect()?;
+        std::fs::copy(dest, &backup).map_err(|e| {
             format!(
-                "could not sync the rollback backup {}: {e}",
+                "could not save the current binary to {}: {e}",
                 backup.display()
             )
         })?;
+        // Durability: fsync the backup's CONTENTS so a crash after the swap
+        // cannot leave the live binary replaced with a truncated rollback.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&backup)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| {
+                format!(
+                    "could not sync the rollback backup {}: {e}",
+                    backup.display()
+                )
+            })?;
 
-    // 2. Copy the new binary into a temp file in the destination directory.
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".tirith-new-")
-        .tempfile_in(dir)
-        .map_err(|e| format!("could not create a temp file in {}: {e}", dir.display()))?;
-    let new_bytes =
-        std::fs::read(new_binary).map_err(|e| format!("could not read the new binary: {e}"))?;
-    tmp.write_all(&new_bytes)
-        .map_err(|e| format!("could not write the new binary: {e}"))?;
-    tmp.flush()
-        .map_err(|e| format!("could not flush the new binary: {e}"))?;
+        // 2. Copy the new binary into a temp file in the destination directory.
+        authorization.authorize_effect()?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".tirith-new-")
+            .tempfile_in(dir)
+            .map_err(|e| format!("could not create a temp file in {}: {e}", dir.display()))?;
+        let new_bytes =
+            std::fs::read(new_binary).map_err(|e| format!("could not read the new binary: {e}"))?;
+        tmp.write_all(&new_bytes)
+            .map_err(|e| format!("could not write the new binary: {e}"))?;
+        tmp.flush()
+            .map_err(|e| format!("could not flush the new binary: {e}"))?;
 
-    // 3. Set the exec bit BEFORE the swap so `tirith` is never live-but-unrunnable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+        // 3. Set the exec bit BEFORE the swap so `tirith` is never
+        // live-but-unrunnable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("could not set executable permissions: {e}"))?;
+        }
         tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("could not set executable permissions: {e}"))?;
+            .sync_all()
+            .map_err(|e| format!("could not sync the new binary: {e}"))?;
+
+        // 4. Atomic rename over the live binary.
+        verify_exact_regular_preimage(dest, Some(expected_dest_sha256))?;
+        authorization.authorize_effect()?;
+        tmp.persist(dest).map_err(|e| {
+            format!(
+                "could not atomically replace {}: {} (the old binary is intact)",
+                dest.display(),
+                e.error
+            )
+        })?;
+        fsync_parent_dir(dest);
+
+        Ok(SwapResult {
+            previous_backup: backup.clone(),
+        })
+    })();
+
+    match replacement {
+        Ok(swapped) => Ok(swapped),
+        Err(error) => {
+            authorization.authorize_effect()?;
+            let restore_result = match prior_backup {
+                Some(preserved) => preserved
+                    .persist(&backup)
+                    .map(|_| fsync_parent_dir(&backup))
+                    .map_err(|e| e.error.to_string()),
+                None => match std::fs::remove_file(&backup) {
+                    Ok(()) => {
+                        fsync_parent_dir(&backup);
+                        Ok(())
+                    }
+                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(())
+                    }
+                    Err(remove_error) => Err(remove_error.to_string()),
+                },
+            };
+            match restore_result {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(format!(
+                    "{error}; additionally could not restore the prior rollback backup: {restore_error}"
+                )),
+            }
+        }
     }
-
-    // Durability: fsync the new binary's bytes AND mode before the rename. The
-    // sync MUST follow `set_permissions` — syncing first could leave the file
-    // durable without the exec bit (durable-but-unrunnable).
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| format!("could not sync the new binary: {e}"))?;
-
-    // 4. Atomic rename over the live binary.
-    tmp.persist(dest).map_err(|e| {
-        // Rename failed; the old binary is intact (rename doesn't touch dest
-        // until it succeeds) and the backup exists.
-        format!(
-            "could not atomically replace {}: {} (the old binary is intact)",
-            dest.display(),
-            e.error
-        )
-    })?;
-    // Rename durability: fsync the parent dir so the new name→inode entry
-    // survives a crash. Best-effort; no-op on non-Unix.
-    fsync_parent_dir(dest);
-
-    Ok(SwapResult {
-        previous_backup: backup,
-    })
 }
 
 /// Atomically install `source`'s bytes onto `dest`, used by `--rollback`.
@@ -1648,10 +2824,19 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
 /// the backup, which `atomic_self_replace` would clobber as its first step. This
 /// reads `source` fully into memory up front, so the restored bytes are correct
 /// even when `source == previous_backup_path(dest)`.
-fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
+fn atomic_restore_from(
+    dest: &Path,
+    source: &Path,
+    expected_dest_sha256: &str,
+    expected_source_sha256: &str,
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<(), String> {
     let dir = dest
         .parent()
         .ok_or_else(|| "cannot determine the binary's directory".to_string())?;
+    verify_exact_regular_preimage(dest, Some(expected_dest_sha256))?;
+    verify_exact_regular_preimage(source, Some(expected_source_sha256))?;
+    authorization.authorize_effect()?;
     if !dir_is_writable(dir) {
         return Err(format!(
             "the directory {} is not writable — tirith cannot restore its binary there",
@@ -1667,6 +2852,7 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
         )
     })?;
 
+    authorization.authorize_effect()?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".tirith-rollback-")
         .tempfile_in(dir)
@@ -1687,6 +2873,9 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
     tmp.as_file()
         .sync_all()
         .map_err(|e| format!("could not sync the rollback binary: {e}"))?;
+    verify_exact_regular_preimage(dest, Some(expected_dest_sha256))?;
+    verify_exact_regular_preimage(source, Some(expected_source_sha256))?;
+    authorization.authorize_effect()?;
     tmp.persist(dest).map_err(|e| {
         format!(
             "could not atomically restore {}: {} (the current binary is intact)",
@@ -1697,6 +2886,31 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
     // Rename durability (see `atomic_self_replace`): fsync the parent dir.
     fsync_parent_dir(dest);
     Ok(())
+}
+
+fn verify_exact_regular_preimage(path: &Path, expected_sha256: Option<&str>) -> Result<(), String> {
+    match (std::fs::symlink_metadata(path), expected_sha256) {
+        (Err(error), None) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        (Err(error), _) => Err(format!(
+            "could not revalidate the exact preimage at {}: {error}",
+            path.display()
+        )),
+        (Ok(_), None) => Err(format!(
+            "the previously absent self-update path {} appeared during the transaction",
+            path.display()
+        )),
+        (Ok(metadata), Some(_)) if !metadata.file_type().is_file() => Err(format!(
+            "self-update path {} is no longer a regular file",
+            path.display()
+        )),
+        (Ok(_), Some(expected)) => match hash_file_opt(path) {
+            Some(observed) if selfupdate::digest_eq(&observed, expected) => Ok(()),
+            _ => Err(format!(
+                "self-update path {} changed during the transaction",
+                path.display()
+            )),
+        },
+    }
 }
 
 /// fsync `path`'s parent directory after a rename so the new name→inode entry is
@@ -1728,7 +2942,14 @@ fn hash_file_opt(path: &Path) -> Option<String> {
 }
 
 /// Write `bytes` to `path` (plain, non-atomic — only for files in a private temp dir).
-fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_file(
+    path: &Path,
+    bytes: &[u8],
+    authorization: &impl SelfEffectAuthorization,
+) -> std::io::Result<()> {
+    authorization
+        .authorize_effect()
+        .map_err(std::io::Error::other)?;
     let mut f = std::fs::File::create(path)?;
     f.write_all(bytes)?;
     f.flush()
@@ -1768,6 +2989,136 @@ fn describe_status(status: &VerificationStatus) -> String {
 mod tests {
     use super::*;
 
+    /// The archiver used by self-update must never be selectable by a same-UID
+    /// writer, so the search list stays fixed to global root-managed directories
+    /// and deliberately excludes per-user profiles. This mirrors the equivalent
+    /// guard on the trusted-zsh search path.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_tar_search_is_fixed_to_global_root_managed_directories() {
+        assert_eq!(
+            TRUSTED_TAR_SEARCH_DIRS,
+            [
+                "/bin",
+                "/usr/bin",
+                "/run/current-system/sw/bin",
+                "/nix/var/nix/profiles/default/bin",
+            ]
+        );
+        assert!(TRUSTED_TAR_SEARCH_DIRS.iter().all(|path| {
+            path.starts_with('/')
+                && !path.contains("per-user")
+                && !path.contains(".nix-profile")
+                && !path.contains("$HOME")
+        }));
+    }
+
+    struct TestEffectAuthorization;
+
+    impl SelfEffectAuthorization for TestEffectAuthorization {
+        fn authorize_effect(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn atomic_self_replace_for_test(dest: &Path, new_binary: &Path) -> Result<SwapResult, String> {
+        let live_sha = hash_file_opt(dest).expect("test live binary");
+        let backup_sha = hash_file_opt(&previous_backup_path(dest));
+        atomic_self_replace(
+            dest,
+            new_binary,
+            &live_sha,
+            backup_sha.as_deref(),
+            &TestEffectAuthorization,
+        )
+    }
+
+    fn atomic_restore_from_for_test(dest: &Path, source: &Path) -> Result<(), String> {
+        let live_sha = hash_file_opt(dest).expect("test live binary");
+        let source_sha = hash_file_opt(source).expect("test rollback binary");
+        atomic_restore_from(
+            dest,
+            source,
+            &live_sha,
+            &source_sha,
+            &TestEffectAuthorization,
+        )
+    }
+
+    fn extract_tirith_binary_for_test(
+        archive: &Path,
+        target: &str,
+        workdir: &Path,
+    ) -> Result<PathBuf, String> {
+        extract_tirith_binary(archive, target, workdir, &TestEffectAuthorization)
+    }
+
+    #[cfg(unix)]
+    fn write_test_targz(path: &Path, members: &[(&str, &[u8])]) {
+        fn write_octal(field: &mut [u8], value: usize) {
+            field.fill(b'0');
+            let encoded = format!("{value:o}");
+            assert!(encoded.len() < field.len(), "tar field overflow");
+            let start = field.len() - encoded.len() - 1;
+            field[start..start + encoded.len()].copy_from_slice(encoded.as_bytes());
+            field[field.len() - 1] = 0;
+        }
+
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = u32::MAX;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            !crc
+        }
+
+        let mut tar = Vec::new();
+        for &(name, contents) in members {
+            let name = name.as_bytes();
+            assert!(name.len() <= 100, "test tar member name is too long");
+            let mut header = [0u8; 512];
+            header[..name.len()].copy_from_slice(name);
+            write_octal(&mut header[100..108], 0o755);
+            write_octal(&mut header[108..116], 0);
+            write_octal(&mut header[116..124], 0);
+            write_octal(&mut header[124..136], contents.len());
+            write_octal(&mut header[136..148], 0);
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: usize = header.iter().map(|byte| usize::from(*byte)).sum();
+            let encoded = format!("{checksum:06o}\0 ");
+            header[148..156].copy_from_slice(encoded.as_bytes());
+            tar.extend_from_slice(&header);
+            tar.extend_from_slice(contents);
+            tar.resize(tar.len().next_multiple_of(512), 0);
+        }
+        tar.resize(tar.len() + 1024, 0);
+
+        // A gzip stream containing DEFLATE stored blocks. Keeping this tiny
+        // fixture encoder in-process avoids depending on GNU or BSD tar syntax
+        // merely to build bytes that production then extracts with the host tar.
+        let mut gzip = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+        let mut remaining = tar.as_slice();
+        while !remaining.is_empty() {
+            let take = remaining.len().min(u16::MAX as usize);
+            let final_block = take == remaining.len();
+            gzip.push(u8::from(final_block));
+            let length = take as u16;
+            gzip.extend_from_slice(&length.to_le_bytes());
+            gzip.extend_from_slice(&(!length).to_le_bytes());
+            gzip.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+        }
+        gzip.extend_from_slice(&crc32(&tar).to_le_bytes());
+        gzip.extend_from_slice(&(tar.len() as u32).to_le_bytes());
+        std::fs::write(path, gzip).expect("write hermetic tar.gz fixture");
+    }
+
     #[test]
     fn selfupdate_rejects_unsafe_initial_destinations() {
         for url in [
@@ -1792,6 +3143,82 @@ mod tests {
     }
 
     #[test]
+    fn selfupdate_policy_deny_precedes_any_temp_or_destination_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("tirith");
+        let envelope = self_boundary_envelope(
+            "self-update",
+            serde_json::json!({"mode": "update", "test": "deny-before-effect"}),
+            Some(&destination),
+        )
+        .unwrap();
+        let gate = tirith_core::web3_policy::TaskGatePolicy {
+            mode: tirith_core::web3_policy::TaskGateMode::Enforce,
+            effects_denied_for_untrusted_sources: [
+                tirith_core::effects::CommandEffectKind::FilesystemWrite,
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let result = prepare_self_authorization_with_policy::<
+            tirith_core::task_boundary::SelfUpdateBoundary,
+        >(
+            envelope,
+            [tirith_core::effects::CommandEffectKind::FilesystemWrite]
+                .into_iter()
+                .collect(),
+            &gate,
+        );
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retained_selfupdate_authorization_rejects_operation_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("tirith");
+        let envelope = self_boundary_envelope(
+            "self-update",
+            serde_json::json!({"mode": "update", "target": "first"}),
+            Some(&destination),
+        )
+        .unwrap();
+        let mut authorization = prepare_self_authorization_with_policy::<
+            tirith_core::task_boundary::SelfUpdateBoundary,
+        >(
+            envelope,
+            [tirith_core::effects::CommandEffectKind::FilesystemWrite]
+                .into_iter()
+                .collect(),
+            &tirith_core::web3_policy::TaskGatePolicy::default(),
+        )
+        .unwrap();
+        authorization.envelope.sources[0]
+            .content
+            .push_str("-swapped");
+        assert!(authorization.authorize_effect().is_err());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn selfupdate_refuses_stale_binary_preimage_without_writing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("tirith");
+        let new = dir.path().join("new-tirith");
+        std::fs::write(&live, b"ORIGINAL").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+        let expected = hash_file_opt(&live).unwrap();
+        std::fs::write(&live, b"RACED").unwrap();
+
+        let result = atomic_self_replace(&live, &new, &expected, None, &TestEffectAuthorization);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&live).unwrap(), b"RACED");
+        assert!(!previous_backup_path(&live).exists());
+    }
+
+    #[test]
     fn atomic_self_replace_swaps_and_keeps_backup() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("tirith");
@@ -1799,7 +3226,7 @@ mod tests {
         std::fs::write(&live, b"OLD-BINARY").unwrap();
         std::fs::write(&new, b"NEW-BINARY").unwrap();
 
-        let swap = atomic_self_replace(&live, &new).expect("swap should succeed");
+        let swap = atomic_self_replace_for_test(&live, &new).expect("swap should succeed");
 
         // Live binary is now the new bytes.
         assert_eq!(std::fs::read(&live).unwrap(), b"NEW-BINARY");
@@ -1810,14 +3237,29 @@ mod tests {
     }
 
     #[test]
-    fn source_built_carveout_is_cargo_aur_dnf_only() {
-        // Compiled-from-source / distro-rebuilt installs get an honest Unverified.
+    fn failed_second_self_replace_preserves_the_existing_rollback_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("tirith");
+        let missing_new = dir.path().join("missing-new-tirith");
+        let backup = previous_backup_path(&live);
+        std::fs::write(&live, b"CURRENT-BINARY").unwrap();
+        std::fs::write(&backup, b"KNOWN-GOOD-BINARY").unwrap();
+
+        atomic_self_replace_for_test(&live, &missing_new).expect_err("missing update must fail");
+
+        assert_eq!(std::fs::read(&live).unwrap(), b"CURRENT-BINARY");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"KNOWN-GOOD-BINARY");
+    }
+
+    #[test]
+    fn source_built_carveout_is_cargo_and_aur_only() {
+        // Compiled-from-source installs get an honest Unverified.
         assert!(source_built_unverified_reason(&InstallMethod::Cargo).is_some());
         assert!(source_built_unverified_reason(&InstallMethod::Aur).is_some());
-        assert!(source_built_unverified_reason(&InstallMethod::Dnf).is_some());
         // These ship the canonical binary and MUST verify normally (no carve-out).
         for m in [
             InstallMethod::Apt,
+            InstallMethod::Dnf,
             InstallMethod::SelfManaged,
             InstallMethod::Homebrew,
             InstallMethod::Npm,
@@ -1828,6 +3270,28 @@ mod tests {
                 source_built_unverified_reason(&m).is_none(),
                 "{m:?} must not be carved out"
             );
+        }
+    }
+
+    #[test]
+    fn native_helper_is_required_only_for_install_methods_that_ship_it() {
+        assert!(install_method_requires_package_approval_helper(
+            &InstallMethod::SelfManaged
+        ));
+        assert!(install_method_requires_package_approval_helper(
+            &InstallMethod::Apt
+        ));
+        assert!(install_method_requires_package_approval_helper(
+            &InstallMethod::Dnf
+        ));
+        for method in [
+            InstallMethod::Npm,
+            InstallMethod::Homebrew,
+            InstallMethod::Cargo,
+            InstallMethod::Aur,
+            InstallMethod::Unknown,
+        ] {
+            assert!(!install_method_requires_package_approval_helper(&method));
         }
     }
 
@@ -1893,11 +3357,11 @@ mod tests {
         std::fs::write(&live, b"V1").unwrap();
         std::fs::write(&new, b"V2").unwrap();
 
-        let swap = atomic_self_replace(&live, &new).unwrap();
+        let swap = atomic_self_replace_for_test(&live, &new).unwrap();
         assert_eq!(std::fs::read(&live).unwrap(), b"V2");
 
         // Roll back: restore the backup over the live binary.
-        atomic_restore_from(&live, &swap.previous_backup).unwrap();
+        atomic_restore_from_for_test(&live, &swap.previous_backup).unwrap();
         assert_eq!(std::fs::read(&live).unwrap(), b"V1");
     }
 
@@ -1911,7 +3375,7 @@ mod tests {
         let backup = previous_backup_path(&live);
         std::fs::write(&backup, b"PREVIOUS-BYTES").unwrap();
 
-        atomic_restore_from(&live, &backup).unwrap();
+        atomic_restore_from_for_test(&live, &backup).unwrap();
 
         assert_eq!(std::fs::read(&live).unwrap(), b"PREVIOUS-BYTES");
     }
@@ -1927,7 +3391,7 @@ mod tests {
         std::fs::write(&src, b"restored").unwrap();
         std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        atomic_restore_from(&live, &src).unwrap();
+        atomic_restore_from_for_test(&live, &src).unwrap();
 
         let mode = std::fs::metadata(&live).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "restored binary must be executable");
@@ -1945,7 +3409,7 @@ mod tests {
         // Deliberately NOT executable before the swap.
         std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        atomic_self_replace(&live, &new).unwrap();
+        atomic_self_replace_for_test(&live, &new).unwrap();
 
         let mode = std::fs::metadata(&live).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "swapped-in binary must be executable");
@@ -2013,6 +3477,7 @@ mod tests {
         std::fs::write(&checksums, &txt).unwrap();
 
         let release = ReleaseSet {
+            tag: "v0.3.3".to_string(),
             archive_path: archive,
             checksums_txt: txt,
             sig_path: None,
@@ -2037,6 +3502,7 @@ mod tests {
         std::fs::write(&checksums, &txt).unwrap();
 
         let release = ReleaseSet {
+            tag: "v0.3.3".to_string(),
             archive_path: archive,
             checksums_txt: txt,
             sig_path: None, // release shipped no cosign signature
@@ -2049,6 +3515,7 @@ mod tests {
             ArchiveVerdict::Ok {
                 signed,
                 cosign_note,
+                ..
             } => {
                 assert_eq!(signed, ChecksumStrength::ChecksumOnly);
                 // No `.sig`/`.pem` published — the note must say so, not advise
@@ -2074,6 +3541,7 @@ mod tests {
         std::fs::write(&checksums, txt).unwrap();
 
         let release = ReleaseSet {
+            tag: "v0.3.3".to_string(),
             archive_path: archive,
             checksums_txt: txt.to_string(),
             sig_path: None,
@@ -2204,26 +3672,17 @@ mod tests {
     #[test]
     fn extract_tirith_binary_finds_member_in_targz() {
         let dir = tempfile::tempdir().unwrap();
-        // tar.gz with a `tirith` file plus a decoy.
-        let stage = dir.path().join("stage");
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("tirith"), b"BINARY-CONTENT").unwrap();
-        std::fs::write(stage.join("README"), b"decoy").unwrap();
+        // tar.gz with a `tirith` file plus a decoy, built without relying on
+        // host-specific tar fixture-creation flags.
         let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
-        let ok = std::process::Command::new("tar")
-            .arg("czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&stage)
-            .arg("tirith")
-            .arg("README")
-            .status()
-            .expect("tar should run")
-            .success();
-        assert!(ok, "tar czf should succeed");
+        write_test_targz(
+            &archive,
+            &[("tirith", b"BINARY-CONTENT"), ("README", b"decoy")],
+        );
 
         let extracted =
-            extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", dir.path()).unwrap();
+            extract_tirith_binary_for_test(&archive, "x86_64-unknown-linux-gnu", dir.path())
+                .unwrap();
         assert_eq!(std::fs::read(&extracted).unwrap(), b"BINARY-CONTENT");
     }
 
@@ -2245,7 +3704,7 @@ mod tests {
             .status()
             .unwrap();
 
-        let r = extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", dir.path());
+        let r = extract_tirith_binary_for_test(&archive, "x86_64-unknown-linux-gnu", dir.path());
         assert!(r.is_err());
     }
 
@@ -2281,7 +3740,7 @@ mod tests {
 
         let workdir = dir.path().join("work");
         std::fs::create_dir_all(&workdir).unwrap();
-        let r = extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir);
+        let r = extract_tirith_binary_for_test(&archive, "x86_64-unknown-linux-gnu", &workdir);
         assert!(
             r.is_err(),
             "an escaping-symlink `tirith` member must be rejected, got: {r:?}"
@@ -2305,35 +3764,20 @@ mod tests {
     #[test]
     fn extract_tirith_binary_dotdot_member_writes_nothing_outside() {
         let dir = tempfile::tempdir().unwrap();
-        let stage = dir.path().join("stage");
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("tirith"), b"PAYLOAD").unwrap();
         // Archive the member under a `../escaped-tirith` name.
         let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
-        let ok = std::process::Command::new("tar")
-            .arg("czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&stage)
-            .arg("--transform")
-            .arg("s,^tirith,../escaped-tirith,")
-            .arg("tirith")
-            .status();
-        // GNU tar has --transform; bsdtar may not, so tolerate failure.
-        let renamed = ok.map(|s| s.success()).unwrap_or(false);
+        write_test_targz(&archive, &[("../escaped-tirith", b"PAYLOAD")]);
 
         let workdir = dir.path().join("work");
         std::fs::create_dir_all(&workdir).unwrap();
         let leak = workdir.join("escaped-tirith");
-        let _ = extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir);
+        let _ = extract_tirith_binary_for_test(&archive, "x86_64-unknown-linux-gnu", &workdir);
 
-        if renamed {
-            // The `../`-prefixed member must not have escaped into `work/`.
-            assert!(
-                !leak.exists(),
-                "a `../`-prefixed archive member must not be written outside the extract dir"
-            );
-        }
+        // The `../`-prefixed member must not have escaped into `work/`.
+        assert!(
+            !leak.exists(),
+            "a `../`-prefixed archive member must not be written outside the extract dir"
+        );
     }
 
     /// F21 / F1: the containment check rejects ESCAPES, not in-bounds files — a
@@ -2362,24 +3806,23 @@ mod tests {
         std::fs::write(pre.join("tirith"), b"PRE-EXISTING").unwrap();
 
         let extracted =
-            extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir).unwrap();
+            extract_tirith_binary_for_test(&archive, "x86_64-unknown-linux-gnu", &workdir).unwrap();
         assert!(extracted.starts_with(pre.canonicalize().unwrap()));
     }
 
-    /// F19: a `cosign` on `PATH` that EXITS NON-ZERO must yield
-    /// `ArchiveVerdict::Failed` — never folded into a checksum-only pass.
-    /// Mutates `PATH`, so it holds the crate-wide `ENV_LOCK` and restores via
-    /// `EnvGuard`.
+    /// F19: an exact `cosign` executable that EXITS NON-ZERO must yield
+    /// `ArchiveVerdict::Failed` — never folded into a checksum-only pass. The
+    /// test injects the executable through the internal seam rather than PATH;
+    /// Linux production continues to accept only its trusted fixed paths.
     #[cfg(unix)]
     #[test]
     fn cosign_failure_makes_archive_verdict_failed() {
-        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
 
-        // A fake `cosign` that always exits 1. MUST be executable or PATH
-        // resolution would skip it.
+        // A fake `cosign` that always exits 1. It is passed as the exact program
+        // under test; production resolution is not involved.
         let fake_bin_dir = dir.path().join("fakebin");
         std::fs::create_dir_all(&fake_bin_dir).unwrap();
         let fake_cosign = fake_bin_dir.join("cosign");
@@ -2405,6 +3848,7 @@ mod tests {
         std::fs::write(&cert, b"dummy-certificate").unwrap();
 
         let release = ReleaseSet {
+            tag: "v0.3.3".to_string(),
             archive_path: archive,
             checksums_txt: txt,
             sig_path: Some(sig),
@@ -2412,20 +3856,11 @@ mod tests {
             checksums_path: checksums,
         };
 
-        let verdict = {
-            // Serialize against every other env-mutating test in the crate.
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // Prepend (not replace) the fake-cosign dir so `sh` stays
-            // resolvable; `EnvGuard` restores PATH on Drop.
-            let mut entries = vec![fake_bin_dir.clone()];
-            if let Some(p) = std::env::var_os("PATH") {
-                entries.extend(std::env::split_paths(&p));
-            }
-            let joined = std::env::join_paths(entries).expect("join PATH");
-            let _path_guard = EnvGuard::set("PATH", std::path::Path::new(&joined));
-
-            verify_archive_against_checksums(&release, "tirith-x86_64-unknown-linux-gnu.tar.gz")
-        };
+        let verdict = verify_archive_against_checksums_with_program(
+            &release,
+            "tirith-x86_64-unknown-linux-gnu.tar.gz",
+            Some(&fake_cosign),
+        );
 
         match verdict {
             ArchiveVerdict::Failed(reason) => {
@@ -2443,6 +3878,54 @@ mod tests {
                 }
             ),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cosign_identity_is_bound_to_the_exact_release_workflow_and_tag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_cosign = dir.path().join("cosign");
+        std::fs::write(
+            &fake_cosign,
+            "#!/bin/sh\nexpected='https://github.com/sheeki03/tirith/.github/workflows/release.yml@refs/tags/v9.8.7'\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--certificate-identity' ]; then\n    shift\n    [ \"${1-}\" = \"$expected\" ] || exit 41\n    found=1\n  fi\n  shift\ndone\n[ \"${found-}\" = 1 ]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_cosign, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
+        let body = b"TAG-BOUND RELEASE";
+        std::fs::write(&archive, body).unwrap();
+        let digest = hex_sha256(body);
+        let checksums_txt = format!("{digest}  tirith-x86_64-unknown-linux-gnu.tar.gz\n");
+        let checksums_path = dir.path().join("checksums.txt");
+        std::fs::write(&checksums_path, &checksums_txt).unwrap();
+        let sig_path = dir.path().join("checksums.txt.sig");
+        let cert_path = dir.path().join("checksums.txt.pem");
+        std::fs::write(&sig_path, b"signature").unwrap();
+        std::fs::write(&cert_path, b"certificate").unwrap();
+        let release = ReleaseSet {
+            tag: "v9.8.7".to_string(),
+            archive_path: archive,
+            checksums_txt,
+            sig_path: Some(sig_path),
+            cert_path: Some(cert_path),
+            checksums_path,
+        };
+
+        let verdict = verify_archive_against_checksums_with_program(
+            &release,
+            "tirith-x86_64-unknown-linux-gnu.tar.gz",
+            Some(&fake_cosign),
+        );
+        assert!(matches!(
+            verdict,
+            ArchiveVerdict::Ok {
+                signed: ChecksumStrength::Signed,
+                ..
+            }
+        ));
     }
 
     #[test]

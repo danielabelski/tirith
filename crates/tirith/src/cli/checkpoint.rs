@@ -39,13 +39,8 @@ pub fn list_checkpoints(json: bool) -> i32 {
                     let trigger =
                         checkpoint_trigger_for_human(e.trigger_command.as_deref().unwrap_or("-"));
                     println!(
-                        "{:<38} {:<26} {:<8} {:<12} {}{}",
-                        e.id,
-                        e.created_at,
-                        e.file_count,
-                        size,
-                        trigger,
-                        if e.incomplete { " [INCOMPLETE]" } else { "" }
+                        "{:<38} {:<26} {:<8} {:<12} {}",
+                        e.id, e.created_at, e.file_count, size, trigger
                     );
                 }
                 println!("\n{} checkpoint(s)", entries.len());
@@ -78,8 +73,6 @@ pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
                     "missing": report.missing,
                     "corrupt": report.corrupt,
                     "errors": report.errors,
-                    "checkpoint_incomplete": report.checkpoint_incomplete,
-                    "checkpoint_incomplete_reason": report.checkpoint_incomplete_reason,
                     "count": restored_n,
                 });
                 println!(
@@ -90,18 +83,6 @@ pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
                     })
                 );
             } else {
-                if report.checkpoint_incomplete {
-                    eprintln!(
-                        "tirith checkpoint restore: WARNING: the source checkpoint was incomplete: {}",
-                        super::sanitize_for_human_output(
-                            report
-                                .checkpoint_incomplete_reason
-                                .as_deref()
-                                .unwrap_or("one or more requested entries were omitted"),
-                            false,
-                        )
-                    );
-                }
                 println!("Restored {restored_n} file(s):");
                 // repo-0366: every persisted path is project-controlled; all
                 // restore/diff output goes through terminal sanitization.
@@ -140,10 +121,7 @@ pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
             // full per-bucket report is still printed above; we only flip the exit
             // status. 1 == restore completed with failures (distinct from 2, an
             // operational error that aborted the restore entirely).
-            if report.checkpoint_incomplete
-                || !report.missing.is_empty()
-                || !report.corrupt.is_empty()
-                || !report.errors.is_empty()
+            if !report.missing.is_empty() || !report.corrupt.is_empty() || !report.errors.is_empty()
             {
                 1
             } else {
@@ -253,23 +231,8 @@ pub fn create_checkpoint(paths: &[String], trigger: Option<&str>, json: bool) ->
                     meta.file_count,
                     format_bytes(meta.total_bytes)
                 );
-                if meta.incomplete {
-                    eprintln!(
-                        "tirith checkpoint create: WARNING: checkpoint is incomplete: {}",
-                        super::sanitize_for_human_output(
-                            meta.incomplete_reason
-                                .as_deref()
-                                .unwrap_or("one or more requested entries were omitted"),
-                            false,
-                        )
-                    );
-                }
             }
-            if meta.incomplete {
-                1
-            } else {
-                0
-            }
+            0
         }
         Err(e) => {
             eprintln!("tirith checkpoint create: {e}");
@@ -328,7 +291,7 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
     snapshot_paths.extend(paths.iter().cloned());
 
     // --- BEFORE: file inventory + runtime state ---
-    let (files_before, truncated_before) = inventory_files(&snapshot_paths);
+    let (files_before, _trunc_before) = inventory_files(&snapshot_paths);
     let rt_before = checkpoint::capture_runtime_state(&home);
     let net_before = if with_net_hints {
         Some(net_hint_sources(&home))
@@ -338,7 +301,6 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
 
     // F1: keep tirith alive across Ctrl-C so the AFTER snapshot + diff always run
     // (child is in its own process group, see `run_command`).
-    WATCH_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
     install_watch_sigint_handler();
 
     // --- RUN the command with the user's full privileges (no isolation) ---
@@ -354,8 +316,7 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
 
     // --- AFTER: re-inventory + re-capture (ALWAYS, even after an interrupt) ---
     let (files_after, truncated_after) = inventory_files(&snapshot_paths);
-    let inventory_truncated = truncated_before || truncated_after;
-    if inventory_truncated {
+    if truncated_after {
         eprintln!(
             "tirith watch: WARNING: file inventory hit the 100,000-entry cap — the before/after diff is partial"
         );
@@ -404,7 +365,6 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
             &findings,
             action,
             interrupted,
-            inventory_truncated,
         );
     } else {
         print_watch_human(
@@ -417,7 +377,6 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
             with_net_hints,
             &findings,
             interrupted,
-            inventory_truncated,
         );
     }
 
@@ -483,28 +442,6 @@ fn run_command(command: &[String]) -> std::io::Result<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        use std::os::unix::process::ExitStatusExt as _;
-
-        struct ForegroundGuard {
-            fd: libc::c_int,
-            parent_pgid: libc::pid_t,
-            previous_sigttou: libc::sighandler_t,
-            active: bool,
-        }
-
-        impl Drop for ForegroundGuard {
-            fn drop(&mut self) {
-                if self.active {
-                    // SAFETY: the fd and process group were captured from this
-                    // process immediately before handoff. Restoration is
-                    // best-effort because Drop cannot report an error.
-                    unsafe {
-                        libc::tcsetpgrp(self.fd, self.parent_pgid);
-                        libc::signal(libc::SIGTTOU, self.previous_sigttou);
-                    }
-                }
-            }
-        }
         // SAFETY: `setpgid` is async-signal-safe and the only call in the
         // forked child before exec; it puts the child in its own process group.
         unsafe {
@@ -520,40 +457,21 @@ fn run_command(command: &[String]) -> std::io::Result<i32> {
         let stdin_fd = libc::STDIN_FILENO;
         let our_pgid = unsafe { libc::getpgrp() };
         let is_tty = unsafe { libc::isatty(stdin_fd) } == 1;
-        let mut foreground = None;
         if is_tty {
             // Move the terminal's foreground group to the child. SIGTTOU can
             // fire when a background group writes to the tty; ignore it for
             // the handoff window.
-            let previous_sigttou = unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
-            if previous_sigttou == libc::SIG_ERR {
-                let signal_error = std::io::Error::last_os_error();
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(signal_error);
+            unsafe {
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                libc::tcsetpgrp(stdin_fd, child_pgid);
             }
-            if unsafe { libc::tcsetpgrp(stdin_fd, child_pgid) } != 0 {
-                let handoff_error = std::io::Error::last_os_error();
-                // Restore the caller's signal disposition before returning.
-                unsafe {
-                    libc::signal(libc::SIGTTOU, previous_sigttou);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(handoff_error);
-            }
-            foreground = Some(ForegroundGuard {
-                fd: stdin_fd,
-                parent_pgid: our_pgid,
-                previous_sigttou,
-                active: true,
-            });
         }
-        let status = child.wait();
-        drop(foreground); // restore the terminal even when wait returned Err
-        let status = status?;
-        if status.signal() == Some(libc::SIGINT) {
-            WATCH_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let status = child.wait()?;
+        if is_tty {
+            unsafe {
+                libc::tcsetpgrp(stdin_fd, our_pgid);
+                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            }
         }
         Ok(status.code().unwrap_or(128))
     }
@@ -595,22 +513,17 @@ fn inventory_files(roots: &[String]) -> (std::collections::BTreeMap<String, Syst
     let mut out = std::collections::BTreeMap::new();
     // repo-0477: deterministic order + a truncation flag, so before/after
     // snapshots cover the SAME subset and a capped inventory is reported.
-    let mut truncated = false;
     for root in roots {
-        if out.len() >= MAX_FILES {
-            truncated = true;
-            break;
-        }
         let path = Path::new(root);
         if path.is_file() {
             if let Some(mtime) = file_mtime(path) {
                 out.insert(path.to_string_lossy().into_owned(), mtime);
             }
-        } else if path.is_dir() && inventory_dir(path, &mut out, MAX_FILES) {
-            truncated = true;
-            break;
+        } else if path.is_dir() {
+            inventory_dir(path, &mut out, MAX_FILES);
         }
     }
+    let truncated = out.len() >= MAX_FILES;
     (out, truncated)
 }
 
@@ -618,13 +531,13 @@ fn inventory_dir(
     dir: &Path,
     out: &mut std::collections::BTreeMap<String, SystemTime>,
     max_files: usize,
-) -> bool {
+) {
     if out.len() >= max_files {
-        return true;
+        return;
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return false,
+        Err(_) => return,
     };
     // repo-0477: sort so a capped inventory covers the SAME subset on every
     // run (filesystem order is arbitrary).
@@ -632,7 +545,7 @@ fn inventory_dir(
     paths.sort();
     for p in paths {
         if out.len() >= max_files {
-            return true;
+            break;
         }
         let meta = match p.symlink_metadata() {
             Ok(m) => m,
@@ -656,12 +569,11 @@ fn inventory_dir(
                 .and_then(|n| n.to_str())
                 .map(|n| n.starts_with('.'))
                 .unwrap_or(false);
-            if !is_dot && inventory_dir(&p, out, max_files) {
-                return true;
+            if !is_dot {
+                inventory_dir(&p, out, max_files);
             }
         }
     }
-    false
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -715,7 +627,6 @@ fn print_watch_human(
     with_net_hints: bool,
     findings: &[Finding],
     interrupted: bool,
-    inventory_truncated: bool,
 ) {
     let s = tirith_core::style::Stream::Stdout;
     let command = super::sanitize_for_human_output(command, false);
@@ -728,15 +639,6 @@ fn print_watch_human(
             s,
         );
         println!("  {note}");
-    }
-    if inventory_truncated {
-        println!(
-            "  {}",
-            tirith_core::style::yellow(
-                "inventory incomplete: the 100,000-entry cap was reached before or after the command",
-                s,
-            )
-        );
     }
 
     print_list_section("new files", new_files, false);
@@ -808,7 +710,6 @@ fn emit_watch_json(
     findings: &[Finding],
     action: Action,
     interrupted: bool,
-    inventory_truncated: bool,
 ) {
     // `net_hints` is null unless the experimental flag is set, so a consumer
     // never reads an empty array as "no network activity".
@@ -832,7 +733,6 @@ fn emit_watch_json(
         // True if tirith caught a SIGINT: the after-snapshot ran but the command
         // may not have finished — treat the diff as a lower bound.
         "interrupted": interrupted,
-        "inventory_truncated": inventory_truncated,
         "new_files": new_files,
         "modified_files": modified_files,
         "shell_rc_modified": dedup_rc,
@@ -853,7 +753,7 @@ fn emit_watch_json(
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::test_harness::ENV_LOCK;
+    use crate::cli::test_harness::{CwdGuard, EnvGuard, ENV_LOCK};
     use tirith_core::checkpoint::{self, ManifestEntry};
 
     #[cfg(unix)]
@@ -871,17 +771,8 @@ mod tests {
     #[test]
     fn run_command_single_argument_is_an_explicit_shell_expression() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let previous_shell = std::env::var_os("SHELL");
-        // SAFETY: this module serializes its environment-mutating tests.
-        unsafe { std::env::set_var("SHELL", "/bin/sh") };
+        let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/sh"));
         let result = super::run_command(&["exit 7".to_string()]);
-        // SAFETY: restore the process environment before asserting.
-        unsafe {
-            match previous_shell {
-                Some(value) => std::env::set_var("SHELL", value),
-                None => std::env::remove_var("SHELL"),
-            }
-        }
         assert_eq!(result.unwrap(), 7);
     }
 
@@ -894,19 +785,6 @@ mod tests {
             "exit 7".to_string(),
         ];
         assert_eq!(super::run_command(&command).unwrap(), 7);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn run_command_marks_a_sigint_terminated_child_as_interrupted() {
-        super::WATCH_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
-        let command = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "kill -INT $$".to_string(),
-        ];
-        assert_eq!(super::run_command(&command).unwrap(), 128);
-        assert!(super::WATCH_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[cfg(windows)]
@@ -957,19 +835,14 @@ mod tests {
         std::fs::create_dir_all(&workdir).unwrap();
         let state_dir = tmpdir.path().join("state");
 
-        let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        let prev_log = std::env::var("TIRITH_LOG").ok();
-        let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized via ENV_LOCK. state_dir() honors XDG_STATE_HOME on all
-        // unix (it is resolved manually, not via etcetera), so this is portable.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // These guards retain the exact OsString values installed before the
+        // test, including non-UTF-8 values, and restore during unwinding.
+        let _state = EnvGuard::set("XDG_STATE_HOME", &state_dir);
+        let _log = EnvGuard::set("TIRITH_LOG", std::path::Path::new("0"));
+        let _cwd = CwdGuard::set(&workdir);
 
         let name = "a.txt";
         let run = || -> Result<(i32, i32), String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
             std::fs::write(name, "alpha").map_err(|e| format!("write: {e}"))?;
             let meta = checkpoint::create(&[name], Some("rm -rf project"))?;
 
@@ -998,21 +871,6 @@ mod tests {
         };
 
         let result = run();
-
-        // Restore cwd + env before assertions so cleanup runs even on failure.
-        if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
-        }
-        unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-            match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
-            }
-        }
 
         let (clean_code, partial_code) = result.expect("restore flow should run");
         assert_eq!(clean_code, 0, "a fully clean restore must exit 0");

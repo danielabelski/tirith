@@ -1426,7 +1426,8 @@ mod tests {
         assert_eq!(
             drift_finding.severity,
             Severity::High,
-            "drift adding a tool outside the allowed set must be High: {drift_finding:?}",
+            "drift adding a tool outside the allowed set must be High: {:?}",
+            drift_finding,
         );
     }
 
@@ -1465,7 +1466,8 @@ mod tests {
         assert_eq!(
             drift_finding.severity,
             Severity::Medium,
-            "drift adding only allowed tools must stay Medium: {drift_finding:?}",
+            "drift adding only allowed tools must stay Medium: {:?}",
+            drift_finding,
         );
     }
 
@@ -1539,7 +1541,8 @@ mod tests {
             drift_finding.severity,
             Severity::High,
             "an Added server exposing a tool outside the allowed set must be \
-             High (symmetric with the Changed-path ladder): {drift_finding:?}",
+             High (symmetric with the Changed-path ladder): {:?}",
+            drift_finding,
         );
     }
 
@@ -1574,7 +1577,8 @@ mod tests {
         assert_eq!(
             drift_finding.severity,
             Severity::High,
-            "an Added server has no approved live descriptor baseline yet: {drift_finding:?}",
+            "an Added server has no approved live descriptor baseline yet: {:?}",
+            drift_finding,
         );
     }
 
@@ -1611,7 +1615,8 @@ mod tests {
             drift_finding.severity,
             Severity::Medium,
             "an Added server unlisted in mcp_allowed_tools is unconstrained \
-             and must stay Medium: {drift_finding:?}",
+             and must stay Medium: {:?}",
+            drift_finding,
         );
     }
 
@@ -1646,7 +1651,8 @@ mod tests {
             drift_finding.severity,
             Severity::High,
             "an Added server under an empty `[]` allow-list exposing any tool \
-             must be High: {drift_finding:?}",
+             must be High: {:?}",
+            drift_finding,
         );
     }
 
@@ -1679,7 +1685,8 @@ mod tests {
         assert_eq!(
             drift_finding.severity,
             Severity::High,
-            "an Added server still needs an approved live empty set: {drift_finding:?}",
+            "an Added server still needs an approved live empty set: {:?}",
+            drift_finding,
         );
     }
 

@@ -262,7 +262,10 @@ fn decode_signed_token(
 
     // exp is required on signed tokens and must be an i64 Unix timestamp.
     // Wrong type → None (fail-closed), and comparison is exclusive.
-    let exp = payload.get("exp")?.as_i64()?;
+    let exp = {
+        let v = payload.get("exp")?;
+        v.as_i64()?
+    };
     if now.timestamp() >= exp {
         return None;
     }
@@ -556,6 +559,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
+    use tirith_test_support::GlobalStateGuard;
 
     fn test_keypair() -> (SigningKey, [u8; 32]) {
         let sk = SigningKey::generate(&mut OsRng);
@@ -1172,12 +1176,9 @@ mod tests {
         let token = format!("{payload_b64}.{fake_sig_b64}");
         assert!(token.contains('='));
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LICENSE", &token) };
+        let mut environment = GlobalStateGuard::new().expect("isolate license environment");
+        environment.set_env("TIRITH_LICENSE", &token);
         let status = key_format_status();
-        unsafe { std::env::remove_var("TIRITH_LICENSE") };
         assert_eq!(
             status,
             KeyFormatStatus::SignedStructural,

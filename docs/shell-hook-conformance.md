@@ -123,7 +123,7 @@ cleanly** — never fails — when a prerequisite is missing:
 | Shell / mode | Invariants covered | Status |
 |--------------|--------------------|--------|
 | bash — preexec (DEBUG-trap, warn-only) | a, b, c, e, g | Passing |
-| bash — preexec with `TIRITH_BASH_PREEXEC_ENFORCE=1` | d | Passing |
+| bash — preexec with `TIRITH_BASH_PREEXEC_ENFORCE=1` | a, b, d, phase/receipt cardinality | Passing on Bash 3.2 harness + current-Bash PTY |
 | bash — enter (`bind -x` Enter override) | f | Passing |
 | bash — #111 capability gate | a, b, d | Passing |
 | fish | a, b, c, d, e, g | Passing |
@@ -192,6 +192,33 @@ configuration (`HISTCONTROL`, `HISTIGNORE`, `set +o history`, a pre-set `IFS`,
 an already-enabled `extdebug`) is covered by the `capability_*` tests in
 `crates/tirith/tests/bash_preexec_enforce.rs`.
 
+### Issue #176 — preexec functions and prompt phases
+
+Preexec enforcement keeps `extdebug` off for allowed lines and enables it
+lazily only after a complete typed-line block decision. Exact prompt-boundary
+guards execute an existing scalar as data inside a dedicated function frame,
+and bracket Bash 5.1+ arrays, preserving their order and the previous command
+status. Incomplete scalar syntax and heredocs are refused rather than spliced
+into guard syntax; `return` cannot skip the end guard, and prompt mutation is
+published as a downgrade before the next input boundary. Older Bash preserves
+arrays unchanged and leaves interception off because it cannot execute both
+guards. A sourced
+hook truthfully reports protection `off` until the first prompt captures a
+caller-owned DEBUG trap at top level; that prompt publishes `warn-only` (or
+`blocks` for requested enforcement) before accepting more input. The
+conformance test covers both sides of that transition, exact per-prompt trap
+ownership records, noisy existing traps, and exact chaining. Startup first
+purges security-critical imported Bash functions using POSIX special-builtin
+precedence, so exported `unset`, `builtin`, `command`, `declare`, `type`, or
+`shopt` functions cannot suppress initialization or fake a blocking state.
+The DEBUG trampoline uses
+structural call depth, not a function-name allowlist: prompt/startup execution
+is excluded by phase, while nested fires reuse the top-level decision and do
+not create receipts. Focused tests cover benign and blocked function lines,
+prompt functions, pipelines, user-owned `extdebug`, readonly prompt state,
+one-receipt-per-typed-line cardinality, and clean-output silence on Bash 3.2
+and a modern Bash PTY.
+
 ## Follow-up
 
 - **zsh / PowerShell / nushell PTY conformance.** The harness is
@@ -200,10 +227,7 @@ an already-enabled `extdebug`) is covered by the `capability_*` tests in
   model). Tracked as M0.1 follow-up; placeholder `#[ignore]`d tests mark the
   gap. PowerShell PTY coverage can validate preflight delivery, but cannot turn
   the intentionally unsupported strict receipt into an execution-proof claim.
-- **Offline isolation.** The bash enter-mode hook shells out to `tirith
-  check`, which may attempt a background threat-DB refresh. The conformance
-  tests do not currently assert on network behaviour. The `--offline` switch
-  (and the `TIRITH_OFFLINE` environment variable) now exists: setting
-  `TIRITH_OFFLINE=1` in a harness session makes that background refresh a
-  guaranteed no-op, so a future conformance test can pin network behaviour
-  deterministically.
+- **Offline isolation.** The bash enter-mode hook shells out to `tirith check`.
+  Setting `TIRITH_OFFLINE=1` in a harness session disables its background
+  refresh and every runtime HTTP/DNS enrichment path; cached results remain
+  usable and cache misses become explicit incomplete-verification findings.

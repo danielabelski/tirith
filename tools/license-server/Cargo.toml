@@ -38,6 +38,7 @@ uuid = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# R2 backup uses the existing reqwest/HMAC/SHA-256 stack and a small,
-# deterministic AWS SigV4 signer in `main.rs`. Keeping the one PUT operation
-# in-tree avoids pulling the vulnerable rust-s3 -> aws-creds -> quick-xml chain.
+# Backup (optional R2/S3). Keep the signer sans-I/O and XML-free: rust-s3's
+# response stack pins vulnerable quick-xml/rustls lines, while this service only
+# needs a presigned PUT URL and already owns the reqwest transport.
+rusty-s3 = { version = "0.8.1", default-features = false }

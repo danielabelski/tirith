@@ -24,7 +24,7 @@ pub fn use_color_for(stream: Stream) -> bool {
 /// A bracketed severity label like `[CRITICAL]`, ANSI-colored when `stream`
 /// supports color, else plain.
 pub fn severity_label(severity: &Severity, stream: Stream) -> String {
-    let label = format!("[{severity}]");
+    let label = format!("[{}]", severity);
     if !use_color_for(stream) {
         return label;
     }

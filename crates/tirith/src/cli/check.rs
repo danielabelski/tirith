@@ -20,20 +20,9 @@ use tirith_core::execution_state::{
 };
 use tirith_core::extract::ScanContext;
 use tirith_core::output;
-use tirith_core::threatdb_api::RuntimeThreatMode;
+use tirith_core::threatdb_api::{RuntimeThreatMode, RuntimeThreatNetwork};
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{action_from_findings, upgraded_action_from_findings, Action, Verdict};
-
-/// Once a check dispatches webhooks, every return path waits for their bounded
-/// best-effort delivery. A lexical guard avoids missing protocol/approval/
-/// deferral early returns as new branches are added.
-struct PendingWebhookGuard;
-
-impl Drop for PendingWebhookGuard {
-    fn drop(&mut self) {
-        tirith_core::webhook::wait_for_pending_webhooks(Duration::from_secs(5));
-    }
-}
+use tirith_core::verdict::{action_from_findings, Action, Verdict};
 
 /// W6: build a DISPLAY-ONLY clone of `effective` whose repeated Warn / WarnAck
 /// findings (already surfaced earlier this session) are collapsed, and return how
@@ -148,6 +137,8 @@ pub fn run(
     suggest_safe_command: bool,
     card: Option<String>,
 ) -> i32 {
+    let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+    let offline = offline || crate::cli::offline_env_active();
     let shell_name = match shell_type {
         ShellType::Posix => "posix",
         ShellType::Fish => "fish",
@@ -264,11 +255,11 @@ pub fn run(
                         policy_path_used: resp.policy_path_used,
                         timings_ms: resp.timings_ms,
                         urls_extracted_count: resp.urls_extracted_count,
-                        requires_approval: None,
-                        approval_timeout_secs: None,
-                        approval_fallback: None,
-                        approval_rule: None,
-                        approval_description: None,
+                        requires_approval: resp.requires_approval,
+                        approval_timeout_secs: resp.approval_timeout_secs,
+                        approval_fallback: resp.approval_fallback,
+                        approval_rule: resp.approval_rule,
+                        approval_description: resp.approval_description,
                         escalation_reason: None,
                         agent_origin: None,
                         // M11 ch2 — matched `allowed[]` name carried across the
@@ -348,10 +339,17 @@ pub fn run(
     // does not know the caller's identity by design, the CLI does.
     raw_verdict.agent_origin = Some(origin);
 
+    let ran_locally = engine_policy.is_some();
+    let policy =
+        engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
+    tirith_core::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
+    // Invalid custom seed diagnostics are an unconditional policy-health
+    // contract. Emit the indexed categorical warning before every honored
+    // bypass return, without ever rendering the raw regex/compiler error.
+    crate::cli::warn_bad_injection_seeds(&policy);
+
     // Bypass path audits and returns without post-processing.
     if raw_verdict.bypass_honored && execution_receipt.is_none() {
-        let policy =
-            engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
         let event_id = uuid::Uuid::new_v4().to_string();
         // Best-effort audit: a write failure must not change the exit code.
         let _ = tirith_core::audit::log_verdict(
@@ -364,29 +362,21 @@ pub fn run(
         return 0;
     }
 
-    let ran_locally = engine_policy.is_some();
-    let policy =
-        engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
     crate::cli::warn_repo_policy_neutralized(&policy);
-    // Surface an invalid `injection_seeds_custom` regex (compiled and silently
-    // dropped during analysis) to the operator. UNCONDITIONAL by design: on the
-    // local path `policy` is the engine's; on the daemon path it is the client-side
-    // `Policy::discover` resolved just above (the daemon server does NOT surface bad
-    // seeds), so the operator sees the warning on either path. Cheap: few seeds.
-    crate::cli::warn_bad_injection_seeds(&policy);
 
     if ran_locally {
-        let runtime_findings = tirith_core::threatdb_api::enrich_command(
+        let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
             cmd,
             shell_type,
             &policy.threat_intel,
             RuntimeThreatMode::Inline,
+            if offline {
+                RuntimeThreatNetwork::CacheOnly
+            } else {
+                RuntimeThreatNetwork::Online
+            },
         );
-        if !runtime_findings.is_empty() {
-            raw_verdict.findings.extend(runtime_findings);
-            raw_verdict.action =
-                upgraded_action_from_findings(&raw_verdict.findings, raw_verdict.action);
-        }
+        tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
     }
 
     // Snapshot raw action + rule ids before post-processing so the audit log
@@ -537,26 +527,34 @@ pub fn run(
         && tirith_core::checkpoint::should_auto_checkpoint(cmd)
     {
         if let Some(cwd_val) = &cwd {
-            // repo-0214: checkpoint creation must finish before this process
-            // returns an executable verdict. A detached worker is terminated at
-            // process exit, while a timed wait cannot cancel it safely; either
-            // shape could let the destructive command run without a published
-            // checkpoint. This path is interactive-only, and creation itself is
-            // bounded by the checkpoint entry/file/total-byte budgets.
-            match tirith_core::checkpoint::create(&[cwd_val.as_str()], Some(cmd)) {
-                Err(e) => eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}"),
-                Ok(meta) => {
-                    if meta.incomplete {
-                        eprintln!(
-                            "tirith: auto-checkpoint is incomplete; the destructive command may proceed without a complete snapshot"
-                        );
-                    }
+            let cwd_owned = cwd_val.clone();
+            let cmd_owned = cmd.to_string();
+            // repo-0214: keep the handle — a detached snapshot is killed at
+            // process exit, so a destructive command could run with NO usable
+            // checkpoint. Joined (bounded) before the command returns.
+            let handle = std::thread::spawn(move || {
+                if let Err(e) =
+                    tirith_core::checkpoint::create(&[cwd_owned.as_str()], Some(&cmd_owned))
+                {
+                    eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}");
+                } else {
                     // Purge old checkpoints to prevent unbounded disk growth.
                     let config = tirith_core::checkpoint::CheckpointConfig::default();
                     if let Err(e) = tirith_core::checkpoint::purge(&config) {
                         eprintln!("tirith: checkpoint purge failed (non-fatal): {e}");
                     }
                 }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                eprintln!(
+                    "tirith: auto-checkpoint did not finish within 60s; the destructive command may proceed without a complete snapshot"
+                );
             }
         }
     }
@@ -573,7 +571,6 @@ pub fn run(
             &policy.dlp_custom_patterns,
         );
     }
-    let _pending_webhook_guard = PendingWebhookGuard;
 
     // Protocol v3 owns every approval / warning-ack interaction in this process.
     // The shell receives only an already-armed receipt token; it never reports a
@@ -589,6 +586,7 @@ pub fn run(
             channel,
             requires_warn_ack,
             warn_only,
+            &policy.dlp_custom_patterns,
         );
     }
 
@@ -603,15 +601,29 @@ pub fn run(
             &session_id,
             tirith_core::suppression::DEFAULT_COOLDOWN_SECS,
         );
-        if output::write_human(&display, warn_only, std::io::stderr().lock()).is_err() {
-            eprintln!("tirith: failed to write approval output");
-        }
+        let mut human = output::HumanInvocationWriter::new(
+            std::io::stderr().lock(),
+            tirith_core::style::use_color_for(tirith_core::style::Stream::Stderr),
+        );
+        let mut human_failed = output::write_human_to_invocation_with_patterns(
+            &display,
+            warn_only,
+            &policy.dlp_custom_patterns,
+            &mut human,
+        )
+        .is_err();
         // If every displayable warning was collapsed, surface one compact notice
         // (same stream `write_human` used here: stderr in approval-check mode).
         if display.findings.is_empty() && suppressed_count > 0 {
-            eprintln!(
+            human_failed |= writeln!(
+                human,
                 "tirith: {suppressed_count} repeated warning(s) suppressed this session (run `tirith warnings`)"
-            );
+            )
+            .is_err();
+        }
+        human_failed |= human.finish().is_err();
+        if human_failed {
+            eprintln!("tirith: failed to write approval output");
         }
 
         // Mode B (hook-driven strict_warn): write warn-ack temp file and exit 3.
@@ -642,41 +654,47 @@ pub fn run(
 
     // Safe-command suggestions are advisory only: computed when opted-in AND the
     // verdict flagged something; they never influence the action or exit code.
-    let safe_suggestions: Vec<tirith_core::safe_command::SafeSuggestion> =
-        if suggest_safe_command && effective.action != Action::Allow {
-            let suggestion_ctx = AnalysisContext {
-                input: cmd.to_string(),
-                shell: shell_type,
-                scan_context: ScanContext::Exec,
-                raw_bytes: None,
-                interactive,
-                cwd: cwd.clone(),
-                file_path: None,
-                repo_root: None,
-                is_config_override: false,
-                clipboard_html: None,
-                card_ref: card.clone(),
-                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
-            };
-            if ran_locally {
-                tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_and_session(
+    let safe_suggestions: Vec<tirith_core::safe_command::SafeSuggestion> = if suggest_safe_command
+        && effective.action != Action::Allow
+    {
+        let suggestion_ctx = AnalysisContext {
+            input: cmd.to_string(),
+            shell: shell_type,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive,
+            cwd: cwd.clone(),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: card.clone(),
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        };
+        if ran_locally {
+            tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_session_and_network(
                     &suggestion_ctx,
                     &policy,
                     &session_id,
+                    if offline {
+                        RuntimeThreatNetwork::CacheOnly
+                    } else {
+                        RuntimeThreatNetwork::Online
+                    },
                 )
-            } else {
-                // A daemon verdict may include its longer-budget/private-network
-                // enrichment. Never replace that producer profile with a local
-                // Inline re-analysis at an executable-output boundary.
-                tirith_core::safe_command::suggest_verified_with_policy(
-                    &suggestion_ctx,
-                    &effective,
-                    &policy,
-                )
-            }
         } else {
-            Vec::new()
-        };
+            // A daemon verdict may include its longer-budget/private-network
+            // enrichment. Never replace that producer profile with a local
+            // Inline re-analysis at an executable-output boundary.
+            tirith_core::safe_command::suggest_verified_with_policy(
+                &suggestion_ctx,
+                &effective,
+                &policy,
+            )
+        }
+    } else {
+        Vec::new()
+    };
 
     if json {
         let suggestions_opt = if suggest_safe_command {
@@ -703,35 +721,49 @@ pub fn run(
             &session_id,
             tirith_core::suppression::DEFAULT_COOLDOWN_SECS,
         );
-        if output::write_human_auto(&display, warn_only).is_err() {
-            eprintln!("tirith: failed to write output");
-        }
+        let mut human = output::HumanInvocationWriter::new(
+            std::io::stderr().lock(),
+            tirith_core::style::use_color_for(tirith_core::style::Stream::Stderr),
+        );
+        let mut human_failed = output::write_human_to_invocation_with_patterns(
+            &display,
+            warn_only,
+            &policy.dlp_custom_patterns,
+            &mut human,
+        )
+        .is_err();
         // If every displayable warning was collapsed, surface one compact notice
         // on the same stream `write_human_auto` used (stderr).
         if display.findings.is_empty() && suppressed_count > 0 {
-            eprintln!(
+            human_failed |= writeln!(
+                human,
                 "tirith: {suppressed_count} repeated warning(s) suppressed this session (run `tirith warnings`)"
-            );
+            )
+            .is_err();
         }
-        if output::write_safe_suggestions(
+        human_failed |= output::write_safe_suggestions(
             &safe_suggestions,
             &policy.dlp_custom_patterns,
-            std::io::stderr().lock(),
+            &mut human,
         )
-        .is_err()
-        {
-            eprintln!("tirith: failed to write safe-command suggestions");
-        }
+        .is_err();
         // On a clean human verdict from DIRECT CLI use, confirm nothing was found
         // (`write_human_auto` is silent on no findings). Gated OFF for hook
         // invocations — a per-keystroke "no issues" would be noise — detected via
         // the `_TIRITH_HOOK` / `_TIRITH_BASH_INTERNAL` markers the shell hooks set.
-        // `note` is already `--quiet`-aware. Never emitted in the JSON branch.
+        // This now shares the invocation writer with the verdict, so preserve
+        // the same process-global quiet gate that `note` previously provided.
+        // Never emitted in the JSON branch.
         if effective.findings.is_empty()
+            && !crate::cli::is_quiet()
             && std::env::var("_TIRITH_HOOK").is_err()
             && std::env::var("_TIRITH_BASH_INTERNAL").is_err()
         {
-            crate::cli::note("tirith: no issues");
+            human_failed |= writeln!(human, "tirith: no issues").is_err();
+        }
+        human_failed |= human.finish().is_err();
+        if human_failed {
+            eprintln!("tirith: failed to write human output");
         }
     }
 
@@ -826,6 +858,11 @@ pub fn run(
         }
         return 1;
     }
+
+    // repo-0208: wait (bounded) for in-flight webhook deliveries so a one-shot
+    // `check` does not terminate them at process exit. Delivery remains
+    // best-effort; the verdict exit code is unaffected.
+    tirith_core::webhook::wait_for_pending_webhooks(std::time::Duration::from_secs(5));
 
     exit_code
 }
@@ -931,14 +968,21 @@ fn receipt_interaction_requirements(
 
 fn resolve_owned_interactions(
     requirements: &ReceiptInteractionRequirements<'_>,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
     io: &mut impl ReceiptInteractionIo,
 ) -> Result<OwnedInteractionResolution, String> {
     let mut approval_outcome = None;
     if let Some(approval) = &requirements.approval {
-        let rule = crate::cli::sanitize_for_human_output(approval.rule, false);
+        // Rule and description are policy-controlled strings captured into the
+        // receipt interaction channel. DLP must run before terminal
+        // neutralization, using the same frozen plan as the displayed verdict.
+        let rule = tirith_core::output::sanitize_human_field_with_compiled(approval.rule, compiled);
         io.notify(&format!("tirith: approval required for {rule}"))?;
         if !approval.description.is_empty() {
-            let description = crate::cli::sanitize_for_human_output(approval.description, false);
+            let description = tirith_core::output::sanitize_human_field_with_compiled(
+                approval.description,
+                compiled,
+            );
             io.notify(&format!("  {description}"))?;
         }
         let prompt = approval
@@ -946,18 +990,23 @@ fn resolve_owned_interactions(
             .map(|timeout| format!("Approve? ({}s timeout) [y/N] ", timeout.as_secs()))
             .unwrap_or_else(|| "Approve? [y/N] ".to_string());
         let answer = io.prompt(&prompt, approval.timeout)?;
-        approval_outcome = Some(match answer {
-            PromptAnswer::Accepted => ShellApprovalOutcome::Granted,
-            PromptAnswer::Rejected => ShellApprovalOutcome::Rejected,
-            PromptAnswer::TimedOut => ShellApprovalOutcome::TimedOut,
-        });
-        if !matches!(answer, PromptAnswer::Accepted) {
-            io.notify(&format!(
-                "tirith: approval not granted — fallback: {}",
-                approval.fallback.label()
-            ))?;
-            if !approval.fallback.permits_execution() {
+        match answer {
+            PromptAnswer::Accepted => {
+                approval_outcome = Some(ShellApprovalOutcome::Granted);
+            }
+            PromptAnswer::Rejected => {
+                io.notify("tirith: approval rejected — command blocked")?;
                 return Ok(OwnedInteractionResolution::Blocked);
+            }
+            PromptAnswer::TimedOut => {
+                approval_outcome = Some(ShellApprovalOutcome::TimedOut);
+                io.notify(&format!(
+                    "tirith: approval timed out — fallback: {}",
+                    approval.fallback.label()
+                ))?;
+                if !approval.fallback.permits_execution() {
+                    return Ok(OwnedInteractionResolution::Blocked);
+                }
             }
         }
     }
@@ -985,14 +1034,19 @@ fn render_receipt_display(
     effective: &Verdict,
     session_id: &str,
     warn_only: bool,
-    mut writer: impl std::io::Write,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+    writer: impl std::io::Write,
 ) -> Result<(), String> {
     let (display, suppressed_count) = build_display_verdict(
         effective,
         session_id,
         tirith_core::suppression::DEFAULT_COOLDOWN_SECS,
     );
-    output::write_human(&display, warn_only, &mut writer)
+    let mut writer = output::HumanInvocationWriter::new(
+        writer,
+        tirith_core::style::use_color_for(tirith_core::style::Stream::Stderr),
+    );
+    output::write_human_to_invocation_with_compiled(&display, warn_only, compiled, &mut writer)
         .map_err(|error| format!("write shell receipt verdict: {error}"))?;
     if display.findings.is_empty() && suppressed_count > 0 {
         writeln!(
@@ -1002,7 +1056,7 @@ fn render_receipt_display(
         .map_err(|error| format!("write shell receipt suppression notice: {error}"))?;
     }
     writer
-        .flush()
+        .finish()
         .map_err(|error| format!("flush shell receipt verdict: {error}"))
 }
 
@@ -1074,11 +1128,17 @@ fn complete_owned_receipt_check(
     channel: ShellReceiptChannel,
     requires_warn_ack: bool,
     warn_only: bool,
+    custom_patterns: &[String],
 ) -> i32 {
+    let interaction_dlp = tirith_core::redact::CompiledCustomPatterns::new_silent(custom_patterns);
     if effective.action == Action::Block && !effective.bypass_honored {
-        if let Err(error) =
-            render_receipt_display(effective, session_id, warn_only, std::io::stderr().lock())
-        {
+        if let Err(error) = render_receipt_display(
+            effective,
+            session_id,
+            warn_only,
+            &interaction_dlp,
+            std::io::stderr().lock(),
+        ) {
             eprintln!("tirith: {error}");
         }
         discard_receipt_best_effort(token, channel);
@@ -1087,9 +1147,13 @@ fn complete_owned_receipt_check(
 
     let requirements = receipt_interaction_requirements(effective, requires_warn_ack);
     if !channel_can_own_interactions(channel) && !requirements.is_empty() {
-        if let Err(error) =
-            render_receipt_display(effective, session_id, warn_only, std::io::stderr().lock())
-        {
+        if let Err(error) = render_receipt_display(
+            effective,
+            session_id,
+            warn_only,
+            &interaction_dlp,
+            std::io::stderr().lock(),
+        ) {
             eprintln!("tirith: {error}");
         }
         eprintln!(
@@ -1100,9 +1164,13 @@ fn complete_owned_receipt_check(
     }
 
     if requirements.is_empty() {
-        if let Err(error) =
-            render_receipt_display(effective, session_id, warn_only, std::io::stderr().lock())
-        {
+        if let Err(error) = render_receipt_display(
+            effective,
+            session_id,
+            warn_only,
+            &interaction_dlp,
+            std::io::stderr().lock(),
+        ) {
             eprintln!("tirith: {error}");
             discard_receipt_best_effort(token, channel);
             return 1;
@@ -1112,8 +1180,14 @@ fn complete_owned_receipt_check(
 
     #[cfg(unix)]
     let resolution = with_controlling_tty(|tty| {
-        render_receipt_display(effective, session_id, warn_only, &mut *tty)?;
-        resolve_owned_interactions(&requirements, tty)
+        render_receipt_display(
+            effective,
+            session_id,
+            warn_only,
+            &interaction_dlp,
+            &mut *tty,
+        )?;
+        resolve_owned_interactions(&requirements, &interaction_dlp, tty)
     });
 
     #[cfg(not(unix))]
@@ -2115,7 +2189,7 @@ fn wait_for_prompt_input(
                 return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
             }
             let descriptor_state = if descriptor_flags >= 0 {
-                format!("open with flags {descriptor_flags:#x}, isatty={is_tty}")
+                format!("open with flags {descriptor_flags:#x}, isatty={}", is_tty)
             } else {
                 format!("closed: {}", std::io::Error::last_os_error())
             };
@@ -2381,17 +2455,18 @@ fn prepare_receipt_consumption(
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));
-    let runtime_findings = tirith_core::threatdb_api::enrich_command(
+    let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
         command,
         context.shell(),
         &policy.threat_intel,
         RuntimeThreatMode::Inline,
+        if crate::cli::offline_env_active() {
+            RuntimeThreatNetwork::CacheOnly
+        } else {
+            RuntimeThreatNetwork::Online
+        },
     );
-    if !runtime_findings.is_empty() {
-        raw_verdict.findings.extend(runtime_findings);
-        raw_verdict.action =
-            upgraded_action_from_findings(&raw_verdict.findings, raw_verdict.action);
-    }
+    tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
     if context.strict_warn_override() {
         policy.strict_warn = true;
     }
@@ -2467,6 +2542,10 @@ mod receipt_interaction_tests {
     use super::*;
     use std::collections::VecDeque;
 
+    fn dlp(patterns: &[String]) -> tirith_core::redact::CompiledCustomPatterns {
+        tirith_core::redact::CompiledCustomPatterns::new_silent(patterns)
+    }
+
     #[derive(Default)]
     struct FakeInteractionIo {
         answers: VecDeque<Result<PromptAnswer, String>>,
@@ -2522,7 +2601,7 @@ mod receipt_interaction_tests {
         let requirements = approval_requirements(ApprovalFallback::Block, None, None);
         let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::Accepted)]);
 
-        let resolution = resolve_owned_interactions(&requirements, &mut io).unwrap();
+        let resolution = resolve_owned_interactions(&requirements, &dlp(&[]), &mut io).unwrap();
 
         assert_eq!(
             resolution,
@@ -2542,7 +2621,7 @@ mod receipt_interaction_tests {
         let mut io =
             FakeInteractionIo::answering([Ok(PromptAnswer::TimedOut), Ok(PromptAnswer::Accepted)]);
 
-        let resolution = resolve_owned_interactions(&requirements, &mut io).unwrap();
+        let resolution = resolve_owned_interactions(&requirements, &dlp(&[]), &mut io).unwrap();
 
         assert_eq!(
             resolution,
@@ -2563,9 +2642,9 @@ mod receipt_interaction_tests {
     #[test]
     fn block_fallback_stops_before_warning_ack() {
         let requirements = approval_requirements(ApprovalFallback::Block, None, Some(3));
-        let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::Rejected)]);
+        let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::TimedOut)]);
 
-        let resolution = resolve_owned_interactions(&requirements, &mut io).unwrap();
+        let resolution = resolve_owned_interactions(&requirements, &dlp(&[]), &mut io).unwrap();
 
         assert_eq!(resolution, OwnedInteractionResolution::Blocked);
         assert_eq!(io.prompts.len(), 1, "warn acknowledgement must not run");
@@ -2576,11 +2655,36 @@ mod receipt_interaction_tests {
     }
 
     #[test]
+    fn explicit_approval_rejection_blocks_every_fallback_without_arming_metadata() {
+        for fallback in [
+            ApprovalFallback::Allow,
+            ApprovalFallback::Warn,
+            ApprovalFallback::Block,
+        ] {
+            let requirements = approval_requirements(fallback, Some(Duration::from_secs(7)), None);
+            let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::Rejected)]);
+
+            let resolution = resolve_owned_interactions(&requirements, &dlp(&[]), &mut io).unwrap();
+
+            assert_eq!(resolution, OwnedInteractionResolution::Blocked);
+            assert_eq!(io.prompts.len(), 1);
+            assert!(io
+                .notifications
+                .iter()
+                .any(|message| message.ends_with("approval rejected — command blocked")));
+            assert!(io
+                .notifications
+                .iter()
+                .all(|message| !message.contains("fallback:")));
+        }
+    }
+
+    #[test]
     fn prompt_error_never_activates_permissive_fallback() {
         let requirements = approval_requirements(ApprovalFallback::Allow, None, None);
         let mut io = FakeInteractionIo::answering([Err("tty read failed".to_string())]);
 
-        let error = resolve_owned_interactions(&requirements, &mut io).unwrap_err();
+        let error = resolve_owned_interactions(&requirements, &dlp(&[]), &mut io).unwrap_err();
 
         assert_eq!(error, "tty read failed");
         assert!(io
@@ -2597,7 +2701,7 @@ mod receipt_interaction_tests {
         };
         let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::Rejected)]);
 
-        let resolution = resolve_owned_interactions(&requirements, &mut io).unwrap();
+        let resolution = resolve_owned_interactions(&requirements, &dlp(&[]), &mut io).unwrap();
 
         assert_eq!(resolution, OwnedInteractionResolution::Blocked);
         assert_eq!(io.prompts.len(), 1);
@@ -2605,6 +2709,43 @@ mod receipt_interaction_tests {
             io.notifications.last().map(String::as_str),
             Some("tirith: warnings not acknowledged — command blocked")
         );
+    }
+
+    #[test]
+    fn captured_interaction_io_dlp_redacts_policy_canaries_before_terminal_sanitizing() {
+        let canary = "C02_RECEIPT_INTERACTION_CANARY";
+        let patterns = vec![regex::escape(canary)];
+        let requirements = ReceiptInteractionRequirements {
+            approval: Some(ApprovalPrompt {
+                timeout: None,
+                fallback: ApprovalFallback::Block,
+                rule: "rule C02_RECEIPT_INTERACTION_CANARY\u{1b}[31m\nforged",
+                description:
+                    "description C02_RECEIPT_INTERACTION_CANARY\u{1b}]0;owned\u{07}\nforged",
+            }),
+            warn_ack_findings: None,
+        };
+        let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::Accepted)]);
+
+        let resolution =
+            resolve_owned_interactions(&requirements, &dlp(&patterns), &mut io).unwrap();
+
+        assert!(matches!(
+            resolution,
+            OwnedInteractionResolution::Authorized {
+                approval: Some(ShellApprovalOutcome::Granted),
+                warn_acknowledged: false,
+            }
+        ));
+        let captured = io.notifications.join("\n");
+        assert!(
+            !captured.contains(canary),
+            "captured IO leaked {captured:?}"
+        );
+        assert!(captured.contains("[REDACTED:custom]"));
+        assert!(!captured.contains('\u{1b}'));
+        assert!(!captured.contains("\nforged"));
+        assert!(io.notifications.iter().all(|line| !line.contains('\n')));
     }
 
     #[test]
@@ -3062,7 +3203,10 @@ mod receipt_interaction_tests {
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                // libc's ioctl request type varies: c_ulong on glibc/macOS,
+                // c_int on musl. Infer the target ABI instead of forcing either
+                // width, so both native and aarch64-musl test harnesses compile.
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0 {

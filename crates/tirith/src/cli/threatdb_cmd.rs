@@ -12,8 +12,8 @@ use tirith_core::policy;
 use tirith_core::selfupdate::SemVer;
 use tirith_core::threatdb::{ThreatDb, ThreatDbWriter, ThreatSource, MAX_FORMAT_VERSION};
 use tirith_core::threatdb_feeds::{
-    parse_domain_blocklist, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
-    parse_urlhaus_csv,
+    parse_domain_blocklist_reader, parse_phishtank_csv, parse_threatfox_zip,
+    parse_tor_exit_list_reader, parse_urlhaus_csv, MAX_FEED_ENTRIES, MAX_FEED_INPUT_BYTES,
 };
 
 /// Pinned Ed25519 manifest-verify key. MUST stay in sync with
@@ -44,7 +44,7 @@ const MANIFEST_TIMEOUT_SECS: u64 = 15;
 const DB_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 const SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 /// Max bytes read from any single supplemental feed response.
-const MAX_SUPPLEMENTAL_FEED_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_SUPPLEMENTAL_FEED_SIZE: u64 = MAX_FEED_INPUT_BYTES;
 
 const LOCKFILE_NAME: &str = "threatdb-update.lock";
 const NEXT_CHECK_FILE: &str = "threatdb-next-check-at";
@@ -76,7 +76,7 @@ fn validate_remote_url(url: &str, purpose: &str) -> Result<(), String> {
         .map_err(|reason| format!("refusing unsafe {purpose} URL: {reason}"))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct Manifest {
     sha256: String,
     size: u64,
@@ -99,6 +99,12 @@ impl Manifest {
 
     /// Verify the manifest signature against the pinned public key.
     fn verify_signature(&self) -> Result<(), String> {
+        let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
+            .map_err(|e| format!("invalid embedded public key: {e}"))?;
+        self.verify_signature_with_key(&verify_key)
+    }
+
+    fn verify_signature_with_key(&self, verify_key: &VerifyingKey) -> Result<(), String> {
         let sig_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &self.signature)
                 .map_err(|e| format!("invalid manifest signature encoding: {e}"))?;
@@ -113,9 +119,6 @@ impl Manifest {
 
         let signature = Signature::from_slice(&sig_bytes)
             .map_err(|e| format!("invalid manifest signature: {e}"))?;
-
-        let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
-            .map_err(|e| format!("invalid embedded public key: {e}"))?;
 
         let payload = self.canonical_payload();
         use ed25519_dalek::Verifier;
@@ -357,7 +360,7 @@ pub fn update(force: bool, background: bool) -> i32 {
 }
 
 /// Outcome of a primary-DB update attempt.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateOutcome {
     /// A new primary DB was downloaded, verified, and installed.
     Installed,
@@ -390,16 +393,32 @@ fn do_update(force: bool) -> Result<(), String> {
         }
     };
 
-    // Refresh the cache, then run the supplemental update ONLY when a new primary
-    // was actually installed (matching the pre-DB-B behavior: an already-current
-    // DB does not trigger a supplemental refresh).
+    // Primary currentness and supplemental currentness are independent. Enabling,
+    // retrying, or disabling an opt-in feed must reconcile the overlay even when
+    // the signed primary DB was already current.
     ThreatDb::refresh_cache();
-    if outcome == UpdateOutcome::Installed {
-        if let Err(e) = update_supplemental_db(&policy::Policy::discover(None)) {
-            eprintln!("tirith: warning: supplemental threat DB update failed: {e}");
-        }
+    if let Err(e) = reconcile_supplemental_after_primary(outcome, || {
+        update_supplemental_db(&policy::Policy::discover(None))
+    }) {
+        eprintln!("tirith: warning: supplemental threat DB update failed: {e}");
     }
     Ok(())
+}
+
+fn reconcile_supplemental_after_primary<F>(
+    outcome: UpdateOutcome,
+    reconcile: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    match outcome {
+        UpdateOutcome::Installed | UpdateOutcome::AlreadyCurrent => reconcile(),
+        UpdateOutcome::NoCompatibleAsset => Err(
+            "internal error: supplemental reconciliation reached before primary selection"
+                .to_string(),
+        ),
+    }
 }
 
 /// Attempt the v2-index update path. Returns:
@@ -420,7 +439,8 @@ fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
         Some(a) => a,
         None => {
             eprintln!(
-                "tirith: v2 index has no asset compatible with this build (max format {MAX_FORMAT_VERSION}, tirith {current_tirith_version}); using legacy manifest"
+                "tirith: v2 index has no asset compatible with this build (max format {}, tirith {}); using legacy manifest",
+                MAX_FORMAT_VERSION, current_tirith_version
             );
             return Ok(UpdateOutcome::NoCompatibleAsset);
         }
@@ -671,13 +691,39 @@ impl SupplementalEntries {
         &mut self,
         entries: tirith_core::threatdb_feeds::FeedEntries,
         source: ThreatSource,
-    ) -> usize {
-        let count = entries.hostnames.len() + entries.ips.len();
+    ) -> Result<usize, String> {
+        self.ingest_with_limit(entries, source, MAX_FEED_ENTRIES)
+    }
+
+    fn ingest_with_limit(
+        &mut self,
+        entries: tirith_core::threatdb_feeds::FeedEntries,
+        source: ThreatSource,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let count = entries
+            .hostnames
+            .len()
+            .checked_add(entries.ips.len())
+            .ok_or_else(|| "supplemental feed entry count overflow".to_string())?;
+        let current = self
+            .hostnames
+            .len()
+            .checked_add(self.ips.len())
+            .ok_or_else(|| "supplemental aggregate entry count overflow".to_string())?;
+        let projected = current
+            .checked_add(count)
+            .ok_or_else(|| "supplemental aggregate entry count overflow".to_string())?;
+        if projected > limit {
+            return Err(format!(
+                "supplemental feeds exceed the aggregate indicator limit of {limit}"
+            ));
+        }
         self.hostnames
             .extend(entries.hostnames.into_iter().map(|h| (h, source)));
         self.ips
             .extend(entries.ips.into_iter().map(|ip| (ip, source)));
-        count
+        Ok(count)
     }
 }
 
@@ -695,7 +741,7 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
     let phishing_enabled = policy.threat_intel.phishing_army_enabled;
 
     if !abusech_enabled && !phishing_enabled {
-        let _ = std::fs::remove_file(&supplemental_path);
+        remove_disabled_supplemental(&supplemental_path)?;
         ThreatDb::refresh_cache();
         return Ok(());
     }
@@ -793,6 +839,17 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
     Ok(())
 }
 
+fn remove_disabled_supplemental(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to remove disabled supplemental threat DB {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 /// Log a feed outcome; `true` when the feed genuinely produced entries.
 /// repo-0441: an EMPTY successful response is treated as a failure for
 /// publication purposes — a wiped/zero-answer upstream must not shrink the DB.
@@ -816,10 +873,9 @@ fn fetch_urlhaus_feed(
     supplemental: &mut SupplementalEntries,
 ) -> Result<usize, String> {
     let url = URLHAUS_EXPORT_TEMPLATE.replace("{auth_key}", auth_key);
-    let body = fetch_text(client, &url)?;
-    let entries = parse_urlhaus_csv(Cursor::new(body.into_bytes()))
-        .map_err(|e| format!("URLhaus parse failed: {e}"))?;
-    Ok(supplemental.ingest(entries, ThreatSource::Urlhaus))
+    let response = fetch_feed_response(client, &url)?;
+    let entries = parse_urlhaus_csv(response).map_err(|e| format!("URLhaus parse failed: {e}"))?;
+    supplemental.ingest(entries, ThreatSource::Urlhaus)
 }
 
 fn fetch_threatfox_feed(
@@ -830,35 +886,37 @@ fn fetch_threatfox_feed(
     let url = THREATFOX_EXPORT_TEMPLATE.replace("{auth_key}", auth_key);
     let zip_bytes = fetch_bytes(client, &url)?;
     let entries = parse_threatfox_zip(Cursor::new(zip_bytes))?;
-    Ok(supplemental.ingest(entries, ThreatSource::ThreatFoxIoc))
+    supplemental.ingest(entries, ThreatSource::ThreatFoxIoc)
 }
 
 fn fetch_phishing_army_feed(
     client: &reqwest::blocking::Client,
     supplemental: &mut SupplementalEntries,
 ) -> Result<usize, String> {
-    let body = fetch_text(client, PHISHING_ARMY_URL)?;
-    let entries = parse_domain_blocklist(&body);
-    Ok(supplemental.ingest(entries, ThreatSource::PhishingArmy))
+    let response = fetch_feed_response(client, PHISHING_ARMY_URL)?;
+    let entries = parse_domain_blocklist_reader(response)
+        .map_err(|e| format!("Phishing Army parse failed: {e}"))?;
+    supplemental.ingest(entries, ThreatSource::PhishingArmy)
 }
 
 fn fetch_phishtank_feed(
     client: &reqwest::blocking::Client,
     supplemental: &mut SupplementalEntries,
 ) -> Result<usize, String> {
-    let body = fetch_text(client, PHISHTANK_URL)?;
-    let entries = parse_phishtank_csv(Cursor::new(body.into_bytes()))
-        .map_err(|e| format!("PhishTank parse failed: {e}"))?;
-    Ok(supplemental.ingest(entries, ThreatSource::PhishTank))
+    let response = fetch_feed_response(client, PHISHTANK_URL)?;
+    let entries =
+        parse_phishtank_csv(response).map_err(|e| format!("PhishTank parse failed: {e}"))?;
+    supplemental.ingest(entries, ThreatSource::PhishTank)
 }
 
 fn fetch_tor_exit_feed(
     client: &reqwest::blocking::Client,
     supplemental: &mut SupplementalEntries,
 ) -> Result<usize, String> {
-    let body = fetch_text(client, TOR_EXIT_URL)?;
-    let entries = parse_tor_exit_list(&body);
-    Ok(supplemental.ingest(entries, ThreatSource::TorExit))
+    let response = fetch_feed_response(client, TOR_EXIT_URL)?;
+    let entries =
+        parse_tor_exit_list_reader(response).map_err(|e| format!("Tor exit parse failed: {e}"))?;
+    supplemental.ingest(entries, ThreatSource::TorExit)
 }
 
 /// Redact query-string secrets (e.g. `?auth-key=...`) from a URL for log/error use.
@@ -870,14 +928,10 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-fn fetch_text(client: &reqwest::blocking::Client, url: &str) -> Result<String, String> {
-    let bytes = fetch_bytes(client, url)?;
-    let safe = redact_url(url);
-    String::from_utf8(bytes)
-        .map_err(|e| format!("failed to decode UTF-8 response body for {safe}: {e}"))
-}
-
-fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
+fn fetch_feed_response(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<reqwest::blocking::Response, String> {
     let safe = redact_url(url);
     validate_remote_url(url, "supplemental feed")?;
     let response = client
@@ -903,6 +957,21 @@ fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>,
             format!("fetch failed for {safe}: {reason}")
         })?;
 
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SUPPLEMENTAL_FEED_SIZE)
+    {
+        return Err(format!(
+            "response body for {safe} exceeds {} bytes",
+            MAX_SUPPLEMENTAL_FEED_SIZE
+        ));
+    }
+    Ok(response)
+}
+
+fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
+    let safe = redact_url(url);
+    let response = fetch_feed_response(client, url)?;
     let content_length = response.content_length();
     read_bounded_bytes(response, &safe, content_length, MAX_SUPPLEMENTAL_FEED_SIZE)
 }
@@ -1177,7 +1246,7 @@ fn print_status_human(info: &ThreatDbStatus) {
     let path = info.path.as_deref().unwrap_or("unknown");
     let age_str = match info.age_hours {
         Some(h) if h < 1.0 => format!("{:.0}m old", h * 60.0),
-        Some(h) if h < 48.0 => format!("{h:.0}h old"),
+        Some(h) if h < 48.0 => format!("{:.0}h old", h),
         Some(h) => format!("{:.0}d old", h / 24.0),
         None => "unknown age".to_string(),
     };
@@ -1296,34 +1365,64 @@ pub fn maybe_background_update(offline_flag: bool) {
     }
 }
 
-/// Fetch the manifest from the primary URL, falling back to the release asset URL
-/// when the primary fetch fails OR the primary manifest is older than the current
-/// DB (e.g. manifest PR not yet merged).
+/// Fetch and authenticate both independently published legacy manifests, then
+/// select the newest verified candidate. Selection cannot run on merely parsed
+/// JSON: an invalid primary must not suppress a valid fallback, and an older
+/// replayed primary must not beat a newer signed release candidate.
 fn fetch_manifest() -> Result<Manifest, String> {
-    match fetch_manifest_from(MANIFEST_URL_PRIMARY) {
-        Ok(m) => {
-            // If the primary version is at or below the installed DB, try the
-            // fallback in case it's ahead (releases can lag the raw path).
-            if let Some(db) = ThreatDb::cached() {
-                if m.version <= db.build_sequence() {
-                    eprintln!("tirith: primary manifest is stale (v{} <= current v{}), trying fallback...",
-                        m.version, db.build_sequence());
-                    match fetch_manifest_from(MANIFEST_URL_FALLBACK) {
-                        Ok(fallback) if fallback.version > db.build_sequence() => {
-                            return Ok(fallback)
-                        }
-                        _ => {}
-                    }
+    let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
+        .map_err(|error| format!("invalid embedded public key: {error}"))?;
+    fetch_manifest_with(fetch_manifest_from, &verify_key)
+}
+
+fn fetch_verified_manifest_candidate<F>(
+    fetch: &mut F,
+    url: &str,
+    verify_key: &VerifyingKey,
+) -> Result<Manifest, String>
+where
+    F: FnMut(&str) -> Result<Manifest, String>,
+{
+    let manifest = fetch(url)?;
+    manifest.verify_signature_with_key(verify_key)?;
+    Ok(manifest)
+}
+
+fn fetch_manifest_with<F>(mut fetch: F, verify_key: &VerifyingKey) -> Result<Manifest, String>
+where
+    F: FnMut(&str) -> Result<Manifest, String>,
+{
+    let primary = fetch_verified_manifest_candidate(&mut fetch, MANIFEST_URL_PRIMARY, verify_key);
+    let fallback = fetch_verified_manifest_candidate(&mut fetch, MANIFEST_URL_FALLBACK, verify_key);
+    match (primary, fallback) {
+        (Ok(primary), Ok(fallback)) => match primary.version.cmp(&fallback.version) {
+            std::cmp::Ordering::Greater => Ok(primary),
+            std::cmp::Ordering::Less => Ok(fallback),
+            std::cmp::Ordering::Equal => {
+                if primary.canonical_payload() != fallback.canonical_payload() {
+                    return Err(format!(
+                        "legacy manifest equivocation: primary and fallback both claim version {} with different signed payloads",
+                        primary.version
+                    ));
                 }
+                Ok(primary)
             }
-            Ok(m)
+        },
+        (Ok(primary), Err(fallback_error)) => {
+            eprintln!(
+                "tirith: legacy manifest fallback unavailable or invalid ({fallback_error}); using verified primary"
+            );
+            Ok(primary)
         }
-        Err(primary_err) => {
-            eprintln!("tirith: primary manifest unavailable ({primary_err}), trying fallback...");
-            fetch_manifest_from(MANIFEST_URL_FALLBACK).map_err(|fallback_err| {
-                format!("manifest fetch failed: primary: {primary_err}; fallback: {fallback_err}")
-            })
+        (Err(primary_error), Ok(fallback)) => {
+            eprintln!(
+                "tirith: legacy manifest primary unavailable or invalid ({primary_error}); using verified fallback"
+            );
+            Ok(fallback)
         }
+        (Err(primary_error), Err(fallback_error)) => Err(format!(
+            "legacy manifest fetch/verification failed: primary: {primary_error}; fallback: {fallback_error}"
+        )),
     }
 }
 
@@ -1424,7 +1523,8 @@ fn fetch_manifest_from_with_state_and_client(
         let content_len = resp.content_length().unwrap_or(0);
         if content_len > MAX_MANIFEST_SIZE {
             return Err(format!(
-                "manifest too large: {content_len} bytes (max {MAX_MANIFEST_SIZE})"
+                "manifest too large: {} bytes (max {})",
+                content_len, MAX_MANIFEST_SIZE
             ));
         }
         // repo-0440: bound DURING the read — a chunked/no-length response
@@ -1490,7 +1590,8 @@ fn fetch_manifest_from_with_state_and_client(
             let retry_content_len = retry_resp.content_length().unwrap_or(0);
             if retry_content_len > MAX_MANIFEST_SIZE {
                 return Err(format!(
-                    "manifest too large on retry: {retry_content_len} bytes (max {MAX_MANIFEST_SIZE})"
+                    "manifest too large on retry: {} bytes (max {})",
+                    retry_content_len, MAX_MANIFEST_SIZE
                 ));
             }
             let retry_etag = retry_resp
@@ -1549,7 +1650,8 @@ fn download_db(manifest: &Manifest) -> Result<Vec<u8>, String> {
 fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
     if declared_size > MAX_DB_SIZE {
         return Err(format!(
-            "DB file too large: {declared_size} bytes (max {MAX_DB_SIZE})"
+            "DB file too large: {} bytes (max {})",
+            declared_size, MAX_DB_SIZE
         ));
     }
 
@@ -1656,7 +1758,8 @@ fn fetch_index_v2_from(url: &str) -> Result<IndexV2, String> {
     let content_len = resp.content_length().unwrap_or(0);
     if content_len > MAX_MANIFEST_SIZE {
         return Err(format!(
-            "v2 index too large: {content_len} bytes (max {MAX_MANIFEST_SIZE})"
+            "v2 index too large: {} bytes (max {})",
+            content_len, MAX_MANIFEST_SIZE
         ));
     }
     let body_bytes = read_bounded_bytes(resp, "v2-index", None, MAX_MANIFEST_SIZE)?;
@@ -2170,8 +2273,9 @@ fn explain_package(
             source_label: None,
             confidence: None,
             detail: format!(
-                "{eco} package '{name}' is edit-distance {distance} from the popular package '{popular}' \
-                 — a possible slopsquat/typo. Not itself listed as malicious."
+                "{} package '{}' is edit-distance {} from the popular package '{}' \
+                 — a possible slopsquat/typo. Not itself listed as malicious.",
+                eco, name, distance, popular
             ),
             reference_url: None,
         });
@@ -2619,7 +2723,7 @@ const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 /// Proleptic Gregorian leap-year test, shared by the date parser and formatter.
 fn is_leap_year(y: i64) -> bool {
-    (y.rem_euclid(4) == 0 && y.rem_euclid(100) != 0) || y.rem_euclid(400) == 0
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 /// Parse `YYYY-MM-DD` (or `...THH:MM:SS`) to a Unix epoch. Dependency-free;
@@ -2939,6 +3043,168 @@ mod tests {
             size: 1024,
             min_tirith_version: min.map(str::to_string),
         }
+    }
+
+    fn signed_manifest(version: u64, url: &str, sha256: &str, key: &SigningKey) -> Manifest {
+        let mut manifest = Manifest {
+            sha256: sha256.to_string(),
+            size: 1024,
+            url: url.to_string(),
+            version,
+            signature: String::new(),
+        };
+        use ed25519_dalek::Signer;
+        let signature = key.sign(manifest.canonical_payload().as_bytes());
+        manifest.signature = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            signature.to_bytes(),
+        );
+        manifest
+    }
+
+    #[test]
+    fn already_current_primary_still_reconciles_supplemental_state() {
+        for outcome in [UpdateOutcome::Installed, UpdateOutcome::AlreadyCurrent] {
+            let mut calls = 0usize;
+            reconcile_supplemental_after_primary(outcome, || {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, 1, "{outcome:?} must reconcile exactly once");
+        }
+        let mut calls = 0usize;
+        assert!(
+            reconcile_supplemental_after_primary(UpdateOutcome::NoCompatibleAsset, || {
+                calls += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            calls, 0,
+            "an unresolved primary must not publish an overlay"
+        );
+    }
+
+    #[test]
+    fn disabled_supplemental_removal_is_idempotent_and_reports_real_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("supplemental.dat");
+        std::fs::write(&path, b"stale overlay").unwrap();
+        remove_disabled_supplemental(&path).unwrap();
+        assert!(!path.exists());
+        remove_disabled_supplemental(&path).unwrap();
+
+        let directory = root.path().join("not-a-file");
+        std::fs::create_dir(&directory).unwrap();
+        let error = remove_disabled_supplemental(&directory).unwrap_err();
+        assert!(error.contains("failed to remove"), "{error}");
+        assert!(directory.is_dir());
+    }
+
+    #[test]
+    fn supplemental_aggregate_limit_is_atomic() {
+        let mut supplemental = SupplementalEntries::default();
+        let first = tirith_core::threatdb_feeds::FeedEntries {
+            hostnames: vec!["one.example".to_string()],
+            ips: vec![],
+        };
+        assert_eq!(
+            supplemental
+                .ingest_with_limit(first, ThreatSource::Urlhaus, 1)
+                .unwrap(),
+            1
+        );
+        let second = tirith_core::threatdb_feeds::FeedEntries {
+            hostnames: vec!["two.example".to_string()],
+            ips: vec![],
+        };
+        let error = supplemental
+            .ingest_with_limit(second, ThreatSource::PhishingArmy, 1)
+            .unwrap_err();
+        assert!(error.contains("aggregate indicator limit"), "{error}");
+        assert_eq!(supplemental.hostnames.len(), 1);
+        assert_eq!(supplemental.hostnames[0].0, "one.example");
+    }
+
+    #[test]
+    fn legacy_invalid_primary_uses_valid_signed_fallback() {
+        let key = SigningKey::from_bytes(&[0x31; 32]);
+        let fallback = signed_manifest(
+            12,
+            "https://example.com/fallback.dat",
+            &"b".repeat(64),
+            &key,
+        );
+        let mut invalid_primary =
+            signed_manifest(13, "https://example.com/primary.dat", &"a".repeat(64), &key);
+        invalid_primary.version = 14;
+
+        let selected = fetch_manifest_with(
+            |url| {
+                if url == MANIFEST_URL_PRIMARY {
+                    Ok(invalid_primary.clone())
+                } else {
+                    Ok(fallback.clone())
+                }
+            },
+            &key.verifying_key(),
+        )
+        .expect("valid fallback must survive an unauthenticated primary");
+        assert_eq!(selected.version, 12);
+        assert!(selected
+            .verify_signature_with_key(&key.verifying_key())
+            .is_ok());
+    }
+
+    #[test]
+    fn legacy_selection_chooses_newest_only_after_both_verify() {
+        let key = SigningKey::from_bytes(&[0x32; 32]);
+        let primary = signed_manifest(11, "https://example.com/primary.dat", &"a".repeat(64), &key);
+        let fallback = signed_manifest(
+            12,
+            "https://example.com/fallback.dat",
+            &"b".repeat(64),
+            &key,
+        );
+        let selected = fetch_manifest_with(
+            |url| {
+                if url == MANIFEST_URL_PRIMARY {
+                    Ok(primary.clone())
+                } else {
+                    Ok(fallback.clone())
+                }
+            },
+            &key.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(selected.version, 12);
+        assert_eq!(selected.url, fallback.url);
+    }
+
+    #[test]
+    fn legacy_equal_version_signed_equivocation_fails_closed() {
+        let key = SigningKey::from_bytes(&[0x33; 32]);
+        let primary = signed_manifest(12, "https://example.com/primary.dat", &"a".repeat(64), &key);
+        let fallback = signed_manifest(
+            12,
+            "https://example.com/fallback.dat",
+            &"b".repeat(64),
+            &key,
+        );
+        let error = fetch_manifest_with(
+            |url| {
+                if url == MANIFEST_URL_PRIMARY {
+                    Ok(primary.clone())
+                } else {
+                    Ok(fallback.clone())
+                }
+            },
+            &key.verifying_key(),
+        )
+        .unwrap_err();
+        assert!(error.contains("equivocation"), "{error}");
     }
 
     #[test]
@@ -3282,6 +3548,33 @@ mod tests {
         let idx = signed_index_v2(1, vec![asset(1, None), asset(2, Some("0.3.4"))], &key);
         let chosen = idx.select_asset("0.3.4").expect("an asset is compatible");
         assert_eq!(chosen.format, 2, "highest compatible format wins");
+    }
+
+    #[test]
+    fn post_r3_signed_index_selection_contract_is_frozen() {
+        let key = SigningKey::from_bytes(&[0xc0; 32]);
+        let idx = signed_index_v2(181, vec![asset(2, Some("0.3.4")), asset(1, None)], &key);
+
+        for (client, expected_format, expected_filename) in [
+            ("0.3.3", 1, "tirith-threatdb-v1.dat"),
+            ("0.3.4", 2, "tirith-threatdb-v2.dat"),
+            ("0.4.0", 2, "tirith-threatdb-v2.dat"),
+        ] {
+            let selected = idx
+                .select_asset(client)
+                .unwrap_or_else(|| panic!("post-r3 client {client} must select an asset"));
+            assert_eq!(selected.format, expected_format, "client {client}");
+            assert_eq!(selected.filename, expected_filename, "client {client}");
+        }
+
+        let reversed = signed_index_v2(181, vec![asset(1, None), asset(2, Some("0.3.4"))], &key);
+        assert_eq!(
+            reversed
+                .select_asset("0.3.4")
+                .map(|asset| (asset.format, asset.filename.as_str())),
+            Some((2, "tirith-threatdb-v2.dat")),
+            "signed-index asset order must not affect the selected channel"
+        );
     }
 
     #[test]
@@ -3837,7 +4130,8 @@ mod tests {
         let diff = written_ts.saturating_sub(now);
         assert_eq!(
             diff, BACKOFF_SECS,
-            "backoff should set next-check-at to now + {BACKOFF_SECS} seconds, got diff={diff}"
+            "backoff should set next-check-at to now + {} seconds, got diff={}",
+            BACKOFF_SECS, diff
         );
         assert_eq!(
             BACKOFF_SECS, 3600,
@@ -4536,37 +4830,13 @@ mod tests {
     // `maybe_background_update` a guaranteed no-op — zero network and no
     // `spawned-at` state file (the breadcrumb written right before a spawn).
 
-    /// RAII guard that sets/removes `TIRITH_OFFLINE` and restores it on Drop.
-    struct OfflineEnvGuard {
-        old: Option<std::ffi::OsString>,
-    }
-    impl OfflineEnvGuard {
-        fn set(val: &str) -> Self {
-            let old = std::env::var_os("TIRITH_OFFLINE");
-            unsafe { std::env::set_var("TIRITH_OFFLINE", val) };
-            Self { old }
-        }
-        fn unset() -> Self {
-            let old = std::env::var_os("TIRITH_OFFLINE");
-            unsafe { std::env::remove_var("TIRITH_OFFLINE") };
-            Self { old }
-        }
-    }
-    impl Drop for OfflineEnvGuard {
-        fn drop(&mut self) {
-            match &self.old {
-                Some(v) => unsafe { std::env::set_var("TIRITH_OFFLINE", v) },
-                None => unsafe { std::env::remove_var("TIRITH_OFFLINE") },
-            }
-        }
-    }
-
     #[test]
     fn offline_env_active_recognizes_truthy_values() {
-        // `offline_env_active` lives in `cli/mod.rs`; exercised here via the env guard.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `offline_env_active` lives in `cli/mod.rs`; exercise it inside the
+        // shared process-global state guard.
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in ["1", "true", "TRUE", "yes", "On", " on "] {
-            let _e = OfflineEnvGuard::set(v);
+            guard.set_env("TIRITH_OFFLINE", v);
             assert!(
                 crate::cli::offline_env_active(),
                 "TIRITH_OFFLINE={v:?} should be treated as offline"
@@ -4576,15 +4846,15 @@ mod tests {
 
     #[test]
     fn offline_env_active_rejects_falsey_and_unset() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in ["0", "false", "no", "", "off", "garbage"] {
-            let _e = OfflineEnvGuard::set(v);
+            guard.set_env("TIRITH_OFFLINE", v);
             assert!(
                 !crate::cli::offline_env_active(),
                 "TIRITH_OFFLINE={v:?} should NOT be treated as offline"
             );
         }
-        let _e = OfflineEnvGuard::unset();
+        guard.remove_env("TIRITH_OFFLINE");
         assert!(
             !crate::cli::offline_env_active(),
             "unset TIRITH_OFFLINE should not be offline"
@@ -4595,8 +4865,8 @@ mod tests {
     fn offline_flag_skips_background_update_no_network_attempt() {
         // With `--offline`, `maybe_background_update` must not reach the state
         // dir: no `spawned-at` file, so no child spawned (= zero network).
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _e = OfflineEnvGuard::unset();
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove_env("TIRITH_OFFLINE");
         let tmp = tempfile::tempdir().unwrap();
         let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 
@@ -4613,8 +4883,8 @@ mod tests {
     fn offline_env_skips_background_update_no_network_attempt() {
         // Same guarantee via `TIRITH_OFFLINE` (the path shell hooks and the
         // conformance harness use, lacking CLI flags per `tirith check`).
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _e = OfflineEnvGuard::set("1");
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        guard.set_env("TIRITH_OFFLINE", "1");
         let tmp = tempfile::tempdir().unwrap();
         let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 

@@ -969,6 +969,52 @@ mod tests {
         dir.join("canaries.jsonl")
     }
 
+    /// Categorical, bounded request-line diagnostic. It intentionally reports
+    /// neither target bytes, headers, nor body content, so a failed callback
+    /// assertion cannot leak a token or caller-controlled payload into CI logs.
+    fn callback_request_shape(request: &[u8]) -> String {
+        const LINE_CAP: usize = 256;
+        const LENGTH_CAP: usize = 1024 * 1024;
+
+        let raw_line_len = request
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .unwrap_or(request.len());
+        let line_len = raw_line_len.min(LINE_CAP).min(request.len());
+        let line = &request[..line_len];
+        let mut parts = line.split(|byte| *byte == b' ');
+        let method = match parts.next() {
+            Some(b"POST") => "post",
+            Some(b"") | None => "missing",
+            Some(_) => "other",
+        };
+        let target = match parts.next() {
+            Some(b"/canary") => "origin_canary",
+            Some(value) if value.starts_with(b"http://") => "absolute_http",
+            Some(value) if value.starts_with(b"https://") => "absolute_https",
+            Some(value) if value.starts_with(b"/") => "other_origin",
+            Some(b"") | None => "missing",
+            Some(_) => "other",
+        };
+        let version = match parts.next() {
+            Some(b"HTTP/1.1") => "http_1_1",
+            Some(b"HTTP/1.0") => "http_1_0",
+            Some(b"") | None => "missing",
+            Some(_) => "other",
+        };
+        let extra_parts = parts.next().is_some();
+        format!(
+            "method={method};target={target};version={version};extra_parts={extra_parts};\
+             line_bytes={};line_truncated={};request_bytes={};request_length_capped={};\
+             headers_complete={}",
+            line_len,
+            raw_line_len > LINE_CAP,
+            request.len().min(LENGTH_CAP),
+            request.len() > LENGTH_CAP,
+            request.windows(4).any(|window| window == b"\r\n\r\n")
+        )
+    }
+
     /// Make a FIFO at `path` (unix). Returns false if mkfifo is unsupported here.
     #[cfg(unix)]
     fn mkfifo_at(path: &Path) -> bool {
@@ -1638,9 +1684,6 @@ mod tests {
     fn callback_sender_rejects_connect_time_private_dns_rebind() {
         use crate::ssrf_guard::test_support::EnvironmentRestore;
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
         let url = "http://callback-public.example.test:8080/canary";
@@ -1690,9 +1733,6 @@ mod tests {
             http_response, EnvironmentRestore, ScriptedHttpServer,
         };
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
         let location = "http://127.0.0.1:9/internal";
@@ -1752,9 +1792,6 @@ mod tests {
             http_response, EnvironmentRestore, ProxyTrap, ScriptedHttpServer,
         };
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = ScriptedHttpServer::start(vec![http_response("204 No Content", &[], b"")]);
         let proxy = ProxyTrap::start();
         let mut restore = EnvironmentRestore::new();
@@ -1802,7 +1839,11 @@ mod tests {
             "callback sender must not delegate the target to an ambient proxy"
         );
         let request = &requests[0];
-        assert!(request.starts_with(b"POST /canary HTTP/1.1\r\n"));
+        assert!(
+            request.starts_with(b"POST /canary HTTP/1.1\r\n"),
+            "unexpected direct callback wire shape: {}",
+            callback_request_shape(request)
+        );
         let body_start = request
             .windows(4)
             .position(|window| window == b"\r\n\r\n")

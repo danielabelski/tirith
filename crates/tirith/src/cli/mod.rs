@@ -99,7 +99,7 @@ fn write_json_to<W: Write, T: serde::Serialize>(out: &mut W, value: &T) -> bool 
 /// Callers MUST pass only the untrusted VALUE, never a whole formatted line: the
 /// display scrub removes ALL ANSI, including tirith's own severity colors.
 pub fn sanitize_for_human_output(s: &str, allow_multiline: bool) -> String {
-    let cleaned = tirith_core::mcp::output_filter::sanitize_for_display(s);
+    let cleaned = tirith_core::mcp::output_filter::sanitize_for_display(s).replace('\t', "\\t");
     if allow_multiline {
         // Keep newlines but re-indent every continuation line so an injected `\n`
         // cannot fabricate a new top-level row. The display scrub already reduced
@@ -119,9 +119,134 @@ pub fn sanitize_for_human_output(s: &str, allow_multiline: bool) -> String {
     }
 }
 
+/// Maximum number of Unicode scalar values retained from an untrusted
+/// provenance field. The trailing ellipsis, when present, is outside this
+/// budget by one character.
+#[cfg(test)]
+pub(crate) const PROVENANCE_MAX_CHARS: usize = tirith_core::redact::PROVENANCE_MAX_CHARS;
+
+/// Redact and terminal-neutralize an untrusted provenance text field using one
+/// already-frozen custom-DLP plan. Newlines/tabs are flattened so the same
+/// returned value is safe in both JSON and human one-line projections.
+pub(crate) fn sanitize_provenance_text_with_compiled(
+    value: &str,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> String {
+    tirith_core::redact::sanitize_provenance_text_with_compiled(value, compiled)
+}
+
+/// Redact an untrusted provenance URL before it reaches any output surface.
+/// Userinfo, query, and fragment are always removed. Known hosted-RPC provider
+/// paths (and generic `/v2|v3/<secret-shaped-token>` paths) are reduced to a
+/// non-secret prefix because API credentials commonly live in those segments.
+/// The resulting value then passes through the exact text sanitizer above.
+pub(crate) fn sanitize_provenance_url_with_compiled(
+    value: &str,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> String {
+    tirith_core::redact::sanitize_provenance_url_with_compiled(value, compiled)
+}
+
+/// A redacted, priority-bounded clone for one JSON DTO boundary. The raw
+/// verdict remains available to policy, audit, and exit-code callers.
+pub(crate) struct VerdictPresentation {
+    pub verdict: tirith_core::verdict::Verdict,
+    pub original_findings_count: usize,
+    pub presented_findings_count: usize,
+    pub dropped_findings_count: usize,
+}
+
+pub(crate) fn prepare_verdict_presentation(
+    verdict: &tirith_core::verdict::Verdict,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> VerdictPresentation {
+    let original_findings_count = verdict.findings.len();
+    let retained_findings_count =
+        tirith_core::verdict::retained_finding_indices_for_output(&verdict.findings).len();
+    let dropped_findings_count = original_findings_count.saturating_sub(retained_findings_count);
+
+    // Redact before truncation so a presentation boundary cannot split a
+    // secret and make the configured pattern stop matching.
+    let mut display = verdict.clone();
+    tirith_core::redact::redact_verdict_with_compiled(&mut display, compiled);
+    tirith_core::verdict::bound_verdict_for_output(&mut display);
+    let presented_findings_count = display.findings.len();
+
+    VerdictPresentation {
+        verdict: display,
+        original_findings_count,
+        presented_findings_count,
+        dropped_findings_count,
+    }
+}
+
 #[cfg(test)]
 mod write_json_tests {
     use super::write_json_to;
+
+    #[test]
+    fn verdict_projection_keeps_late_critical_high_and_analysis_incomplete() {
+        use tirith_core::verdict::{Finding, RuleId, Severity, Timings, Verdict};
+
+        let finding = |rule_id, severity, title: &str| Finding {
+            rule_id,
+            severity,
+            title: title.to_string(),
+            description: "bounded projection regression".to_string(),
+            evidence: Vec::new(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let mut findings = (0..400)
+            .map(|index| {
+                finding(
+                    RuleId::ConfigInjection,
+                    Severity::Low,
+                    &format!("early low {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        findings.push(finding(
+            RuleId::CredentialInText,
+            Severity::High,
+            "late high",
+        ));
+        findings.push(finding(
+            RuleId::AnalysisIncomplete,
+            Severity::Medium,
+            "late analysis incomplete",
+        ));
+        findings.push(finding(
+            RuleId::PrivateKeyExposed,
+            Severity::Critical,
+            "late critical",
+        ));
+        let verdict = Verdict::from_findings(findings, 3, Timings::default());
+        let raw_count = verdict.findings.len();
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let projection = super::prepare_verdict_presentation(&verdict, &compiled);
+
+        assert_eq!(verdict.findings.len(), raw_count);
+        assert_eq!(projection.original_findings_count, raw_count);
+        assert!(projection.dropped_findings_count > 0);
+        for rule_id in [
+            RuleId::PrivateKeyExposed,
+            RuleId::CredentialInText,
+            RuleId::AnalysisIncomplete,
+        ] {
+            assert!(
+                projection
+                    .verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == rule_id),
+                "late priority finding {rule_id} was dropped"
+            );
+        }
+    }
 
     /// A writer that always fails — models a broken pipe / closed stdout.
     struct FailingWriter;
@@ -294,6 +419,14 @@ mod write_json_tests {
         assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
     }
 
+    /// The containment properties below are asserted on
+    /// [`super::write_config_file_permitted`], the only contained publisher the
+    /// CLI has left, with an inert default policy so the subject is the write
+    /// and not the gate.
+    fn inert() -> tirith_core::policy::Policy {
+        tirith_core::policy::Policy::default()
+    }
+
     #[test]
     fn contained_atomic_write_stays_beneath_root() {
         let root = tempfile::tempdir().unwrap();
@@ -301,7 +434,15 @@ mod write_json_tests {
         std::fs::create_dir(&config).unwrap();
         let path = config.join("policy.yaml");
 
-        super::write_file_atomic_contained(root.path(), &path, b"safe: true\n", true).unwrap();
+        super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"safe: true\n",
+            true,
+            &inert(),
+            true,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"safe: true\n");
 
         let outside = tempfile::tempdir().unwrap();
@@ -311,9 +452,458 @@ mod write_json_tests {
                 .file_name()
                 .expect("temp directory has a name"),
         );
-        let err = super::write_file_atomic_contained(root.path(), &escaped, b"escape", true)
-            .expect_err("a destination outside the anchored root must be rejected");
+        let err = super::write_config_file_permitted(
+            root.path(),
+            &escaped,
+            b"escape",
+            true,
+            &inert(),
+            true,
+        )
+        .expect_err("a destination outside the anchored root must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn config_write_without_a_v2_provider_fails_closed_when_provenance_is_required() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("policy.yaml");
+        let mut policy = inert();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_requiring_verified_provenance
+            .insert(tirith_core::effects::CommandEffectKind::FilesystemWrite);
+
+        let error = super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"safe: true\n",
+            true,
+            &policy,
+            true,
+        )
+        .expect_err("a locally derived v1 envelope cannot satisfy verified provenance");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("verified provenance requires a strict schema-v2 task envelope"));
+        assert!(!path.exists(), "a refused write must not be published");
+    }
+
+    #[test]
+    fn config_write_operation_mismatch_never_enters_replay_consumption() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let authorized_path = root.path().join("authorized-policy.yaml");
+        let authorized_envelope =
+            tirith_core::config_write::ConfigWritePermit::operation_envelope_for(
+                root.path(),
+                &authorized_path,
+                b"safe\n",
+                true,
+                "policy-a",
+                false,
+            )
+            .unwrap();
+        let authorized_operation = tirith_core::task_boundary::BoundaryOperation {
+            boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+            envelope: &authorized_envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: Default::default(),
+        };
+        let pending = tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+            tirith_core::task_boundary::ConfigWriteBoundary,
+        >(
+            &authorized_operation,
+            &tirith_core::web3_policy::TaskGatePolicy::default(),
+            &tirith_core::task_analysis::TaskAnalysisContext::default(),
+        )
+        .expect("prepare authorization");
+
+        let changed_path = root.path().join("changed-policy.yaml");
+        let changed_envelope =
+            tirith_core::config_write::ConfigWritePermit::operation_envelope_for(
+                root.path(),
+                &changed_path,
+                b"safe\n",
+                true,
+                "policy-a",
+                false,
+            )
+            .unwrap();
+        let changed_operation = tirith_core::task_boundary::BoundaryOperation {
+            boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+            envelope: &changed_envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: Default::default(),
+        };
+        // This closure is the only path into `consume_default`, and therefore
+        // the only path that could open and write the durable replay ledger.
+        let replay_writes = AtomicUsize::new(0);
+        let result = super::consume_config_write_authorization_with(
+            pending,
+            &changed_operation,
+            |pending| {
+                replay_writes.fetch_add(1, Ordering::SeqCst);
+                pending.consume_default(chrono::Utc::now())
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("a changed operation must fail before replay consumption"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            tirith_core::task_boundary::BoundaryAuthorizationError::EnvelopeMismatch
+        ));
+        assert_eq!(replay_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn every_config_projection_mutation_fails_before_replay_consumption() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Mutation {
+            label: &'static str,
+            other_root: bool,
+            other_destination: bool,
+            contents: &'static [u8],
+            overwrite: bool,
+            policy_identity: &'static str,
+            policy_change: bool,
+        }
+        let mutations = [
+            Mutation {
+                label: "destination",
+                other_root: false,
+                other_destination: true,
+                contents: b"safe\n",
+                overwrite: true,
+                policy_identity: "policy-a",
+                policy_change: true,
+            },
+            Mutation {
+                label: "content",
+                other_root: false,
+                other_destination: false,
+                contents: b"changed\n",
+                overwrite: true,
+                policy_identity: "policy-a",
+                policy_change: true,
+            },
+            Mutation {
+                label: "overwrite mode",
+                other_root: false,
+                other_destination: false,
+                contents: b"safe\n",
+                overwrite: false,
+                policy_identity: "policy-a",
+                policy_change: true,
+            },
+            Mutation {
+                label: "root identity",
+                other_root: true,
+                other_destination: false,
+                contents: b"safe\n",
+                overwrite: true,
+                policy_identity: "policy-a",
+                policy_change: true,
+            },
+            Mutation {
+                label: "policy identity",
+                other_root: false,
+                other_destination: false,
+                contents: b"safe\n",
+                overwrite: true,
+                policy_identity: "policy-b",
+                policy_change: true,
+            },
+            Mutation {
+                label: "PolicyChange classification",
+                other_root: false,
+                other_destination: false,
+                contents: b"safe\n",
+                overwrite: true,
+                policy_identity: "policy-a",
+                policy_change: false,
+            },
+        ];
+
+        for mutation in mutations {
+            let authorized_root = tempfile::tempdir().unwrap();
+            let other_root = tempfile::tempdir().unwrap();
+            let authorized_path = authorized_root.path().join("policy.yaml");
+            let authorized_envelope =
+                tirith_core::config_write::ConfigWritePermit::operation_envelope_for(
+                    authorized_root.path(),
+                    &authorized_path,
+                    b"safe\n",
+                    true,
+                    "policy-a",
+                    true,
+                )
+                .unwrap();
+            let authorized_operation = tirith_core::task_boundary::BoundaryOperation {
+                boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+                envelope: &authorized_envelope,
+                adapter: tirith_core::task::IngressAdapter::Unattributed,
+                boundary_effects:
+                    tirith_core::config_write::ConfigWritePermit::boundary_effects_for(true),
+            };
+            let pending =
+                tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+                    tirith_core::task_boundary::ConfigWriteBoundary,
+                >(
+                    &authorized_operation,
+                    &tirith_core::web3_policy::TaskGatePolicy::default(),
+                    &tirith_core::task_analysis::TaskAnalysisContext::default(),
+                )
+                .expect("prepare authorization");
+
+            let root = if mutation.other_root {
+                other_root.path()
+            } else {
+                authorized_root.path()
+            };
+            let path = if mutation.other_destination {
+                root.join("other.yaml")
+            } else {
+                root.join("policy.yaml")
+            };
+            let changed_envelope =
+                tirith_core::config_write::ConfigWritePermit::operation_envelope_for(
+                    root,
+                    &path,
+                    mutation.contents,
+                    mutation.overwrite,
+                    mutation.policy_identity,
+                    mutation.policy_change,
+                )
+                .unwrap();
+            let changed_operation = tirith_core::task_boundary::BoundaryOperation {
+                boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+                envelope: &changed_envelope,
+                adapter: tirith_core::task::IngressAdapter::Unattributed,
+                boundary_effects:
+                    tirith_core::config_write::ConfigWritePermit::boundary_effects_for(
+                        mutation.policy_change,
+                    ),
+            };
+            let replay_writes = AtomicUsize::new(0);
+            let result = super::consume_config_write_authorization_with(
+                pending,
+                &changed_operation,
+                |pending| {
+                    replay_writes.fetch_add(1, Ordering::SeqCst);
+                    pending.consume_default(chrono::Utc::now())
+                },
+            );
+            let error = match result {
+                Ok(_) => panic!("{}: mutation reached replay consumption", mutation.label),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                tirith_core::task_boundary::BoundaryAuthorizationError::EnvelopeMismatch
+            ));
+            assert_eq!(
+                replay_writes.load(Ordering::SeqCst),
+                0,
+                "{}",
+                mutation.label
+            );
+        }
+    }
+
+    #[test]
+    fn policy_file_mutators_are_byte_identical_on_real_writer_denial() {
+        type Mutator = fn(&std::path::Path) -> std::io::Result<()>;
+        fn context(path: &std::path::Path) -> std::io::Result<()> {
+            super::context::update_policy_guard_key(path, true)
+        }
+        fn env(path: &std::path::Path) -> std::io::Result<()> {
+            super::env_guard::update_policy_guard_key(path, true)
+        }
+        fn exec(path: &std::path::Path) -> std::io::Result<()> {
+            super::exec::update_policy_guard_key(path, true)
+        }
+        fn hooks(path: &std::path::Path) -> std::io::Result<()> {
+            super::hooks::update_policy_guard_key(path, true)
+        }
+        fn sudo_guard(path: &std::path::Path) -> std::io::Result<()> {
+            super::sudo::update_policy_key(path, "context_guard_enabled", "true")
+        }
+        fn sudo_reason(path: &std::path::Path) -> std::io::Result<()> {
+            super::sudo::update_policy_key(path, "sudo_require_reason", "true")
+        }
+        fn baseline(path: &std::path::Path) -> std::io::Result<()> {
+            super::baseline::update_baseline_flag(path, true)
+        }
+        fn devcontainer(path: &std::path::Path) -> std::io::Result<()> {
+            super::devcontainer::update_policy_key(path, "devcontainer_guard_enabled", "true")
+        }
+        fn ssh(path: &std::path::Path) -> std::io::Result<()> {
+            super::ssh::update_policy_guard_key(path, true)
+        }
+        fn iac_guard(path: &std::path::Path) -> std::io::Result<()> {
+            super::iac::update_policy_key(path, "iac_guard_enabled", "true")
+        }
+        fn iac_plan(path: &std::path::Path) -> std::io::Result<()> {
+            super::iac::update_policy_key(path, "iac_require_plan_before_apply", "true")
+        }
+        fn doctor(path: &std::path::Path) -> std::io::Result<()> {
+            let root = path.parent().and_then(std::path::Path::parent).unwrap();
+            super::doctor::create_policy_contained(root, path, "replacement\n")
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))
+        }
+
+        let surfaces: &[(&str, Mutator)] = &[
+            ("context guard", context),
+            ("env guard", env),
+            ("exec guard", exec),
+            ("hooks guard", hooks),
+            ("sudo guard", sudo_guard),
+            ("sudo require-reason", sudo_reason),
+            ("baseline learn", baseline),
+            ("devcontainer guard", devcontainer),
+            ("ssh guard", ssh),
+            ("iac guard", iac_guard),
+            ("iac require-plan", iac_plan),
+            ("doctor policy create", doctor),
+        ];
+        let denied = b"task_gate:\n  mode: enforce\n  effects_denied_for_untrusted_sources: [policy_change]\n";
+
+        for (surface, mutate) in surfaces {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join(".git")).unwrap();
+            let config = root.path().join(".tirith");
+            std::fs::create_dir(&config).unwrap();
+            let path = config.join("policy.yaml");
+            std::fs::write(&path, denied).unwrap();
+            let error = mutate(&path).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{surface}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), denied, "{surface}");
+        }
+    }
+
+    #[test]
+    fn context_label_writer_is_byte_identical_on_real_writer_denial() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("context-labels.yaml");
+        let original = b"aws:prod: critical\n";
+        std::fs::write(&path, original).unwrap();
+        let mut policy = inert();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .insert(tirith_core::effects::CommandEffectKind::PolicyChange);
+
+        super::write_context_labels_permitted(&path, &[("gcp:prod", "production")], &policy)
+            .expect_err("the real retained label writer must be denied");
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn retained_publisher_does_not_run_after_policy_change_deny() {
+        let mut policy = inert();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .insert(tirith_core::effects::CommandEffectKind::PolicyChange);
+
+        let retained_root = tempfile::tempdir().unwrap();
+        let retained_path = retained_root.path().join("policy.yaml");
+        std::fs::write(&retained_path, b"original\n").unwrap();
+        let destination = tirith_core::util::ContainedAtomicFile::prepare(
+            retained_root.path(),
+            &retained_path,
+            false,
+        )
+        .unwrap();
+        let error = super::write_prepared_config_file_permitted(
+            retained_root.path(),
+            &retained_path,
+            destination,
+            b"changed\n",
+            true,
+            &policy,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&retained_path).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn denied_parent_creating_write_leaves_namespace_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        let path = config.join("policy.yaml");
+        let mut policy = inert();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .insert(tirith_core::effects::CommandEffectKind::PolicyChange);
+
+        let error = super::write_config_file_permitted_with_parent_creation(
+            root.path(),
+            &path,
+            b"changed\n",
+            true,
+            &policy,
+            true,
+            true,
+        )
+        .expect_err("policy deny must happen before parent creation");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!config.exists());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_rejects_distinct_non_utf8_config_destinations() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        std::fs::create_dir(&config).unwrap();
+        let first = config.join(OsString::from_vec(b"policy-\x80.yaml".to_vec()));
+        let second = config.join(OsString::from_vec(b"policy-\x81.yaml".to_vec()));
+
+        assert_ne!(first, second);
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        for path in [&first, &second] {
+            let error = super::write_config_file_permitted(
+                root.path(),
+                path,
+                b"safe: true\n",
+                true,
+                &inert(),
+                true,
+            )
+            .expect_err("non-UTF-8 destinations must be rejected before authorization");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!path.exists());
+        }
     }
 
     #[test]
@@ -323,15 +913,36 @@ mod write_json_tests {
         std::fs::create_dir(&config).unwrap();
         let path = config.join("commands.yaml");
 
-        super::write_file_atomic_contained(root.path(), &path, b"original\n", false)
-            .expect("no-clobber create must succeed when absent");
-        let error = super::write_file_atomic_contained(root.path(), &path, b"replacement\n", false)
-            .expect_err("no-clobber publish must refuse an existing destination");
+        super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"original\n",
+            false,
+            &inert(),
+            false,
+        )
+        .expect("no-clobber create must succeed when absent");
+        let error = super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"replacement\n",
+            false,
+            &inert(),
+            false,
+        )
+        .expect_err("no-clobber publish must refuse an existing destination");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&path).unwrap(), b"original\n");
 
-        super::write_file_atomic_contained(root.path(), &path, b"replacement\n", true)
-            .expect("overwrite still atomically replaces the destination");
+        super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"replacement\n",
+            true,
+            &inert(),
+            false,
+        )
+        .expect("overwrite still atomically replaces the destination");
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement\n");
         assert_eq!(
             std::fs::read_dir(&config).unwrap().count(),
@@ -353,7 +964,7 @@ mod write_json_tests {
         let path = config.join("policy.yaml");
         symlink(outside.path(), &path).unwrap();
 
-        super::write_file_atomic_contained(root.path(), &path, b"attacker", true)
+        super::write_config_file_permitted(root.path(), &path, b"attacker", true, &inert(), true)
             .expect_err("a repo-contained writer must refuse a final symlink");
         assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
         assert!(std::fs::symlink_metadata(path)
@@ -373,8 +984,15 @@ mod write_json_tests {
         symlink(outside.path(), &config).unwrap();
         let path = config.join("policy.yaml");
 
-        let err = super::write_file_atomic_contained(root.path(), &path, b"attacker", true)
-            .expect_err("a repo-contained writer must refuse an escaping parent link");
+        let err = super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"attacker",
+            true,
+            &inert(),
+            true,
+        )
+        .expect_err("a repo-contained writer must refuse an escaping parent link");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!outside.path().join("policy.yaml").exists());
     }
@@ -451,19 +1069,387 @@ pub(crate) fn write_file_atomic(
     write_file_atomic_to_dest(&dest, contents, overwrite)
 }
 
-/// Atomically write a repository-owned file while proving the effective parent
-/// remains beneath `root`. Unlike [`write_file_atomic`], this variant never
-/// follows a final-component symlink: profile compatibility and repository
-/// containment are distinct policies.
-pub(crate) fn write_file_atomic_contained(
+fn consume_config_write_authorization_with<F>(
+    pending: tirith_core::task_boundary::PendingBoundaryAuthorization<
+        tirith_core::task_boundary::ConfigWriteBoundary,
+    >,
+    operation: &tirith_core::task_boundary::BoundaryOperation<'_>,
+    consume: F,
+) -> Result<
+    tirith_core::task_boundary::TaskBoundaryPermit<tirith_core::task_boundary::ConfigWriteBoundary>,
+    tirith_core::task_boundary::BoundaryAuthorizationError,
+>
+where
+    F: FnOnce(
+        tirith_core::task_boundary::PendingBoundaryAuthorization<
+            tirith_core::task_boundary::ConfigWriteBoundary,
+        >,
+    ) -> Result<
+        tirith_core::task_boundary::TaskBoundaryPermit<
+            tirith_core::task_boundary::ConfigWriteBoundary,
+        >,
+        tirith_core::task_boundary::BoundaryAuthorizationError,
+    >,
+{
+    if !pending.binds_operation(operation) {
+        return Err(tirith_core::task_boundary::BoundaryAuthorizationError::EnvelopeMismatch);
+    }
+    consume(pending)
+}
+
+/// C12: publish a TIRITH-OWNED configuration file through the task gate and a
+/// single-use [`tirith_core::config_write::ConfigWritePermit`].
+///
+/// The irreversible step is the final rename inside `commit`, so the gate runs
+/// before the permit is even issued and the permit re-checks its bindings again
+/// immediately before that rename. `policy_change` is the caller's own statement
+/// that the mutation changes effective policy, trust, or approval configuration;
+/// only the caller knows that semantic role, so it is passed as a boundary
+/// effect rather than guessed from the path.
+///
+/// Honest scope: this covers files Tirith itself writes. A shell redirection
+/// into an agent config, or any other host write that does not go through
+/// Tirith, is not intercepted here.
+///
+/// This is the ONLY contained publisher the CLI has. There used to be an
+/// ungated `write_file_atomic_contained` beside it, and every site that still
+/// called it (the MCP lock, the MCP policy scaffold, the gateway's descriptor
+/// re-baseline) was a Tirith-owned config write the gate silently did not cover.
+/// Deleting it, rather than documenting it, is what makes that class of omission
+/// a compile error instead of an audit finding.
+#[cfg(test)]
+pub(crate) fn write_config_file_permitted(
     root: &std::path::Path,
     path: &std::path::Path,
     contents: &[u8],
     overwrite: bool,
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
 ) -> std::io::Result<()> {
-    write_file_atomic_contained_with_hook(root, path, contents, overwrite, || Ok(()))
+    write_config_file_permitted_with_parent_creation(
+        root,
+        path,
+        contents,
+        overwrite,
+        policy,
+        policy_change,
+        false,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_config_file_permitted_with_parent_creation(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    contents: &[u8],
+    overwrite: bool,
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
+    create_parent: bool,
+) -> std::io::Result<()> {
+    // Make the pure policy decision before `create_parent` can materialize a
+    // directory. Replay is deliberately not consumed until the retained
+    // filesystem capability exists and has reconstructed the same operation.
+    preflight_config_write_authorization(root, path, overwrite, policy, policy_change)?;
+    let permit = tirith_core::config_write::ConfigWritePermit::prepare_owned(
+        root,
+        path,
+        contents,
+        overwrite,
+        &policy.enforcement_projection_hash(),
+        policy_change,
+        create_parent,
+    )?;
+    commit_config_write_permit(permit, contents, policy)
+}
+
+/// Make the complete pure task-gate decision before a caller creates a parent,
+/// opens/creates a mutation lock, or performs any other filesystem side effect.
+/// The payload is intentionally empty: content is not an effect-classification
+/// input, and the exact bytes/capability are authorized again after the caller
+/// has safely read and rendered them. Provenance-required policy still fails
+/// closed here because locally-derived ConfigWrite has no trusted v2 provider.
+pub(crate) fn preflight_config_write_authorization(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    overwrite: bool,
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
+) -> std::io::Result<()> {
+    let _pending =
+        prepare_config_write_authorization(root, path, &[], overwrite, policy, policy_change)?;
+    Ok(())
+}
+
+/// Preflight before a potentially parent-creating retained bind. RMW callers
+/// keep the returned capability through read, render, exact authorization, and
+/// publication.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_config_destination_permitted(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    overwrite: bool,
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
+    create_parent: bool,
+) -> std::io::Result<tirith_core::util::ContainedAtomicFile> {
+    preflight_config_write_authorization(root, path, overwrite, policy, policy_change)?;
+    let destination = tirith_core::util::ContainedAtomicFile::prepare(root, path, create_parent)?;
+    destination.lock_parent_for_mutation()?;
+    Ok(destination)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_prepared_config_file_permitted(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    destination: tirith_core::util::ContainedAtomicFile,
+    contents: &[u8],
+    overwrite: bool,
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
+) -> std::io::Result<()> {
+    let permit = tirith_core::config_write::ConfigWritePermit::from_prepared(
+        destination,
+        root,
+        path,
+        contents,
+        overwrite,
+        &policy.enforcement_projection_hash(),
+        policy_change,
+    )?;
+    commit_config_write_permit(permit, contents, policy)
+}
+
+/// Delete a Tirith-owned configuration file through the same retained
+/// ConfigWrite boundary used for publication. The domain-separated binding
+/// distinguishes deletion from writing the old bytes, while the permit also
+/// binds the exact present preimage identity and digest captured by the caller.
+pub(crate) fn delete_prepared_config_file_permitted(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    destination: tirith_core::util::ContainedAtomicFile,
+    expected_contents: &[u8],
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
+) -> std::io::Result<()> {
+    let delete_binding = format!(
+        "tirith-config-delete:v1:present-sha256:{}:result-absent",
+        tirith_core::command_card::sha256_hex(expected_contents)
+    );
+    let permit = tirith_core::config_write::ConfigWritePermit::from_prepared(
+        destination,
+        root,
+        path,
+        delete_binding.as_bytes(),
+        true,
+        &policy.enforcement_projection_hash(),
+        policy_change,
+    )?;
+    let envelope = permit.operation_envelope();
+    let operation = tirith_core::task_boundary::BoundaryOperation {
+        boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+        envelope: &envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: permit.boundary_effects(),
+    };
+    let pending_authorization =
+        prepare_config_write_authorization_from_operation(&operation, policy)?;
+    if !permit.binds_publication(delete_binding.as_bytes(), &operation) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "configuration deletion no longer matches its exact authorization",
+        ));
+    }
+    let boundary_permit =
+        consume_config_write_authorization_with(pending_authorization, &operation, |pending| {
+            pending.consume_default(chrono::Utc::now())
+        })
+        .map_err(config_write_gate_error)?;
+    permit
+        .commit_delete_authorized(
+            delete_binding.as_bytes(),
+            expected_contents,
+            boundary_permit,
+            &operation,
+        )
+        .map_err(std::io::Error::from)
+}
+
+fn commit_config_write_permit(
+    permit: tirith_core::config_write::ConfigWritePermit,
+    contents: &[u8],
+    policy: &tirith_core::policy::Policy,
+) -> std::io::Result<()> {
+    let envelope = permit.operation_envelope();
+    let operation = tirith_core::task_boundary::BoundaryOperation {
+        boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+        envelope: &envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: permit.boundary_effects(),
+    };
+    let pending_authorization =
+        prepare_config_write_authorization_from_operation(&operation, policy)?;
+    commit_config_write_permit_with_operation(permit, contents, pending_authorization, &operation)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_config_write_authorization(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    contents: &[u8],
+    overwrite: bool,
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
+) -> std::io::Result<
+    tirith_core::task_boundary::PendingBoundaryAuthorization<
+        tirith_core::task_boundary::ConfigWriteBoundary,
+    >,
+> {
+    let envelope = tirith_core::config_write::ConfigWritePermit::operation_envelope_for(
+        root,
+        path,
+        contents,
+        overwrite,
+        &policy.enforcement_projection_hash(),
+        policy_change,
+    )?;
+    let operation = tirith_core::task_boundary::BoundaryOperation {
+        boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+        envelope: &envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: tirith_core::config_write::ConfigWritePermit::boundary_effects_for(
+            policy_change,
+        ),
+    };
+    prepare_config_write_authorization_from_operation(&operation, policy)
+}
+
+fn prepare_config_write_authorization_from_operation(
+    operation: &tirith_core::task_boundary::BoundaryOperation<'_>,
+    policy: &tirith_core::policy::Policy,
+) -> std::io::Result<
+    tirith_core::task_boundary::PendingBoundaryAuthorization<
+        tirith_core::task_boundary::ConfigWriteBoundary,
+    >,
+> {
+    tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+        tirith_core::task_boundary::ConfigWriteBoundary,
+    >(
+        operation,
+        &policy.task_gate,
+        &tirith_core::task_analysis::TaskAnalysisContext::default(),
+    )
+    .map_err(config_write_gate_error)
+}
+
+fn commit_config_write_permit_with_operation(
+    permit: tirith_core::config_write::ConfigWritePermit,
+    contents: &[u8],
+    pending_authorization: tirith_core::task_boundary::PendingBoundaryAuthorization<
+        tirith_core::task_boundary::ConfigWriteBoundary,
+    >,
+    operation: &tirith_core::task_boundary::BoundaryOperation<'_>,
+) -> std::io::Result<()> {
+    if !permit.binds_publication(contents, operation) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "configuration write no longer matches its exact authorization",
+        ));
+    }
+    let boundary_permit =
+        consume_config_write_authorization_with(pending_authorization, operation, |pending| {
+            pending.consume_default(chrono::Utc::now())
+        })
+        .map_err(config_write_gate_error)?;
+    permit
+        .commit_authorized(contents, boundary_permit, operation)
+        .map_err(std::io::Error::from)
+}
+
+fn config_write_gate_error(
+    error: tirith_core::task_boundary::BoundaryAuthorizationError,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("task gate refused this configuration write: {error}"),
+    )
+}
+
+/// Retain one labels-file capability across read, render, authorization, and
+/// publication. Multiple labels are committed atomically (SSH alias + resolved
+/// hostname therefore cannot partially succeed).
+pub(crate) fn write_context_labels_permitted(
+    path: &std::path::Path,
+    labels: &[(&str, &str)],
+    policy: &tirith_core::policy::Policy,
+) -> std::io::Result<()> {
+    const LABELS_FILE_READ_CAP: u64 = 1024 * 1024;
+    let root = path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "label path must be <root>/<dir>/<file>",
+            )
+        })?;
+    let destination = prepare_config_destination_permitted(root, path, true, policy, true, true)?;
+    let mut existing = std::collections::BTreeMap::<String, String>::new();
+    match destination.read_capped(LABELS_FILE_READ_CAP) {
+        Ok(bytes) => {
+            let content = String::from_utf8(bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "labels file is not valid UTF-8",
+                )
+            })?;
+            if !content.trim().is_empty() {
+                existing = serde_yaml::from_str(&content).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("labels file is not a string-to-string YAML mapping: {error}"),
+                    )
+                })?;
+            }
+        }
+        Err(tirith_core::util::OpenRegularError::NotFound) => {}
+        Err(error) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("cannot read existing labels file: {error:?}"),
+            ));
+        }
+    }
+    for (key, value) in labels {
+        existing.insert((*key).to_string(), (*value).to_string());
+    }
+    let yaml = serde_yaml::to_string(&existing).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cannot serialize labels file: {error}"),
+        )
+    })?;
+    write_prepared_config_file_permitted(
+        root,
+        path,
+        destination,
+        yaml.as_bytes(),
+        true,
+        policy,
+        true,
+    )
+}
+
+/// The contained publication [`write_config_file_permitted`] performs, with a
+/// hook between binding the parent and publishing through it.
+///
+/// Test-only, and deliberately so: the hook exists to open the check/use gap on
+/// purpose, and a production caller reaching this would be reaching a contained
+/// write that no task gate saw. It calls the same
+/// [`tirith_core::util::ContainedAtomicFile`] pair the permit calls, so the
+/// containment properties it pins are the permit's own.
+#[cfg(test)]
 fn write_file_atomic_contained_with_hook(
     root: &std::path::Path,
     path: &std::path::Path,
@@ -620,11 +1606,16 @@ pub fn confirm(prompt: &str, yes: bool) -> bool {
 pub mod agent;
 pub mod ai;
 pub mod aliases;
+/// The `tirith attest` namespace (C18): point-in-time build and deployment
+/// receipts. Distinct from the nested `tirith pkg attest`, which binds PyPI
+/// publish attestations and is untouched by this surface.
+pub mod attest;
 pub mod audit;
 pub mod baseline;
 #[cfg(unix)]
 pub mod bash_capability;
 pub mod browser;
+pub mod browser_audit;
 pub mod browser_host;
 pub mod canary;
 /// Consumer-facing capsule launch surface (Stack E, unit E5): the single seam
@@ -636,6 +1627,12 @@ pub mod canary;
 pub mod capsule;
 pub mod capsule_child;
 pub mod capsule_proxy;
+/// The `tirith capsule run --preset untrusted-project` surface (C14): copies an
+/// untrusted project into a held ephemeral directory, launches the operator's
+/// exact argv inside the fail-closed capsule seam, and emits one signed,
+/// content-addressed receipt. Refuses before any copy or spawn on every host
+/// that cannot deliver the preset's controls; there is no degraded fallback.
+pub mod capsule_run;
 /// Windows capsule executor (Stack E, unit E4): the `windows`-crate Win32 half that
 /// applies a `tirith_core::capsule::windows::WindowsLaunchPlan` (AppContainer +
 /// ACLs + Job Object + suspended `CreateProcessW`). `cfg(windows)`-gated so the
@@ -679,9 +1676,20 @@ pub mod lsp;
 pub mod manpage;
 pub mod mcp;
 pub mod mcp_server;
+/// `tirith pkg attest-npm` (C17): resolve the operator's own npm through the
+/// trusted-child mechanism, discover its exact version, and run ONLY the argv a
+/// closed, fixture-backed contract table authorizes for that version, binding
+/// the answer to the project's `package-lock.json` digest, its installed
+/// `node_modules` inventory, and its registry hosts. Attestation evidence only:
+/// a clean receipt means npm's signature check passed, never that the package
+/// code is benign. The spawn / rendering half of
+/// [`tirith_core::provenance::npm`].
+pub mod npm_integrity;
 pub mod onboard;
 pub mod output_guard;
 pub mod package;
+pub(crate) mod package_approval_authority;
+pub(crate) mod package_approval_authority_native;
 pub mod paste;
 pub mod path;
 pub mod pending;
@@ -718,6 +1726,8 @@ pub mod ssh;
 pub mod status;
 pub mod sudo;
 pub mod taint;
+pub mod task;
+pub(crate) mod task_receipt_keys;
 pub mod temp_run;
 pub mod threatdb_cmd;
 pub mod trust;
@@ -975,19 +1985,50 @@ fn should_warn_neutralized(
         && !marker_exists
 }
 
-/// Surface invalid `injection_seeds_custom` regexes once to stderr on the
-/// paste/check CLI path. The engine compiles these seeds internally on the paste
-/// path but is a library and does not print, so it drops the bad list; a seed that
-/// passes the lenient `tirith policy validate` shape check yet fails the real
-/// compile would otherwise be silently skipped with no operator feedback. Mirrors
-/// the view/lsp/gateway seams. stderr is safe: `tirith check`/`paste` write their
-/// verdict to stdout.
-pub fn warn_bad_injection_seeds(policy: &tirith_core::policy::Policy) {
-    let (_seeds, bad) =
-        tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
-    for (pattern, error) in &bad {
-        eprintln!("tirith: warning: invalid injection_seeds_custom regex {pattern:?}: {error}");
+fn invalid_injection_seed_message(
+    context: &str,
+    diagnostic: tirith_core::rules::prompt_injection::InvalidSeedDiagnostic,
+) -> String {
+    format!(
+        "{context}: warning: injection_seeds_custom[{}] was rejected ({})",
+        diagnostic.index,
+        diagnostic.category.as_str()
+    )
+}
+
+/// Surface already-categorical custom-seed failures through one DLP-aware,
+/// single-line, invocation-bounded stderr envelope. Neither this API nor the
+/// diagnostic type accepts the raw regex/error text, so callers cannot
+/// accidentally echo an attacker-controlled policy value.
+pub fn warn_invalid_injection_seed_diagnostics(
+    context: &str,
+    diagnostics: &[tirith_core::rules::prompt_injection::InvalidSeedDiagnostic],
+    policy: &tirith_core::policy::Policy,
+) {
+    let compiled =
+        tirith_core::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    let mut output = tirith_core::verdict::BoundedTextBuilder::new();
+    for &diagnostic in diagnostics {
+        let message = invalid_injection_seed_message(context, diagnostic);
+        let message = tirith_core::output::sanitize_human_field_with_compiled(&message, &compiled);
+        output.push_str(&message);
+        output.push_str("\n");
     }
+    let output = output.finish();
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(output.as_bytes());
+    let _ = stderr.flush();
+}
+
+/// Surface invalid `injection_seeds_custom` regexes once to stderr on the
+/// paste/check CLI path without rendering either the regex or the compiler's
+/// echoing error text.
+pub fn warn_bad_injection_seeds(policy: &tirith_core::policy::Policy) {
+    let (_seeds, diagnostics) =
+        tirith_core::rules::prompt_injection::compile_seeds_with_safe_diagnostics(
+            &policy.injection_seeds_custom,
+        );
+    warn_invalid_injection_seed_diagnostics("tirith", &diagnostics, policy);
 }
 
 /// Once per shell SESSION (per policy), tell the operator that a repo-scoped policy
@@ -1032,12 +2073,35 @@ pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_shim_target, quiet_from_env, resolve_shim_target, resolve_tirith_on_path_from,
-        sanitize_for_human_output, shell_join, should_warn_neutralized,
+        invalid_injection_seed_message, parse_shim_target, quiet_from_env, resolve_shim_target,
+        resolve_tirith_on_path_from, sanitize_for_human_output, shell_join,
+        should_warn_neutralized,
     };
     use std::fs;
     use std::path::PathBuf;
     use tirith_core::policy::PolicyScope;
+
+    #[test]
+    fn invalid_custom_seed_message_is_indexed_and_never_accepts_raw_pattern() {
+        use tirith_core::rules::prompt_injection::{
+            compile_seeds_with_safe_diagnostics, InvalidSeedCategory,
+        };
+
+        let pat = "ghp_".to_string() + &"A".repeat(36);
+        let secret_pattern = format!("(?P<{pat}>\nX");
+        let (_compiled, diagnostics) =
+            compile_seeds_with_safe_diagnostics(&["valid seed".into(), secret_pattern.clone()]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].index, 1);
+        assert_eq!(diagnostics[0].category, InvalidSeedCategory::RegexRejected);
+
+        let message = invalid_injection_seed_message("tirith", diagnostics[0]);
+        assert!(message.contains("injection_seeds_custom[1]"));
+        assert!(message.contains("regex_rejected"));
+        assert!(!message.contains(&secret_pattern));
+        assert!(!message.contains(&pat));
+        assert!(!message.contains('\n'));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1100,6 +2164,7 @@ mod tests {
             "aredb"
         );
         assert_eq!(sanitize_for_human_output("a\x1b[2Jb", false), "ab");
+        assert_eq!(sanitize_for_human_output("a\tb", false), "a\\tb");
     }
 
     #[test]
@@ -1118,6 +2183,7 @@ mod tests {
         assert_eq!(sanitize_for_human_output("a\u{202E}b", true), "ab");
         // An embedded ESC sequence is scrubbed here too.
         assert_eq!(sanitize_for_human_output("x\x1b[2Jy\nz", true), "xy\n  z");
+        assert_eq!(sanitize_for_human_output("x\ty", true), "x\\ty");
     }
 
     #[test]

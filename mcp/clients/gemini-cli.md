@@ -94,4 +94,6 @@ and:
   `tool_name` / `toolName`, `tool_input` / `toolInput`).
 - Hook telemetry events are logged via `tirith hook-event` (fire-and-forget,
   non-blocking).
-- The hook requires `python3` on PATH.
+- Automated setup validates Python once and records its absolute path in the
+  hook command. Re-run setup if that interpreter moves; the agent does not
+  resolve `python3` from its runtime PATH.

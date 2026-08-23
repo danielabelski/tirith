@@ -182,13 +182,13 @@ pub fn parse_ttl(s: &str) -> Option<u64> {
 
 /// Format the duration as a short human string (`30m`, `2h`, `1d`).
 pub fn format_ttl(secs: u64) -> String {
-    if secs.is_multiple_of(24 * 60 * 60) && secs >= 24 * 60 * 60 {
+    if secs % (24 * 60 * 60) == 0 && secs >= 24 * 60 * 60 {
         return format!("{}d", secs / (24 * 60 * 60));
     }
-    if secs.is_multiple_of(60 * 60) && secs >= 60 * 60 {
+    if secs % (60 * 60) == 0 && secs >= 60 * 60 {
         return format!("{}h", secs / (60 * 60));
     }
-    if secs.is_multiple_of(60) && secs >= 60 {
+    if secs % 60 == 0 && secs >= 60 {
         return format!("{}m", secs / 60);
     }
     format!("{secs}s")

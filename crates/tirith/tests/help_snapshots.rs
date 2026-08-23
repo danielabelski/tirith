@@ -137,7 +137,7 @@ help_example_tests! {
     help_gateway_run_filter_output    => (["gateway", "run", "--help"], "--filter-output");
     help_gateway_run_filter_output_ex => (["gateway", "run", "--help"], "tirith gateway run --filter-output");
     help_mcp_server_sanitize          => (["mcp-server", "--help"], "--sanitize-tool-output");
-    help_mcp_server_sanitize_ex       => (["mcp-server", "--help"], "tirith mcp-server --sanitize-tool-output");
+    help_mcp_server_unsafe_ex         => (["mcp-server", "--help"], "tirith mcp-server --unsafe-unsanitized-tool-output");
     help_context         => (["context", "--help"], "tirith context status");
     help_context_status  => (["context", "status", "--help"], "tirith context status");
     help_context_guard   => (["context", "guard", "--help"], "tirith context guard on");
@@ -198,9 +198,9 @@ help_example_tests! {
     help_baseline_status       => (["baseline", "status", "--help"], "tirith baseline status --json");
     help_baseline_reset        => (["baseline", "reset", "--help"], "tirith baseline reset --yes");
     help_temp_run              => (["temp-run", "--help"], "tirith temp-run -- ./script.sh");
-    help_command_card          => (["command-card", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
+    help_command_card          => (["command-card", "--help"], "tirith command-card sign --key ed25519-priv.bin --command");
     help_command_card_create   => (["command-card", "create", "--help"], "tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' > card.json");
-    help_command_card_sign     => (["command-card", "sign", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
+    help_command_card_sign     => (["command-card", "sign", "--help"], "tirith command-card sign --key ed25519-priv.bin --command");
     help_command_card_verify   => (["command-card", "verify", "--help"], "tirith command-card verify install-card.json");
     // `command-card fetch` is #[cfg(unix)] (unix-only runner path), so gate the
     // snapshot to match.
@@ -227,6 +227,11 @@ help_example_tests! {
     help_incident_stop         => (["incident", "stop", "--help"], "tirith incident stop --yes");
     help_incident_status       => (["incident", "status", "--help"], "tirith incident status");
     help_incident_report       => (["incident", "report", "--help"], "tirith incident report --out");
+    help_attest                    => (["attest", "--help"], "tirith attest build --source . --output dist --out build.receipt.json");
+    help_attest_build              => (["attest", "build", "--help"], "tirith attest build --source . --output dist");
+    help_attest_verify_build       => (["attest", "verify-build", "--help"], "tirith attest verify-build build.receipt.json --source . --output dist");
+    help_attest_deployment         => (["attest", "deployment", "--help"], "tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example");
+    help_attest_verify_deployment  => (["attest", "verify-deployment", "--help"], "tirith attest verify-deployment deployment.receipt.json");
     help_onboard               => (["onboard", "--help"], "tirith onboard --json");
     help_dashboard             => (["dashboard", "--help"], "tirith dashboard serve --port 8765");
     help_dashboard_export      => (["dashboard", "export", "--help"], "tirith dashboard export --out .");

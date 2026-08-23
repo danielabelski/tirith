@@ -185,7 +185,7 @@ fn cmd_keygen(output: &Path, kid: &str) -> Result<(), String> {
     println!("    kid: \"{kid}\",");
     print!("    key: [");
     for (i, b) in pk_bytes.iter().enumerate() {
-        if i.is_multiple_of(20) {
+        if i % 20 == 0 {
             print!("\n        ");
         }
         print!("{b}");
@@ -458,7 +458,7 @@ fn escape_decoded(value: &str) -> String {
 }
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
+    if hex.len() % 2 != 0 {
         return Err("hex string has odd length".to_string());
     }
     (0..hex.len())

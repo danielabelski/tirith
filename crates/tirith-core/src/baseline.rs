@@ -332,10 +332,8 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
 /// Bounded re-read budget for adopting a concurrently-created salt: the race
 /// winner creates a 0-byte file and only THEN writes the salt, so a loser may
 /// see a short file. Retrying briefly keeps a transient race from disabling
-/// baseline. Two seconds worst case, only on the rare losing side. The wider
-/// bound accounts for a heavily loaded process scheduler delaying the writer
-/// after it has created the file but before it can publish the 32-byte body.
-const SALT_ADOPT_ATTEMPTS: usize = 200;
+/// baseline. ~100 ms worst case, only on the rare losing side.
+const SALT_ADOPT_ATTEMPTS: usize = 10;
 const SALT_ADOPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Read the salt written by the `create_new` race winner, tolerating the brief
@@ -1069,11 +1067,20 @@ mod tests {
         // The winner created the file and wrote only a short prefix so far.
         std::fs::write(&salt_file, &full[..8]).unwrap();
 
+        // Rendezvous rather than race two sleeps. The writer used to wait 20ms
+        // against a retry budget of SALT_ADOPT_ATTEMPTS * SALT_ADOPT_BACKOFF,
+        // which is only ~90ms: on a loaded runner the writer thread is not
+        // always scheduled inside that window, and the loser then reports the
+        // salt as never completed. A barrier makes the write land while adopt
+        // is retrying without depending on either thread's timing.
         let writer_path = salt_file.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = std::sync::Arc::clone(&barrier);
         let handle = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            writer_barrier.wait();
             std::fs::write(&writer_path, full).unwrap();
         });
+        barrier.wait();
         let adopted = adopt_concurrent_salt(&salt_file)
             .expect("adopt must wait for the in-progress write, not fail");
         handle.join().unwrap();

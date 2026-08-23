@@ -102,12 +102,7 @@ pub fn fix(dry_run: bool, yes: bool, json: bool) -> i32 {
 
         // Per-finding confirmation unless --yes. `confirm` is TTY-gated and
         // returns false in a non-interactive context without --yes.
-        // The confirmation target must be injective: a display sanitizer can
-        // intentionally collapse controls/deceptive Unicode, which could make
-        // two different filesystem paths look identical. Present an exact,
-        // printable byte/code-unit escape before mutating the original path.
-        let prompt_path = confirmation_path(&f.path);
-        let prompt = format!("chmod {mode:04o} {prompt_path}?");
+        let prompt = format!("chmod {mode:04o} {path}?");
         if !confirm(&prompt, yes) {
             results.push(FixResult::skipped(f, mode));
             if !json {
@@ -180,60 +175,6 @@ fn apply_chmod(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn apply_chmod(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
-}
-
-/// Render the exact path selected for a destructive confirmation without
-/// emitting terminal controls or deceptive Unicode. Unlike the ordinary human
-/// display sanitizer, this representation is injective over the platform path
-/// encoding, so approval cannot be transferred to a different raw path that
-/// happens to sanitize to the same text.
-#[cfg(unix)]
-fn confirmation_path(path: &std::path::Path) -> String {
-    use std::fmt::Write as _;
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut rendered = String::from("b\"");
-    for byte in path.as_os_str().as_bytes() {
-        match *byte {
-            b' '..=b'~' if !matches!(*byte, b'\\' | b'\"') => rendered.push(*byte as char),
-            b'\\' => rendered.push_str("\\\\"),
-            b'\"' => rendered.push_str("\\\""),
-            value => write!(rendered, "\\x{value:02x}").expect("write to String"),
-        }
-    }
-    rendered.push('\"');
-    rendered
-}
-
-#[cfg(windows)]
-fn confirmation_path(path: &std::path::Path) -> String {
-    use std::fmt::Write as _;
-    use std::os::windows::ffi::OsStrExt;
-
-    let mut rendered = String::from("u\"");
-    for unit in path.as_os_str().encode_wide() {
-        match unit {
-            0x20..=0x7e if !matches!(unit, 0x5c | 0x22) => {
-                rendered.push(char::from_u32(u32::from(unit)).expect("ASCII code unit"));
-            }
-            0x5c => rendered.push_str("\\\\"),
-            0x22 => rendered.push_str("\\\""),
-            value => write!(rendered, "\\u{value:04x}").expect("write to String"),
-        }
-    }
-    rendered.push('\"');
-    rendered
-}
-
-#[cfg(not(any(unix, windows)))]
-fn confirmation_path(path: &std::path::Path) -> String {
-    let escaped: String = path
-        .as_os_str()
-        .to_string_lossy()
-        .chars()
-        .flat_map(char::escape_default)
-        .collect();
-    format!("u\"{escaped}\"")
 }
 
 // ─── human output ────────────────────────────────────────────────────────────
@@ -397,30 +338,6 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn confirmation_path_is_exact_printable_and_collision_free() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let ordinary = std::path::Path::new("/tmp/key with spaces");
-        assert_eq!(confirmation_path(ordinary), "b\"/tmp/key with spaces\"");
-
-        let hostile =
-            std::path::PathBuf::from(OsString::from_vec(b"/tmp/key\n\x1b\xe2\x80\xae".to_vec()));
-        let escaped = confirmation_path(&hostile);
-        assert_eq!(escaped, "b\"/tmp/key\\x0a\\x1b\\xe2\\x80\\xae\"");
-        assert!(!escaped.contains('\n'));
-        assert!(!escaped.contains('\u{1b}'));
-
-        let collapsed_peer = std::path::Path::new("/tmp/key");
-        assert_ne!(
-            escaped,
-            confirmation_path(collapsed_peer),
-            "distinct raw mutation targets must never share a confirmation label"
-        );
     }
 
     #[cfg(unix)]

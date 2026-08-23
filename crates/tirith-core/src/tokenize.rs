@@ -42,16 +42,105 @@ pub struct Segment {
 
 /// Tokenize a command string according to shell type.
 pub fn tokenize(input: &str, shell: ShellType) -> Vec<Segment> {
+    tokenize_bounded(input, shell, usize::MAX, usize::MAX, usize::MAX).0
+}
+
+/// Tokenize while retaining at most `max_segments` segments. The lexer still
+/// consumes the full bounded input so quote and separator state remain correct,
+/// but it does not allocate argv/raw storage for discarded segments.
+pub(crate) fn tokenize_bounded(
+    input: &str,
+    shell: ShellType,
+    max_segments: usize,
+    max_words_per_segment: usize,
+    max_word_bytes: usize,
+) -> (Vec<Segment>, TokenizeBudget) {
+    let limits = TokenizeLimits {
+        max_segments,
+        max_words_per_segment,
+        max_word_bytes,
+    };
     match shell {
-        ShellType::Posix => tokenize_posix(input, true),
-        ShellType::Fish => tokenize_fish(input),
-        ShellType::PowerShell => tokenize_powershell(input),
-        ShellType::Cmd => tokenize_cmd(input),
+        ShellType::Posix => tokenize_posix(input, true, SingleQuoteStyle::Posix, limits),
+        ShellType::Fish => tokenize_fish(input, limits),
+        ShellType::PowerShell => tokenize_powershell(input, limits),
+        ShellType::Cmd => tokenize_cmd(input, limits),
     }
 }
 
-fn tokenize_posix(input: &str, bash_function_names: bool) -> Vec<Segment> {
-    let mut segments = Vec::new();
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TokenizeBudget {
+    pub segments_truncated: bool,
+    pub words_truncated: bool,
+    pub word_bytes_truncated: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TokenizeLimits {
+    max_segments: usize,
+    max_words_per_segment: usize,
+    max_word_bytes: usize,
+}
+
+struct SegmentAccumulator {
+    values: Vec<Segment>,
+    limits: TokenizeLimits,
+    budget: TokenizeBudget,
+    defer_word_parsing: bool,
+    single_quote_style: SingleQuoteStyle,
+}
+
+impl SegmentAccumulator {
+    fn new(
+        limits: TokenizeLimits,
+        defer_word_parsing: bool,
+        single_quote_style: SingleQuoteStyle,
+    ) -> Self {
+        Self {
+            values: Vec::with_capacity(limits.max_segments.min(64)),
+            limits,
+            budget: TokenizeBudget::default(),
+            defer_word_parsing,
+            single_quote_style,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.values.len() >= self.limits.max_segments
+    }
+
+    fn mark_truncated(&mut self) {
+        self.budget.segments_truncated = true;
+    }
+
+    fn note_word_budget(&mut self, budget: WordBudget) {
+        self.budget.words_truncated |= budget.words_truncated;
+        self.budget.word_bytes_truncated |= budget.word_bytes_truncated;
+    }
+
+    fn push(&mut self, segment: Segment) {
+        debug_assert!(!self.is_full());
+        self.values.push(segment);
+    }
+
+    fn finish(self) -> (Vec<Segment>, TokenizeBudget) {
+        (self.values, self.budget)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SingleQuoteStyle {
+    Posix,
+    Fish,
+}
+
+fn tokenize_posix(
+    input: &str,
+    bash_function_names: bool,
+    single_quote_style: SingleQuoteStyle,
+    limits: TokenizeLimits,
+) -> (Vec<Segment>, TokenizeBudget) {
+    let mut segments = SegmentAccumulator::new(limits, false, single_quote_style);
     let mut current = String::new();
     let mut preceding_sep = None;
     let mut search_cursor: usize = 0;
@@ -91,6 +180,19 @@ fn tokenize_posix(input: &str, bash_function_names: bool) -> Vec<Segment> {
                 current.push(ch);
                 i += 1;
                 while i < len && chars[i] != '\'' {
+                    if single_quote_style == SingleQuoteStyle::Fish
+                        && chars[i] == '\\'
+                        && i + 1 < len
+                        && matches!(chars[i + 1], '\\' | '\'')
+                    {
+                        // Fish recognizes exactly two escapes inside single
+                        // quotes: `\\` and `\'`. In particular, an escaped
+                        // apostrophe does not terminate the quoted word.
+                        current.push(chars[i]);
+                        current.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
                     current.push(chars[i]);
                     i += 1;
                 }
@@ -152,6 +254,7 @@ fn tokenize_posix(input: &str, bash_function_names: bool) -> Vec<Segment> {
                             &current,
                             paren_depth,
                             bash_function_names,
+                            single_quote_style,
                         ))) =>
             {
                 let embedded_in_word = ends_with_unescaped_char(&current, '$', '\\');
@@ -303,7 +406,7 @@ fn tokenize_posix(input: &str, bash_function_names: bool) -> Vec<Segment> {
         input,
         &mut search_cursor,
     );
-    segments
+    segments.finish()
 }
 
 /// Whether the current token really ends in a redirection operator.  Looking
@@ -339,7 +442,12 @@ fn posix_reserved_word_boundary_after(chars: &[char], index: usize) -> bool {
     })
 }
 
-fn opens_posix_brace_scope(current: &str, paren_depth: usize, bash_function_names: bool) -> bool {
+fn opens_posix_brace_scope(
+    current: &str,
+    paren_depth: usize,
+    bash_function_names: bool,
+    single_quote_style: SingleQuoteStyle,
+) -> bool {
     let trimmed = current.trim_end_matches(is_posix_syntax_whitespace);
     if trimmed.is_empty()
         || (paren_depth > 0
@@ -351,7 +459,7 @@ fn opens_posix_brace_scope(current: &str, paren_depth: usize, bash_function_name
         return true;
     }
 
-    let words = split_words(trimmed);
+    let words = split_words_with_style(trimmed, single_quote_style);
     if words
         .first()
         .is_some_and(|word| word.eq_ignore_ascii_case("coproc"))
@@ -446,10 +554,10 @@ fn looks_like_posix_function_header(raw: &str, bash_function_names: bool) -> boo
         }
 }
 
-fn tokenize_fish(input: &str) -> Vec<Segment> {
-    // Fish differs slightly from POSIX, but POSIX tokenization is close enough
-    // for URL extraction.
-    tokenize_posix(input, false)
+fn tokenize_fish(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, TokenizeBudget) {
+    // Fish shares the control-operator grammar used by this bounded scanner,
+    // but unlike POSIX it accepts `\'` and `\\` within single-quoted words.
+    tokenize_posix(input, false, SingleQuoteStyle::Fish, limits)
 }
 
 /// Distinguish PowerShell's unary call operator from its postfix background
@@ -618,11 +726,75 @@ fn powershell_stop_parsing_token(
 /// the segment's original spelling and byte range. PowerShell recognizes all
 /// Unicode whitespace, and an unquoted/double-quoted backtick newline removes
 /// both characters instead of creating a word boundary.
-fn split_powershell_words(input: &str) -> Vec<String> {
+#[derive(Debug, Clone, Copy, Default)]
+struct WordBudget {
+    words_truncated: bool,
+    word_bytes_truncated: bool,
+    word_limit_reached: bool,
+}
+
+fn push_bounded_word_char(
+    current: &mut String,
+    overflowed: &mut bool,
+    ch: char,
+    max_word_bytes: usize,
+    budget: &mut WordBudget,
+) {
+    if budget.word_limit_reached {
+        budget.words_truncated = true;
+        *overflowed = true;
+        return;
+    }
+    if *overflowed {
+        return;
+    }
+    if current.len().saturating_add(ch.len_utf8()) > max_word_bytes {
+        current.clear();
+        *overflowed = true;
+        budget.word_bytes_truncated = true;
+        return;
+    }
+    current.push(ch);
+}
+
+fn flush_bounded_word(
+    words: &mut Vec<String>,
+    current: &mut String,
+    overflowed: &mut bool,
+    max_words: usize,
+    budget: &mut WordBudget,
+) {
+    if *overflowed {
+        *overflowed = false;
+        current.clear();
+        return;
+    }
+    if current.is_empty() {
+        return;
+    }
+    if words.len() >= max_words {
+        budget.words_truncated = true;
+        current.clear();
+        return;
+    }
+    words.push(std::mem::take(current));
+    budget.word_limit_reached = words.len() >= max_words;
+}
+
+fn split_powershell_words_bounded(
+    input: &str,
+    max_words: usize,
+    max_word_bytes: usize,
+) -> (Vec<String>, WordBudget) {
     let chars: Vec<char> = input.chars().collect();
     let byte_offsets: Vec<usize> = input.char_indices().map(|(offset, _)| offset).collect();
-    let mut words = Vec::new();
+    let mut words = Vec::with_capacity(max_words.min(64));
     let mut current = String::new();
+    let mut overflowed = false;
+    let mut budget = WordBudget {
+        word_limit_reached: max_words == 0,
+        ..WordBudget::default()
+    };
     let mut quote: Option<PowerShellQuoteKind> = None;
     let mut index = 0usize;
 
@@ -630,14 +802,26 @@ fn split_powershell_words(input: &str) -> Vec<String> {
         let ch = chars[index];
         if let Some(kind) = quote {
             if kind == PowerShellQuoteKind::Single {
-                current.push(ch);
+                push_bounded_word_char(
+                    &mut current,
+                    &mut overflowed,
+                    ch,
+                    max_word_bytes,
+                    &mut budget,
+                );
                 if powershell_quote_kind(ch) == Some(PowerShellQuoteKind::Single) {
                     if chars
                         .get(index + 1)
                         .and_then(|next| powershell_quote_kind(*next))
                         == Some(PowerShellQuoteKind::Single)
                     {
-                        current.push(chars[index + 1]);
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            chars[index + 1],
+                            max_word_bytes,
+                            &mut budget,
+                        );
                         index += 2;
                     } else {
                         quote = None;
@@ -660,18 +844,42 @@ fn split_powershell_words(input: &str) -> Vec<String> {
                         index += 2;
                     }
                     (Some(next), _) => {
-                        current.push(ch);
-                        current.push(*next);
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            ch,
+                            max_word_bytes,
+                            &mut budget,
+                        );
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            *next,
+                            max_word_bytes,
+                            &mut budget,
+                        );
                         index += 2;
                     }
                     (None, _) => {
-                        current.push(ch);
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            ch,
+                            max_word_bytes,
+                            &mut budget,
+                        );
                         index += 1;
                     }
                 }
                 continue;
             }
-            current.push(ch);
+            push_bounded_word_char(
+                &mut current,
+                &mut overflowed,
+                ch,
+                max_word_bytes,
+                &mut budget,
+            );
             if powershell_quote_kind(ch) == Some(PowerShellQuoteKind::Double) {
                 quote = None;
             }
@@ -683,7 +891,13 @@ fn split_powershell_words(input: &str) -> Vec<String> {
             let start = byte_offsets[index];
             if let Some(here_string) = powershell_here_string(input, start) {
                 while index < chars.len() && byte_offsets[index] < here_string.end {
-                    current.push(chars[index]);
+                    push_bounded_word_char(
+                        &mut current,
+                        &mut overflowed,
+                        chars[index],
+                        max_word_bytes,
+                        &mut budget,
+                    );
                     index += 1;
                 }
                 continue;
@@ -692,7 +906,13 @@ fn split_powershell_words(input: &str) -> Vec<String> {
 
         if let Some(kind) = powershell_quote_kind(ch) {
             quote = Some(kind);
-            current.push(ch);
+            push_bounded_word_char(
+                &mut current,
+                &mut overflowed,
+                ch,
+                max_word_bytes,
+                &mut budget,
+            );
             index += 1;
             continue;
         }
@@ -702,35 +922,76 @@ fn split_powershell_words(input: &str) -> Vec<String> {
                 (Some('\r'), Some('\n')) => index += 3,
                 (Some('\r'), _) => index += 2,
                 (Some(next), _) => {
-                    current.push(ch);
-                    current.push(*next);
+                    push_bounded_word_char(
+                        &mut current,
+                        &mut overflowed,
+                        ch,
+                        max_word_bytes,
+                        &mut budget,
+                    );
+                    push_bounded_word_char(
+                        &mut current,
+                        &mut overflowed,
+                        *next,
+                        max_word_bytes,
+                        &mut budget,
+                    );
                     index += 2;
                 }
                 (None, _) => {
-                    current.push(ch);
+                    push_bounded_word_char(
+                        &mut current,
+                        &mut overflowed,
+                        ch,
+                        max_word_bytes,
+                        &mut budget,
+                    );
                     index += 1;
                 }
             }
             continue;
         }
         if ch.is_whitespace() {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
+            flush_bounded_word(
+                &mut words,
+                &mut current,
+                &mut overflowed,
+                max_words,
+                &mut budget,
+            );
             index += 1;
             continue;
         }
-        current.push(ch);
+        push_bounded_word_char(
+            &mut current,
+            &mut overflowed,
+            ch,
+            max_word_bytes,
+            &mut budget,
+        );
         index += 1;
     }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
+    flush_bounded_word(
+        &mut words,
+        &mut current,
+        &mut overflowed,
+        max_words,
+        &mut budget,
+    );
+    (words, budget)
 }
 
-fn normalize_powershell_segment_words(segment: &mut Segment) {
-    let words = split_powershell_words(&segment.raw);
+fn normalize_powershell_segment_words(
+    segment: &mut Segment,
+    max_words: usize,
+    max_word_bytes: usize,
+) -> WordBudget {
+    let (words, budget) = split_powershell_words_bounded(&segment.raw, max_words, max_word_bytes);
+    if budget.words_truncated || budget.word_bytes_truncated {
+        segment.command = None;
+        segment.args.clear();
+        return budget;
+    }
     let first_non_assign = words.iter().position(|word| !is_env_assignment(word));
     match first_non_assign {
         Some(index) => {
@@ -742,10 +1003,11 @@ fn normalize_powershell_segment_words(segment: &mut Segment) {
             segment.args.clear();
         }
     }
+    budget
 }
 
-fn tokenize_powershell(input: &str) -> Vec<Segment> {
-    let mut segments = Vec::new();
+fn tokenize_powershell(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, TokenizeBudget) {
+    let mut segments = SegmentAccumulator::new(limits, true, SingleQuoteStyle::Posix);
     let mut current = String::new();
     let mut preceding_sep = None;
     let mut search_cursor: usize = 0;
@@ -1091,15 +1353,25 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
         input,
         &mut search_cursor,
     );
-    for segment in &mut segments {
-        normalize_powershell_segment_words(segment);
+    let mut word_budget = WordBudget::default();
+    for segment in &mut segments.values {
+        let budget = normalize_powershell_segment_words(
+            segment,
+            limits.max_words_per_segment,
+            limits.max_word_bytes,
+        );
+        word_budget.words_truncated |= budget.words_truncated;
+        word_budget.word_bytes_truncated |= budget.word_bytes_truncated;
     }
-    segments.retain(|segment| !segment.raw.chars().all(char::is_whitespace));
+    segments.note_word_budget(word_budget);
     segments
+        .values
+        .retain(|segment| !segment.raw.chars().all(char::is_whitespace));
+    segments.finish()
 }
 
-fn tokenize_cmd(input: &str) -> Vec<Segment> {
-    let mut segments = Vec::new();
+fn tokenize_cmd(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, TokenizeBudget) {
+    let mut segments = SegmentAccumulator::new(limits, false, SingleQuoteStyle::Posix);
     let mut current = String::new();
     let mut preceding_sep = None;
     let mut search_cursor: usize = 0;
@@ -1249,7 +1521,7 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
         input,
         &mut search_cursor,
     );
-    segments
+    segments.finish()
 }
 
 /// Push a tokenized segment into `segments`, trimming leading/trailing shell
@@ -1260,7 +1532,7 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
 /// searches skip already-consumed bytes (handles duplicate segments like
 /// `foo | foo` correctly).
 fn push_posix_segment(
-    segments: &mut Vec<Segment>,
+    segments: &mut SegmentAccumulator,
     raw: &str,
     preceding_sep: Option<String>,
     input: &str,
@@ -1270,7 +1542,7 @@ fn push_posix_segment(
 }
 
 fn push_segment(
-    segments: &mut Vec<Segment>,
+    segments: &mut SegmentAccumulator,
     raw: &str,
     preceding_sep: Option<String>,
     input: &str,
@@ -1280,7 +1552,7 @@ fn push_segment(
 }
 
 fn push_segment_impl(
-    segments: &mut Vec<Segment>,
+    segments: &mut SegmentAccumulator,
     raw: &str,
     preceding_sep: Option<String>,
     input: &str,
@@ -1316,22 +1588,46 @@ fn push_segment_impl(
         }
     };
 
-    let words = split_words(trimmed);
-    // Skip leading `VAR=VALUE` assignments.
-    let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
-    let (command, args) = match first_non_assign {
-        Some(idx) => {
-            let cmd = Some(words[idx].clone());
-            let args = if idx + 1 < words.len() {
-                words[idx + 1..].to_vec()
-            } else {
-                Vec::new()
-            };
-            (cmd, args)
-        }
-        None => {
-            // All words are assignments — no command.
+    if segments.is_full() {
+        segments.mark_truncated();
+        return;
+    }
+
+    let (command, args) = if segments.defer_word_parsing {
+        (None, Vec::new())
+    } else {
+        let (words, words_truncated, word_bytes_truncated) = split_words_bounded_with_style(
+            trimmed,
+            segments.limits.max_words_per_segment,
+            segments.limits.max_word_bytes,
+            segments.single_quote_style,
+        );
+        let budget = WordBudget {
+            words_truncated,
+            word_bytes_truncated,
+            ..WordBudget::default()
+        };
+        segments.note_word_budget(budget);
+        if words_truncated || word_bytes_truncated {
             (None, Vec::new())
+        } else {
+            // Skip leading `VAR=VALUE` assignments.
+            let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
+            match first_non_assign {
+                Some(idx) => {
+                    let cmd = Some(words[idx].clone());
+                    let args = if idx + 1 < words.len() {
+                        words[idx + 1..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    (cmd, args)
+                }
+                None => {
+                    // All words are assignments — no command.
+                    (None, Vec::new())
+                }
+            }
         }
     };
 
@@ -1369,8 +1665,18 @@ pub fn is_env_assignment(word: &str) -> bool {
 /// Return the values from leading `NAME=VALUE` tokens in a raw segment.
 /// Stops at the first non-assignment word, matching the shell prefix-assignment model.
 pub fn leading_env_assignments(segment_raw: &str) -> Vec<(String, String)> {
+    leading_env_assignments_bounded(segment_raw, usize::MAX, usize::MAX).0
+}
+
+pub(crate) fn leading_env_assignments_bounded(
+    segment_raw: &str,
+    max_words: usize,
+    max_word_bytes: usize,
+) -> (Vec<(String, String)>, bool, bool) {
     let mut assignments = Vec::new();
-    for word in split_words(segment_raw.trim()) {
+    let (words, words_truncated, word_bytes_truncated) =
+        split_words_bounded(segment_raw.trim(), max_words, max_word_bytes);
+    for word in words {
         if !is_env_assignment(&word) {
             break;
         }
@@ -1378,7 +1684,7 @@ pub fn leading_env_assignments(segment_raw: &str) -> Vec<(String, String)> {
             assignments.push((name.to_string(), value.to_string()));
         }
     }
-    assignments
+    (assignments, words_truncated, word_bytes_truncated)
 }
 
 /// Return the values from leading `NAME=VALUE` tokens in a raw segment.
@@ -1394,9 +1700,27 @@ pub fn leading_env_assignment_values(segment_raw: &str) -> Vec<String> {
 /// Kept crate-visible so wrapper payloads such as `env -S` can build the same
 /// canonical argv without incorrectly treating `;`/`|` as controls executed by
 /// the wrapper itself.
-pub(crate) fn split_words(input: &str) -> Vec<String> {
-    let mut words = Vec::new();
+pub(crate) fn split_words_bounded(
+    input: &str,
+    max_words: usize,
+    max_word_bytes: usize,
+) -> (Vec<String>, bool, bool) {
+    split_words_bounded_with_style(input, max_words, max_word_bytes, SingleQuoteStyle::Posix)
+}
+
+fn split_words_bounded_with_style(
+    input: &str,
+    max_words: usize,
+    max_word_bytes: usize,
+    single_quote_style: SingleQuoteStyle,
+) -> (Vec<String>, bool, bool) {
+    let mut words = Vec::with_capacity(max_words.min(64));
     let mut current = String::new();
+    let mut overflowed = false;
+    let mut budget = WordBudget {
+        word_limit_reached: max_words == 0,
+        ..WordBudget::default()
+    };
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0;
@@ -1405,63 +1729,178 @@ pub(crate) fn split_words(input: &str) -> Vec<String> {
         let ch = chars[i];
         match ch {
             ' ' | '\t' if !current.is_empty() => {
-                words.push(current.clone());
-                current.clear();
+                flush_bounded_word(
+                    &mut words,
+                    &mut current,
+                    &mut overflowed,
+                    max_words,
+                    &mut budget,
+                );
                 i += 1;
                 while i < len && (chars[i] == ' ' || chars[i] == '\t') {
                     i += 1;
                 }
             }
+            ' ' | '\t' if overflowed => {
+                flush_bounded_word(
+                    &mut words,
+                    &mut current,
+                    &mut overflowed,
+                    max_words,
+                    &mut budget,
+                );
+                i += 1;
+            }
             ' ' | '\t' => {
                 i += 1;
             }
             '\'' => {
-                current.push(ch);
+                push_bounded_word_char(
+                    &mut current,
+                    &mut overflowed,
+                    ch,
+                    max_word_bytes,
+                    &mut budget,
+                );
                 i += 1;
                 while i < len && chars[i] != '\'' {
-                    current.push(chars[i]);
+                    if single_quote_style == SingleQuoteStyle::Fish
+                        && chars[i] == '\\'
+                        && i + 1 < len
+                        && matches!(chars[i + 1], '\\' | '\'')
+                    {
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            chars[i],
+                            max_word_bytes,
+                            &mut budget,
+                        );
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            chars[i + 1],
+                            max_word_bytes,
+                            &mut budget,
+                        );
+                        i += 2;
+                        continue;
+                    }
+                    push_bounded_word_char(
+                        &mut current,
+                        &mut overflowed,
+                        chars[i],
+                        max_word_bytes,
+                        &mut budget,
+                    );
                     i += 1;
                 }
                 if i < len {
-                    current.push(chars[i]);
+                    push_bounded_word_char(
+                        &mut current,
+                        &mut overflowed,
+                        chars[i],
+                        max_word_bytes,
+                        &mut budget,
+                    );
                     i += 1;
                 }
             }
             '"' => {
-                current.push(ch);
+                push_bounded_word_char(
+                    &mut current,
+                    &mut overflowed,
+                    ch,
+                    max_word_bytes,
+                    &mut budget,
+                );
                 i += 1;
                 while i < len && chars[i] != '"' {
                     if chars[i] == '\\' && i + 1 < len {
-                        current.push(chars[i]);
-                        current.push(chars[i + 1]);
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            chars[i],
+                            max_word_bytes,
+                            &mut budget,
+                        );
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            chars[i + 1],
+                            max_word_bytes,
+                            &mut budget,
+                        );
                         i += 2;
                     } else {
-                        current.push(chars[i]);
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            chars[i],
+                            max_word_bytes,
+                            &mut budget,
+                        );
                         i += 1;
                     }
                 }
                 if i < len {
-                    current.push(chars[i]);
+                    push_bounded_word_char(
+                        &mut current,
+                        &mut overflowed,
+                        chars[i],
+                        max_word_bytes,
+                        &mut budget,
+                    );
                     i += 1;
                 }
             }
             '\\' if i + 1 < len => {
-                current.push(chars[i]);
-                current.push(chars[i + 1]);
+                push_bounded_word_char(
+                    &mut current,
+                    &mut overflowed,
+                    chars[i],
+                    max_word_bytes,
+                    &mut budget,
+                );
+                push_bounded_word_char(
+                    &mut current,
+                    &mut overflowed,
+                    chars[i + 1],
+                    max_word_bytes,
+                    &mut budget,
+                );
                 i += 2;
             }
             _ => {
-                current.push(ch);
+                push_bounded_word_char(
+                    &mut current,
+                    &mut overflowed,
+                    ch,
+                    max_word_bytes,
+                    &mut budget,
+                );
                 i += 1;
             }
         }
     }
 
-    if !current.is_empty() {
-        words.push(current);
-    }
+    flush_bounded_word(
+        &mut words,
+        &mut current,
+        &mut overflowed,
+        max_words,
+        &mut budget,
+    );
 
-    words
+    (words, budget.words_truncated, budget.word_bytes_truncated)
+}
+
+pub(crate) fn split_words(input: &str) -> Vec<String> {
+    split_words_bounded(input, usize::MAX, usize::MAX).0
+}
+
+fn split_words_with_style(input: &str, single_quote_style: SingleQuoteStyle) -> Vec<String> {
+    split_words_bounded_with_style(input, usize::MAX, usize::MAX, single_quote_style).0
 }
 
 #[cfg(test)]
@@ -1805,7 +2244,7 @@ mod tests {
             "Get-Date && Set-ExecutionPolicy Bypass",
             ShellType::PowerShell,
         );
-        assert_eq!(segs.len(), 2, "expected 2 segments, got {segs:?}");
+        assert_eq!(segs.len(), 2, "expected 2 segments, got {:?}", segs);
         assert_eq!(segs[0].command.as_deref(), Some("Get-Date"));
         assert_eq!(segs[1].preceding_separator.as_deref(), Some("&&"));
         assert_eq!(segs[1].command.as_deref(), Some("Set-ExecutionPolicy"));
@@ -1817,7 +2256,7 @@ mod tests {
             "Get-Date || Set-ExecutionPolicy Bypass",
             ShellType::PowerShell,
         );
-        assert_eq!(segs.len(), 2, "expected 2 segments, got {segs:?}");
+        assert_eq!(segs.len(), 2, "expected 2 segments, got {:?}", segs);
         assert_eq!(segs[0].command.as_deref(), Some("Get-Date"));
         assert_eq!(segs[1].preceding_separator.as_deref(), Some("||"));
         assert_eq!(segs[1].command.as_deref(), Some("Set-ExecutionPolicy"));
@@ -1828,7 +2267,7 @@ mod tests {
         // Critical precedence check: `||` must be consumed as ONE separator,
         // not two pipes producing three segments.
         let segs = tokenize("a || b", ShellType::PowerShell);
-        assert_eq!(segs.len(), 2, "expected 2 segments (||), got {segs:?}");
+        assert_eq!(segs.len(), 2, "expected 2 segments (||), got {:?}", segs);
         assert_eq!(segs[1].preceding_separator.as_deref(), Some("||"));
     }
 
@@ -2117,6 +2556,68 @@ mod tests {
     }
 
     #[test]
+    fn fish_escaped_single_quote_keeps_controls_and_spaces_quoted() {
+        let inert = r#"printf '%s\n' 'safe\'; rm -rf /'"#;
+        let fish = tokenize(inert, ShellType::Fish);
+        assert_eq!(
+            fish.len(),
+            1,
+            "Fish quoted data became executable: {fish:?}"
+        );
+        assert_eq!(fish[0].command.as_deref(), Some("printf"));
+        assert_eq!(fish[0].args, vec![r#"'%s\n'"#, r#"'safe\'; rm -rf /'"#]);
+        assert_byte_ranges_match_raw(inert, &fish);
+
+        // POSIX does not recognize an escape inside single quotes. Pin the
+        // dialect distinction so a future cleanup cannot silently merge the
+        // scanners again.
+        let posix = tokenize(inert, ShellType::Posix);
+        assert_eq!(posix.len(), 2, "POSIX quote semantics changed: {posix:?}");
+        assert_eq!(posix[1].command.as_deref(), Some("rm"));
+
+        let spaced = r#"echo 'can\'t split' tail"#;
+        let fish = tokenize(spaced, ShellType::Fish);
+        assert_eq!(fish.len(), 1, "escaped quote split a Fish word: {fish:?}");
+        assert_eq!(fish[0].args, vec![r#"'can\'t split'"#, "tail"]);
+        assert_byte_ranges_match_raw(spaced, &fish);
+    }
+
+    #[test]
+    fn fish_single_quote_backslash_parity_preserves_real_suffixes() {
+        // Two backslashes form Fish's `\\` escape, so the following quote is
+        // a real closer and the destructive suffix remains executable.
+        let even = r#"printf '%s\n' 'safe\\'; rm -rf /"#;
+        let segments = tokenize(even, ShellType::Fish);
+        assert_eq!(
+            segments.len(),
+            2,
+            "real Fish suffix was hidden: {segments:?}"
+        );
+        assert_eq!(segments[1].command.as_deref(), Some("rm"));
+        assert_eq!(segments[1].preceding_separator.as_deref(), Some(";"));
+        assert_byte_ranges_match_raw(even, &segments);
+
+        // With three backslashes, Fish consumes `\\` and then `\'`; the
+        // semicolon is quoted data until the final apostrophe.
+        let odd = r#"printf '%s\n' 'safe\\\'; rm -rf /'"#;
+        let segments = tokenize(odd, ShellType::Fish);
+        assert_eq!(
+            segments.len(),
+            1,
+            "escaped Fish apostrophe exposed an inert suffix: {segments:?}"
+        );
+        assert_byte_ranges_match_raw(odd, &segments);
+
+        // An escaped apostrophe does not swallow a suffix after the actual
+        // closing quote.
+        let closed = r#"printf '%s\n' 'can\'t'; rm -rf /"#;
+        let segments = tokenize(closed, ShellType::Fish);
+        assert_eq!(segments.len(), 2, "closing quote was ignored: {segments:?}");
+        assert_eq!(segments[1].command.as_deref(), Some("rm"));
+        assert_byte_ranges_match_raw(closed, &segments);
+    }
+
+    #[test]
     fn test_backslash_escape() {
         let segs = tokenize("echo hello\\|world | bash", ShellType::Posix);
         // The backslash-pipe is inside the first segment
@@ -2213,6 +2714,49 @@ mod tests {
         let segs = tokenize("dir & echo done", ShellType::Cmd);
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[1].preceding_separator.as_deref(), Some("&"));
+    }
+
+    #[test]
+    fn bounded_tokenization_never_retains_a_segment_past_the_cap() {
+        for (shell, input) in [
+            (ShellType::Posix, "one; two; three"),
+            (ShellType::Fish, "one; two; three"),
+            (ShellType::PowerShell, "one; two; three"),
+            (ShellType::Cmd, "one & two & three"),
+        ] {
+            let (segments, budget) = tokenize_bounded(input, shell, 2, usize::MAX, usize::MAX);
+            assert_eq!(segments.len(), 2, "{shell:?}: {segments:?}");
+            assert!(budget.segments_truncated, "{shell:?}: {segments:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_tokenization_drops_argv_when_count_or_word_bytes_overflow() {
+        for shell in [
+            ShellType::Posix,
+            ShellType::Fish,
+            ShellType::PowerShell,
+            ShellType::Cmd,
+        ] {
+            let (segments, count_budget) =
+                tokenize_bounded("one two three", shell, 1, 2, usize::MAX);
+            assert_eq!(segments.len(), 1, "{shell:?}: {segments:?}");
+            assert!(count_budget.words_truncated, "{shell:?}: {segments:?}");
+            assert!(segments[0].command.is_none(), "{shell:?}: {segments:?}");
+            assert!(segments[0].args.is_empty(), "{shell:?}: {segments:?}");
+
+            let (segments, byte_budget) = tokenize_bounded("abcdefgh", shell, 1, usize::MAX, 4);
+            assert_eq!(segments.len(), 1, "{shell:?}: {segments:?}");
+            assert!(byte_budget.word_bytes_truncated, "{shell:?}: {segments:?}");
+            assert!(segments[0].command.is_none(), "{shell:?}: {segments:?}");
+            assert!(segments[0].args.is_empty(), "{shell:?}: {segments:?}");
+        }
+
+        let (segments, budget) = tokenize_bounded("one\u{00a0}two", ShellType::PowerShell, 1, 2, 4);
+        assert_eq!(segments[0].command.as_deref(), Some("one"));
+        assert_eq!(segments[0].args, vec!["two"]);
+        assert!(!budget.words_truncated);
+        assert!(!budget.word_bytes_truncated);
     }
 
     #[test]

@@ -111,8 +111,8 @@ fn spawn_cleanup_task(db: Db) {
     });
 }
 
-/// Dead-letter auto-retry: re-fetch unresolvable products from the Polar
-/// API every five minutes.
+/// Dead-letter auto-retry: re-fetch unresolvable products and provisionally
+/// revoked, unorderable lifecycle events from the Polar API every five minutes.
 ///
 /// Only subscription-type dead letters are retried here. `order.paid` with
 /// an unknown product returns 500 so Polar retries the full event, and
@@ -145,8 +145,12 @@ async fn retry_dead_letters(
             None => continue,
         };
 
-        // Stale if the tier was already fixed by a newer event.
-        if entry.current_tier.as_deref() != Some("unknown") {
+        let lifecycle_reconciliation = entry.reason.starts_with("unorderable_revocation:");
+
+        // Product-resolution rows are stale once the tier is fixed. Lifecycle
+        // reconciliation rows are about access state and must still run even
+        // when the tier is already known.
+        if !lifecycle_reconciliation && entry.current_tier.as_deref() != Some("unknown") {
             info!(
                 dead_letter_id = entry.id,
                 sub_id = %sub_id,
@@ -220,6 +224,46 @@ async fn retry_dead_letters(
         };
 
         let product_id = body.get("product_id").and_then(|v| v.as_str());
+
+        if lifecycle_reconciliation {
+            let current_status = body
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let current_tier = product_id.and_then(|pid| config.tier_for_product(pid));
+            match db
+                .apply_retry_lifecycle_fix(
+                    entry.id,
+                    &entry.event_id,
+                    &entry.event_type,
+                    &sub_id,
+                    current_status,
+                    current_tier,
+                    product_id,
+                    entry.last_event_at.clone(),
+                )
+                .await
+            {
+                Ok(true) => info!(
+                    dead_letter_id = entry.id,
+                    sub_id = %sub_id,
+                    status = %current_status,
+                    "reconciled provisional revocation from current Polar state"
+                ),
+                Ok(false) => info!(
+                    dead_letter_id = entry.id,
+                    sub_id = %sub_id,
+                    "discarded lifecycle reconciliation superseded by a newer local event"
+                ),
+                Err(error) => error!(
+                    dead_letter_id = entry.id,
+                    sub_id = %sub_id,
+                    %error,
+                    "failed to apply lifecycle reconciliation"
+                ),
+            }
+            continue;
+        }
 
         if let Some(pid) = product_id {
             if let Some(tier) = config.tier_for_product(pid) {
@@ -377,15 +421,29 @@ async fn upload_to_r2(
     backup_path: &str,
     date_str: &str,
 ) {
-    let client = match reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(client) => client,
+    use std::time::Duration;
+
+    use rusty_s3::{Bucket, Credentials, S3Action as _, UrlStyle};
+
+    let endpoint = match endpoint.parse() {
+        Ok(endpoint) => endpoint,
         Err(e) => {
-            error!("failed to build R2 HTTP client: {e}");
+            error!("R2 endpoint error: {e}");
+            return;
+        }
+    };
+    let bucket = match Bucket::new(endpoint, UrlStyle::Path, bucket_name.to_owned(), "auto") {
+        Ok(bucket) => bucket,
+        Err(e) => {
+            error!("R2 bucket init error: {e}");
+            return;
+        }
+    };
+    let credentials = Credentials::new(access_key, secret_key);
+    let client = match r2_http_client() {
+        Ok(client) => client,
+        Err(_) => {
+            error!("R2 HTTP client initialization failed");
             return;
         }
     };
@@ -399,280 +457,156 @@ async fn upload_to_r2(
     };
 
     let key = format!("backups/tirith-license-{date_str}.db");
-    match put_r2_object(
-        &client,
-        endpoint,
-        bucket_name,
-        access_key,
-        secret_key,
-        &key,
-        data,
-    )
-    .await
-    {
-        Ok(status) if status.is_success() => {
+    let upload = bucket
+        .put_object(Some(&credentials), &key)
+        .sign(Duration::from_secs(300));
+    let database_uploaded = match client.put(upload).body(data).send().await {
+        Ok(response) if response.status().is_success() => {
             info!(key = %key, "backup uploaded to R2");
+            true
         }
-        Ok(status) => {
-            error!(%status, "R2 upload returned error");
+        Ok(response) => {
+            error!(status = %response.status(), "R2 upload returned error");
+            false
         }
-        Err(e) => {
-            error!("R2 upload failed: {e}");
+        Err(_) => {
+            // reqwest errors can retain the presigned bearer URL. Never render
+            // them into durable logs.
+            error!("R2 upload request failed");
+            false
         }
+    };
+
+    // A `.sha256` object with no `.db` beside it is not a partial success: a
+    // restore or verification job reads a digest it cannot resolve.
+    if !database_uploaded {
+        return;
     }
 
     let checksum_path = format!("{backup_path}.sha256");
     if let Ok(checksum_data) = tokio::fs::read(&checksum_path).await {
         let checksum_key = format!("backups/tirith-license-{date_str}.db.sha256");
-        match put_r2_object(
-            &client,
-            endpoint,
-            bucket_name,
-            access_key,
-            secret_key,
-            &checksum_key,
-            checksum_data,
-        )
-        .await
-        {
-            Ok(status) if status.is_success() => {}
-            Ok(status) => error!(%status, "R2 checksum upload returned error"),
-            Err(e) => error!("R2 checksum upload failed: {e}"),
+        let checksum_upload = bucket
+            .put_object(Some(&credentials), &checksum_key)
+            .sign(Duration::from_secs(300));
+        match client.put(checksum_upload).body(checksum_data).send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                error!(status = %response.status(), "R2 checksum upload returned error");
+            }
+            Err(_) => {
+                error!("R2 checksum upload request failed");
+            }
         }
     }
 }
 
-const R2_REGION: &str = "auto";
-const S3_SERVICE: &str = "s3";
-const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
-const SIGV4_SIGNED_HEADERS: &str = "host;x-amz-content-sha256;x-amz-date";
+/// Matches the tirith-core runner download client so a stalled R2 PUT cannot
+/// hang the sequential backup loop forever.
+const R2_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-struct SignedR2Put {
-    url: reqwest::Url,
-    host: String,
-    amz_date: String,
-    payload_hash: String,
-    authorization: String,
+fn r2_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    r2_http_client_with_timeout(R2_HTTP_TIMEOUT)
 }
 
-fn hmac_sha256(key: &[u8], input: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts keys of every length");
-    mac.update(input);
-    let bytes = mac.finalize().into_bytes();
-    let mut output = [0_u8; 32];
-    output.copy_from_slice(&bytes);
-    output
-}
-
-/// Build a path-style R2 PUT request signed with AWS Signature Version 4.
-///
-/// R2 uses the standard S3 SigV4 protocol with the fixed `auto` region. The
-/// endpoint is deployment configuration, but it still has to be an HTTPS origin
-/// with no credentials, query, or fragment so Authorization can never be sent to
-/// a redirected or ambiguous target.
-fn sign_r2_put(
-    endpoint: &str,
-    bucket_name: &str,
-    access_key: &str,
-    secret_key: &str,
-    key: &str,
-    body: &[u8],
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<SignedR2Put, &'static str> {
-    use sha2::{Digest, Sha256};
-
-    if bucket_name.is_empty()
-        || access_key.is_empty()
-        || secret_key.is_empty()
-        || key.is_empty()
-        || key.split('/').any(str::is_empty)
-    {
-        return Err("R2 signing inputs are incomplete");
-    }
-
-    let mut url = reqwest::Url::parse(endpoint).map_err(|_| "R2 endpoint is not a valid URL")?;
-    if url.scheme() != "https"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("R2 endpoint must be a credential-free HTTPS origin");
-    }
-
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| "R2 endpoint cannot be used as a URL base")?;
-        segments.pop_if_empty().push(bucket_name);
-        for segment in key.split('/') {
-            segments.push(segment);
-        }
-    }
-
-    let hostname = url.host_str().ok_or("R2 endpoint has no host")?;
-    let host = match url.port() {
-        Some(port) => format!("{hostname}:{port}"),
-        None => hostname.to_string(),
-    };
-    let canonical_uri = url.path();
-    let payload_hash = hex::encode(Sha256::digest(body));
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date = now.format("%Y%m%d").to_string();
-    let canonical_headers =
-        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
-    let canonical_request = format!(
-        "PUT\n{canonical_uri}\n\n{canonical_headers}\n{SIGV4_SIGNED_HEADERS}\n{payload_hash}"
-    );
-    let scope = format!("{date}/{R2_REGION}/{S3_SERVICE}/aws4_request");
-    let string_to_sign = format!(
-        "{SIGV4_ALGORITHM}\n{amz_date}\n{scope}\n{}",
-        hex::encode(Sha256::digest(canonical_request.as_bytes()))
-    );
-
-    let date_key = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date.as_bytes());
-    let region_key = hmac_sha256(&date_key, R2_REGION.as_bytes());
-    let service_key = hmac_sha256(&region_key, S3_SERVICE.as_bytes());
-    let signing_key = hmac_sha256(&service_key, b"aws4_request");
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-    let authorization = format!(
-        "{SIGV4_ALGORITHM} Credential={access_key}/{scope}, SignedHeaders={SIGV4_SIGNED_HEADERS}, Signature={signature}"
-    );
-
-    Ok(SignedR2Put {
-        url,
-        host,
-        amz_date,
-        payload_hash,
-        authorization,
-    })
-}
-
-async fn put_r2_object(
-    client: &reqwest::Client,
-    endpoint: &str,
-    bucket_name: &str,
-    access_key: &str,
-    secret_key: &str,
-    key: &str,
-    body: Vec<u8>,
-) -> Result<reqwest::StatusCode, &'static str> {
-    use reqwest::header::{AUTHORIZATION, HOST};
-
-    let signed = sign_r2_put(
-        endpoint,
-        bucket_name,
-        access_key,
-        secret_key,
-        key,
-        &body,
-        chrono::Utc::now(),
-    )?;
-    client
-        .put(signed.url)
-        .header(HOST, signed.host)
-        .header("x-amz-content-sha256", signed.payload_hash)
-        .header("x-amz-date", signed.amz_date)
-        .header(AUTHORIZATION, signed.authorization)
-        .body(body)
-        .send()
-        .await
-        .map(|response| response.status())
-        .map_err(|_| "R2 upload request failed")
+fn r2_http_client_with_timeout(
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    // A presigned URL is a bearer credential and PUT bodies are the private
+    // database backup. Never replay either to a redirect-selected origin.
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
 }
 
 #[cfg(test)]
-mod r2_signing_tests {
-    use super::*;
-    use chrono::TimeZone;
+mod r2_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    fn test_time() -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc
-            .with_ymd_and_hms(2026, 8, 12, 3, 4, 5)
-            .single()
-            .unwrap()
-    }
+    #[tokio::test]
+    async fn backup_client_never_replays_a_presigned_put_across_redirects() {
+        let redirect_target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        redirect_target
+            .set_nonblocking(true)
+            .expect("make redirect target observable");
+        let target_address = redirect_target.local_addr().expect("target address");
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let target_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match redirect_target.accept() {
+                    Ok(_) => {
+                        let _ = observed_sender.send(true);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+            let _ = observed_sender.send(false);
+        });
 
-    #[test]
-    fn r2_signature_matches_fixed_independent_vector() {
-        let signed = sign_r2_put(
-            "https://account.r2.cloudflarestorage.com",
-            "tirith-backups",
-            "AKIAEXAMPLE",
-            "very-secret-test-key",
-            "backups/tirith-license-2026-08-12.db",
-            b"abc",
-            test_time(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            signed.url.as_str(),
-            "https://account.r2.cloudflarestorage.com/tirith-backups/backups/tirith-license-2026-08-12.db"
-        );
-        assert_eq!(
-            signed.payload_hash,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(
-            signed.authorization,
-            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260812/auto/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=8640f3028fe5b7c57a6d90c4da75539c28984c62d1a593b334d90f5a96cf8ab9"
-        );
-        assert!(!signed.authorization.contains("very-secret-test-key"));
-    }
-
-    #[test]
-    fn r2_signer_rejects_ambiguous_or_insecure_endpoints() {
-        for endpoint in [
-            "http://account.r2.cloudflarestorage.com",
-            "https://user@account.r2.cloudflarestorage.com",
-            "https://account.r2.cloudflarestorage.com/api/",
-            "https://account.r2.cloudflarestorage.com?redirect=1",
-            "https://account.r2.cloudflarestorage.com#fragment",
-        ] {
-            assert!(sign_r2_put(
-                endpoint,
-                "bucket",
-                "key",
-                "secret",
-                "backup.db",
-                b"x",
-                test_time()
+        let origin = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+        let origin_address = origin.local_addr().expect("origin address");
+        let origin_thread = std::thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accept initial PUT");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).expect("read initial PUT");
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_address}/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
-            .is_err());
-        }
+            .expect("write redirect");
+        });
+
+        let response = super::r2_http_client()
+            .expect("build R2 client")
+            .put(format!(
+                "http://{origin_address}/backup?X-Amz-Signature=secret"
+            ))
+            .body("private database bytes")
+            .send()
+            .await
+            .expect("receive the redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(!observed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("redirect observer result"));
+        origin_thread.join().expect("origin thread");
+        target_thread.join().expect("target thread");
     }
 
-    #[test]
-    fn r2_signature_binds_payload_and_percent_encoded_path() {
-        let first = sign_r2_put(
-            "https://account.r2.cloudflarestorage.com",
-            "backup bucket",
-            "key",
-            "secret",
-            "daily/backup file.db",
-            b"first",
-            test_time(),
-        )
-        .unwrap();
-        let second = sign_r2_put(
-            "https://account.r2.cloudflarestorage.com",
-            "backup bucket",
-            "key",
-            "secret",
-            "daily/backup file.db",
-            b"second",
-            test_time(),
-        )
-        .unwrap();
+    #[tokio::test]
+    async fn backup_client_times_out_instead_of_hanging() {
+        assert_eq!(super::R2_HTTP_TIMEOUT, Duration::from_secs(30));
 
-        assert_eq!(first.url.path(), "/backup%20bucket/daily/backup%20file.db");
-        assert_ne!(first.payload_hash, second.payload_hash);
-        assert_ne!(first.authorization, second.authorization);
+        let stall = TcpListener::bind("127.0.0.1:0").expect("bind stall listener");
+        let stall_address = stall.local_addr().expect("stall address");
+        let stall_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = stall.accept() {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+
+        let error = super::r2_http_client_with_timeout(Duration::from_millis(200))
+            .expect("build R2 client")
+            .put(format!("http://{stall_address}/backup"))
+            .body("private database bytes")
+            .send()
+            .await
+            .expect_err("a stalled R2 PUT must time out");
+        assert!(
+            error.is_timeout(),
+            "expected a request timeout, got: {error:?}"
+        );
+        let _ = stall_thread.join();
     }
 }

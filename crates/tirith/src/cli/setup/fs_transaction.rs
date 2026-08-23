@@ -195,42 +195,41 @@ where
     F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     V: FnMut() -> Result<(), String>,
 {
-    // Dry runs are side-effect-free and need no synchronization. The transform
-    // is invoked exactly once so callers cannot accidentally duplicate a
-    // diagnostic, validator process, or other observable work.
+    // Compute and cap the transformed payload before creating a parent,
+    // persistent lock file, backup, or temporary file. Missing-parent dry runs and
+    // rejected oversized writes therefore remain completely non-mutating.
     revalidate_selection()?;
+    let preflight_snapshot = FileSnapshot {
+        inner: super::fs_helpers::read_snapshot_scoped(path, scope_root)?,
+    };
+    let mut update = transform(&preflight_snapshot)?;
+    validate_update_size(&update)?;
+    #[cfg(test)]
+    test_hook(TestStage::PreflightReady)?;
+
     if dry_run {
-        let snapshot = FileSnapshot {
-            inner: super::fs_helpers::read_snapshot_scoped(path, scope_root)?,
-        };
-        let update = transform(&snapshot)?;
-        validate_update_size(&update)?;
         return match update {
             FileUpdate::Unchanged => Ok(TransactionOutcome::Unchanged),
             FileUpdate::Write { .. } => Ok(TransactionOutcome::DryRunWouldWrite),
         };
     }
 
-    // Give adversarial tests one read-only pre-lock seam. Production performs
-    // no unlocked transform: a closure may validate generated content or emit
-    // a diagnostic, so retrying it after a race would duplicate external work.
-    #[cfg(test)]
-    {
-        let _ = super::fs_helpers::read_snapshot_scoped(path, scope_root)?;
-        test_hook(TestStage::PreflightReady)?;
-    }
-
     // Acquire a transient cross-process synchronization capability that does
-    // not create a lock file or destination parent. Read and transform only
-    // after the lock is held, then enforce the cap before any persistent
-    // filesystem artifact is created.
+    // not create a lock file or destination parent. Re-read and recompute
+    // while holding it, so a drifted oversized transform is rejected before
+    // any persistent filesystem side effect.
     let transaction_lock = PlatformTransaction::lock(path, scope_root)?;
     revalidate_selection()?;
     let snapshot = FileSnapshot {
         inner: super::fs_helpers::read_snapshot_scoped(path, scope_root)?,
     };
-    let update = transform(&snapshot)?;
-    validate_update_size(&update)?;
+    if snapshot.inner != preflight_snapshot.inner {
+        // A cooperative writer may have completed between the side-effect-free
+        // preflight and our lock acquisition. Recompute under the lock so both
+        // updates are retained, then enforce the same cap again.
+        update = transform(&snapshot)?;
+        validate_update_size(&update)?;
+    }
     let FileUpdate::Write {
         bytes,
         mode,

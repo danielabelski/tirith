@@ -23,12 +23,14 @@ artifact-hash-lookup = []
 test-network-seams = []
 # native-yara (yara-x): DEFERRED by the PR-0 dependency spike, NOT wired here.
 # The plan pencilled in `native-yara = ["dep:yara-x"]` with yara-x 0.14, but on the
-# original dependency spike ran while the workspace MSRV was 1.83 and found the
-# yara-x 0.14 closure required newer Rust. The workspace is now on 1.88, but this
-# optional engine remains deliberately unwired until its operational and policy
-# contract is reviewed as a separate change. The engine treats an absent
-# native-yara feature as `native_yara_rules: unavailable` (not "incomplete"), so
-# this remains an honest no-op rather than silently claiming coverage.
+# current registry yara-x 0.14 requires `intaglio >= 1.10`, and intaglio 1.10 (its
+# lowest available release) bumped its MSRV to Rust 1.85. yara-x 0.14 also pulls
+# `ar_archive_writer` (Rust 1.88) and a newer `time` (1.88) transitively. There is
+# no version of the yara-x 0.14 closure that builds on our MSRV 1.83, so the
+# feature and the `yara-x` dependency are intentionally omitted. The engine already
+# treats an absent native-yara feature as `native_yara_rules: unavailable` (not
+# "incomplete"), so this is a clean no-op. Revisit when the workspace MSRV rises to
+# >= 1.85 or a yara-x line with a 1.83-compatible closure ships.
 
 [dependencies]
 url = { workspace = true }
@@ -61,6 +63,12 @@ tempfile = "3"
 toml = "0.8"
 ed25519-dalek = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Socket-based DNS with cancellable async lookups. The resolver worker in
+# `network::dns` drives this on a private current-thread runtime so core callers
+# retain a synchronous API without using libc's non-interruptible resolver.
+# hickory-resolver 0.24.4 declares Rust 1.71.1, below workspace MSRV 1.83.
+hickory-resolver = { version = "0.24.4", default-features = false, features = ["system-config", "tokio-runtime"] }
+tokio = { workspace = true, features = ["net", "rt", "time"] }
 csv = { workspace = true }
 owo-colors = { workspace = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -74,7 +82,7 @@ flate2 = "1"
 # minimized to exactly the formats we triage: no `write`/`build` (we never emit
 # objects), no `compression`/`archive`/`wasm`/`xcoff`. `pe` pulls `coff`. We
 # enable `std` for the borrowed-data `read` API and `std::io::Error`. MSRV: the
-# crate declares rust-version 1.65, below our workspace MSRV 1.88. Reviewed under
+# crate declares rust-version 1.65, under our workspace MSRV 1.83. Reviewed under
 # the repo `cargo deny` gate (Apache-2.0 OR MIT, both allowlisted). This replaces
 # hand-rolling ELF + fat Mach-O + PE/TLS parsing, which is a far larger
 # malformed-input attack surface; `object` is widely fuzzed and read-only.
@@ -94,9 +102,8 @@ getrandom = "0.3"
 # because it pulls tokio + Apache-only). `default-features = false` plus the single
 # protocol-revision feature keeps the surface to serde structs we map known
 # content onto, while unknown blocks are preserved losslessly by our own
-# `PreservedContent::Unknown(serde_json::Value)` wrapper. Proven on Rust 1.83 in
-# the PR-0 dependency spike (crate MSRV 1.80), below the current 1.88 workspace
-# floor. License MIT.
+# `PreservedContent::Unknown(serde_json::Value)` wrapper. Proven on MSRV 1.83 in
+# the PR-0 dependency spike (crate MSRV 1.80). License MIT.
 rust-mcp-schema = { version = "0.10", default-features = false, features = ["2025_11_25"] }
 # JSON Schema validation for MCP inputSchema -> args and outputSchema ->
 # result.structuredContent (Stack C). `default-features = false` is mandatory:
@@ -132,6 +139,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
 # Resolver-tool enrollment also needs typed owner/DACL and trusted Windows
@@ -151,19 +159,26 @@ windows = { version = "0.62", default-features = false, features = [
 # filesystem (and, on ABI v4 / Linux 6.7, port-level network) access control;
 # extrasafe = an ergonomic seccomp-BPF policy builder (wraps seccompiler). Both
 # are applied by the internal `tirith __capsule-child` launcher, NOT inside
-# `pre_exec`. `cfg(target_os = "linux")`-gated so macOS / Windows targets compile
-# without them. Proven to resolve + build on Rust 1.83 across the linux-gnu target
-# in the PR-0 spike, below the current 1.88 workspace floor. Licenses: landlock
-# MIT/Apache-2.0, extrasafe MIT.
+# `pre_exec`. Landlock supports Linux generally, but extrasafe 0.5 intentionally
+# compile-errors outside linux-x86_64, so keep that dependency gated to the only
+# architecture where `capsule::linux::apply_seccomp` uses it. On other Linux
+# architectures the backend reports `network_raw_denied = false`; locked-down
+# callers therefore degrade/fail closed rather than claiming absent seccomp.
+# Proven to resolve + build on MSRV 1.83. Licenses: landlock MIT/Apache-2.0,
+# extrasafe MIT.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 extrasafe = "0.5"
 
 [build-dependencies]
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+regex = { workspace = true }
 
 [dev-dependencies]
+tirith-test-support = { workspace = true }
 toml = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

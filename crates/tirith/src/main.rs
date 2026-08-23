@@ -11,12 +11,12 @@ use clap::{Parser, Subcommand};
 /// `every_command_is_categorized` test guards this against drift.
 const COMMANDS_BY_CATEGORY: &str = "\
 COMMANDS BY CATEGORY:
-  Scan & Analyze:   check paste run score diff fetch fix scan view preview watch temp-run taint intend lab explain why visual-audit
+  Scan & Analyze:   check paste run score diff fetch fix scan view preview watch temp-run capsule taint intend task lab explain why visual-audit
   Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
   Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
-  Supply-chain:     package pkg ecosystem threat-db iac canary secret command-card commands
+  Supply-chain:     package pkg ecosystem threat-db iac canary secret command-card commands attest
   Integrations:     mcp mcp-server gateway agent ai lsp license
   Forensics:        audit incident checkpoint pending share redact clipboard
 
@@ -309,8 +309,9 @@ Examples:
         defer: bool,
 
         /// Suppress all network activity on the hot path: skip the periodic
-        /// background threat-DB refresh so analysis runs purely locally.
-        /// Also honored via the TIRITH_OFFLINE environment variable.
+        /// threat-DB refresh and use cached runtime threat intelligence only.
+        /// Cache misses are reported as incomplete verification without HTTP
+        /// or DNS. Also honored via the TIRITH_OFFLINE environment variable.
         #[arg(long)]
         offline: bool,
 
@@ -535,14 +536,55 @@ Examples:
   tirith pkg verify-env --target .venv requests flask
   tirith pkg receipt list
 
-`tirith pkg install` is the ENFORCING path (contained, hash-pinned, and supported
-only on x86_64 Linux). Every other platform or architecture refuses before pip
-executes. This platform limit applies only to enforcing execution: `pkg approve`
-does not install, `pkg verify-env` only verifies an existing tree, and
-`tirith install` remains the analysis path.")]
+`tirith pkg approve` native approval issuance and `tirith pkg install` enforcing
+execution are supported only on x86_64 Linux. Other platforms and architectures
+fail closed instead of issuing an approval that cannot be redeemed. `pkg
+verify-env` remains a read-only verifier, and `tirith install` remains the
+portable analysis path.")]
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
+    },
+
+    /// Bind one source tree, one output tree, and one set of deployed routes
+    /// into content-addressed, point-in-time receipts, signed when this
+    /// installation has an audit key.
+    #[command(after_help = "\
+What it is:
+  `attest build` hashes a source tree and an output tree into one deterministic
+  digest each, plus the commit, dirty state, lockfile digests, policy hash, a
+  REDACTED argv digest, and the per-file output manifest. `attest deployment`
+  fetches manifest-listed routes from ONE https origin and binds the bytes that
+  came back. The two verify- commands re-check what was bound.
+
+What it is NOT:
+  - not a reproducible-build claim: tirith does not run your build and cannot
+    say the output came from the source;
+  - not continuous monitoring: a deployment receipt describes the routes it
+    fetched, at the moment it fetched them, and nothing else;
+  - `attest verify-deployment` re-checks the DOCUMENT and does not re-fetch.
+    Run `attest deployment` again to measure the site again.
+
+This is a different command from `tirith pkg attest`, which binds PyPI publish
+attestations for a wheel and is unaffected by anything here.
+
+Exit codes (deliberately distinct from `tirith check`, which uses 3 for a warn
+acknowledgement; per-command codes in tirith are not shared):
+  0  clean     everything asked for was bound, or still matches
+  1  mismatch  a bound tree or a fetched route no longer matches, a document
+               failed its own integrity rules, or a target left the origin
+  2  usage     a bad path, an unreadable receipt, or an invalid route map
+  3  partial   something could not be measured: a cap, an unreadable tree, an
+               unreachable, authenticated, or CDN-transformed route
+
+Examples:
+  tirith attest build --source . --output dist --out build.receipt.json
+  tirith attest verify-build build.receipt.json --source . --output dist
+  tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example
+  tirith attest verify-deployment deployment.receipt.json")]
+    Attest {
+        #[command(subcommand)]
+        action: AttestAction,
     },
 
     /// Run adversarial training scenarios (experimental)
@@ -573,6 +615,22 @@ Examples:
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
+    },
+
+    /// Diagnostically assess an untrusted task envelope (preview).
+    ///
+    /// Reports what the envelope WOULD be allowed to do under the current
+    /// policy. Executes nothing, fetches nothing, resolves no package, and
+    /// writes nothing.
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+
+    /// Run an untrusted project inside a fail-closed OS containment capsule
+    Capsule {
+        #[command(subcommand)]
+        action: CapsuleAction,
     },
 
     /// Score a URL for security risk
@@ -1049,23 +1107,29 @@ Examples:
         after_help = "\
 Examples:
   tirith mcp-server
-  tirith mcp-server --sanitize-tool-output
+  tirith mcp-server --unsafe-unsanitized-tool-output
 
 Used by MCP client configurations to run tirith as a local tool server.
 
-`--sanitize-tool-output` (M7 ch4) routes every tool result through the
-output-direction analyzer before sending it back to the calling agent. Blocks
-on OSC52 / hyperlink-mismatch / hidden-text / fake-prompt; the agent receives
-a sanitized placeholder citing the audit event_id. Opt-in until field-tested;
-default is current behavior (pass through unchanged)."
+Tool and resource-read output is routed through the output-direction analyzer
+before reaching the calling agent. A high-severity finding blocks: OSC52
+clipboard writes and hyperlink mismatches among them, where the content is
+replaced by a safe placeholder citing the audit event_id. A medium-severity
+finding warns: hidden text and fake shell prompts among them, where the content
+is byte-sanitized and carries a notice citing the same event_id.
+`--unsafe-unsanitized-tool-output` restores the legacy pass-through only for
+compatibility and is not recommended."
     )]
     McpServer {
-        /// Route every tool result through the M7 output-direction analyzer.
-        /// Blocks on dangerous escape sequences (OSC52 clipboard write, OSC0/2
-        /// title rewrite, screen-clear, hyperlink mismatch, hidden text,
-        /// fake-prompt). Default is pass-through.
-        #[arg(long)]
+        /// Compatibility spelling retained from the former opt-in behavior.
+        /// Output sanitization is already enabled by default.
+        #[arg(long, conflicts_with = "unsafe_unsanitized_tool_output")]
         sanitize_tool_output: bool,
+
+        /// UNSAFE compatibility mode: forward tool/resource output without the
+        /// output-direction analyzer.
+        #[arg(long, conflicts_with = "sanitize_tool_output")]
+        unsafe_unsanitized_tool_output: bool,
     },
 
     /// Govern the MCP servers a repository declares
@@ -1153,18 +1217,27 @@ refuses before reading the run config or starting the upstream process;
 Examples:
   tirith setup claude-code --with-mcp
   tirith setup cursor
+  tirith setup cline
+  tirith setup continue
+  tirith setup roo-code
+  tirith setup openhands
+  tirith setup grok-build --scope user
+  tirith setup omp
+  tirith setup opencode
+  tirith setup fx
+  tirith setup prime-agent
   tirith setup copilot-cli
   tirith setup kiro --scope user
   tirith setup claude-code --dry-run")]
     Setup {
-        /// Tool to configure: claude-code, codex, copilot-cli, cursor, gemini-cli, kiro, openclaw, pi-cli, vscode, windsurf
+        /// Tool to configure: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, windsurf
         tool: String,
 
         /// Scope: project (default for most tools) or user
         #[arg(long)]
         scope: Option<String>,
 
-        /// Also register tirith MCP server (Claude Code and Gemini CLI)
+        /// Also register tirith MCP server (Claude Code and Gemini CLI; MCP-only clients register it automatically)
         #[arg(long)]
         with_mcp: bool,
 
@@ -1669,7 +1742,7 @@ built-ins; configure them via `policy.share.customer_id_patterns`.
 
 Examples:
   tirith share --target llm ./fixture.log
-  tirith share --target public-paste --out /tmp/safe.log ./fixture.log
+  tirith share --target public-paste --out ./safe.log ./fixture.log
   tirith share --target github-issue --json ./fixture.log")]
     Share {
         /// File to redact. Use `-` (or omit) to read stdin.
@@ -2200,8 +2273,8 @@ Examples:
 Subcommands:
   tirith env guard on|off|status                  — flip the exec-path env-guard
         [--json]                                    rules (off by default).
-  tirith env diff [--reset]                       — show sensitive vars set /
-        [--json]                                    changed since shell start.
+  tirith env diff [--reset]                       — show sensitive vars newly set
+        [--json]                                    since shell start.
                                                     Exit 1 if any newly appeared.
   tirith env explain <VAR>                        — show where a var is set
         [--json]                                    (file:line, value MASKED).
@@ -2214,9 +2287,9 @@ What it protects:
   policy.env_guard_sensitive_vars.
 
 Value safety (load-bearing):
-  tirith NEVER prints, stores, or hashes-recoverably an env value. `explain`
-  masks values as ****; the shell-start snapshot stores variable NAMES plus an
-  8-char SHA-256 prefix for change-detection only — useless for value recovery.
+  tirith NEVER prints, persists, hashes, or baseline-compares an env value.
+  Credential-bearing RPC URLs are classified transiently; every snapshot entry
+  is still stored by NAME and presence only. `explain` masks values as ****.
 
 Examples:
   tirith env guard on
@@ -2599,8 +2672,8 @@ Examples:
     #[cfg_attr(
         unix,
         command(after_help = "\
-A command card is an ed25519-signed attestation of what a command DOES: the
-exact command string, the domains it should contact, the SHA-256 of any script
+A command card is an ed25519-signed attestation of what a command DOES: a
+shell-bound digest of the exact command, the domains it should contact, the SHA-256 of any script
 it pipes, the paths it writes, whether it needs sudo, and an expiry date. A
 maintainer publishes a card next to their install one-liner; a user verifies
 the card against the command they are about to run.
@@ -2639,15 +2712,15 @@ Subcommands:
 Examples:
   tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' \\
     --expected-domain example.com --writes /usr/local/bin/example > install-card.json
-  tirith command-card sign --key ed25519-priv.bin install-card.json
+  tirith command-card sign --key ed25519-priv.bin --command 'curl -fsSL https://example.com/install.sh | sh' install-card.json
   tirith command-card verify install-card.json
   tirith command-card fetch https://example.com/install-card.json")
     )]
     #[cfg_attr(
         not(unix),
         command(after_help = "\
-A command card is an ed25519-signed attestation of what a command DOES: the
-exact command string, the domains it should contact, the SHA-256 of any script
+A command card is an ed25519-signed attestation of what a command DOES: a
+shell-bound digest of the exact command, the domains it should contact, the SHA-256 of any script
 it pipes, the paths it writes, whether it needs sudo, and an expiry date. A
 maintainer publishes a card next to their install one-liner; a user verifies
 the card against the command they are about to run.
@@ -2682,7 +2755,7 @@ Subcommands:
 Examples:
   tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' \\
     --expected-domain example.com --writes /usr/local/bin/example > install-card.json
-  tirith command-card sign --key ed25519-priv.bin install-card.json
+  tirith command-card sign --key ed25519-priv.bin --command 'curl -fsSL https://example.com/install.sh | sh' install-card.json
   tirith command-card verify install-card.json")
     )]
     CommandCard {
@@ -2953,6 +3026,13 @@ Subcommands:
                       host. Dry-run by default (prints the manifest + path);
                       --apply writes it. Windows uses a registry key — guidance
                       is printed there rather than writing the registry.
+  audit               read-only integrity audit of the extensions installed in a
+                      Chromium-family profile: sorted-tree digests, declared
+                      permissions and execution surfaces, install class,
+                      provenance, and drift against a baseline receipt. Reads the
+                      extension source trees and three install-class fields from
+                      Preferences; never cookies, history, passwords, wallet
+                      storage, or Local State.
 
 Because the extension is not yet published its Chrome id is unknown; pass
 --extension-id <id> or a clearly-marked placeholder is used.
@@ -2961,10 +3041,342 @@ Examples:
   tirith browser install-extension
   tirith browser install-extension --apply
   tirith browser install-extension --extension-id abcdefghijklmnopabcdefghijklmnop --apply
-  tirith browser install-extension --json")]
+  tirith browser install-extension --json
+  tirith browser audit --browser all
+  tirith browser audit --baseline ./browser-baseline.json --format json")]
     Browser {
         #[command(subcommand)]
         action: BrowserAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// Assess a bounded task envelope from a file or stdin.
+    Check {
+        /// Envelope JSON file. Reads stdin when omitted.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+
+        /// Which Tirith-owned ingress adapter obtained the content. This is an
+        /// OPERATOR assertion; the envelope can never claim it for itself.
+        #[arg(long)]
+        adapter: Option<String>,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttestAction {
+    /// Bind a source tree and an output tree into one point-in-time receipt.
+    #[command(after_help = "\
+What it binds:
+  A deterministic sha256 over each tree (sorted relative paths, mode, size, and
+  file bytes), the HEAD commit and dirty state when the source is a repository,
+  the lockfile digests, the policy projection hash, a digest of the REDACTED
+  argv, the per-file output manifest, and the identity of the one external tool
+  tirith itself ran.
+
+What it refuses:
+  A symlink anywhere in either tree, a non-regular entry, a non-UTF-8 path, two
+  paths that collide under case folding or Unicode normalization, a file that
+  was rebound, grew, or was truncated while it was being hashed, and anything
+  past 100,000 entries, 2 GiB, or 256 directories deep. Every refusal is a
+  refusal, never a silently skipped entry.
+
+Removed from the SOURCE digest, explicitly and on the record:
+  .git at every depth (every path it pruned is listed in the receipt and folded
+  into the digest), the --output root when it is nested under --source, and the
+  --out receipt destination, so a receipt can never hash itself into existence.
+
+Removed from the OUTPUT digest:
+  only the --out receipt destination when it lands inside --output. Nothing is
+  pruned by name there: a directory called .git under build output is shipped
+  content, and dropping it would leave bytes inside a tree the receipt calls
+  bound.
+
+--execution-receipt:
+  Links a `tirith capsule run` receipt. The link is labelled verified ONLY when
+  that receipt's SIGNATURE verifies against this installation's audit key, it is
+  self-consistent, it records a fully contained run whose child reached exit 0,
+  and its input tree digest is THIS source tree. It says nothing about --output:
+  a capsule builds inside an ephemeral copy that is deleted before the run ends,
+  so the bytes it produced are not on this disk. Anything else is recorded as an
+  observation with the reasons named, and the receipt is partial.
+
+Exit codes:
+  0  clean     both trees were bound in full
+  1  mismatch  the assembled receipt failed its own integrity rules
+  2  usage     a bad --source, --output, --execution-receipt, or --out
+  3  partial   a tree could not be bound in full (a cap, a symlink, a race), or
+               a linked execution receipt did not prove a contained run
+
+Examples:
+  tirith attest build --source . --output dist
+  tirith attest build --source . --output dist --out build.receipt.json
+  tirith attest build --source . --output dist --execution-receipt capsule.receipt.json
+  tirith attest build --source . --output dist --format json")]
+    Build {
+        /// The source tree to bind.
+        #[arg(long, default_value = ".")]
+        source: std::path::PathBuf,
+        /// The build output tree to bind.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// A `tirith capsule run` receipt to link this build to.
+        #[arg(long)]
+        execution_receipt: Option<std::path::PathBuf>,
+        /// Also write the receipt to this path (atomic, mode 0600).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Re-hash both trees and compare them with a build receipt.
+    #[command(after_help = "\
+What it does:
+  Checks the receipt's SIGNATURE against this installation's audit key, then
+  re-scans --source and --output under the caps, exclusion set, and permission
+  model the receipt itself records and compares the two digests. It proves the
+  trees are unchanged since the receipt was taken; it proves nothing about where
+  either tree came from.
+
+  The signature is the load-bearing check. receipt_id and both tree digests are
+  keyless sha256s that anyone who can write the file can recompute, so on an
+  installation that signs, an unsigned or non-verifying receipt is a mismatch
+  rather than a warning. Both exclusion sets and both covered file counts are
+  printed on every answer, so an exclusion set wide enough to swallow a tree is
+  visible instead of hiding behind the word clean.
+
+Exit codes:
+  0  clean     both trees still hash to what the receipt bound
+  1  mismatch  a tree changed, the receipt failed its own integrity rules
+               (including a stripped signature, which the content address binds),
+               or its signature does not verify
+  2  usage     the file is not a build receipt, or a bad --source / --output
+  3  partial   a tree could not be re-scanned, the receipt was itself partial, or
+               it is signed and no verifying key is installed to check it
+
+Examples:
+  tirith attest verify-build build.receipt.json --source . --output dist
+  tirith attest verify-build build.receipt.json --source . --output dist --format json")]
+    VerifyBuild {
+        /// The build receipt to verify against.
+        #[arg(value_name = "RECEIPT")]
+        receipt: std::path::PathBuf,
+        /// The source tree to re-hash.
+        #[arg(long, default_value = ".")]
+        source: std::path::PathBuf,
+        /// The output tree to re-hash.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Fetch manifest-listed routes from one https origin and bind the bytes.
+    #[command(after_help = "\
+What it does:
+  Verifies the build receipt FIRST (a receipt that fails its own integrity rules
+  or whose signature this installation rejects produces a mismatch and ZERO
+  requests), then fetches only the routes the build's output manifest names, from
+  ONE origin, through tirith's connect-time DNS guard. It sends
+  Accept-Encoding: identity and hashes the exact returned body bytes.
+
+Route mapping:
+  By default index.html serves its containing directory and every other file
+  serves its exact relative path. A --route-map JSON file
+  ({\"routes\": {\"index.html\": \"/\", \"app.js\": \"/static/app.js\"}}) replaces
+  that convention with your own; every key must name a file in the build
+  receipt's output manifest, and every value must be an absolute same-origin
+  path.
+
+  BOTH mappings go through the same gate, the default one included: it is
+  derived from filenames in a build tree nothing character-checked, and a file
+  named so that its route resolves to another authority would otherwise send the
+  request there. Every resolved URL is re-checked against the base origin before
+  the request leaves, and a route that resolves elsewhere is a mismatch that
+  reaches no network.
+
+Bounds:
+  8 concurrent fetches, 5 redirect hops, 32 MiB per response, 2 GiB in total,
+  30 second request and 10 second connect budgets.
+
+What this receipt proves:
+  ONLY that the routes it lists returned these bytes at the timestamp it
+  records. It is not continuous monitoring, it says nothing about routes it did
+  not fetch, and it is not proof that the deployed site is the build. CSP and
+  trusted-types headers are recorded as observations, never as byte proof.
+
+Exit codes:
+  0  clean     every built file was fetched and served exactly the built bytes
+  1  mismatch  a route served different bytes, did not serve the file at all,
+               redirected or resolved off the origin, resolved to a private or
+               loopback address, or the build receipt failed verification
+  2  usage     the file is not a build receipt, or the route map is invalid
+  3  partial   a route was unreachable, authenticated, challenged, transformed
+               in transit, or over a cap; the build receipt was itself partial;
+               or built files were never fetched
+
+Examples:
+  tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example
+  tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example --route-map routes.json
+  tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example --out deployment.receipt.json")]
+    Deployment {
+        /// The build receipt whose output manifest names what to fetch.
+        #[arg(long)]
+        build_receipt: std::path::PathBuf,
+        /// The single https origin to fetch from.
+        #[arg(long)]
+        base_url: String,
+        /// JSON file mapping built files to URL paths.
+        #[arg(long)]
+        route_map: Option<std::path::PathBuf>,
+        /// Also write the receipt to this path (atomic, mode 0600).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Re-check a deployment receipt document. Makes no network request.
+    #[command(after_help = "\
+What it does:
+  Checks the receipt's SIGNATURE against this installation's audit key,
+  re-computes the content address, re-counts the route ledger, and reports what
+  the receipt did not cover, what origin it is about, and when it was measured.
+
+  It deliberately does NOT re-fetch. A second measurement presented as
+  verification of the first would be exactly the continuous-monitoring claim
+  this command refuses to make. To measure the site again, run
+  `tirith attest deployment` again and compare the two receipts.
+
+Exit codes:
+  0  clean     the document stands up and every recorded route matched
+  1  mismatch  the document failed its integrity rules, its signature does not
+               verify, or a route mismatched
+  2  usage     the file is not a deployment receipt
+  3  partial   a route was unmeasured, built files were never fetched, the build
+               receipt behind it was partial, or the signature cannot be checked
+
+Examples:
+  tirith attest verify-deployment deployment.receipt.json
+  tirith attest verify-deployment deployment.receipt.json --format json")]
+    VerifyDeployment {
+        /// The deployment receipt to re-check.
+        #[arg(value_name = "RECEIPT")]
+        receipt: std::path::PathBuf,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+/// Honesty block for `tirith capsule run`. The wording here is the SAME
+/// contract the command's refusal message, the JSON envelope, and
+/// `docs/capsule.md` carry.
+const CAPSULE_RUN_AFTER_HELP: &str = "\
+FAIL-CLOSED CONTAINMENT. NO DEGRADED FALLBACK.
+  This is the recruiter-task preset: you were sent a repository and asked to
+  run it. The project is COPIED into a held ephemeral directory and the command
+  runs there, with write access to the copy and a private temporary HOME and
+  nothing else.
+
+PLATFORM LIMIT (not a bug, a refusal):
+  Enforceable only on x86_64 Linux with a usable Landlock ABI. Raw-network
+  denial needs seccomp, which this build supports on x86_64 Linux only; macOS
+  cannot enforce a memory or process-count ceiling at all; and the parent-owned
+  wall-clock and combined-output supervisor is Linux-only. Every other host
+  REFUSES before anything is copied or spawned, naming the exact control it
+  could not deliver. It never falls back to a degraded or uncontained run.
+
+WHAT THE PRESET DOES:
+  - copies the project with symlink-safe, same-inode traversal, REFUSING (never
+    silently skipping) symlinks, hardlinks, cross-filesystem entries, path
+    escapes, case/Unicode collisions, and non-regular files; excludes .git;
+    caps at 100,000 files, 200,000 entries, 256 levels, and 2 GiB
+  - denies all network. Domain allow-listing is NOT offered: no backend here
+    can enforce it, so claiming it would be a lie. Dependencies must be
+    vendored or preinstalled by a separate trusted transaction
+  - denies credential stores, wallet roots, browser profiles, and inherited
+    secret environment; the child gets a fixed PATH and a temporary HOME
+  - applies CPU 120s, wall 300s, memory 2 GiB, 256 processes, 256 open files,
+    and 16 MiB combined output, tightened further by any task_gate policy
+
+RECEIPT:
+  Every invocation writes one signed, content-addressed receipt, including a
+  refusal. It records the argv DIGEST (never the argv), the project input and
+  output tree digests, the backend, requested versus achieved coverage, the
+  effective limits, the child's exit status SEPARATELY from Tirith's decision,
+  the termination reason, a bounded file diff, whether a copy was materialized
+  at all, and cleanup confirmation for the copy, the process tree, and the
+  temporary HOME. Host paths are redacted from the recorded reason. A run that
+  was not fully contained is recorded as `partial` or `refused`, never as a
+  contained result.
+
+EXIT CODES:
+  0 contained and the child exited 0; 1 a Tirith decision (refused before
+  launch, terminated after it, or a run whose receipt could not be recorded or
+  could not be anchored in the audit chain);
+  2 usage or input error; 3 contained but the child itself exited non-zero.
+
+Examples:
+  tirith capsule run --preset untrusted-project --project . -- npm test
+  tirith capsule run --preset untrusted-project --project ./take-home \\
+    --receipt ./run.json -- ./scripts/build.sh";
+
+#[derive(Subcommand)]
+enum CapsuleAction {
+    /// Copy an untrusted project into a held ephemeral directory and run an
+    /// exact argv inside a fail-closed capsule
+    #[command(after_help = CAPSULE_RUN_AFTER_HELP)]
+    Run {
+        /// Containment preset. The only value is `untrusted-project`.
+        #[arg(long, default_value = cli::capsule_run::PRESET_UNTRUSTED_PROJECT)]
+        preset: String,
+
+        /// Project directory to copy and run. Never written to itself.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+
+        /// Write the run receipt to this path (0600). A content-addressed copy
+        /// is stored under the tirith data directory regardless.
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+
+        /// The exact argv to run inside the capsule, after `--`. Never joined
+        /// or reparsed by a shell.
+        #[arg(last = true, required = true)]
+        argv: Vec<std::ffi::OsString>,
     },
 }
 
@@ -3071,6 +3483,101 @@ Examples:
         apply: bool,
         /// Emit a JSON envelope instead of human text.
         #[arg(long)]
+        json: bool,
+    },
+
+    /// Read-only integrity audit of the installed Chromium-family extensions
+    #[command(after_help = "\
+Hashes the extension SOURCE trees a Chromium-family browser has installed and
+reports what each one declares, then compares that against a baseline receipt.
+Explicit, one-shot, read-only: it never removes, quarantines, or watches
+anything.
+
+WHAT IT READS:
+  <user-data>/<profile>/Extensions/<id>/<version>/**   every file, for the digest
+  <profile>/Preferences and Secure Preferences         THREE fields per extension
+                                                       id (location, from_webstore,
+                                                       was_installed_by_default),
+                                                       which is where the browser
+                                                       records install class
+
+WHAT IT NEVER READS:
+  cookies, history, saved passwords, Local Storage, IndexedDB, Local/Sync
+  Extension Settings, wallet databases, seed material, or Preferences as a
+  document. It also never reads <user-data>/Local State, because that file holds
+  the human profile names alongside the signed-in account email. Profile
+  identity here is the profile DIRECTORY NAME and nothing else.
+
+WHAT IT REPORTS:
+  browser and profile identity, extension id, version, install class, a
+  deterministic sorted-tree digest, manifest version, permissions and host
+  scopes, execution surfaces, provenance class, coverage, and (against a
+  baseline) new / removed / version change / version directory REUSED (a
+  declared version that moved while its directory did not, which no real browser
+  update produces) / version-directory set change / same-version BYTE change /
+  permission, host, and OPTIONAL permission and host expansion /
+  manifest-version change / execution-surface change / provenance change.
+
+  Permission RISK and integrity DRIFT are reported separately and never folded
+  together. A wallet extension legitimately holding broad permissions is not the
+  same event as one whose bytes changed without its version changing. Wallet
+  extension ids are labels, never trust anchors, and enterprise or developer
+  installs are classified, not condemned.
+
+COVERAGE:
+  Any symlink, name collision, unreadable or locked directory, hard link,
+  oversize file, or exhausted budget makes the result `partial`. A partial digest
+  is never emitted as if it were complete, and it is never compared against a
+  baseline as if it were: an extension whose tree could not be fully hashed, or
+  whose own directory could not be fully enumerated, is reported as
+  `integrity_not_comparable` rather than as tamper or as clean.
+
+BASELINE TRUST:
+  A baseline's `receipt_id` and `inventory_hash` are hashes the document computes
+  over ITSELF, so anyone who can edit the file can recompute them. They prove the
+  document is internally consistent and nothing more. When this installation has
+  an audit key, `--baseline` therefore REQUIRES an ed25519 signature that
+  verifies against it: a signature that does not verify, and a signature that was
+  stripped, are both usage errors rather than a clean comparison.
+
+EXIT CODES:
+  0 audited with no drift; 1 drift against the supplied baseline, including an
+  extension that could not be compared and any `--baseline` run whose coverage
+  was partial (a verify run that could not verify never reports no drift);
+  2 usage error, unreadable / unverifiable baseline, failed baseline write, or a
+  broken JSON write with no drift.
+
+Examples:
+  tirith browser audit
+  tirith browser audit --browser all
+  tirith browser audit --browser brave --write-baseline ./browser-baseline.json
+  tirith browser audit --baseline ./browser-baseline.json --format json")]
+    Audit {
+        /// Which browser to audit: chrome (default), chromium, brave, edge, or
+        /// all. Firefox and XPI are out of scope and are refused by name.
+        #[arg(long, default_value = "chrome")]
+        browser: String,
+
+        /// Audit exactly this profile directory instead of discovering profiles
+        /// under the browser's user-data directory. Not combinable with
+        /// `--browser all`.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+
+        /// Compare against this baseline receipt and report drift.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+
+        /// Write the current inventory as a content-addressed baseline receipt
+        /// at this path (0600), ed25519-signed when the audit chain has a key.
+        #[arg(long)]
+        write_baseline: Option<PathBuf>,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 }
@@ -3503,7 +4010,9 @@ enum CommandCardAction {
     #[command(after_help = "\
 Flag-driven when --command is supplied; otherwise prompts for the command on
 the terminal. The card is printed as pretty JSON on stdout, so you can redirect
-it to a file. Sign it next with `tirith command-card sign`.
+it to a file. New cards store only a shell-bound command digest; the raw command
+and credential paths are never persisted. Raw private keys, mnemonics, and raw
+keypairs are refused. Sign the card next with `tirith command-card sign`.
 
 If --expires is omitted, the card expires 90 days from today.
 
@@ -3512,18 +4021,22 @@ Examples:
   tirith command-card create --command 'sh ./setup.sh' --requires-sudo --writes /etc/foo
   tirith command-card create --command 'x' --expected-domain example.com --expected-domain github.com/example/project")]
     Create {
-        /// The exact command the card attests to. Prompts if omitted.
+        /// The exact command to digest and attest to. Prompts if omitted; the
+        /// raw value is not stored in newly-created cards.
         #[arg(long)]
         command: Option<String>,
+        /// Shell dialect under which the command will execute.
+        #[arg(long, default_value = "posix")]
+        shell: String,
         /// A domain (or host/path prefix) the command is expected to contact.
         /// Repeatable.
         #[arg(long = "expected-domain")]
         expected_domain: Vec<String>,
         /// SHA-256 (hex) of the script the command downloads/pipes, if any.
-        /// RECORDED-BUT-NOT-ENFORCED in v1: it is part of the signed
+        /// RECORDED-BUT-NOT-ENFORCED: it is part of the signed
         /// attestation, but `tirith check` does NOT fetch the script to compare
         /// it (the hot path never makes network calls). v1 verifies only the
-        /// signature, expiry, and exact command.
+        /// signature, expiry, and shell-bound command digest.
         #[arg(long)]
         script_sha256: Option<String>,
         /// A filesystem path the command is expected to write. Repeatable.
@@ -3549,14 +4062,26 @@ Reads the card JSON, signs the canonical (signature-cleared) payload with the
 supplied ed25519 private key, and rewrites the file with the `signature` block
 populated (algo, key_id, hex value). The key file may be 32 raw bytes, hex, or
 base64. The key_id stamped on the card is the first 16 hex chars of
-sha256(public-key).
+sha256(public-key). Unsigned legacy cards are migrated in place to the
+privacy-safe shell-bound command-digest schema before signing.
+
+Schema-3 cards require `--command` at signing time. Tirith verifies it against
+the stored digest before producing a signature and never writes it to the card.
 
 Examples:
-  tirith command-card sign --key ed25519-priv.bin install-card.json")]
+  tirith command-card sign --key ed25519-priv.bin --command 'sh ./setup.sh' install-card.json")]
     Sign {
         /// Path to the ed25519 private key (32 raw bytes, hex, or base64).
         #[arg(long)]
         key: String,
+        /// Shell dialect to bind when promoting schema v1 or migrating a
+        /// legacy schema-v2 Web3 card that has no shell binding.
+        #[arg(long, default_value = "posix")]
+        shell: String,
+        /// Re-supply the reviewed command when signing a privacy-safe card.
+        /// Required for schema 3 so the signer verifies the opaque digest.
+        #[arg(long)]
+        command: Option<String>,
         /// Path to the card JSON to sign in place.
         card: String,
         /// Output format (default: human).
@@ -4540,16 +5065,16 @@ Examples:
         json: bool,
     },
 
-    /// Show sensitive vars set / changed since shell start (values masked)
+    /// Show sensitive vars newly set since shell start (values masked)
     #[command(after_help = "\
 What it shows:
   Compares the sensitive vars set in this process against the shell-start
   snapshot (state-dir/env_snapshot.json, written by the shell hook). Reports
-  which sensitive vars are newly-set or value-changed. VALUES ARE NEVER SHOWN —
-  change-detection uses an 8-char SHA-256 prefix only.
+  which sensitive vars are newly set. Sensitive values are presence-only and
+  are never shown, persisted, hashed, or compared with snapshot values.
 
 --reset:
-  Re-baseline the snapshot from the current environment (names + 8-char hashes).
+  Re-baseline the snapshot from the current environment (all values are presence-only).
 
 Exit codes:
   0  no sensitive var newly appeared (or --reset).
@@ -5324,12 +5849,15 @@ impl PkgEcosystem {
 
 #[derive(Subcommand)]
 enum PkgAction {
-    /// Resolve + inspect a requirement set and approve its install plan, printing
-    /// the plan digest the approval binds to. Does NOT install.
+    /// Resolve + inspect a requirement set and approve its install plan through
+    /// the x86_64 Linux native authority. Does NOT install.
     #[command(after_help = "\
 Examples:
   tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
-  tirith pkg approve pip flask --target .venv")]
+  tirith pkg approve pip flask --target .venv
+
+Native approval issuance is available only on x86_64 Linux. Unsupported
+platforms fail closed before publishing an approval record.")]
     Approve {
         /// The ecosystem (only `pip` is enforced).
         #[arg(value_enum)]
@@ -5512,6 +6040,86 @@ Examples:
         /// The wheel artifact to fetch + bind provenance for.
         #[arg(value_name = "WHEEL")]
         wheel: std::path::PathBuf,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Ask the project's OWN npm to verify its installed packages' registry
+    /// signatures and provenance attestations, and bind the answer to the exact
+    /// package-lock.json, the installed node_modules inventory, and both the
+    /// lockfile's registry hosts and the ones npm itself reported. Emits a
+    /// content-addressed, signed receipt.
+    #[command(
+        name = "attest-npm",
+        after_help = "\
+What it does:
+  Resolves npm through tirith's trusted-executable mechanism (no shell, so an
+  alias cannot hijack the name), discovers npm's exact version, and only then
+  looks that version up in a CLOSED, fixture-backed contract table. The table
+  maps a supported npm version range to one exact argv, its expected JSON
+  schema, and how to read the result. An npm outside the table returns partial
+  with an unsupported-version reason and runs NO audit command: tirith never
+  hands a speculative flag to an npm whose output shape it has not
+  characterized.
+
+  The audit runs without a shell, with a 120 second timeout and 8 MiB stdout /
+  stderr caps, and its stderr is redacted before it reaches the receipt. Offline
+  mode returns partial without resolving or spawning anything. On Windows npm is
+  a batch launcher (npm.cmd) that the trusted-executable validator refuses, so
+  Windows returns partial rather than pretending.
+
+  Public mode is hermetic: it pins https://registry.npmjs.org/, strict TLS, a
+  direct connection, isolated empty user/global npm config, and an isolated
+  cache. Ambient HOME, npm config, auth, and proxy state do not reach the child.
+  Because npm reads the project's own .npmrc above those files, any effective
+  project setting returns partial and runs NO audit command.
+
+  A private registry is used only with TIRITH_NPM_AUDIT_MODE=trusted-private
+  plus an HTTPS TIRITH_NPM_REGISTRY and an absolute owner-only credential file
+  in TIRITH_NPM_AUTH_SOURCE. Optional TIRITH_NPM_CA_FILE and TIRITH_NPM_PROXY
+  are validated and bound too. Credentials are snapshotted for the child but
+  never stored in the receipt; npm and Node executable digests are recorded.
+
+What a clean receipt means:
+  npm's own registry signature check passed. It is NOT a statement that the
+  package code is benign, and tirith has not downloaded, inspected, or bound the
+  tarball bytes npm will install. npm performs its own registry network I/O,
+  outside tirith's fetch validator and capsule broker.
+
+  npm's JSON enumerates invalid, missing, and explicitly attested packages.
+  Absence from all three buckets is never positive evidence: a package without
+  explicit audit membership is not-audited, which is partial.
+
+Exit codes (deliberately distinct from `tirith check`, which uses 3 for a warn
+acknowledgement; per-command codes in tirith are not shared):
+  0  clean     every eligible package carried a verified registry signature
+  1  mismatch  a signature, attestation, or attested subject digest FAILED
+  2  usage     bad --project, an unwritable --out, or a broken JSON write
+  3  partial   old npm, offline, unsupported platform, a project .npmrc that
+               reconfigures the audit, network or parse failure, missing install
+               tree, an unsupported dependency source, an installed package with
+               no lockfile entry, or a package npm's report does not cover
+
+Examples:
+  tirith pkg attest-npm --project .
+  tirith pkg attest-npm --project . --require-provenance
+  tirith pkg attest-npm --out npm-provenance.receipt.json --format json"
+    )]
+    AttestNpm {
+        /// The project directory holding package-lock.json and node_modules
+        /// (default: the repository root, else the working directory).
+        #[arg(long)]
+        project: Option<std::path::PathBuf>,
+        /// Also write the receipt to this path (atomic, mode 0600).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Require a verified provenance attestation for every eligible
+        /// package, not merely a registry signature.
+        #[arg(long)]
+        require_provenance: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -7343,6 +7951,24 @@ fn run() {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::pypi_integrity::run(&wheel, json)
         }
+        Commands::Pkg {
+            action:
+                PkgAction::AttestNpm {
+                    project,
+                    out,
+                    require_provenance,
+                    format,
+                    json,
+                },
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::npm_integrity::run(cli::npm_integrity::AttestNpmArgs {
+                project,
+                out,
+                require_provenance,
+                json,
+            })
+        }
         Commands::Pkg { action } => {
             let pkg_action = match action {
                 PkgAction::Approve {
@@ -7438,6 +8064,10 @@ fn run() {
                 // exit code through `cli::pypi_integrity::run`), so it never reaches
                 // here.
                 PkgAction::Attest { .. } => unreachable!("pkg attest handled above"),
+                // `AttestNpm` likewise returns its own exit code through
+                // `cli::npm_integrity::run` in an earlier arm, so it never
+                // reaches here.
+                PkgAction::AttestNpm { .. } => unreachable!("pkg attest-npm handled above"),
             };
             cli::pkg::run(pkg_action)
         }
@@ -7458,6 +8088,92 @@ fn run() {
                 && is_terminal::is_terminal(std::io::stdin());
             cli::lab::run(interactive, filter.as_deref(), want_json, score)
         }
+
+        Commands::Task { action } => match action {
+            TaskAction::Check {
+                file,
+                adapter,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::task::run(file.as_deref(), adapter.as_deref(), json)
+            }
+        },
+
+        Commands::Attest { action } => match action {
+            AttestAction::Build {
+                source,
+                output,
+                execution_receipt,
+                out,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::attest::build(cli::attest::BuildArgs {
+                    source,
+                    output,
+                    execution_receipt,
+                    out,
+                    json,
+                })
+            }
+            AttestAction::VerifyBuild {
+                receipt,
+                source,
+                output,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::attest::verify_build(cli::attest::VerifyBuildArgs {
+                    receipt,
+                    source,
+                    output,
+                    json,
+                })
+            }
+            AttestAction::Deployment {
+                build_receipt,
+                base_url,
+                route_map,
+                out,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::attest::deployment(cli::attest::DeploymentArgs {
+                    build_receipt,
+                    base_url,
+                    route_map,
+                    out,
+                    json,
+                })
+            }
+            AttestAction::VerifyDeployment {
+                receipt,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::attest::verify_deployment(cli::attest::VerifyDeploymentArgs { receipt, json })
+            }
+        },
+
+        Commands::Capsule { action } => match action {
+            CapsuleAction::Run {
+                preset,
+                project,
+                receipt,
+                format,
+                json,
+                argv,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::capsule_run::run(&preset, &project, receipt.as_deref(), &argv, json)
+            }
+        },
 
         Commands::Score {
             url,
@@ -7552,8 +8268,9 @@ fn run() {
         } => cli::fix::run(&command, &shell, non_interactive, json),
 
         Commands::McpServer {
-            sanitize_tool_output,
-        } => cli::mcp_server::run(sanitize_tool_output),
+            sanitize_tool_output: _,
+            unsafe_unsanitized_tool_output,
+        } => cli::mcp_server::run(!unsafe_unsanitized_tool_output),
 
         Commands::Mcp { action } => match action {
             McpAction::Lock {
@@ -8725,6 +9442,7 @@ fn run() {
         Commands::CommandCard { action } => match action {
             CommandCardAction::Create {
                 command,
+                shell,
                 expected_domain,
                 script_sha256,
                 writes,
@@ -8734,24 +9452,61 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::command_card::create(
-                    command,
-                    expected_domain,
-                    script_sha256,
-                    writes,
-                    requires_sudo,
-                    expires,
-                    json,
-                )
+                match shell.parse::<tirith_core::tokenize::ShellType>() {
+                    Ok(shell) => cli::command_card::create(
+                        command,
+                        shell,
+                        expected_domain,
+                        script_sha256,
+                        writes,
+                        requires_sudo,
+                        expires,
+                        json,
+                    ),
+                    Err(error) => {
+                        if json {
+                            let _ = cli::write_json_stdout(
+                                &serde_json::json!({ "error": error }),
+                                "tirith command-card create: failed to write JSON output",
+                            );
+                        } else {
+                            eprintln!(
+                                "tirith command-card create: {}",
+                                cli::sanitize_for_human_output(&error, false)
+                            );
+                        }
+                        2
+                    }
+                }
             }
             CommandCardAction::Sign {
                 key,
+                shell,
+                command,
                 card,
                 format,
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::command_card::sign(&key, &card, json)
+                match shell.parse::<tirith_core::tokenize::ShellType>() {
+                    Ok(shell) => {
+                        cli::command_card::sign(&key, &card, command.as_deref(), shell, json)
+                    }
+                    Err(error) => {
+                        if json {
+                            let _ = cli::write_json_stdout(
+                                &serde_json::json!({ "error": error }),
+                                "tirith command-card sign: failed to write JSON output",
+                            );
+                        } else {
+                            eprintln!(
+                                "tirith command-card sign: {}",
+                                cli::sanitize_for_human_output(&error, false)
+                            );
+                        }
+                        2
+                    }
+                }
             }
             CommandCardAction::Verify { card, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -8939,6 +9694,23 @@ fn run() {
                     2
                 }
             },
+            BrowserAction::Audit {
+                browser,
+                profile,
+                baseline,
+                write_baseline,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::browser_audit::run(cli::browser_audit::AuditArgs {
+                    browser,
+                    profile,
+                    baseline,
+                    write_baseline,
+                    json,
+                })
+            }
         },
 
         // `temp-run` and its hidden `sandbox-dir` alias share one impl.

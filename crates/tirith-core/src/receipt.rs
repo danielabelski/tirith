@@ -158,6 +158,51 @@ impl Receipt {
             git_branch: self.git_branch.clone(),
         }
     }
+
+    /// Clone this receipt for a public DTO using one frozen analysis DLP plan.
+    /// Stored receipts retain full local fidelity; the returned clone removes
+    /// cwd and structurally strips URL credentials/query/fragment/provider
+    /// tokens while DLP-redacting and bounding every free-text path field.
+    pub fn presentation_clone_with_compiled(
+        &self,
+        compiled: &crate::redact::CompiledCustomPatterns,
+    ) -> Self {
+        let text =
+            |value: &str| crate::redact::sanitize_provenance_text_with_compiled(value, compiled);
+        let url =
+            |value: &str| crate::redact::sanitize_provenance_url_with_compiled(value, compiled);
+        Self {
+            url: url(&self.url),
+            final_url: self.final_url.as_deref().map(&url),
+            redirects: self.redirects.iter().map(|value| url(value)).collect(),
+            sha256: self.sha256.clone(),
+            size: self.size,
+            domains_referenced: self
+                .domains_referenced
+                .iter()
+                .map(|value| text(value))
+                .collect(),
+            paths_referenced: self
+                .paths_referenced
+                .iter()
+                .map(|value| text(value))
+                .collect(),
+            // `analysis_method` keeps the DLP pass: it embeds an incomplete-reason
+            // string from the runner, so it is not a closed vocabulary.
+            analysis_method: text(&self.analysis_method),
+            // `privilege` and `timestamp` are program-generated, never derived
+            // from analysed input: privilege is one of "normal"/"elevated"/"user"
+            // and timestamp is `Utc::now().to_rfc3339()`. Running operator DLP
+            // over them could only ever corrupt them -- a custom pattern as
+            // ordinary as `\d{4}` rewrites the year and breaks the receipt for
+            // the downstream verifier that parses it. There is nothing to redact.
+            privilege: self.privilege.clone(),
+            timestamp: self.timestamp.clone(),
+            cwd: None,
+            git_repo: self.git_repo.as_deref().map(url),
+            git_branch: self.git_branch.as_deref().map(text),
+        }
+    }
 }
 
 /// Redact the userinfo component (`user:password@`) of an absolute URL while
@@ -1034,6 +1079,7 @@ fn sha2_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_test_support::GlobalStateGuard;
 
     #[test]
     fn test_validate_sha256_valid() {
@@ -1127,16 +1173,102 @@ mod tests {
     }
 
     #[test]
+    fn presentation_clone_uses_frozen_dlp_and_shared_url_sanitizer() {
+        let canary = "C02_RECEIPT_PRESENTATION_CANARY";
+        let provider_token = "provider-token-0123456789";
+        let patterns = vec![regex::escape(canary)];
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let mut receipt = script_receipt("a".repeat(64));
+        receipt.url = format!(
+            "https://user:password@mainnet.infura.io/v3/{provider_token}?token={canary}#fragment"
+        );
+        receipt.final_url = Some(format!(
+            "https://eth-mainnet.g.alchemy.com/v2/{provider_token}?token={canary}"
+        ));
+        receipt.redirects = vec![format!(
+            "https://rpc.ankr.com/eth/{provider_token}?token={canary}"
+        )];
+        receipt.paths_referenced = vec![format!("/private/{canary}/wallet.json")];
+        receipt.git_repo = Some(format!(
+            "https://user:password@github.com/org/repo?token={canary}#fragment"
+        ));
+        receipt.git_branch = Some(format!("branch-{canary}"));
+
+        let projected = receipt.presentation_clone_with_compiled(&compiled);
+        let serialized = serde_json::to_string(&projected).unwrap();
+
+        for secret in [
+            canary,
+            provider_token,
+            "user:password",
+            "token=",
+            "#fragment",
+        ] {
+            assert!(!serialized.contains(secret), "receipt leaked {secret}");
+        }
+        assert!(serialized.contains("[REDACTED:custom]"));
+        assert!(projected.cwd.is_none());
+        assert!(
+            receipt.url.contains(canary),
+            "raw receipt must remain intact"
+        );
+        assert!(
+            receipt.cwd.is_some(),
+            "stored receipt must retain local cwd"
+        );
+    }
+
+    /// `privilege` and `timestamp` are produced by tirith itself, never derived
+    /// from the analysed subject, so there is nothing in them to redact. Running
+    /// the operator's custom DLP patterns over them could only ever corrupt them,
+    /// and an operator pattern broad enough to hit a bare 4-digit run is entirely
+    /// ordinary. A mangled timestamp breaks the downstream verifier that parses
+    /// the receipt, so this is a data-integrity bug, not a cosmetic one.
+    #[test]
+    fn a_broad_operator_dlp_pattern_cannot_corrupt_program_generated_receipt_fields() {
+        // Matches the year in any RFC 3339 timestamp, and "user"/"normal".
+        let patterns = vec![r"\d{4}".to_string(), r"user|normal".to_string()];
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&patterns);
+
+        let mut receipt = script_receipt("b".repeat(64));
+        receipt.timestamp = "2026-01-01T00:00:00Z".to_string();
+        receipt.privilege = "user".to_string();
+
+        let projected = receipt.presentation_clone_with_compiled(&compiled);
+
+        assert_eq!(
+            projected.timestamp, "2026-01-01T00:00:00Z",
+            "a program-generated timestamp must survive operator DLP verbatim"
+        );
+        assert_eq!(
+            projected.privilege, "user",
+            "a closed-vocabulary privilege must survive operator DLP verbatim"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&projected.timestamp).is_ok(),
+            "the projected timestamp must still parse as RFC 3339"
+        );
+
+        // The same pattern set must still redact genuinely attacker-influenced
+        // free text, so this is a scoping fix and not a hole in the DLP pass.
+        let mut tainted = script_receipt("c".repeat(64));
+        tainted.analysis_method = "static-incomplete:normal".to_string();
+        let tainted = tainted.presentation_clone_with_compiled(&compiled);
+        assert!(
+            tainted.analysis_method.contains("[REDACTED:custom]"),
+            "analysis_method still carries subject-derived text: {}",
+            tainted.analysis_method
+        );
+    }
+
+    #[test]
     fn load_rejects_substituted_receipt_identity() {
         // repo-0416: a receipt file whose embedded hash differs from the
         // requested filename is a substituted receipt — verifying it would
         // check a DIFFERENT cached script while reporting success for the
         // requested one.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let _environment = isolate_dirs(root.path());
         let dir = root.path().join("tirith").join("receipts");
         std::fs::create_dir_all(&dir).unwrap();
         let requested = "a".repeat(64);
@@ -1233,42 +1365,24 @@ mod tests {
 
     use crate::capsule::CapsuleCoverage;
 
-    /// A scoped env-var override that restores the prior value on drop. Local to
-    /// these tests so they do not depend on policy.rs's private guard.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, val: &std::path::Path) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::set_var(key, val);
-            EnvGuard { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     /// Point every directory env var [`crate::policy::data_dir`] /
     /// [`crate::policy::config_dir`] consult at `root`, on whichever platform the
     /// test runs (XDG on unix, APPDATA/LOCALAPPDATA on Windows), plus HOME so a
-    /// stray home lookup cannot escape. The guards restore on drop.
-    fn isolate_dirs(root: &std::path::Path) -> Vec<EnvGuard> {
-        vec![
-            EnvGuard::set("XDG_DATA_HOME", root),
-            EnvGuard::set("XDG_CONFIG_HOME", root),
-            EnvGuard::set("XDG_STATE_HOME", root),
-            EnvGuard::set("APPDATA", root),
-            EnvGuard::set("LOCALAPPDATA", root),
-            EnvGuard::set("HOME", root),
-            EnvGuard::set("USERPROFILE", root),
-        ]
+    /// stray home lookup cannot escape. The shared guard restores on drop.
+    fn isolate_dirs(root: &std::path::Path) -> GlobalStateGuard {
+        let mut environment = GlobalStateGuard::new().expect("isolate receipt directories");
+        for key in [
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "HOME",
+            "USERPROFILE",
+        ] {
+            environment.set_env(key, root);
+        }
+        environment
     }
 
     /// A sample capsule receipt with full deny-all coverage (what a clean
@@ -1562,17 +1676,10 @@ mod tests {
     // by the pkg_install receipt tests.
     #[cfg(unix)]
     fn record_saves_file_and_anchors_in_audit_chain() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let mut environment = isolate_dirs(root.path());
         // Make sure logging is on for this test even if the ambient env set it off.
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        environment.set_env("TIRITH_LOG", "1");
 
         let r = sample_receipt();
         // require_signature=false: an unsigned (tamper-evident) anchor is fine here.
@@ -1615,16 +1722,9 @@ mod tests {
 
     #[test]
     fn record_lists_alongside_script_receipts_without_cross_parse() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        let mut environment = isolate_dirs(root.path());
+        environment.set_env("TIRITH_LOG", "1");
 
         // Save one artifact-scan receipt.
         let r = sample_receipt();
@@ -1667,13 +1767,10 @@ mod tests {
 
     #[test]
     fn record_fails_closed_when_signature_required_but_unavailable() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         // Isolate config so no real audit-signing.key is present -> signing
         // unavailable.
-        let _guards = isolate_dirs(root.path());
+        let _environment = isolate_dirs(root.path());
 
         let r = sample_receipt();
         // require_signature=true with no signing key must fail closed and write
@@ -1707,16 +1804,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn forged_committed_receipt_is_rejected_before_write_or_anchor() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        let mut environment = isolate_dirs(root.path());
+        environment.set_env("TIRITH_LOG", "1");
 
         let private = sample_receipt();
         let mut forged = private.clone();
@@ -1742,16 +1832,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unsafe_or_stale_receipt_id_is_rejected_before_write_or_anchor() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        let mut environment = isolate_dirs(root.path());
+        environment.set_env("TIRITH_LOG", "1");
 
         let mut forged = sample_receipt();
         forged.receipt_id = "../../escape".to_string();
@@ -1774,18 +1857,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn signed_private_capability_is_required_for_committed_recording() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let mut environment = isolate_dirs(root.path());
         let tirith_dir = root.path().join("tirith");
         plant_signing_key(&tirith_dir);
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        environment.set_env("TIRITH_LOG", "1");
 
         let private = sample_receipt();
         let private_id = private.receipt_id.clone();
@@ -1835,20 +1911,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn record_fails_closed_when_signature_required_but_logging_off() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let mut environment = isolate_dirs(root.path());
         // config_dir() == data_dir() == <root>/tirith under the isolated XDG vars.
         let tirith_dir = root.path().join("tirith");
         plant_signing_key(&tirith_dir);
         // Logging OFF -> the receipt anchor is Skipped.
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "0");
+        environment.set_env("TIRITH_LOG", "0");
 
         // Sanity: the signing key IS available (so this is NOT the key-absent path).
         assert!(
@@ -1875,16 +1944,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn record_skipped_is_ok_unsigned_when_signature_not_required() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "0");
+        let mut environment = isolate_dirs(root.path());
+        environment.set_env("TIRITH_LOG", "0");
 
         let r = sample_receipt();
         let recorded = r
@@ -1909,17 +1971,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn record_degrades_to_anchor_warning_when_chain_append_fails() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let mut environment = isolate_dirs(root.path());
         // Keep logging ON so the anchor is attempted (not Skipped).
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        environment.set_env("TIRITH_LOG", "1");
 
         // Put a DIRECTORY at the audit log path so the append open() fails (EISDIR)
         // -> AuditWrite::Failed -> ReceiptAnchor::Failed.

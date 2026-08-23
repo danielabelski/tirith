@@ -38,7 +38,8 @@ pub(crate) fn load_last_trigger_from(
         }
         Err(tirith_core::util::OpenRegularError::TooLarge) => {
             return Err(format!(
-                "last trigger exceeds the {MAX_LAST_TRIGGER_BYTES} byte limit"
+                "last trigger exceeds the {} byte limit",
+                MAX_LAST_TRIGGER_BYTES
             ))
         }
         Err(tirith_core::util::OpenRegularError::Io(error)) => {
@@ -64,29 +65,6 @@ pub fn write_last_trigger(
             return;
         }
         let path = dir.join("last_trigger.json");
-
-        // A failed replacement must not leave an older event available to
-        // `trust --from-last-trigger`. Invalidate the previous record before
-        // constructing the new one; losing this convenience record is safer
-        // than applying trust to a stale finding after any serialization or
-        // publication failure below.
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    tirith_core::audit::audit_diagnostic(format!(
-                        "tirith: warning: cannot invalidate stale last-trigger record: {e}"
-                    ));
-                    return;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tirith_core::audit::audit_diagnostic(format!(
-                    "tirith: warning: cannot inspect prior last-trigger record: {e}"
-                ));
-                return;
-            }
-        }
 
         let redacted_findings =
             tirith_core::redact::redacted_findings(&verdict.findings, custom_patterns);

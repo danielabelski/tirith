@@ -119,6 +119,8 @@ passes it to `tirith check --json`, and:
   command analysis and pass through silently.
 - Copilot CLI does not document a stderr surface for `preToolUse`; deny
   decisions go through stdout JSON only.
-- The hook requires `python3` on PATH.
+- Automated setup validates Python once and records its absolute path while
+  keeping the hook script repo-relative. Re-run setup if that interpreter
+  moves; Copilot does not resolve `python3` from its runtime PATH.
 - Telemetry events are logged via `tirith hook-event` (fire-and-forget,
   non-blocking).

@@ -15,6 +15,9 @@ const USER_AGENTS: &[(&str, &str)] = &[
     ("curl", "curl/8.7.1"),
 ];
 
+#[cfg(unix)]
+type CloakingEffectAuthorizer = dyn Fn() -> Result<(), String> + Send + Sync;
+
 /// Result of a cloaking check.
 #[cfg(unix)]
 pub struct CloakingResult {
@@ -26,6 +29,41 @@ pub struct CloakingResult {
     /// Pairs of agents whose responses differed significantly.
     pub diff_pairs: Vec<DiffPair>,
 }
+
+/// A completed cloaking check together with the exact owned-boundary decision
+/// that authorized its network transaction.
+#[cfg(unix)]
+pub struct AuthorizedCloakingResult {
+    pub result: CloakingResult,
+    pub assessment: crate::task_boundary::BoundaryAssessment,
+}
+
+/// A cloaking failure that retains any boundary assessment already reached.
+/// Syntax failures occur before an assessment exists; policy denials and
+/// post-authorization network failures retain it for structured output.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct CloakingCheckError {
+    message: String,
+    assessment: Option<Box<crate::task_boundary::BoundaryAssessment>>,
+}
+
+#[cfg(unix)]
+impl CloakingCheckError {
+    pub fn assessment(&self) -> Option<&crate::task_boundary::BoundaryAssessment> {
+        self.assessment.as_deref()
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for CloakingCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for CloakingCheckError {}
 
 #[cfg(unix)]
 pub struct AgentResponse {
@@ -140,22 +178,151 @@ impl CloakingResult {
     }
 }
 
-/// Check a URL for server-side cloaking.
+/// Check a URL for server-side cloaking under the frozen operator task gate.
+///
+/// The boundary binding performs syntax-only URL validation. The typed permit
+/// becomes a retained effect lease before `network` is invoked, so an enforcing
+/// refusal cannot reach DNS resolution, client construction, or a socket. The
+/// exact binding and its earliest expiry are then revalidated before each DNS
+/// preflight, request dispatch, and redirect follow. The ordered [`USER_AGENTS`]
+/// set is included in the operation binding and is therefore authorized as one
+/// fixed multi-request probe transaction.
 #[cfg(unix)]
-pub fn check(url: &str) -> Result<CloakingResult, String> {
-    let validated_url = crate::url_validate::validate_fetch_url(url)?;
-    let client = cloaking_client(crate::ssrf_guard::fetch_resolver())?;
+pub fn check(
+    url: &str,
+    gate: &crate::web3_policy::TaskGatePolicy,
+) -> Result<CloakingResult, String> {
+    authorize_then_check(url, gate, check_network)
+}
+
+/// Check with an explicit audit sink. The callback runs exactly once for every
+/// recordable assessment, after the policy decision and before target DNS on
+/// allows, or after the refusal on denies. It never runs in Off mode.
+#[cfg(unix)]
+pub fn check_with_audit(
+    url: &str,
+    gate: &crate::web3_policy::TaskGatePolicy,
+    audit: impl FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> Result<AuthorizedCloakingResult, CloakingCheckError> {
+    authorize_then_check_with_audit(url, gate, check_network, audit)
+        .map(|(result, assessment)| AuthorizedCloakingResult { result, assessment })
+}
+
+#[cfg(unix)]
+fn authorize_then_check<T>(
+    url: &str,
+    gate: &crate::web3_policy::TaskGatePolicy,
+    network: impl FnOnce(&str, std::sync::Arc<CloakingEffectAuthorizer>) -> Result<T, String>,
+) -> Result<T, String> {
+    authorize_then_check_with_audit(url, gate, network, |_| {})
+        .map(|(result, _assessment)| result)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn authorize_then_check_with_audit<T>(
+    url: &str,
+    gate: &crate::web3_policy::TaskGatePolicy,
+    network: impl FnOnce(&str, std::sync::Arc<CloakingEffectAuthorizer>) -> Result<T, String>,
+    mut audit: impl FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> Result<(T, crate::task_boundary::BoundaryAssessment), CloakingCheckError> {
+    let binding = crate::task_boundary::fetch_cloaking_operation_binding(url, USER_AGENTS)
+        .map_err(|message| CloakingCheckError {
+            message,
+            assessment: None,
+        })?;
+    let operation = binding.operation();
+    let pending = match crate::task_boundary::prepare_locally_derived_boundary_authorization::<
+        crate::task_boundary::FetchCloakingBoundary,
+    >(
+        &operation,
+        gate,
+        &crate::task_analysis::TaskAnalysisContext::default(),
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let assessment = error.assessment().cloned();
+            if let Some(assessment) = assessment.as_ref().filter(|value| value.is_recordable()) {
+                audit(assessment);
+            }
+            return Err(CloakingCheckError {
+                message: format!("cloaking task authorization refused: {error}"),
+                assessment: assessment.map(Box::new),
+            });
+        }
+    };
+    let assessment = pending.assessment().clone();
+    let permit = match pending.consume_default_for_operation(&operation, chrono::Utc::now()) {
+        Ok(permit) => permit,
+        Err(error) => {
+            if assessment.is_recordable() {
+                audit(&assessment);
+            }
+            return Err(CloakingCheckError {
+                message: format!("cloaking task authorization refused: {error}"),
+                assessment: Some(Box::new(assessment)),
+            });
+        }
+    };
+    let lease = match permit.into_effect_lease_at(&operation, chrono::Utc::now()) {
+        Ok(lease) => lease,
+        Err(error) => {
+            if assessment.is_recordable() {
+                audit(&assessment);
+            }
+            return Err(CloakingCheckError {
+                message: format!("cloaking task authorization refused: {error}"),
+                assessment: Some(Box::new(assessment)),
+            });
+        }
+    };
+    drop(operation);
+    let authorization: std::sync::Arc<CloakingEffectAuthorizer> = std::sync::Arc::new(move || {
+        lease
+            .authorize_effect_at(&binding.operation(), chrono::Utc::now())
+            .map_err(|error| format!("cloaking task authorization refused: {error}"))
+    });
+    if assessment.is_recordable() {
+        audit(&assessment);
+    }
+    let result = network(url, authorization).map_err(|message| CloakingCheckError {
+        message,
+        assessment: Some(Box::new(assessment.clone())),
+    })?;
+    Ok((result, assessment))
+}
+
+#[cfg(unix)]
+fn check_network(
+    url: &str,
+    authorization: std::sync::Arc<CloakingEffectAuthorizer>,
+) -> Result<CloakingResult, String> {
+    let client = cloaking_client(
+        crate::ssrf_guard::fetch_resolver(),
+        std::sync::Arc::clone(&authorization),
+    )?;
 
     const MAX_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 
     let mut responses: Vec<(String, u16, String)> = Vec::new();
 
     for (name, ua) in USER_AGENTS {
-        match fetch_with_ua(&client, validated_url.as_str(), ua, MAX_BODY) {
+        let validated_url = authorize_immediately_before(authorization.as_ref(), || {
+            crate::url_validate::validate_fetch_url(url)
+        })??;
+        let fetch_result = authorize_immediately_before(authorization.as_ref(), || {
+            fetch_with_ua(&client, validated_url.as_str(), ua, MAX_BODY)
+        })?;
+        match fetch_result {
             Ok((status, body)) => {
                 responses.push((name.to_string(), status, body));
             }
             Err(e) => {
+                // A redirect callback can be the point where the retained lease
+                // expires. reqwest surfaces that refusal as a request error; do
+                // not downgrade it to an agent-specific probe failure or allow
+                // the loop to continue under an expired authorization.
+                authorization()?;
                 eprintln!("tirith: cloaking: {name} fetch failed: {e}");
                 // A host-unreachable failure (DNS/connect) is identical for every
                 // user-agent, so retrying the rest just burns ~5 more timeouts on
@@ -319,17 +486,22 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
 #[cfg(unix)]
 fn cloaking_client(
     resolver: std::sync::Arc<crate::ssrf_guard::SsrfGuardResolver>,
+    authorization: std::sync::Arc<CloakingEffectAuthorizer>,
 ) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .no_proxy()
         .dns_resolver(resolver)
         .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() > 10 {
                 attempt.error("too many redirects")
+            } else if let Err(reason) = authorization() {
+                attempt.error(reason)
             } else if let Err(reason) =
                 crate::url_validate::validate_fetch_url(attempt.url().as_str())
             {
+                attempt.error(reason)
+            } else if let Err(reason) = authorization() {
                 attempt.error(reason)
             } else {
                 attempt.follow()
@@ -337,6 +509,15 @@ fn cloaking_client(
         }))
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))
+}
+
+#[cfg(unix)]
+fn authorize_immediately_before<T>(
+    authorization: &CloakingEffectAuthorizer,
+    effect: impl FnOnce() -> T,
+) -> Result<T, String> {
+    authorization()?;
+    Ok(effect())
 }
 
 #[cfg(unix)]
@@ -593,16 +774,189 @@ mod tests {
     }
 
     #[test]
+    fn enforcing_network_denial_never_reaches_the_network_sink() {
+        let calls = std::cell::Cell::new(0usize);
+        let gate = crate::web3_policy::TaskGatePolicy {
+            mode: crate::web3_policy::TaskGateMode::Enforce,
+            effects_denied_for_untrusted_sources: [
+                crate::effects::CommandEffectKind::NetworkEgress,
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let result = authorize_then_check("https://example.com", &gate, |_, _| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0, "a denied probe reached DNS/client setup");
+    }
+
+    #[test]
+    fn off_and_observe_preserve_cloaking_probe_execution() {
+        for mode in [
+            crate::web3_policy::TaskGateMode::Off,
+            crate::web3_policy::TaskGateMode::Observe,
+        ] {
+            let calls = std::cell::Cell::new(0usize);
+            let gate = crate::web3_policy::TaskGatePolicy {
+                mode,
+                effects_denied_for_untrusted_sources: [
+                    crate::effects::CommandEffectKind::NetworkEgress,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            };
+            authorize_then_check("https://example.com", &gate, |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls.get(), 1, "{mode:?} changed fetch behavior");
+        }
+    }
+
+    #[test]
+    fn recordable_assessments_reach_the_explicit_audit_sink_once() {
+        let calls = std::cell::Cell::new(0usize);
+        let audits = std::cell::RefCell::new(Vec::new());
+        let gate = crate::web3_policy::TaskGatePolicy {
+            mode: crate::web3_policy::TaskGateMode::Observe,
+            effects_denied_for_untrusted_sources: [
+                crate::effects::CommandEffectKind::NetworkEgress,
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let (_result, assessment) = authorize_then_check_with_audit(
+            "https://example.com",
+            &gate,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            |assessment| audits.borrow_mut().push(assessment.projection()),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(audits.borrow().len(), 1);
+        assert_eq!(audits.borrow()[0]["boundary"], "fetch_cloaking");
+        assert_eq!(audits.borrow()[0]["mode"], "observe");
+        assert!(assessment.is_recordable());
+    }
+
+    #[test]
+    fn denied_assessment_is_audited_and_retained_without_network() {
+        let calls = std::cell::Cell::new(0usize);
+        let audits = std::cell::RefCell::new(Vec::new());
+        let gate = crate::web3_policy::TaskGatePolicy {
+            mode: crate::web3_policy::TaskGateMode::Enforce,
+            effects_denied_for_untrusted_sources: [
+                crate::effects::CommandEffectKind::NetworkEgress,
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let error = authorize_then_check_with_audit(
+            "https://example.com",
+            &gate,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            |assessment| audits.borrow_mut().push(assessment.projection()),
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 0);
+        assert_eq!(audits.borrow().len(), 1);
+        assert_eq!(audits.borrow()[0]["outcome"], "deny");
+        assert_eq!(
+            error.assessment().unwrap().boundary,
+            crate::task_boundary::OwnedBoundary::FetchCloaking
+        );
+    }
+
+    #[test]
+    fn effect_lease_expiry_after_dns_refuses_before_socket_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let binding = crate::task_boundary::fetch_cloaking_operation_binding(
+            "https://example.com",
+            USER_AGENTS,
+        )
+        .unwrap();
+        let operation = binding.operation();
+        let deadline = chrono::DateTime::parse_from_rfc3339("2026-08-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let before_deadline = deadline - chrono::TimeDelta::milliseconds(1);
+        let permit = crate::task_boundary::TaskBoundaryPermit::<
+            crate::task_boundary::FetchCloakingBoundary,
+        >::for_test_with_deadline(&operation, deadline);
+        let lease = permit
+            .into_effect_lease_at(&operation, before_deadline)
+            .unwrap();
+        drop(operation);
+
+        let checks = std::sync::Arc::new(AtomicUsize::new(0));
+        let authorization_checks = std::sync::Arc::clone(&checks);
+        let expires_after_dns: std::sync::Arc<CloakingEffectAuthorizer> =
+            std::sync::Arc::new(move || {
+                let now = if authorization_checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    before_deadline
+                } else {
+                    deadline
+                };
+                lease
+                    .authorize_effect_at(&binding.operation(), now)
+                    .map_err(|error| format!("cloaking task authorization refused: {error}"))
+            });
+        let dns_calls = std::cell::Cell::new(0usize);
+        let socket_calls = std::cell::Cell::new(0usize);
+
+        let dns = authorize_immediately_before(&*expires_after_dns, || {
+            dns_calls.set(dns_calls.get() + 1);
+        });
+        let socket = authorize_immediately_before(&*expires_after_dns, || {
+            socket_calls.set(socket_calls.get() + 1);
+        });
+
+        assert!(dns.is_ok());
+        assert!(socket.is_err());
+        assert_eq!(dns_calls.get(), 1, "authorized DNS preflight did not run");
+        assert_eq!(
+            socket_calls.get(),
+            0,
+            "expired lease reached socket dispatch"
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn test_cloaking_rejects_localhost_target_before_fetch() {
         // Serialize with the empty-baseline test below: that test sets
         // `TIRITH_PRIVATE_FETCH_ALLOW` process-wide, which (if it overlapped)
         // would relax the very localhost rejection this test asserts.
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match check("http://localhost/") {
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global cloaking state");
+        global.remove_env("TIRITH_PRIVATE_FETCH_ALLOW");
+        match check(
+            "http://localhost/",
+            &crate::web3_policy::TaskGatePolicy::default(),
+        ) {
             Ok(_) => panic!("expected localhost target to be rejected"),
-            Err(err) => assert!(err.contains("localhost")),
+            Err(err) => assert!(
+                matches!(
+                    err.as_str(),
+                    "refusing to connect to localhost destination"
+                        | "refusing to connect to non-public address"
+                ),
+                "unexpected categorical localhost rejection: {err}"
+            ),
         }
     }
 
@@ -622,7 +976,8 @@ mod tests {
             assert_eq!(host, "rebind.example.test");
             Ok(vec!["127.0.0.1:9".parse().unwrap()])
         });
-        let client = cloaking_client(resolver).expect("build guarded cloaking client");
+        let client = cloaking_client(resolver, std::sync::Arc::new(|| Ok(())))
+            .expect("build guarded cloaking client");
         let error = client
             .get(url)
             .send()
@@ -649,6 +1004,7 @@ mod tests {
     #[test]
     fn test_classify_connect_refusal_short_circuits() {
         let client = reqwest::blocking::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("client");
@@ -694,6 +1050,7 @@ mod tests {
         });
 
         let client = reqwest::blocking::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_millis(200))
             .build()
             .expect("client");
@@ -746,28 +1103,6 @@ mod tests {
     }
 
     /// Snapshot an env var and restore it on `Drop`.
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     /// When the BASELINE (chrome, USER_AGENTS[0]) returns an empty body but other
     /// user-agents succeed, there is no reference to diff against and the check
     /// could not actually run. It MUST come back inconclusive (`Err`), never
@@ -788,10 +1123,9 @@ mod tests {
 
         // Loopback fetches are SSRF-blocked by default; the carve-out opt-in is
         // process-wide, so serialize with other env-sensitive cloaking tests.
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _allow_private = EnvVarGuard::set("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global cloaking state");
+        global.set_env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
@@ -830,7 +1164,10 @@ mod tests {
             }
         });
 
-        let result = check(&format!("http://{addr}/"));
+        let result = check(
+            &format!("http://{addr}/"),
+            &crate::web3_policy::TaskGatePolicy::default(),
+        );
         let _ = server.join();
 
         // The contract: an empty baseline is inconclusive (Err), NOT a successful

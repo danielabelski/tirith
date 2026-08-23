@@ -226,18 +226,11 @@ impl PathAuditReport {
 /// writable-before-system finding.
 fn is_package_manager_prefix(dir: &Path) -> bool {
     let s = dir.to_string_lossy().to_lowercase();
-    s == "/opt/homebrew/bin"
-        || s == "/opt/homebrew/sbin"
-        || s.starts_with("/opt/homebrew/cellar/")
-        || s.starts_with("/opt/homebrew/opt/")
-        || s == "/home/linuxbrew/.linuxbrew/bin"
-        || s == "/home/linuxbrew/.linuxbrew/sbin"
-        || s.starts_with("/home/linuxbrew/.linuxbrew/cellar/")
-        || s.starts_with("/home/linuxbrew/.linuxbrew/opt/")
+    s.starts_with("/opt/homebrew/")
+        || s.starts_with("/usr/local/")
+        || s.starts_with("/home/linuxbrew/")
+        || s.starts_with("/opt/homebrew")
         || s == "/usr/local/bin"
-        || s == "/usr/local/sbin"
-        || s.starts_with("/usr/local/cellar/")
-        || s.starts_with("/usr/local/opt/")
 }
 
 /// Audit a `$PATH` string. `repo_root` and `tmp_roots` are injected for
@@ -823,13 +816,14 @@ mod tests {
     }
 
     #[test]
-    fn leader_findings_carry_path_evidence() {
+    fn leader_findings_public_debug_projects_path_evidence() {
         let f = leader_findings(&[LeaderLocation::InTmp], "/tmp/payload");
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule_id, RuleId::ExecInTmp);
         assert_eq!(f[0].severity, Severity::Medium);
         let blob = format!("{:?}", f[0].evidence);
-        assert!(blob.contains("/tmp/payload"), "{blob}");
+        assert!(!blob.contains("/tmp/payload"), "{blob}");
+        assert!(blob.contains("[REDACTED]"), "{blob}");
     }
 
     // ── cold: audit_path_str ──────────────────────────────────────────────

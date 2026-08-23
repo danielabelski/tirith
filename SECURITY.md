@@ -43,16 +43,25 @@ We will coordinate disclosure timing with you. We won't publish details until a 
 
 ## Data handling
 
-Tirith processes commands and pasted text **entirely locally**. During `check` and `paste`:
+Tirith's command parser, local rules, and `paste` analysis run locally. A
+normal `check` may enrich package-install candidates through the enabled OSV,
+deps.dev, ecosyste.ms, Safe Browsing, or KEV providers; those requests can
+disclose the parsed package name and version or constraint to the provider.
+Use `tirith check --offline` (or disable the corresponding policy providers) to
+guarantee that runtime enrichment makes no network request. Offline mode is
+enforced in both the direct and daemon-backed check paths; an unavailable local
+answer is reported as incomplete rather than silently going online.
 
-- **No network calls** are made
-- **No data leaves your machine**
-- Analysis results are written to a local JSONL audit log only
-- Full command text is redacted in logs (first 80 chars, truncated)
+- `paste` makes no network calls.
+- Tirith sends no telemetry, analytics, or crash reports.
+- Analysis results are written to a local JSONL audit log only.
+- Full command text is redacted in logs (first 80 chars, truncated).
 
-The audit log lives at `~/.local/share/tirith/audit.jsonl` (or platform equivalent). Disable with `TIRITH_LOG=0`.
+The audit log lives at `$XDG_DATA_HOME/tirith/log.jsonl` (normally
+`~/.local/share/tirith/log.jsonl`, or the platform equivalent). Disable it with
+`TIRITH_LOG=0`.
 
-Tirith has no telemetry, no analytics, no crash reporting, no phone-home behavior.
+There is no unrelated phone-home behavior.
 
 ## Reproducible builds
 
@@ -63,14 +72,23 @@ Release artifacts are built via GitHub Actions with:
 
 Verify a release:
 ```bash
-cosign verify-blob --certificate-identity-regexp 'github.com/sheeki03/tirith' \
+TAG=vX.Y.Z  # replace with the exact immutable release tag you downloaded
+cosign verify-blob \
+  --signature checksums.txt.sig \
+  --certificate checksums.txt.pem \
+  --certificate-identity "https://github.com/sheeki03/tirith/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  --bundle tirith-*.cosign.bundle \
-  tirith-*.tar.gz
+  checksums.txt
+sha256sum --check --strict checksums.txt
 ```
 
 ## Supported versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.1.x | Yes |
+The latest published minor release line receives security fixes. Older minor
+lines receive best-effort support only; upgrade before reporting a result as a
+current-version vulnerability. Code on an unreleased branch or integration
+stack is not a supported release until its protected tag and artifacts exist.
+
+For the planned 0.4.0 release, 0.3.x remains the supported published line until
+0.4.0 is actually available. After publication, 0.4.x becomes the supported
+line.

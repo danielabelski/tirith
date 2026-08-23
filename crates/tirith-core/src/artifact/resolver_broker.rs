@@ -205,19 +205,6 @@ impl ResolverBroker {
                             };
                             match thread_connections.lock() {
                                 Ok(mut registry) => {
-                                    // Synchronize registration with Drop's
-                                    // stop-then-registry sweep. Without this
-                                    // check, Drop can scan an empty registry
-                                    // while this accepted connection is waiting
-                                    // for the same mutex, after which the new
-                                    // partial session would miss cancellation
-                                    // and retain the listener join until its
-                                    // handshake deadline.
-                                    if thread_stop.load(Ordering::Acquire) {
-                                        thread_active.fetch_sub(1, Ordering::AcqRel);
-                                        let _ = stream.shutdown(Shutdown::Both);
-                                        break;
-                                    }
                                     registry.insert(connection_id, vec![clone]);
                                 }
                                 Err(_) => {

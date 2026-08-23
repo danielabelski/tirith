@@ -847,7 +847,19 @@ fn print_json(breakdown: &RiskBreakdown, explain: bool) -> bool {
         /// Full factor breakdown — present only with `explain`.
         #[serde(skip_serializing_if = "Option::is_none")]
         risk_breakdown: Option<&'a RiskBreakdown>,
+        /// C13: present whenever npm `dist` facts are reported, so a JSON
+        /// consumer cannot read an integrity/signature field as a claim that
+        /// Tirith checked the artifact.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        npm_identity_caveat: Option<&'static str>,
     }
+
+    let npm_identity_caveat = match &breakdown.api_signals {
+        ApiSignals::Available { provenance } if provenance.npm_dist.is_some() => {
+            Some(NPM_BYTES_NOT_BOUND_CAVEAT)
+        }
+        _ => None,
+    };
 
     let out = PackageRiskOutput {
         ecosystem: &breakdown.ecosystem,
@@ -860,6 +872,7 @@ fn print_json(breakdown: &RiskBreakdown, explain: bool) -> bool {
         content_signals: &breakdown.content_signals,
         api_signals: &breakdown.api_signals,
         risk_breakdown: if explain { Some(breakdown) } else { None },
+        npm_identity_caveat,
     };
     super::write_json_stdout(&out, "tirith package: failed to write JSON output")
 }
@@ -882,7 +895,7 @@ fn write_human(
     let name = super::sanitize_for_human_output(&breakdown.name, false);
     let risk_level = super::sanitize_for_human_output(breakdown.risk_level, false);
 
-    writeln!(w, "tirith package risk: {ecosystem} package '{name}'")?;
+    writeln!(w, "tirith package risk: {} package '{}'", ecosystem, name)?;
     writeln!(w, "  risk score:  {}/100 ({})", breakdown.score, risk_level)?;
 
     match &breakdown.name_vs_popular {
@@ -1005,7 +1018,8 @@ fn write_human(
     } else {
         writeln!(
             w,
-            "  Run 'tirith package explain {ecosystem} {name}' for the factor-by-factor derivation."
+            "  Run 'tirith package explain {} {}' for the factor-by-factor derivation.",
+            ecosystem, name
         )?;
     }
     Ok(())
@@ -1085,6 +1099,86 @@ fn write_api_provenance_human(
     } else {
         writeln!(w, "               - status: latest version current")?;
     }
+    if let Some(dist) = p.npm_dist.as_ref() {
+        write_npm_dist_facts_human(dist, w)?;
+    }
+    Ok(())
+}
+
+/// The caveat every npm identity/provenance rendering must carry. Aliased to
+/// the core constant so this surface, `cli::install`, and C17's npm provenance
+/// receipt cannot drift into implying different things.
+pub(crate) const NPM_BYTES_NOT_BOUND_CAVEAT: &str =
+    tirith_core::provenance::npm_facts::NPM_BYTES_NOT_BOUND_CAVEAT;
+
+/// Render the C13 npm `dist` provenance FACTS.
+///
+/// Every line here reports what the registry PUBLISHED, and the closing caveat
+/// is mandatory rather than decoration: without it the integrity and signature
+/// lines read as verification claims. Tirith does not download the tarball, so
+/// there is nothing local for the SRI to cover, and there is no ECDSA P-256
+/// backend to check the signature with.
+fn write_npm_dist_facts_human(
+    dist: &tirith_core::provenance::npm_facts::NpmDistFacts,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    if dist.is_empty() {
+        return Ok(());
+    }
+    if let Some(origin) = dist.registry_origin.as_deref() {
+        writeln!(
+            w,
+            "               - registry origin: {}",
+            super::sanitize_for_human_output(origin, false)
+        )?;
+    }
+    match (dist.tarball_url.as_deref(), dist.tarball_url_rejected) {
+        (Some(url), _) => writeln!(
+            w,
+            "               - tarball: {} (registry-bound URL; not downloaded)",
+            super::sanitize_for_human_output(url, false)
+        )?,
+        (None, true) => writeln!(
+            w,
+            "               - tarball: REJECTED, {}",
+            super::sanitize_for_human_output(
+                dist.tarball_rejection_reason
+                    .as_deref()
+                    .unwrap_or("not bound to the registry origin"),
+                false
+            )
+        )?,
+        (None, false) => writeln!(w, "               - tarball: none published")?,
+    }
+    match dist.integrity_sri.as_ref() {
+        Some(sri) => writeln!(
+            w,
+            "               - integrity: {} (parsed from dist.integrity; not checked)",
+            super::sanitize_for_human_output(&sri.canonical(), false)
+        )?,
+        // Ahead of both fallbacks: a value Tirith declined to parse must not be
+        // reported as a value the publisher never shipped.
+        None if dist.integrity_unparsed => writeln!(
+            w,
+            "               - integrity: PUBLISHED BUT UNREADABLE (dist.integrity did not parse)"
+        )?,
+        None if dist.legacy_shasum_present => writeln!(
+            w,
+            "               - integrity: none; legacy dist.shasum present (SHA-1, display only)"
+        )?,
+        None => writeln!(w, "               - integrity: not published")?,
+    }
+    writeln!(
+        w,
+        "               - registry signature: {}",
+        dist.signature_state.label()
+    )?;
+    writeln!(
+        w,
+        "               - provenance attestation: {}",
+        dist.attestation_state.label()
+    )?;
+    writeln!(w, "               - NOTE: {}", NPM_BYTES_NOT_BOUND_CAVEAT)?;
     Ok(())
 }
 
@@ -1528,6 +1622,12 @@ mod tests {
 
     use tirith_core::registry_api::{FetchError, RegistryMetadata};
 
+    fn isolate_registry_state() -> tirith_test_support::GlobalStateGuard {
+        crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     /// A fixture-fed [`RegistryClient`].
     struct FakeClient {
         result: Result<RegistryMetadata, FetchError>,
@@ -1549,6 +1649,7 @@ mod tests {
 
     #[test]
     fn gather_api_offline_flag_skips_network() {
+        let _global = isolate_registry_state();
         // CR12: `--offline` must short-circuit without calling `fetch` (the
         // exploding client would panic) and report NotComputed, not Unavailable.
         let sig = gather_api(&ExplodingClient, Ecosystem::Npm, "react", None, true);
@@ -1562,6 +1663,7 @@ mod tests {
 
     #[test]
     fn gather_api_success_returns_available() {
+        let _global = isolate_registry_state();
         let meta = RegistryMetadata {
             source: "npm".to_string(),
             package_name: Some("react".to_string()),
@@ -1575,6 +1677,7 @@ mod tests {
 
     #[test]
     fn gather_api_failure_degrades_to_unavailable() {
+        let _global = isolate_registry_state();
         let client = FakeClient {
             result: Err(FetchError::Network("connection refused".to_string())),
         };
@@ -1584,6 +1687,7 @@ mod tests {
 
     #[test]
     fn online_run_offline_flag_still_exits_zero_without_network() {
+        let _global = isolate_registry_state();
         // `--online --offline` scores offline and exits 0 with no network call,
         // exercising the public `run` end-to-end.
         let code = run(

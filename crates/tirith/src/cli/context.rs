@@ -274,7 +274,7 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
 ///   (which previously clobbered the target with only the guard key), and
 /// - publishes through a 0600 atomic temp-file rename instead of truncating
 ///   in place.
-fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     let root = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -284,7 +284,9 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
                 "policy path has no containing directory",
             )
         })?;
-    let contained = tirith_core::util::ContainedAtomicFile::prepare(root, path, true)?;
+    let policy = Policy::discover_local_only(root.to_str());
+    let contained =
+        super::prepare_config_destination_permitted(root, path, true, &policy, true, true)?;
     let existing = read_existing_policy_for_guard(&contained, path)?;
     let new_line = format!("context_guard_enabled: {enable}");
 
@@ -316,7 +318,15 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     // `context_guard_enabled` must equal the requested value.
     verify_context_guard_effective(&out, enable)?;
 
-    contained.write_atomic(out.as_bytes(), true)
+    super::write_prepared_config_file_permitted(
+        root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 /// Parse the candidate policy and require the top-level `context_guard_enabled`
@@ -426,7 +436,15 @@ pub fn label(label_key: &str, criticality: &str, scope: LabelScope, json: bool) 
         },
     };
 
-    if let Err(e) = policy_mod::write_context_label(&target_path, label_key, criticality) {
+    let policy = Policy::discover_local_only(
+        target_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::to_str),
+    );
+    if let Err(e) =
+        super::write_context_labels_permitted(&target_path, &[(label_key, criticality)], &policy)
+    {
         eprintln!(
             "tirith context label: failed to write {}: {e}",
             target_path.display()

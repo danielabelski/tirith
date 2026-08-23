@@ -448,10 +448,6 @@ pub(crate) struct ManifestParseDetails {
     /// `-r` / `--requirement` include targets (as written, to be resolved
     /// against the including manifest's directory).
     pub includes: Vec<String>,
-    /// `-c` / `--constraint` targets. These refine versions for dependencies
-    /// declared through requirements files; they never declare packages by
-    /// themselves.
-    pub constraints: Vec<String>,
     /// Direct URL/VCS dependency sources (as written). Every one is a
     /// coverage gap; when a package name was extractable it was ALSO assessed.
     pub unsupported_sources: Vec<String>,
@@ -468,14 +464,12 @@ pub(crate) fn parse_manifest_detailed(
         return Some(ManifestParseDetails {
             deps: parsed.deps,
             includes: parsed.includes,
-            constraints: parsed.constraints,
             unsupported_sources: parsed.unsupported_sources,
         });
     }
     parse_manifest(kind, text).map(|deps| ManifestParseDetails {
         deps,
         includes: Vec::new(),
-        constraints: Vec::new(),
         unsupported_sources: Vec::new(),
     })
 }
@@ -643,6 +637,105 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     }
 
     Some(out)
+}
+
+/// Most lockfile entries retained by [`npm_lock_integrity_index`]. A lockfile
+/// is attacker-influenced input, so the index it produces is bounded.
+const MAX_LOCK_INTEGRITY_ENTRIES: usize = 8192;
+
+/// Index a `package-lock.json` by resolved `(registry name, version)` to its
+/// recorded `integrity` string (C13).
+///
+/// Separate from [`parse_package_lock`] on purpose: that function answers "what
+/// does this project depend on", which every ecosystem scan needs, while this
+/// one answers "what bytes did the lockfile pin for that exact version", which
+/// only the provenance comparison needs. Entries with no `integrity` are simply
+/// absent from the index; absence is "not recorded", never "mismatch".
+///
+/// Identity comes from the same resolver the dependency parser uses, so an
+/// aliased entry indexes under the TARGET package rather than the alias, and a
+/// leaf `name` that contradicts its install path cannot re-key the entry. That
+/// last part is what keeps the index honest: trusting `meta.name` outright let
+/// a crafted lockfile put `"name": "lodash"` on `node_modules/evil`, so the
+/// attacker's digest was compared against lodash while the real `evil` entry
+/// went unrecorded and therefore unchecked.
+///
+/// Contradictory identity metadata is a malformed lockfile, not a reason to
+/// index part of it: the whole index is empty in that case, which reads as
+/// "nothing recorded" rather than as agreement.
+pub fn npm_lock_integrity_index(text: &str) -> BTreeMap<(String, String), String> {
+    let mut index = BTreeMap::new();
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+        return index;
+    };
+
+    if let Some(packages) = json.get("packages").and_then(|value| value.as_object()) {
+        let Some(aliases) = npm_lock_alias_claims(packages) else {
+            return BTreeMap::new();
+        };
+        for (path_key, meta) in packages {
+            let Some(installed_name) = package_lock_name_from_path(path_key) else {
+                continue;
+            };
+            let Some((name, _alias, _version)) =
+                npm_lock_v2_identity(path_key, &installed_name, meta, aliases.get(path_key))
+            else {
+                return BTreeMap::new();
+            };
+            insert_lock_integrity(&mut index, &name, meta);
+        }
+    }
+
+    if let Some(dependencies) = json.get("dependencies").and_then(|value| value.as_object()) {
+        collect_lock_v1_integrity(dependencies, &mut index);
+    }
+
+    index
+}
+
+fn collect_lock_v1_integrity(
+    dependencies: &serde_json::Map<String, serde_json::Value>,
+    index: &mut BTreeMap<(String, String), String>,
+) {
+    for (declared_name, meta) in dependencies {
+        let (name, _alias, _version) = npm_lock_identity(declared_name.trim(), meta);
+        insert_lock_integrity(index, &name, meta);
+        if let Some(nested) = meta.get("dependencies").and_then(|value| value.as_object()) {
+            collect_lock_v1_integrity(nested, index);
+        }
+    }
+}
+
+fn insert_lock_integrity(
+    index: &mut BTreeMap<(String, String), String>,
+    name: &str,
+    meta: &serde_json::Value,
+) {
+    if index.len() >= MAX_LOCK_INTEGRITY_ENTRIES {
+        return;
+    }
+    let Some(version) = meta.get("version").and_then(|value| value.as_str()) else {
+        return;
+    };
+    // An alias records `npm:target@version`; the resolved version is the tail.
+    let version = version
+        .strip_prefix("npm:")
+        .and_then(split_npm_name_version)
+        .and_then(|(_, version)| version)
+        .unwrap_or(version);
+    let Some(integrity) = meta.get("integrity").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if name.is_empty() || version.is_empty() || integrity.trim().is_empty() {
+        return;
+    }
+    // First write wins. A v2 lockfile carries both `packages` and the legacy
+    // `dependencies` mirror, and only the `packages` pass corroborates identity
+    // against the install path. Overwriting would let the uncorroborated mirror
+    // replace an entry the hardened pass already resolved.
+    index
+        .entry((name.to_string(), version.to_string()))
+        .or_insert_with(|| integrity.trim().to_string());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -979,7 +1072,6 @@ fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
 pub(crate) struct RequirementsParseEx {
     pub deps: Vec<DeclaredDependency>,
     pub includes: Vec<String>,
-    pub constraints: Vec<String>,
     pub unsupported_sources: Vec<String>,
 }
 
@@ -987,7 +1079,6 @@ pub(crate) struct RequirementsParseEx {
 fn parse_requirements_txt_ex(text: &str) -> RequirementsParseEx {
     let mut out = Vec::new();
     let mut includes = Vec::new();
-    let mut constraints = Vec::new();
     let mut unsupported_sources = Vec::new();
     for raw_line in text.lines() {
         // Strip an inline comment, then trim.
@@ -1003,7 +1094,7 @@ fn parse_requirements_txt_ex(text: &str) -> RequirementsParseEx {
         // dependency set; silently skipping them under-reports the project.
         // The target is recorded for bounded, contained resolution by the
         // collector.
-        for flag in ["-r", "--requirement"] {
+        for flag in ["-r", "--requirement", "-c", "--constraint"] {
             if let Some(rest) = line
                 .strip_prefix(flag)
                 .filter(|_| line.len() > flag.len())
@@ -1012,18 +1103,6 @@ fn parse_requirements_txt_ex(text: &str) -> RequirementsParseEx {
                 let target = rest.trim_start_matches(['=', ' ', '\t']).trim();
                 if !target.is_empty() {
                     includes.push(target.to_string());
-                }
-            }
-        }
-        for flag in ["-c", "--constraint"] {
-            if let Some(rest) = line
-                .strip_prefix(flag)
-                .filter(|_| line.len() > flag.len())
-                .filter(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('='))
-            {
-                let target = rest.trim_start_matches(['=', ' ', '\t']).trim();
-                if !target.is_empty() {
-                    constraints.push(target.to_string());
                 }
             }
         }
@@ -1066,105 +1145,7 @@ fn parse_requirements_txt_ex(text: &str) -> RequirementsParseEx {
     RequirementsParseEx {
         deps: out,
         includes,
-        constraints,
         unsupported_sources,
-    }
-}
-
-fn python_dependency_key(name: &str) -> String {
-    let mut key = String::with_capacity(name.len());
-    let mut separator = false;
-    for ch in name.chars() {
-        if matches!(ch, '-' | '_' | '.') {
-            if !separator {
-                key.push('-');
-                separator = true;
-            }
-        } else {
-            key.push(ch.to_ascii_lowercase());
-            separator = false;
-        }
-    }
-    key
-}
-
-fn pep440_specifier_for_intent(intent: &VersionIntent) -> Option<String> {
-    match intent {
-        VersionIntent::Unspecified => None,
-        VersionIntent::Exact(version) | VersionIntent::Resolved(version) => {
-            Some(format!("=={version}"))
-        }
-        VersionIntent::Constraint { raw, .. } => Some(raw.clone()),
-    }
-}
-
-fn combine_python_constraints(left: &VersionIntent, right: &VersionIntent) -> VersionIntent {
-    match (
-        pep440_specifier_for_intent(left),
-        pep440_specifier_for_intent(right),
-    ) {
-        (None, None) => VersionIntent::Unspecified,
-        (Some(spec), None) | (None, Some(spec)) => VersionIntent::from_pep440_specifier(&spec),
-        (Some(left), Some(right)) => {
-            VersionIntent::from_pep440_specifier(&format!("{left},{right}"))
-        }
-    }
-}
-
-fn constrain_python_version(declared: &VersionIntent, constraint: &VersionIntent) -> VersionIntent {
-    let concrete = declared.exact_version();
-    let constraint_allows_concrete = concrete.is_some_and(|version| match constraint {
-        VersionIntent::Unspecified => true,
-        VersionIntent::Exact(other) | VersionIntent::Resolved(other) => {
-            match (
-                crate::version_intent::ReleaseVersion::parse(version),
-                crate::version_intent::ReleaseVersion::parse(other),
-            ) {
-                (Some(version), Some(other)) => version == other,
-                _ => version == other,
-            }
-        }
-        VersionIntent::Constraint {
-            parsed: Some(parsed),
-            ..
-        } => crate::version_intent::ReleaseVersion::parse(version)
-            .is_some_and(|version| parsed.matches(&version)),
-        VersionIntent::Constraint { parsed: None, .. } => false,
-    });
-
-    if constraint_allows_concrete {
-        declared.clone()
-    } else if matches!(declared, VersionIntent::Unspecified) {
-        constraint.clone()
-    } else {
-        combine_python_constraints(declared, constraint)
-    }
-}
-
-fn record_python_constraint(
-    constraints: &mut BTreeMap<String, VersionIntent>,
-    dependency: DeclaredDependency,
-) {
-    let key = python_dependency_key(&dependency.name);
-    constraints
-        .entry(key)
-        .and_modify(|current| {
-            *current = combine_python_constraints(current, &dependency.version);
-        })
-        .or_insert(dependency.version);
-}
-
-fn apply_python_constraints(
-    declared: &mut [(DeclaredDependency, String)],
-    constraints: &BTreeMap<String, VersionIntent>,
-) {
-    for (dependency, _) in declared {
-        if dependency.ecosystem != Ecosystem::PyPI {
-            continue;
-        }
-        if let Some(constraint) = constraints.get(&python_dependency_key(&dependency.name)) {
-            dependency.version = constrain_python_version(&dependency.version, constraint);
-        }
     }
 }
 
@@ -2724,7 +2705,7 @@ fn rule_scoped_allowlisted(
     rule_id: &str,
 ) -> bool {
     let bare = name.to_lowercase();
-    let qualified = format!("{eco}:{bare}");
+    let qualified = format!("{}:{}", eco, bare);
     policy.allowlist_rules.iter().any(|rule| {
         rule.rule_id.eq_ignore_ascii_case(rule_id)
             && rule.patterns.iter().any(|p| {
@@ -2766,23 +2747,17 @@ fn collect_from_manifests(
     for manifest in &manifests {
         let rel = relative_label(request.root, &manifest.path);
         manifest_labels.push(rel.clone());
-        let mut manifest_declared = Vec::new();
-        let mut constraints = BTreeMap::new();
         parse_one_manifest(
             manifest,
             &rel,
-            &mut manifest_declared,
+            &mut declared,
             notes,
             &mut budget,
             &mut gaps,
             &mut includes_resolved,
             canonical_root.as_deref(),
             0,
-            false,
-            &mut constraints,
         );
-        apply_python_constraints(&mut manifest_declared, &constraints);
-        declared.extend(manifest_declared);
     }
     (manifest_labels, declared, gaps)
 }
@@ -2833,7 +2808,6 @@ fn collect_from_specific_lockfile(
     let mut gaps = Vec::new();
     let mut includes_resolved = 0usize;
     let canonical_root = path.parent().and_then(|p| std::fs::canonicalize(p).ok());
-    let mut constraints = BTreeMap::new();
     parse_one_manifest(
         &discovered,
         &label,
@@ -2844,10 +2818,7 @@ fn collect_from_specific_lockfile(
         &mut includes_resolved,
         canonical_root.as_deref(),
         0,
-        false,
-        &mut constraints,
     );
-    apply_python_constraints(&mut declared, &constraints);
     (vec![label], declared, gaps)
 }
 
@@ -2983,8 +2954,6 @@ fn parse_one_manifest(
     includes_resolved: &mut usize,
     canonical_root: Option<&Path>,
     include_depth: usize,
-    constraint_only: bool,
-    constraints: &mut BTreeMap<String, VersionIntent>,
 ) {
     use crate::scan::{CoverageGap, CoverageGapKind};
     // The aggregate byte budget (repo-0277) is charged before every read so a
@@ -3063,11 +3032,7 @@ fn parse_one_manifest(
         });
     }
     for dep in details.deps {
-        if constraint_only && dep.ecosystem == Ecosystem::PyPI {
-            record_python_constraint(constraints, dep);
-        } else {
-            out.push((dep, rel.to_string()));
-        }
+        out.push((dep, rel.to_string()));
     }
     // Direct URL/VCS sources (repo-0275) are not registry-verifiable: each one
     // is an explicit coverage note even when its package name was assessed.
@@ -3087,17 +3052,10 @@ fn parse_one_manifest(
             ),
         });
     }
-    // Resolve requirement and constraint includes (repo-0275) relative to the
+    // Resolve `-r`/`--requirement` includes (repo-0275) relative to the
     // including manifest's directory, contained under the verified scan root,
-    // with hard depth and count caps so include bombs/cycles are rejected. A
-    // requirements include inherits a constraint-only parent; a constraint
-    // include is always constraint-only.
-    for (include, nested_constraint_only) in details
-        .includes
-        .iter()
-        .map(|include| (include, constraint_only))
-        .chain(details.constraints.iter().map(|include| (include, true)))
-    {
+    // with hard depth and count caps so include bombs/cycles are rejected.
+    for include in &details.includes {
         if include_depth >= MAX_REQUIREMENTS_INCLUDE_DEPTH
             || *includes_resolved >= MAX_REQUIREMENTS_INCLUDES
         {
@@ -3154,8 +3112,6 @@ fn parse_one_manifest(
             includes_resolved,
             canonical_root,
             include_depth + 1,
-            nested_constraint_only,
-            constraints,
         );
     }
 }
@@ -3564,7 +3520,10 @@ impl InstalledIntegrityReport {
     fn distinct_signal_kinds(&self) -> Vec<String> {
         let mut kinds: BTreeSet<String> = BTreeSet::new();
         for s in &self.signals {
-            kinds.insert(s.kind.wire_name().to_owned());
+            // The signal kind serializes to its snake_case name.
+            if let Ok(serde_json::Value::String(k)) = serde_json::to_value(s.kind) {
+                kinds.insert(k);
+            }
         }
         kinds.into_iter().collect()
     }
@@ -3715,7 +3674,9 @@ impl InstalledIntegrityReport {
 fn startup_distinct_kind_strings(signals: &[crate::artifact::ArtifactSignal]) -> Vec<String> {
     let mut kinds: BTreeSet<String> = BTreeSet::new();
     for s in signals {
-        kinds.insert(s.kind.wire_name().to_owned());
+        if let Ok(serde_json::Value::String(k)) = serde_json::to_value(s.kind) {
+            kinds.insert(k);
+        }
     }
     kinds.into_iter().collect()
 }
@@ -4936,67 +4897,6 @@ git+https://github.com/x/y.git
         // pip directives and VCS installs must NOT yield a name.
         assert!(!names.iter().any(|n| n.contains("other-requirements")));
         assert!(!names.iter().any(|n| n.contains("github")));
-    }
-
-    #[test]
-    fn requirements_and_constraint_includes_are_kept_in_distinct_channels() {
-        let parsed = parse_requirements_txt_ex(
-            "-r requirements.in\n--requirement=dev.in\n-c constraints.txt\n--constraint=platform.txt\n",
-        );
-        assert_eq!(parsed.includes, ["requirements.in", "dev.in"]);
-        assert_eq!(parsed.constraints, ["constraints.txt", "platform.txt"]);
-        assert!(parsed.deps.is_empty());
-    }
-
-    #[test]
-    fn constraint_files_refine_declared_dependencies_without_declaring_new_names() {
-        let root = tempfile::tempdir().unwrap();
-        let requirements = root.path().join("requirements.txt");
-        std::fs::write(&requirements, "declared-pkg\n-c constraints.txt\n").unwrap();
-        std::fs::write(
-            root.path().join("constraints.txt"),
-            "declared_pkg==2.3.4\nconstraint-only==9.9.9\n",
-        )
-        .unwrap();
-
-        let manifest = DiscoveredManifest {
-            path: requirements,
-            kind: ManifestKind::PyRequirementsTxt,
-        };
-        let mut declared = Vec::new();
-        let mut notes = Vec::new();
-        let mut budget = ScanReadBudget::new();
-        let mut gaps = Vec::new();
-        let mut includes_resolved = 0;
-        let mut constraints = BTreeMap::new();
-        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
-        parse_one_manifest(
-            &manifest,
-            "requirements.txt",
-            &mut declared,
-            &mut notes,
-            &mut budget,
-            &mut gaps,
-            &mut includes_resolved,
-            Some(&canonical_root),
-            0,
-            false,
-            &mut constraints,
-        );
-        apply_python_constraints(&mut declared, &constraints);
-
-        assert!(gaps.is_empty(), "unexpected coverage gaps: {gaps:?}");
-        assert_eq!(
-            declared.len(),
-            1,
-            "constraint-only names must not be emitted"
-        );
-        assert_eq!(declared[0].0.name, "declared-pkg");
-        assert_eq!(
-            declared[0].0.version,
-            VersionIntent::Exact("2.3.4".to_string())
-        );
-        assert!(constraints.contains_key("constraint-only"));
     }
 
     #[test]

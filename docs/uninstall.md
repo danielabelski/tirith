@@ -11,6 +11,22 @@ Remove the `tirith init` hook line from your shell config:
 | fish | `~/.config/fish/config.fish` |
 | PowerShell | `$PROFILE` |
 
+## Remove AI-agent integrations
+
+Before removing the binary, remove the Tirith-owned hook, plugin, MCP, or
+gateway entry from every host configured with `tirith setup`. Setup preserves
+unrelated host settings and may create a sibling backup when it changes an
+existing file; do not delete an entire shared host configuration directory.
+
+There is not yet a universal `tirith setup --uninstall` operation because the
+19 hosts use different ownership and merge contracts. Use the
+[agent integration matrix](../mcp/clients/mcp-only-agents.md) to locate the
+exact user/project artifacts for Claude Code, Cline, Codex, GitHub Copilot CLI,
+Continue, Cursor, fx, Gemini CLI, Grok Build, Kiro, OMP, OpenClaw, OpenCode,
+OpenHands, Pi CLI, Prime Agent, Roo Code, VS Code, and Windsurf. Restart the
+host after removing its Tirith entry, then run `tirith doctor` while Tirith is
+still installed to check for any remaining effective integration.
+
 ## Remove binary
 
 ### Homebrew
@@ -59,6 +75,9 @@ sudo dnf remove tirith
 ### Shell script install
 ```sh
 rm ~/.local/bin/tirith
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent
 ```
 
 ### Nix
@@ -86,7 +105,14 @@ rm -rf ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/tirith
 ```
 
 ### Manual
-Delete the `tirith` binary from your PATH.
+Delete the `tirith` binary from your PATH. On x86_64 Linux, also remove the
+matching root-owned helper if it was installed manually:
+
+```sh
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent
+```
 
 ## Remove data
 
@@ -98,6 +124,9 @@ rm -rf ~/.config/tirith
 
 # Remove data (audit log, receipts, materialized hooks, last_trigger)
 rm -rf ~/.local/share/tirith
+
+# Optional: remove native package-approval keys after all Tirith installs are gone
+sudo rm -rf /etc/tirith/package-approval
 ```
 
 On macOS:

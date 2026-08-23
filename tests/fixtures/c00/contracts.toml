@@ -1,0 +1,113 @@
+[threatdb_v1]
+size = 381
+sha256 = "8c5d358f2835805a03d030ca2e6e45c89fe069757c486313a074d03f2033bad7"
+
+[threatdb_v2]
+size = 718
+sha256 = "147d12f0f00e1629d2665f90a7bce609fe7ccd075b72d7846c030341b91e961c"
+
+[command_card_v1]
+signing_payload_sha256 = "069789b72889d9875c0eb5b188812cbbb254ce395329bdbf92017532def9efd6"
+key_id = "56fae12f77164627"
+signature_hex = "9d4a7e2f0f592613202dd483ff3ab48f72e93dda98505f473a6d29a563affbd05cd21fd250b43dbaeac83dbee7faba457415895eda935e7af2067e0d6564eb07"
+
+[legacy_policy]
+# Re-frozen for projection_version 3. C04 deliberately bumped the security
+# projection from v2 to v3 so every string is privacy-projected BEFORE it can
+# participate in a durable value or digest; v2 hashed raw free text. The bump
+# is a redaction improvement, and this contract was simply not re-frozen in
+# that commit.
+#
+# Verified before updating, rather than assuming: the projection for this
+# legacy fixture was diffed key-by-key against the C00 baseline. No key was
+# added or removed and no value changed except `projection_version` (2 -> 3),
+# so the freeze is being moved for a declared schema bump, not to paper over
+# a content change. Bisect: passes at 131c3238 (C00), fails from 32e22f61
+# (C04) onward.
+projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
+security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
+
+[capability_manifest]
+# Release-documentation truthfulness note: the existing `mcp-server` coverage
+# now distinguishes the six cross-platform tools from the additional
+# `tirith_fetch_cloaking` tool available on Unix. No command, group, inspection
+# level, policy-completeness value, or runtime behavior changed; only the
+# platform-qualified coverage prose changed.
+# TIRITH-SEC-0083 truthfulness note: the existing `mcp-server` coverage now
+# records the secure-default tool/resource-read output sanitizer. No command,
+# group, inspection level, or policy-completeness value changed.
+# C20 compatibility note: SIX NEW `[[command]]` entries were added for commands
+# this stack shipped that the manifest did not yet describe: `task check` in the
+# existing "Scan & analyze" group, the four `attest build` / `attest
+# verify-build` / `attest deployment` / `attest verify-deployment` entries in
+# the existing "Supply-chain" group, and `pkg attest-npm` in the existing
+# "Package firewall" group. This is a declared ADDITION for coverage truth, not
+# a content regression: the manifest is documented as the single source of truth
+# for the capability matrix, and six user-facing commands were missing from it.
+#
+# Verified before updating, rather than assumed: both manifests were parsed and
+# diffed entry by entry. 82 `[[command]]` entries before, 88 after; six added,
+# ZERO removed, ZERO renamed, ZERO regrouped, and no existing entry's
+# `inspected`, `coverage`, or `policy_complete` value changed. The relative
+# order of every pre-existing entry is byte-identical, no new group was
+# introduced, the group order is unchanged, and `manifest_version` stays at 1.
+# The freeze exists to catch a silent WEAKENING of a recorded capability claim;
+# adding entries for commands that had none cannot weaken one, and each new
+# entry states its own limit (task effect inference covers only the Web3 shell
+# grammar; a build receipt is not a reproducible-build claim; a deployment
+# receipt is not continuous monitoring; `verify-deployment` re-measures nothing;
+# tirith does not download, inspect, or bind npm tarball bytes). Bisect: passes
+# at 68f1a31e (C19) with the previous value
+# c8196ad78de6626a03868e495681352e0d9857fe12d6c72abc836a05b879bf7a; this value
+# is required from the C20 commit onward.
+#
+# C16 compatibility note (retained): the `browser` entry moved from `inspected = "none"` to
+# `inspected = "partial"` and its coverage prose was rewritten. This is a
+# TRUTHFULNESS correction forced by a real capability change, not an erosion of
+# the claim: `tirith browser audit` hashes the bytes of every file under a
+# profile's `Extensions/<id>/<version>` tree and parses each `manifest.json`, so
+# the previous "does not inspect content here" statement became false the moment
+# that action landed. The freeze exists to catch a silent WEAKENING of a recorded
+# capability claim; `none` -> `partial` is a strengthening, and the new prose
+# additionally enumerates what the command refuses to read (cookies, history,
+# saved passwords, Local Storage, IndexedDB, extension storage, wallet
+# databases, Local State) so the manifest states the privacy boundary rather
+# than leaving it to the code.
+#
+# Verified before updating, rather than assumed: the manifest was parsed before
+# and after and diffed entry by entry. 82 `[[command]]` entries before, 82 after;
+# no entry added, removed, renamed, regrouped, or reordered; `manifest_version`
+# unchanged at 1; no other entry's `inspected`, `coverage`, or `policy_complete`
+# value changed; `browser`'s own `policy_complete` is untouched at true, because
+# the audit reports and does not gate, so there is no decision for policy to fail
+# to reach. Exactly one entry and exactly two fields differ. Bisect: passes at
+# 365ca26c (C15) with the previous value 833185d2c8efc423a7fb3c866a31ec2a3040c7b48da000da7db7265cf2d5f6c0;
+# this value is required from the C16 commit onward.
+#
+# C14 compatibility note (retained): one NEW `[[command]]` entry, `capsule run`, was added
+# to the existing "Scan & analyze" group. This is a declared ADDITION, not a
+# content regression: verified before updating, rather than assumed, by diffing
+# the manifest entry-by-entry against the previous freeze. No existing command
+# was removed, renamed, or regrouped, and no existing `inspected`, `coverage`,
+# or `policy_complete` value changed. The freeze exists to catch a silent
+# weakening of a recorded capability claim; adding a command that did not exist
+# before cannot weaken one. Bisect: passes at ad08ac6b (C13) with the previous
+# value; this value is required from the C14 commit onward.
+#
+# C13 compatibility note (retained): the `install` and `package` coverage prose
+# changed to state the new npm registry-identity facts AND, explicitly, that
+# tirith does not download, inspect, or bind the tarball bytes npm installs. No
+# command was added, removed, renamed, or regrouped, and no `inspected` or
+# `policy_complete` value changed; that was a documentation-truth edit only.
+sha256 = "03270b4ec0ce3d38ad081d810a1bedca5b2904f32da05dc3cef9ee1ee8a0929f"
+
+[mcp]
+default_tools = [
+  "tirith_check_command",
+  "tirith_check_url",
+  "tirith_check_paste",
+  "tirith_scan_file",
+  "tirith_scan_directory",
+  "tirith_verify_mcp_config",
+]
+unix_additional_tools = ["tirith_fetch_cloaking"]

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod agent_origin;
 pub mod aliases;
 pub mod approval;
@@ -8,21 +10,29 @@ pub mod audit_tune;
 pub mod audit_upload;
 pub mod baseline;
 pub mod blast_radius;
+pub mod browser_extensions;
+pub mod build_receipt;
 pub mod canary;
 pub mod capsule;
+pub mod capsule_project;
+pub mod capsule_receipt;
 pub mod checkpoint;
 pub mod clipboard;
 pub mod command_card;
 pub mod commands_manifest;
+pub mod config_write;
 pub mod confusables;
+pub mod content_kind;
 pub mod context_detect;
 pub mod custom_rule_dsl;
 pub mod dashboard;
 pub mod data;
 pub mod deobfuscate;
 pub mod dep_confusion;
+pub mod deployment_receipt;
 pub mod devcontainer_writer;
 pub mod ecosystem_scan;
+pub mod effects;
 pub mod engine;
 pub mod env_guard;
 pub mod escalation;
@@ -37,6 +47,7 @@ pub mod incident;
 pub mod install_script_analysis;
 pub mod install_txn;
 pub mod intent;
+pub mod lexical_path;
 pub mod license;
 pub mod location;
 pub mod lsp_profiles;
@@ -44,8 +55,10 @@ pub mod mcp;
 pub mod mcp_lock;
 pub mod network;
 pub mod normalize;
+pub mod npm_command;
 pub mod osv_correlation;
 pub mod output;
+pub mod package_approval;
 pub mod package_risk;
 pub mod parse;
 pub mod path_audit;
@@ -72,6 +85,7 @@ pub mod scan;
 pub mod scoring;
 pub mod secret_rotation;
 pub mod selfupdate;
+pub mod sensitive_assets;
 pub mod session;
 pub mod session_warnings;
 pub mod ssrf_guard;
@@ -79,6 +93,10 @@ pub mod style;
 pub mod sudo_session;
 pub mod suppression;
 pub mod taint;
+pub mod task;
+pub mod task_analysis;
+pub mod task_boundary;
+pub mod task_envelope;
 pub mod text_confusables;
 pub mod threatdb;
 pub mod threatdb_api;
@@ -90,13 +108,9 @@ pub mod util;
 pub mod util_build_dirs;
 pub mod verdict;
 pub mod version_intent;
+pub mod web3_policy;
 pub mod webhook;
 
 #[cfg(unix)]
 pub mod runner;
 pub mod script_analysis;
-
-/// Crate-wide mutex all env-mutating tests MUST hold (`std::env::set_var` is not
-/// thread-safe).
-#[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

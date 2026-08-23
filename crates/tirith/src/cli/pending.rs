@@ -152,6 +152,19 @@ pub fn export(output: Option<PathBuf>) -> i32 {
 
     match output {
         Some(path) => {
+            // repo-0406: a repository can pre-plant the chosen export name as a
+            // symlink to a writable external file; write_file_atomic resolves
+            // symlinks deliberately, so refuse a symlinked destination here.
+            if std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "tirith pending export: refusing to write through symlink {}",
+                    path.display()
+                );
+                return 2;
+            }
             // The file path still pre-serializes (the bytes are written to a file,
             // not stdout, so the EPIPE concern does not apply here).
             let json = match serde_json::to_string_pretty(&all) {
@@ -161,15 +174,10 @@ pub fn export(output: Option<PathBuf>) -> i32 {
                     return 2;
                 }
             };
-            // repo-0406: retain the destination's parent capability from secure
-            // traversal through publication. A final or intermediate symlink
-            // cannot redirect the export, including one swapped after binding.
-            let root = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            match super::write_file_atomic_contained(&root, &path, json.as_bytes(), true) {
+            // Write atomically (temp + fsync + rename) so a crash/ENOSPC mid-write
+            // cannot leave a half-written export at `path`; a reader sees either the
+            // old file or the complete new one. `overwrite = true`: export replaces.
+            match super::write_file_atomic(&path, json.as_bytes(), true) {
                 Ok(()) => {
                     println!(
                         "Wrote {} pending decision(s) to {}",

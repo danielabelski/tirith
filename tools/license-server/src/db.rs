@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::AppError;
 
@@ -92,21 +92,63 @@ CREATE INDEX IF NOT EXISTS idx_tokens_sub ON tokens(subscription_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_sub ON api_keys(subscription_id);
 "#;
 
-/// repo-0445: `last_event_at` participates in SQLite `MAX()` over TEXT, which
-/// only matches chronological order when every value shares one fixed-width
-/// UTC encoding. Normalize RFC3339 inputs (any offset/fraction) to
-/// `...T..:..:.. .mmmZ`; unparseable values pass through unchanged (the stale
-/// guards treat them conservatively).
-fn normalize_event_ts(raw: Option<&str>) -> Option<String> {
-    raw.map(|value| {
-        chrono::DateTime::parse_from_rfc3339(value)
-            .map(|ts| {
-                ts.to_utc()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-            })
-            .unwrap_or_else(|_| value.to_string())
-    })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventTimestampError {
+    Missing,
+    InvalidIncoming,
+    InvalidStored,
+    Stale,
 }
+
+/// Whether a `subscription.updated` new-status revokes the API key, matching
+/// the status side-effect match in `process_subscription_updated`: `active`
+/// and `trialing` un-revoke, `canceled` leaves the key until period end, and
+/// everything else (`past_due`, `revoked`, and any unknown status handled
+/// defensively) revokes.
+/// A dropped update of a revoking status keeps paid access open, so those are
+/// the ones worth dead-lettering when they cannot be ordered.
+fn status_revokes(new_status: &str) -> bool {
+    !matches!(new_status, "active" | "trialing" | "canceled")
+}
+
+/// Validate an event timestamp and compare it to the row version observed in
+/// the same transaction. A missing or unparseable timestamp is never allowed to
+/// carry a lifecycle side effect, and an unparseable legacy row fails closed
+/// until it is repaired deliberately.
+fn ordered_event_timestamp(
+    incoming: Option<&str>,
+    previous: Option<&str>,
+    allow_equal: bool,
+) -> Result<String, EventTimestampError> {
+    let incoming = incoming.ok_or(EventTimestampError::Missing)?;
+    let incoming = chrono::DateTime::parse_from_rfc3339(incoming)
+        .map_err(|_| EventTimestampError::InvalidIncoming)?;
+    if let Some(previous) = previous {
+        let previous = chrono::DateTime::parse_from_rfc3339(previous)
+            .map_err(|_| EventTimestampError::InvalidStored)?;
+        if incoming < previous || (incoming == previous && !allow_equal) {
+            return Err(EventTimestampError::Stale);
+        }
+    }
+    Ok(incoming
+        .to_utc()
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+}
+
+const INSERT_DEAD_LETTER_SQL: &str = "INSERT INTO dead_letter \
+     (event_id, subscription_id, event_type, reason, occurred_at, payload) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+     ON CONFLICT(event_id) DO UPDATE SET \
+       subscription_id=excluded.subscription_id, \
+       event_type=excluded.event_type, \
+       reason=excluded.reason, \
+       occurred_at=excluded.occurred_at, \
+       payload=excluded.payload, \
+       created_at=datetime('now') \
+     WHERE excluded.reason LIKE 'unorderable_revocation:%' \
+       AND dead_letter.reason NOT LIKE 'unorderable_revocation:%'";
+
+const DEAD_LETTER_REDACTION_MIGRATION: &str = "dead_letter_payload_redaction_v1";
 
 impl Db {
     pub fn open(path: &str) -> Result<Self, AppError> {
@@ -135,6 +177,89 @@ impl Db {
         if has_price_id && !has_product_id {
             conn.execute_batch("ALTER TABLE subscriptions RENAME COLUMN price_id TO product_id")
                 .map_err(|e| AppError::Internal(format!("migration price_id→product_id: {e}")))?;
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                 name TEXT PRIMARY KEY,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .map_err(|e| AppError::Internal(format!("migration marker schema: {e}")))?;
+        let dead_letters_redacted: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name=?1)",
+                params![DEAD_LETTER_REDACTION_MIGRATION],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("migration marker read: {e}")))?;
+
+        if !dead_letters_redacted {
+            // Older releases persisted the complete provider event in
+            // dead_letter, including customer email and arbitrary metadata.
+            // Rewrite the retained set exactly once. The rows and marker share
+            // one transaction so a crash or rejected row cannot publish a
+            // partial privacy migration.
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| AppError::Internal(format!("migration redaction tx: {e}")))?;
+            let legacy_dead_letters = {
+                match tx.prepare(
+                    "SELECT id, event_type, occurred_at, subscription_id, payload FROM dead_letter",
+                ) {
+                    Ok(mut statement) => statement
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        })
+                        .map_err(|e| {
+                            AppError::Internal(format!("migration read dead-letter: {e}"))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| {
+                            AppError::Internal(format!("migration collect dead-letter: {e}"))
+                        })?,
+                    // Direct partial-schema tests may construct only the
+                    // subscriptions table. Production creates dead_letter
+                    // before migrations, so absence is a safe no-op.
+                    Err(_) => Vec::new(),
+                }
+            };
+            for (id, event_type, occurred_at, subscription_id, payload) in legacy_dead_letters {
+                let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
+                let data = parsed.as_ref().and_then(|value| value.get("data"));
+                let safe_text = |field: &str| {
+                    data.and_then(|value| value.get(field))
+                        .and_then(serde_json::Value::as_str)
+                };
+                let redacted = RedactedDeadLetterPayload::lifecycle(
+                    &event_type,
+                    occurred_at.as_deref(),
+                    subscription_id.as_deref(),
+                    safe_text("status"),
+                    safe_text("product_id"),
+                    safe_text("checkout_id"),
+                    safe_text("customer_id"),
+                    safe_text("tier"),
+                );
+                tx.execute(
+                    "UPDATE dead_letter SET payload=?1 WHERE id=?2",
+                    params![redacted.into_inner(), id],
+                )
+                .map_err(|e| AppError::Internal(format!("migration redact dead-letter: {e}")))?;
+            }
+            tx.execute(
+                "INSERT INTO schema_migrations (name) VALUES (?1)",
+                params![DEAD_LETTER_REDACTION_MIGRATION],
+            )
+            .map_err(|e| AppError::Internal(format!("migration marker insert: {e}")))?;
+            tx.commit()
+                .map_err(|e| AppError::Internal(format!("migration redaction commit: {e}")))?;
         }
 
         Ok(())
@@ -194,6 +319,33 @@ impl Db {
                 return Ok(CreatedOutcome::Duplicate);
             }
 
+            let previous_event_at: Option<String> = tx
+                .query_row(
+                    "SELECT last_event_at FROM subscriptions WHERE id=?1",
+                    params![data.subscription_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("db read created order: {e}")))?
+                .flatten();
+            let occurred_at = match ordered_event_timestamp(
+                data.occurred_at.as_deref(),
+                previous_event_at.as_deref(),
+                false,
+            ) {
+                Ok(timestamp) => timestamp,
+                Err(_) => {
+                    tx.execute(
+                        "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
+                        params![data.event_id, data.event_type],
+                    )
+                    .map_err(|e| AppError::Internal(format!("db mark stale created: {e}")))?;
+                    tx.commit()
+                        .map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
+                    return Ok(CreatedOutcome::StaleIgnored);
+                }
+            };
+
             // Reconcile status to 'active' unless the row is already
             // terminal ('revoked'). The CASE preserves 'revoked' so the
             // guard below can detect it.
@@ -214,7 +366,7 @@ impl Db {
                     data.email,
                     data.tier,
                     data.product_id,
-                    normalize_event_ts(data.occurred_at.as_deref()),
+                    occurred_at,
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert sub: {e}")))?;
@@ -312,87 +464,6 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    /// `subscription.canceled`: benefits continue until period end; the API
-    /// key is NOT revoked.
-    pub async fn process_subscription_canceled(
-        &self,
-        data: CanceledData,
-    ) -> Result<bool, AppError> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = acquire_db(&conn);
-            let tx = conn.unchecked_transaction()
-                .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
-
-            let exists: bool = tx
-                .query_row(
-                    "SELECT 1 FROM webhook_events WHERE event_id=?1",
-                    params![data.event_id],
-                    |_| Ok(true),
-                )
-                .optional()
-                .map_err(|e| AppError::Internal(format!("db idem: {e}")))?
-                .unwrap_or(false);
-            if exists {
-                tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
-                return Ok(false);
-            }
-
-            // 'revoked' absorbs canceled.
-            let prev_status: Option<String> = tx
-                .query_row(
-                    "SELECT status FROM subscriptions WHERE id=?1",
-                    params![data.subscription_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| AppError::Internal(format!("db read prev: {e}")))?;
-
-            if prev_status.as_deref() == Some("revoked") {
-                tx.execute(
-                    "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, 'subscription.canceled')",
-                    params![data.event_id],
-                )
-                .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
-                tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
-                return Ok(false);
-            }
-
-            tx.execute(
-                "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
-                 VALUES (?1, ?2, ?3, ?4, 'canceled', ?5, ?6)
-                 ON CONFLICT(id) DO UPDATE SET
-                   status='canceled',
-                   customer_id=COALESCE(NULLIF(excluded.customer_id,'unknown'), subscriptions.customer_id),
-                   email=COALESCE(NULLIF(excluded.email,'unknown'), subscriptions.email),
-                   tier=COALESCE(NULLIF(excluded.tier,'unknown'), subscriptions.tier),
-                   product_id=COALESCE(NULLIF(excluded.product_id,'unknown'), subscriptions.product_id),
-                   last_event_at=MAX(COALESCE(subscriptions.last_event_at,''), COALESCE(excluded.last_event_at,'')),
-                   updated_at=datetime('now')",
-                params![
-                    data.subscription_id,
-                    data.customer_id.as_deref().unwrap_or("unknown"),
-                    data.email.as_deref().unwrap_or("unknown"),
-                    data.tier.as_deref().unwrap_or("unknown"),
-                    data.product_id.as_deref().unwrap_or("unknown"),
-                    normalize_event_ts(data.occurred_at.as_deref()),
-                ],
-            )
-            .map_err(|e| AppError::Internal(format!("db upsert canceled: {e}")))?;
-
-            tx.execute(
-                "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, 'subscription.canceled')",
-                params![data.event_id],
-            )
-            .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
-
-            tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
-            Ok(true)
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
-    }
-
     /// `subscription.revoked`: terminal state, revokes the API key.
     pub async fn process_subscription_revoked(&self, data: RevokedData) -> Result<bool, AppError> {
         let conn = self.conn.clone();
@@ -415,6 +486,73 @@ impl Db {
                 return Ok(false);
             }
 
+            let previous_event_at: Option<String> = tx
+                .query_row(
+                    "SELECT last_event_at FROM subscriptions WHERE id=?1",
+                    params![data.subscription_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("db read revoked order: {e}")))?
+                .flatten();
+            let occurred_at = match ordered_event_timestamp(
+                data.occurred_at.as_deref(),
+                previous_event_at.as_deref(),
+                true,
+            ) {
+                Ok(occurred_at) => occurred_at,
+                Err(reason) => {
+                    tracing::warn!(
+                        event_id = %data.event_id,
+                        ?reason,
+                        "subscription.revoked did not carry a provably newer timestamp; state unchanged"
+                    );
+                    if matches!(reason, EventTimestampError::Stale) {
+                        tx.execute(
+                            "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, 'subscription.revoked')",
+                            params![data.event_id],
+                        )
+                        .map_err(|e| AppError::Internal(format!("db mark stale revoked: {e}")))?;
+                    } else {
+                        // An authenticated revocation that cannot be ordered is
+                        // still sufficient reason to fail closed. Revoke first,
+                        // retain no plaintext PII, and leave the webhook event
+                        // unprocessed so a redelivery or the reconciliation
+                        // worker can repair the malformed timeline.
+                        tx.execute(
+                            "UPDATE api_keys SET revoked=1 WHERE subscription_id=?1",
+                            params![data.subscription_id],
+                        )
+                        .map_err(|e| AppError::Internal(format!("db provisional revoke: {e}")))?;
+                        let payload = RedactedDeadLetterPayload::lifecycle(
+                            "subscription.revoked",
+                            data.occurred_at.as_deref(),
+                            Some(&data.subscription_id),
+                            Some("revoked"),
+                            data.product_id.as_deref(),
+                            None,
+                            data.customer_id.as_deref(),
+                            data.tier.as_deref(),
+                        );
+                        tx.execute(
+                            INSERT_DEAD_LETTER_SQL,
+                            params![
+                                data.event_id,
+                                data.subscription_id,
+                                "subscription.revoked",
+                                format!("unorderable_revocation:{reason:?}"),
+                                data.occurred_at,
+                                payload.into_inner(),
+                            ],
+                        )
+                        .map_err(|e| AppError::Internal(format!("db dead-letter revoked: {e}")))?;
+                    }
+                    tx.commit()
+                        .map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
+                    return Ok(false);
+                }
+            };
+
             tx.execute(
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, 'revoked', ?5, ?6)
@@ -432,7 +570,7 @@ impl Db {
                     data.email.as_deref().unwrap_or("unknown"),
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    normalize_event_ts(data.occurred_at.as_deref()),
+                    occurred_at,
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert revoked: {e}")))?;
@@ -516,6 +654,80 @@ impl Db {
             let prev_status = prev_row.as_ref().map(|(s, _)| s.as_str());
             let prev_last_event_at = prev_row.as_ref().and_then(|(_, t)| t.as_deref());
 
+            // Missing, malformed, and stale timestamps are all non-advances.
+            // This check runs before the terminal-state branch so every update
+            // has one ordering contract, including events targeting a revoked
+            // row and `revoked` updates routed through this generic seam.
+            let occurred_at = match ordered_event_timestamp(
+                data.occurred_at.as_deref(),
+                prev_last_event_at,
+                status_revokes(&data.new_status),
+            ) {
+                Ok(occurred_at) => occurred_at,
+                Err(reason) => {
+                    tracing::warn!(
+                        event_id = %data.event_id,
+                        ?reason,
+                        "subscription update did not carry a provably newer timestamp; state unchanged"
+                    );
+                    if !matches!(reason, EventTimestampError::Stale)
+                        && status_revokes(&data.new_status)
+                    {
+                        tx.execute(
+                            "UPDATE api_keys SET revoked=1 WHERE subscription_id=?1",
+                            params![data.subscription_id],
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!("db provisional update revoke: {e}"))
+                        })?;
+                        let payload = RedactedDeadLetterPayload::lifecycle(
+                            &data.event_type,
+                            data.occurred_at.as_deref(),
+                            Some(&data.subscription_id),
+                            Some(&data.new_status),
+                            data.product_id.as_deref(),
+                            None,
+                            data.customer_id.as_deref(),
+                            data.tier.as_deref(),
+                        );
+                        tx.execute(
+                            INSERT_DEAD_LETTER_SQL,
+                            params![
+                                data.event_id,
+                                data.subscription_id,
+                                data.event_type,
+                                format!("unorderable_revocation:{reason:?}"),
+                                data.occurred_at,
+                                payload.into_inner(),
+                            ],
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!("db dead-letter update: {e}"))
+                        })?;
+                    }
+                    if matches!(reason, EventTimestampError::Stale)
+                        || !status_revokes(&data.new_status)
+                    {
+                        tx.execute(
+                            "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
+                            params![data.event_id, data.event_type],
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!("db mark rejected update: {e}"))
+                        })?;
+                    }
+                    tx.commit()
+                        .map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
+                    return Ok(if matches!(reason, EventTimestampError::Stale) {
+                        UpdatedOutcome::StaleIgnored
+                    } else if status_revokes(&data.new_status) {
+                        UpdatedOutcome::ReconciliationPending
+                    } else {
+                        UpdatedOutcome::UnorderableIgnored
+                    });
+                }
+            };
+
             // revoked absorbs every non-revoked transition.
             if prev_status == Some("revoked") && data.new_status != "revoked" {
                 tx.execute(
@@ -525,66 +737,6 @@ impl Db {
                 .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
                 tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
                 return Ok(UpdatedOutcome::TerminalIgnored);
-            }
-
-            // Out-of-order guard: a stale/reordered genuine event whose
-            // occurred_at predates the row's last_event_at must not overwrite
-            // the status or touch the `revoked` flag. Without this, an older
-            // `active` arriving after `past_due`/`revoked` would re-enable a
-            // key that was correctly disabled by the newer event.
-            //
-            // Both sides carry a Polar event's `created_at`, but
-            // last_event_at is persisted verbatim from the payload, so an
-            // equivalent-or-older instant may be encoded with a different UTC
-            // offset (e.g. `+02:00` vs `Z`) or fractional-second format. A raw
-            // string compare sorts those incorrectly and would let a stale
-            // event through, so parse BOTH to a normalized instant first and
-            // compare the instants.
-            //
-            // Fail-safe policy: a parse failure must never let a stale event
-            // re-apply status side effects. If the incoming occurred_at is
-            // unparseable we cannot trust it is newer, so we reject it as a
-            // non-advance (StaleIgnored). If prev_last_event_at is unparseable
-            // (e.g. a malformed legacy value) we likewise cannot prove the
-            // incoming event is newer, so we conservatively treat the incoming
-            // event as stale. Only a successful parse of BOTH with
-            // occurred >= prev advances the row.
-            if let (Some(occurred), Some(prev_at)) =
-                (data.occurred_at.as_deref(), prev_last_event_at)
-            {
-                let is_stale = match (
-                    chrono::DateTime::parse_from_rfc3339(occurred),
-                    chrono::DateTime::parse_from_rfc3339(prev_at),
-                ) {
-                    (Ok(occurred_ts), Ok(prev_ts)) => occurred_ts < prev_ts,
-                    (Err(e), _) => {
-                        tracing::warn!(
-                            event_id = %data.event_id,
-                            occurred_at = %occurred,
-                            error = %e,
-                            "unparseable incoming occurred_at; rejecting as stale (non-advance)"
-                        );
-                        true
-                    }
-                    (Ok(_), Err(e)) => {
-                        tracing::warn!(
-                            event_id = %data.event_id,
-                            last_event_at = %prev_at,
-                            error = %e,
-                            "unparseable stored last_event_at; conservatively treating incoming event as stale"
-                        );
-                        true
-                    }
-                };
-                if is_stale {
-                    tx.execute(
-                        "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
-                        params![data.event_id, data.event_type],
-                    )
-                    .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
-                    tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
-                    return Ok(UpdatedOutcome::StaleIgnored);
-                }
             }
 
             tx.execute(
@@ -603,7 +755,7 @@ impl Db {
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.new_status,
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    normalize_event_ts(data.occurred_at.as_deref()),
+                    occurred_at,
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert updated: {e}")))?;
@@ -626,10 +778,11 @@ impl Db {
 
             // Side effects by status. The earlier terminal guard means
             // `prev_status == revoked` never reaches this match, so any
-            // remaining prev_status (past_due / canceled / active / None)
-            // is safe to un-revoke when transitioning to active.
+            // remaining prev_status (past_due / canceled / active / trialing /
+            // None) is safe to un-revoke when transitioning to a benefit-
+            // carrying state.
             let outcome = match data.new_status.as_str() {
-                "active" => {
+                "active" | "trialing" => {
                     let rows = tx
                         .execute(
                             "UPDATE api_keys SET revoked=0 WHERE subscription_id=?1",
@@ -706,10 +859,28 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    /// Atomic consume — DELETE … RETURNING ensures exactly one request
-    /// receives the row.
-    /// repo-0237: non-destructive read of a pending receipt. `receipt_view`
-    /// peeks, decrypts/validates, and only then calls [`Self::receipt_consume`]
+    /// Non-destructive availability check for confirmation pages. This avoids
+    /// loading encrypted credentials for safe GET/HEAD requests.
+    pub async fn receipt_available(&self, receipt_secret: &str) -> Result<bool, AppError> {
+        let conn = self.conn.clone();
+        let secret = receipt_secret.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = acquire_db(&conn);
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_receipts WHERE receipt_secret=?1 AND expires_at > datetime('now'))",
+                    params![secret],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::Internal(format!("db receipt availability: {e}")))?;
+            Ok(exists != 0)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
+    }
+
+    /// repo-0237: non-destructive read of a pending receipt. `receipt_consume`
+    /// peeks, decrypts/validates, and only then calls the atomic consume below
     /// — a decryption/validation failure must not destroy the only recoverable
     /// encrypted API key.
     pub async fn receipt_peek(&self, receipt_secret: &str) -> Result<Option<ReceiptRow>, AppError> {
@@ -739,6 +910,8 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
+    /// Atomic consume — DELETE … RETURNING ensures exactly one request
+    /// receives the row.
     pub async fn receipt_consume(
         &self,
         receipt_secret: &str,
@@ -813,60 +986,139 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    /// Insert a refreshed token only when this subscription has not received one
-    /// within `min_interval_secs`. The age check and insert share one IMMEDIATE
-    /// transaction, so concurrent requests (including separate server processes
-    /// using the same SQLite database) cannot all pass a split check before any
-    /// token becomes visible.
-    pub async fn insert_token_if_interval_elapsed(
+    /// Atomically re-authorize the exact API key/subscription/tier snapshot,
+    /// enforce the issuance interval, and publish the token. Revocation or a
+    /// lifecycle transition that commits after the route's preliminary read
+    /// but before this statement makes the INSERT select zero rows, so no token
+    /// can be published after access was withdrawn.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_refresh_token_if_authorized(
         &self,
+        key_hash: &str,
         sub_id: &str,
+        expected_tier: &str,
         token: &str,
         expires_at: i64,
         min_interval_secs: i64,
-    ) -> Result<bool, AppError> {
+    ) -> Result<RefreshPublishOutcome, AppError> {
         let conn = self.conn.clone();
+        let key_hash = key_hash.to_string();
         let sid = sub_id.to_string();
+        let tier = expected_tier.to_string();
         let tok = token.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut conn = acquire_db(&conn);
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|e| AppError::Internal(format!("db token tx: {e}")))?;
-            let age = tx
-                .query_row(
-                    "SELECT CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', MAX(created_at)) AS INTEGER) FROM tokens WHERE subscription_id=?1",
-                    params![sid],
-                    |row| row.get::<_, Option<i64>>(0),
+            let conn = acquire_db(&conn);
+            let inserted = conn
+                .execute(
+                    // A token whose created_at cannot be parsed (a malformed or
+                    // legacy value) makes strftime return NULL. Comparing NULL
+                    // would make the row fall OUT of the recency window and let
+                    // the rate-limited insert through, which is fail-open. Treat
+                    // an unparseable created_at as within the window instead, so
+                    // an existing token still blocks a new one: fail closed.
+                    "INSERT INTO tokens (subscription_id, token, expires_at)
+                     SELECT s.id, ?4, ?5
+                     FROM subscriptions s
+                     JOIN api_keys k ON k.subscription_id=s.id
+                     WHERE k.key_hash=?1
+                       AND k.revoked=0
+                       AND s.id=?2
+                       AND s.tier=?3
+                       AND s.status IN ('active','trialing','canceled')
+                       AND NOT EXISTS (
+                       SELECT 1 FROM tokens
+                       WHERE subscription_id=s.id
+                         AND (
+                           strftime('%s', created_at) IS NULL
+                           OR CAST(strftime('%s', created_at) AS INTEGER)
+                              > unixepoch('now') - ?6
+                         )
+                     )",
+                    params![key_hash, sid, tier, tok, expires_at, min_interval_secs],
                 )
-                .map_err(|e| AppError::Internal(format!("db token age: {e}")))?;
-            if age.is_some_and(|seconds| seconds < min_interval_secs) {
-                tx.commit()
-                    .map_err(|e| AppError::Internal(format!("db token tx commit: {e}")))?;
-                return Ok(false);
+                .map_err(|e| AppError::Internal(format!("db insert refresh token: {e}")))?;
+            if inserted == 1 {
+                return Ok(RefreshPublishOutcome::Inserted);
             }
-            tx.execute(
-                "INSERT INTO tokens (subscription_id, token, expires_at) VALUES (?1, ?2, ?3)",
-                params![sid, tok, expires_at],
-            )
-            .map_err(|e| AppError::Internal(format!("db insert token: {e}")))?;
-            tx.commit()
-                .map_err(|e| AppError::Internal(format!("db token tx commit: {e}")))?;
-            Ok(true)
+            let authorized: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM subscriptions s
+                       JOIN api_keys k ON k.subscription_id=s.id
+                       WHERE k.key_hash=?1 AND k.revoked=0 AND s.id=?2
+                         AND s.tier=?3 AND s.status IN ('active','trialing','canceled')
+                     )",
+                    params![key_hash, sid, tier],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::Internal(format!("db refresh reauthorize: {e}")))?;
+            Ok(if authorized {
+                RefreshPublishOutcome::RateLimited
+            } else {
+                RefreshPublishOutcome::NotAuthorized
+            })
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
+    }
+
+    #[cfg(test)]
+    fn count_tokens_for_subscription(&self, sub_id: &str) -> i64 {
+        let conn = acquire_db(&self.conn);
+        conn.query_row(
+            "SELECT COUNT(*) FROM tokens WHERE subscription_id=?1",
+            params![sub_id],
+            |row| row.get(0),
+        )
+        .expect("count tokens")
+    }
+
+    #[cfg(test)]
+    fn delete_tokens_for_subscription(&self, sub_id: &str) {
+        let conn = acquire_db(&self.conn);
+        conn.execute(
+            "DELETE FROM tokens WHERE subscription_id=?1",
+            params![sub_id],
+        )
+        .expect("delete tokens");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dead_letter_reason_for_event(&self, event_id: &str) -> Option<String> {
+        let conn = acquire_db(&self.conn);
+        conn.query_row(
+            "SELECT reason FROM dead_letter WHERE event_id=?1",
+            params![event_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("read dead-letter reason")
     }
 
     pub async fn insert_dead_letter(&self, dl: DeadLetterData) -> Result<(), AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = acquire_db(&conn);
-            conn.execute(
-                "INSERT OR IGNORE INTO dead_letter (event_id, subscription_id, event_type, reason, occurred_at, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![dl.event_id, dl.subscription_id, dl.event_type, dl.reason, dl.occurred_at, dl.payload],
-            )
-            .map_err(|e| AppError::Internal(format!("db dead letter: {e}")))?;
+            let event_id = dl.event_id.clone();
+            let written = conn
+                .execute(
+                    INSERT_DEAD_LETTER_SQL,
+                    params![
+                        dl.event_id,
+                        dl.subscription_id,
+                        dl.event_type,
+                        dl.reason,
+                        dl.occurred_at,
+                        dl.payload.into_inner()
+                    ],
+                )
+                .map_err(|e| AppError::Internal(format!("db dead letter: {e}")))?;
+            if written == 0 {
+                tracing::info!(
+                    event_id = %event_id,
+                    "dead-letter write was superseded by the existing event row"
+                );
+            }
             Ok(())
         })
         .await
@@ -896,12 +1148,16 @@ impl Db {
             let conn = acquire_db(&conn);
             let mut stmt = conn
                 .prepare(
-                    "SELECT dl.id, dl.event_id, dl.subscription_id, dl.event_type, dl.occurred_at, s.tier, s.last_event_at
+                    "SELECT dl.id, dl.event_id, dl.subscription_id, dl.event_type, dl.occurred_at, s.tier, s.last_event_at, dl.reason
                      FROM dead_letter dl
                      LEFT JOIN subscriptions s ON dl.subscription_id = s.id
-                     WHERE dl.reason='unresolvable_product'
+                     WHERE (dl.reason='unresolvable_product'
+                            OR dl.reason LIKE 'unorderable_revocation:%')
                        AND dl.event_type LIKE 'subscription.%'
-                       AND dl.created_at > datetime('now', '-1 hour')
+                       AND dl.created_at > CASE
+                           WHEN dl.reason='unresolvable_product' THEN datetime('now', '-1 hour')
+                           ELSE datetime('now', '-90 days')
+                         END
                        AND dl.subscription_id IS NOT NULL",
                 )
                 .map_err(|e| AppError::Internal(format!("db prepare retry: {e}")))?;
@@ -915,6 +1171,7 @@ impl Db {
                         occurred_at: row.get(4)?,
                         current_tier: row.get(5)?,
                         last_event_at: row.get(6)?,
+                        reason: row.get(7)?,
                     })
                 })
                 .map_err(|e| AppError::Internal(format!("db query retry: {e}")))?
@@ -954,6 +1211,80 @@ impl Db {
             )
             .map_err(|e| AppError::Internal(format!("db delete dl: {e}")))?;
             Ok(())
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_retry_lifecycle_fix(
+        &self,
+        dead_letter_id: i64,
+        event_id: &str,
+        event_type: &str,
+        sub_id: &str,
+        current_status: &str,
+        current_tier: Option<&str>,
+        current_product_id: Option<&str>,
+        expected_last_event_at: Option<String>,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.clone();
+        let event_id = event_id.to_string();
+        let event_type = event_type.to_string();
+        let sid = sub_id.to_string();
+        let status = current_status.to_string();
+        let tier = current_tier.map(str::to_string);
+        let product_id = current_product_id.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let conn = acquire_db(&conn);
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| AppError::Internal(format!("db lifecycle retry tx: {e}")))?;
+            let reconciled_at =
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let changed = tx
+                .execute(
+                    "INSERT INTO subscriptions \
+                     (id, tier, status, product_id, last_event_at) \
+                     VALUES (?1, COALESCE(?2, 'unknown'), ?3, COALESCE(?4, 'unknown'), ?5) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                       status=excluded.status, \
+                       tier=COALESCE(?2, subscriptions.tier), \
+                       product_id=COALESCE(?4, subscriptions.product_id), \
+                       last_event_at=?5, \
+                       updated_at=datetime('now') \
+                     WHERE subscriptions.last_event_at IS ?6",
+                    params![
+                        sid,
+                        tier,
+                        status,
+                        product_id,
+                        reconciled_at,
+                        expected_last_event_at
+                    ],
+                )
+                .map_err(|e| AppError::Internal(format!("db lifecycle reconcile: {e}")))?;
+
+            if changed == 1 {
+                tx.execute(
+                    "UPDATE api_keys SET revoked=?1 WHERE subscription_id=?2",
+                    params![if status_revokes(&status) { 1 } else { 0 }, sid],
+                )
+                .map_err(|e| AppError::Internal(format!("db reconcile key: {e}")))?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
+                    params![event_id, event_type],
+                )
+                .map_err(|e| AppError::Internal(format!("db reconcile event: {e}")))?;
+            }
+            tx.execute(
+                "DELETE FROM dead_letter WHERE id=?1",
+                params![dead_letter_id],
+            )
+            .map_err(|e| AppError::Internal(format!("db delete lifecycle dl: {e}")))?;
+            tx.commit()
+                .map_err(|e| AppError::Internal(format!("db lifecycle retry commit: {e}")))?;
+            Ok(changed == 1)
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
@@ -1005,16 +1336,7 @@ pub enum CreatedOutcome {
     SkippedRevoked,
     AlreadyProvisioned,
     Duplicate,
-}
-
-pub struct CanceledData {
-    pub event_id: String,
-    pub subscription_id: String,
-    pub customer_id: Option<String>,
-    pub email: Option<String>,
-    pub tier: Option<String>,
-    pub product_id: Option<String>,
-    pub occurred_at: Option<String>,
+    StaleIgnored,
 }
 
 pub struct RevokedData {
@@ -1054,6 +1376,11 @@ pub enum UpdatedOutcome {
     /// status overwrite or `revoked` side-effect, so a stale `active` can
     /// never re-enable a key revoked by a newer `past_due`/`revoked`.
     StaleIgnored,
+    /// The event could not be ordered, so a revoking transition was applied
+    /// provisionally and queued for current-state reconciliation.
+    ReconciliationPending,
+    /// A non-revoking event with an invalid timeline was ignored.
+    UnorderableIgnored,
     UnknownStatusRevoked,
 }
 
@@ -1072,13 +1399,59 @@ pub struct SubRow {
     pub tier: String,
 }
 
+/// JSON persisted in `dead_letter` can contain identifiers required for
+/// reconciliation, but never customer email, credentials, metadata, or
+/// arbitrary provider fields. The inner string is private so every insertion
+/// seam must use this allowlisted constructor.
+#[derive(Debug, Clone)]
+pub struct RedactedDeadLetterPayload(String);
+
+impl RedactedDeadLetterPayload {
+    #[allow(clippy::too_many_arguments)]
+    pub fn lifecycle(
+        event_type: &str,
+        occurred_at: Option<&str>,
+        subscription_id: Option<&str>,
+        status: Option<&str>,
+        product_id: Option<&str>,
+        checkout_id: Option<&str>,
+        customer_id: Option<&str>,
+        tier: Option<&str>,
+    ) -> Self {
+        Self(
+            serde_json::json!({
+                "type": event_type,
+                "timestamp": occurred_at,
+                "data": {
+                    "id": subscription_id,
+                    "status": status,
+                    "product_id": product_id,
+                    "checkout_id": checkout_id,
+                    "customer_id": customer_id,
+                    "tier": tier,
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
 pub struct DeadLetterData {
     pub event_id: String,
     pub subscription_id: Option<String>,
     pub event_type: String,
     pub reason: String,
     pub occurred_at: Option<String>,
-    pub payload: String,
+    pub payload: RedactedDeadLetterPayload,
 }
 
 #[allow(dead_code)]
@@ -1090,6 +1463,14 @@ pub struct RetryableDeadLetter {
     pub occurred_at: Option<String>,
     pub current_tier: Option<String>,
     pub last_event_at: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshPublishOutcome {
+    Inserted,
+    RateLimited,
+    NotAuthorized,
 }
 
 #[cfg(test)]
@@ -1117,18 +1498,6 @@ mod tests {
             receipt_secret: format!("receipt_{event_id}"),
             api_key_enc: vec![1, 2, 3],
             api_key_nonce: vec![4, 5, 6],
-        }
-    }
-
-    fn make_canceled(event_id: &str, sub_id: &str) -> CanceledData {
-        CanceledData {
-            event_id: event_id.to_string(),
-            subscription_id: sub_id.to_string(),
-            customer_id: Some("cust_1".to_string()),
-            email: Some("test@example.com".to_string()),
-            tier: Some("team".to_string()),
-            product_id: Some("prod_1".to_string()),
-            occurred_at: Some("2024-01-02T00:00:00Z".to_string()),
         }
     }
 
@@ -1181,6 +1550,225 @@ mod tests {
         (status, revoked)
     }
 
+    /// Rows in the dead-letter table, as (event_type, reason), for assertions.
+    fn dead_letter_rows(db: &Db) -> Vec<(String, String)> {
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT event_type, reason FROM dead_letter ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    fn dead_letter_payloads(db: &Db) -> Vec<String> {
+        let conn = db.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT payload FROM dead_letter ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn unorderable_past_due_update_is_dead_lettered() {
+        // `past_due` revokes the API key. An update that cannot be ordered
+        // (here a missing timestamp) cannot safely update the timeline, but its
+        // revocation is applied provisionally and reconciled from Polar.
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = None; // Missing -> unorderable, not Stale
+        let outcome = db.process_subscription_updated(past_due).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::ReconciliationPending);
+
+        let rows = dead_letter_rows(&db);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a dropped revoking update must be dead-lettered"
+        );
+        assert_eq!(rows[0].0, "subscription.past_due");
+        assert!(rows[0].1.contains("unorderable"), "{}", rows[0].1);
+        // Timeline status is unchanged, but access fails closed immediately.
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "active");
+        assert_eq!(revoked, Some(true));
+    }
+
+    #[tokio::test]
+    async fn unorderable_active_update_is_not_dead_lettered() {
+        // `active` does not revoke, so a dropped one keeps no paid access open;
+        // dead-lettering it would be noise. Only revoking updates are recorded.
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        let mut active = make_updated("evt_2", "sub_1", "active");
+        active.occurred_at = Some("not-a-timestamp".to_string()); // InvalidIncoming
+        let outcome = db.process_subscription_updated(active).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::UnorderableIgnored);
+        assert!(dead_letter_rows(&db).is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_revoking_update_is_not_dead_lettered() {
+        // Stale is an ordinary non-advance: the stored state is already at or
+        // past this event, so declining it is correct and not a dropped action.
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        // Older than the created event's 2024-01-01 -> Stale, not unorderable.
+        past_due.occurred_at = Some("2023-01-01T00:00:00Z".to_string());
+        let outcome = db.process_subscription_updated(past_due).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::StaleIgnored);
+        assert!(
+            dead_letter_rows(&db).is_empty(),
+            "a Stale non-advance must not be dead-lettered"
+        );
+    }
+
+    #[tokio::test]
+    async fn unorderable_revoked_event_is_dead_lettered_but_stale_is_not() {
+        // Pins the revoked path the update path now mirrors: Missing/Invalid ->
+        // dead-letter, Stale -> not.
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut unorderable = make_revoked("evt_2", "sub_1");
+        unorderable.occurred_at = None;
+        assert!(!db.process_subscription_revoked(unorderable).await.unwrap());
+        assert_eq!(dead_letter_rows(&db).len(), 1);
+
+        let mut stale = make_revoked("evt_3", "sub_1");
+        stale.occurred_at = Some("2023-01-01T00:00:00Z".to_string());
+        assert!(!db.process_subscription_revoked(stale).await.unwrap());
+        assert_eq!(
+            dead_letter_rows(&db).len(),
+            1,
+            "a Stale revoked event must not add a second dead-letter row"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_dead_letter_replaces_same_event_tier_failure_and_redacts_email() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        db.insert_dead_letter(DeadLetterData {
+            event_id: "evt_2".to_string(),
+            subscription_id: Some("sub_1".to_string()),
+            event_type: "subscription.past_due".to_string(),
+            reason: "unresolvable_product".to_string(),
+            occurred_at: None,
+            payload: RedactedDeadLetterPayload::lifecycle(
+                "subscription.past_due",
+                None,
+                Some("sub_1"),
+                Some("past_due"),
+                Some("unknown-product"),
+                None,
+                Some("cust_1"),
+                None,
+            ),
+        })
+        .await
+        .unwrap();
+
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = None;
+        past_due.email = Some("private@example.com".to_string());
+        assert_eq!(
+            db.process_subscription_updated(past_due).await.unwrap(),
+            UpdatedOutcome::ReconciliationPending
+        );
+        let rows = dead_letter_rows(&db);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.starts_with("unorderable_revocation:"));
+        let payloads = dead_letter_payloads(&db);
+        assert_eq!(payloads.len(), 1);
+        assert!(!payloads[0].contains("private@example.com"));
+        assert_eq!(read_state(&db, "sub_1").1, Some(true));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reconciliation_restores_only_current_provider_state() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = None;
+        assert_eq!(
+            db.process_subscription_updated(past_due).await.unwrap(),
+            UpdatedOutcome::ReconciliationPending
+        );
+        let retry = db.get_retryable_dead_letters().await.unwrap().remove(0);
+        assert!(db
+            .apply_retry_lifecycle_fix(
+                retry.id,
+                &retry.event_id,
+                &retry.event_type,
+                "sub_1",
+                "active",
+                Some("team"),
+                Some("prod_1"),
+                retry.last_event_at,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            read_state(&db, "sub_1"),
+            ("active".to_string(), Some(false))
+        );
+        assert!(dead_letter_rows(&db).is_empty());
+        assert!(db.event_exists("evt_2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn submillisecond_ordering_and_equal_timestamp_ties_fail_closed() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = Some("2024-03-01T00:00:00.000900Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(past_due).await.unwrap(),
+            UpdatedOutcome::Revoked
+        );
+        let mut older_active = make_updated("evt_3", "sub_1", "active");
+        older_active.occurred_at = Some("2024-03-01T00:00:00.000100Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(older_active).await.unwrap(),
+            UpdatedOutcome::StaleIgnored
+        );
+
+        let mut equal_active = make_updated("evt_4", "sub_1", "active");
+        equal_active.occurred_at = Some("2024-03-01T00:00:00.000900Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(equal_active).await.unwrap(),
+            UpdatedOutcome::StaleIgnored,
+            "an equal timestamp must not weaken a revoking state"
+        );
+        assert_eq!(read_state(&db, "sub_1").1, Some(true));
+    }
+
     #[tokio::test]
     async fn test_provision_creates_key_and_token() {
         let db = test_db();
@@ -1194,47 +1782,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refreshed_token_interval_check_and_insert_are_atomic() {
+    async fn parallel_refreshes_have_exactly_one_atomic_winner() {
         let db = test_db();
-        {
-            let conn = db.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO subscriptions (id, tier, status) VALUES ('sub_refresh', 'team', 'active')",
-                [],
-            )
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
             .unwrap();
-        }
+        db.delete_tokens_for_subscription("sub_1");
 
-        const REQUESTS: usize = 8;
-        let barrier = Arc::new(tokio::sync::Barrier::new(REQUESTS));
-        let mut tasks = Vec::with_capacity(REQUESTS);
-        for index in 0..REQUESTS {
+        let contestants = 16;
+        let barrier = Arc::new(tokio::sync::Barrier::new(contestants));
+        let mut tasks = Vec::new();
+        for index in 0..contestants {
             let db = db.clone();
-            let barrier = barrier.clone();
+            let barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
-                let token = format!("refresh-token-{index}");
                 barrier.wait().await;
-                db.insert_token_if_interval_elapsed("sub_refresh", &token, 9_999_999_999, 60)
-                    .await
-                    .unwrap()
+                db.publish_refresh_token_if_authorized(
+                    "keyhash_sub_1",
+                    "sub_1",
+                    "team",
+                    &format!("refresh-token-{index}"),
+                    9_999_999_999,
+                    60,
+                )
+                .await
+                .unwrap()
             }));
         }
 
-        let mut admitted = 0;
+        let mut winners = 0;
         for task in tasks {
-            admitted += usize::from(task.await.unwrap());
+            winners += usize::from(task.await.unwrap() == RefreshPublishOutcome::Inserted);
         }
-        assert_eq!(admitted, 1, "only one concurrent refresh may issue");
+        assert_eq!(winners, 1, "parallel refreshes must have one winner");
+        assert_eq!(db.count_tokens_for_subscription("sub_1"), 1);
+    }
 
-        let conn = db.conn.lock().unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM tokens WHERE subscription_id='sub_refresh'",
+    #[tokio::test]
+    async fn rate_limiter_fails_closed_on_an_unparseable_created_at() {
+        // A token row whose created_at cannot be parsed used to fall out of the
+        // recency window and let a second token through (fail-open). It must now
+        // count as recent and block the second insert.
+        let db = test_db();
+        // tokens.subscription_id has a foreign key to subscriptions, so seed one.
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        db.delete_tokens_for_subscription("sub_1"); // start from a clean token slate
+        assert!(
+            db.publish_refresh_token_if_authorized(
+                "keyhash_sub_1",
+                "sub_1",
+                "team",
+                "tok-1",
+                9_999_999_999,
+                60,
+            )
+            .await
+            .unwrap()
+                == RefreshPublishOutcome::Inserted,
+            "the first token is inserted"
+        );
+        // Corrupt the stored created_at so strftime('%s', ...) returns NULL.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tokens SET created_at='not-a-timestamp' WHERE subscription_id='sub_1'",
                 [],
-                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        }
+        assert!(
+            db.publish_refresh_token_if_authorized(
+                "keyhash_sub_1",
+                "sub_1",
+                "team",
+                "tok-2",
+                9_999_999_999,
+                60,
+            )
+            .await
+            .unwrap()
+                == RefreshPublishOutcome::RateLimited,
+            "an existing token with an unparseable created_at must still rate-limit"
+        );
+        assert_eq!(db.count_tokens_for_subscription("sub_1"), 1);
+    }
+
+    #[tokio::test]
+    async fn trialing_keeps_benefits_and_refresh_authorization() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        db.delete_tokens_for_subscription("sub_1");
+
+        let mut trialing = make_updated("evt_2", "sub_1", "trialing");
+        trialing.occurred_at = Some("2024-02-01T00:00:00Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(trialing).await.unwrap(),
+            UpdatedOutcome::Unrevoked
+        );
+        assert_eq!(
+            read_state(&db, "sub_1"),
+            ("trialing".to_string(), Some(false))
+        );
+
+        assert_eq!(
+            db.publish_refresh_token_if_authorized(
+                "keyhash_sub_1",
+                "sub_1",
+                "team",
+                "trial-refresh-token",
+                9_999_999_999,
+                60,
+            )
+            .await
+            .unwrap(),
+            RefreshPublishOutcome::Inserted
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_publication_rechecks_revocation_after_preflight() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        db.delete_tokens_for_subscription("sub_1");
+
+        // Model the route's preflight succeeding, followed by a webhook
+        // revocation before token publication reaches the database.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE api_keys SET revoked=1 WHERE subscription_id='sub_1'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.publish_refresh_token_if_authorized(
+                "keyhash_sub_1",
+                "sub_1",
+                "team",
+                "must-not-publish",
+                9_999_999_999,
+                60,
+            )
+            .await
+            .unwrap(),
+            RefreshPublishOutcome::NotAuthorized
+        );
+        assert_eq!(db.count_tokens_for_subscription("sub_1"), 0);
     }
 
     #[tokio::test]
@@ -1255,6 +1955,9 @@ mod tests {
         db.process_subscription_created(data1).await.unwrap();
 
         let mut data2 = make_created("evt_2", "sub_1", "team");
+        // This is a later provider event, not a replay at the same logical
+        // instant. Equal-timestamp activations intentionally fail closed.
+        data2.occurred_at = Some("2024-01-02T00:00:00Z".to_string());
         data2.checkout_id = Some("checkout_2".to_string());
         data2.receipt_secret = "receipt_2".to_string();
         let outcome = db.process_subscription_created(data2).await.unwrap();
@@ -1312,6 +2015,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_receipt_availability_is_non_consuming_until_atomic_consume() {
+        let db = test_db();
+        let mut data = make_created("evt_1", "sub_1", "team");
+        data.checkout_id = Some("checkout_real".to_string());
+        db.process_subscription_created(data).await.unwrap();
+
+        assert!(db.receipt_available("receipt_evt_1").await.unwrap());
+        assert!(db.receipt_available("receipt_evt_1").await.unwrap());
+        assert!(db.receipt_consume("receipt_evt_1").await.unwrap().is_some());
+        assert!(!db.receipt_available("receipt_evt_1").await.unwrap());
+        assert!(db.receipt_consume("receipt_evt_1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_provision_skipped_if_revoked() {
         let db = test_db();
         {
@@ -1333,9 +2050,11 @@ mod tests {
         let created = make_created("evt_1", "sub_1", "team");
         db.process_subscription_created(created).await.unwrap();
 
-        let canceled = make_canceled("evt_2", "sub_1");
-        let processed = db.process_subscription_canceled(canceled).await.unwrap();
-        assert!(processed);
+        let canceled = make_updated("evt_2", "sub_1", "canceled");
+        assert_eq!(
+            db.process_subscription_updated(canceled).await.unwrap(),
+            UpdatedOutcome::StatusUpdated
+        );
 
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "canceled");
@@ -1351,9 +2070,12 @@ mod tests {
         let revoked = make_revoked("evt_2", "sub_1");
         db.process_subscription_revoked(revoked).await.unwrap();
 
-        let canceled = make_canceled("evt_3", "sub_1");
-        let processed = db.process_subscription_canceled(canceled).await.unwrap();
-        assert!(!processed);
+        let mut canceled = make_updated("evt_3", "sub_1", "canceled");
+        canceled.occurred_at = Some("2024-01-05T00:00:00Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(canceled).await.unwrap(),
+            UpdatedOutcome::TerminalIgnored
+        );
 
         let (status, _) = read_state(&db, "sub_1");
         assert_eq!(status, "revoked");
@@ -1375,6 +2097,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_revoked_event_cannot_override_newer_active_state() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut newer_active = make_updated("evt_2", "sub_1", "active");
+        newer_active.occurred_at = Some("2024-03-01T00:00:00Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(newer_active).await.unwrap(),
+            UpdatedOutcome::Unrevoked
+        );
+
+        let mut stale_revoked = make_revoked("evt_3", "sub_1");
+        stale_revoked.occurred_at = Some("2024-02-01T00:00:00Z".to_string());
+        assert!(!db
+            .process_subscription_revoked(stale_revoked)
+            .await
+            .unwrap());
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "active");
+        assert_eq!(revoked, Some(false));
+
+        let mut newer_revoked = make_revoked("evt_4", "sub_1");
+        newer_revoked.occurred_at = Some("2024-04-01T00:00:00Z".to_string());
+        assert!(db
+            .process_subscription_revoked(newer_revoked)
+            .await
+            .unwrap());
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "revoked");
+        assert_eq!(revoked, Some(true));
+    }
+
+    #[tokio::test]
+    async fn missing_update_timestamp_cannot_reenable_key() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = Some("2024-03-01T00:00:00Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(past_due).await.unwrap(),
+            UpdatedOutcome::Revoked
+        );
+
+        let mut missing_timestamp = make_updated("evt_3", "sub_1", "active");
+        missing_timestamp.occurred_at = None;
+        assert_eq!(
+            db.process_subscription_updated(missing_timestamp)
+                .await
+                .unwrap(),
+            UpdatedOutcome::UnorderableIgnored
+        );
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "past_due");
+        assert_eq!(revoked, Some(true));
+    }
+
+    #[tokio::test]
+    async fn missing_revoked_timestamp_provisionally_revokes_access() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut revoked_event = make_revoked("evt_2", "sub_1");
+        revoked_event.occurred_at = None;
+        assert!(!db
+            .process_subscription_revoked(revoked_event)
+            .await
+            .unwrap());
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "active");
+        assert_eq!(revoked, Some(true));
+    }
+
+    #[tokio::test]
     async fn test_active_after_past_due_unrevokes() {
         let db = test_db();
         let created = make_created("evt_1", "sub_1", "team");
@@ -1388,7 +2190,8 @@ mod tests {
         assert_eq!(status, "past_due");
         assert_eq!(revoked, Some(true));
 
-        let active = make_updated("evt_3", "sub_1", "active");
+        let mut active = make_updated("evt_3", "sub_1", "active");
+        active.occurred_at = Some("2024-01-05T00:00:00Z".to_string());
         let outcome = db.process_subscription_updated(active).await.unwrap();
         assert_eq!(outcome, UpdatedOutcome::Unrevoked);
 
@@ -1485,7 +2288,8 @@ mod tests {
         let revoked = make_revoked("evt_2", "sub_1");
         db.process_subscription_revoked(revoked).await.unwrap();
 
-        let active = make_updated("evt_3", "sub_1", "active");
+        let mut active = make_updated("evt_3", "sub_1", "active");
+        active.occurred_at = Some("2024-01-05T00:00:00Z".to_string());
         let outcome = db.process_subscription_updated(active).await.unwrap();
         assert_eq!(outcome, UpdatedOutcome::TerminalIgnored);
 
@@ -1535,7 +2339,8 @@ mod tests {
         let canceled = make_updated("evt_2", "sub_1", "canceled");
         db.process_subscription_updated(canceled).await.unwrap();
 
-        let active = make_updated("evt_3", "sub_1", "active");
+        let mut active = make_updated("evt_3", "sub_1", "active");
+        active.occurred_at = Some("2024-01-05T00:00:00Z".to_string());
         let outcome = db.process_subscription_updated(active).await.unwrap();
         assert_eq!(outcome, UpdatedOutcome::Unrevoked);
 
@@ -1563,13 +2368,14 @@ mod tests {
         let db = test_db();
         // canceled arrives first (creates row with status=canceled) and
         // subscription.active provision arrives second.
-        let canceled = make_canceled("evt_1", "sub_1");
-        db.process_subscription_canceled(canceled).await.unwrap();
+        let canceled = make_updated("evt_1", "sub_1", "canceled");
+        db.process_subscription_updated(canceled).await.unwrap();
 
         let (status, _) = read_state(&db, "sub_1");
         assert_eq!(status, "canceled");
 
-        let created = make_created("evt_2", "sub_1", "team");
+        let mut created = make_created("evt_2", "sub_1", "team");
+        created.occurred_at = Some("2024-01-05T00:00:00Z".to_string());
         let outcome = db.process_subscription_created(created).await.unwrap();
         assert!(matches!(outcome, CreatedOutcome::Provisioned));
 
@@ -1577,6 +2383,22 @@ mod tests {
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "active");
         assert_eq!(revoked, Some(false));
+    }
+
+    #[tokio::test]
+    async fn stale_activation_cannot_override_newer_cancellation() {
+        let db = test_db();
+        let mut canceled = make_updated("evt_1", "sub_1", "canceled");
+        canceled.occurred_at = Some("2024-03-01T00:00:00.000900Z".to_string());
+        db.process_subscription_updated(canceled).await.unwrap();
+
+        let mut created = make_created("evt_2", "sub_1", "team");
+        created.occurred_at = Some("2024-03-01T00:00:00.000100Z".to_string());
+        assert!(matches!(
+            db.process_subscription_created(created).await.unwrap(),
+            CreatedOutcome::StaleIgnored
+        ));
+        assert_eq!(read_state(&db, "sub_1"), ("canceled".to_string(), None));
     }
 
     #[tokio::test]
@@ -1634,5 +2456,192 @@ mod tests {
         assert!(conn
             .prepare("SELECT price_id FROM subscriptions LIMIT 0")
             .is_err());
+    }
+
+    #[test]
+    fn migration_redacts_retained_legacy_dead_letter_payloads() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dead_letter (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL UNIQUE,
+                 subscription_id TEXT,
+                 event_type TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 occurred_at TEXT,
+                 payload TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        let legacy = serde_json::json!({
+            "type": "subscription.past_due",
+            "timestamp": "2024-01-02T03:04:05.123456Z",
+            "data": {
+                "id": "payload-substitution-must-not-win",
+                "status": "past_due",
+                "product_id": "prod_team",
+                "checkout_id": "checkout_1",
+                "customer_id": "customer_1",
+                "tier": "team",
+                "customer": {"email": "legacy-private@example.com"},
+                "metadata": {"api_key": "legacy-secret-canary"}
+            }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO dead_letter
+             (event_id, subscription_id, event_type, reason, occurred_at, payload)
+             VALUES ('evt_legacy', 'sub_trusted', 'subscription.past_due',
+                     'unresolvable_product', '2024-01-02T03:04:05.123456Z', ?1)",
+            params![legacy],
+        )
+        .unwrap();
+
+        Db::migrate(&conn).unwrap();
+
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM dead_letter WHERE event_id='evt_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!payload.contains("legacy-private@example.com"));
+        assert!(!payload.contains("legacy-secret-canary"));
+        assert!(!payload.contains("payload-substitution-must-not-win"));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["type"], "subscription.past_due");
+        assert_eq!(parsed["timestamp"], "2024-01-02T03:04:05.123456Z");
+        assert_eq!(parsed["data"]["id"], "sub_trusted");
+        assert_eq!(parsed["data"]["status"], "past_due");
+        assert_eq!(parsed["data"]["product_id"], "prod_team");
+        assert_eq!(parsed["data"]["tier"], "team");
+
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name=?1",
+                params![DEAD_LETTER_REDACTION_MIGRATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, 1);
+
+        // Reopening checks the marker rather than rescanning retained rows.
+        Db::migrate(&conn).unwrap();
+        let after_second_run: String = conn
+            .query_row(
+                "SELECT payload FROM dead_letter WHERE event_id='evt_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_second_run, payload);
+    }
+
+    #[test]
+    fn dead_letter_redaction_migration_rolls_back_rows_and_marker_together() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dead_letter (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL UNIQUE,
+                 subscription_id TEXT,
+                 event_type TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 occurred_at TEXT,
+                 payload TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO dead_letter
+             (event_id, subscription_id, event_type, reason, payload)
+             VALUES
+               ('evt_first', 'sub_1', 'subscription.past_due', 'legacy',
+                '{\"data\":{\"metadata\":{\"secret\":\"first-canary\"}}}'),
+               ('evt_second', 'sub_2', 'subscription.revoked', 'legacy',
+                '{\"data\":{\"metadata\":{\"secret\":\"second-canary\"}}}');
+             CREATE TRIGGER reject_second_redaction
+             BEFORE UPDATE OF payload ON dead_letter
+             WHEN OLD.event_id='evt_second'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected migration failure');
+             END;",
+        )
+        .unwrap();
+
+        assert!(Db::migrate(&conn).is_err());
+        let payloads = {
+            let mut statement = conn
+                .prepare("SELECT payload FROM dead_letter ORDER BY event_id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(payloads
+            .iter()
+            .any(|payload| payload.contains("first-canary")));
+        assert!(payloads
+            .iter()
+            .any(|payload| payload.contains("second-canary")));
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name=?1",
+                params![DEAD_LETTER_REDACTION_MIGRATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, 0);
+
+        conn.execute_batch("DROP TRIGGER reject_second_redaction;")
+            .unwrap();
+        Db::migrate(&conn).unwrap();
+        let remaining_canaries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dead_letter
+                 WHERE payload LIKE '%first-canary%' OR payload LIKE '%second-canary%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_canaries, 0);
+    }
+
+    #[test]
+    fn migration_reduces_malformed_dead_letters_to_relational_identity() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dead_letter (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL UNIQUE,
+                 subscription_id TEXT,
+                 event_type TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 occurred_at TEXT,
+                 payload TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO dead_letter
+             (event_id, subscription_id, event_type, reason, occurred_at, payload)
+             VALUES ('evt_bad', 'sub_safe', 'subscription.revoked',
+                     'unorderable_revocation:InvalidStored', NULL,
+                     'not-json legacy-secret-canary');",
+        )
+        .unwrap();
+
+        Db::migrate(&conn).unwrap();
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM dead_letter WHERE event_id='evt_bad'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!payload.contains("legacy-secret-canary"));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["type"], "subscription.revoked");
+        assert_eq!(parsed["data"]["id"], "sub_safe");
     }
 }

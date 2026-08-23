@@ -11,15 +11,18 @@ const ABSOLUTE_MAX_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
 /// Dedicated cross-process lock guarding every spool read/append/rewrite
 /// (repo-0250): without it, two drainers snapshot-then-rewrite from stale
 /// state and can delete or duplicate each other's events.
-fn spool_lock_path() -> PathBuf {
-    let mut name = spool_path().into_os_string();
+fn spool_lock_path(spool: &std::path::Path) -> PathBuf {
+    let mut name = spool.as_os_str().to_os_string();
     name.push(".lock");
     PathBuf::from(name)
 }
 
-fn with_spool_lock<R>(f: impl FnOnce() -> std::io::Result<R>) -> std::io::Result<R> {
+fn with_spool_lock<R>(
+    spool: &std::path::Path,
+    f: impl FnOnce() -> std::io::Result<R>,
+) -> std::io::Result<R> {
     use fs2::FileExt as _;
-    let lock_path = spool_lock_path();
+    let lock_path = spool_lock_path(spool);
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -60,11 +63,11 @@ pub fn spool_event(event_json: &str) -> std::io::Result<()> {
             "audit event exceeds the per-event spool limit",
         ));
     }
-    with_spool_lock(|| spool_event_locked(event_json))
+    let path = spool_path();
+    with_spool_lock(&path, || spool_event_locked(&path, event_json))
 }
 
-fn spool_event_locked(event_json: &str) -> std::io::Result<()> {
-    let path = spool_path();
+fn spool_event_locked(path: &std::path::Path, event_json: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -87,7 +90,7 @@ fn spool_event_locked(event_json: &str) -> std::io::Result<()> {
             ));
         }
     }
-    let mut file = opts.open(&path)?;
+    let mut file = opts.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other(
             "refusing to append to a non-regular audit spool",
@@ -195,7 +198,7 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
     // Snapshot under the spool lock (repo-0250); the network phase runs
     // unlocked so appends are not blocked behind slow sends, and the final
     // rewrite re-locks and removes only the prefix this drainer actually sent.
-    let lines = match with_spool_lock(|| -> std::io::Result<Vec<String>> {
+    let lines = match with_spool_lock(&path, || -> std::io::Result<Vec<String>> {
         let (current, tail_truncated) = read_spool_lines_bounded(&path, max_bytes)?;
         let retained = enforce_retention(current.clone(), max_events, max_bytes);
         if tail_truncated || retained != current {
@@ -275,7 +278,7 @@ fn write_spool_atomic(path: &std::path::Path, lines: &[String]) -> std::io::Resu
 /// pass changed the prefix, leave the file untouched: at-least-once delivery is
 /// safer than guessing and deleting an event.
 fn rewrite_spool(path: &std::path::Path, snapshot: &[String], sent_count: usize, max_bytes: u64) {
-    let result = with_spool_lock(|| {
+    let result = with_spool_lock(path, || {
         // repo-0250: under the lock, re-read the CURRENT file and remove only
         // the prefix this drainer sent. Events appended by another process
         // while we were sending land at the end and must survive.
@@ -424,7 +427,7 @@ pub fn spool_and_upload(
 /// dropping the oldest lines. Runs under the spool lock.
 fn trim_spool_to_retention(max_events: usize, max_bytes: u64) {
     let path = spool_path();
-    let _ = with_spool_lock(|| -> std::io::Result<()> {
+    let _ = with_spool_lock(&path, || -> std::io::Result<()> {
         let (lines, tail_truncated) = match read_spool_lines_bounded(&path, max_bytes) {
             Ok(c) => c,
             Err(_) => return Ok(()),
@@ -525,8 +528,8 @@ mod tests {
     #[test]
     fn test_rewrite_spool_preserves_concurrent_appends() {
         // repo-0250: lines appended by another process AFTER the drainer's
-        // snapshot must survive the rewrite; the rewrite is refused when the
-        // pending tail no longer matches (at-least-once beats silent loss).
+        // snapshot must survive when the snapshotted prefix is still intact.
+        // A changed prefix is covered by the fail-closed test below.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.jsonl");
         fs::write(&path, "line1\nline3\nline4\nline5-new\n").unwrap();

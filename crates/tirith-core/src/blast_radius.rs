@@ -13,7 +13,7 @@
 //! `$VAR` resolution: the empty-var-glob bug (`rm -rf "$EMPTY/"` → `rm -rf "/"`)
 //! is detected against an injected variable map, not `std::env` inside the
 //! detector, so tests avoid the libc `setenv` race (PR #125). Production callers
-//! pass a `std::env::vars()` snapshot via [`env_snapshot`].
+//! pass a `std::env::vars_os()` snapshot via [`env_snapshot`].
 
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
@@ -137,8 +137,13 @@ struct ParsedFsOp {
 /// Snapshot the process environment for the `env_map` parameter of
 /// [`cheap_check`] / [`simulate`]. Call ONCE in the caller (never inside the
 /// detector) so the detector stays pure and testable.
+///
+/// Non-UTF-8 keys/values are omitted. `std::env::vars()` panics on them
+/// (MSRV 1.83), which would turn a host env byte into an analysis crash.
 pub fn env_snapshot() -> HashMap<String, String> {
-    std::env::vars().collect()
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 const MAX_NESTED_COMMAND_DEPTH: usize = 8;
@@ -155,14 +160,15 @@ fn collect_executable_segments(
             .into_iter()
             .map(|segment| (segment, shell)),
     );
-    let nested = crate::extract::executable_substitution_scan(input, shell).bodies;
+    let nested_scan = crate::extract::executable_substitution_scan(input, shell);
+    let mut incomplete = nested_scan.gap.is_some();
+    let nested = nested_scan.bodies;
     if nested.is_empty() {
-        return false;
+        return incomplete;
     }
     if depth >= MAX_NESTED_COMMAND_DEPTH {
         return true;
     }
-    let mut incomplete = false;
     for body in nested {
         // Do not use `Iterator::any`: traversing every sibling is required to
         // collect all executable segments even after an earlier depth gap.
@@ -197,12 +203,12 @@ pub fn cheap_check(
         findings.push(finding(
             RuleId::AnalysisIncomplete,
             Severity::High,
-            "nested command analysis exceeded its depth limit",
-            "A destructive command may be hidden in nested shell execution syntax deeper than \
-             Tirith's bounded parser can safely resolve.",
+            "nested command analysis was incomplete",
+            "A destructive command may be hidden beyond Tirith's bounded nested-shell depth, \
+             lexical-candidate, input, or retained-body budget.",
             Evidence::CommandPattern {
-                pattern: "over-deep nested shell execution".to_string(),
-                matched: input.to_string(),
+                pattern: "nested shell execution coverage gap".to_string(),
+                matched: "nested body suffix omitted by bounded analysis".to_string(),
             },
         ));
     }
@@ -211,6 +217,22 @@ pub fn cheap_check(
         let parsed = match parse_fs_op(seg, *segment_shell) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
+            Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
+                findings.push(finding(
+                    RuleId::AnalysisIncomplete,
+                    Severity::High,
+                    "destructive command analysis exceeded its work budget",
+                    "The command exceeded Tirith's bounded token-normalization budget. A \
+                     destructive operation may remain in the omitted suffix, so it is blocked \
+                     instead of being treated as absent.",
+                    Evidence::CommandPattern {
+                        pattern: "destructive command work budget exhausted".to_string(),
+                        matched: "input or token suffix omitted before command normalization"
+                            .to_string(),
+                    },
+                ));
+                continue;
+            }
             Err(_) => {
                 if segment_has_destructive_marker(seg, *segment_shell) {
                     findings.push(finding(
@@ -411,12 +433,19 @@ fn simulate_with_work_limit(
     if nested_incomplete {
         report.walk_errors += 1;
         report.walk_truncated = true;
+        report.classification_incomplete = true;
     }
 
     for (seg, segment_shell) in &segments {
         let parsed = match parse_fs_op(seg, *segment_shell) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
+            Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
+                report.walk_errors += 1;
+                report.walk_truncated = true;
+                report.classification_incomplete = true;
+                continue;
+            }
             Err(_) => {
                 if segment_has_destructive_marker(seg, *segment_shell) {
                     report.walk_errors += 1;
@@ -903,17 +932,10 @@ fn expand_known_path(
 /// above root; the result has no trailing slash except bare root, which stays
 /// `/`.
 fn posix_lexical(path: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    format!("/{}", out.join("/"))
+    let rooted = format!("/{}", path.trim_start_matches('/'));
+    crate::lexical_path::LexicalPath::parse(&rooted, crate::lexical_path::PathDialect::Posix)
+        .map(|path| path.to_slash_string())
+        .unwrap_or(rooted)
 }
 
 /// The POSIX parent of a `/`-rooted path: everything up to the last `/`, or `/`
@@ -991,7 +1013,8 @@ fn is_system_path(path: &str, home: Option<&str>) -> bool {
         let home = posix_lexical(home);
         candidate == home
             || (first_glob.is_some()
-                && candidate.starts_with(&format!("{}/", home.trim_end_matches('/'))))
+                && (candidate == home
+                    || candidate.starts_with(&format!("{}/", home.trim_end_matches('/')))))
     })
 }
 
@@ -2008,6 +2031,23 @@ mod tests {
     }
 
     #[test]
+    fn string_posix_normalizer_uses_shared_lexical_contract() {
+        assert_eq!(
+            posix_lexical("/tmp/../etc//apt/./sources.list"),
+            "/etc/apt/sources.list"
+        );
+        assert_eq!(posix_lexical("/../../etc/passwd"), "/etc/passwd");
+        assert_eq!(posix_lexical("var/log/../etc"), "/var/etc");
+
+        // This helper has an explicitly POSIX grammar even on Windows hosts;
+        // a Windows-shaped token remains one literal POSIX component.
+        assert_eq!(
+            posix_lexical(r"C:\Windows\System32"),
+            r"/C:\Windows\System32"
+        );
+    }
+
+    #[test]
     fn cheap_check_analyzes_background_groups_and_command_substitutions() {
         for input in [
             "echo ready & rm -rf /",
@@ -2045,6 +2085,33 @@ mod tests {
                 "shell-specific group/substitution escaped: {input} -> {findings:?}"
             );
         }
+    }
+
+    #[test]
+    fn cheap_check_retains_executable_scan_budget_exhaustion() {
+        let exact = format!("{}echo $(rm -rf /)", "true;".repeat(254));
+        let exact_findings = cheap_check(&exact, ShellType::Posix, &empty_env());
+        assert!(
+            exact_findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+            "the exact-cap body must remain visible: {exact_findings:?}"
+        );
+        assert!(
+            exact_findings
+                .iter()
+                .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+            "the exact-cap control must remain complete: {exact_findings:?}"
+        );
+
+        let plus_one = format!("{}echo $(rm -rf /)", "true;".repeat(255));
+        let findings = cheap_check(&plus_one, ShellType::Posix, &empty_env());
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }),
+            "the executable-substitution work gap must fail closed: {findings:?}"
+        );
     }
 
     #[test]

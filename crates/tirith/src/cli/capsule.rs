@@ -181,6 +181,16 @@ impl DegradedPolicy {
 /// asserts the same contract, so a future enforcing surface that mis-wires its
 /// policy is caught in tests rather than silently running an attacker's code
 /// uncontained.
+///
+/// C12 extends the same contract to the task gate: a surface holding an
+/// enforcing task decision must never reach a degraded run, or a decision that
+/// TIGHTENED the capsule (`task_boundary::tighten_capsule_spec`) would be
+/// satisfied by no capsule at all. That holds structurally today, because
+/// `pkg install` launches through `run_to_completion_bound_inputs` (whose API
+/// has no degraded mode) and `tirith run` passes `FailClosed`; the source scan
+/// `only_the_declared_best_effort_surfaces_name_the_degraded_policy` in
+/// `crates/tirith/tests/owned_boundary_enforcement.rs` keeps a future surface
+/// from quietly joining the list.
 fn assert_degraded_run_is_permitted(policy: DegradedPolicy) {
     debug_assert!(
         !policy.is_enforcing(),
@@ -207,6 +217,13 @@ pub struct CapsuleOutcome {
     /// ordinary exit status. Keeping this on the successful outcome prevents a
     /// wall/output kill from being misreported as a pre-exec refusal.
     pub termination: Option<CapsuleTermination>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// Whether this launch PROVED the launcher's temporary HOME was removed.
+    /// `None` means the launch path did not observe it, which a consumer must
+    /// treat as unproven rather than as success: the temporary HOME holds
+    /// whatever the contained child wrote to `$HOME`, so a receipt that claims it
+    /// is gone has to have watched it go.
+    pub ephemeral_home_cleanup_confirmed: Option<bool>,
 }
 
 /// Why a target that definitely started was terminated by the parent-owned
@@ -364,7 +381,7 @@ pub enum BoundOutputPresentation {
 /// non-recursive unlink relative to the held parent after an identity check.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
-struct HeldEphemeralDirectory {
+pub(super) struct HeldEphemeralDirectory {
     guard: Option<tempfile::TempDir>,
     handle: std::fs::File,
     parent: std::fs::File,
@@ -375,7 +392,7 @@ struct HeldEphemeralDirectory {
 
 #[cfg(target_os = "linux")]
 impl HeldEphemeralDirectory {
-    fn from_tempdir(
+    pub(super) fn from_tempdir(
         guard: tempfile::TempDir,
         backend_id: &'static str,
         label: &str,
@@ -506,14 +523,14 @@ impl HeldEphemeralDirectory {
         }
     }
 
-    fn path(&self) -> &std::path::Path {
+    pub(super) fn path(&self) -> &std::path::Path {
         self.guard
             .as_ref()
             .expect("held ephemeral directory is not used after preservation")
             .path()
     }
 
-    fn handle(&self) -> &std::fs::File {
+    pub(super) fn handle(&self) -> &std::fs::File {
         &self.handle
     }
 
@@ -523,7 +540,7 @@ impl HeldEphemeralDirectory {
         remove_owned_directory_contents(self.handle.as_raw_fd())
     }
 
-    fn visible_root_matches_held_identity(&self) -> std::io::Result<bool> {
+    pub(super) fn visible_root_matches_held_identity(&self) -> std::io::Result<bool> {
         use std::os::fd::AsRawFd as _;
 
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -545,13 +562,13 @@ impl HeldEphemeralDirectory {
             && stat.st_ino == self.inode)
     }
 
-    fn preserve(mut self) {
+    pub(super) fn preserve(mut self) {
         if let Some(guard) = self.guard.take() {
             let _ = guard.keep();
         }
     }
 
-    fn cleanup_with_hook<F>(&mut self, after_identity_check: F) -> std::io::Result<()>
+    pub(super) fn cleanup_with_hook<F>(&mut self, after_identity_check: F) -> std::io::Result<()>
     where
         F: FnOnce(),
     {
@@ -836,6 +853,53 @@ struct CleanupFrame {
 /// attack. Directory streams themselves are never retained across descent.
 #[cfg(target_os = "linux")]
 const CLEANUP_MAX_DEPTH: usize = 16_384;
+/// Bound total destructive work independently of directory depth. A hostile
+/// capsule can cheaply create enormous zero-byte fanout, so cleanup must return
+/// an honest residue error instead of extending the capsule indefinitely.
+#[cfg(target_os = "linux")]
+const CLEANUP_MAX_ENTRIES: usize = 100_000;
+#[cfg(target_os = "linux")]
+const CLEANUP_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(target_os = "linux")]
+struct CleanupBudget {
+    entries_seen: usize,
+    max_entries: usize,
+    deadline: std::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl CleanupBudget {
+    fn new(max_entries: usize, duration: std::time::Duration) -> Self {
+        Self {
+            entries_seen: 0,
+            max_entries,
+            deadline: std::time::Instant::now() + duration,
+        }
+    }
+
+    fn check_deadline(&self) -> std::io::Result<()> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "cleanup exceeded its time budget; preserving unremoved residue",
+            ));
+        }
+        Ok(())
+    }
+
+    fn observe_entry(&mut self) -> std::io::Result<()> {
+        self.check_deadline()?;
+        if self.entries_seen >= self.max_entries {
+            return Err(std::io::Error::other(format!(
+                "cleanup exceeds the {0}-entry resource limit; preserving unremoved residue",
+                self.max_entries
+            )));
+        }
+        self.entries_seen += 1;
+        Ok(())
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn push_cleanup_frame(
@@ -868,6 +932,19 @@ fn remove_owned_directory_contents_with_hook<F>(
 where
     F: FnMut(i32, &std::ffi::CStr, bool),
 {
+    let mut budget = CleanupBudget::new(CLEANUP_MAX_ENTRIES, CLEANUP_MAX_DURATION);
+    remove_owned_directory_contents_with_hook_and_budget(directory_fd, hook, &mut budget)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owned_directory_contents_with_hook_and_budget<F>(
+    directory_fd: i32,
+    hook: &mut F,
+    budget: &mut CleanupBudget,
+) -> std::io::Result<()>
+where
+    F: FnMut(i32, &std::ffi::CStr, bool),
+{
     use std::os::fd::AsRawFd as _;
 
     if unsafe { libc::fchmod(directory_fd, 0o700) } != 0 {
@@ -882,6 +959,7 @@ where
     let mut frames = Vec::<CleanupFrame>::new();
 
     loop {
+        budget.check_deadline()?;
         let observed_current = cleanup_fd_identity(current.as_raw_fd())?;
         if observed_current != current_identity
             || observed_current.file_type != libc::S_IFDIR
@@ -985,6 +1063,8 @@ where
                 }
             }
         };
+
+        budget.observe_entry()?;
 
         let handle = open_cleanup_entry(current.as_raw_fd(), observed.name.as_c_str())?;
         let identity = cleanup_fd_identity(handle.as_raw_fd())?;
@@ -1109,20 +1189,31 @@ fn open_cleanup_parent(directory_fd: i32) -> std::io::Result<std::os::fd::OwnedF
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: fstat initialized the structure on success.
-    let stat = unsafe { stat.assume_init() };
+const CLEANUP_STATX_TYPE: u32 = 0x0001;
+#[cfg(target_os = "linux")]
+const CLEANUP_STATX_INO: u32 = 0x0100;
+#[cfg(target_os = "linux")]
+const CLEANUP_STATX_MNT_ID: u32 = 0x1000;
+#[cfg(target_os = "linux")]
+const CLEANUP_STATX_REQUIRED: u32 = CLEANUP_STATX_TYPE | CLEANUP_STATX_INO | CLEANUP_STATX_MNT_ID;
+
+#[cfg(target_os = "linux")]
+struct CleanupStatxEvidence {
+    mask: u32,
+    inode: u64,
+    file_type: libc::mode_t,
+    mount_id: u64,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn cleanup_fd_statx(fd: i32) -> std::io::Result<CleanupStatxEvidence> {
     let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
     if unsafe {
         libc::statx(
             fd,
             c"".as_ptr(),
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID,
+            CLEANUP_STATX_REQUIRED,
             statx.as_mut_ptr(),
         )
     } != 0
@@ -1131,10 +1222,97 @@ fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
     }
     // SAFETY: statx initialized the structure on success.
     let statx = unsafe { statx.assume_init() };
-    let required = libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID;
-    if statx.stx_mask & required != required
-        || statx.stx_ino != stat.st_ino
-        || (statx.stx_mode as libc::mode_t) & libc::S_IFMT != stat.st_mode & libc::S_IFMT
+    Ok(CleanupStatxEvidence {
+        mask: statx.stx_mask,
+        inode: statx.stx_ino,
+        file_type: (statx.stx_mode as libc::mode_t) & libc::S_IFMT,
+        mount_id: statx.stx_mnt_id,
+    })
+}
+
+/// Linux's stable 256-byte `struct statx` UAPI layout.
+///
+/// libc 0.2 intentionally hides its musl statx bindings unless callers opt in
+/// to an unstable, global musl-version cfg. The kernel interface itself is
+/// architecture-stable. Keep a private output-only layout for the musl release
+/// target so cleanup retains exact mount-ID evidence instead of weakening to
+/// `st_dev` (which cannot distinguish same-device bind mounts). Any unsupported
+/// syscall or missing result bit propagates as a fail-closed cleanup error.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[repr(C)]
+struct CleanupKernelStatx {
+    stx_mask: u32,
+    _stx_blksize: u32,
+    _stx_attributes: u64,
+    _stx_nlink: u32,
+    _stx_uid: u32,
+    _stx_gid: u32,
+    stx_mode: u16,
+    _stx_pad1: u16,
+    stx_ino: u64,
+    _stx_size: u64,
+    _stx_blocks: u64,
+    _stx_attributes_mask: u64,
+    _stx_timestamps: [u8; 64],
+    _stx_rdev_major: u32,
+    _stx_rdev_minor: u32,
+    _stx_dev_major: u32,
+    _stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    _stx_dio_mem_align: u32,
+    _stx_dio_offset_align: u32,
+    _stx_spare: [u64; 12],
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 256] = [(); std::mem::size_of::<CleanupKernelStatx>()];
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 0] = [(); std::mem::offset_of!(CleanupKernelStatx, stx_mask)];
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 28] = [(); std::mem::offset_of!(CleanupKernelStatx, stx_mode)];
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 32] = [(); std::mem::offset_of!(CleanupKernelStatx, stx_ino)];
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 144] = [(); std::mem::offset_of!(CleanupKernelStatx, stx_mnt_id)];
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn cleanup_fd_statx(fd: i32) -> std::io::Result<CleanupStatxEvidence> {
+    let mut statx = std::mem::MaybeUninit::<CleanupKernelStatx>::zeroed();
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            fd as libc::c_long,
+            c"".as_ptr(),
+            (libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) as libc::c_long,
+            CLEANUP_STATX_REQUIRED as libc::c_long,
+            statx.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful statx syscall initialized the complete UAPI buffer.
+    let statx = unsafe { statx.assume_init() };
+    Ok(CleanupStatxEvidence {
+        mask: statx.stx_mask,
+        inode: statx.stx_ino,
+        file_type: (statx.stx_mode as libc::mode_t) & libc::S_IFMT,
+        mount_id: statx.stx_mnt_id,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the structure on success.
+    let stat = unsafe { stat.assume_init() };
+    let statx = cleanup_fd_statx(fd)?;
+    if statx.mask & CLEANUP_STATX_REQUIRED != CLEANUP_STATX_REQUIRED
+        || statx.inode != stat.st_ino
+        || statx.file_type != stat.st_mode & libc::S_IFMT
     {
         return Err(std::io::Error::other(
             "cleanup descriptor identity lacks exact inode/type/mount evidence",
@@ -1144,7 +1322,7 @@ fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
         device: stat.st_dev,
         inode: stat.st_ino,
         file_type: stat.st_mode & libc::S_IFMT,
-        mount_id: statx.stx_mnt_id,
+        mount_id: statx.mount_id,
     })
 }
 
@@ -1156,7 +1334,12 @@ fn cleanup_fd_link_count(fd: i32) -> std::io::Result<u64> {
     }
     // SAFETY: fstat initialized the structure on success.
     let stat = unsafe { stat.assume_init() };
-    Ok(stat.st_nlink)
+    // libc exposes nlink_t as u64 on x86_64 Linux and u32 on aarch64 Linux.
+    // Normalize with a lossless widening conversion so both shipped GNU
+    // targets enforce the same link-count invariant.
+    #[allow(clippy::useless_conversion)]
+    let link_count = stat.st_nlink.into();
+    Ok(link_count)
 }
 
 #[cfg(target_os = "linux")]
@@ -1690,7 +1873,7 @@ pub fn select_backend(spec: &CapsuleSpec) -> SelectedBackend {
 
 /// Build a secret-free description of the coverage shortfall (which required flags
 /// the backend could not deliver), for a fail-closed refusal message.
-fn shortfall_reason(backend_id: &str, sel: &SelectedBackend) -> String {
+pub(super) fn shortfall_reason(backend_id: &str, sel: &SelectedBackend) -> String {
     let c = &sel.coverage;
     let r = &sel.required;
     let mut missing: Vec<&str> = Vec::new();
@@ -1727,6 +1910,48 @@ fn shortfall_reason(backend_id: &str, sel: &SelectedBackend) -> String {
             missing.join(", ")
         }
     )
+}
+
+/// Prove, BEFORE anything is copied or spawned, that this host can deliver every
+/// control `spec` requires under the inherited-stdio [`run_to_completion_os`]
+/// shape.
+///
+/// C14's `capsule run --preset untrusted-project` needs this because it does
+/// real work (copying an untrusted project into a held ephemeral directory)
+/// before it can launch, and a preset that copies first and refuses second would
+/// leave the operator's disk holding a copy of an attacker's repository for no
+/// reason.
+///
+/// It calls the SAME reconciler the launch itself calls
+/// ([`supervised_stdin_plan`]), which strips `max_output_bytes` and
+/// `wall_clock_seconds` from the backend request because no OS backend enforces
+/// them, re-selects, refuses on any shortfall, and only then re-raises the
+/// aggregate resource bit because the PARENT owns those two dimensions. A
+/// hand-rolled second probe would be free to disagree with it, and the direction
+/// it would disagree in is over-reporting.
+///
+/// Every non-Linux host refuses: the parent-owned wall-clock and combined-output
+/// supervisor is `#[cfg(target_os = "linux")]`, so those two dimensions cannot be
+/// enforced anywhere else however capable the OS backend is.
+pub(super) fn preflight_run_to_completion(spec: &CapsuleSpec) -> Result<(), CapsuleRefused> {
+    #[cfg(target_os = "linux")]
+    {
+        supervised_stdin_plan(spec, 0).map(|_plan| ())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let selected = select_backend(spec);
+        Err(CapsuleRefused {
+            backend_id: selected.backend_id,
+            reason: format!(
+                "{}; additionally the parent-owned wall-clock and combined-output supervisor \
+                 this preset requires is implemented only on Linux, so max_output_bytes and \
+                 wall_clock_seconds cannot be enforced on this platform",
+                shortfall_reason(selected.backend_id, &selected)
+            ),
+        })
+    }
 }
 
 /// Run a contained child with its working directory bound to an already-open,
@@ -1928,6 +2153,7 @@ fn linux_run_to_completion_bound_directory_supervised(
         proof.take_child_fds(),
         Some(bound_directory),
         None,
+        None,
     )?;
     for (name, value) in extra_env {
         command.env(name, value);
@@ -2021,6 +2247,7 @@ fn linux_run_to_completion_bound_directory_supervised(
                 coverage: achieved,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             &output.stdout,
             &output.stderr,
@@ -2369,6 +2596,7 @@ pub fn run_to_completion_bound_inputs(
                 target: bound_target_directory,
                 target_visible_root,
             }),
+            None,
         )?;
         for (name, value) in extra_env {
             command.env(name, value);
@@ -2501,6 +2729,7 @@ pub fn run_to_completion_bound_inputs(
                     coverage: achieved,
                     degraded: false,
                     termination: None,
+                    ephemeral_home_cleanup_confirmed: None,
                 },
                 &output.stdout,
                 &output.stderr,
@@ -3525,6 +3754,7 @@ fn run_to_completion_with_stdin_captured(
             vec![coverage_child],
             None,
             None,
+            None,
         )?;
         if let Some(directory) = cwd {
             command.current_dir(directory);
@@ -3676,6 +3906,7 @@ fn run_to_completion_with_stdin_captured(
                 coverage: achieved,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             stdout: supervised.stdout,
             stderr: supervised.stderr,
@@ -3786,6 +4017,7 @@ fn run_to_completion_with_reviewed_file_captured(
             Some(launch_arm.launch_ack_fd().as_raw_fd()),
             Some(coverage_fd),
             vec![coverage_child],
+            None,
             None,
             None,
         )?;
@@ -3933,6 +4165,7 @@ fn run_to_completion_with_reviewed_file_captured(
                 coverage: achieved,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             stdout: supervised.stdout,
             stderr: supervised.stderr,
@@ -4504,6 +4737,7 @@ fn terminated_outcome(
         coverage,
         degraded: false,
         termination: Some(termination),
+        ephemeral_home_cleanup_confirmed: None,
     }
 }
 
@@ -4556,6 +4790,7 @@ pub(crate) fn test_suppress_bound_child_output(stdout: &[u8], stderr: &[u8]) -> 
             coverage: CapsuleCoverage::NONE,
             degraded: false,
             termination: None,
+            ephemeral_home_cleanup_confirmed: None,
         },
         stdout,
         stderr,
@@ -4595,7 +4830,61 @@ fn forward_bounded_child_output(
     outcome
 }
 
+/// A parent-held directory capability that becomes the contained child's working
+/// directory AND its single writable grant, both derived from the DESCRIPTOR.
+///
+/// The alternative is to hand the launcher a pathname and let it `chdir` and
+/// `PathFd::new` that name again. Both of those are fresh resolutions, so a
+/// same-UID process that renames the directory and drops a symlink in its place
+/// after the parent's identity check redirects the write grant to whatever the
+/// symlink points at. Passing the descriptor removes the resolutions instead of
+/// racing them.
 #[cfg(target_os = "linux")]
+pub struct BoundWorkDirectory<'a> {
+    /// The retained directory capability. The caller keeps it open across the
+    /// whole launch.
+    pub handle: &'a std::fs::File,
+    /// The canonical pathname the descriptor was opened from. Diagnostic only:
+    /// the launcher proves it still identifies the descriptor and refuses if it
+    /// does not, but authority comes from the descriptor either way.
+    pub canonical_root: &'a std::path::Path,
+}
+
+/// Run a contained child whose working directory and only writable grant are one
+/// parent-held directory capability. There is no degraded or uncontained
+/// fallback: a launch shape that exists to bind authority to a descriptor cannot
+/// have a mode that drops the binding.
+#[cfg(target_os = "linux")]
+pub fn run_to_completion_bound_work_directory(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    work: BoundWorkDirectory<'_>,
+    extra_env: &[(String, String)],
+    degraded: DegradedPolicy,
+    output_presentation: BoundOutputPresentation,
+) -> Result<CapsuleOutcome, CapsuleRefused> {
+    if degraded != DegradedPolicy::FailClosed {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "a descriptor-bound working directory never permits degraded execution"
+                .to_string(),
+        });
+    }
+    linux_run_to_completion_supervised(
+        spec,
+        program,
+        args,
+        None,
+        extra_env,
+        degraded,
+        Some(work),
+        output_presentation,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn linux_run_to_completion_supervised(
     spec: &CapsuleSpec,
     program: &OsStr,
@@ -4603,20 +4892,112 @@ fn linux_run_to_completion_supervised(
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
     degraded: DegradedPolicy,
+    work: Option<BoundWorkDirectory<'_>>,
+    output_presentation: BoundOutputPresentation,
+) -> Result<CapsuleOutcome, CapsuleRefused> {
+    // The launch owns the temporary HOME, so the launch is what can prove it was
+    // removed. Holding it here rather than inside the body means there is exactly
+    // one release point to observe, whatever path the body returned through.
+    let mut temp_home: Option<HeldTempHome> = None;
+    let outcome = linux_supervised_launch(
+        spec,
+        program,
+        args,
+        cwd,
+        extra_env,
+        degraded,
+        work,
+        output_presentation,
+        &mut temp_home,
+    );
+    let home_confirmed = confirm_temp_home_cleanup(&mut temp_home, spec.environment.temporary_home);
+    outcome.map(|mut outcome| {
+        outcome.ephemeral_home_cleanup_confirmed = Some(home_confirmed);
+        outcome
+    })
+}
+
+/// Remove the launcher's temporary HOME and report whether it was PROVEN gone.
+///
+/// A home that was deliberately PRESERVED (because the contained process tree
+/// could not be proven dead, so releasing its HOME would hand a live descendant a
+/// directory the parent no longer tracks) is not proven gone either, and reports
+/// false. `requested` false means the spec asked for no temporary HOME at all, so
+/// there is nothing outstanding.
+#[cfg(target_os = "linux")]
+fn confirm_temp_home_cleanup(temp_home: &mut Option<HeldTempHome>, requested: bool) -> bool {
+    match temp_home.take() {
+        Some(mut home) => match home.directory.cleanup_with_hook(|| {}) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("tirith capsule: the launcher temporary HOME was preserved: {error}");
+                home.directory.preserve();
+                false
+            }
+        },
+        None => !requested,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "linux")]
+fn linux_supervised_launch(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+    degraded: DegradedPolicy,
+    work: Option<BoundWorkDirectory<'_>>,
+    output_presentation: BoundOutputPresentation,
+    temp_home: &mut Option<HeldTempHome>,
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
+    if work.is_some() && cwd.is_some() {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "a descriptor-bound working directory replaces the pathname cwd; supplying \
+                     both would reintroduce the pathname resolution it removes"
+                .to_string(),
+        });
+    }
     let mut launch_spec = spec.clone();
-    let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
+    let bound_work = match work.as_ref() {
+        Some(work) => Some(reserve_bound_work_directory(&mut launch_spec, work)?),
+        None => None,
+    };
+    *temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
     let mut proof = LinuxLaunchProof::create(&mut launch_spec)?;
     let plan = match supervised_stdin_plan(&launch_spec, 0) {
         Ok(plan) => plan,
-        Err(_error) if degraded == DegradedPolicy::AllowDegraded => {
+        Err(_error) if degraded == DegradedPolicy::AllowDegraded && work.is_none() => {
             assert_degraded_run_is_permitted(degraded);
             let selected = select_backend(spec);
             return uncontained_run_os(program, args, cwd, extra_env, &selected, true);
         }
         Err(error) => return Err(error),
     };
+    if let Some(work) = work.as_ref() {
+        // The canonical plan must grant exactly this root once, and as a WRITE
+        // root: that is the grant the launcher will source from the descriptor,
+        // and `apply_containment_with_bound_root_sets` refuses if the canonical
+        // policy has drifted from it.
+        let write_grants = plan
+            .backend_spec
+            .filesystem
+            .write_roots
+            .iter()
+            .filter(|root| root.as_path() == work.canonical_root)
+            .count();
+        if write_grants != 1 {
+            return Err(CapsuleRefused {
+                backend_id: plan.backend_selected.backend_id,
+                reason: format!(
+                    "descriptor-bound working directory must be one exact canonical write grant (found {write_grants})"
+                ),
+            });
+        }
+    }
     let status_fd = proof.status_fd;
     let ack_fd = proof.ack_fd;
     let coverage_fd = proof.coverage_fd;
@@ -4636,6 +5017,7 @@ fn linux_run_to_completion_supervised(
         proof.take_child_fds(),
         None,
         None,
+        bound_work,
     )?;
     if let Some(directory) = cwd {
         command.current_dir(directory);
@@ -4654,7 +5036,7 @@ fn linux_run_to_completion_supervised(
     let child_pid = child.id();
     let Some(deadline) = launch_started.checked_add(plan.limits.timeout) else {
         let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
         return Err(CapsuleRefused {
             backend_id: plan.backend_selected.backend_id,
             reason: format!(
@@ -4666,7 +5048,7 @@ fn linux_run_to_completion_supervised(
         Ok(coverage) => coverage,
         Err(reason) => {
             let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
             return Err(CapsuleRefused {
                 backend_id: plan.backend_selected.backend_id,
                 reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
@@ -4675,7 +5057,7 @@ fn linux_run_to_completion_supervised(
     };
     if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
         let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
         return Err(CapsuleRefused {
             backend_id: plan.backend_selected.backend_id,
             reason: format!(
@@ -4687,7 +5069,7 @@ fn linux_run_to_completion_supervised(
         Ok(()) => {}
         Err(TargetExecConfirmationError::BeforeAck(reason)) => {
             let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
             return Err(CapsuleRefused {
                 backend_id: plan.backend_selected.backend_id,
                 reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
@@ -4695,7 +5077,7 @@ fn linux_run_to_completion_supervised(
         }
         Err(TargetExecConfirmationError::AfterAck(reason)) => {
             let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+            preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
             return Ok(terminated_outcome(
                 plan.backend_selected.backend_id,
                 achieved,
@@ -4709,7 +5091,7 @@ fn linux_run_to_completion_supervised(
     remaining.timeout = deadline.saturating_duration_since(Instant::now());
     if remaining.timeout.is_zero() {
         let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
+        preserve_temp_home_on_unconfirmed_cleanup(temp_home, cleanup);
         let termination = CapsuleTermination {
             kind: if cleanup {
                 CapsuleTerminationKind::WallClock
@@ -4727,7 +5109,7 @@ fn linux_run_to_completion_supervised(
             termination,
         ));
     }
-    match supervise_inherited_stdin_child(child, remaining, &mut temp_home) {
+    match supervise_inherited_stdin_child(child, remaining, temp_home) {
         Ok(output) => Ok(forward_bounded_child_output(
             CapsuleOutcome {
                 exit_code: output.status.code().unwrap_or(128),
@@ -4735,10 +5117,11 @@ fn linux_run_to_completion_supervised(
                 coverage: achieved,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             &output.stdout,
             &output.stderr,
-            BoundOutputPresentation::ForwardSanitized,
+            output_presentation,
         )),
         Err(reason) => {
             let termination = supervision_termination(reason);
@@ -4771,7 +5154,16 @@ pub fn run_to_completion_os(
 ) -> Result<CapsuleOutcome, CapsuleRefused> {
     #[cfg(target_os = "linux")]
     {
-        linux_run_to_completion_supervised(spec, program, args, cwd, extra_env, degraded)
+        linux_run_to_completion_supervised(
+            spec,
+            program,
+            args,
+            cwd,
+            extra_env,
+            degraded,
+            None,
+            BoundOutputPresentation::ForwardSanitized,
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -4833,6 +5225,7 @@ pub fn run_to_completion_os(
                 coverage: sel.coverage,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             })
         }
     }
@@ -4866,6 +5259,7 @@ fn uncontained_run_os(
         coverage: sel.coverage,
         degraded,
         termination: None,
+        ephemeral_home_cleanup_confirmed: None,
     })
 }
 
@@ -5071,6 +5465,7 @@ fn linux_spawn_piped_supervised(
         Some(proof.ack_fd),
         Some(proof.coverage_fd),
         proof.take_child_fds(),
+        None,
         None,
         None,
     )?;
@@ -5346,6 +5741,7 @@ fn linux_contained_command_os(
         Vec::new(),
         None,
         None,
+        None,
     )?;
     prepared.temp_home = temp_home;
     Ok(prepared)
@@ -5371,6 +5767,7 @@ fn linux_contained_command_os_with_options(
     extra_bound_fds: Vec<BoundTargetFd>,
     bound_directory: Option<BoundDirectoryFd>,
     bound_inputs: Option<BoundInputLaunch>,
+    bound_work_directory: Option<BoundDirectoryFd>,
 ) -> Result<PreparedContainedCommand, CapsuleRefused> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     if launch_status_fd.is_some() || launch_ack_fd.is_some() {
@@ -5436,6 +5833,12 @@ fn linux_contained_command_os_with_options(
             .arg("--cwd-root")
             .arg(&directory.original_root);
     }
+    if let Some(directory) = bound_work_directory.as_ref() {
+        cmd.arg("--work-fd")
+            .arg(directory.inherited.to_string())
+            .arg("--work-root")
+            .arg(&directory.original_root);
+    }
     if let Some(bound) = bound_inputs.as_ref() {
         cmd.arg("--staging-fd")
             .arg(bound.staging.inherited.to_string())
@@ -5478,6 +5881,12 @@ fn linux_contained_command_os_with_options(
                 }
             }
             if let Some(directory) = bound_directory.as_ref() {
+                let _keep_destination_reserved = (&directory._reservation, &directory._blockers);
+                if libc::fcntl(directory.inherited, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if let Some(directory) = bound_work_directory.as_ref() {
                 let _keep_destination_reserved = (&directory._reservation, &directory._blockers);
                 if libc::fcntl(directory.inherited, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -5583,6 +5992,57 @@ fn reserve_bound_target_fd(
             _blockers: blockers,
         });
     }
+}
+
+/// Reserve the inheritable slot for a descriptor-bound working directory and add
+/// it to the handle allow-list, after proving the pathname still identifies the
+/// descriptor.
+///
+/// The pathname check is not the security boundary (the descriptor is); it is
+/// what turns a swapped visible root into a refusal here rather than a confusing
+/// grant mismatch inside the launcher.
+#[cfg(target_os = "linux")]
+fn reserve_bound_work_directory(
+    launch_spec: &mut CapsuleSpec,
+    work: &BoundWorkDirectory<'_>,
+) -> Result<BoundDirectoryFd, CapsuleRefused> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !work.canonical_root.is_absolute() {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "descriptor-bound working directory needs an absolute canonical root"
+                .to_string(),
+        });
+    }
+    let visible =
+        std::fs::symlink_metadata(work.canonical_root).map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("inspect the descriptor-bound working directory: {error}"),
+        })?;
+    let held = work.handle.metadata().map_err(|error| CapsuleRefused {
+        backend_id: "landlock-seccomp",
+        reason: format!("inspect the descriptor-bound working directory capability: {error}"),
+    })?;
+    if !visible.is_dir()
+        || !held.is_dir()
+        || visible.dev() != held.dev()
+        || visible.ino() != held.ino()
+    {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "the descriptor-bound working directory pathname no longer identifies its \
+                     retained capability"
+                .to_string(),
+        });
+    }
+    let bound = reserve_bound_directory_fd(
+        launch_spec,
+        std::os::fd::AsRawFd::as_raw_fd(work.handle),
+        work.canonical_root,
+    )?;
+    launch_spec.handles.extra_unix_fds.push(bound.inherited);
+    Ok(bound)
 }
 
 #[cfg(target_os = "linux")]
@@ -5785,22 +6245,22 @@ fn macos_contained_command_os(
     // scrub — otherwise the Seatbelt profile (deny default) blocks the child's
     // own temp directory.
     let mut spec_owned;
-    let mut macos_temp_home: Option<tempfile::TempDir> = None;
+    let mut macos_temp_home: Option<std::path::PathBuf> = None;
     let spec = if spec.environment.temporary_home {
         spec_owned = spec.clone();
-        let temp_home = tempfile::Builder::new()
+        let temp_home_path = tempfile::Builder::new()
             .prefix("tirith-capsule-")
             .tempdir()
             .map_err(|e| CapsuleRefused {
                 backend_id: sel.backend_id,
                 reason: format!("cannot create capsule temporary home: {e}"),
-            })?;
-        let temp_home_path = temp_home.path().to_path_buf();
+            })?
+            .keep();
         spec_owned
             .filesystem
             .write_roots
             .push(temp_home_path.clone());
-        macos_temp_home = Some(temp_home);
+        macos_temp_home = Some(temp_home_path);
         &spec_owned
     } else {
         spec
@@ -5837,12 +6297,10 @@ fn macos_contained_command_os(
     // temporary HOME cannot be created for a `temporary_home` spec: skipping it
     // would leave the real `$HOME` reachable (env_clear already ran, but
     // `getpwuid()->pw_dir` still resolves it) while `env_isolated` claims true.
-    let env_result = match macos_temp_home.as_ref() {
-        Some(home) => {
-            let home = home.path().to_path_buf();
-            apply_macos_env_with_source(&mut cmd, spec, exact_env, move || Ok(home))
-        }
-        None => apply_macos_env_from(&mut cmd, spec, exact_env),
+    let env_result = match (exact_env, macos_temp_home) {
+        (Some(environment), _) => apply_macos_env_from(&mut cmd, spec, Some(environment)),
+        (None, Some(home)) => apply_macos_env_with_home(&mut cmd, spec, home),
+        (None, None) => apply_macos_env(&mut cmd, spec),
     };
     env_result.map_err(|reason| CapsuleRefused {
         backend_id: sel.backend_id,
@@ -5850,8 +6308,37 @@ fn macos_contained_command_os(
     })?;
     Ok(PreparedContainedCommand {
         command: cmd,
-        temp_home: macos_temp_home,
+        temp_home: None,
     })
+}
+
+/// Apply the env policy to a macOS `Command`: clear the environment, re-add the
+/// surviving variable names from the current process, then (when `temporary_home`)
+/// repoint HOME/TMPDIR/XDG_* at a fresh temp directory. The temp dir intentionally
+/// leaks for the child's lifetime (matching the Linux launcher).
+///
+/// **Fails closed** when `temporary_home` is set but the temporary directory cannot
+/// be created: returning `Err` here propagates to a [`CapsuleRefused`] so the launch
+/// is refused rather than running with the real `$HOME` reachable. `env_clear`
+/// alone is NOT enough to hide the home directory, because macOS `getpwuid()` (used
+/// by libc / the shell to resolve `~`) reads `pw_dir` from the password database,
+/// not the environment; only repointing HOME/TMPDIR/XDG_* at a fresh dir isolates
+/// the child. Skipping the repoint while still reporting `env_isolated = true` would
+/// be a silent over-report (the gap the Linux launcher fails closed on too).
+#[cfg(target_os = "macos")]
+fn apply_macos_env(cmd: &mut Command, spec: &CapsuleSpec) -> Result<(), String> {
+    apply_macos_env_from(cmd, spec, None)
+}
+
+/// repo-0198: variant taking an already-created temp home (shared with the
+/// Seatbelt write roots so the profile grants what the env points at).
+#[cfg(target_os = "macos")]
+fn apply_macos_env_with_home(
+    cmd: &mut Command,
+    spec: &CapsuleSpec,
+    home: std::path::PathBuf,
+) -> Result<(), String> {
+    apply_macos_env_with_source(cmd, spec, None, move || Ok(home))
 }
 
 #[cfg(target_os = "macos")]
@@ -5875,7 +6362,7 @@ fn apply_macos_env_from(
 /// `make_temp_home` so the fail-closed propagation is deterministically testable
 /// (a test can pass a factory that returns `Err` without mutating the process-wide
 /// `TMPDIR`, which would race other tests). Production passes the real tempfile
-/// factory via [`apply_macos_env_from`].
+/// factory via [`apply_macos_env`].
 #[cfg(all(target_os = "macos", test))]
 fn apply_macos_env_with<F>(
     cmd: &mut Command,
@@ -5908,7 +6395,26 @@ where
     // The same pure decision the Linux launcher uses (`EnvironmentPolicy`'s own
     // `surviving_vars`): start from the allow-list (or the parent set when
     // `inherit`), then drop every sensitive name.
-    let survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    let mut survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    if policy.deny_sensitive {
+        survivors.retain(|name| {
+            let sensitive = match exact_env {
+                Some(environment) => environment
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .is_some_and(|(_, value)| !policy.assignment_survives(name, value)),
+                None => std::env::var_os(name).is_some_and(|value| {
+                    value
+                        .to_str()
+                        .map(|value| !policy.assignment_survives(name, value))
+                        .unwrap_or_else(|| {
+                            tirith_core::sensitive_assets::is_registered_env_name(name)
+                        })
+                }),
+            };
+            !sensitive
+        });
+    }
     if survivors.iter().any(|name| name.starts_with("DYLD_")) {
         return Err(
             "macOS contained launch refuses every DYLD_* loader-control variable before the trusted capsule re-exec"
@@ -6100,6 +6606,11 @@ fn windows_run_to_completion_os(
         coverage: sel.coverage,
         degraded: false,
         termination: None,
+        // `None` means "not observed", not "confirmed gone". This launcher owns
+        // no ephemeral HOME, so it has nothing to observe, and a caller that
+        // requires proof of cleanup must treat the absence as unproven rather
+        // than as success.
+        ephemeral_home_cleanup_confirmed: None,
     })
 }
 
@@ -6248,6 +6759,23 @@ mod tests {
         entries
     }
 
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    #[test]
+    fn musl_cleanup_statx_binding_returns_exact_directory_identity() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().expect("statx fixture directory");
+        let handle = std::fs::File::open(directory.path()).expect("open fixture directory");
+        let metadata = handle.metadata().expect("fixture metadata");
+        let identity = cleanup_fd_identity(handle.as_raw_fd()).expect("musl statx evidence");
+
+        assert_eq!(identity.device, metadata.dev());
+        assert_eq!(identity.inode, metadata.ino());
+        assert_eq!(identity.file_type, libc::S_IFDIR);
+        assert_ne!(identity.mount_id, 0, "Linux mount IDs are positive");
+    }
+
     #[cfg(target_os = "linux")]
     fn linux_launch_proof_fixture() -> (LinuxLaunchProof, std::fs::File, std::fs::File) {
         use std::os::fd::FromRawFd as _;
@@ -6384,6 +6912,7 @@ mod tests {
                 coverage: CapsuleCoverage::NONE,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             forwardable.blocked,
         );
@@ -6429,6 +6958,7 @@ mod tests {
                 coverage: CapsuleCoverage::NONE,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             b"safe\x1b]52;c;Zm9yZ2Vk\x07tail",
             b"",
@@ -6457,6 +6987,7 @@ mod tests {
                 coverage: CapsuleCoverage::NONE,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             b"installed\xff\n",
             b"ordinary warning\n",
@@ -6479,6 +7010,7 @@ mod tests {
                 coverage: CapsuleCoverage::NONE,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             b"safe\x1b]52;c;Zm9yZ2Vk\x07tail",
             b"pip diagnostic",
@@ -6991,6 +7523,66 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_cleanup_preserves_residue_after_entry_budget() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().expect("cleanup root");
+        for index in 0..4 {
+            std::fs::write(root.path().join(format!("entry-{index}")), b"payload")
+                .expect("create cleanup entry");
+        }
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root.path())
+            .expect("open cleanup root");
+        let mut budget = CleanupBudget::new(2, std::time::Duration::from_secs(1));
+        let error = remove_owned_directory_contents_with_hook_and_budget(
+            handle.as_raw_fd(),
+            &mut |_, _, _| {},
+            &mut budget,
+        )
+        .expect_err("cleanup must stop at its entry budget");
+
+        assert!(
+            error.to_string().contains("2-entry resource limit"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().next().is_some(),
+            "budget exhaustion must leave residue instead of claiming complete cleanup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_cleanup_preserves_residue_after_time_budget() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().expect("cleanup root");
+        let marker = root.path().join("marker");
+        std::fs::write(&marker, b"payload").expect("create cleanup entry");
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root.path())
+            .expect("open cleanup root");
+        let mut budget = CleanupBudget::new(100, std::time::Duration::ZERO);
+        let error = remove_owned_directory_contents_with_hook_and_budget(
+            handle.as_raw_fd(),
+            &mut |_, _, _| {},
+            &mut budget,
+        )
+        .expect_err("cleanup must stop at its deadline");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(marker.exists(), "deadline exhaustion must preserve residue");
     }
 
     #[cfg(target_os = "linux")]
@@ -7544,6 +8136,7 @@ mod tests {
                 coverage: plan.reported_selected.coverage,
                 degraded: false,
                 termination: None,
+                ephemeral_home_cleanup_confirmed: None,
             },
             stdout: output.stdout,
             stderr: output.stderr,
@@ -8250,6 +8843,7 @@ mod tests {
             coverage,
             degraded: true,
             termination: None,
+            ephemeral_home_cleanup_confirmed: None,
         };
         assert!(outcome.coverage_summary().contains("rlimits=false"));
 
@@ -8365,6 +8959,7 @@ mod tests {
             },
             degraded: false,
             termination: None,
+            ephemeral_home_cleanup_confirmed: None,
         };
         let s = outcome.coverage_summary();
         assert!(s.contains("fs_read=true"));

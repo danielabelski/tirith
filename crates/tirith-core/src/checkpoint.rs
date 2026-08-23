@@ -90,12 +90,6 @@ pub struct CheckpointListEntry {
     pub trigger_command: Option<String>,
     pub file_count: usize,
     pub total_bytes: u64,
-    /// The checkpoint omitted one or more requested entries.
-    #[serde(default)]
-    pub incomplete: bool,
-    /// First bounded omission reason, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub incomplete_reason: Option<String>,
 }
 
 /// Checkpoint configuration.
@@ -121,9 +115,6 @@ fn default_max_total_bytes() -> u64 {
 
 /// Checkpoint metadata is tiny; cap hostile files before allocating/parsing.
 const CHECKPOINT_META_MAX_BYTES: u64 = 1024 * 1024;
-/// Manifests may contain thousands of paths, but remain bounded before JSON
-/// allocation/parsing when the checkpoint store is corrupt or attacker-owned.
-const CHECKPOINT_MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 impl Default for CheckpointConfig {
     fn default() -> Self {
@@ -307,19 +298,11 @@ pub fn create_with_config(
     let mut fill = || -> Result<(), BackupError> {
         for path_str in paths {
             let path = Path::new(path_str);
-            let root_meta = match path.symlink_metadata() {
-                Ok(meta) => meta,
-                Err(e) => {
-                    capture_gaps.push(format!("cannot inspect requested path {path_str}: {e}"));
-                    continue;
-                }
-            };
-            if root_meta.file_type().is_symlink() {
-                capture_gaps.push(format!("requested symlink omitted: {path_str}"));
+            if !path.exists() {
                 continue;
             }
 
-            if root_meta.is_file() {
+            if path.is_file() {
                 match backup_file(path, &files_dir, &mut budget) {
                     Ok(entry) => {
                         total_bytes += entry.size;
@@ -331,7 +314,7 @@ pub fn create_with_config(
                     }
                     Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
                 }
-            } else if root_meta.is_dir() {
+            } else if path.is_dir() {
                 match backup_dir(path, &files_dir, &mut budget, &mut capture_gaps) {
                     Ok(entries) => {
                         for entry in entries {
@@ -345,10 +328,6 @@ pub fn create_with_config(
                     }
                     Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
                 }
-            } else {
-                capture_gaps.push(format!(
-                    "requested path is not a regular file or directory: {path_str}"
-                ));
             }
         }
         Ok(())
@@ -475,8 +454,6 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
             trigger_command: meta.trigger_command,
             file_count: meta.file_count,
             total_bytes: meta.total_bytes,
-            incomplete: meta.incomplete,
-            incomplete_reason: meta.incomplete_reason,
         });
     }
 
@@ -512,22 +489,6 @@ fn load_bound_checkpoint_meta(
         return Err("metadata id does not match its checkpoint directory".to_string());
     }
     Ok((meta, identity))
-}
-
-fn load_bound_checkpoint_manifest(
-    checkpoint_dir: &Path,
-    identity: Option<(u64, u64)>,
-) -> Result<Vec<ManifestEntry>, String> {
-    verify_checkpoint_dir_identity(checkpoint_dir, identity)?;
-    let manifest_bytes = crate::util::read_text_no_follow_capped(
-        &checkpoint_dir.join("manifest.json"),
-        CHECKPOINT_MANIFEST_MAX_BYTES,
-    )
-    .map_err(|e| format!("cannot safely read manifest.json: {e:?}"))?;
-    verify_checkpoint_dir_identity(checkpoint_dir, identity)?;
-    let manifest_str = String::from_utf8(manifest_bytes)
-        .map_err(|_| "checkpoint manifest.json is not UTF-8".to_string())?;
-    serde_json::from_str(&manifest_str).map_err(|e| format!("corrupt manifest.json: {e}"))
 }
 
 /// Validate that a checkpoint id is the canonical lowercase UUID basename that
@@ -664,11 +625,7 @@ fn reject_symlinked_checkpoint_dir(cp_dir: &Path) -> Result<(), String> {
 fn capture_checkpoint_dir_identity(cp_dir: &Path) -> Result<Option<(u64, u64)>, String> {
     use std::os::unix::fs::MetadataExt;
     match fs::symlink_metadata(cp_dir) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(Some((m.dev(), m.ino()))),
-        Ok(_) => Err(format!(
-            "checkpoint path is not a real directory: {}",
-            cp_dir.display()
-        )),
+        Ok(m) => Ok(Some((m.dev(), m.ino()))),
         Err(e) => Err(format!("cannot stat checkpoint directory: {e}")),
     }
 }
@@ -691,14 +648,7 @@ fn verify_checkpoint_dir_identity(
         use std::os::unix::fs::MetadataExt;
         if let Some((dev, ino)) = captured {
             return match fs::symlink_metadata(cp_dir) {
-                Ok(m)
-                    if m.is_dir()
-                        && !m.file_type().is_symlink()
-                        && m.dev() == dev
-                        && m.ino() == ino =>
-                {
-                    Ok(())
-                }
+                Ok(m) if m.dev() == dev && m.ino() == ino => Ok(()),
                 Ok(_) => Err(format!(
                     "checkpoint directory changed identity mid-read (possible swap): {}",
                     cp_dir.display()
@@ -994,10 +944,6 @@ pub struct RestoreReport {
     pub missing: Vec<String>,
     pub corrupt: Vec<String>,
     pub errors: Vec<(String, String)>,
-    /// The source checkpoint was created with omitted entries.
-    pub checkpoint_incomplete: bool,
-    /// First bounded omission reason recorded at capture.
-    pub checkpoint_incomplete_reason: Option<String>,
 }
 
 /// Restore files from a checkpoint, returning a per-bucket report.
@@ -1028,11 +974,33 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
     }
-    // Bind metadata and manifest to one validated physical directory. Both
-    // files are opened no-follow and capped before allocation/deserialization.
-    let (checkpoint_meta, cp_ident) = load_bound_checkpoint_meta(&cp_dir, checkpoint_id)?;
-    let manifest = load_bound_checkpoint_manifest(&cp_dir, cp_ident)?;
-    let capture_root = checkpoint_meta.capture_root.as_deref().map(PathBuf::from);
+    // The parent containment check above is LEXICAL: it confirms `cp_dir`'s parent
+    // path equals the store, but does not stop `cp_dir` ITSELF from being a symlink
+    // that redirects outside the store. Reading its manifest / restoring its files
+    // would then follow that link. Reject a symlinked checkpoint directory before
+    // any read. (`symlink_metadata` does not follow the final component.)
+    reject_symlinked_checkpoint_dir(&cp_dir)?;
+    // K3 (TOCTOU): the symlink check above is path-based, so `cp_dir` could be
+    // swapped for a symlink/another directory before the reads below. Pin its
+    // `(dev, ino)` now and re-verify before each subsequent read so a mid-call swap
+    // fails closed instead of feeding an attacker-controlled manifest/meta/blob.
+    let cp_ident = capture_checkpoint_dir_identity(&cp_dir)?;
+
+    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
+    let manifest_str = fs::read_to_string(cp_dir.join("manifest.json"))
+        .map_err(|e| format!("read manifest: {e}"))?;
+    let manifest: Vec<ManifestEntry> =
+        serde_json::from_str(&manifest_str).map_err(|e| format!("parse manifest: {e}"))?;
+
+    // F6: the capture-time root used to anchor RELATIVE manifest paths. Read from
+    // meta.json (best-effort; a missing/corrupt meta or a pre-F6 checkpoint yields
+    // None, which makes relative entries non-anchorable and therefore rejected).
+    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
+    let capture_root: Option<PathBuf> = fs::read_to_string(cp_dir.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<CheckpointMeta>(&s).ok())
+        .and_then(|m| m.capture_root)
+        .map(PathBuf::from);
 
     let files_dir = cp_dir.join("files");
     let mut report = RestoreReport {
@@ -1042,8 +1010,6 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
         missing: Vec::new(),
         corrupt: Vec::new(),
         errors: Vec::new(),
-        checkpoint_incomplete: checkpoint_meta.incomplete,
-        checkpoint_incomplete_reason: checkpoint_meta.incomplete_reason,
     };
 
     for entry in &manifest {
@@ -1083,20 +1049,17 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
         // slip UNVERIFIED bytes into the destination, breaking the "corrupt blobs
         // are recorded, never written" guarantee. The handle is rewound to 0
         // between the hash and the copy below.
-        let mut blob = match crate::util::open_read_no_follow_capped(&src, u64::MAX) {
+        let mut blob = match fs::File::open(&src) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!(
-                    "tirith: checkpoint restore: cannot safely open backup for {}: {e:?}, skipping",
+                    "tirith: checkpoint restore: cannot open backup for {}: {e}, skipping",
                     entry.original_path
                 );
                 report.corrupt.push(entry.original_path.clone());
                 continue;
             }
         };
-        // The child open above must still belong to the directory identity we
-        // pinned before reading metadata/manifest.
-        verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
 
         // Verify the backup blob's content matches the manifest SHA before
         // restoring. A mismatch means the blob was corrupted or tampered with
@@ -1269,9 +1232,31 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
     }
-    let (checkpoint_meta, cp_ident) = load_bound_checkpoint_meta(&cp_dir, checkpoint_id)?;
-    let manifest = load_bound_checkpoint_manifest(&cp_dir, cp_ident)?;
-    let capture_root = checkpoint_meta.capture_root.as_deref().map(PathBuf::from);
+    // Same symlink guard as the restore path: a symlinked `cp_dir` could redirect
+    // the manifest/file reads outside the store. Reject it before any read.
+    reject_symlinked_checkpoint_dir(&cp_dir)?;
+    // K3 (TOCTOU): mirror `restore_reported` exactly. Pin the checkpoint dir's
+    // `(dev, ino)` after the path-based symlink check and re-verify before each
+    // read so a mid-call directory swap fails closed instead of reading an
+    // attacker-controlled manifest/meta/blob.
+    let cp_ident = capture_checkpoint_dir_identity(&cp_dir)?;
+
+    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
+    let manifest_str = fs::read_to_string(cp_dir.join("manifest.json"))
+        .map_err(|e| format!("read manifest: {e}"))?;
+    let manifest: Vec<ManifestEntry> =
+        serde_json::from_str(&manifest_str).map_err(|e| format!("parse manifest: {e}"))?;
+
+    // F6: anchor RELATIVE manifest paths to the capture-time root (read from
+    // meta.json) exactly as `restore_reported` does, rather than resolving them
+    // against the caller's cwd. A missing/corrupt meta or a pre-F6 checkpoint yields
+    // None, which makes a relative entry non-anchorable (skipped below).
+    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
+    let capture_root: Option<PathBuf> = fs::read_to_string(cp_dir.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<CheckpointMeta>(&s).ok())
+        .and_then(|m| m.capture_root)
+        .map(PathBuf::from);
 
     let files_dir = cp_dir.join("files");
     let mut diffs = Vec::new();
@@ -1283,18 +1268,28 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
-        // A manifest is persisted state, not trusted input. Validate both
-        // fields before joining either one into a filesystem path.
-        validate_restore_path(&entry.original_path)?;
-        validate_sha256_filename(&entry.sha256)?;
-
         // K3: re-verify identity before EACH `files/<sha>` read; a swap part-way
         // through aborts the diff (the store is no longer trustworthy).
         verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
-        let backup_path = files_dir.join(&entry.sha256);
-        let mut backup = match crate::util::open_read_no_follow_capped(&backup_path, u64::MAX) {
-            Ok(file) => file,
-            Err(_) => {
+        let backup = files_dir.join(&entry.sha256);
+        if !backup.exists() {
+            diffs.push(DiffEntry {
+                path: entry.original_path.clone(),
+                status: DiffStatus::BackupCorrupt,
+                checkpoint_sha256: entry.sha256.clone(),
+                current_sha256: None,
+            });
+            classified_paths.insert(entry.original_path.clone());
+            continue;
+        }
+
+        // repo-0202: an EXISTING blob is not proof of integrity — hash it and
+        // compare against its content-addressed name so a truncated/tampered
+        // blob is reported corrupt instead of falsely matching later at
+        // restore time.
+        match sha256_file(&backup) {
+            Ok(actual) if actual == entry.sha256 => {}
+            _ => {
                 diffs.push(DiffEntry {
                     path: entry.original_path.clone(),
                     status: DiffStatus::BackupCorrupt,
@@ -1304,20 +1299,6 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
                 classified_paths.insert(entry.original_path.clone());
                 continue;
             }
-        };
-        verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
-
-        // repo-0202: an existing blob is not proof of integrity. Hash the
-        // no-follow handle and compare against its content-addressed name.
-        if !matches!(sha256_reader(&mut backup), Ok(actual) if actual == entry.sha256) {
-            diffs.push(DiffEntry {
-                path: entry.original_path.clone(),
-                status: DiffStatus::BackupCorrupt,
-                checkpoint_sha256: entry.sha256.clone(),
-                current_sha256: None,
-            });
-            classified_paths.insert(entry.original_path.clone());
-            continue;
         }
 
         // Anchor through the SAME helper restore uses: an absolute entry passes
@@ -1767,27 +1748,33 @@ fn backup_file(
     files_dir: &Path,
     budget: &mut CreationBudget,
 ) -> Result<ManifestEntry, BackupError> {
+    let meta = match path.metadata() {
+        Ok(m) => Some(m),
+        Err(e) => {
+            eprintln!(
+                "tirith: checkpoint: cannot read metadata for {}: {e}",
+                path.display()
+            );
+            None
+        }
+    };
+    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
     // repo-0201: hash and copy through ONE open handle — hashing first and
     // reopening for the copy let a concurrent modification desync the
     // content-addressed blob from the manifest digest (restore would then
     // reject the only backup as corrupt).
-    let src_file = crate::util::open_read_no_follow_capped(path, u64::MAX)
-        .map_err(|e| BackupError::Skip(format!("open {}: {e:?}", path.display())))?;
-    // Size and mode come from that exact handle, not a path lookup that can be
-    // swapped before open.
-    let meta = src_file
-        .metadata()
-        .map_err(|e| BackupError::Skip(format!("metadata {}: {e}", path.display())))?;
-    let initial_size = meta.len();
+    let src_file = fs::File::open(path)
+        .map_err(|e| BackupError::Skip(format!("open {}: {e}", path.display())))?;
 
     // Refuse to START a large copy the filesystem cannot hold (repo-0262):
     // failing mid-copy would leave a torn blob and a wasted partial write.
     #[cfg(unix)]
-    if initial_size >= 1024 * 1024 {
+    if size >= 1024 * 1024 {
         if let Some(free) = available_bytes(files_dir) {
-            if free < initial_size {
+            if free < size {
                 return Err(BackupError::Abort(format!(
-                    "insufficient filesystem space for checkpoint copy of {} ({initial_size} bytes needed, {free} available)",
+                    "insufficient filesystem space for checkpoint copy of {} ({size} bytes needed, {free} available)",
                     path.display()
                 )));
             }
@@ -1832,15 +1819,8 @@ fn backup_file(
     // Content-addressed dedup: two checkpointed files with identical contents
     // share a single on-disk copy. Only a REAL copy draws down the cumulative
     // creation budget (repo-0262).
-    let existing_matches = crate::util::open_read_no_follow_capped(&dst, u64::MAX)
-        .ok()
-        .and_then(|mut existing| sha256_reader(&mut existing).ok())
-        .as_deref()
-        == Some(sha.as_str());
-    if existing_matches {
-        // Identical verified content is already stored; drop the duplicate
-        // temp copy. A corrupt, symlinked, or non-regular destination is not
-        // trusted merely because its filename equals the digest.
+    if dst.exists() {
+        // Identical content already stored; drop the duplicate temp copy.
         drop(tmp);
         // repo-0262: a deduplicated copy draws NO budget — refund what the
         // streaming pass charged.
@@ -1853,11 +1833,9 @@ fn backup_file(
     Ok(ManifestEntry {
         original_path: normalize_capture_path(path),
         sha256: sha,
-        // The open source can grow or shrink while being streamed. The digest
-        // and manifest size must both describe the bytes actually copied.
-        size: copied,
+        size,
         is_dir: false,
-        mode: captured_mode(&meta),
+        mode: meta.as_ref().and_then(captured_mode),
     })
 }
 
@@ -1925,15 +1903,11 @@ fn backup_dir_recursive(
 
     for entry in read_dir {
         if entries.len() >= max_files {
-            gaps.push(format!(
-                "entry cap of {max_files} reached before all files were captured"
-            ));
             break;
         }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                gaps.push(format!("unreadable entry in {}: {e}", dir.display()));
                 eprintln!(
                     "tirith: checkpoint: skip unreadable entry in {}: {e}",
                     dir.display()
@@ -1954,7 +1928,6 @@ fn backup_dir_recursive(
         };
 
         if meta.file_type().is_symlink() {
-            gaps.push(format!("symlink omitted: {}", path.display()));
             continue; // following symlinks could back up files outside the tree
         }
 
@@ -1989,7 +1962,6 @@ fn backup_dir_recursive(
                 .map(|n| n.starts_with('.'))
                 .unwrap_or(false)
             {
-                gaps.push(format!("dot-directory omitted: {}", path.display()));
                 continue;
             }
             // Record the directory itself so restore recreates empty
@@ -2043,6 +2015,7 @@ fn sha256_reader<R: Read>(reader: &mut R) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_test_support::GlobalStateGuard;
 
     /// Unlimited creation budget for backup-helper unit tests.
     fn test_budget() -> CreationBudget {
@@ -2078,13 +2051,11 @@ mod tests {
     fn list_and_purge_bind_metadata_to_private_directory_identity() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let tmp = tempfile::tempdir().unwrap();
         let previous_state = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: serialized by the crate-wide test environment lock.
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        global_state.set_env("XDG_STATE_HOME", tmp.path());
 
         let outcome = (|| -> Result<(Vec<CheckpointListEntry>, PurgeResult, bool, u32), String> {
             let base = try_checkpoints_dir().ok_or("checkpoint dir unavailable")?;
@@ -2127,11 +2098,11 @@ mod tests {
             Ok((listed, purged, checkpoint_dir.exists(), mode))
         })();
 
-        // SAFETY: restore the process environment before making assertions.
-        unsafe {
+        // Restore the isolated environment before making assertions.
+        {
             match previous_state {
-                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(value) => global_state.set_env("XDG_STATE_HOME", value),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 
@@ -2148,13 +2119,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn purge_ignores_symlinked_checkpoint_entries() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let tmp = tempfile::tempdir().unwrap();
         let previous_state = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: serialized by the crate-wide test environment lock.
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        global_state.set_env("XDG_STATE_HOME", tmp.path());
 
         let outcome = (|| -> Result<(PurgeResult, bool), String> {
             let base = secure_checkpoints_dir()?;
@@ -2172,11 +2141,11 @@ mod tests {
             Ok((result, outside.join("sentinel").exists()))
         })();
 
-        // SAFETY: restore the process environment before making assertions.
-        unsafe {
+        // Restore the isolated environment before making assertions.
+        {
             match previous_state {
-                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(value) => global_state.set_env("XDG_STATE_HOME", value),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 
@@ -2206,44 +2175,6 @@ mod tests {
         assert!(backup_path.exists());
         let content = fs::read_to_string(&backup_path).unwrap();
         assert_eq!(content, "hello world");
-    }
-
-    #[test]
-    fn backup_replaces_a_corrupt_preexisting_digest_blob() {
-        let tmp = tempfile::tempdir().unwrap();
-        let test_file = tmp.path().join("test.txt");
-        fs::write(&test_file, "hello world").unwrap();
-        let files_dir = tmp.path().join("files");
-        fs::create_dir_all(&files_dir).unwrap();
-        let digest = sha256_file(&test_file).unwrap();
-        fs::write(files_dir.join(&digest), "corrupt").unwrap();
-
-        let entry = backup_file(&test_file, &files_dir, &mut test_budget()).unwrap();
-
-        assert_eq!(entry.sha256, digest);
-        assert_eq!(entry.size, 11);
-        assert_eq!(
-            fs::read(files_dir.join(&entry.sha256)).unwrap(),
-            b"hello world"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bound_manifest_loader_refuses_a_symlinked_manifest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let id = uuid::Uuid::new_v4().to_string();
-        let checkpoint_dir = tmp.path().join(&id);
-        fs::create_dir_all(&checkpoint_dir).unwrap();
-        let outside = tmp.path().join("outside.json");
-        fs::write(&outside, "[]").unwrap();
-        std::os::unix::fs::symlink(&outside, checkpoint_dir.join("manifest.json")).unwrap();
-        let identity = capture_checkpoint_dir_identity(&checkpoint_dir).unwrap();
-
-        let error = load_bound_checkpoint_manifest(&checkpoint_dir, identity)
-            .expect_err("a manifest symlink must be refused");
-
-        assert!(error.contains("safely read manifest.json"), "{error}");
     }
 
     #[test]
@@ -2331,11 +2262,9 @@ mod tests {
         //
         // `validate_restore_path` rejects absolute original paths, so the
         // checkpointed paths must be relative. We chdir into a temp workdir
-        // (serialized by TEST_ENV_LOCK, the same boundary the env mutation
+        // (serialized by GlobalStateGuard, the same boundary the env mutation
         // below relies on) and checkpoint by bare filename.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -2344,15 +2273,17 @@ mod tests {
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         // Relative names that pass validate_restore_path; resolved against `workdir`.
         let name_a = "a.txt";
         let name_b = "b.txt";
 
-        let run = || -> Result<RestoreReport, String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<RestoreReport, String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
 
             fs::write(name_a, "alpha contents").map_err(|e| format!("write a: {e}"))?;
             fs::write(name_b, "bravo contents").map_err(|e| format!("write b: {e}"))?;
@@ -2399,11 +2330,11 @@ mod tests {
 
         // Restore cwd and env before assertions so cleanup runs even on failure.
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
         match prev_state {
-            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            Some(val) => global_state.set_env("XDG_STATE_HOME", val),
+            None => global_state.remove_env("XDG_STATE_HOME"),
         }
 
         let report = result.expect("restore_reported should succeed");
@@ -2441,9 +2372,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_reported_happy_path() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -2455,20 +2384,20 @@ mod tests {
         let prev_data = std::env::var("XDG_DATA_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules. Point the
+        // GlobalStateGuard restores the exact prior process state.
         // audit log at the temp data dir and ENABLE logging so the restore
         // emission is observable.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("XDG_DATA_HOME", &data_dir);
-            std::env::set_var("TIRITH_LOG", "1");
-        }
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("XDG_DATA_HOME", &data_dir);
+        global_state.set_env("TIRITH_LOG", "1");
 
         let name_a = "a.txt";
         let name_b = "b.txt";
 
-        let run = || -> Result<RestoreReport, String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<RestoreReport, String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
             fs::write(name_a, "original alpha").map_err(|e| format!("write a: {e}"))?;
             fs::write(name_b, "original bravo").map_err(|e| format!("write b: {e}"))?;
             let meta = create(&[name_a, name_b], Some("rm -rf project"))?;
@@ -2487,20 +2416,20 @@ mod tests {
 
         // Restore cwd + env before assertions so cleanup runs even on failure.
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_data {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
+                Some(v) => global_state.set_env("XDG_DATA_HOME", v),
+                None => global_state.remove_env("XDG_DATA_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2552,9 +2481,7 @@ mod tests {
     fn test_restore_preserves_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -2564,15 +2491,15 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "secret.txt";
-        let run = || -> Result<RestoreReport, String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<RestoreReport, String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
             fs::write(name, "top secret").map_err(|e| format!("write: {e}"))?;
             // Lock the original file down to owner-read/write only.
             fs::set_permissions(name, fs::Permissions::from_mode(0o600))
@@ -2591,16 +2518,16 @@ mod tests {
             .map(|m| m.permissions().mode() & 0o777);
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2628,15 +2555,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_refuses_symlinked_checkpoint_dir() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         // A tempdir-scoped absolute target the manifest would restore to if the
         // symlink guard regressed. Scoping it under `tmpdir` (instead of a fixed
@@ -2690,11 +2615,11 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
         if let Err(e) = outcome {
@@ -2767,9 +2692,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_refuses_symlinked_destination() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -2782,16 +2705,16 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "victim.txt";
         let outside_for_run = outside.clone();
-        let run = || -> Result<RestoreReport, String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<RestoreReport, String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
             fs::write(name, "checkpointed bytes").map_err(|e| format!("write: {e}"))?;
             let meta = create(&[name], Some("rm -rf project"))?;
             // Remove the live file and replace it with a symlink that escapes the
@@ -2807,16 +2730,16 @@ mod tests {
 
         // Restore cwd + env before assertions so cleanup runs even on failure.
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2845,19 +2768,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_reported_absolute_path_restores() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         // An ABSOLUTE path under the tempdir (not a symlink) — exactly the shape
         // create() records for an auto-checkpoint of an absolute target. Canonicalize
@@ -2881,14 +2800,14 @@ mod tests {
         let result = run();
         let live = fs::read_to_string(&abs_file).ok();
 
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2981,9 +2900,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_reported_relative_path_anchors_to_capture_root() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         // Canonicalize so the macOS /var -> /private/var symlink does not trip the
@@ -2998,22 +2915,24 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "note.txt";
-        let run = || -> Result<RestoreReport, String> {
+        let mut run = || -> Result<RestoreReport, String> {
             // Capture in dir A with a RELATIVE name (capture_root := dir A).
-            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+            global_state
+                .set_cwd(&dir_a)
+                .map_err(|e| format!("chdir A: {e}"))?;
             fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
             let meta = create(&[name], Some("rm -rf ."))?;
             // Mutate the live file in A so a successful restore is observable.
             fs::write(name, "MUTATED").map_err(|e| format!("rewrite: {e}"))?;
             // Restore from a DIFFERENT cwd (dir B).
-            std::env::set_current_dir(&dir_b).map_err(|e| format!("chdir B: {e}"))?;
+            global_state
+                .set_cwd(&dir_b)
+                .map_err(|e| format!("chdir B: {e}"))?;
             restore_reported(&meta.id)
         };
 
@@ -3022,16 +2941,16 @@ mod tests {
         let leaked_b = dir_b.join(name).exists();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -3058,17 +2977,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_diff_rejects_traversal_ids() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let tmpdir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmpdir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", tmpdir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             assert!(
@@ -3085,15 +3000,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -3110,9 +3025,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_diff_relative_path_anchors_to_capture_root() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         // Canonicalize so the macOS /var -> /private/var symlink does not trip the
@@ -3127,39 +3040,41 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "note.txt";
-        let run = || -> Result<Vec<DiffEntry>, String> {
+        let mut run = || -> Result<Vec<DiffEntry>, String> {
             // Capture in dir A with a RELATIVE name (capture_root := dir A).
-            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+            global_state
+                .set_cwd(&dir_a)
+                .map_err(|e| format!("chdir A: {e}"))?;
             fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
             let meta = create(&[name], Some("rm -rf ."))?;
             // Mutate the live file in A so a correctly-anchored diff sees Modified.
             fs::write(name, "MUTATED").map_err(|e| format!("rewrite: {e}"))?;
             // Diff from a DIFFERENT cwd (dir B), where no `note.txt` exists.
-            std::env::set_current_dir(&dir_b).map_err(|e| format!("chdir B: {e}"))?;
+            global_state
+                .set_cwd(&dir_b)
+                .map_err(|e| format!("chdir B: {e}"))?;
             diff(&meta.id)
         };
 
         let result = run();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -3187,9 +3102,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_diff_regular_file_replaced_by_symlink_is_modified() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         // Canonicalize so the macOS /var -> /private/var symlink does not trip the
@@ -3202,15 +3115,15 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "note.txt";
-        let run = || -> Result<Vec<DiffEntry>, String> {
-            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+        let mut run = || -> Result<Vec<DiffEntry>, String> {
+            global_state
+                .set_cwd(&dir_a)
+                .map_err(|e| format!("chdir A: {e}"))?;
             // Capture a REGULAR file.
             fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
             let meta = create(&[name], Some("rm -rf ."))?;
@@ -3227,16 +3140,16 @@ mod tests {
         let result = run();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -3304,9 +3217,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_reported_legacy_relative_without_root_is_rejected() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(tmpdir.path()).unwrap();
@@ -3317,14 +3228,12 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "legacy.txt";
-        let run = || -> Result<RestoreReport, String> {
+        let mut run = || -> Result<RestoreReport, String> {
             // Hand-build a pre-F6 checkpoint: meta.json WITHOUT capture_root, a
             // manifest with a RELATIVE original_path, and a matching blob.
             let cp_base = try_checkpoints_dir().ok_or("checkpoint dir unavailable")?;
@@ -3364,7 +3273,9 @@ mod tests {
                 .map_err(|e| format!("manifest: {e}"))?;
 
             // Restore from a cwd where a leaked write would be observable.
-            std::env::set_current_dir(&cwd_dir).map_err(|e| format!("chdir: {e}"))?;
+            global_state
+                .set_cwd(&cwd_dir)
+                .map_err(|e| format!("chdir: {e}"))?;
             restore_reported(&id)
         };
 
@@ -3372,16 +3283,16 @@ mod tests {
         let leaked = cwd_dir.join(name).exists();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -3407,9 +3318,7 @@ mod tests {
     fn test_create_and_purge_removes_expired() {
         // create_and_purge() must create a new checkpoint AND purge age-expired
         // ones in a single call.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -3419,8 +3328,8 @@ mod tests {
         let state_dir = tmpdir.path().join("state");
 
         let prev = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         // Seed an ancient checkpoint (60 days old, past the 30-day default).
         let cp_base = state_dir.join("tirith/checkpoints");
@@ -3454,8 +3363,8 @@ mod tests {
 
         // Restore env before assertions so cleanup runs even on assertion failure.
         match prev {
-            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            Some(val) => global_state.set_env("XDG_STATE_HOME", val),
+            None => global_state.remove_env("XDG_STATE_HOME"),
         }
 
         assert!(result.is_ok(), "create_and_purge failed: {result:?}");
@@ -3625,21 +3534,19 @@ mod tests {
         // F10 end-to-end: `restore_reported` must reject a traversal/absolute id
         // up front (before reading any manifest), so an attacker cannot point the
         // restore at a checkpoint directory outside the store.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         let traversal = restore_reported("../../../../etc");
         let absolute = restore_reported("/tmp/evil");
 
         match prev_state {
-            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+            None => global_state.remove_env("XDG_STATE_HOME"),
         }
 
         assert!(
@@ -3792,9 +3699,7 @@ mod tests {
         // crash-atomic write, the published files are always whole: assert both
         // parse, the manifest covers every captured file, meta carries a
         // `capture_root`, and the checkpoint dir has no stray temp siblings.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -3802,11 +3707,13 @@ mod tests {
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
-        let run = || -> Result<(CheckpointMeta, PathBuf), String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<(CheckpointMeta, PathBuf), String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
             fs::write("a.txt", "alpha").map_err(|e| format!("write a: {e}"))?;
             fs::write("b.txt", "bravo").map_err(|e| format!("write b: {e}"))?;
             let meta = create(&["a.txt", "b.txt"], Some("rm -rf project"))?;
@@ -3818,11 +3725,11 @@ mod tests {
         let result = run();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
         match prev_state {
-            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+            None => global_state.remove_env("XDG_STATE_HOME"),
         }
 
         let (meta, cp_dir) = result.expect("create should succeed");
@@ -3868,9 +3775,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn create_aborts_and_cleans_up_when_total_byte_budget_exceeded() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
@@ -3884,8 +3789,8 @@ mod tests {
         fs::write(&file_b, vec![0xBBu8; 3072]).unwrap();
 
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         let a = file_a.to_string_lossy().into_owned();
         let b = file_b.to_string_lossy().into_owned();
@@ -3902,10 +3807,10 @@ mod tests {
                 .unwrap_or(0)
         });
 
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 
@@ -3930,9 +3835,7 @@ mod tests {
     fn restore_applies_per_path_modes_and_recreates_empty_dirs() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
@@ -3954,8 +3857,8 @@ mod tests {
         fs::set_permissions(&creds_copy, fs::Permissions::from_mode(0o644)).unwrap();
 
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         let root = workdir.to_string_lossy().into_owned();
         let outcome = (|| -> Result<(RestoreReport, PathBuf), String> {
@@ -3971,10 +3874,10 @@ mod tests {
             Ok((report, tmpdir.path().join("store").join(&meta.id)))
         })();
 
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 
@@ -4018,9 +3921,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_refuses_symlinked_intermediate_parent() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
@@ -4035,8 +3936,8 @@ mod tests {
         fs::write(&victim_file, "ORIGINAL").unwrap();
 
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         let root = workdir.to_string_lossy().into_owned();
         let outcome = (|| -> Result<RestoreReport, String> {
@@ -4049,10 +3950,10 @@ mod tests {
             restore_reported(&meta.id)
         })();
 
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 

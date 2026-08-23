@@ -311,7 +311,7 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// symlinks, then used for both the bounded read and atomic 0600 publication.
 /// Any read error other than genuine absence aborts rather than becoming an
 /// empty baseline.
-fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+pub(super) fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/policy.yaml →
     // <repo>, <config>/tirith/policy.yaml → <config>. A policy path is always
     // at least three components deep; refuse a malformed shallower path rather
@@ -323,7 +323,15 @@ fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()>
         )
     })?;
 
-    let contained = tirith_core::util::ContainedAtomicFile::prepare(containment_root, path, true)?;
+    let policy = Policy::discover_local_only(containment_root.to_str());
+    let contained = super::prepare_config_destination_permitted(
+        containment_root,
+        path,
+        true,
+        &policy,
+        true,
+        true,
+    )?;
 
     // Read the current contents WITHOUT following a symlinked final component.
     // An absent file is an empty baseline (the key is then appended); any other
@@ -364,7 +372,15 @@ fn update_policy_key(path: &Path, key: &str, value: &str) -> std::io::Result<()>
         out.push('\n');
     }
 
-    contained.write_atomic(out.as_bytes(), true)
+    super::write_prepared_config_file_permitted(
+        containment_root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 /// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
@@ -394,6 +410,9 @@ mod tests {
 
     #[test]
     fn update_policy_key_creates_file() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         update_policy_key(&path, "sudo_require_reason", "true").unwrap();

@@ -264,4 +264,7 @@ commands are blocked. Set `TIRITH_FAIL_OPEN=1` to switch to fail-open behavior.
 - The PreToolUse hook is project-scoped (`.claude/settings.json`) or global
   (`~/.claude/settings.json`). Use global for protection across all projects.
 - The MCP server and the hook are independent — you can use either or both.
+- Automated setup validates Python once and records its absolute path in the
+  hook command. Re-run setup if that interpreter moves; Claude Code does not
+  resolve `python3` from the agent's runtime PATH.
 - Hooks require a Claude Code restart to take effect after changes.

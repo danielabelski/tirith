@@ -38,9 +38,10 @@ pub fn offer_zshenv_guard(
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let zshenv_path = home.join(".zshenv");
     let mut completed_verb = "updated";
-    // Keep validation explicitly one-shot even if this closure grows more than
-    // one write path. `transactional_update` invokes the transform once under
-    // its lock, so a successful `zsh -n` is never duplicated by retry logic.
+    // `transactional_update` may run the transform twice (preflight, then a
+    // locked recompute when the destination drifted in between). The managed
+    // block is snapshot-independent, so one successful `zsh -n` proves it for
+    // both runs — never spawn the validator a second time.
     let mut block_validated = false;
     let outcome = super::fs_helpers::transactional_update(
         &zshenv_path,
