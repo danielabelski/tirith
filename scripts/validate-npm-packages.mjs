@@ -15,6 +15,7 @@ if (process.argv.length !== 4) {
 const version = process.argv[2].replace(/^v/, "");
 const artifactRoot = process.argv[3];
 const npmCache = mkdtempSync(join(tmpdir(), "tirith-npm-cache-"));
+const MAX_ARCHIVE_MEMBER_BYTES = 128 * 1024 * 1024;
 const platforms = {
   "darwin-arm64": ["tirith-aarch64-apple-darwin/tirith-aarch64-apple-darwin.tar.gz", "tirith"],
   "darwin-x64": ["tirith-x86_64-apple-darwin/tirith-x86_64-apple-darwin.tar.gz", "tirith"],
@@ -25,8 +26,9 @@ const platforms = {
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: null, ...options });
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed: ${result.stderr?.toString()}`);
+  if (result.error || result.status !== 0) {
+    const cause = result.error?.message || result.stderr?.toString() || `exit status ${result.status}`;
+    throw new Error(`${command} ${args.join(" ")} failed: ${cause}`);
   }
   return result.stdout;
 }
@@ -61,8 +63,8 @@ for (const [platform, [archive, binary]] of Object.entries(platforms)) {
 
   const archivePath = `${artifactRoot}/${archive}`;
   const sourceBinary = archive.endsWith(".zip")
-    ? run("unzip", ["-p", archivePath, binary])
-    : run("tar", ["xOzf", archivePath, binary]);
+    ? run("unzip", ["-p", archivePath, binary], { maxBuffer: MAX_ARCHIVE_MEMBER_BYTES })
+    : run("tar", ["xOzf", archivePath, binary], { maxBuffer: MAX_ARCHIVE_MEMBER_BYTES });
   const stagedBinary = readFileSync(`${directory}/bin/${binary}`);
   if (sha256(sourceBinary) !== sha256(stagedBinary)) {
     throw new Error(`${pkg.name} embeds bytes that differ from ${archivePath}`);
