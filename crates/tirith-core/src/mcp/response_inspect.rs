@@ -47,6 +47,9 @@
 //! [`kind_for_method`] returns `None` so response inspection is never wrongly
 //! applied to a request shape.
 
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+use base64::engine::DecodePaddingMode;
+use base64::{alphabet, Engine as _};
 use serde::Serialize;
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
@@ -70,6 +73,83 @@ use crate::mcp::MAX_STRUCTURED_DEPTH as MAX_INSPECT_WALK_DEPTH;
 /// whole message; this is a second, tighter bound on a single decoded blob so a
 /// base64 field cannot force a large allocation during sniffing).
 pub const MAX_INSPECT_BLOB_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bound the secondary URI/blob walkers independently of the text scanner. The
+/// scanner has its own larger structural allowance, but these passes can perform
+/// DNS work, decode blobs, and construct violations, so they use a tighter shared
+/// budget and fail closed when any dimension is exhausted.
+const MAX_RESPONSE_WALK_NODES: usize = 100_000;
+const MAX_RESPONSE_BLOBS: usize = 32;
+const MAX_RESPONSE_VIOLATIONS: usize = 64;
+
+struct ResponseWalkBudget {
+    remaining_nodes: usize,
+    remaining_blobs: usize,
+    exhausted: bool,
+}
+
+impl ResponseWalkBudget {
+    fn new() -> Self {
+        Self {
+            remaining_nodes: MAX_RESPONSE_WALK_NODES,
+            remaining_blobs: MAX_RESPONSE_BLOBS,
+            exhausted: false,
+        }
+    }
+
+    fn charge_node(&mut self) -> bool {
+        if self.exhausted || self.remaining_nodes == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining_nodes -= 1;
+        true
+    }
+
+    fn charge_blob(&mut self) -> bool {
+        if self.exhausted || self.remaining_blobs == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining_blobs -= 1;
+        true
+    }
+
+    fn push(&mut self, out: &mut Vec<ResponseViolation>, violation: ResponseViolation) {
+        // Details are categorical, so exact duplicates add no security signal.
+        // Deduplicate before the global cap rather than allowing an attacker to
+        // allocate one entry per identical blob or URI.
+        if out
+            .iter()
+            .any(|prior| prior.code == violation.code && prior.detail == violation.detail)
+        {
+            return;
+        }
+        // Reserve one slot for the fail-closed budget marker.
+        if out.len() >= MAX_RESPONSE_VIOLATIONS - 1 {
+            self.exhausted = true;
+            return;
+        }
+        out.push(violation);
+    }
+
+    fn finish(&self, out: &mut Vec<ResponseViolation>) {
+        if !self.exhausted
+            || out
+                .iter()
+                .any(|violation| violation.code == "analysis_budget_exceeded")
+        {
+            return;
+        }
+        if out.len() >= MAX_RESPONSE_VIOLATIONS {
+            out.truncate(MAX_RESPONSE_VIOLATIONS - 1);
+        }
+        out.push(ResponseViolation {
+            code: "analysis_budget_exceeded",
+            detail: "response URI/blob inspection exceeded its bounded work budget".to_string(),
+        });
+    }
+}
 
 /// One hostile response may spend at most this long resolving every distinct
 /// HTTP(S) host it carries. Late resolver results are discarded. Because the
@@ -339,14 +419,16 @@ fn inspect_response_inner(
 
     // 2. URI screen for resource_link / resource / resource-descriptor URIs.
     let mut violations = Vec::new();
-    collect_uri_violations(result, kind, &mut violations, dns_budget);
+    let mut walk_budget = ResponseWalkBudget::new();
+    collect_uri_violations(result, kind, &mut violations, dns_budget, &mut walk_budget);
 
     // 3. MIME vs sniffed bytes + size cap for inline blobs. repo-0294: this
     // covers prompts/get too — `walk_for_embedded_blobs` handles the nested
     // `{type: resource, resource: {blob}}` shape a rendered prompt carries.
     if matches!(kind, ResponseKind::ResourcesRead | ResponseKind::PromptsGet) {
-        collect_blob_violations(result, &mut violations);
+        collect_blob_violations(result, &mut violations, &mut walk_budget);
     }
+    walk_budget.finish(&mut violations);
 
     // CR1: the same offending URL can be reached by both the canonical typed /
     // descriptor screen AND the generic `metadata_uri_ssrf` pass (which now also
@@ -388,17 +470,27 @@ fn collect_uri_violations(
     kind: ResponseKind,
     out: &mut Vec<ResponseViolation>,
     dns_budget: &ResponseDnsBudget,
+    walk_budget: &mut ResponseWalkBudget,
 ) {
     // Generic structural walk: catch resource_link / embedded resource anywhere.
-    walk_for_resource_uris(result, out, dns_budget, 0);
+    walk_for_resource_uris(result, out, dns_budget, walk_budget, 0);
 
     // Kind-specific descriptor fields that are not content blocks.
     match kind {
         ResponseKind::ResourcesList | ResponseKind::ResourcesTemplatesList => {
             if let Some(arr) = result.get("resources").and_then(Value::as_array) {
                 for entry in arr {
+                    if !walk_budget.charge_node() {
+                        break;
+                    }
                     if let Some(uri) = entry.get("uri").and_then(Value::as_str) {
-                        screen_uri(uri, "resource_descriptor_ssrf", out, dns_budget);
+                        screen_uri(
+                            uri,
+                            "resource_descriptor_ssrf",
+                            out,
+                            dns_budget,
+                            walk_budget,
+                        );
                     }
                 }
             }
@@ -408,8 +500,17 @@ fn collect_uri_violations(
             // are rejected because their eventual destination cannot be proven.
             if let Some(arr) = result.get("resourceTemplates").and_then(Value::as_array) {
                 for entry in arr {
+                    if !walk_budget.charge_node() {
+                        break;
+                    }
                     if let Some(t) = entry.get("uriTemplate").and_then(Value::as_str) {
-                        screen_uri_template(t, "resource_template_ssrf", out, dns_budget);
+                        screen_uri_template(
+                            t,
+                            "resource_template_ssrf",
+                            out,
+                            dns_budget,
+                            walk_budget,
+                        );
                     }
                 }
             }
@@ -417,8 +518,11 @@ fn collect_uri_violations(
         ResponseKind::ResourcesRead => {
             if let Some(arr) = result.get("contents").and_then(Value::as_array) {
                 for entry in arr {
+                    if !walk_budget.charge_node() {
+                        break;
+                    }
                     if let Some(uri) = entry.get("uri").and_then(Value::as_str) {
-                        screen_uri(uri, "resource_content_ssrf", out, dns_budget);
+                        screen_uri(uri, "resource_content_ssrf", out, dns_budget, walk_budget);
                     }
                 }
             }
@@ -447,9 +551,10 @@ fn walk_for_resource_uris(
     v: &Value,
     out: &mut Vec<ResponseViolation>,
     dns_budget: &ResponseDnsBudget,
+    walk_budget: &mut ResponseWalkBudget,
     depth: usize,
 ) {
-    if dns_budget.is_exhausted() || depth > MAX_INSPECT_WALK_DEPTH {
+    if dns_budget.is_exhausted() || depth > MAX_INSPECT_WALK_DEPTH || !walk_budget.charge_node() {
         return;
     }
     match v {
@@ -458,7 +563,7 @@ fn walk_for_resource_uris(
             match ty {
                 Some("resource_link") => {
                     if let Some(uri) = map.get("uri").and_then(Value::as_str) {
-                        screen_uri(uri, "resource_link_ssrf", out, dns_budget);
+                        screen_uri(uri, "resource_link_ssrf", out, dns_budget, walk_budget);
                     }
                 }
                 Some("resource") => {
@@ -467,7 +572,7 @@ fn walk_for_resource_uris(
                         .and_then(|r| r.get("uri"))
                         .and_then(Value::as_str)
                     {
-                        screen_uri(uri, "embedded_resource_ssrf", out, dns_budget);
+                        screen_uri(uri, "embedded_resource_ssrf", out, dns_budget, walk_budget);
                     }
                 }
                 _ => {}
@@ -486,16 +591,22 @@ fn walk_for_resource_uris(
             // genuinely typed `uri` still yields exactly its canonical violation.
             for child in map.values() {
                 if let Some(s) = child.as_str() {
-                    screen_http_string(s, out, dns_budget);
+                    screen_http_string(s, out, dns_budget, walk_budget);
                 }
             }
             for child in map.values() {
-                walk_for_resource_uris(child, out, dns_budget, depth + 1);
+                walk_for_resource_uris(child, out, dns_budget, walk_budget, depth + 1);
+                if walk_budget.exhausted {
+                    break;
+                }
             }
         }
         Value::Array(items) => {
             for item in items {
-                walk_for_resource_uris(item, out, dns_budget, depth + 1);
+                walk_for_resource_uris(item, out, dns_budget, walk_budget, depth + 1);
+                if walk_budget.exhausted {
+                    break;
+                }
             }
         }
         _ => {}
@@ -549,38 +660,28 @@ fn dedup_violations(violations: &mut Vec<ResponseViolation>) {
 /// template: its fixed scheme/authority is validated while expansion-controlled
 /// destinations are rejected. This mirrors the kind-specific `uriTemplate` path
 /// without treating braces as a validation exemption.
-fn screen_http_string(s: &str, out: &mut Vec<ResponseViolation>, dns_budget: &ResponseDnsBudget) {
+fn screen_http_string(
+    s: &str,
+    out: &mut Vec<ResponseViolation>,
+    dns_budget: &ResponseDnsBudget,
+    walk_budget: &mut ResponseWalkBudget,
+) {
     if s.contains('{') || s.contains('}') {
         if matches!(fixed_template_scheme(s).as_deref(), Some("http" | "https")) {
-            screen_uri_template(s, "metadata_uri_ssrf", out, dns_budget);
+            screen_uri_template(s, "metadata_uri_ssrf", out, dns_budget, walk_budget);
         }
         return;
     }
 
     if matches!(normalized_uri_scheme(s).as_deref(), Some("http" | "https")) {
-        screen_uri(s, "metadata_uri_ssrf", out, dns_budget);
+        screen_uri(s, "metadata_uri_ssrf", out, dns_budget, walk_budget);
     }
 }
 
-/// Schemes that are never a legitimate upstream resource link and are obvious
-/// exfil / local-read / network-bounce vectors: rejected outright (no DNS). A
-/// tool result must not hand the client a local-file, inline-data, script, or
-/// non-http network link masquerading as a resource.
-const FORBIDDEN_URI_SCHEMES: &[&str] = &[
-    "file",
-    "data",
-    "javascript",
-    "vbscript",
-    "ftp",
-    "ftps",
-    "gopher",
-    "dict",
-    "tftp",
-    "ldap",
-    "smb",
-    "blob",
-    "jar",
-];
+/// The only non-HTTP absolute schemes Tirith emits or deliberately recognizes
+/// as non-network MCP identifiers. Unknown absolute schemes fail closed: a
+/// denylist cannot enumerate transports such as `ws`, `ssh`, `git`, or `nfs`.
+const INTERNAL_URI_SCHEMES: &[&str] = &["tirith", "ui"];
 
 /// Count bound within the total response deadline. The deadline prevents a
 /// small number of slow hosts from consuming unbounded wall time; this count
@@ -746,16 +847,17 @@ impl ResponseDnsBudget {
 ///   ([`crate::url_validate::validate_fetch_url`]: scheme / embedded-creds /
 ///   cloud-metadata / private / loopback / link-local). A non-public destination
 ///   is a violation.
-/// * a [`FORBIDDEN_URI_SCHEMES`] scheme → an immediate violation (local-read /
-///   inline-data / non-http bounce).
-/// * anything else — an opaque/internal scheme the client will not auto-resolve
-///   over the network (`tirith://`, `ui://`, a custom app scheme, or a bare
-///   path) — is left alone. Only network-fetchable URIs are SSRF vectors.
+/// * `tirith:` / `ui:` → explicitly recognized internal identifiers.
+/// * a relative path → left relative and allowed.
+/// * every other absolute scheme → an immediate violation. Unknown schemes are
+///   not presumed non-network: downstream clients may register transports that
+///   this gateway does not know about.
 fn screen_uri(
     uri: &str,
     code: &'static str,
     out: &mut Vec<ResponseViolation>,
     dns_budget: &ResponseDnsBudget,
+    walk_budget: &mut ResponseWalkBudget,
 ) {
     let trimmed = uri.trim();
     let scheme = normalized_uri_scheme(trimmed);
@@ -765,7 +867,7 @@ fn screen_uri(
     // them, so they are not equivalent to the ordinary relative paths allowed
     // below.
     if trimmed.starts_with("//") {
-        out.push(ResponseViolation {
+        walk_budget.push(out, ResponseViolation {
             code,
             detail:
                 "resource link failed SSRF policy: scheme-relative network targets are ambiguous"
@@ -786,24 +888,31 @@ fn screen_uri(
             dns_budget.validate_fetch_url(trimmed)
         };
         if let Err(e) = result {
-            out.push(ResponseViolation {
-                code,
-                detail: categorical_ssrf_detail(&e),
-            });
+            walk_budget.push(
+                out,
+                ResponseViolation {
+                    code,
+                    detail: categorical_ssrf_detail(&e),
+                },
+            );
         }
         return;
     }
 
-    // A known-dangerous non-http scheme: reject without resolution.
-    let scheme = scheme.unwrap_or_else(|| "unknown".to_string());
-    if FORBIDDEN_URI_SCHEMES.contains(&scheme.as_str()) {
-        out.push(ResponseViolation {
-            code,
-            detail: "forbidden URI scheme in resource link".to_string(),
-        });
+    // A relative reference has no scheme. Only the two deliberately recognized
+    // internal schemes are allowed among absolute non-HTTP identifiers.
+    let Some(scheme) = scheme else {
+        return;
+    };
+    if !INTERNAL_URI_SCHEMES.contains(&scheme.as_str()) {
+        walk_budget.push(
+            out,
+            ResponseViolation {
+                code,
+                detail: "unrecognized absolute URI scheme in resource link".to_string(),
+            },
+        );
     }
-    // Any other scheme (or none) is an opaque internal URI, not a network fetch:
-    // leave it alone.
 }
 
 fn categorical_ssrf_detail(reason: &str) -> String {
@@ -904,14 +1013,18 @@ fn screen_uri_template(
     code: &'static str,
     out: &mut Vec<ResponseViolation>,
     dns_budget: &ResponseDnsBudget,
+    walk_budget: &mut ResponseWalkBudget,
 ) {
     let target = match inspect_uri_template_target(template) {
         Ok(target) => target,
         Err(e) => {
-            out.push(ResponseViolation {
-                code,
-                detail: categorical_template_detail(&e),
-            });
+            walk_budget.push(
+                out,
+                ResponseViolation {
+                    code,
+                    detail: categorical_template_detail(&e),
+                },
+            );
             return;
         }
     };
@@ -919,16 +1032,22 @@ fn screen_uri_template(
     match target {
         UriTemplateTarget::HttpBase(base) => {
             if let Err(e) = dns_budget.validate_fetch_url(&base) {
-                out.push(ResponseViolation {
-                    code,
-                    detail: categorical_ssrf_detail(&e),
-                });
+                walk_budget.push(
+                    out,
+                    ResponseViolation {
+                        code,
+                        detail: categorical_ssrf_detail(&e),
+                    },
+                );
             }
         }
-        UriTemplateTarget::ForbiddenScheme(_) => out.push(ResponseViolation {
-            code,
-            detail: "forbidden URI scheme in resource link".to_string(),
-        }),
+        UriTemplateTarget::ForbiddenScheme(_) => walk_budget.push(
+            out,
+            ResponseViolation {
+                code,
+                detail: "unrecognized absolute URI scheme in resource link".to_string(),
+            },
+        ),
         UriTemplateTarget::Opaque => {}
     }
 }
@@ -964,9 +1083,8 @@ fn inspect_uri_template_target(template: &str) -> Result<UriTemplateTarget, Stri
                     Ok(UriTemplateTarget::HttpBase(trimmed.to_string()))
                 }
             }
-            Some(scheme) if FORBIDDEN_URI_SCHEMES.contains(&scheme) => {
-                Ok(UriTemplateTarget::ForbiddenScheme(scheme.to_string()))
-            }
+            Some(scheme) if INTERNAL_URI_SCHEMES.contains(&scheme) => Ok(UriTemplateTarget::Opaque),
+            Some(scheme) => Ok(UriTemplateTarget::ForbiddenScheme(scheme.to_string())),
             _ if trimmed.starts_with("//") => {
                 Err("scheme-relative network targets are ambiguous".to_string())
             }
@@ -997,7 +1115,9 @@ fn inspect_uri_template_target(template: &str) -> Result<UriTemplateTarget, Stri
         .to_ascii_lowercase();
     let after_scheme = colon + 1;
 
-    if FORBIDDEN_URI_SCHEMES.contains(&scheme.as_str()) {
+    if !matches!(scheme.as_str(), "http" | "https")
+        && !INTERNAL_URI_SCHEMES.contains(&scheme.as_str())
+    {
         return Ok(UriTemplateTarget::ForbiddenScheme(scheme));
     }
 
@@ -1230,30 +1350,41 @@ fn validate_template_varspec(varspec: &str) -> Result<(), String> {
 /// Decode inline `blob`s in a `resources/read` response (bounded) and compare the
 /// declared `mimeType` against the sniffed magic bytes, appending a violation for
 /// a spoof or an oversized blob.
-fn collect_blob_violations(result: &Value, out: &mut Vec<ResponseViolation>) {
-    let Some(arr) = result.get("contents").and_then(Value::as_array) else {
-        return;
-    };
-    for entry in arr {
-        let Some(obj) = entry.as_object() else {
-            continue;
-        };
-        let Some(blob_b64) = obj.get("blob").and_then(Value::as_str) else {
-            continue;
-        };
-        let declared = obj.get("mimeType").and_then(Value::as_str);
-        check_blob(blob_b64, declared, out);
+fn collect_blob_violations(
+    result: &Value,
+    out: &mut Vec<ResponseViolation>,
+    walk_budget: &mut ResponseWalkBudget,
+) {
+    if let Some(arr) = result.get("contents").and_then(Value::as_array) {
+        for entry in arr {
+            if walk_budget.exhausted {
+                break;
+            }
+            let Some(obj) = entry.as_object() else {
+                continue;
+            };
+            let Some(blob_b64) = obj.get("blob").and_then(Value::as_str) else {
+                continue;
+            };
+            let declared = obj.get("mimeType").and_then(Value::as_str);
+            check_blob(blob_b64, declared, out, walk_budget);
+        }
     }
     // Also screen embedded-resource blobs anywhere in the tree (an embedded
     // `resource` content block can carry a `blob` too).
-    walk_for_embedded_blobs(result, out, 0);
+    walk_for_embedded_blobs(result, out, walk_budget, 0);
 }
 
 /// Recursively find embedded `resource` blocks with an inline `blob` and check
 /// them (the top-level `contents[]` is handled by the caller; this catches
 /// `{type:"resource", resource:{blob, mimeType}}` nested in content arrays).
-fn walk_for_embedded_blobs(v: &Value, out: &mut Vec<ResponseViolation>, depth: usize) {
-    if depth > MAX_INSPECT_WALK_DEPTH {
+fn walk_for_embedded_blobs(
+    v: &Value,
+    out: &mut Vec<ResponseViolation>,
+    walk_budget: &mut ResponseWalkBudget,
+    depth: usize,
+) {
+    if depth > MAX_INSPECT_WALK_DEPTH || !walk_budget.charge_node() {
         return;
     }
     match v {
@@ -1262,17 +1393,23 @@ fn walk_for_embedded_blobs(v: &Value, out: &mut Vec<ResponseViolation>, depth: u
                 if let Some(res) = map.get("resource").and_then(Value::as_object) {
                     if let Some(blob) = res.get("blob").and_then(Value::as_str) {
                         let declared = res.get("mimeType").and_then(Value::as_str);
-                        check_blob(blob, declared, out);
+                        check_blob(blob, declared, out, walk_budget);
                     }
                 }
             }
             for child in map.values() {
-                walk_for_embedded_blobs(child, out, depth + 1);
+                walk_for_embedded_blobs(child, out, walk_budget, depth + 1);
+                if walk_budget.exhausted {
+                    break;
+                }
             }
         }
         Value::Array(items) => {
             for item in items {
-                walk_for_embedded_blobs(item, out, depth + 1);
+                walk_for_embedded_blobs(item, out, walk_budget, depth + 1);
+                if walk_budget.exhausted {
+                    break;
+                }
             }
         }
         _ => {}
@@ -1282,25 +1419,27 @@ fn walk_for_embedded_blobs(v: &Value, out: &mut Vec<ResponseViolation>, depth: u
 /// Decode a base64 blob (size-capped) and compare its sniffed kind to the declared
 /// MIME type. Pushes a violation on an oversize blob or a benign-declared /
 /// dangerous-sniffed mismatch.
-fn check_blob(blob_b64: &str, declared: Option<&str>, out: &mut Vec<ResponseViolation>) {
-    #[cfg(test)]
-    BLOB_CHECK_TEST_COUNT.with(|count| count.set(count.get() + 1));
-    // A base64 string decodes to ~3/4 its length; refuse before allocating if the
-    // encoded length alone already exceeds the (4/3-scaled) cap.
-    if blob_b64.len() / 4 * 3 > MAX_INSPECT_BLOB_BYTES {
-        out.push(ResponseViolation {
-            code: "blob_too_large",
-            detail: "resource blob exceeds inspection cap before decode".to_string(),
-        });
+fn check_blob(
+    blob_b64: &str,
+    declared: Option<&str>,
+    out: &mut Vec<ResponseViolation>,
+    walk_budget: &mut ResponseWalkBudget,
+) {
+    if !walk_budget.charge_blob() {
         return;
     }
+    #[cfg(test)]
+    BLOB_CHECK_TEST_COUNT.with(|count| count.set(count.get() + 1));
     let decoded = match decode_base64_bounded(blob_b64, MAX_INSPECT_BLOB_BYTES) {
         Ok(d) => d,
         Err(BlobDecodeError::TooLarge) => {
-            out.push(ResponseViolation {
-                code: "blob_too_large",
-                detail: "resource blob exceeds inspection cap after decode".to_string(),
-            });
+            walk_budget.push(
+                out,
+                ResponseViolation {
+                    code: "blob_too_large",
+                    detail: "resource blob exceeds inspection cap after decode".to_string(),
+                },
+            );
             return;
         }
         // repo-0297: fail CLOSED on undecodable base64. Common downstream
@@ -1308,7 +1447,7 @@ fn check_blob(blob_b64: &str, declared: Option<&str>, out: &mut Vec<ResponseViol
         // our strict decoder can still decode client-side; skipping the MIME
         // check here was a fail-open smuggling channel.
         Err(BlobDecodeError::Invalid) => {
-            out.push(ResponseViolation {
+            walk_budget.push(out, ResponseViolation {
                 code: "blob_undecodable",
                 detail: "resource blob is not strictly decodable base64; a permissive client-side decoder may still materialize it".to_string(),
             });
@@ -1329,7 +1468,7 @@ fn check_blob(blob_b64: &str, declared: Option<&str>, out: &mut Vec<ResponseViol
     if mime_admits_dangerous(&declared, sniffed) {
         return;
     }
-    out.push(ResponseViolation {
+    walk_budget.push(out, ResponseViolation {
         code: "mime_spoof",
         detail: format!(
             "resource blob signature conflicts with declared MIME category: detected={}; declared={}",
@@ -1494,62 +1633,57 @@ enum BlobDecodeError {
     Invalid,
 }
 
+/// Strict standard-base64 engine. Padding may be omitted, but when present it
+/// must have canonical length and placement; non-zero unused trailing bits are
+/// rejected so one byte sequence has no alternate encodings.
+const STRICT_PADDED_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_allow_trailing_bits(false),
+);
+const STRICT_UNPADDED_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_encode_padding(false)
+        .with_decode_padding_mode(DecodePaddingMode::RequireNone)
+        .with_decode_allow_trailing_bits(false),
+);
+
 /// Decode standard base64 (with or without padding), refusing to allocate past
-/// `cap` decoded bytes. Whitespace is ignored (MCP blobs are sometimes wrapped).
-/// This is a small, dependency-free decoder so the portable core needs no extra
-/// crate for the MIME-sniff path; only the leading bytes matter for sniffing, so
-/// we stop as soon as we have enough or hit the cap.
+/// `cap` decoded bytes. ASCII whitespace is ignored (MCP blobs are sometimes
+/// wrapped), but every other byte must belong to one complete canonical encoding.
 fn decode_base64_bounded(input: &str, cap: usize) -> Result<Vec<u8>, BlobDecodeError> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::new();
-    let mut quad = [0u8; 4];
-    let mut n = 0usize;
-    for &c in input.as_bytes() {
-        if c == b'=' {
-            break; // padding: end of data
-        }
-        if c.is_ascii_whitespace() {
-            continue;
-        }
-        let Some(v) = val(c) else {
-            return Err(BlobDecodeError::Invalid);
-        };
-        quad[n] = v;
-        n += 1;
-        if n == 4 {
-            out.push((quad[0] << 2) | (quad[1] >> 4));
-            out.push((quad[1] << 4) | (quad[2] >> 2));
-            out.push((quad[2] << 6) | quad[3]);
-            n = 0;
-            if out.len() > cap {
-                return Err(BlobDecodeError::TooLarge);
-            }
-        }
-    }
-    // Trailing partial group (1 leftover is invalid base64; 2 -> 1 byte; 3 -> 2).
-    match n {
-        0 => {}
-        1 => return Err(BlobDecodeError::Invalid),
-        2 => out.push((quad[0] << 2) | (quad[1] >> 4)),
-        3 => {
-            out.push((quad[0] << 2) | (quad[1] >> 4));
-            out.push((quad[1] << 4) | (quad[2] >> 2));
-        }
-        _ => unreachable!(),
-    }
-    if out.len() > cap {
+    let significant_len = input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count();
+    let max_encoded_len = (cap.saturating_add(2) / 3).saturating_mul(4);
+    if significant_len > max_encoded_len {
         return Err(BlobDecodeError::TooLarge);
     }
-    Ok(out)
+
+    let compact;
+    let encoded = if significant_len == input.len() {
+        input.as_bytes()
+    } else {
+        compact = input
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        compact.as_slice()
+    };
+
+    let decoder = if encoded.contains(&b'=') {
+        &STRICT_PADDED_BASE64
+    } else {
+        &STRICT_UNPADDED_BASE64
+    };
+    let decoded = decoder
+        .decode(encoded)
+        .map_err(|_| BlobDecodeError::Invalid)?;
+    if decoded.len() > cap {
+        return Err(BlobDecodeError::TooLarge);
+    }
+    Ok(decoded)
 }
 
 #[cfg(test)]
@@ -1858,7 +1992,63 @@ mod tests {
         assert!(outcome
             .violations
             .iter()
-            .any(|v| v.detail.contains("forbidden URI scheme")));
+            .any(|v| v.detail.contains("unrecognized absolute URI scheme")));
+    }
+
+    #[test]
+    fn unrecognized_absolute_resource_schemes_fail_closed() {
+        for scheme in ["ws", "wss", "ssh", "git", "nfs", "custom-transport"] {
+            let result = json!({
+                "resources": [{
+                    "uri": format!("{scheme}://attacker.invalid/resource"),
+                    "name": "r"
+                }]
+            });
+            let outcome = inspect_response(&result, ResponseKind::ResourcesList, &ctx());
+            assert!(
+                outcome.is_block(),
+                "unknown absolute scheme {scheme:?} must block: {outcome:?}"
+            );
+            assert!(outcome.violations.iter().any(|violation| {
+                violation.code == "resource_descriptor_ssrf"
+                    && violation
+                        .detail
+                        .contains("unrecognized absolute URI scheme")
+            }));
+        }
+    }
+
+    #[test]
+    fn unrecognized_absolute_template_schemes_fail_closed() {
+        for template in [
+            "ws://attacker.invalid/{path}",
+            "ssh://attacker.invalid/{path}",
+            "git://attacker.invalid/{path}",
+            "nfs://attacker.invalid/{path}",
+        ] {
+            let result = json!({
+                "resourceTemplates": [{"uriTemplate": template, "name": "r"}]
+            });
+            let outcome = inspect_response(&result, ResponseKind::ResourcesTemplatesList, &ctx());
+            assert!(
+                outcome.is_block(),
+                "unknown template scheme must block for {template:?}: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_and_explicit_internal_resource_uris_remain_allowed() {
+        let result = json!({
+            "resources": [
+                {"uri": "docs/reference.txt", "name": "relative"},
+                {"uri": "tirith://project-safety", "name": "tirith"},
+                {"uri": "ui://widget/main", "name": "ui"}
+            ]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ResourcesList, &ctx());
+        assert_eq!(outcome.action, Action::Allow, "{outcome:?}");
+        assert!(outcome.violations.is_empty(), "{outcome:?}");
     }
 
     #[test]
@@ -2222,10 +2412,12 @@ mod tests {
         // An encoded length that decodes past the cap is refused without buffering.
         let huge = "A".repeat((MAX_INSPECT_BLOB_BYTES / 3 + 10) * 4);
         let mut direct_violations = Vec::new();
+        let mut walk_budget = ResponseWalkBudget::new();
         check_blob(
             &huge,
             Some("application/octet-stream"),
             &mut direct_violations,
+            &mut walk_budget,
         );
         assert!(direct_violations
             .iter()
@@ -2257,6 +2449,46 @@ mod tests {
     }
 
     #[test]
+    fn base64_suffix_padding_and_trailing_bit_smuggling_are_rejected() {
+        for invalid in [
+            "TQ==junk", // valid prefix followed by attacker-controlled data
+            "T=Q=",     // padding in the middle
+            "TQ=",      // partial rather than canonical padding
+            "TQ===",    // excess padding
+            "TR==",     // non-zero unused trailing bits (also decodes to `M` permissively)
+            "A",        // impossible one-symbol tail
+        ] {
+            assert!(
+                matches!(
+                    decode_base64_bounded(invalid, MAX_INSPECT_BLOB_BYTES),
+                    Err(BlobDecodeError::Invalid)
+                ),
+                "noncanonical base64 must be rejected: {invalid:?}"
+            );
+        }
+
+        let result = json!({
+            "contents": [{
+                "uri": "tirith://x",
+                "mimeType": "text/plain",
+                "blob": "TQ==junk"
+            }]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ResourcesRead, &ctx());
+        assert!(outcome.is_block(), "{outcome:?}");
+        assert!(has_code(&outcome, "blob_undecodable"), "{outcome:?}");
+    }
+
+    #[test]
+    fn canonical_unpadded_and_wrapped_base64_remain_accepted() {
+        for (encoded, expected) in [("TQ", b"M".as_slice()), ("T W\nE=", b"Ma".as_slice())] {
+            let decoded = decode_base64_bounded(encoded, MAX_INSPECT_BLOB_BYTES)
+                .unwrap_or_else(|_| panic!("decode canonical base64 {encoded:?}"));
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
     fn base64_decoder_roundtrips() {
         for sample in [
             &b""[..],
@@ -2271,6 +2503,75 @@ mod tests {
                 .unwrap_or_else(|_| panic!("decode {enc:?}"));
             assert_eq!(dec, sample, "roundtrip {sample:?} via {enc}");
         }
+    }
+
+    #[test]
+    fn prompts_get_embedded_blob_is_inspected_without_top_level_contents() {
+        let result = json!({
+            "messages": [{
+                "role": "user",
+                "content": {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "tirith://embedded",
+                        "mimeType": "text/plain",
+                        "blob": "f0VMRg=="
+                    }
+                }
+            }]
+        });
+        let outcome = inspect_response(&result, ResponseKind::PromptsGet, &ctx());
+        assert!(outcome.is_block(), "{outcome:?}");
+        assert!(has_code(&outcome, "mime_spoof"), "{outcome:?}");
+    }
+
+    #[test]
+    fn blob_count_budget_fails_closed_without_unbounded_violations() {
+        BLOB_CHECK_TEST_COUNT.with(|count| count.set(0));
+        let contents = (0..=MAX_RESPONSE_BLOBS)
+            .map(|_| {
+                json!({
+                    "uri": "tirith://blob",
+                    "mimeType": "text/plain",
+                    "blob": "not*base*64!!!"
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = json!({"contents": contents});
+
+        let mut violations = Vec::new();
+        let mut walk_budget = ResponseWalkBudget::new();
+        collect_blob_violations(&result, &mut violations, &mut walk_budget);
+        walk_budget.finish(&mut violations);
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "blob_undecodable"),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "analysis_budget_exceeded"),
+            "{violations:?}"
+        );
+        assert!(violations.len() <= 2, "{violations:?}");
+        BLOB_CHECK_TEST_COUNT.with(|count| assert_eq!(count.get(), MAX_RESPONSE_BLOBS));
+    }
+
+    #[test]
+    fn response_walk_node_budget_fails_closed() {
+        let result = json!({
+            "items": vec![Value::Null; MAX_RESPONSE_WALK_NODES]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ToolsList, &ctx());
+        assert!(outcome.is_block(), "{outcome:?}");
+        assert!(
+            has_code(&outcome, "analysis_budget_exceeded"),
+            "{outcome:?}"
+        );
+        assert!(outcome.violations.len() <= MAX_RESPONSE_VIOLATIONS);
     }
 
     #[test]
