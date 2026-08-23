@@ -102,12 +102,13 @@ enum EventTimestampError {
 
 /// Whether a `subscription.updated` new-status revokes the API key, matching
 /// the status side-effect match in `process_subscription_updated`: `active`
-/// unrevokes, `canceled` leaves the key until period end, and everything else
-/// (`past_due`, `revoked`, and any unknown status handled defensively) revokes.
+/// and `trialing` un-revoke, `canceled` leaves the key until period end, and
+/// everything else (`past_due`, `revoked`, and any unknown status handled
+/// defensively) revokes.
 /// A dropped update of a revoking status keeps paid access open, so those are
 /// the ones worth dead-lettering when they cannot be ordered.
 fn status_revokes(new_status: &str) -> bool {
-    !matches!(new_status, "active" | "canceled")
+    !matches!(new_status, "active" | "trialing" | "canceled")
 }
 
 /// Validate an event timestamp and compare it to the row version observed in
@@ -147,6 +148,8 @@ const INSERT_DEAD_LETTER_SQL: &str = "INSERT INTO dead_letter \
      WHERE excluded.reason LIKE 'unorderable_revocation:%' \
        AND dead_letter.reason NOT LIKE 'unorderable_revocation:%'";
 
+const DEAD_LETTER_REDACTION_MIGRATION: &str = "dead_letter_payload_redaction_v1";
+
 impl Db {
     pub fn open(path: &str) -> Result<Self, AppError> {
         let conn =
@@ -176,55 +179,87 @@ impl Db {
                 .map_err(|e| AppError::Internal(format!("migration price_id→product_id: {e}")))?;
         }
 
-        // Older releases persisted the complete provider event in dead_letter,
-        // including customer email and arbitrary metadata. The newtype below
-        // prevents new unsafe writes, but that compile-time invariant cannot
-        // clean rows already on disk. Rewrite every retained row through the
-        // same allowlist on startup; malformed legacy JSON is reduced to the
-        // trusted relational columns rather than preserved verbatim.
-        let legacy_dead_letters = match conn.prepare(
-            "SELECT id, event_type, occurred_at, subscription_id, payload FROM dead_letter",
-        ) {
-            Ok(mut statement) => statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|e| AppError::Internal(format!("migration read dead-letter: {e}")))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| AppError::Internal(format!("migration collect dead-letter: {e}")))?,
-            // The direct legacy-schema migration test constructs only the
-            // subscriptions table. Production `Db::open` creates dead_letter
-            // before migrations, so absence is a test/partial-schema no-op.
-            Err(_) => Vec::new(),
-        };
-        for (id, event_type, occurred_at, subscription_id, payload) in legacy_dead_letters {
-            let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
-            let data = parsed.as_ref().and_then(|value| value.get("data"));
-            let safe_text = |field: &str| {
-                data.and_then(|value| value.get(field))
-                    .and_then(serde_json::Value::as_str)
-            };
-            let redacted = RedactedDeadLetterPayload::lifecycle(
-                &event_type,
-                occurred_at.as_deref(),
-                subscription_id.as_deref(),
-                safe_text("status"),
-                safe_text("product_id"),
-                safe_text("checkout_id"),
-                safe_text("customer_id"),
-                safe_text("tier"),
-            );
-            conn.execute(
-                "UPDATE dead_letter SET payload=?1 WHERE id=?2",
-                params![redacted.into_inner(), id],
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                 name TEXT PRIMARY KEY,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .map_err(|e| AppError::Internal(format!("migration marker schema: {e}")))?;
+        let dead_letters_redacted: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name=?1)",
+                params![DEAD_LETTER_REDACTION_MIGRATION],
+                |row| row.get(0),
             )
-            .map_err(|e| AppError::Internal(format!("migration redact dead-letter: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("migration marker read: {e}")))?;
+
+        if !dead_letters_redacted {
+            // Older releases persisted the complete provider event in
+            // dead_letter, including customer email and arbitrary metadata.
+            // Rewrite the retained set exactly once. The rows and marker share
+            // one transaction so a crash or rejected row cannot publish a
+            // partial privacy migration.
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| AppError::Internal(format!("migration redaction tx: {e}")))?;
+            let legacy_dead_letters = {
+                match tx.prepare(
+                    "SELECT id, event_type, occurred_at, subscription_id, payload FROM dead_letter",
+                ) {
+                    Ok(mut statement) => statement
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        })
+                        .map_err(|e| {
+                            AppError::Internal(format!("migration read dead-letter: {e}"))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| {
+                            AppError::Internal(format!("migration collect dead-letter: {e}"))
+                        })?,
+                    // Direct partial-schema tests may construct only the
+                    // subscriptions table. Production creates dead_letter
+                    // before migrations, so absence is a safe no-op.
+                    Err(_) => Vec::new(),
+                }
+            };
+            for (id, event_type, occurred_at, subscription_id, payload) in legacy_dead_letters {
+                let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
+                let data = parsed.as_ref().and_then(|value| value.get("data"));
+                let safe_text = |field: &str| {
+                    data.and_then(|value| value.get(field))
+                        .and_then(serde_json::Value::as_str)
+                };
+                let redacted = RedactedDeadLetterPayload::lifecycle(
+                    &event_type,
+                    occurred_at.as_deref(),
+                    subscription_id.as_deref(),
+                    safe_text("status"),
+                    safe_text("product_id"),
+                    safe_text("checkout_id"),
+                    safe_text("customer_id"),
+                    safe_text("tier"),
+                );
+                tx.execute(
+                    "UPDATE dead_letter SET payload=?1 WHERE id=?2",
+                    params![redacted.into_inner(), id],
+                )
+                .map_err(|e| AppError::Internal(format!("migration redact dead-letter: {e}")))?;
+            }
+            tx.execute(
+                "INSERT INTO schema_migrations (name) VALUES (?1)",
+                params![DEAD_LETTER_REDACTION_MIGRATION],
+            )
+            .map_err(|e| AppError::Internal(format!("migration marker insert: {e}")))?;
+            tx.commit()
+                .map_err(|e| AppError::Internal(format!("migration redaction commit: {e}")))?;
         }
 
         Ok(())
@@ -743,10 +778,11 @@ impl Db {
 
             // Side effects by status. The earlier terminal guard means
             // `prev_status == revoked` never reaches this match, so any
-            // remaining prev_status (past_due / canceled / active / None)
-            // is safe to un-revoke when transitioning to active.
+            // remaining prev_status (past_due / canceled / active / trialing /
+            // None) is safe to un-revoke when transitioning to a benefit-
+            // carrying state.
             let outcome = match data.new_status.as_str() {
-                "active" => {
+                "active" | "trialing" => {
                     let rows = tx
                         .execute(
                             "UPDATE api_keys SET revoked=0 WHERE subscription_id=?1",
@@ -988,7 +1024,7 @@ impl Db {
                        AND k.revoked=0
                        AND s.id=?2
                        AND s.tier=?3
-                       AND s.status IN ('active','canceled')
+                       AND s.status IN ('active','trialing','canceled')
                        AND NOT EXISTS (
                        SELECT 1 FROM tokens
                        WHERE subscription_id=s.id
@@ -1010,7 +1046,7 @@ impl Db {
                        SELECT 1 FROM subscriptions s
                        JOIN api_keys k ON k.subscription_id=s.id
                        WHERE k.key_hash=?1 AND k.revoked=0 AND s.id=?2
-                         AND s.tier=?3 AND s.status IN ('active','canceled')
+                         AND s.tier=?3 AND s.status IN ('active','trialing','canceled')
                      )",
                     params![key_hash, sid, tier],
                     |row| row.get(0),
@@ -1063,18 +1099,26 @@ impl Db {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = acquire_db(&conn);
-            conn.execute(
-                INSERT_DEAD_LETTER_SQL,
-                params![
-                    dl.event_id,
-                    dl.subscription_id,
-                    dl.event_type,
-                    dl.reason,
-                    dl.occurred_at,
-                    dl.payload.into_inner()
-                ],
-            )
-            .map_err(|e| AppError::Internal(format!("db dead letter: {e}")))?;
+            let event_id = dl.event_id.clone();
+            let written = conn
+                .execute(
+                    INSERT_DEAD_LETTER_SQL,
+                    params![
+                        dl.event_id,
+                        dl.subscription_id,
+                        dl.event_type,
+                        dl.reason,
+                        dl.occurred_at,
+                        dl.payload.into_inner()
+                    ],
+                )
+                .map_err(|e| AppError::Internal(format!("db dead letter: {e}")))?;
+            if written == 0 {
+                tracing::info!(
+                    event_id = %event_id,
+                    "dead-letter write was superseded by the existing event row"
+                );
+            }
             Ok(())
         })
         .await
@@ -1826,6 +1870,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trialing_keeps_benefits_and_refresh_authorization() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        db.delete_tokens_for_subscription("sub_1");
+
+        let mut trialing = make_updated("evt_2", "sub_1", "trialing");
+        trialing.occurred_at = Some("2024-02-01T00:00:00Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(trialing).await.unwrap(),
+            UpdatedOutcome::Unrevoked
+        );
+        assert_eq!(
+            read_state(&db, "sub_1"),
+            ("trialing".to_string(), Some(false))
+        );
+
+        assert_eq!(
+            db.publish_refresh_token_if_authorized(
+                "keyhash_sub_1",
+                "sub_1",
+                "team",
+                "trial-refresh-token",
+                9_999_999_999,
+                60,
+            )
+            .await
+            .unwrap(),
+            RefreshPublishOutcome::Inserted
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_publication_rechecks_revocation_after_preflight() {
         let db = test_db();
         db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
@@ -2440,7 +2518,16 @@ mod tests {
         assert_eq!(parsed["data"]["product_id"], "prod_team");
         assert_eq!(parsed["data"]["tier"], "team");
 
-        // Idempotency matters because this migration runs at every startup.
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name=?1",
+                params![DEAD_LETTER_REDACTION_MIGRATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, 1);
+
+        // Reopening checks the marker rather than rescanning retained rows.
         Db::migrate(&conn).unwrap();
         let after_second_run: String = conn
             .query_row(
@@ -2450,6 +2537,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after_second_run, payload);
+    }
+
+    #[test]
+    fn dead_letter_redaction_migration_rolls_back_rows_and_marker_together() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dead_letter (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL UNIQUE,
+                 subscription_id TEXT,
+                 event_type TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 occurred_at TEXT,
+                 payload TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO dead_letter
+             (event_id, subscription_id, event_type, reason, payload)
+             VALUES
+               ('evt_first', 'sub_1', 'subscription.past_due', 'legacy',
+                '{\"data\":{\"metadata\":{\"secret\":\"first-canary\"}}}'),
+               ('evt_second', 'sub_2', 'subscription.revoked', 'legacy',
+                '{\"data\":{\"metadata\":{\"secret\":\"second-canary\"}}}');
+             CREATE TRIGGER reject_second_redaction
+             BEFORE UPDATE OF payload ON dead_letter
+             WHEN OLD.event_id='evt_second'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected migration failure');
+             END;",
+        )
+        .unwrap();
+
+        assert!(Db::migrate(&conn).is_err());
+        let payloads = {
+            let mut statement = conn
+                .prepare("SELECT payload FROM dead_letter ORDER BY event_id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(payloads
+            .iter()
+            .any(|payload| payload.contains("first-canary")));
+        assert!(payloads
+            .iter()
+            .any(|payload| payload.contains("second-canary")));
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name=?1",
+                params![DEAD_LETTER_REDACTION_MIGRATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, 0);
+
+        conn.execute_batch("DROP TRIGGER reject_second_redaction;")
+            .unwrap();
+        Db::migrate(&conn).unwrap();
+        let remaining_canaries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dead_letter
+                 WHERE payload LIKE '%first-canary%' OR payload LIKE '%second-canary%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_canaries, 0);
     }
 
     #[test]
