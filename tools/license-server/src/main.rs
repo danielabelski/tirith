@@ -111,8 +111,8 @@ fn spawn_cleanup_task(db: Db) {
     });
 }
 
-/// Dead-letter auto-retry: re-fetch unresolvable products from the Polar
-/// API every five minutes.
+/// Dead-letter auto-retry: re-fetch unresolvable products and provisionally
+/// revoked, unorderable lifecycle events from the Polar API every five minutes.
 ///
 /// Only subscription-type dead letters are retried here. `order.paid` with
 /// an unknown product returns 500 so Polar retries the full event, and
@@ -145,8 +145,12 @@ async fn retry_dead_letters(
             None => continue,
         };
 
-        // Stale if the tier was already fixed by a newer event.
-        if entry.current_tier.as_deref() != Some("unknown") {
+        let lifecycle_reconciliation = entry.reason.starts_with("unorderable_revocation:");
+
+        // Product-resolution rows are stale once the tier is fixed. Lifecycle
+        // reconciliation rows are about access state and must still run even
+        // when the tier is already known.
+        if !lifecycle_reconciliation && entry.current_tier.as_deref() != Some("unknown") {
             info!(
                 dead_letter_id = entry.id,
                 sub_id = %sub_id,
@@ -220,6 +224,46 @@ async fn retry_dead_letters(
         };
 
         let product_id = body.get("product_id").and_then(|v| v.as_str());
+
+        if lifecycle_reconciliation {
+            let current_status = body
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let current_tier = product_id.and_then(|pid| config.tier_for_product(pid));
+            match db
+                .apply_retry_lifecycle_fix(
+                    entry.id,
+                    &entry.event_id,
+                    &entry.event_type,
+                    &sub_id,
+                    current_status,
+                    current_tier,
+                    product_id,
+                    entry.last_event_at.clone(),
+                )
+                .await
+            {
+                Ok(true) => info!(
+                    dead_letter_id = entry.id,
+                    sub_id = %sub_id,
+                    status = %current_status,
+                    "reconciled provisional revocation from current Polar state"
+                ),
+                Ok(false) => info!(
+                    dead_letter_id = entry.id,
+                    sub_id = %sub_id,
+                    "discarded lifecycle reconciliation superseded by a newer local event"
+                ),
+                Err(error) => error!(
+                    dead_letter_id = entry.id,
+                    sub_id = %sub_id,
+                    %error,
+                    "failed to apply lifecycle reconciliation"
+                ),
+            }
+            continue;
+        }
 
         if let Some(pid) = product_id {
             if let Some(tier) = config.tier_for_product(pid) {
