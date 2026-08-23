@@ -50,6 +50,19 @@ pub(crate) struct DirEntryFacts {
 /// inspection and use.
 pub(crate) type FileIdentity = (u64, u64);
 
+/// Same-handle facts that must remain stable while bytes are consumed.
+/// Identity and length alone do not detect an in-place, same-size rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileGeneration {
+    pub(crate) identity: FileIdentity,
+    pub(crate) size: u64,
+    pub(crate) links: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanos: i64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanos: i64,
+}
+
 pub(crate) fn file_identity(file: &File) -> std::io::Result<FileIdentity> {
     #[cfg(unix)]
     {
@@ -74,6 +87,54 @@ pub(crate) fn file_identity(file: &File) -> std::io::Result<FileIdentity> {
             u64::from(info.dwVolumeSerialNumber),
             (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(unsupported_capability())
+    }
+}
+
+pub(crate) fn file_generation(file: &File) -> std::io::Result<FileGeneration> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file.metadata()?;
+        Ok(FileGeneration {
+            identity: (metadata.dev(), metadata.ino()),
+            size: metadata.size(),
+            links: metadata.nlink(),
+            modified_seconds: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the file handle is live and `info` is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(FileGeneration {
+            identity: (
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            ),
+            size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+            links: u64::from(info.nNumberOfLinks),
+            modified_seconds: i64::from(info.ftLastWriteTime.dwHighDateTime),
+            modified_nanos: i64::from(info.ftLastWriteTime.dwLowDateTime),
+            changed_seconds: i64::from(info.ftCreationTime.dwHighDateTime),
+            changed_nanos: i64::from(info.ftCreationTime.dwLowDateTime),
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -420,16 +481,9 @@ fn child_as_file_error(error: ChildError) -> OpenRegularError {
 /// saw, so a file hashed as part of an audited tree may in fact be a store the
 /// audit promised never to read.
 pub(crate) fn hard_link_count(file: &File) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        file.metadata().ok().map(|metadata| metadata.nlink())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        None
-    }
+    file_generation(file)
+        .ok()
+        .map(|generation| generation.links)
 }
 
 #[cfg(windows)]

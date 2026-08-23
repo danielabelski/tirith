@@ -478,18 +478,24 @@ fn the_caps_are_folded_into_the_digest() {
 
 fn walk_entry(root: &Path, relative: &str, size: u64, mode: u32) -> WalkEntry {
     let capability = DirCapability::open_root(root).expect("open retained test root");
-    let identity = capability
+    let opened = capability
         .open_descendant_file(relative, u64::MAX)
-        .map(|file| file_identity(&file).expect("read stable test identity"))
+        .map(|file| {
+            (
+                file_identity(&file).expect("read stable test identity"),
+                file_generation(&file).expect("read stable test generation"),
+            )
+        })
         // Only the vanished-file test fabricates an already-gone walk entry; its
         // open fails before this sentinel identity can be compared.
-        .unwrap_or((0, 0));
+        .ok();
     WalkEntry {
         relative: relative.to_string(),
         directory: false,
         mode,
         size,
-        identity,
+        identity: opened.map(|(identity, _)| identity).unwrap_or((0, 0)),
+        generation: opened.map(|(_, generation)| generation),
     }
 }
 
@@ -606,6 +612,7 @@ fn a_file_rebound_to_another_inode_of_the_same_size_and_mode_is_refused() {
         mode: real_mode,
         size: 4,
         identity: measured.identity,
+        generation: measured.generation,
     };
     let error = hash_test_entry(root.path(), &entry, &mut hasher)
         .expect_err("a name rebound to another inode must be refused");
@@ -670,9 +677,72 @@ fn a_vanished_file_is_refused_rather_than_skipped() {
     assert!(matches!(error, TreeScanError::Changed(path) if path == "gone.txt"));
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn a_same_size_in_place_mutation_during_streaming_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("changing.bin");
+    std::fs::write(&path, vec![b'A'; 128 * 1024]).expect("write original");
+    let mutate = path.clone();
+    FILE_HASH_CHUNK_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::write(mutate, vec![b'B'; 128 * 1024]).expect("rewrite in place");
+        }));
+    });
+
+    let error = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect_err("same-size mutation must invalidate the file generation");
+    assert!(matches!(error, TreeScanError::Changed(path) if path == "changing.bin"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_file_with_an_external_hardlink_is_refused() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let root = parent.path().join("source");
+    std::fs::create_dir(&root).expect("source root");
+    std::fs::write(root.join("shared.bin"), b"shared").expect("source file");
+    std::fs::hard_link(root.join("shared.bin"), parent.path().join("outside.bin"))
+        .expect("external hardlink");
+
+    let error = scan_tree(&root, &[], PrunedNames::None, TreeLimits::default())
+        .expect_err("external aliases make a tree file unstable");
+    assert!(matches!(error, TreeScanError::Changed(path) if path.contains("hard links")));
+}
+
 // ---------------------------------------------------------------------------
 // Exclusions
 // ---------------------------------------------------------------------------
+
+#[test]
+fn exclusion_count_and_aggregate_bytes_are_bounded_before_walking() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write(root.path(), "one.txt", "one");
+    let too_many = (0..=MAX_TREE_EXCLUSIONS)
+        .map(|index| format!("missing-{index}"))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        scan_tree(
+            root.path(),
+            &too_many,
+            PrunedNames::None,
+            TreeLimits::default()
+        ),
+        Err(TreeScanError::CapExceeded(_))
+    ));
+
+    let wide = "x".repeat(296);
+    let too_wide = (0..900)
+        .map(|index| format!("{index:04}{wide}"))
+        .collect::<Vec<_>>();
+    assert!(scan_tree(
+        root.path(),
+        &too_wide,
+        PrunedNames::None,
+        TreeLimits::default()
+    )
+    .is_err());
+}
 
 #[test]
 fn git_the_output_root_and_the_receipt_destination_are_all_excluded() {
@@ -938,6 +1008,71 @@ fn a_fresh_receipt_is_content_addressed_clean_and_valid() {
     assert!(receipt.subject.source_tree.is_some());
     assert!(receipt.subject.output_tree.is_some());
     assert!(!receipt.coverage.audit_chain_anchored);
+}
+
+#[test]
+fn receipt_validation_rejects_unbounded_or_noncanonical_exclusions() {
+    let (_root, receipt) = clean_receipt();
+    for exclusions in [
+        (0..=MAX_TREE_EXCLUSIONS)
+            .map(|index| format!("excluded-{index}"))
+            .collect::<Vec<_>>(),
+        vec!["/not-normalized/".to_string()],
+    ] {
+        let mut unsafe_receipt = receipt.clone();
+        unsafe_receipt.subject.source_exclusions = exclusions;
+        unsafe_receipt.signature = None;
+        unsafe_receipt.signature_present = false;
+        unsafe_receipt.receipt_id = unsafe_receipt.compute_content_hash();
+        assert!(unsafe_receipt
+            .validate()
+            .expect_err("unsafe exclusions must fail before a verification walk")
+            .to_string()
+            .contains("exclusion"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_the_visible_source_after_its_scan_makes_the_receipt_partial() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let source = parent.path().join("source");
+    let retained = parent.path().join("retained-source");
+    let output = parent.path().join("output");
+    std::fs::create_dir(&source).expect("source");
+    std::fs::create_dir(&output).expect("output");
+    write(&source, "Cargo.lock", "LOCK-A");
+    write(&source, "src/main.rs", "fn main() {}\n");
+    write(&output, "app", "binary");
+
+    let visible_source = source.clone();
+    let receipt = build_receipt_after_source_scan(
+        &BuildRequest {
+            source: source.clone(),
+            output,
+            extra_exclusions: Vec::new(),
+            extra_output_exclusions: Vec::new(),
+            execution_receipt: None,
+            argv: Vec::new(),
+            limits: TreeLimits::default(),
+        },
+        "a".repeat(64),
+        move || {
+            std::fs::rename(&visible_source, &retained).expect("move retained source");
+            std::fs::create_dir(&visible_source).expect("replacement source");
+            write(&visible_source, "Cargo.lock", "LOCK-B");
+        },
+    );
+
+    assert_eq!(receipt.status, AttestStatus::Partial);
+    assert!(receipt.subject.source_tree.is_none());
+    assert!(receipt.subject.lockfiles.is_empty());
+    assert!(receipt.subject.git.commit.is_none());
+    assert!(receipt
+        .coverage
+        .scan_refusal
+        .as_deref()
+        .is_some_and(|reason| reason.contains("visible source root changed")));
 }
 
 #[test]

@@ -55,13 +55,16 @@
 //! Every failure is a REFUSAL, never a skip. A digest over a tree that was
 //! silently partial would be a receipt that says something false about bytes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::command_card::sha256_hex;
-use crate::util::dirfd::{file_identity, ChildError, DirCapability, EntryKind, FileIdentity};
+use crate::util::dirfd::{
+    file_generation, file_identity, ChildError, DirCapability, EntryKind, FileGeneration,
+    FileIdentity,
+};
 use crate::util::{open_read_no_follow_capped, ContainedAtomicFile, HashOutcome, OpenRegularError};
 
 /// Schema version of [`BuildReceipt`]. Bumped when a field is added or its
@@ -103,6 +106,11 @@ pub const MAX_TOOL_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum bytes of a saved receipt that will be re-read. A receipt is a small
 /// bounded record.
 pub const MAX_BUILD_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Exclusions are untrusted receipt input during unsigned verification. Bound
+/// both their cardinality and aggregate bytes before a tree walk can use them.
+pub const MAX_TREE_EXCLUSIONS: usize = 1024;
+pub const MAX_TREE_EXCLUSION_BYTES: usize = 256 * 1024;
 
 /// The directory (or submodule pointer file) pruned from SOURCE hashing at
 /// EVERY depth, so a receipt binds the working tree rather than the object
@@ -473,6 +481,54 @@ struct WalkEntry {
     size: u64,
     /// The filesystem identity the walk saw, re-checked through the open handle.
     identity: FileIdentity,
+    /// Present for files and compared before and after streaming their bytes.
+    generation: Option<FileGeneration>,
+}
+
+struct ExclusionMatcher {
+    normalized: Vec<String>,
+    exact: BTreeSet<String>,
+}
+
+impl ExclusionMatcher {
+    fn new(exclusions: &[String], max_path_bytes: usize) -> Result<Self, TreeScanError> {
+        if exclusions.len() > MAX_TREE_EXCLUSIONS {
+            return Err(TreeScanError::CapExceeded(format!(
+                "more than {MAX_TREE_EXCLUSIONS} exclusions"
+            )));
+        }
+        let mut normalized = Vec::with_capacity(exclusions.len());
+        let mut aggregate_bytes = 0usize;
+        for exclusion in exclusions {
+            let value = exclusion.trim_matches('/');
+            if value.is_empty() {
+                continue;
+            }
+            if value.len() > max_path_bytes {
+                return Err(TreeScanError::PathTooLong(value.to_string()));
+            }
+            aggregate_bytes = aggregate_bytes.saturating_add(value.len());
+            if aggregate_bytes > MAX_TREE_EXCLUSION_BYTES {
+                return Err(TreeScanError::CapExceeded(format!(
+                    "exclusions exceed {MAX_TREE_EXCLUSION_BYTES} bytes"
+                )));
+            }
+            normalized.push(value.to_string());
+        }
+        normalized.sort();
+        normalized.dedup();
+        let exact = normalized.iter().cloned().collect();
+        Ok(Self { normalized, exact })
+    }
+
+    fn excludes(&self, relative: &str) -> bool {
+        if self.exact.contains(relative) {
+            return true;
+        }
+        relative
+            .match_indices('/')
+            .any(|(index, _)| self.exact.contains(&relative[..index]))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,7 +565,12 @@ pub fn scan_tree(
     pruned: PrunedNames,
     limits: TreeLimits,
 ) -> Result<TreeScan, TreeScanError> {
-    let root_capability = DirCapability::open_root(root).map_err(|error| match error {
+    let root_capability = open_tree_root_capability(root)?;
+    scan_tree_from_capability(&root_capability, exclusions, pruned, limits)
+}
+
+fn open_tree_root_capability(root: &Path) -> Result<DirCapability, TreeScanError> {
+    DirCapability::open_root(root).map_err(|error| match error {
         ChildError::Symlink => TreeScanError::Symlink(root.display().to_string()),
         ChildError::NotADirectory => {
             TreeScanError::RootUnusable("the tree root is not a directory".to_string())
@@ -518,8 +579,7 @@ pub fn scan_tree(
             TreeScanError::RootUnusable("the tree root has an unsafe name".to_string())
         }
         ChildError::Io(error) => TreeScanError::RootUnusable(error.to_string()),
-    })?;
-    scan_tree_from_capability(&root_capability, exclusions, pruned, limits)
+    })
 }
 
 /// Complete a tree scan through an already retained root. Kept separate from
@@ -547,26 +607,11 @@ fn scan_tree_from_capability_after_walk(
     limits
         .validate_for_scan()
         .map_err(TreeScanError::CapExceeded)?;
-    let mut normalized_exclusions: Vec<String> = exclusions
-        .iter()
-        .map(|value| value.trim_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .collect();
-    normalized_exclusions.sort();
-    normalized_exclusions.dedup();
-
-    // Precomputed once: the subtree prefix of every excluded directory. Built
-    // outside the walk because the alternative formats a string per entry per
-    // exclusion, and the walk runs up to a hundred thousand times.
-    let exclusion_prefixes: Vec<String> = normalized_exclusions
-        .iter()
-        .map(|value| format!("{value}/"))
-        .collect();
+    let exclusion_matcher = ExclusionMatcher::new(exclusions, limits.max_path_bytes)?;
 
     let mut state = TreeWalkState {
         limits,
-        normalized_exclusions: &normalized_exclusions,
-        exclusion_prefixes: &exclusion_prefixes,
+        exclusions: &exclusion_matcher,
         pruned,
         entries: Vec::new(),
         pruned_paths: Vec::new(),
@@ -603,7 +648,7 @@ fn scan_tree_from_capability_after_walk(
     let mut hasher = DigestBuilder::new(
         mode_model,
         limits,
-        &normalized_exclusions,
+        &exclusion_matcher.normalized,
         pruned,
         &pruned_paths,
     );
@@ -642,8 +687,7 @@ fn scan_tree_from_capability_after_walk(
         revalidate_directory_snapshot(
             root,
             snapshot,
-            &normalized_exclusions,
-            &exclusion_prefixes,
+            &exclusion_matcher,
             pruned,
             limits.max_path_bytes,
         )?;
@@ -656,7 +700,7 @@ fn scan_tree_from_capability_after_walk(
         total_bytes,
         mode_model,
         limits,
-        exclusions: normalized_exclusions,
+        exclusions: exclusion_matcher.normalized,
         pruned: pruned_paths,
         files,
     })
@@ -664,8 +708,7 @@ fn scan_tree_from_capability_after_walk(
 
 struct TreeWalkState<'a> {
     limits: TreeLimits,
-    normalized_exclusions: &'a [String],
-    exclusion_prefixes: &'a [String],
+    exclusions: &'a ExclusionMatcher,
     pruned: PrunedNames,
     entries: Vec<WalkEntry>,
     pruned_paths: Vec<String>,
@@ -695,7 +738,7 @@ fn walk_capability_directory(
         .limits
         .max_files
         .saturating_sub(state.entries.len())
-        .saturating_add(state.normalized_exclusions.len())
+        .saturating_add(state.exclusions.normalized.len())
         .saturating_add(2);
     let (facts, truncated) = directory.read_entries(listing_cap).map_err(|error| {
         TreeScanError::Io(format!("{}: {error}", display_relative(relative_dir)))
@@ -709,8 +752,7 @@ fn walk_capability_directory(
     let snapshot_entries = projected_directory_entries(
         &facts,
         relative_dir,
-        state.normalized_exclusions,
-        state.exclusion_prefixes,
+        state.exclusions,
         state.pruned,
         state.limits.max_path_bytes,
     )?;
@@ -734,12 +776,7 @@ fn walk_capability_directory(
             state.pruned_paths.push(relative);
             continue;
         }
-        if state.normalized_exclusions.contains(&relative)
-            || state
-                .exclusion_prefixes
-                .iter()
-                .any(|prefix| relative.starts_with(prefix.as_str()))
-        {
+        if state.exclusions.excludes(&relative) {
             continue;
         }
         if relative.len() > state.limits.max_path_bytes {
@@ -783,6 +820,7 @@ fn walk_capability_directory(
                     identity: child
                         .identity()
                         .map_err(|error| TreeScanError::Io(format!("{relative}: {error}")))?,
+                    generation: None,
                 });
                 walk_capability_directory(&child, &relative, depth + 1, state)?;
             }
@@ -798,12 +836,21 @@ fn walk_capability_directory(
                 }
                 let identity = file_identity(&handle)
                     .map_err(|error| TreeScanError::Io(format!("{relative}: {error}")))?;
+                let generation = file_generation(&handle)
+                    .map_err(|error| TreeScanError::Io(format!("{relative}: {error}")))?;
+                if generation.links != 1 {
+                    return Err(TreeScanError::Changed(format!(
+                        "{relative} has {} hard links",
+                        generation.links
+                    )));
+                }
                 state.entries.push(WalkEntry {
                     relative,
                     directory: false,
                     mode: mode_of(&metadata),
                     size: metadata.len(),
                     identity,
+                    generation: Some(generation),
                 });
             }
             EntryKind::Symlink | EntryKind::Other => unreachable!("handled above"),
@@ -815,8 +862,7 @@ fn walk_capability_directory(
 fn projected_directory_entries(
     facts: &[crate::util::dirfd::DirEntryFacts],
     relative_dir: &str,
-    normalized_exclusions: &[String],
-    exclusion_prefixes: &[String],
+    exclusions: &ExclusionMatcher,
     pruned: PrunedNames,
     max_path_bytes: usize,
 ) -> Result<Vec<DirectoryEntrySnapshot>, TreeScanError> {
@@ -836,11 +882,7 @@ fn projected_directory_entries(
             });
             continue;
         }
-        if normalized_exclusions.contains(&relative)
-            || exclusion_prefixes
-                .iter()
-                .any(|prefix| relative.starts_with(prefix.as_str()))
-        {
+        if exclusions.excludes(&relative) {
             continue;
         }
         if relative.len() > max_path_bytes {
@@ -864,8 +906,7 @@ fn projected_directory_entries(
 fn revalidate_directory_snapshot(
     root: &DirCapability,
     snapshot: &DirectorySnapshot,
-    normalized_exclusions: &[String],
-    exclusion_prefixes: &[String],
+    exclusions: &ExclusionMatcher,
     pruned: PrunedNames,
     max_path_bytes: usize,
 ) -> Result<(), TreeScanError> {
@@ -873,8 +914,7 @@ fn revalidate_directory_snapshot(
         return revalidate_directory_snapshot_handle(
             root,
             snapshot,
-            normalized_exclusions,
-            exclusion_prefixes,
+            exclusions,
             pruned,
             max_path_bytes,
         );
@@ -882,22 +922,14 @@ fn revalidate_directory_snapshot(
     let directory = root
         .open_descendant_directory(&snapshot.relative)
         .map_err(|error| map_child_directory_error(&snapshot.relative, error))?;
-    revalidate_directory_snapshot_handle(
-        &directory,
-        snapshot,
-        normalized_exclusions,
-        exclusion_prefixes,
-        pruned,
-        max_path_bytes,
-    )
+    revalidate_directory_snapshot_handle(&directory, snapshot, exclusions, pruned, max_path_bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn revalidate_directory_snapshot_handle(
     directory: &DirCapability,
     snapshot: &DirectorySnapshot,
-    normalized_exclusions: &[String],
-    exclusion_prefixes: &[String],
+    exclusions: &ExclusionMatcher,
     pruned: PrunedNames,
     max_path_bytes: usize,
 ) -> Result<(), TreeScanError> {
@@ -917,7 +949,7 @@ fn revalidate_directory_snapshot_handle(
     // listing. One further slot is enough to observe an unprojected addition.
     let listing_cap = snapshot
         .raw_entry_count
-        .saturating_add(normalized_exclusions.len())
+        .saturating_add(exclusions.normalized.len())
         .saturating_add(2);
     let (facts, truncated) = directory
         .read_entries(listing_cap)
@@ -928,8 +960,7 @@ fn revalidate_directory_snapshot_handle(
     let entries = projected_directory_entries(
         &facts,
         &snapshot.relative,
-        normalized_exclusions,
-        exclusion_prefixes,
+        exclusions,
         pruned,
         max_path_bytes,
     )?;
@@ -1035,6 +1066,11 @@ fn hash_bound_file(
     if entry.identity != opened_identity {
         return Err(TreeScanError::Changed(entry.relative.clone()));
     }
+    let opened_generation = file_generation(&handle)
+        .map_err(|error| TreeScanError::Io(format!("{}: {error}", entry.relative)))?;
+    if entry.generation != Some(opened_generation) || opened_generation.links != 1 {
+        return Err(TreeScanError::Changed(entry.relative.clone()));
+    }
 
     tree.size(entry.size);
     let mut file_hasher = Sha256::new();
@@ -1054,6 +1090,12 @@ fn hash_bound_file(
         if take != read {
             return Err(TreeScanError::Changed(entry.relative.clone()));
         }
+        #[cfg(test)]
+        FILE_HASH_CHUNK_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
     }
     let mut extra = [0u8; 1];
     if handle
@@ -1063,7 +1105,18 @@ fn hash_bound_file(
     {
         return Err(TreeScanError::Changed(entry.relative.clone()));
     }
+    let completed_generation = file_generation(&handle)
+        .map_err(|error| TreeScanError::Io(format!("{}: {error}", entry.relative)))?;
+    if completed_generation != opened_generation {
+        return Err(TreeScanError::Changed(entry.relative.clone()));
+    }
     Ok(hex::encode(file_hasher.finalize()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILE_HASH_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 /// The streaming tree hasher. Every field is length-prefixed, so no two
@@ -1232,6 +1285,22 @@ pub fn scan_lockfiles(root: &Path) -> Vec<LockfileDigest> {
         }
     }
     found
+}
+
+fn lockfiles_from_tree_scan(scan: &TreeScan) -> Vec<LockfileDigest> {
+    LOCKFILE_NAMES
+        .iter()
+        .filter_map(|name| {
+            scan.files
+                .iter()
+                .find(|file| file.path == *name)
+                .map(|file| LockfileDigest {
+                    name: (*name).to_string(),
+                    sha256: file.sha256.clone(),
+                    size: file.size,
+                })
+        })
+        .collect()
 }
 
 /// Resolve `HEAD` and the dirty flag through the SAME hardened git envelope the
@@ -1992,6 +2061,22 @@ impl BuildReceipt {
         self.evidence.limits.validate_for_scan().map_err(|reason| {
             BuildReceiptError::Invalid(format!("the tree limits are unsafe: {reason}"))
         })?;
+        for (label, exclusions) in [
+            ("source", &self.subject.source_exclusions),
+            ("output", &self.subject.output_exclusions),
+        ] {
+            let matcher = ExclusionMatcher::new(exclusions, self.evidence.limits.max_path_bytes)
+                .map_err(|error| {
+                    BuildReceiptError::Invalid(format!(
+                        "the {label} exclusion set is unsafe: {error}"
+                    ))
+                })?;
+            if matcher.normalized != *exclusions {
+                return Err(BuildReceiptError::Invalid(format!(
+                    "the {label} exclusions must be sorted, unique, non-empty normalized relative paths"
+                )));
+            }
+        }
         // The manifest cap is a property of the schema, so a hand-written
         // document cannot carry a longer one and turn `attest deployment` into a
         // request amplifier.
@@ -2194,6 +2279,14 @@ pub struct BuildRequest {
 /// verification, and `verify-build` would report a tree that nobody touched as
 /// changed.
 pub fn build_receipt(request: &BuildRequest, policy_projection_hash: String) -> BuildReceipt {
+    build_receipt_after_source_scan(request, policy_projection_hash, || {})
+}
+
+fn build_receipt_after_source_scan(
+    request: &BuildRequest,
+    policy_projection_hash: String,
+    after_source_scan: impl FnOnce(),
+) -> BuildReceipt {
     let mut refusals: Vec<String> = Vec::new();
     let output_relative = relative_under(&request.source, &request.output);
 
@@ -2202,34 +2295,68 @@ pub fn build_receipt(request: &BuildRequest, policy_projection_hash: String) -> 
         exclusions.push(relative);
     }
     exclusions.extend(request.extra_exclusions.iter().cloned());
-    let output_exclusions = request.extra_output_exclusions.clone();
-
-    let source_scan = match scan_tree(
-        &request.source,
-        &exclusions,
-        PrunedNames::GitMetadata,
-        request.limits,
-    ) {
-        Ok(scan) => Some(scan),
+    let exclusions = match ExclusionMatcher::new(&exclusions, request.limits.max_path_bytes) {
+        Ok(matcher) => Some(matcher.normalized),
         Err(error) => {
             refusals.push(format!("source: {error}"));
             None
         }
     };
-    // The output tree prunes nothing by name: a directory called `.git` under
-    // build output is shipped content, and dropping it would leave bytes the
-    // receipt says nothing about inside a tree it calls bound.
-    let output_scan = match scan_tree(
-        &request.output,
-        &output_exclusions,
-        PrunedNames::None,
-        request.limits,
+    let output_exclusions = match ExclusionMatcher::new(
+        &request.extra_output_exclusions,
+        request.limits.max_path_bytes,
     ) {
-        Ok(scan) => Some(scan),
+        Ok(matcher) => Some(matcher.normalized),
         Err(error) => {
             refusals.push(format!("output: {error}"));
             None
         }
+    };
+
+    let source_capability = match open_tree_root_capability(&request.source) {
+        Ok(capability) => Some(capability),
+        Err(error) => {
+            refusals.push(format!("source: {error}"));
+            None
+        }
+    };
+    let mut source_scan = match (source_capability.as_ref(), exclusions.as_ref()) {
+        (Some(capability), Some(exclusions)) => match scan_tree_from_capability(
+            capability,
+            exclusions,
+            PrunedNames::GitMetadata,
+            request.limits,
+        ) {
+            Ok(scan) => Some(scan),
+            Err(error) => {
+                refusals.push(format!("source: {error}"));
+                None
+            }
+        },
+        _ => None,
+    };
+
+    // The source capability deliberately remains alive across every later
+    // evidence capture. Tests use this seam to replace its visible pathname.
+    after_source_scan();
+
+    // The output tree prunes nothing by name: a directory called `.git` under
+    // build output is shipped content, and dropping it would leave bytes the
+    // receipt says nothing about inside a tree it calls bound.
+    let output_scan = match output_exclusions.as_ref() {
+        Some(output_exclusions) => match scan_tree(
+            &request.output,
+            output_exclusions,
+            PrunedNames::None,
+            request.limits,
+        ) {
+            Ok(scan) => Some(scan),
+            Err(error) => {
+                refusals.push(format!("output: {error}"));
+                None
+            }
+        },
+        None => None,
     };
 
     let mut output_files = Vec::new();
@@ -2249,15 +2376,54 @@ pub fn build_receipt(request: &BuildRequest, policy_projection_hash: String) -> 
         }
     }
 
+    let source_visible = source_capability
+        .as_ref()
+        .is_some_and(|capability| visible_root_matches(capability, &request.source));
+    if source_capability.is_some() && !source_visible {
+        refusals
+            .push("source: the visible source root changed after its retained scan".to_string());
+    }
+
+    let source_inventory = if source_visible && source_scan.is_some() {
+        let inventory = capsule_source_inventory(&request.source);
+        if source_capability
+            .as_ref()
+            .is_some_and(|capability| visible_root_matches(capability, &request.source))
+        {
+            inventory
+        } else {
+            refusals.push(
+                "source: the visible source root changed during capsule inventory".to_string(),
+            );
+            None
+        }
+    } else {
+        None
+    };
+    let git = if source_visible && source_scan.is_some() {
+        let binding = capture_git_binding(&request.source);
+        if source_capability
+            .as_ref()
+            .is_some_and(|capability| visible_root_matches(capability, &request.source))
+        {
+            binding
+        } else {
+            refusals.push("source: the visible source root changed during Git capture".to_string());
+            GitBinding::default()
+        }
+    } else {
+        GitBinding::default()
+    };
+    let lockfiles = source_scan
+        .as_ref()
+        .map(lockfiles_from_tree_scan)
+        .unwrap_or_default();
+
     let anchor = SignatureAnchor::installed();
-    let execution = match request.execution_receipt.as_deref() {
+    let mut execution = match request.execution_receipt.as_deref() {
         None => ExecutionLink::default(),
         Some(path) => match load_capsule_receipt(path) {
-            Ok(capsule) => evaluate_execution_link(
-                &capsule,
-                capsule_source_inventory(&request.source).as_deref(),
-                anchor,
-            ),
+            Ok(capsule) => evaluate_execution_link(&capsule, source_inventory.as_deref(), anchor),
             Err(reason) => ExecutionLink {
                 linked: true,
                 reasons: vec![reason],
@@ -2265,6 +2431,37 @@ pub fn build_receipt(request: &BuildRequest, policy_projection_hash: String) -> 
             },
         },
     };
+
+    // Rebind the retained source only after capsule, Git, and lockfile facts
+    // have been captured. A clean receipt requires the same tree digest on both
+    // sides and the visible path must still name this retained root.
+    if let (Some(capability), Some(exclusions), Some(initial)) = (
+        source_capability.as_ref(),
+        exclusions.as_ref(),
+        source_scan.as_ref(),
+    ) {
+        let stable = visible_root_matches(capability, &request.source)
+            && scan_tree_from_capability(
+                capability,
+                exclusions,
+                PrunedNames::GitMetadata,
+                request.limits,
+            )
+            .is_ok_and(|final_scan| final_scan == *initial);
+        if !stable {
+            refusals.push(
+                "source: the source tree changed while auxiliary evidence was captured".to_string(),
+            );
+            source_scan = None;
+            if execution.linked {
+                execution.verdict = ExecutionVerdict::Observed;
+                execution.reasons.push(
+                    "the retained source tree did not remain stable across execution-link capture"
+                        .to_string(),
+                );
+            }
+        }
+    }
 
     let (argv_digest, argv_len) = redacted_argv_digest(&request.argv);
     // A link that was asked for and did not stand up is exactly what the
@@ -2287,7 +2484,7 @@ pub fn build_receipt(request: &BuildRequest, policy_projection_hash: String) -> 
             source_exclusions: source_scan
                 .as_ref()
                 .map(|scan| scan.exclusions.clone())
-                .unwrap_or(exclusions),
+                .unwrap_or_else(|| exclusions.unwrap_or_default()),
             source_pruned: source_scan
                 .as_ref()
                 .map(|scan| scan.pruned.clone())
@@ -2297,11 +2494,15 @@ pub fn build_receipt(request: &BuildRequest, policy_projection_hash: String) -> 
             output_exclusions: output_scan
                 .as_ref()
                 .map(|scan| scan.exclusions.clone())
-                .unwrap_or(output_exclusions),
+                .unwrap_or_else(|| output_exclusions.unwrap_or_default()),
             output_files,
             output_files_truncated,
-            git: capture_git_binding(&request.source),
-            lockfiles: scan_lockfiles(&request.source),
+            git,
+            lockfiles: if source_scan.is_some() {
+                lockfiles
+            } else {
+                Vec::new()
+            },
             argv_digest,
             argv_len,
         },
@@ -2317,6 +2518,16 @@ pub fn build_receipt(request: &BuildRequest, policy_projection_hash: String) -> 
             audit_chain_anchored: false,
         },
     })
+}
+
+fn visible_root_matches(retained: &DirCapability, visible_path: &Path) -> bool {
+    let Ok(visible) = DirCapability::open_root(visible_path) else {
+        return false;
+    };
+    match (retained.identity(), visible.identity()) {
+        (Ok(retained), Ok(visible)) => retained == visible,
+        _ => false,
+    }
 }
 
 /// The `/`-normalized path of `child` relative to `parent`, when `child` really
