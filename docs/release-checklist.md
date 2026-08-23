@@ -59,6 +59,15 @@ and self-updater accept the checksum signature only from the exact
 `release.yml@refs/tags/<requested-tag>` OIDC identity; a valid signature from
 another repository workflow or another release tag is not interchangeable.
 
+Release versions are single-use. Before publishing, the workflow requires the
+GitHub Release, both crates.io versions, all six npm versions, and all
+version-specific container tags to be absent. A pre-existing version is a hard
+conflict, not a successful rerun, and GitHub release assets are never replaced.
+Recover a partially published release manually after comparing the published
+bytes and provenance; do not delete or overwrite public artifacts to make a
+workflow rerun green. Release runner labels and the Node toolchain use explicit
+versions rather than moving `*-latest` or major-only selectors.
+
 ## Linux release compatibility contract
 
 The two GNU tarballs are cross-linked with Zig against a GLIBC 2.28 ceiling.

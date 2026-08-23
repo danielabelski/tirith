@@ -415,6 +415,45 @@ fn installer_pins_cosign_to_the_exact_release_workflow_and_resolved_tag() {
 }
 
 #[test]
+fn release_publication_refuses_mutable_inputs_and_version_conflicts() {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = std::fs::read_to_string(repository_root.join(".github/workflows/release.yml"))
+        .expect("read release workflow");
+
+    for mutable_runner in ["ubuntu-latest", "macos-latest", "windows-latest"] {
+        assert!(
+            !workflow.contains(mutable_runner),
+            "release workflow must not use moving runner label {mutable_runner}"
+        );
+    }
+    assert!(workflow.contains("node-version: \"22.17.0\""));
+    assert!(!workflow.contains("softprops/action-gh-release@"));
+    assert!(workflow.contains("release assets are immutable"));
+    assert!(workflow.contains("gh release create \"$GITHUB_REF_NAME\" artifacts/*"));
+
+    for forbidden_conflict_fallback in [
+        "already (uploaded|exists)",
+        "previously published version|previously published versions",
+        "cannot publish over the previously published",
+    ] {
+        assert!(
+            !workflow.contains(forbidden_conflict_fallback),
+            "registry conflict must fail instead of matching {forbidden_conflict_fallback:?}"
+        );
+    }
+    for required_guard in [
+        "Refuse crates.io version conflicts",
+        "Refuse existing versioned container tags",
+        "already exists on npm; refusing to accept a registry conflict",
+    ] {
+        assert!(
+            workflow.contains(required_guard),
+            "missing publication conflict guard {required_guard:?}"
+        );
+    }
+}
+
+#[test]
 fn linux_release_keeps_glibc_and_canonical_package_contracts() {
     let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let workflow_path = repository_root.join(".github/workflows/release.yml");
