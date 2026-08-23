@@ -149,6 +149,10 @@ fn setup_cursor_force_rejects_hardlinked_hook_without_mutating_external_inode() 
         .current_dir(project.path())
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
+        // The setup command persists only a system-managed interpreter. Keep
+        // this filesystem-hardlink regression independent of hosted-toolcache
+        // permissions by selecting the root-managed Unix interpreter directly.
+        .env("PATH", "/usr/bin:/bin")
         .args(["setup", "cursor", "--scope", "project", "--force"])
         .output()
         .unwrap();

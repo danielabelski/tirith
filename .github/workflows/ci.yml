@@ -94,12 +94,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ matrix.rust }}
-      # Setup integrations persist a validated absolute interpreter. Exercise
-      # that production dependency on every hosted OS instead of assuming the
-      # runner image happens to expose `python3` under a trusted PATH entry.
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.13"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --locked
       - name: Production capsule reviewed-file receipt
