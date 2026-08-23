@@ -3848,11 +3848,19 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    const DENSE_FD_BUDGET_CHILD: &str = "TIRITH_TEST_DENSE_FD_BUDGET_CHILD";
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn target_exec_parent_endpoints_do_not_consume_the_dense_child_fd_budget() {
+    fn target_exec_dense_fd_budget_probe_child() {
         use std::io::Write as _;
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
+        if std::env::var_os(DENSE_FD_BUDGET_CHILD).is_none() {
+            return;
+        }
+
+        const CHILD_FD_LIMIT: i32 = 96;
         let mut source = tempfile::tempfile().expect("dense-fd source");
         source
             .write_all(b"fd-shape")
@@ -3863,37 +3871,59 @@ mod tests {
             assert!(descriptor >= 0, "fill dense child descriptor range");
             // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
             dense.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) });
-            if descriptor >= 91 {
+            if descriptor >= CHILD_FD_LIMIT {
                 break;
             }
         }
 
+        // The test process may start with arbitrary descriptors already open.
+        // Fill every available slot below the limit, then release exactly four
+        // descriptors owned by this probe: two for the child endpoints and two
+        // to prove that the relocated parent endpoints consumed no low slots.
+        let holes = dense
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, descriptor)| {
+                (descriptor.as_raw_fd() < CHILD_FD_LIMIT).then_some(index)
+            })
+            .take(4)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            holes.len(),
+            4,
+            "isolated probe must own four descriptors below the child limit"
+        );
+        for index in holes {
+            drop(dense.remove(index));
+        }
+
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
-        spec.resources.max_open_files = Some(96);
+        spec.resources.max_open_files = Some(CHILD_FD_LIMIT as u32);
         let (channel, arm) =
             TargetLaunchStatusPipe::create(&mut spec, "test-dense-fd-controller".to_string())
                 .expect("protocol uses exactly two low child descriptors");
         let status_fd = arm.status_writer.as_raw_fd();
         let ack_fd = arm.ack_guard.as_raw_fd();
-        assert!((3..96).contains(&status_fd));
-        assert!((3..96).contains(&ack_fd));
+        assert!((3..CHILD_FD_LIMIT).contains(&status_fd));
+        assert!((3..CHILD_FD_LIMIT).contains(&ack_fd));
         assert_ne!(status_fd, ack_fd);
-        assert!(channel.status_reader.as_raw_fd() >= 96);
+        assert!(channel.status_reader.as_raw_fd() >= CHILD_FD_LIMIT);
         assert!(
             channel
                 .ack_parent
                 .as_ref()
                 .expect("parent ACK endpoint")
                 .as_raw_fd()
-                >= 96
+                >= CHILD_FD_LIMIT
         );
 
         let first = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-        assert!((3..96).contains(&first));
+        assert!((3..CHILD_FD_LIMIT).contains(&first));
         // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
         let first = unsafe { std::os::fd::OwnedFd::from_raw_fd(first) };
         let second = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-        assert!((3..96).contains(&second));
+        assert!((3..CHILD_FD_LIMIT).contains(&second));
         // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
         let second = unsafe { std::os::fd::OwnedFd::from_raw_fd(second) };
         let full_shape = [status_fd, ack_fd, first.as_raw_fd(), second.as_raw_fd()];
@@ -3903,6 +3933,28 @@ mod tests {
                 "full child FD shape collided: {full_shape:?}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_exec_parent_endpoints_do_not_consume_the_dense_child_fd_budget() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .args([
+            "--exact",
+            "runner::tests::target_exec_dense_fd_budget_probe_child",
+            "--nocapture",
+        ])
+        .env(DENSE_FD_BUDGET_CHILD, "1")
+        .output()
+        .expect("run isolated dense-fd budget probe");
+        assert!(
+            output.status.success(),
+            "isolated dense-fd budget probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
