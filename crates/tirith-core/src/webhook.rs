@@ -295,10 +295,26 @@ fn send_with_retry(
     max_attempts: u32,
 ) -> Result<(), String> {
     let client = crate::ssrf_guard::server_client_builder()
+        // Webhook headers are operator-supplied credentials. Reqwest only
+        // strips its small built-in sensitive-header set on a cross-origin
+        // redirect; arbitrary X-API-Key/X-Webhook-Token values would otherwise
+        // be replayed to the redirect target. A webhook endpoint must therefore
+        // acknowledge the exact configured URL rather than redirect delivery.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("client build: {e}"))?;
 
+    send_with_retry_client(&client, url, payload, headers, max_attempts)
+}
+
+fn send_with_retry_client(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    payload: &str,
+    headers: &[(String, String)],
+    max_attempts: u32,
+) -> Result<(), String> {
     for attempt in 0..max_attempts {
         let mut req = client
             .post(url)
@@ -313,6 +329,11 @@ fn send_with_retry(
             Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => {
                 let status = resp.status();
+                if status.is_redirection() {
+                    return Err(format!(
+                        "HTTP {status} (redirects disabled for credential safety)"
+                    ));
+                }
                 // SF-16: Don't retry client errors (4xx) — they will never succeed
                 if status.is_client_error() {
                     return Err(format!("HTTP {status} (non-retriable client error)"));
@@ -350,6 +371,8 @@ fn sanitize_for_json(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
 
     struct TestEnvironment {
         global: tirith_test_support::GlobalStateGuard,
@@ -452,6 +475,63 @@ mod tests {
         env.set("TIRITH_ORG_NAME", "myorg");
         assert_eq!(expand_env_value("$TIRITH_ORG_NAME"), "myorg");
         assert_eq!(expand_env_value("${TIRITH_ORG_NAME}"), "myorg");
+    }
+
+    #[test]
+    fn webhook_redirects_never_replay_custom_headers_or_body() {
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let redirect_target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            redirect_target.set_nonblocking(true).unwrap();
+            let target_address = redirect_target.local_addr().unwrap();
+            let location = format!(
+                "http://redirect-target.example:{}/capture",
+                target_address.port()
+            );
+            let source = crate::ssrf_guard::test_support::ScriptedHttpServer::start(vec![
+                crate::ssrf_guard::test_support::http_response(
+                    status,
+                    &[("Location", location.as_str())],
+                    b"",
+                ),
+            ]);
+            let source_address = source.address();
+            let resolver = crate::ssrf_guard::fixture_resolver_with_lookup_for_test(move |_host| {
+                Ok(vec![source_address])
+            });
+            let client = crate::ssrf_guard::server_client_builder_with_resolver_for_test(resolver)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let source_url = format!(
+                "http://webhook-source.example:{}/hook",
+                source_address.port()
+            );
+            let error = send_with_retry_client(
+                &client,
+                &source_url,
+                r#"{"canary":"body-secret"}"#,
+                &[("X-Webhook-Token".into(), "header-secret".into())],
+                1,
+            )
+            .unwrap_err();
+
+            assert!(error.contains(status.split_once(' ').unwrap().0), "{error}");
+            assert!(error.contains("redirects disabled for credential safety"));
+            let source_requests = source.finish();
+            let request = String::from_utf8_lossy(&source_requests[0]);
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-webhook-token: header-secret"),
+                "{request}"
+            );
+            assert!(request.contains(r#"{"canary":"body-secret"}"#));
+            match redirect_target.accept() {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("webhook client followed {status} and reached redirect target"),
+                Err(error) => panic!("checking redirect target: {error}"),
+            }
+        }
     }
 
     #[test]
