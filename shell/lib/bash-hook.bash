@@ -843,12 +843,30 @@ _tirith_debug_trampoline() {
 
 _tirith_extract_trap_body() {
   local specification="${1:-}" signal="${2:-}"
-  local prefix="trap -- '" suffix="' $signal"
+  local prefix="trap -- '" suffix="' $signal" encoded quote_escape quartet char i=0
   _TIRITH_EXTRACTED_TRAP=""
-  [[ -n "$signal" && "$specification" == "$prefix"*"$suffix" ]] || return 1
-  specification="${specification#"$prefix"}"
-  specification="${specification%"$suffix"}"
-  _TIRITH_EXTRACTED_TRAP="$specification"
+  [[ "$signal" == "DEBUG" && "$specification" == "$prefix"*"$suffix" ]] || return 1
+  encoded="${specification#"$prefix"}"
+  encoded="${encoded%"$suffix"}"
+
+  # `trap -p` emits a reusable shell single-quoted word. An embedded apostrophe
+  # is serialized as the four-character boundary `\'\''`; stripping only the
+  # outer quotes leaves those boundaries behind and later `eval` either changes
+  # the handler or raises a syntax error. Validate every quote boundary, then
+  # evaluate the canonical word only as the right-hand side of an assignment;
+  # the handler itself is data here and is not executed.
+  quote_escape="'\\''"
+  while (( i < ${#encoded} )); do
+    char="${encoded:i:1}"
+    if [[ "$char" == "'" ]]; then
+      quartet="${encoded:i:4}"
+      [[ "$quartet" == "$quote_escape" ]] || return 1
+      i=$((i + 4))
+    else
+      i=$((i + 1))
+    fi
+  done
+  builtin eval -- "_TIRITH_EXTRACTED_TRAP='$encoded'"
 }
 
 _tirith_read_debug_trap_capture() {
@@ -1749,7 +1767,17 @@ if [[ -n "${TIRITH_BASH_MODE:-}" ]]; then
   # made a deliberate choice; if they force `enter` in an environment where
   # delivery is broken, the startup health gate and the pending-not-consumed
   # detection still degrade visibly (contract invariant f) — never silently.
-  _TIRITH_BASH_MODE="$TIRITH_BASH_MODE"
+  case "$TIRITH_BASH_MODE" in
+    enter|preexec) _TIRITH_BASH_MODE="$TIRITH_BASH_MODE" ;;
+    *)
+      # An arbitrary value previously selected neither installer branch while
+      # still exporting a plausible warn-only status. Refuse that silent
+      # no-hook state: fall back to the conservative preexec path and identify
+      # the invalid configuration at startup.
+      _TIRITH_BASH_MODE="preexec"
+      [[ $- == *i* ]] && _tirith_output "tirith: invalid TIRITH_BASH_MODE (expected enter or preexec); using preexec"
+      ;;
+  esac
 elif _tirith_check_safe_mode; then
   _TIRITH_BASH_MODE="preexec"
   # Only print warning in interactive shells (avoid polluting scripted output)

@@ -201,6 +201,19 @@ fn hook_exports_requested_preexec_armed_but_off_before_prompt() {
 }
 
 #[test]
+fn invalid_requested_mode_falls_back_to_preexec_instead_of_disabling_hooks() {
+    let out = source_hook_and_dump_exports(None, &[("TIRITH_BASH_MODE", "typo-mode")]);
+    assert!(
+        out.contains("MODE=preexec"),
+        "an invalid mode must select the conservative preexec path, got:\n{out}"
+    );
+    assert!(
+        out.contains("PROT=off"),
+        "preexec must remain truthful until its prompt bootstrap, got:\n{out}"
+    );
+}
+
+#[test]
 fn hook_exports_ssh_preexec_armed_but_off_before_prompt() {
     // SSH forces preexec even when the capability cache says enter `works`.
     let out =

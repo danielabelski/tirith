@@ -170,6 +170,38 @@ echo clean_post_block && touch {sentinels}/clean_ran
 }
 
 #[test]
+fn invalid_mode_warns_and_cannot_bypass_requested_enforcement() {
+    let (_out, stderr, invocations, sentinel_dir) = run_with_sentinels(
+        r#"
+sh -c 'touch {sentinels}/invalid_mode_leak' BLOCK_TOKEN-invalid-mode
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "typo-mode"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+    assert!(
+        stderr.contains("invalid TIRITH_BASH_MODE (expected enter or preexec); using preexec"),
+        "invalid mode must be visible: {stderr}"
+    );
+    assert!(
+        !stderr.contains("typo-mode"),
+        "the untrusted mode value must not be reflected to the terminal: {stderr}"
+    );
+    assert!(
+        !sentinel_path(&sentinel_dir, "invalid_mode_leak").exists(),
+        "an invalid mode bypassed enforcement; invocations: {invocations:#?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|invocation| invocation.contains("BLOCK_TOKEN-invalid-mode")),
+        "the fallback never consulted Tirith: {invocations:#?}"
+    );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
 fn enforce_blocks_whole_pipeline() {
     // A blocked producer must keep the downstream `sh` segment from running.
     // `printf` (not a real network client) so an unexpected execute fails fast.
@@ -942,6 +974,79 @@ printf 'USER_TRAP_COUNT=%s\n' "$USER_TRAP_COUNT" >&2
         count >= 2,
         "user DEBUG trap must chain through trampoline, got count={count}, stderr={stderr}"
     );
+}
+
+#[test]
+fn debug_trap_chain_decodes_quotes_and_multiline_body_exactly() {
+    // Bash 3.2 cannot reliably replace a DEBUG trap that was installed after
+    // Tirith's first prompt; the hook detects that and degrades visibly. The
+    // pure decoder test below covers serialization on every Bash, while this
+    // end-to-end ownership/chaining contract requires modern Bash.
+    if spawned_bash_major() < 5 {
+        eprintln!("skipping: DEBUG trap replacement chaining needs bash >= 5");
+        return;
+    }
+    let (_out, stderr, invocations, _tmp) = run_with_sentinels(
+        r#"
+USER_TRAP_COUNT=0
+trap 'USER_TRAP_COUNT=$((USER_TRAP_COUNT + 1))
+printf "CHAIN_LITERAL=%s\n" "single'\''quote" >&2' DEBUG
+unset _TIRITH_BASH_LOADED
+source '__HOOK__'
+USER_TRAP_COUNT=0
+echo ALLOW_TOKEN-serialized-trap
+printf 'SERIALIZED_TRAP_COUNT=%s\n' "$USER_TRAP_COUNT" >&2
+"#
+        .replace("__HOOK__", &hook_path())
+        .as_str(),
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+    assert!(
+        stderr.contains("CHAIN_LITERAL=single'quote"),
+        "the chained trap's apostrophe was not decoded exactly: {stderr}"
+    );
+    let count = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("SERIALIZED_TRAP_COUNT="))
+        .next_back()
+        .and_then(|count| count.parse::<u32>().ok())
+        .unwrap_or(0);
+    assert!(
+        count > 0,
+        "the multiline chained trap did not run: {stderr}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|invocation| invocation.contains("ALLOW_TOKEN-serialized-trap")),
+        "Tirith did not retain control behind the serialized trap: {invocations:#?}; stderr={stderr}"
+    );
+}
+
+#[test]
+fn trap_body_decoder_preserves_quotes_and_newlines_without_execution() {
+    let serialized = r#"trap -- 'printf "CHAIN_LITERAL=%s\n" "single'\''quote"
+SECOND_COMMAND=still-data' DEBUG"#;
+    let expected = "printf \"CHAIN_LITERAL=%s\\n\" \"single'quote\"\nSECOND_COMMAND=still-data";
+    let script = format!(
+        "source '{}'; _tirith_extract_trap_body \"$TRAP_SPEC\" DEBUG || exit 91; printf '%s' \"$_TIRITH_EXTRACTED_TRAP\"",
+        hook_path()
+    );
+    let output = Command::new("bash")
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env("TRAP_SPEC", serialized)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .output()
+        .expect("run trap decoder");
+    assert!(
+        output.status.success(),
+        "decoder failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
 }
 
 #[test]
