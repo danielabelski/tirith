@@ -139,6 +139,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
 # Resolver-tool enrollment also needs typed owner/DACL and trusted Windows

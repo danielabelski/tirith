@@ -1710,9 +1710,9 @@ mod platform {
     // The Windows implementation follows the same retained-capability model as
     // the repo-trust and setup writers: each no-reparse directory is held,
     // temp identity is verified against that held parent before bytes are
-    // written, and NtSetInformationFile(FileRenameInformation) publishes
-    // relative to the held parent handle (the Win32 rename wrapper refuses
-    // handle-relative names).
+    // written, and NtSetInformationFile(FileRenameInformationEx) publishes
+    // relative to the held parent handle with POSIX replacement semantics (the
+    // Win32 rename wrapper refuses handle-relative names).
     use std::ffi::{OsStr, OsString};
     use std::fs::File;
     use std::io::{self, Read as _, Write as _};
@@ -1724,7 +1724,7 @@ mod platform {
     use super::{ContainedReadSnapshot, OpenRegularError};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
+        FileRenameInformationEx, NtCreateFile, NtSetInformationFile, FILE_CREATE,
         FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
         FILE_SYNCHRONOUS_IO_NONALERT,
     };
@@ -1743,6 +1743,9 @@ mod platform {
         FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+    };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     #[cfg(test)]
@@ -2792,11 +2795,16 @@ mod platform {
         let mut storage = vec![0usize; words];
         let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         // SAFETY: storage is aligned for FILE_RENAME_INFO and sized through the
-        // variable filename payload. The layout doubles as the kernel's
-        // FILE_RENAME_INFORMATION: the union's first byte is the BOOLEAN the
-        // kernel reads, and the zeroed remainder is inert padding.
+        // variable filename payload. The layout is also the kernel's
+        // FILE_RENAME_INFORMATION_EX: the union's `Flags` member is the first
+        // field, followed by the retained parent handle and relative name.
         unsafe {
-            (*info).Anonymous.ReplaceIfExists = overwrite;
+            (*info).Anonymous.Flags = FILE_RENAME_FLAG_POSIX_SEMANTICS
+                | if overwrite {
+                    FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+                } else {
+                    0
+                };
             (*info).RootDirectory = parent;
             (*info).FileNameLength = (name.len() * std::mem::size_of::<u16>()) as u32;
             std::ptr::copy_nonoverlapping(
@@ -2809,14 +2817,17 @@ mod platform {
             // accepts full destination paths only. The retained parent handle
             // IS the point of this rename (no by-name re-resolution an attacker
             // could redirect), so call the NT service directly — its
-            // FileRenameInformation honors handle-relative names.
+            // FileRenameInformationEx honors handle-relative names. POSIX
+            // replacement semantics are required here because the validated
+            // destination remains open (with FILE_SHARE_DELETE) so its file ID
+            // cannot be recycled between comparison and publication.
             let mut io_status = IO_STATUS_BLOCK::default();
             let status = NtSetInformationFile(
                 file,
                 &mut io_status,
                 info.cast(),
                 bytes as u32,
-                FileRenameInformation,
+                FileRenameInformationEx,
             );
             if status < 0 {
                 // NTSTATUS values are not Win32 error codes. Translate before
