@@ -268,22 +268,43 @@ fn hook_does_not_export_in_noninteractive_shell() {
 
 #[test]
 fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export() {
+    let version = Command::new("bash")
+        .args([
+            "--norc",
+            "--noprofile",
+            "-c",
+            "printf '%s' \"${BASH_VERSINFO[0]}\"",
+        ])
+        .output()
+        .expect("read Bash major version");
+    let major = String::from_utf8_lossy(&version.stdout)
+        .parse::<u32>()
+        .expect("Bash major version is numeric");
+    if major < 4 {
+        // Bash 3.2 aborts a non-interactive source immediately on the readonly
+        // assignment used to deny the bootstrap; it cannot reach the explicit
+        // disabled-state branch this regression exercises. The dedicated
+        // modern-Bash CI job covers that reachable branch on Bash 5.3.
+        eprintln!("skipping disabled-state branch fixture on Bash {major}");
+        return;
+    }
+
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let shadow_marker = tmpdir.path().join("shadowed-export-ran");
     let hook = hook_path();
     let script = format!(
-        "readonly POSIXLY_CORRECT; source '{hook}' 2>/dev/null; \
+        "export() {{ touch '{}'; }}; \
+         readonly POSIXLY_CORRECT; source '{hook}' 2>/dev/null; \
          /bin/sh -c 'printf \"CHILD_MODE=%s\\nCHILD_PROT=%s\\n\" \
-           \"$TIRITH_BASH_EFFECTIVE_MODE\" \"$TIRITH_BASH_EFFECTIVE_PROTECTION\"'"
+           \"$TIRITH_BASH_EFFECTIVE_MODE\" \"$TIRITH_BASH_EFFECTIVE_PROTECTION\"'",
+        shadow_marker.display()
     );
-    let shadow = format!("() {{ touch '{}'; }}", shadow_marker.display());
     let output = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env_clear()
         .env("PATH", path_with_tirith_under_test())
         .env("TIRITH_BASH_EFFECTIVE_MODE", "preexec")
         .env("TIRITH_BASH_EFFECTIVE_PROTECTION", "blocks")
-        .env("BASH_FUNC_export%%", shadow)
         .output()
         .expect("run bootstrap failure fixture");
     assert!(output.status.success());
