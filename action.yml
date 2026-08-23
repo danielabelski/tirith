@@ -86,11 +86,11 @@ runs:
 
         # Generate SARIF if requested
         if [ "$INPUT_SARIF" = "true" ]; then
-          tirith scan "$INPUT_PATH" --sarif "${IGNORE_ARGS[@]}" > results.sarif || true
+          tirith scan --sarif "${IGNORE_ARGS[@]}" -- "$INPUT_PATH" > results.sarif || true
         fi
 
         # Run CI check (this sets the exit code)
-        tirith scan "$INPUT_PATH" --ci --fail-on "$INPUT_FAIL_ON" "${IGNORE_ARGS[@]}"
+        tirith scan --ci --fail-on "$INPUT_FAIL_ON" "${IGNORE_ARGS[@]}" -- "$INPUT_PATH"
     - name: Upload SARIF
       if: always() && inputs.sarif == 'true'
       uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8

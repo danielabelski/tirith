@@ -8891,6 +8891,28 @@ fn package_explain_json_carries_factor_breakdown() {
 
 // `tirith scan` directory walk — picks up every scannable file type.
 
+#[test]
+fn scan_option_boundary_treats_a_directory_named_help_as_a_path() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let target = project.path().join("--help");
+    fs::create_dir(&target).expect("help-named directory");
+    fs::write(target.join("README.md"), "ordinary project\n").expect("fixture");
+
+    let output = tirith()
+        .current_dir(project.path())
+        .args(["scan", "--format", "json", "--", "--help"])
+        .output()
+        .expect("scan help-named directory");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("the path must be scanned, not interpreted as CLI help");
+    assert_eq!(json["schema_version"], 5);
+}
+
 fn pdf_with_valid_xref_and_malformed_content() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();

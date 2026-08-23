@@ -228,6 +228,29 @@ fn github_automation_keeps_all_action_references_immutably_pinned() {
 }
 
 #[test]
+fn composite_scan_action_terminates_options_before_the_input_path() {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let action =
+        std::fs::read_to_string(repository_root.join("action.yml")).expect("read composite action");
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(&action).expect("composite action must be valid YAML");
+    let root = document.as_mapping().expect("composite action root");
+    let runs = yaml_key(root, "runs").as_mapping().expect("runs mapping");
+    let steps = yaml_key(runs, "steps").as_sequence().expect("steps");
+    let scan = steps
+        .iter()
+        .filter_map(serde_yaml::Value::as_mapping)
+        .find(|step| yaml_key(step, "name").as_str() == Some("Run scan"))
+        .expect("Run scan step");
+    let script = yaml_key(scan, "run").as_str().expect("Run scan script");
+    assert!(script.contains("tirith scan --sarif \"${IGNORE_ARGS[@]}\" -- \"$INPUT_PATH\""));
+    assert!(script.contains(
+        "tirith scan --ci --fail-on \"$INPUT_FAIL_ON\" \"${IGNORE_ARGS[@]}\" -- \"$INPUT_PATH\""
+    ));
+    assert!(!script.contains("tirith scan \"$INPUT_PATH\""));
+}
+
+#[test]
 fn mutable_docker_tags_are_not_immutable_pins() {
     assert!(!uses_is_immutably_pinned(
         "docker://ghcr.io/example/tool:latest"
