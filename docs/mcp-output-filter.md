@@ -97,6 +97,36 @@ and keep sanitized content, per the two sections above.
 default. Only the explicitly named `--unsafe-unsanitized-tool-output`
 compatibility flag disables that local-server boundary.
 
+## Listing and resource-response inspection
+
+The gateway also inspects the untrusted results of `tools/list`,
+`resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`,
+and `prompts/get`. Every string leaf and object key reaches the same output
+analyzer. Resource links, descriptors, content URIs, URI templates, and URLs in
+extension metadata additionally cross the outbound destination policy.
+
+Concrete HTTP(S) destinations receive the full credential, metadata-host,
+private, loopback, link-local, DNS, redirect, and rebinding checks. Relative
+references and the explicit internal `tirith:` and `ui:` schemes are accepted.
+Every other absolute scheme is refused: an unfamiliar scheme is not assumed
+safe merely because Tirith itself does not dereference it, since an MCP client
+may have registered a network-capable handler for it. URI templates must have a
+fixed, inspectable scheme and authority; an expansion cannot select either.
+
+Inline resource blobs are decoded only under the decoded-size and blob-count
+limits. Tirith accepts canonical standard Base64, either fully padded or wholly
+unpadded, with optional ASCII wrapping whitespace. Data after padding, partial
+or excess padding, invalid placement, and non-zero unused trailing bits are
+rejected. Executable, script, and archive magic bytes are compared with the
+declared MIME category. This applies both to top-level `resources/read`
+contents and embedded resources in `prompts/get`.
+
+URI and blob passes share node, blob, and retained-violation budgets. Exact
+categorical violations are deduplicated while they are collected. Exhaustion
+adds `analysis_incomplete` and blocks the whole response; an already-final text
+Block short-circuits these secondary passes because no later inspection can
+make the response forwardable.
+
 ## Scan cap and large payloads
 
 The streaming analyzer scans all accepted content and structured string leaves;

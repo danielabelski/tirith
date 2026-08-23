@@ -150,7 +150,7 @@ def render(source_index: dict[str, Any], ledger: dict[str, Any]) -> str:
             "## Update contract",
             "",
             "- Edit `findings.json`, never this generated view.",
-            "- Validate every change with `python3 docs/security/remediation/validate_ledger.py --structural`.",
+            "- Validate every local change with `python3 docs/security/remediation/validate_ledger.py --structural --allow-missing-base`; use `--base-ref REF` in CI or when a comparison base is available.",
             "- Regenerate with `python3 docs/security/remediation/render_main.py`.",
             "- Use `--layer OWNER` and `--release-candidate SHA` with downloaded external evidence; use `--merged-main SHA` only with the configured committed closure bundle.",
             "- `reopened`, `invalidated`, and `regressed` are history events, never lifecycle values.",

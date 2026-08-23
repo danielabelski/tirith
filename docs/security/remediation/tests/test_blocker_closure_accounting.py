@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import shlex
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -59,6 +62,26 @@ def _finding(closed_date: str | None = None) -> dict:
 
 
 class BlockerClosureAccountingTests(unittest.TestCase):
+    def test_generated_local_validation_command_executes(self) -> None:
+        root = Path(__file__).resolve().parents[4]
+        tracker = root / "main.md"
+        command = next(
+            line.split("`", 2)[1]
+            for line in tracker.read_text(encoding="utf-8").splitlines()
+            if line.startswith("- Validate every local change with `")
+        )
+        argv = shlex.split(command)
+        argv[0] = sys.executable
+        result = subprocess.run(
+            argv,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
     def test_invalid_calendar_dates_are_rejected(self) -> None:
         for invalid in ["2026-02-29", "2026-13-01", "2026-99-99", "2026-8-01"]:
             finding = _finding()

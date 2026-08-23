@@ -693,7 +693,7 @@ fn linux_release_keeps_glibc_and_canonical_package_contracts() {
         "qemu-aarch64-static \"$BIN\" capsule run",
         "CAPSULE_RC",
         "REFUSED before launch (nothing was copied or spawned)",
-        "missing: network_raw_denied",
+        "grep -Fq 'network_raw_denied'",
         "TIRITH_CAPSULE_CHILD_MUST_NOT_RUN",
     ] {
         assert!(
@@ -808,7 +808,7 @@ fn linux_release_keeps_glibc_and_canonical_package_contracts() {
         "capsule run",
         "capsule_rc -ne 1",
         "REFUSED before launch (nothing was copied or spawned)",
-        "missing: network_raw_denied",
+        "grep -Fq 'network_raw_denied'",
         "TIRITH_CAPSULE_CHILD_MUST_NOT_RUN",
     ] {
         assert!(

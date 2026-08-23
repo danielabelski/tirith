@@ -24,7 +24,7 @@ Exact duplicate source rows inherit the lifecycle of their canonical root; sourc
 | `source-index.schema.json` | `11cfcf409c6fb54615871d11b3cae24e4bf437ed52689baa444e3ebe4d3ea521` |
 | `findings.schema.json` | `c394c809808d484dac67efc16a53967e2e5121d1d4d8ad895c307500045d13e2` |
 | `evidence-bundle.schema.json` | `803938b38dee2dfdfb2988b7a3a54c37783089c08bc20ad566fdf0ff0af8dada` |
-| `render_main.py` | `9586a361de1c0af111fbad314f464e1d71eebe0272a610524bd3b9189abe86df` |
+| `render_main.py` | `961803a8d939c89be246a6c684b0b0a19819d5cc77e2a7777d684324de32ae0e` |
 
 ### Source accounting
 
@@ -344,7 +344,7 @@ Exact duplicate source rows inherit the lifecycle of their canonical root; sourc
 ## Update contract
 
 - Edit `findings.json`, never this generated view.
-- Validate every change with `python3 docs/security/remediation/validate_ledger.py --structural`.
+- Validate every local change with `python3 docs/security/remediation/validate_ledger.py --structural --allow-missing-base`; use `--base-ref REF` in CI or when a comparison base is available.
 - Regenerate with `python3 docs/security/remediation/render_main.py`.
 - Use `--layer OWNER` and `--release-candidate SHA` with downloaded external evidence; use `--merged-main SHA` only with the configured committed closure bundle.
 - `reopened`, `invalidated`, and `regressed` are history events, never lifecycle values.

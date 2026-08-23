@@ -43,16 +43,23 @@ We will coordinate disclosure timing with you. We won't publish details until a 
 
 ## Data handling
 
-Tirith processes commands and pasted text **entirely locally**. During `check` and `paste`:
+Tirith's command parser, local rules, and `paste` analysis run locally. A
+normal `check` may enrich package-install candidates through the enabled OSV,
+deps.dev, ecosyste.ms, Safe Browsing, or KEV providers; those requests can
+disclose the parsed package name and version or constraint to the provider.
+Use `tirith check --offline` (or disable the corresponding policy providers) to
+guarantee that runtime enrichment makes no network request. Offline mode is
+enforced in both the direct and daemon-backed check paths; an unavailable local
+answer is reported as incomplete rather than silently going online.
 
-- **No network calls** are made
-- **No data leaves your machine**
-- Analysis results are written to a local JSONL audit log only
-- Full command text is redacted in logs (first 80 chars, truncated)
+- `paste` makes no network calls.
+- Tirith sends no telemetry, analytics, or crash reports.
+- Analysis results are written to a local JSONL audit log only.
+- Full command text is redacted in logs (first 80 chars, truncated).
 
 The audit log lives at `~/.local/share/tirith/audit.jsonl` (or platform equivalent). Disable with `TIRITH_LOG=0`.
 
-Tirith has no telemetry, no analytics, no crash reporting, no phone-home behavior.
+There is no unrelated phone-home behavior.
 
 ## Reproducible builds
 

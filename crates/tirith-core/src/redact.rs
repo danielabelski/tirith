@@ -2194,8 +2194,13 @@ mod tests {
 
     #[test]
     fn supported_secret_analysis_distinguishes_clean_secret_and_incomplete() {
-        let prose = "ordinary safe prose.\n".repeat(50_000);
-        assert_eq!(prose.len(), 1_050_000);
+        // `safe` is an English BIP-39 word. Punctuation prevents a mnemonic
+        // run while the count deliberately exceeds the cheap Tier-1 token cap.
+        let prose = "safe.\n".repeat(crate::sensitive_assets::MAX_BIP39_TIER1_WORD_TOKENS + 1);
+        assert!(
+            prose.len() < crate::sensitive_assets::MAX_BIP39_SCAN_INPUT_BYTES,
+            "the clean fixture must exercise token accounting, not the byte ceiling"
+        );
         let clean = analyze_supported_secrets(&prose);
         assert_eq!(clean.redacted, prose);
         assert_eq!(clean.status, SupportedSecretStatus::default());

@@ -216,6 +216,14 @@ stdin and stdout through the same Python adapter. Setup validates `python3`
 wrappers; re-run setup if it moves. An untrusted repository or temporary PATH
 shadow makes setup fail closed and is never executed.
 
+The adapter accepts both Cline's current `run_commands` batch and its legacy
+`execute_command` event. It decodes and bounds every batch member, refuses
+malformed or empty command data, and checks the applicable POSIX, PowerShell,
+and Cmd interpretations when the event does not identify one authoritative
+shell. A denial in any applicable grammar denies the tool call. Every other
+intentional Cline path emits an explicit JSON allow envelope; empty stdout is
+reserved for no outcome and is never Tirith's representation of allow.
+
 OpenHands searches exactly two places for `hooks.json`: the working directory
 it was started in (`OPENHANDS_WORK_DIR`, otherwise the current directory, with
 no parent walk) and `~/.openhands`. Setup writes to whichever the scope names,

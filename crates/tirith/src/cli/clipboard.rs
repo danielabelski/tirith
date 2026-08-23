@@ -1346,7 +1346,7 @@ mod tests {
             ),
             source_title: format!(
                 "title {canary} {built_in}\u{1b}[31m\n{}",
-                "oversize ".repeat(tirith_core::verdict::MAX_PRESENTATION_BYTES)
+                "oversize ".repeat(crate::cli::PROVENANCE_MAX_CHARS)
             ),
             hidden_text_detected: true,
         };
@@ -1358,7 +1358,10 @@ mod tests {
         for secret in [canary, provider_token, built_in, "user:password"] {
             assert!(!serialized_text.contains(secret), "JSON leaked {secret}");
         }
-        assert!(serialized_text.contains("[REDACTED:custom]"));
+        assert!(
+            serialized_text.contains("[REDACTED:custom]"),
+            "custom DLP marker missing from JSON projection: {serialized_text}"
+        );
         assert!(!serialized_text.contains("\\u001b"));
         assert!(!json["source_title"].as_str().unwrap().contains('\n'));
         assert!(
@@ -1384,7 +1387,7 @@ mod tests {
 
         let hostile_path = PathBuf::from(format!(
             "/tmp/{canary}/{built_in}\u{1b}[2J\n{}",
-            "p".repeat(tirith_core::verdict::MAX_PRESENTATION_BYTES)
+            "p".repeat(crate::cli::PROVENANCE_MAX_CHARS * 2)
         ));
         let start_json = watch_start_json(&hostile_path, &compiled);
         let start_serialized = serde_json::to_vec(&start_json).unwrap();

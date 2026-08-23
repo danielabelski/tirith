@@ -155,7 +155,7 @@ fn build_payload(
 
         let result = template
             .replace("{{rule_id}}", &sanitize_for_json(&rule_ids.join(",")))
-            .replace("{{command_preview}}", &sanitize_for_json(&command_preview))
+            .replace("{{command_preview}}", &sanitize_for_json(command_preview))
             .replace(
                 "{{action}}",
                 &sanitize_for_json(&format!("{:?}", verdict.action)),

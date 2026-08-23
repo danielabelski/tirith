@@ -297,9 +297,20 @@ jobs:
             echo "$CAPSULE_OUTPUT"
             exit 1
           fi
-          echo "$CAPSULE_OUTPUT" \
-            | grep -Fq 'REFUSED before launch (nothing was copied or spawned)'
-          echo "$CAPSULE_OUTPUT" | grep -Fq 'missing: network_raw_denied'
+          grep -Fq 'REFUSED before launch (nothing was copied or spawned)' \
+            <<<"$CAPSULE_OUTPUT" || {
+            echo "ERROR: aarch64 musl capsule did not report a pre-launch refusal"
+            echo "$CAPSULE_OUTPUT"
+            exit 1
+          }
+          # QEMU user mode may not expose Landlock either, so the shortfall can
+          # name controls before network_raw_denied. Require the missing control
+          # itself, not an ordering-dependent `missing: ...` fragment.
+          grep -Fq 'network_raw_denied' <<<"$CAPSULE_OUTPUT" || {
+            echo "ERROR: aarch64 musl capsule did not name unavailable raw-network denial"
+            echo "$CAPSULE_OUTPUT"
+            exit 1
+          }
           echo "musl artifact smoke test passed"
 
       - name: Download completions (Unix)

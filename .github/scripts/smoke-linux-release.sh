@@ -127,7 +127,9 @@ if [[ "$(uname -m)" == "aarch64" ]]; then
     printf '%s\n' "$capsule_output" >&2
     exit 1
   }
-  grep -Fq 'missing: network_raw_denied' <<<"$capsule_output" || {
+  # QEMU user mode may make additional kernel controls unavailable, placing
+  # their names before this one in the categorical shortfall list.
+  grep -Fq 'network_raw_denied' <<<"$capsule_output" || {
     echo "ERROR: aarch64 capsule did not name the unavailable seccomp coverage" >&2
     printf '%s\n' "$capsule_output" >&2
     exit 1
