@@ -1,5 +1,10 @@
 # Compatibility and Stability
 
+This matrix describes the current 0.4.0 integration tree. Until 0.4.0 is
+tagged, the latest published package may expose a smaller surface. The
+[draft release guide](release-notes-0.4.0.md) separates target capabilities
+from released artifacts.
+
 ## Stability Tiers
 
 Tirith subcommands fall into two stability tiers:
@@ -29,12 +34,18 @@ what an experimental command must satisfy to move to stable.
 | `run` | Experimental | Remote-script inspection on Unix; live execution is Linux-only, sealed-descriptor-bound, and refused before download elsewhere. |
 | `fetch` | Experimental | Server-side cloaking detection (Unix only). |
 | `checkpoint` | Experimental | File checkpoint and rollback. |
-| `gateway` | Experimental | MCP gateway proxy for AI-agent security. |
-| `setup` | Experimental | Configure tirith for AI coding tools. |
+| `gateway` | Experimental | MCP gateway proxy for AI-agent security. Request analysis and output filtering are bounded and fail closed, but enforcement covers only calls actually routed through the gateway. |
+| `setup` | Experimental | Configure 19 named AI-agent hosts. A written artifact is not proof the host loaded it; run the per-host verification matrix after setup and upgrades. |
 | `policy` | Experimental | Policy `init` / `validate` / `test` / `tune`. |
 | `trust` | Experimental | Manage trusted patterns: `add` / `list` / `explain` / `diff` / `remove` / `gc`. Narrow scope and a 30-day TTL by default; scope visualization, per-entry `explain`, and a `diff` trail. |
 | `warnings` | Experimental | Show accumulated session warnings. |
 | `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
+| `package risk` / `package explain` / `package scan` | Experimental | Advisory package-name, local-content, installed-tree, and optional registry-provenance analysis. Does not enforce an install. |
+| `package inspect` | Experimental | Local-only verdict over wheel artifacts, artifact sets, or installed Python environments. No implicit download. |
+| `pkg approve` / `pkg install` | Experimental | Enforcing pip approval/install path on x86_64 Linux only. Unsupported systems refuse before pip starts; npm and Cargo are not enforcing backends. |
+| `pkg verify-env` | Experimental | Read-only RECORD verification of an installed Python environment. |
+| `pkg graph` / `pkg diff` / `pkg attest` / `pkg receipt` | Experimental | Provenance, differential, attestation-binding, and receipt evidence. Graph and attestation are not auto-allow decisions. |
+| `mcp lock` / `mcp verify` / `mcp diff` | Experimental | Source-qualified MCP config and descriptor drift. `verify` is the gating command; `diff` is informational. |
 | `daemon` | Experimental | Background daemon (Unix only). |
 | `audit` | Experimental | Audit log export, stats, and compliance reports. |
 | `activate` | Experimental | License key activation. |
@@ -197,10 +208,11 @@ carry `caveats`, which `validate` refuses to let a document drop.
 Only the capsule run receipt is ELIGIBLE for anchoring in the audit hash chain,
 because it is the only one written to a tirith-owned store. It is anchored when
 an audit chain is configured, and left unanchored otherwise, including under
-`TIRITH_LOG=0`; the run prints which happened. The other four say
-`audit_chain_anchored: false` and refuse to claim otherwise, because they are
-written to an operator-chosen path that the chain's anchor constructor cannot
-accept.
+`TIRITH_LOG=0`; the run prints which happened. npm, build, and deployment
+receipts say `audit_chain_anchored: false` and refuse to claim otherwise because
+they are written to an operator-chosen path that the chain's anchor constructor
+cannot accept. A browser baseline is signed/content-addressed but carries no
+audit-chain-anchor claim; a command card is a separate signed document model.
 
 ## PowerShell parity
 
@@ -222,5 +234,7 @@ score`, and the shell hook work on Windows with `pwsh`.
 
 `tirith doctor --compat` reports PowerShell hook health when `pwsh`
 (PowerShell 7+) or `powershell` (Windows PowerShell 5.1) is found on PATH:
-PSReadLine availability and the current `TIRITH_STATUS` value exported by
-the hook.
+PSReadLine availability plus the install/static compatibility state it can
+observe. The hook's `$global:TIRITH_STATUS` is intentionally shell-local and is
+not exported to child processes, so a separately launched doctor cannot infer
+that live prompt value from the environment.

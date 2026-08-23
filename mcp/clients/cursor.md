@@ -1,6 +1,9 @@
 # Tirith + Cursor Setup (Automatic Coverage)
 
-> **Phase 1b** — Gateway integration documented but not yet integration-tested.
+> **Verification boundary:** setup/config behavior is covered by repository
+> tests, but only a live Cursor session can prove that the installed host
+> version loaded and honored both the hook and gateway. Run the verification
+> steps after setup and every Cursor/Tirith upgrade.
 
 ## Why two paths are required
 

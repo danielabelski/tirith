@@ -1,5 +1,32 @@
 # Release Checklist
 
+## 0.4.0 preparation
+
+The current changelog and release guide describe **target** 0.4.0 behavior; the
+package version remains 0.3.3 until the final integration tree is known. Before
+creating the release commit:
+
+1. Rebase or merge the complete integration stack onto the final default-branch
+   tip and review the resulting tree, not only each stacked diff.
+2. Resolve or explicitly defer every item under `[Unreleased]` → `Known issues`.
+3. Run the required Linux, macOS, and Windows matrices on that exact tree,
+   including native x86_64-Linux containment and host-shaped hook tests.
+4. Complete the Web3/task and ThreatDB v2 rollout playbooks below.
+5. Change the workspace version to `0.4.0`, update Cargo lockfiles, regenerate
+   generated documentation/fixtures through their owning commands, and confirm
+   every package template is materialized from the tag as designed. Do not
+   hand-edit generated capability or evidence files.
+6. Move the changelog content from `[Unreleased]` to
+   `[0.4.0] - YYYY-MM-DD`, remove the draft banner from the release guide, and
+   ensure README installation text does not claim a registry has 0.4.0 before
+   that registry actually does.
+7. Run package assembly and the full release-validation workflow before pushing
+   the protected `v0.4.0` tag.
+
+Version 0.4.0 is intentional: it is the next minor after 0.3.3 and reflects the
+new commands, policy/document schemas, integrations, and enforcement surfaces.
+Skipping directly to 0.5.0 would create an unexplained empty 0.4 release line.
+
 ## Feature-specific rollout playbooks
 
 Some releases carry their own staged-enablement and back-out procedure. Work
@@ -118,3 +145,31 @@ Push a `v*` tag → GitHub Actions workflow builds, compatibility-tests, then pu
 - Homebrew (sheeki03/homebrew-tap — template sed'd from `packaging/homebrew/tirith.rb`)
 - npm (6 packages — root + 5 platform, version from tag)
 - Scoop (sheeki03/scoop-tirith — template sed'd from `packaging/scoop/tirith.json`)
+- GHCR (x86_64 and arm64 images plus immutable version manifest; moving
+  selectors advance only after version publication succeeds)
+- Chocolatey (package push; availability remains pending until community
+  moderation approves it)
+- AUR (`PKGBUILD` and `.SRCINFO` generated from the release tag)
+
+Homebrew core is separate from the tap publication. After the release exists,
+follow [the Homebrew core update guide](homebrew-core.md) and verify the core
+formula/bottles independently before describing `brew install tirith` as
+serving 0.4.0 everywhere.
+
+## Post-publication verification
+
+- Verify the GitHub Release contains every expected platform archive, Debian
+  and RPM package, installer, checksums, signature, certificate, SBOM, and
+  provenance artifact. Re-run verification against the downloaded public
+  bytes, not the runner workspace.
+- Verify `tirith` and `tirith-core` 0.4.0 on crates.io and all six exact 0.4.0
+  npm packages. Test one clean and one blocked command through an installed npm
+  platform wrapper.
+- Verify the Homebrew tap, Scoop bucket, GHCR architecture manifest, and AUR
+  package all resolve to the released checksums/digests.
+- Record Chocolatey's moderation state honestly. `choco info tirith` is the
+  source of truth for the approved community package; do not call 0.4.0
+  available there while it is still awaiting moderation.
+- Run `tirith version --provenance`, `tirith verify-self`, and `tirith doctor`
+  from representative package-manager installs and publish the final release
+  notes only after those checks match the tag.

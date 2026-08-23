@@ -3,7 +3,10 @@
 Applies to: **VS Code**, **Void**, and other VS Code forks that support MCP
 servers. For **Windsurf**, see [windsurf.md](windsurf.md).
 
-> **Phase 1b** — Gateway integration documented but not yet integration-tested.
+> **Verification boundary:** setup/config behavior is covered by repository
+> tests, but only the effective VS Code/fork host can prove that it loaded and
+> honored both the workspace hook and gateway. Run the verification steps after
+> setup and every host/Tirith upgrade.
 
 ## Why two paths are required
 

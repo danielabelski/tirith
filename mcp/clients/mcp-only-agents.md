@@ -1,7 +1,8 @@
 # Agent integrations
 
-Tirith registers its stdio MCP server with several agents, and installs a
-blocking pre-execution hook wherever the host documents one.
+Tirith has a named setup path for 19 agent hosts. Depending on the host, setup
+installs a blocking pre-execution hook or plugin, an MCP gateway, cooperative
+MCP tools, or a combination of those layers.
 
 The distinction matters. MCP makes Tirith's check and scan tools *available* to
 the agent; it does **not** force the agent to call Tirith before running a
@@ -10,10 +11,10 @@ honours a refusal. Where a host offers both, setup installs both, and it writes
 the hook **before** the MCP entry so that a partial failure leaves the half that
 can refuse a command.
 
-Hosts with a blocking hook: Grok Build, Pi CLI, Prime Agent, OMP, Cline, and
-OpenHands. Every hook except Cline's is POSIX only; Cline also gets a
-PowerShell hook on Windows. The remaining clients on this page are MCP only,
-and say so in the table.
+The table is the authoritative quick comparison and deliberately includes the
+earlier integrations as well as the hosts added for 0.4.0. An MCP-only row is
+not an automatic command gate. A hook/plugin row is automatic only after the
+host has loaded the artifact and honors its documented refusal contract.
 
 Three of these hosts fail **open** on their own side: Grok Build, Cline, and
 OpenHands all let the tool run when a hook errors or times out. Tirith's adapter
@@ -30,6 +31,16 @@ private, and `--dry-run`, `--force`, and repeat runs are supported.
 
 | Client | Enforcement | Setup command | Supported scope and config | Verification |
 |---|---|---|---|---|
+| Claude Code | Hook; optional MCP | `tirith setup claude-code --with-mcp` | Project default: `.claude/settings.json` and `.claude/hooks/`; user: `~/.claude/`. Project MCP uses `.mcp.json`; user MCP is merged into Claude settings | `tirith doctor`, then ask Claude to run a known-blocked and a clean command |
+| OpenAI Codex | MCP gateway; optional zsh guard | `tirith setup codex` | User only. Registers a generation-bound Tirith gateway through `codex mcp`; `--install-zshenv` adds the non-interactive zsh path | `codex mcp get tirith-gateway`; run `scripts/codex-upgrade-smoke.sh` and a native-shell block check |
+| GitHub Copilot CLI | Hook | `tirith setup copilot-cli` | Project only: repo-root `.github/hooks/tirith-security.json` plus its pinned Python hook. Copilot loads it only when launched from that repo root | Start Copilot at the repo root; test one blocked `bash` call and one clean call |
+| Cursor | Hook + MCP gateway | `tirith setup cursor` | Project default or user: `.cursor/hooks.json`, hook asset, and `mcp.json`; `--install-zshenv` adds the non-interactive zsh path | `tirith doctor`, restart Cursor, and perform host-shaped hook and MCP checks |
+| Gemini CLI | Hook; optional MCP | `tirith setup gemini-cli --with-mcp` | Project default: `.gemini/`; user: `$GEMINI_CLI_HOME/.gemini`, otherwise `~/.gemini` | Restart Gemini CLI; test `run_shell_command` allow/deny and list MCP tools when enabled |
+| Kiro CLI | Agent-scoped hook | `tirith setup kiro` | Project default or user: `.kiro/hooks/` plus `.kiro/agents/tirith-security.json`. The hook applies only when that agent/config is loaded | Launch `kiro-cli --agent tirith-security` (or merge the hook into the chosen agent), then test allow/deny |
+| OpenClaw | Plugin hook | `tirith setup openclaw` | Project default: `.openclaw/extensions/tirith-security`; user: `$OPENCLAW_STATE_DIR`, legacy `$CLAWDBOT_STATE_DIR`, or `~/.openclaw` | Restart OpenClaw; test `exec`/`bash` allow and deny with the actual host/shell configuration |
+| Pi CLI | Hook | `tirith setup pi-cli` | Project default: `.pi/extensions/`; user: `$PI_CODING_AGENT_DIR`, otherwise `~/.pi/agent/extensions/` | Start Pi with the extension loaded; test one blocked and one clean `bash` call |
+| VS Code | Workspace hook + MCP gateway | `tirith setup vscode` | Project only: `.vscode/settings.json`, `.vscode/hooks/`, and `.vscode/mcp.json`; `--install-zshenv` adds the non-interactive zsh path | Reload the workspace and perform host-shaped hook and MCP checks |
+| Windsurf | Hook + MCP gateway | `tirith setup windsurf` | User only: `~/.codeium/windsurf/hooks.json`, hook asset, and `mcp_config.json`; `--install-zshenv` adds the non-interactive zsh path | Restart Windsurf; test a Cascade command and the registered MCP gateway |
 | Grok Build | Hook + MCP | `tirith setup grok-build` | Project: `<invocation-cwd>/.grok/config.toml` plus trusted `<git-root>/.grok/hooks/tirith.json`; user: `$GROK_HOME`, otherwise `~/.grok` | `grok mcp doctor tirith`; `/hooks` |
 | OMP (Oh My Pi) | Hook + MCP | `tirith setup omp` | User only. Root: `~/${PI_CONFIG_DIR:-.omp}`; named profile: `<root>/profiles/<name>/agent/mcp.json`; default: `$PI_CODING_AGENT_DIR/mcp.json`, otherwise `<root>/agent/mcp.json`. Guard: `hooks/pre/tirith-guard.ts` beside that `mcp.json`, which is where OMP discovers hooks (its agent directory, profile-aware) | `/mcp test tirith` |
 | OpenCode | MCP only | `tirith setup opencode` | Project: the rootmost existing project `.opencode/opencode.json(c)`, otherwise the invocation directory's `opencode.json(c)`; user: `$OPENCODE_CONFIG_DIR/opencode.json(c)`, then `$OPENCODE_CONFIG`, otherwise `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json(c)` | `opencode mcp list` |

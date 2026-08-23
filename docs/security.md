@@ -37,7 +37,8 @@ The following are **not** in scope:
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.2.x   | Yes       |
-| 0.1.x   | Yes       |
+The latest published minor release line receives security fixes. Older minor
+lines receive best-effort support only. An integration branch is not a
+supported release until the protected tag and public artifacts exist. See the
+repository-level [security policy](../SECURITY.md) for the current release-line
+status and verification instructions.

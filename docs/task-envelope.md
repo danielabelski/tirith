@@ -310,6 +310,20 @@ Four properties, each pinned by a test:
   not `Clone`, `commit` consumes `self`, and both the content digest and the
   bound path are rechecked immediately before publication.
 
+### Package-manager approval caveat
+
+At `package_manager_execution`, `action_incomplete_analysis:
+require_approval` uses Tirith's typed package-manager approval channel. An
+interactive run confirms through `/dev/tty`; however, an explicit
+`tirith install --yes ...` is intentionally accepted as an **unattended**
+approval and mints the same boundary capability for that exact operation. It
+does not prove a human was present.
+
+Do not use `require_approval` as a human-in-the-loop guarantee for unattended
+package-manager execution. If automation must never cross that boundary, use a
+blocking task policy or do not pass `--yes` until unattended acknowledgement
+and task-policy approval are separate concepts.
+
 ### What is not covered
 
 - A shell the operator types into directly, unless a shell hook is installed,

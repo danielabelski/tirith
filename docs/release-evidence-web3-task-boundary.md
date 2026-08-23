@@ -1,5 +1,12 @@
 # Release evidence: `codex/web3-task-boundary`
 
+> **Historical integration-stack snapshot.** The commit, counts, and host below
+> describe one earlier branch tip and must not be presented as 0.4.0 release
+> evidence. After the full stack is integrated onto the final default-branch
+> tree, regenerate evidence from that exact commit across the required Linux,
+> macOS, and Windows jobs. Superseding evidence belongs in a new immutable
+> record; do not edit these old measurements to look current.
+
 Measured on the branch tip, on the machine named below. This file records what
 was actually run, so the release owner can tell which gates still need running
 somewhere else rather than re-deriving that from a summary.

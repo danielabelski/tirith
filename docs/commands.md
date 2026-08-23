@@ -49,7 +49,7 @@ covers the everyday subset; this is the complete reference.
 |---------|-------------|
 | `tirith init` | Print the shell hook for your profile (`--prompt-status` adds the prompt snippet) |
 | `tirith onboard` | Guided first-run wizard: detect the environment and recommend a policy template (`--apply`) |
-| `tirith setup <tool>` | One-command AI-tool setup (claude-code, codex, cursor, and more; `--with-mcp`) |
+| `tirith setup <tool>` | One-command setup for 19 named hosts: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, and windsurf (`--scope`, `--with-mcp`, `--dry-run`, `--update-configs`) |
 | `tirith install <backend> <args>` | Recorded, risk-analyzed install across npm / pip / cargo / apt / brew / dnf / yum / pacman / scoop / docker / go / url (`--online`, `--no-exec`, `--yes`, `--sha256`) |
 | `tirith verify-self` / `update` / `version --provenance` | Verify the running binary, signature-verified self-update, and build / install provenance |
 | `tirith browser {host,install-extension}` | Install the Chrome native-messaging host that records clipboard provenance |
@@ -87,6 +87,7 @@ covers the everyday subset; this is the complete reference.
 | Command | What it does |
 |---------|-------------|
 | `tirith package {risk,explain,scan}` | Score a package's supply-chain risk (offline by default; `--online` adds registry provenance; `--installed` walks installed trees) |
+| `tirith package inspect` | Inspect local wheel artifacts, an artifact set, or an installed Python environment for structural violations, identity/RECORD/ownership failures, startup hooks, native execution chains, and cross-distribution loader/payload splits. Never downloads artifacts (`--artifact`, `--artifact-set`, `--installed`, `--format json`) |
 | `tirith ecosystem scan [path]` | Score every declared dependency in a project, slopsquat-aware (`--installed`, `--online`, `--format json`) |
 | `tirith threat-db {update,status,health,sources,explain,diff}` | Manage the signed local threat database (`threatdb` is an alias) |
 | `tirith iac {guard,check-plan,require-plan-before-apply}` | Terraform / Pulumi / OpenTofu apply gates (saved-plan hash, no-plan-apply) |
@@ -114,7 +115,7 @@ covers the everyday subset; this is the complete reference.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith mcp-server` | Run tirith as an MCP server (7 tools) over JSON-RPC stdio; tool/resource output is sanitized by default (`--unsafe-unsanitized-tool-output` restores legacy pass-through) |
+| `tirith mcp-server` | Run tirith as an MCP server (six cross-platform tools, plus `tirith_fetch_cloaking` on Unix) over JSON-RPC stdio; tool/resource output is sanitized by default (`--unsafe-unsanitized-tool-output` restores legacy pass-through) |
 | `tirith mcp {lock,verify,diff,explain,permissions,policy}` | Inventory and gate a repo's MCP servers into `.tirith/mcp.lock`, with per-server tool and per-capability views |
 | `tirith gateway run` | MCP gateway proxy that intercepts AI-agent shell tool calls (`--filter-output`) |
 | `tirith agent {sessions,explain,current,allow,block,policy}` | Caller-origin (human / agent / MCP / CI / IDE) governance; an `agent_rules.deny` match forces a block |
@@ -127,7 +128,7 @@ covers the everyday subset; this is the complete reference.
 |---------|-------------|
 | `tirith audit {export,stats,report,verify}` | Audit-log management; `verify` checks the tamper-evident hash chain (`--expected-head`) |
 | `tirith incident {start,stop,status,report}` | Declare an "under attack" posture: fail-closed, bypass disabled, key rules elevated |
-| `tirith checkpoint {create,list,restore,diff,purge,watch}` | Snapshot files before risky operations in the private per-user state directory; `restore` sha256-verifies each blob and reports per-file outcomes. Releases before 0.3.4 may have left data under `/tmp/tirith/checkpoints`; inspect and remove that legacy directory manually. |
+| `tirith checkpoint {create,list,restore,diff,purge,watch}` | Snapshot files before risky operations in the private per-user state directory; `restore` sha256-verifies each blob and reports per-file outcomes. Releases before 0.4.0 may have left data under `/tmp/tirith/checkpoints`; inspect and remove that legacy directory manually. |
 | `tirith pending {list,resolve,export}` | Pending-decision registry for deferred blocks, suppressed-finding rollups, and restore prompts |
 | `tirith share --target <a>` / `tirith redact --audience <a>` | Audience-aware redaction before sharing (github-issue, slack, llm, public-paste) |
 | `tirith clipboard {copy,scan,guard,watch}` | Clipboard with secret-shape gating and browser source attribution |

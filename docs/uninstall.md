@@ -11,6 +11,22 @@ Remove the `tirith init` hook line from your shell config:
 | fish | `~/.config/fish/config.fish` |
 | PowerShell | `$PROFILE` |
 
+## Remove AI-agent integrations
+
+Before removing the binary, remove the Tirith-owned hook, plugin, MCP, or
+gateway entry from every host configured with `tirith setup`. Setup preserves
+unrelated host settings and may create a sibling backup when it changes an
+existing file; do not delete an entire shared host configuration directory.
+
+There is not yet a universal `tirith setup --uninstall` operation because the
+19 hosts use different ownership and merge contracts. Use the
+[agent integration matrix](../mcp/clients/mcp-only-agents.md) to locate the
+exact user/project artifacts for Claude Code, Cline, Codex, GitHub Copilot CLI,
+Continue, Cursor, fx, Gemini CLI, Grok Build, Kiro, OMP, OpenClaw, OpenCode,
+OpenHands, Pi CLI, Prime Agent, Roo Code, VS Code, and Windsurf. Restart the
+host after removing its Tirith entry, then run `tirith doctor` while Tirith is
+still installed to check for any remaining effective integration.
+
 ## Remove binary
 
 ### Homebrew

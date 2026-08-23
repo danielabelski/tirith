@@ -57,7 +57,9 @@ answer is reported as incomplete rather than silently going online.
 - Analysis results are written to a local JSONL audit log only.
 - Full command text is redacted in logs (first 80 chars, truncated).
 
-The audit log lives at `~/.local/share/tirith/audit.jsonl` (or platform equivalent). Disable with `TIRITH_LOG=0`.
+The audit log lives at `$XDG_DATA_HOME/tirith/log.jsonl` (normally
+`~/.local/share/tirith/log.jsonl`, or the platform equivalent). Disable it with
+`TIRITH_LOG=0`.
 
 There is no unrelated phone-home behavior.
 
@@ -70,7 +72,7 @@ Release artifacts are built via GitHub Actions with:
 
 Verify a release:
 ```bash
-TAG=v0.3.3
+TAG=vX.Y.Z  # replace with the exact immutable release tag you downloaded
 cosign verify-blob \
   --signature checksums.txt.sig \
   --certificate checksums.txt.pem \
@@ -82,6 +84,11 @@ sha256sum --check --strict checksums.txt
 
 ## Supported versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.1.x | Yes |
+The latest published minor release line receives security fixes. Older minor
+lines receive best-effort support only; upgrade before reporting a result as a
+current-version vulnerability. Code on an unreleased branch or integration
+stack is not a supported release until its protected tag and artifacts exist.
+
+For the planned 0.4.0 release, 0.3.x remains the supported published line until
+0.4.0 is actually available. After publication, 0.4.x becomes the supported
+line.

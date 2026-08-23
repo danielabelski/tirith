@@ -1,6 +1,9 @@
 # Tirith + Windsurf Setup (Automatic Coverage)
 
-> **Phase 1b** — Gateway integration documented but not yet integration-tested.
+> **Verification boundary:** setup/config behavior is covered by repository
+> tests, but only a live Windsurf session can prove that Cascade loaded and
+> honored both the hook and gateway. Run the verification steps after setup and
+> every Windsurf/Tirith upgrade.
 
 ## Why two paths are required
 
