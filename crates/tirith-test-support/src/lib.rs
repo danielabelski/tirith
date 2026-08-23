@@ -58,7 +58,11 @@ impl IsolatedRoots {
         let roots = Self {
             root: root.to_path_buf(),
             home: root.join("home"),
-            xdg_config: root.join("xdg-config"),
+            // `xdg-user-dir` sources files from XDG_CONFIG_HOME, so setup
+            // deliberately accepts that root only when it is contained by the
+            // selected HOME. Keep the shared fixture realistic: a sibling of
+            // HOME is isolated, but it is not a valid user configuration root.
+            xdg_config: root.join("home").join(".config"),
             xdg_config_dirs: root.join("xdg-config-dirs"),
             xdg_data: root.join("xdg-data"),
             xdg_state: root.join("xdg-state"),

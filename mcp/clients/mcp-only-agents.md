@@ -10,9 +10,10 @@ honours a refusal. Where a host offers both, setup installs both, and it writes
 the hook **before** the MCP entry so that a partial failure leaves the half that
 can refuse a command.
 
-Hosts with a blocking hook (POSIX only): Grok Build, Pi CLI, Prime Agent, OMP,
-Cline, and OpenHands. The remaining clients on this page are MCP only, and say
-so in the table.
+Hosts with a blocking hook: Grok Build, Pi CLI, Prime Agent, OMP, Cline, and
+OpenHands. Every hook except Cline's is POSIX only; Cline also gets a
+PowerShell hook on Windows. The remaining clients on this page are MCP only,
+and say so in the table.
 
 Three of these hosts fail **open** on their own side: Grok Build, Cline, and
 OpenHands all let the tool run when a hook errors or times out. Tirith's adapter

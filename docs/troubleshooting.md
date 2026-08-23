@@ -53,7 +53,7 @@ tirith can downgrade protection during a session — most commonly bash enter
 mode falling back to preexec warn-only when it detects a delivery failure. A
 downgrade is **never silent**: the hook prints one consolidated message,
 
-```
+```text
 tirith: protection downgraded to warn-only (does not block) — run 'tirith doctor' for details
 ```
 

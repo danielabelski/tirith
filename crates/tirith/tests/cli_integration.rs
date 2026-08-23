@@ -154,7 +154,11 @@ fn setup_cursor_force_rejects_hardlinked_hook_without_mutating_external_inode() 
         .unwrap();
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("hard links"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("hard links"),
+        "setup must reach the hardlink refusal after resolving its pinned dependencies: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         fs::read_to_string(&external_hook).unwrap(),
         "external-original"
