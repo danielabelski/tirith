@@ -75,6 +75,7 @@ fn joined_run_scripts(job: &serde_yaml::Mapping) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
 fn named_step_run<'a>(job: &'a serde_yaml::Mapping, name: &str) -> &'a str {
     yaml_key(job, "steps")
         .as_sequence()
@@ -449,6 +450,11 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
     );
 }
 
+// The two exercised release jobs run on Ubuntu. On Windows, the `bash.exe`
+// found by normal process lookup is the WSL launcher, not a POSIX shell, and a
+// test must not require an installed WSL distribution to validate Linux-only
+// workflow scripts. Linux and macOS CI execute this against GNU and BSD userland.
+#[cfg(unix)]
 #[test]
 fn portable_release_version_resolvers_accept_toml_inline_comments() {
     let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
