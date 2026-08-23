@@ -478,19 +478,26 @@ fn portable_release_version_resolvers_accept_toml_inline_comments() {
         ),
         ("build-rpm", "GITHUB_ENV", "PACKAGE_VERSION=1.2.3-beta.1"),
     ] {
-        let output_path = fixture.path().join(format!("{job_name}.output"));
+        // Keep the workflow output path relative to the controlled working
+        // directory. Git Bash does not translate a native `D:\...` path handed
+        // to it through an arbitrary environment variable, while GitHub's real
+        // output files and Unix paths are already shell-native.
+        let output_name = format!("{job_name}.output");
+        let output_path = fixture.path().join(&output_name);
         let script = named_step_run(workflow_job(jobs, job_name), "Resolve package version");
         let output = std::process::Command::new("bash")
             .args(["--noprofile", "--norc", "-c", script])
             .current_dir(fixture.path())
             .env("GITHUB_REF", "refs/heads/version-parser-test")
             .env("GITHUB_REF_NAME", "version-parser-test")
-            .env(output_env, &output_path)
+            .env(output_env, &output_name)
             .output()
             .unwrap_or_else(|error| panic!("run {job_name} version resolver: {error}"));
         assert!(
             output.status.success(),
-            "{job_name} version resolver rejected valid TOML: {}",
+            "{job_name} version resolver rejected valid TOML (status={}): stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let resolved = std::fs::read_to_string(&output_path)
