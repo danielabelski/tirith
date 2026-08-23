@@ -28,6 +28,11 @@ projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1
 security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
 
 [capability_manifest]
+# Release-documentation truthfulness note: the existing `mcp-server` coverage
+# now distinguishes the six cross-platform tools from the additional
+# `tirith_fetch_cloaking` tool available on Unix. No command, group, inspection
+# level, policy-completeness value, or runtime behavior changed; only the
+# platform-qualified coverage prose changed.
 # TIRITH-SEC-0083 truthfulness note: the existing `mcp-server` coverage now
 # records the secure-default tool/resource-read output sanitizer. No command,
 # group, inspection level, or policy-completeness value changed.
@@ -94,7 +99,7 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # tirith does not download, inspect, or bind the tarball bytes npm installs. No
 # command was added, removed, renamed, or regrouped, and no `inspected` or
 # `policy_complete` value changed; that was a documentation-truth edit only.
-sha256 = "c986da6b353e433b3903314d591088470bc8ed8888dbfef051efac94af64d3ac"
+sha256 = "03270b4ec0ce3d38ad081d810a1bedca5b2904f32da05dc3cef9ee1ee8a0929f"
 
 [mcp]
 default_tools = [
