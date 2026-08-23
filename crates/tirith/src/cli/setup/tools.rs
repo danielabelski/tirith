@@ -1137,6 +1137,21 @@ fn pi_prime_config_dir(
     Ok((configured, scope_root))
 }
 
+/// Resolve the user-scoped Pi guard through the same environment and tilde
+/// rules as setup. Doctor uses this rather than guessing `~/.pi`.
+pub(crate) fn pi_cli_user_guard_path(home: &Path) -> Result<PathBuf, String> {
+    let default = home.join(".pi").join("agent");
+    let (agent_dir, _) = pi_prime_config_dir("PI_CODING_AGENT_DIR", home, default)?;
+    Ok(agent_dir.join("extensions").join("tirith-guard.ts"))
+}
+
+/// Resolve the user-scoped Prime Agent guard exactly as setup does.
+pub(crate) fn prime_agent_user_guard_path(home: &Path) -> Result<PathBuf, String> {
+    let default = home.join(".prime").join("agent");
+    let (agent_dir, _) = pi_prime_config_dir("PRIME_AGENT_CODING_AGENT_DIR", home, default)?;
+    Ok(agent_dir.join("extensions").join("tirith-guard.ts"))
+}
+
 fn trimmed_env_path(name: &str) -> Result<Option<PathBuf>, String> {
     let Some(value) = std::env::var_os(name) else {
         return Ok(None);
@@ -1381,6 +1396,17 @@ fn omp_user_mcp_path(home: &Path) -> Result<OmpUserMcpLocation, String> {
         active_config_scope_root: config_scope_root,
         named_profile: false,
     })
+}
+
+/// Resolve the active OMP profile's guard through the same profile, config-root,
+/// and coding-agent-dir rules as setup.
+pub(crate) fn omp_user_guard_path(home: &Path) -> Result<PathBuf, String> {
+    let location = omp_user_mcp_path(home)?;
+    let agent_dir = location
+        .path
+        .parent()
+        .ok_or_else(|| "active OMP user MCP path has no parent directory".to_string())?;
+    Ok(agent_dir.join("hooks").join("pre").join("tirith-guard.ts"))
 }
 
 fn env_value_is_nonempty(name: &str) -> bool {

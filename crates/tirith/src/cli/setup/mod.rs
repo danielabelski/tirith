@@ -19,7 +19,10 @@ mod fs_helpers_windows_path;
 mod merge;
 mod shell_profile;
 mod tools;
-pub(crate) use tools::cline_hooks_dir;
+pub(crate) use shell_profile::shell_quote;
+pub(crate) use tools::{
+    cline_hooks_dir, omp_user_guard_path, pi_cli_user_guard_path, prime_agent_user_guard_path,
+};
 
 #[cfg(unix)]
 mod zshenv;
