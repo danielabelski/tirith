@@ -16,6 +16,12 @@ FAKE_BIN="$TEST_ROOT/bin"
 OUTPUT_ROOT="$TEST_ROOT/output"
 mkdir -p -- "$FAKE_BIN" "$OUTPUT_ROOT"
 
+# The immutable OpenSSF revision currently contains 235,293 files totaling
+# 441,674,789 bytes. Guard the calibrated defaults so the reviewed snapshot
+# cannot silently become unbuildable again while both resource limits remain.
+grep -Fq 'OSSF_MAX_FILES=250000' "$FETCH_SCRIPT"
+grep -Fq 'OSSF_MAX_BYTES=$((512 * 1024 * 1024))' "$FETCH_SCRIPT"
+
 cat > "$FAKE_BIN/git" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

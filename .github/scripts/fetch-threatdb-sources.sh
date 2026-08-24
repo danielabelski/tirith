@@ -28,8 +28,11 @@ CURL_CONNECT_TIMEOUT_SECONDS=15
 CURL_MAX_TIME_SECONDS=120
 FEODO_MAX_BYTES=$((16 * 1024 * 1024))
 CISA_KEV_MAX_BYTES=$((64 * 1024 * 1024))
-OSSF_MAX_FILES=50000
-OSSF_MAX_BYTES=$((256 * 1024 * 1024))
+# The reviewed immutable OpenSSF revision above materializes to 235,293 files
+# and 441,674,789 bytes (verified by the 2026-08-24 main build). Keep bounded
+# headroom for filesystem accounting while still rejecting an unexpected tree.
+OSSF_MAX_FILES=250000
+OSSF_MAX_BYTES=$((512 * 1024 * 1024))
 DATADOG_MANIFEST_MAX_BYTES=$((64 * 1024 * 1024))
 TYPOSQUAT_MAX_BYTES=$((4 * 1024 * 1024))
 
