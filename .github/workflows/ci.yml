@@ -28,9 +28,39 @@ jobs:
         with:
           persist-credentials: false
       - name: Validate workflow shell syntax
-        run: bash -n .github/scripts/fetch-threatdb-sources.sh .github/scripts/test-fetch-threatdb-sources.sh
+        run: >-
+          bash -n
+          .github/scripts/fetch-threatdb-sources.sh
+          .github/scripts/test-fetch-threatdb-sources.sh
+          .github/scripts/test-threatdb-manifest-transition.sh
       - name: Validate fail-closed ThreatDB fetch orchestration
         run: bash .github/scripts/test-fetch-threatdb-sources.sh
+      - name: Validate ThreatDB manifest transition fixtures
+        run: bash .github/scripts/test-threatdb-manifest-transition.sh
+      - name: Refuse a stale ThreatDB manifest transition
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+
+          python3 .github/scripts/check-threatdb-manifest-transition.py \
+            threatdb-manifest.json
+
+          if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "No prior main commit is available; current manifest shape is valid."
+            exit 0
+          fi
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::invalid base SHA for ThreatDB manifest comparison"
+            exit 1
+          fi
+
+          git fetch --quiet --no-tags --depth=1 origin "$BASE_SHA"
+          git show "${BASE_SHA}:threatdb-manifest.json" \
+            > "$RUNNER_TEMP/threatdb-base-manifest.json"
+          python3 .github/scripts/check-threatdb-manifest-transition.py \
+            "$RUNNER_TEMP/threatdb-base-manifest.json" \
+            threatdb-manifest.json
 
   fmt:
     name: Rustfmt

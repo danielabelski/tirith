@@ -4196,6 +4196,17 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_legacy_manifest_has_valid_pinned_signature() {
+        let manifest: Manifest =
+            serde_json::from_str(include_str!("../../../../threatdb-manifest.json"))
+                .expect("checked-in legacy manifest must be valid JSON");
+
+        manifest
+            .verify_signature()
+            .expect("checked-in legacy manifest must verify with the pinned public key");
+    }
+
+    #[test]
     fn canonical_payload_no_whitespace() {
         let manifest = Manifest {
             sha256: "deadbeef".to_string(),
