@@ -115,24 +115,57 @@ cat > "$FAKE_BIN/curl" <<'EOF'
 set -euo pipefail
 output=
 url=
+connect_timeout=
+max_time=
+max_filesize=
 while (( $# > 0 )); do
   case "$1" in
+    -sSfL)
+      shift
+      ;;
     -o)
       output=$2
       shift 2
+      ;;
+    --connect-timeout|--max-time|--max-filesize)
+      option=$1
+      value=${2:-}
+      case "$value" in
+        ''|*[!0-9]*|0)
+          echo "invalid value for $option: $value" >&2
+          exit 64
+          ;;
+      esac
+      case "$option" in
+        --connect-timeout) connect_timeout=$value ;;
+        --max-time) max_time=$value ;;
+        --max-filesize) max_filesize=$value ;;
+      esac
+      shift 2
+      ;;
+    --connect-timeout=*|--max-time=*|--max-filesize=*)
+      echo "curl long-option values must be separate arguments: $1" >&2
+      exit 64
       ;;
     http://*|https://*)
       url=$1
       shift
       ;;
     *)
-      shift
+      echo "unexpected curl argument: $1" >&2
+      exit 64
       ;;
   esac
 done
-if [ -z "$output" ] || [ -z "$url" ]; then
+if [ -z "$output" ] || [ -z "$url" ] ||
+   [ "$connect_timeout" != "15" ] || [ "$max_time" != "120" ]; then
   exit 64
 fi
+case "$url" in
+  *ipblocklist*) test "$max_filesize" = "16777216" ;;
+  *known_exploited_vulnerabilities*) test "$max_filesize" = "67108864" ;;
+  *) exit 64 ;;
+esac
 printf 'fixture for %s\n' "$url" > "$output"
 if [[ "$url" == *"${FAKE_FETCH_FAILURE:-never-match}"* ]]; then
   exit 42

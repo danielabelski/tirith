@@ -185,18 +185,18 @@ pids+=("$!")
 labels+=("ecosyste.ms typosquatting-dataset")
 
 run_fetch curl -sSfL \
-  --connect-timeout="$CURL_CONNECT_TIMEOUT_SECONDS" \
-  --max-time="$CURL_MAX_TIME_SECONDS" \
-  --max-filesize="$FEODO_MAX_BYTES" \
+  --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
+  --max-time "$CURL_MAX_TIME_SECONDS" \
+  --max-filesize "$FEODO_MAX_BYTES" \
   https://feodotracker.abuse.ch/downloads/ipblocklist.txt \
   -o "$STAGED_SOURCES/feodo.txt"
 pids+=("$!")
 labels+=("Feodo Tracker")
 
 run_fetch curl -sSfL \
-  --connect-timeout="$CURL_CONNECT_TIMEOUT_SECONDS" \
-  --max-time="$CURL_MAX_TIME_SECONDS" \
-  --max-filesize="$CISA_KEV_MAX_BYTES" \
+  --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
+  --max-time "$CURL_MAX_TIME_SECONDS" \
+  --max-filesize "$CISA_KEV_MAX_BYTES" \
   https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json \
   -o "$STAGED_SOURCES/cisa-kev.json"
 pids+=("$!")
