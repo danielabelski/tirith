@@ -200,7 +200,9 @@ child=$!
 (
   sleep "$duration"
   kill -TERM "$child" 2>/dev/null || exit 0
-  sleep 0.2
+  # Give the fake worker's TERM trap time to record graceful termination even
+  # on loaded macOS runners before exercising the hard-kill fallback.
+  sleep 1
   kill -KILL "$child" 2>/dev/null || true
 ) &
 watchdog=$!
@@ -251,6 +253,30 @@ if [ -e "$compile_reached" ] || [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; t
 fi
 if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
   echo "invalid fetch timeout left private staging state" >&2
+  exit 1
+fi
+
+status=0
+if PATH="$FAKE_BIN:$PATH" \
+   THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
+   THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+   THREATDB_REGISTRY_TIMEOUT_SECONDS=0 \
+   bash "$FETCH_SCRIPT"; then
+  touch "$compile_reached"
+else
+  status=$?
+fi
+if (( status == 0 )); then
+  echo "expected an invalid registry timeout to fail preflight" >&2
+  exit 1
+fi
+if [ -e "$compile_reached" ] || [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; then
+  echo "invalid registry timeout reached compile/publication" >&2
+  exit 1
+fi
+if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
+  echo "invalid registry timeout left private staging state" >&2
   exit 1
 fi
 
@@ -389,6 +415,9 @@ else
   status=$?
 fi
 if (( status == 0 )) || [ ! -s "$sparse_started" ] || [ ! -s "$sparse_terminated" ]; then
+  printf 'status=%s started=%s terminated=%s\n' "$status" \
+    "$([ -s "$sparse_started" ] && echo yes || echo no)" \
+    "$([ -s "$sparse_terminated" ] && echo yes || echo no)" >&2
   echo "expected per-source timeout to start and terminate sparse materialization" >&2
   exit 1
 fi
