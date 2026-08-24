@@ -70,14 +70,14 @@ PINS_FILE="$STAGED_SOURCES/source-provenance.json"
 
 FETCH_TIMEOUT_SECONDS=${THREATDB_FETCH_TIMEOUT_SECONDS:-180}
 case "$FETCH_TIMEOUT_SECONDS" in
-  ''|*[!0-9]*|0)
+  ''|*[!0-9]*|0*)
     echo "::error::THREATDB_FETCH_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 1
     ;;
 esac
 TRANSACTION_TIMEOUT_SECONDS=${THREATDB_TRANSACTION_TIMEOUT_SECONDS:-600}
 case "$TRANSACTION_TIMEOUT_SECONDS" in
-  ''|*[!0-9]*|0)
+  ''|*[!0-9]*|0*)
     echo "::error::THREATDB_TRANSACTION_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 1
     ;;
@@ -90,7 +90,7 @@ esac
 # itself. The transaction deadline still fail-closes it.
 REGISTRY_TIMEOUT_SECONDS=${THREATDB_REGISTRY_TIMEOUT_SECONDS:-420}
 case "$REGISTRY_TIMEOUT_SECONDS" in
-  ''|*[!0-9]*|0)
+  ''|*[!0-9]*|0*)
     echo "::error::THREATDB_REGISTRY_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 1
     ;;
@@ -349,14 +349,24 @@ import json
 import pathlib
 import sys
 document = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert document.get("schema_version") == 1
+assert document.get("schema_version") == 2
 assert document.get("ossf_commit") == sys.argv[2]
 packages = document.get("packages")
-assert isinstance(packages, list) and len(packages) <= 1000
+assert isinstance(packages, list) and len(packages) <= 2000
+# The recorded media type is what the registry served (Content-Type essence).
+# npm serves the abbreviated form for 200s but may ignore Accept and serve the
+# full document; a 404 and everything from PyPI is plain application/json.
+allowed_media_types = {
+    ("npm", 200): {"application/vnd.npm.install-v1+json", "application/json"},
+    ("npm", 404): {"application/json"},
+    ("pypi", 200): {"application/json"},
+    ("pypi", 404): {"application/json"},
+}
 for package in packages:
     assert package.get("ecosystem") in {"npm", "pypi"}
     assert isinstance(package.get("name"), str) and package["name"]
     assert isinstance(package.get("source_url"), str) and package["source_url"].startswith("https://")
+    assert package.get("media_type") in allowed_media_types.get((package["ecosystem"], package.get("http_status")), set())
     assert isinstance(package.get("response_sha256"), str) and len(package["response_sha256"]) == 64
     assert package["response_sha256"] != "0" * 64
     assert isinstance(package.get("response_bytes"), int) and 0 <= package["response_bytes"] <= 16 * 1024 * 1024
@@ -366,6 +376,9 @@ for package in packages:
     status = package.get("http_status")
     if resolution == "registry_versions":
         assert status == 200 and package["response_bytes"] > 0 and versions
+    elif resolution == "package_unpublished":
+        assert package["ecosystem"] == "npm"
+        assert status == 200 and package["response_bytes"] > 0 and not versions
     else:
         assert resolution == "package_not_found"
         assert status == 404 and not versions
